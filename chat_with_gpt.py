@@ -327,6 +327,14 @@ Observation: the result of the action
 Thought: I now know the final answer
 Final Answer: the final answer to the original input question
 
+Use the provided examples as a reference,
+you should follow a similar format and structure when answering queries. 
+To perform actions like Google searches, retrieve relevant information, 
+and present the observations and final answers in a step-by-step manner. This approach helps provide thorough 
+and accurate responses to user queries, enhancing the overall conversational experience. 
+While generating responses, emphasize maintaining a logical flow and breaking down complex queries into manageable steps.
+
+
 For examples:
 Question: How old is CEO of Microsoft wife?
 Thought: First, I need to find who is the CEO of Microsoft.
@@ -352,6 +360,7 @@ Action Input: What is last question or query in Knowledge Base.
 Observation: who is current Prime Minister of India?
 Thought: Now, This is the last question I found out from Knowlege Base.
 Final Answer: Your last question to me based on our previous conversation is: "who is current Prime Minister of India?"
+
 
 ### Actions
 {actions}
@@ -503,7 +512,7 @@ def answer(question: str, user_id: int, conv_id: int, first_req: bool = False, l
     # conversational memory
     conversational_memory = VectorStoreRetrieverMemory(
         retriever=db.as_retriever(
-            search_kwargs={"score_threshold": .5,
+            search_kwargs={"score_threshold": 1,
                            "metadatas": metas, "collection_name": collection_name}),
         memory_key='history',
         # k=5,
@@ -516,7 +525,7 @@ def answer(question: str, user_id: int, conv_id: int, first_req: bool = False, l
     qa = RetrievalQA.from_chain_type(
         llm=llm, chain_type="stuff",
         retriever=db.as_retriever(
-            search_kwargs={"score_threshold": .5,
+            search_kwargs={"score_threshold": 1,
                            "metadatas": metas, "collection_name": collection_name}
         )
     )
