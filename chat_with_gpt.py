@@ -52,7 +52,7 @@ from langchain.memory import VectorStoreRetrieverMemory
 os.environ["SERPER_API_KEY"] = "AIzaSyBrM4Y8_TCXJmZDsjMZdBxiwjGKqXvjSGo"
 os.environ["GOOGLE_CSE_ID"] = "9589161c491c4493e"
 os.environ["GOOGLE_API_KEY"] = "AIzaSyCTEiyRiS8mfZlUp3Lc1JwmmyK4sZI_8Lo"
-#os.environ["OPENAI_API_KEY"] = "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"
+os.environ["OPENAI_API_KEY"] = "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"
 search = GoogleSearchAPIWrapper()
 
 
@@ -282,7 +282,7 @@ eb = HuggingFaceEmbeddings()
 db = Chroma(embedding_function=eb)
 
 # defining LLM
-llm = VicunaLLM()
+llm = OpenAI(temperature=.7)
 
 
 template = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
@@ -298,8 +298,7 @@ As a teacher, your goal is to assist students by answering their questions and p
 
 {user_details}
 
-When providing responses, make sure to address the user by their name. For example, if the user asks "What is the capital of France?" your response should be "Sure, [User's Name]. The capital of France is Paris.
-
+The aim is to maintain a natural and conversational tone throughout the interaction. When providing responses, make sure to address the user by their name if necessary. When generating responses, prioritize delivering helpful information while using the user's name sparingly to enhance personalization when appropriate. For example, if the user asks "What is the capital of France?" your response should be "Sure, [User's Name]. The capital of France is Paris
 
 You have access to the following tools:
 
@@ -515,7 +514,7 @@ def answer(question: str, user_id: int, conv_id: int, first_req: bool = False, l
 
     # Create a RetrivalQA object using a vector store, a QA chain, and a number of chunks to consider.
     qa = RetrievalQA.from_chain_type(
-        llm=VicunaLLM(), chain_type="stuff",
+        llm=llm, chain_type="stuff",
         retriever=db.as_retriever(
             search_kwargs={"score_threshold": .5,
                            "metadatas": metas, "collection_name": collection_name}
@@ -574,6 +573,7 @@ def answer(question: str, user_id: int, conv_id: int, first_req: bool = False, l
         "GET", action_url, headers=headers, data=payload)
 
     data = response.json()
+
     action_texts = [obj["action"] for obj in data]
     actions = ", ".join(action_texts)
 
@@ -601,7 +601,6 @@ def answer(question: str, user_id: int, conv_id: int, first_req: bool = False, l
 
     # _input = prompt.format_prompt(query=question)
     # answer = agent(question.to_string())['output']
-    print("ans-->",answer["output"])
     temp_list = [question, answer["output"]]
     db.store_embedding(temp_list, database, metas=metas)
     db.chroma_client.persist()
@@ -697,4 +696,4 @@ def getcollection():
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', debug=True, port=5000)
+    app.run(host='0.0.0.0', debug=True, port=5050)
