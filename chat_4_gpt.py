@@ -46,14 +46,14 @@ from langchain.tools import BaseTool
 from langchain.callbacks.manager import AsyncCallbackManagerForToolRun, CallbackManagerForToolRun
 from langchain.utilities import GoogleSerperAPIWrapper
 from langchain.memory import VectorStoreRetrieverMemory
-
+from langchain import LLMMathChain
 # import os
-# os.environ["GOOGLE_CSE_ID"] = "c4085b9b60bd34e65"
-os.environ["SERPER_API_KEY"] = "AIzaSyBrM4Y8_TCXJmZDsjMZdBxiwjGKqXvjSGo"
+os.environ["OPENAI_API_KEY"] = "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"
 os.environ["GOOGLE_CSE_ID"] = "9589161c491c4493e"
 os.environ["GOOGLE_API_KEY"] = "AIzaSyCTEiyRiS8mfZlUp3Lc1JwmmyK4sZI_8Lo"
-#os.environ["OPENAI_API_KEY"] = "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"
-search = GoogleSearchAPIWrapper(k=10)
+os.environ["NEWS_API_KEY"] = "291350f6b8fd4df982f343888a4cabd5"
+os.environ["SERPAPI_API_KEY"] = "15916f6b8a0a976ab7f92ed1c4e3bc9bb40c73b40404ad2bbf219c5091394cb0"
+search = GoogleSearchAPIWrapper(k=4)
 
 
 # Initialize logging with the specified configuration
@@ -280,42 +280,41 @@ list_of_document = ["Operating the Climate Control System  Your Googlecar has a 
 eb = HuggingFaceEmbeddings()
 # chroma instance
 db = Chroma(embedding_function=eb)
+from langchain.chat_models import ChatOpenAI
 
 # defining LLM
-llm = VicunaLLM()
+llm = ChatOpenAI(temperature=0, max_tokens=512,
+                 model_name="gpt-3.5-turbo")
 
 
-template = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+template = """
+Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
-You are Hevolve, a highly intelligent education AI, developed by HertzAI, designed to answer questions, provide revisions, and teach various topics to students.
-Your response should be meaniful and should not excide more than 200 words and should be as fast as posssible.
-
-
-### Instruction:
-You are a highly knowledgeable teacher with a vast amount of information at your disposal. 
-You also have access to a tool similar to Google Search that allows you to retrieve information from the web in real-time. 
+Instructions:
+You will have to act like the world's best teacher who has knowledge in every field, and you will have to think of the consequences of the particular response you will give.
+Your response should be meaningful, should not exceed more than 200 words, and should be as fast as possible.
+You are a highly knowledgeable teacher with a vast amount of information at your disposal.
+You also have access to a tool similar to Google Search that allows you to retrieve information from the web in real-time.
 As a teacher, your goal is to assist students by answering their questions and providing accurate and up-to-date information.
+The aim is to maintain a natural and conversational tone throughout the interaction. When providing responses, make sure to address the user by their name only if there is a necessity.
+When generating responses, prioritize delivering helpful information while using the user's name sparingly to enhance personalization when appropriate.
 
 {user_details}
 
-When providing responses, make sure to address the user by their name. For example, if the user asks "What is the capital of France?" your response should be "Sure, [User's Name]. The capital of France is Paris.
-
+Things to consider before you respond:
+Context in which you are used:
+You are Hevolve, a highly intelligent educational AI, developed by HertzAI, designed to answer questions, provide revisions, assessments,
+teach various topics and help with research for students and working professionals from various knowledge sources like books, websites, white papers.
+Your responses will be played to the user as a video using an avatar and text to speech in various languages.
 
 You have access to the following tools:
+{tools}
 
-Google Search: A wrapper around Google Search. Useful for when you need to answer questions about current events and also if you don't know the answer. The input is the question to search relavant information.
+Use history to find relevant conversations for the current query.
 
-Knowledge Base: A wrapper around history of Previous Conversation. Useful for when you need to answer question based on previous chat history between you and human. Extract history from this tool answer.
+Use actions to get what all actions the user has taken before, keep all these actions into account while answering the query. Also, it could be used as additional history.
 
-Use history to find relevant conversation for current query.
-
-Use actions to get what all are action user has taken before, keep all this actions in account while answering the query also it could be use as a additional history.
-
-Use user_name to narrate user when required.
-
-Given the chat history so far, generate an engaging message to continue the conversation with the user. Incorporate interesting facts, jokes, or personalized references to previous discussions to keep the interaction lively and captivating. The main aim is to encourage the user to actively participate and explore further topics. Your message should be engaging, friendly, and foster a sense of curiosity. 
-
-
+Given the chat history so far, generate an engaging message to continue the conversation with the user. Incorporate interesting facts, jokes, or personalized references to previous discussions to keep the interaction lively and captivating. The main aim is to encourage the user to actively participate and explore further topics. Your message should be engaging, friendly, and foster a sense of curiosity.
 
 Strictly use the following format:
 
@@ -328,8 +327,15 @@ Observation: the result of the action
 Thought: I now know the final answer
 Final Answer: the final answer to the original input question
 
+Use the provided examples as a reference,
+you should follow a similar format and structure when answering queries.
+To perform actions like Google searches, retrieve relevant information,
+and present the observations and final answers in a step-by-step manner. This approach helps provide thorough
+and accurate responses to user queries, enhancing the overall conversational experience.
+While generating responses, emphasize maintaining a logical flow and breaking down complex queries into manageable steps.
+
 For examples:
-Question: How old is CEO of Microsoft wife?
+Question: How old is the CEO of Microsoft's wife?
 Thought: First, I need to find who is the CEO of Microsoft.
 Action: Google Search
 Action Input: Who is the CEO of Microsoft?
@@ -347,90 +353,51 @@ Final Answer: Anupama Nadella is 50 years old.
 
 Example 2:
 Question: What was my last question to you?
-Thought: First I need to check what all question I have in Knowlege Base.
+Thought: First I need to check what all questions I have in the Knowledge Base.
 Action: Knowledge Base
-Action Input: What is last question or query in Knowledge Base.
-Observation: who is current Prime Minister of India?
-Thought: Now, This is the last question I found out from Knowlege Base.
-Final Answer: Your last question to me based on our previous conversation is: "who is current Prime Minister of India?"
+Action Input: What is the last question or query in the Knowledge Base.
+Observation: Who is the current Prime Minister of India?
+Thought: Now, this is the last question I found out from the Knowledge Base.
+Final Answer: Your last question to me based on our previous conversation is: "Who is the current Prime Minister of India?"
 
-### Actions
+Actions
 {actions}
 
-### History
+History
 {history}
 
-### Input:
+Input:
 {input}
 
-### Response:
+Response:
 {agent_scratchpad}
 """
 
-temp_Ins = """You are highly intelligent AI chatbot created by Hevolve. You can help user with all their queries and give best assistance in solving their queries.Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
-### Instruction:
-Question: {thought}
-Query: {query}
-Observation: {observation}
-
-### Input:
-Make a short summary of useful information from the result observation that is related to the question.
-
-### History"
-Make use of history if required to give answer dont treat as seperate question use it if needed to generate answer better otherwise ignore
-
-### Response:"""
-
-prompt_Ins = PromptTemplate(
-    input_variables=["thought", "query", "observation"],
-    template=temp_Ins,
-)
-
-
+# Set up a prompt template
 class CustomPromptTemplate(StringPromptTemplate):
-
-    input_variables: List[str]
-    """A list of the names of the variables the prompt template expects."""
-
+    # The template to use
     template: str
-    """The prompt template."""
-
-    template_format: str = "f-string"
-    """The format of the prompt template. Options are: 'f-string', 'jinja2'."""
-
-    validate_template: bool = False
-    """Whether or not to try validating the template."""
+    # The list of tools available
+    tools: List[Tool]
 
     def format(self, **kwargs) -> str:
         # Get the intermediate steps (AgentAction, Observation tuples)
         # Format them in a particular way
         intermediate_steps = kwargs.pop("intermediate_steps")
         thoughts = ""
-        # Refine the observation
-        if len(intermediate_steps) > 0:
-            regex = r"Thought\s*\d*\s*:(.*?)\nAction\s*\d*\s*:(.*?)\nAction\s*\d*\s*Input\s*\d*\s*:[\s]*(.*)\nObservation"
-            text_match = intermediate_steps[-1][0].log
-            if len(intermediate_steps) > 1:
-                text_match = 'Thought: ' + text_match
-            match = re.search(regex, text_match, re.DOTALL)
-            my_list = list(intermediate_steps[-1])
-            p_INS_temp = prompt_Ins.format(thought=match.group(
-                1).strip(), query=match.group(3).strip(), observation=my_list[1])
-            my_list[1] = llm(p_INS_temp)
-            my_tuple = tuple(my_list)
-            intermediate_steps[-1] = my_tuple
-
         for action, observation in intermediate_steps:
             thoughts += action.log
-            thoughts += f" {observation}\nThought:"
+            thoughts += f"\nObservation: {observation}\nThought: "
         # Set the agent_scratchpad variable to that value
         kwargs["agent_scratchpad"] = thoughts
+        # Create a tools variable from the list of tools provided
+        kwargs["tools"] = "\n".join([f"{tool.name}: {tool.description}" for tool in self.tools])
+        # Create a list of tool names for the tools provided
+        kwargs["tool_names"] = ", ".join([tool.name for tool in self.tools])
         return self.template.format(**kwargs)
 
 
-prompt = CustomPromptTemplate(input_variables=["input", "history", "intermediate_steps", "actions", "user_details"],
-                              template=template, validate_template=False)
 
 
 class CustomOutputParser(AgentOutputParser):
@@ -441,22 +408,19 @@ class CustomOutputParser(AgentOutputParser):
             return AgentFinish(
                 # Return values is generally always a dictionary with a single `output` key
                 # It is not recommended to try anything else at the moment :)
-                return_values={"output": llm_output.split(
-                    "Final Answer:")[-1].strip()},
+                return_values={"output": llm_output.split("Final Answer:")[-1].strip()},
                 log=llm_output,
             )
         # Parse out the action and action input
         regex = r"Action\s*\d*\s*:(.*?)\nAction\s*\d*\s*Input\s*\d*\s*:[\s]*(.*)"
         match = re.search(regex, llm_output, re.DOTALL)
-
         if not match:
             return AgentFinish(
                 # Return values is generally always a dictionary with a single `output` key
                 # It is not recommended to try anything else at the moment :)
-                return_values={"output": llm_output},
+                return_values={"output": llm_output.split("Final Answer:")[-1].strip()},
                 log=llm_output,
             )
-            # raise ValueError(f"Could not parse LLM output: `{llm_output}`")
         action = match.group(1).strip()
         action_input = match.group(2)
         # Return the action and action input
@@ -481,8 +445,8 @@ def answer(question: str, user_id: int, conv_id: int, first_req: bool = False, l
         database = None
     if database == None:
         database = db.create_chroma_db(name=collection_name)
-    else:
-        database = db.chroma_client.get_collection(name=collection_name)
+    # else:
+    #     database = db.chroma_client.get_collection(name=collection_name)
 
     if first_req:
         db.store_embedding(list_of_document, database, metas=metas)
@@ -502,10 +466,12 @@ def answer(question: str, user_id: int, conv_id: int, first_req: bool = False, l
         f"The top {config.k} chunks are considered to answer the user's query.")
 
     # conversational memory
-    conversational_memory = VectorStoreRetrieverMemory(
-        retriever=db.as_retriever(
+    #use constome search
+    ret = db.as_retriever(
             search_kwargs={"score_threshold": .5,
-                           "metadatas": metas, "collection_name": collection_name}),
+                           "metadatas": metas, "collection_name": collection_name})
+    conversational_memory = VectorStoreRetrieverMemory(
+        retriever=ret,
         memory_key='history',
         # k=5,
         input_key="input",
@@ -515,11 +481,8 @@ def answer(question: str, user_id: int, conv_id: int, first_req: bool = False, l
 
     # Create a RetrivalQA object using a vector store, a QA chain, and a number of chunks to consider.
     qa = RetrievalQA.from_chain_type(
-        llm=VicunaLLM(), chain_type="stuff",
-        retriever=db.as_retriever(
-            search_kwargs={"score_threshold": .5,
-                           "metadatas": metas, "collection_name": collection_name}
-        )
+        llm=llm, chain_type="stuff",
+        retriever=ret
     )
 
     # Once we get chain we are ready to generate Agent for this we need to convert this retrieval chain into a tool. We do that like so:
@@ -528,7 +491,17 @@ def answer(question: str, user_id: int, conv_id: int, first_req: bool = False, l
     # # Call the RetrivalQA object to generate an answer to the prompt.
     # result = qa({"query": prompt})
 
+    news_api_key = os.environ["NEWS_API_KEY"]
+
+    #TOOLS_LIST = ["llm-math"]
+
+    #tools = load_tools(TOOLS_LIST, llm=llm, news_api_key=news_api_key)
+
+    search1 = GoogleSearchAPIWrapper(k=4)
+    # search = GoogleSerperAPIWrapper(serper_api_key="15916f6b8a0a976ab7f92ed1c4e3bc9bb40c73b40404ad2bbf219c5091394cb0")
+    llm_math_chain = LLMMathChain.from_llm(llm=llm, verbose=True)
     tools = [
+
         Tool(
             name='Knowledge Base',
             func=qa.run,
@@ -536,12 +509,34 @@ def answer(question: str, user_id: int, conv_id: int, first_req: bool = False, l
                 " Useful for when you need to answer question based on previous chat history between you and human. Extract history from this tool and answer "
             )
         ),
+
         Tool(
-            name="Search",
-            func=search.run,
-            description="Use the power of Google's search engine to instantly retrieve accurate and up-to-date information from the web using Google search tool.",
+        name="Calculator",
+        func=llm_math_chain.run,
+        description="useful for when you need to answer questions about math or calculations"
+        ),
+        # python refl
+
+        Tool(
+            name="Google Search",
+            description="Search Google for recent results, current events.",
+            func=search1.run,
+        ),
+        Tool(
+                name="current events",
+                func=search1.run,
+                description="useful for when you need to ask with search",
         )
     ]
+
+    prompt = CustomPromptTemplate(
+        template=template,
+        tools=tools,
+        # This omits the `agent_scratchpad`, `tools`, and `tool_names` variables because those are generated dynamically
+        # This includes the `intermediate_steps` variable because that is needed
+        input_variables=["input", "intermediate_steps","history","actions","user_details"]
+    )
+
 
     output_parser = CustomOutputParser()
 

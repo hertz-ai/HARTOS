@@ -46,14 +46,15 @@ from langchain.tools import BaseTool
 from langchain.callbacks.manager import AsyncCallbackManagerForToolRun, CallbackManagerForToolRun
 from langchain.utilities import GoogleSerperAPIWrapper
 from langchain.memory import VectorStoreRetrieverMemory
-
+from langchain.chat_models import ChatOpenAI
+from langchain import LLMMathChain, OpenAI, SerpAPIWrapper, SQLDatabase, SQLDatabaseChain
 # import os
 # os.environ["GOOGLE_CSE_ID"] = "c4085b9b60bd34e65"
 os.environ["SERPER_API_KEY"] = "AIzaSyBrM4Y8_TCXJmZDsjMZdBxiwjGKqXvjSGo"
 os.environ["GOOGLE_CSE_ID"] = "9589161c491c4493e"
 os.environ["GOOGLE_API_KEY"] = "AIzaSyCTEiyRiS8mfZlUp3Lc1JwmmyK4sZI_8Lo"
 os.environ["OPENAI_API_KEY"] = "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"
-search = GoogleSearchAPIWrapper()
+search = GoogleSearchAPIWrapper(k=4)
 
 
 # Initialize logging with the specified configuration
@@ -282,23 +283,32 @@ eb = HuggingFaceEmbeddings()
 db = Chroma(embedding_function=eb)
 
 # defining LLM
-llm = OpenAI(temperature=.7)
+llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo-0613")
+#llm_math_chain = LLMMathChain.from_llm(llm=llm, verbose=True)
+
 
 
 template = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+
 
 You are Hevolve, a highly intelligent education AI, developed by HertzAI, designed to answer questions, provide revisions, and teach various topics to students.
 Your response should be meaniful and should not excide more than 200 words and should be as fast as posssible.
 
 
 ### Instruction:
-You are a highly knowledgeable teacher with a vast amount of information at your disposal. 
-You also have access to a tool similar to Google Search that allows you to retrieve information from the web in real-time. 
+
+
+You are a highly knowledgeable teacher with a vast amount of information at your disposal.
+You also have access to a tool similar to Google Search that allows you to retrieve information from the web in real-time.
 As a teacher, your goal is to assist students by answering their questions and providing accurate and up-to-date information.
 
 {user_details}
 
-The aim is to maintain a natural and conversational tone throughout the interaction. When providing responses, make sure to address the user by their name if necessary. When generating responses, prioritize delivering helpful information while using the user's name sparingly to enhance personalization when appropriate. For example, if the user asks "What is the capital of France?" your response should be "Sure, [User's Name]. The capital of France is Paris
+When generating responses, prioritize delivering helpful information.
+
+The aim is to maintain a natural and conversational tone throughout the interaction. 
+When generating responses, prioritize delivering helpful information while using the user's name sparingly to enhance personalization when appropriate.
+
 
 You have access to the following tools:
 
@@ -310,9 +320,7 @@ Use history to find relevant conversation for current query.
 
 Use actions to get what all are action user has taken before, keep all this actions in account while answering the query also it could be use as a additional history.
 
-Use user_name to narrate user when required.
-
-Given the chat history so far, generate an engaging message to continue the conversation with the user. Incorporate interesting facts, jokes, or personalized references to previous discussions to keep the interaction lively and captivating. The main aim is to encourage the user to actively participate and explore further topics. Your message should be engaging, friendly, and foster a sense of curiosity. 
+Given the chat history so far, generate an engaging message to continue the conversation with the user. Incorporate interesting facts, jokes, or personalized references to previous discussions to keep the interaction lively and captivating. The main aim is to encourage the user to actively participate and explore further topics. Your message should be engaging, friendly, and foster a sense of curiosity.
 
 
 
@@ -328,10 +336,10 @@ Thought: I now know the final answer
 Final Answer: the final answer to the original input question
 
 Use the provided examples as a reference,
-you should follow a similar format and structure when answering queries. 
-To perform actions like Google searches, retrieve relevant information, 
-and present the observations and final answers in a step-by-step manner. This approach helps provide thorough 
-and accurate responses to user queries, enhancing the overall conversational experience. 
+you should follow a similar format and structure when answering queries.
+To perform actions like Google searches, retrieve relevant information,
+and present the observations and final answers in a step-by-step manner. This approach helps provide thorough
+and accurate responses to user queries, enhancing the overall conversational experience.
 While generating responses, emphasize maintaining a logical flow and breaking down complex queries into manageable steps.
 
 
@@ -419,15 +427,18 @@ class CustomPromptTemplate(StringPromptTemplate):
         if len(intermediate_steps) > 0:
             regex = r"Thought\s*\d*\s*:(.*?)\nAction\s*\d*\s*:(.*?)\nAction\s*\d*\s*Input\s*\d*\s*:[\s]*(.*)\nObservation"
             text_match = intermediate_steps[-1][0].log
+            print("text_matched", text_match)
             if len(intermediate_steps) > 1:
                 text_match = 'Thought: ' + text_match
-            match = re.search(regex, text_match, re.DOTALL)
-            my_list = list(intermediate_steps[-1])
-            p_INS_temp = prompt_Ins.format(thought=match.group(
-                1).strip(), query=match.group(3).strip(), observation=my_list[1])
-            my_list[1] = llm(p_INS_temp)
-            my_tuple = tuple(my_list)
-            intermediate_steps[-1] = my_tuple
+            match = re.search(regex, text_match, re.DOTALL) 
+            if match != None:
+                my_list = list(intermediate_steps[-1])
+
+                p_INS_temp = prompt_Ins.format(thought=match.group(
+                    1).strip(), query=match.group(3).strip(), observation=my_list[1])
+                my_list[1] = llm(p_INS_temp)
+                my_tuple = tuple(my_list)
+                intermediate_steps[-1] = my_tuple
 
         for action, observation in intermediate_steps:
             thoughts += action.log
@@ -533,8 +544,19 @@ def answer(question: str, user_id: int, conv_id: int, first_req: bool = False, l
     # Once we get chain we are ready to generate Agent for this we need to convert this retrieval chain into a tool. We do that like so:
 
     # use below code when you want to use chain as standalone
-    # # Call the RetrivalQA object to generate an answer to the prompt.
+    ## Call the RetrivalQA object to generate an answer to the prompt.
     # result = qa({"query": prompt})
+
+    os.environ["NEWS_API_KEY"] = "291350f6b8fd4df982f343888a4cabd5"
+
+    os.environ["SERPAPI_API_KEY"] = "6aed3e3dc8b3f0741fff071d739b91c2211e6dfe60b5dcea64c85b76ed9fce57"
+
+
+    news_api_key = os.environ["NEWS_API_KEY"]
+
+    TOOLS_LIST = ['serpapi', 'google-search','news-api', "llm-math"]
+
+    tools = load_tools(TOOLS_LIST, llm=llm, news_api_key=news_api_key)
 
     tools = [
         Tool(
@@ -543,11 +565,6 @@ def answer(question: str, user_id: int, conv_id: int, first_req: bool = False, l
             description=(
                 " Useful for when you need to answer question based on previous chat history between you and human. Extract history from this tool and answer "
             )
-        ),
-        Tool(
-            name="Search",
-            func=search.run,
-            description="Use the power of Google's search engine to instantly retrieve accurate and up-to-date information from the web using Google search tool.",
         )
     ]
 

@@ -13,7 +13,7 @@ from langchain.document_loaders import DirectoryLoader, TextLoader
 from langchain.prompts import PromptTemplate
 from langchain.chains.question_answering import load_qa_chain
 from langchain.embeddings import HuggingFaceEmbeddings
-from vicuna_config import VicunaLLM, CustomOutputParser
+# from vicuna_config import VicunaLLM, CustomOutputParser
 import sentence_transformers
 import os
 import nltk
@@ -46,14 +46,23 @@ from langchain.tools import BaseTool
 from langchain.callbacks.manager import AsyncCallbackManagerForToolRun, CallbackManagerForToolRun
 from langchain.utilities import GoogleSerperAPIWrapper
 from langchain.memory import VectorStoreRetrieverMemory
+from langchain import LLMMathChain
+from langchain.chat_models import ChatOpenAI
+from typing import Union
+import requests
+from langchain.agents.agent import AgentOutputParser
+from langchain.agents.conversational.prompt import FORMAT_INSTRUCTIONS
+from langchain.schema import AgentAction, AgentFinish, OutputParserException
+from langchain.agents import ConversationalAgent, ZeroShotAgent
 
-# import os
-# os.environ["GOOGLE_CSE_ID"] = "c4085b9b60bd34e65"
-os.environ["SERPER_API_KEY"] = "AIzaSyBrM4Y8_TCXJmZDsjMZdBxiwjGKqXvjSGo"
+
+os.environ["NEWS_API_KEY"] = "291350f6b8fd4df982f343888a4cabd5"
+os.environ["OPENAI_API_KEY"] = "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"
 os.environ["GOOGLE_CSE_ID"] = "9589161c491c4493e"
 os.environ["GOOGLE_API_KEY"] = "AIzaSyCTEiyRiS8mfZlUp3Lc1JwmmyK4sZI_8Lo"
-#os.environ["OPENAI_API_KEY"] = "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"
-search = GoogleSearchAPIWrapper(k=10)
+os.environ["NEWS_API_KEY"] = "291350f6b8fd4df982f343888a4cabd5"
+os.environ["SERPAPI_API_KEY"] = "6aed3e3dc8b3f0741fff071d739b91c2211e6dfe60b5dcea64c85b76ed9fce57"
+search = GoogleSearchAPIWrapper()
 
 
 # Initialize logging with the specified configuration
@@ -69,8 +78,11 @@ LOGGER = logging.getLogger(__name__)
 
 # client: Any  #: :meta private:
 DEFAULT_K = 4  # Number of Documents to return.
-
-# chroma class
+MAX_TOKENS = 512
+global actions
+actions = ""
+global user_details
+user_details = ""
 
 
 def _results_to_docs(results: Any) -> List[Document]:
@@ -270,11 +282,6 @@ class Chroma(VectorStore):
         return pd.DataFrame(db.peek(10))
 
 
-'''
-list_of_document = ["Operating the Climate Control System  Your Googlecar has a climate control system that allows you to adjust the temperature and airflow in the car. To operate the climate control system, use the buttons and knobs located on the center console.  Temperature: The temperature knob controls the temperature inside the car. Turn the knob clockwise to increase the temperature or counterclockwise to decrease the temperature. Airflow: The airflow knob controls the amount of airflow inside the car. Turn the knob clockwise to increase the airflow or counterclockwise to decrease the airflow. Fan speed: The fan speed knob controls the speed of the fan. Turn the knob clockwise to increase the fan speed or counterclockwise to decrease the fan speed. Mode: The mode button allows you to select the desired mode. The available modes are: Auto: The car will automatically adjust the temperature and airflow to maintain a comfortable level. Cool: The car will blow cool air into the car. Heat: The car will blow warm air into the car. Defrost: The car will blow warm air onto the windshield to defrost it."
-                    "Your Googlecar has a large touchscreen display that provides access to a variety of features, including navigation, entertainment, and climate control. To use the touchscreen display, simply touch the desired icon.  For example, you can touch the \"Navigation\" icon to get directions to your destination or touch the \"Music\" icon to play your favorite songs."
-                    "Shifting Gears  Your Googlecar has an automatic transmission. To shift gears, simply move the shift lever to the desired position.  Park: This position is used when you are parked. The wheels are locked and the car cannot move. Reverse: This position is used to back up. Neutral: This position is used when you are stopped at a light or in traffic. The car is not in gear and will not move unless you press the gas pedal. Drive: This position is used to drive forward. Low: This position is used for driving in snow or other slippery conditions."]
-'''
 
 # embedder
 eb = HuggingFaceEmbeddings()
@@ -282,155 +289,81 @@ eb = HuggingFaceEmbeddings()
 db = Chroma(embedding_function=eb)
 
 # defining LLM
-llm = VicunaLLM()
+llm = ChatOpenAI(temperature=0, max_tokens=MAX_TOKENS,
+                 model_name="gpt-3.5-turbo")
+llm_math_chain = LLMMathChain.from_llm(llm=llm, verbose=True)
 
 
-template = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
-
-You are Hevolve, a highly intelligent education AI, developed by HertzAI, designed to answer questions, provide revisions, and teach various topics to students.
-Your response should be meaniful and should not excide more than 200 words and should be as fast as posssible.
+TOOLS_LIST = ['news-api']
+news_api_key = os.environ["NEWS_API_KEY"]
 
 
-### Instruction:
-You are a highly knowledgeable teacher with a vast amount of information at your disposal. 
-You also have access to a tool similar to Google Search that allows you to retrieve information from the web in real-time. 
-As a teacher, your goal is to assist students by answering their questions and providing accurate and up-to-date information.
+def get_qa(metas, collection_name):
+    qa = RetrievalQA.from_chain_type(
+    llm=llm, chain_type="stuff",
+    retriever=db.as_retriever(
+        search_kwargs={"score_threshold": 2,
+                        "metadatas": metas, "collection_name": collection_name}
+        )
+    )
+    return qa
 
+
+# Set up the base template
+template = """Answer the following questions as best you can, but speaking as a pirate might speak. You have access to the following tools:
+
+{tools}
+
+Use this user detail when user asks for his personal information
 {user_details}
 
-When providing responses, make sure to address the user by their name. For example, if the user asks "What is the capital of France?" your response should be "Sure, [User's Name]. The capital of France is Paris.
+This are all action that user have taken in his learning journey
+{actions}
 
-
-You have access to the following tools:
-
-Google Search: A wrapper around Google Search. Useful for when you need to answer questions about current events and also if you don't know the answer. The input is the question to search relavant information.
-
-Knowledge Base: A wrapper around history of Previous Conversation. Useful for when you need to answer question based on previous chat history between you and human. Extract history from this tool answer.
-
-Use history to find relevant conversation for current query.
-
-Use actions to get what all are action user has taken before, keep all this actions in account while answering the query also it could be use as a additional history.
-
-Use user_name to narrate user when required.
-
-Given the chat history so far, generate an engaging message to continue the conversation with the user. Incorporate interesting facts, jokes, or personalized references to previous discussions to keep the interaction lively and captivating. The main aim is to encourage the user to actively participate and explore further topics. Your message should be engaging, friendly, and foster a sense of curiosity. 
-
-
-
-Strictly use the following format:
+Use the following format:
 
 Question: the input question you must answer
 Thought: you should always think about what to do
-Action: the action to take, should be one of [Google Search]
-Action Input: the input to the action, should be a question.
+Action: the action to take, should be one of [{tool_names}]
+Action Input: the input to the action
 Observation: the result of the action
 ... (this Thought/Action/Action Input/Observation can repeat N times)
 Thought: I now know the final answer
 Final Answer: the final answer to the original input question
 
-For examples:
-Question: How old is CEO of Microsoft wife?
-Thought: First, I need to find who is the CEO of Microsoft.
-Action: Google Search
-Action Input: Who is the CEO of Microsoft?
-Observation: Satya Nadella is the CEO of Microsoft.
-Thought: Now, I should find out Satya Nadella's wife.
-Action: Google Search
-Action Input: Who is Satya Nadella's wife?
-Observation: Satya Nadella's wife's name is Anupama Nadella.
-Thought: Then, I need to check Anupama Nadella's age.
-Action: Google Search
-Action Input: How old is Anupama Nadella?
-Observation: Anupama Nadella's age is 50.
-Thought: I now know the final answer.
-Final Answer: Anupama Nadella is 50 years old.
+Begin! Remember to speak as a pirate when giving your final answer. Use lots of "Arg"s
 
-Example 2:
-Question: What was my last question to you?
-Thought: First I need to check what all question I have in Knowlege Base.
-Action: Knowledge Base
-Action Input: What is last question or query in Knowledge Base.
-Observation: who is current Prime Minister of India?
-Thought: Now, This is the last question I found out from Knowlege Base.
-Final Answer: Your last question to me based on our previous conversation is: "who is current Prime Minister of India?"
-
-### Actions
-{actions}
-
-### History
-{history}
-
-### Input:
-{input}
-
-### Response:
-{agent_scratchpad}
-"""
-
-temp_Ins = """You are highly intelligent AI chatbot created by Hevolve. You can help user with all their queries and give best assistance in solving their queries.Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
-
-### Instruction:
-Question: {thought}
-Query: {query}
-Observation: {observation}
-
-### Input:
-Make a short summary of useful information from the result observation that is related to the question.
-
-### History"
-Make use of history if required to give answer dont treat as seperate question use it if needed to generate answer better otherwise ignore
-
-### Response:"""
-
-prompt_Ins = PromptTemplate(
-    input_variables=["thought", "query", "observation"],
-    template=temp_Ins,
-)
+Question: {input}
+{agent_scratchpad}"""
 
 
+# Set up a prompt template
 class CustomPromptTemplate(StringPromptTemplate):
-
-    input_variables: List[str]
-    """A list of the names of the variables the prompt template expects."""
-
+    # The template to use
     template: str
-    """The prompt template."""
-
-    template_format: str = "f-string"
-    """The format of the prompt template. Options are: 'f-string', 'jinja2'."""
-
-    validate_template: bool = False
-    """Whether or not to try validating the template."""
+    # The list of tools available
+    tools: List[Tool]
+    actions: str
+    user_details: str
 
     def format(self, **kwargs) -> str:
         # Get the intermediate steps (AgentAction, Observation tuples)
         # Format them in a particular way
         intermediate_steps = kwargs.pop("intermediate_steps")
         thoughts = ""
-        # Refine the observation
-        if len(intermediate_steps) > 0:
-            regex = r"Thought\s*\d*\s*:(.*?)\nAction\s*\d*\s*:(.*?)\nAction\s*\d*\s*Input\s*\d*\s*:[\s]*(.*)\nObservation"
-            text_match = intermediate_steps[-1][0].log
-            if len(intermediate_steps) > 1:
-                text_match = 'Thought: ' + text_match
-            match = re.search(regex, text_match, re.DOTALL)
-            my_list = list(intermediate_steps[-1])
-            p_INS_temp = prompt_Ins.format(thought=match.group(
-                1).strip(), query=match.group(3).strip(), observation=my_list[1])
-            my_list[1] = llm(p_INS_temp)
-            my_tuple = tuple(my_list)
-            intermediate_steps[-1] = my_tuple
-
         for action, observation in intermediate_steps:
             thoughts += action.log
-            thoughts += f" {observation}\nThought:"
+            thoughts += f"\nObservation: {observation}\nThought: "
         # Set the agent_scratchpad variable to that value
         kwargs["agent_scratchpad"] = thoughts
+        # Create a tools variable from the list of tools provided
+        kwargs["tools"] = "\n".join(
+            [f"{tool.name}: {tool.description}" for tool in self.tools])
+        # Create a list of tool names for the tools provided
+        kwargs["tool_names"] = ", ".join([tool.name for tool in self.tools])
+        kwargs["actions"] = actions
+        kwargs['user_details'] = user_details
         return self.template.format(**kwargs)
-
-
-prompt = CustomPromptTemplate(input_variables=["input", "history", "intermediate_steps", "actions", "user_details"],
-                              template=template, validate_template=False)
 
 
 class CustomOutputParser(AgentOutputParser):
@@ -448,24 +381,46 @@ class CustomOutputParser(AgentOutputParser):
         # Parse out the action and action input
         regex = r"Action\s*\d*\s*:(.*?)\nAction\s*\d*\s*Input\s*\d*\s*:[\s]*(.*)"
         match = re.search(regex, llm_output, re.DOTALL)
-
         if not match:
-            return AgentFinish(
-                # Return values is generally always a dictionary with a single `output` key
-                # It is not recommended to try anything else at the moment :)
-                return_values={"output": llm_output},
-                log=llm_output,
-            )
-            # raise ValueError(f"Could not parse LLM output: `{llm_output}`")
+            raise OutputParserException(
+                f"Could not parse LLM output: `{llm_output}`")
         action = match.group(1).strip()
         action_input = match.group(2)
         # Return the action and action input
         return AgentAction(tool=action, tool_input=action_input.strip(" ").strip('"'), log=llm_output)
 
+def get_actions_user_detail(user_id: int):
+    action_url = f"http://aws_hevolve.hertzai.com:6006/action_by_user_id?user_id={user_id}"
 
-output_parser = CustomOutputParser()
+    payload = {}
+    headers = {}
 
-# search = GoogleSearchAPIWrapper(k=1)
+    response = requests.request(
+        "GET", action_url, headers=headers, data=payload)
+
+    data = response.json()
+
+    action_texts = [obj["action"] for obj in data]
+    actions = ", ".join(action_texts)
+
+    # user detail api
+
+    url = "http://aws_hevolve.hertzai.com:6006/getstudent_by_user_id"
+    payload = json.dumps({
+        "user_id": user_id
+    })
+    headers = {
+        'Content-Type': 'application/json'
+    }
+    response = requests.request("POST", url, headers=headers, data=payload)
+    # print()
+
+    user_data = response.json()
+
+    user_details = f'''Below are the information about the user.
+    user_name: {user_data["name"]} (Call the user by this name),gender: {user_data["gender"]},who_pays_for_course: {user_data["who_pays_for_course"]}(Entity Responsible for Paying the Course Fees),preferred_language: {user_data["preferred_language"]}(User's Preferred Language),date_of_birth: {user_data["dob"]},english_proficiency: {user_data["english_proficiency"]}(User's English Proficiency Level),created_date: {user_data["created_date"]}(user creation date),standard: {user_data["standard"]}(User's Standard in which user studying)
+    '''
+    return user_details, actions
 
 
 # Define answer generation function
@@ -502,25 +457,42 @@ def answer(question: str, user_id: int, conv_id: int, first_req: bool = False, l
         f"The top {config.k} chunks are considered to answer the user's query.")
 
     # conversational memory
-    conversational_memory = VectorStoreRetrieverMemory(
-        retriever=db.as_retriever(
-            search_kwargs={"score_threshold": .5,
-                           "metadatas": metas, "collection_name": collection_name}),
-        memory_key='history',
-        # k=5,
-        input_key="input",
-        # output_key='output',
-        return_docs=False
-    )
 
     # Create a RetrivalQA object using a vector store, a QA chain, and a number of chunks to consider.
-    qa = RetrievalQA.from_chain_type(
-        llm=VicunaLLM(), chain_type="stuff",
-        retriever=db.as_retriever(
-            search_kwargs={"score_threshold": .5,
-                           "metadatas": metas, "collection_name": collection_name}
+    qa = get_qa(metas=metas, collection_name=collection_name)
+
+    tools = [
+        Tool(
+            name = "Search",
+            func=search.run,
+            description="useful for when you need to answer questions about current events. You should ask targeted questions"
+        ),
+        Tool(
+            name="Calculator",
+            func=llm_math_chain.run,
+            description="useful for when you need to answer questions about math"
+        ),
+        Tool(
+            name="Knowledge_Base",
+            func=qa.run,
+            description="Useful for when you need to answer question based on previous chat history between you and human. Extract history from this tool and answer "
         )
-    )
+        
+    ]
+   
+
+    user_details, actions = get_actions_user_detail(user_id)
+
+    prompt = CustomPromptTemplate(
+                template=template,
+                tools=tools,
+                actions=actions,
+                user_details=user_details,
+                # This omits the `agent_scratchpad`, `tools`, and `tool_names` variables because those are generated dynamically
+                # This includes the `intermediate_steps` variable because that is needed
+                input_variables=["input", "intermediate_steps"]
+            )
+
 
     # Once we get chain we are ready to generate Agent for this we need to convert this retrieval chain into a tool. We do that like so:
 
@@ -528,81 +500,30 @@ def answer(question: str, user_id: int, conv_id: int, first_req: bool = False, l
     # # Call the RetrivalQA object to generate an answer to the prompt.
     # result = qa({"query": prompt})
 
-    tools = [
-        Tool(
-            name='Knowledge Base',
-            func=qa.run,
-            description=(
-                " Useful for when you need to answer question based on previous chat history between you and human. Extract history from this tool and answer "
-            )
-        ),
-        Tool(
-            name="Search",
-            func=search.run,
-            description="Use the power of Google's search engine to instantly retrieve accurate and up-to-date information from the web using Google search tool.",
-        )
-    ]
 
     output_parser = CustomOutputParser()
 
+    # LLM chain consisting of the LLM and a prompt
     llm_chain = LLMChain(llm=llm, prompt=prompt)
 
+    tool_names = [tool.name for tool in tools]
     agent = LLMSingleActionAgent(
         llm_chain=llm_chain,
         output_parser=output_parser,
         stop=["\nObservation:"],
-        allowed_tools=tools,
+        allowed_tools=tool_names
     )
+
 
     agent_executor = AgentExecutor.from_agent_and_tools(
-        agent=agent,
-        tools=tools,
-        verbose=True,
-        memory=conversational_memory
-    )
-
-    # user action details
-
-    import requests
-
-    action_url = f"http://aws_hevolve.hertzai.com:6006/action_by_user_id?user_id={user_id}"
-
-    payload = {}
-    headers = {}
-
-    response = requests.request(
-        "GET", action_url, headers=headers, data=payload)
-
-    data = response.json()
-    action_texts = [obj["action"] for obj in data]
-    actions = ", ".join(action_texts)
-
-    # user detail api
-
-    url = "http://aws_hevolve.hertzai.com:6006/getstudent_by_user_id"
-    payload = json.dumps({
-        "user_id": user_id
-    })
-    headers = {
-        'Content-Type': 'application/json'
-    }
-    response = requests.request("POST", url, headers=headers, data=payload)
-    # print()
-
-    user_data = response.json()
-
-    user_details = f'''Below are the information about the user.
-    user_name: {user_data["name"]} (Call the user by this name),gender: {user_data["gender"]},who_pays_for_course: {user_data["who_pays_for_course"]}(Entity Responsible for Paying the Course Fees),preferred_language: {user_data["preferred_language"]}(User's Preferred Language),date_of_birth: {user_data["dob"]},english_proficiency: {user_data["english_proficiency"]}(User's English Proficiency Level),created_date: {user_data["created_date"]}(user creation date),standard: {user_data["standard"]}(User's Standard in which user studying)
-    '''
+        agent=agent, tools=tools, verbose=True)
 
     # Initializing agen
-    answer = agent_executor(
-        {'input': question, 'actions': actions, "user_details": user_details})
+    answer = agent_executor.run({'input': "list all the question I have been asked"})
 
     # _input = prompt.format_prompt(query=question)
     # answer = agent(question.to_string())['output']
-    print("ans-->",answer["output"])
-    temp_list = [question, answer["output"]]
+    temp_list = [question, answer]
     db.store_embedding(temp_list, database, metas=metas)
     db.chroma_client.persist()
 
@@ -697,4 +618,4 @@ def getcollection():
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', debug=True, port=5000)
+    app.run(host='0.0.0.0', debug=True, port=5050)
