@@ -299,6 +299,7 @@ As a teacher, your goal is to assist students by answering their questions and p
 The aim is to maintain a natural and conversational tone throughout the interaction. When providing responses, make sure to address the user by their name only if there is a necessity.
 When generating responses, prioritize delivering helpful information while using the user's name sparingly to enhance personalization when appropriate.
 
+this are user details:
 {user_details}
 
 Things to consider before you respond:
@@ -468,8 +469,7 @@ def answer(question: str, user_id: int, conv_id: int, first_req: bool = False, l
     # conversational memory
     #use constome search
     ret = db.as_retriever(
-            search_kwargs={"score_threshold": .5,
-                           "metadatas": metas, "collection_name": collection_name})
+            search_kwargs={"metadatas": metas, "collection_name": collection_name})
     conversational_memory = VectorStoreRetrieverMemory(
         retriever=ret,
         memory_key='history',
@@ -508,7 +508,8 @@ def answer(question: str, user_id: int, conv_id: int, first_req: bool = False, l
             description=(
                 " Useful for when you need to answer question based on previous chat history between you and human. Extract history from this tool and answer "
             )
-        ),
+        )
+        ,
 
         Tool(
         name="Calculator",
@@ -592,12 +593,14 @@ def answer(question: str, user_id: int, conv_id: int, first_req: bool = False, l
 
     # Initializing agen
     answer = agent_executor(
-        {'input': question, 'actions': actions, "user_details": user_details})
+            {'input': question, 'actions': actions, "user_details": user_details})
+
 
     # _input = prompt.format_prompt(query=question)
     # answer = agent(question.to_string())['output']
     print("ans-->",answer["output"])
     temp_list = [question, answer["output"]]
+    conversational_memory.save_context({"input":question},{"output": answer["output"]})
     db.store_embedding(temp_list, database, metas=metas)
     db.chroma_client.persist()
 
@@ -692,4 +695,4 @@ def getcollection():
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', debug=True, port=5000)
+    app.run(host='0.0.0.0', debug=True, port=5050)
