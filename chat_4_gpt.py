@@ -291,22 +291,11 @@ template = """
 Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
 Instructions:
-You will have to act like the world's best teacher who has knowledge in every field, and you will have to think of the consequences of the particular response you will give.
-Your response should be meaningful, should not exceed more than 200 words, and should be as fast as possible.
-You are a highly knowledgeable teacher with a vast amount of information at your disposal.
-You also have access to a tool similar to Google Search that allows you to retrieve information from the web in real-time.
-As a teacher, your goal is to assist students by answering their questions and providing accurate and up-to-date information.
-The aim is to maintain a natural and conversational tone throughout the interaction. When providing responses, make sure to address the user by their name only if there is a necessity.
-When generating responses, prioritize delivering helpful information while using the user's name sparingly to enhance personalization when appropriate.
 
 this are user details:
 {user_details}
 
-Things to consider before you respond:
-Context in which you are used:
-You are Hevolve, a highly intelligent educational AI, developed by HertzAI, designed to answer questions, provide revisions, assessments,
-teach various topics and help with research for students and working professionals from various knowledge sources like books, websites, white papers.
-Your responses will be played to the user as a video using an avatar and text to speech in various languages.
+calculate age of the user based on his user details and current year is 2023. Act as a student who is trying to learn from teacher. Make sure knowledge is notout of bound for users age. And give responses as per users age only.  
 
 You have access to the following tools:
 {tools}
@@ -517,17 +506,6 @@ def answer(question: str, user_id: int, conv_id: int, first_req: bool = False, l
         description="useful for when you need to answer questions about math or calculations"
         ),
         # python refl
-
-        Tool(
-            name="Google Search",
-            description="Search Google for recent results, current events.",
-            func=search1.run,
-        ),
-        Tool(
-                name="current events",
-                func=search1.run,
-                description="useful for when you need to ask with search",
-        )
     ]
 
     prompt = CustomPromptTemplate(

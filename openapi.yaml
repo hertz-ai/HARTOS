@@ -1,0 +1,2652 @@
+openapi: 3.0.2
+info:
+  title: Hevolve-db-app
+  description: This is Hevolve-db-app with auto docs for the API and everything
+  version: '1.0'
+servers:
+    - url: https://awskong.hertzai.com:8443/db
+tags:
+  - name: Ping
+    description: Get Hevovle-db-app status.
+  - name: Students
+    description: CRUD Ops with Students..
+  - name: Clients
+    description: CRUD Ops with Clients
+  - name: APIs
+    description: 'CRUD Ops with Assessment, Interview, Conversational, Revision APIs '
+  - name: institutions
+    description: Crud ops with institutions
+  - name: Batches
+    description: Crud ops with Batches
+  - name: Users
+    description: Crud ops with Users
+paths:
+  /getstudent_by_user_id:
+    post:
+      tags:
+        - Students
+      summary: Getstudent By Id
+      operationId: getstudent_by_id_getstudent_by_user_id_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GetUserByID'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+ 
+  /allconversations/{user_id}:
+    get:
+      tags:
+        - Users
+      summary: Get All Conversations for perticular user based on user_id
+      operationId: get_all_conversations_allconversations__user_id__get
+      parameters:
+        - required: true
+          schema:
+            type: integer
+            title: User Id
+          name: user_id
+          in: path
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+
+  /getbooks:
+    get:
+      tags:
+        - coursebatchbook
+      summary: Getbook
+      operationId: getbook_getbooks_get
+      parameters:
+        - required: false
+          schema:
+            type: integer
+            title: Skip
+            default: 0
+          name: skip
+          in: query
+        - required: false
+          schema:
+            type: integer
+            title: Limit
+            default: 100
+          name: limit
+          in: query
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/BookInfo'
+                type: array
+                title: Response Getbook Getbooks Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+
+  /search:
+    get:
+      tags:
+        - search
+      summary: Search Chapter Or Topic
+      operationId: search_chapter_or_topic_search__get
+      parameters:
+        - required: true
+          schema:
+            type: string
+            title: Query
+          name: query
+          in: query
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/SearchLayout'
+                type: array
+                title: Response Search Chapter Or Topic Search  Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+
+  
+components:
+  schemas:
+    API:
+      properties:
+        name:
+          type: string
+          title: Name
+        is_active:
+          type: boolean
+          title: Is Active
+      type: object
+      required:
+        - name
+        - is_active
+      title: API
+    APIBase:
+      properties:
+        name:
+          type: string
+          title: Name
+        is_active:
+          type: boolean
+          title: Is Active
+        end_point:
+          type: string
+          title: End Point
+      type: object
+      required:
+        - name
+        - is_active
+        - end_point
+      title: APIBase
+    APICreate:
+      properties:
+        name:
+          type: string
+          title: Name
+        is_active:
+          type: boolean
+          title: Is Active
+        end_point:
+          type: string
+          title: End Point
+        api_id:
+          type: integer
+          title: Api Id
+      type: object
+      required:
+        - name
+        - is_active
+        - end_point
+        - api_id
+      title: APICreate
+    Action:
+      properties:
+        conv_id:
+          type: integer
+          title: Conv Id
+        user_id:
+          type: integer
+          title: User Id
+        action:
+          type: string
+          title: Action
+      type: object
+      required:
+        - conv_id
+        - user_id
+        - action
+      title: Action
+    AllCartoonImages:
+      properties:
+        cartoon_id:
+          type: integer
+          title: Cartoon Id
+        image_name:
+          type: string
+          title: Image Name
+        image_url:
+          type: string
+          title: Image Url
+        delauney_triangulation:
+          type: string
+          title: Delauney Triangulation
+        open_mouth:
+          type: string
+          title: Open Mouth
+        close_mouth:
+          type: string
+          title: Close Mouth
+        scale_shift:
+          type: string
+          title: Scale Shift
+        is_active:
+          type: boolean
+          title: Is Active
+        image_bg_url:
+          type: string
+          title: Image Bg Url
+        user_id:
+          type: integer
+          title: User Id
+      type: object
+      required:
+        - cartoon_id
+        - image_name
+        - image_url
+        - delauney_triangulation
+        - open_mouth
+        - close_mouth
+        - is_active
+        - user_id
+      title: AllCartoonImages
+    Assessment:
+      properties:
+        assessment_id:
+          type: integer
+          title: Assessment Id
+        name:
+          type: string
+          title: Name
+        number_of_questions:
+          type: integer
+          title: Number Of Questions
+        assessment_type:
+          $ref: '#/components/schemas/AssessmentTypeEnum'
+        is_active:
+          type: boolean
+          title: Is Active
+      type: object
+      required:
+        - assessment_id
+        - name
+        - number_of_questions
+        - assessment_type
+        - is_active
+      title: Assessment
+    AssessmentBase:
+      properties:
+        name:
+          type: string
+          title: Name
+        course_name:
+          type: string
+          title: Course Name
+        number_of_questions:
+          type: integer
+          title: Number Of Questions
+        assessment_type:
+          $ref: '#/components/schemas/AssessmentTypeEnum'
+        is_active:
+          type: boolean
+          title: Is Active
+      type: object
+      required:
+        - name
+        - course_name
+        - number_of_questions
+        - assessment_type
+        - is_active
+      title: AssessmentBase
+    AssessmentCreate:
+      properties:
+        name:
+          type: string
+          title: Name
+        course_name:
+          type: string
+          title: Course Name
+        number_of_questions:
+          type: integer
+          title: Number Of Questions
+        assessment_type:
+          $ref: '#/components/schemas/AssessmentTypeEnum'
+        is_active:
+          type: boolean
+          title: Is Active
+      type: object
+      required:
+        - name
+        - course_name
+        - number_of_questions
+        - assessment_type
+        - is_active
+      title: AssessmentCreate
+    AssessmentResult:
+      properties:
+        assessment_result_id:
+          type: integer
+          title: Assessment Result Id
+        user_id:
+          type: integer
+          title: User Id
+        assessment_id:
+          type: integer
+          title: Assessment Id
+        percent:
+          type: number
+          title: Percent
+        remarks:
+          type: string
+          title: Remarks
+        card_type:
+          type: string
+          title: Card Type
+        topic:
+          type: string
+          title: Topic
+        is_active:
+          type: boolean
+          title: Is Active
+      type: object
+      required:
+        - assessment_result_id
+        - user_id
+        - assessment_id
+        - percent
+        - remarks
+        - card_type
+        - topic
+        - is_active
+      title: AssessmentResult
+    AssessmentResultBase:
+      properties:
+        user_id:
+          type: integer
+          title: User Id
+        assessment_id:
+          type: integer
+          title: Assessment Id
+        percent:
+          type: number
+          title: Percent
+        remarks:
+          type: string
+          title: Remarks
+        card_type:
+          type: string
+          title: Card Type
+        topic:
+          type: string
+          title: Topic
+        is_active:
+          type: boolean
+          title: Is Active
+      type: object
+      required:
+        - user_id
+        - assessment_id
+        - percent
+        - remarks
+        - card_type
+        - topic
+        - is_active
+      title: AssessmentResultBase
+    AssessmentResultCreate:
+      properties:
+        user_id:
+          type: integer
+          title: User Id
+        assessment_id:
+          type: integer
+          title: Assessment Id
+        percent:
+          type: number
+          title: Percent
+        remarks:
+          type: string
+          title: Remarks
+        card_type:
+          type: string
+          title: Card Type
+        topic:
+          type: string
+          title: Topic
+        is_active:
+          type: boolean
+          title: Is Active
+      type: object
+      required:
+        - user_id
+        - assessment_id
+        - percent
+        - remarks
+        - card_type
+        - topic
+        - is_active
+      title: AssessmentResultCreate
+    AssessmentTypeEnum:
+      type: string
+      enum:
+        - MCQ
+        - MOCK_INTERVIEW
+        - LONGFORM_QA
+        - CONVERSATION_FOR_IMPROVING_ENGLISH
+        - REVISION
+        - OBJECTIVE
+      title: AssessmentTypeEnum
+      description: An enumeration.
+    BasicStudentInfo:
+      properties:
+        name:
+          type: string
+          title: Name
+        gender:
+          type: string
+          title: Gender
+        dob:
+          type: string
+          title: Dob
+        who_pays_for_course:
+          type: string
+          title: Who Pays For Course
+        english_proficiency:
+          type: string
+          title: English Proficiency
+        preferred_language:
+          type: string
+          title: Preferred Language
+        favorite_teacher_id:
+          type: integer
+          title: Favorite Teacher Id
+      type: object
+      required:
+        - name
+        - gender
+        - dob
+        - who_pays_for_course
+        - english_proficiency
+        - preferred_language
+      title: BasicStudentInfo
+    Batch:
+      properties:
+        batch_id:
+          type: integer
+          title: Batch Id
+        name:
+          type: string
+          title: Name
+        is_active:
+          type: boolean
+          title: Is Active
+      type: object
+      required:
+        - batch_id
+        - name
+        - is_active
+      title: Batch
+    BatchBase:
+      properties:
+        name:
+          type: string
+          title: Name
+        is_active:
+          type: boolean
+          title: Is Active
+        year:
+          type: integer
+          title: Year
+        client_name:
+          type: string
+          title: Client Name
+        institution_name:
+          type: string
+          title: Institution Name
+        standard:
+          type: integer
+          title: Standard
+      type: object
+      required:
+        - name
+        - is_active
+        - year
+        - client_name
+        - institution_name
+        - standard
+      title: BatchBase
+    BatchCreate:
+      properties:
+        name:
+          type: string
+          title: Name
+        is_active:
+          type: boolean
+          title: Is Active
+        year:
+          type: integer
+          title: Year
+        client_name:
+          type: string
+          title: Client Name
+        institution_name:
+          type: string
+          title: Institution Name
+        standard:
+          type: integer
+          title: Standard
+        batch_id:
+          type: integer
+          title: Batch Id
+      type: object
+      required:
+        - name
+        - is_active
+        - year
+        - client_name
+        - institution_name
+        - standard
+        - batch_id
+      title: BatchCreate
+    BatchInfo:
+      properties:
+        batch_id:
+          type: integer
+          title: Batch Id
+        name:
+          type: string
+          title: Name
+      type: object
+      required:
+        - batch_id
+        - name
+      title: BatchInfo
+    BoardInfo:
+      properties:
+        board_id:
+          type: integer
+          title: Board Id
+        board_name:
+          type: string
+          title: Board Name
+      type: object
+      required:
+        - board_id
+        - board_name
+      title: BoardInfo
+    Book:
+      properties:
+        file_name:
+          type: string
+          title: File Name
+        student_name:
+          type: string
+          title: Student Name
+        subject_name:
+          type: string
+          title: Subject Name
+        book_name:
+          type: string
+          title: Book Name
+        is_active:
+          type: boolean
+          title: Is Active
+      type: object
+      required:
+        - file_name
+        - student_name
+        - subject_name
+        - book_name
+        - is_active
+      title: Book
+    BookInfo:
+      properties:
+        book_id:
+          type: integer
+          title: Book Id
+        name:
+          type: string
+          title: Name
+      type: object
+      required:
+        - book_id
+        - name
+      title: BookInfo
+    BookSubjectBoard:
+      properties:
+        subject_id:
+          type: integer
+          title: Subject Id
+        subject_name:
+          type: string
+          title: Subject Name
+        standard_id:
+          type: integer
+          title: Standard Id
+        standard_name:
+          type: string
+          title: Standard Name
+        file_id:
+          type: integer
+          title: File Id
+        book_name:
+          type: string
+          title: Book Name
+        board_id:
+          type: integer
+          title: Board Id
+        board_name:
+          type: string
+          title: Board Name
+        is_active:
+          type: boolean
+          title: Is Active
+      type: object
+      required:
+        - subject_id
+        - subject_name
+        - standard_id
+        - standard_name
+        - file_id
+        - book_name
+        - board_id
+        - board_name
+        - is_active
+      title: BookSubjectBoard
+    Business_Signup:
+      properties:
+        name:
+          type: string
+          title: Name
+        email:
+          type: string
+          title: Email
+        no_of_students:
+          type: integer
+          title: No Of Students
+      type: object
+      required:
+        - name
+        - email
+        - no_of_students
+      title: Business_Signup
+    Business_Signup_base:
+      properties:
+        name:
+          type: string
+          title: Name
+        email:
+          type: string
+          title: Email
+        no_of_students:
+          type: integer
+          title: No Of Students
+        business_id:
+          type: integer
+          title: Business Id
+      type: object
+      required:
+        - name
+        - email
+        - no_of_students
+        - business_id
+      title: Business_Signup_base
+    CartoonImages:
+      properties:
+        image_name:
+          type: string
+          title: Image Name
+        image_url:
+          type: string
+          title: Image Url
+        delauney_triangulation:
+          type: string
+          title: Delauney Triangulation
+        open_mouth:
+          type: string
+          title: Open Mouth
+        close_mouth:
+          type: string
+          title: Close Mouth
+        scale_shift:
+          type: string
+          title: Scale Shift
+        is_active:
+          type: boolean
+          title: Is Active
+        image_bg_url:
+          type: string
+          title: Image Bg Url
+        user_id:
+          type: integer
+          title: User Id
+      type: object
+      required:
+        - image_name
+        - image_url
+        - delauney_triangulation
+        - open_mouth
+        - close_mouth
+        - is_active
+        - user_id
+      title: CartoonImages
+    Client:
+      properties:
+        client_id:
+          type: integer
+          title: Client Id
+        is_active:
+          type: boolean
+          title: Is Active
+        name:
+          type: string
+          title: Name
+      type: object
+      required:
+        - client_id
+        - is_active
+        - name
+      title: Client
+    ClientInfo:
+      properties:
+        name:
+          type: string
+          title: Name
+        num_of_students:
+          type: integer
+          title: Num Of Students
+        phone_number:
+          type: string
+          title: Phone Number
+        email_address:
+          type: string
+          title: Email Address
+        apis:
+          items:
+            $ref: '#/components/schemas/API'
+          type: array
+          title: Apis
+          default: []
+        client_id:
+          type: integer
+          title: Client Id
+        is_active:
+          type: boolean
+          title: Is Active
+      type: object
+      required:
+        - name
+        - num_of_students
+        - phone_number
+        - email_address
+        - client_id
+        - is_active
+      title: ClientInfo
+    ClientInfoBase:
+      properties:
+        name:
+          type: string
+          title: Name
+        num_of_students:
+          type: integer
+          title: Num Of Students
+        phone_number:
+          type: string
+          title: Phone Number
+        email_address:
+          type: string
+          title: Email Address
+        apis:
+          items:
+            $ref: '#/components/schemas/API'
+          type: array
+          title: Apis
+          default: []
+      type: object
+      required:
+        - name
+        - num_of_students
+        - phone_number
+        - email_address
+      title: ClientInfoBase
+    Command:
+      properties:
+        post_id:
+          type: integer
+          title: Post Id
+        user_name:
+          type: string
+          title: User Name
+        text:
+          type: string
+          title: Text
+      type: object
+      required:
+        - post_id
+        - user_name
+        - text
+      title: Command
+    CommandBase:
+      properties:
+        post_id:
+          type: integer
+          title: Post Id
+        user_name:
+          type: string
+          title: User Name
+        text:
+          type: string
+          title: Text
+        comment_id:
+          type: integer
+          title: Comment Id
+      type: object
+      required:
+        - post_id
+        - user_name
+        - text
+        - comment_id
+      title: CommandBase
+    Conversation:
+      properties:
+        user_id:
+          type: integer
+          title: User Id
+        request:
+          type: string
+          title: Request
+        response:
+          type: string
+          title: Response
+        conv_bot_name:
+          type: string
+          title: Conv Bot Name
+        topic:
+          type: string
+          title: Topic
+        revision:
+          type: boolean
+          title: Revision
+        dialogue_id:
+          type: integer
+          title: Dialogue Id
+        card_type:
+          type: string
+          title: Card Type
+        qid:
+          type: integer
+          title: Qid
+      type: object
+      required:
+        - user_id
+        - request
+        - response
+        - conv_bot_name
+        - topic
+        - revision
+        - dialogue_id
+        - card_type
+      title: Conversation
+    CourseBatchBook:
+      properties:
+        course_name:
+          type: string
+          title: Course Name
+        course_id:
+          type: integer
+          title: Course Id
+        batch_name:
+          type: string
+          title: Batch Name
+        batch_id:
+          type: integer
+          title: Batch Id
+        book_name:
+          type: string
+          title: Book Name
+        book_id:
+          type: integer
+          title: Book Id
+        is_active:
+          type: boolean
+          title: Is Active
+      type: object
+      required:
+        - course_name
+        - course_id
+        - batch_name
+        - batch_id
+        - book_name
+        - book_id
+        - is_active
+      title: CourseBatchBook
+    CourseInfo:
+      properties:
+        course_id:
+          type: integer
+          title: Course Id
+        name:
+          type: string
+          title: Name
+      type: object
+      required:
+        - course_id
+        - name
+      title: CourseInfo
+    CreateActivity:
+      properties:
+        post_id:
+          type: integer
+          title: Post Id
+        type:
+          type: string
+          title: Type
+      type: object
+      required:
+        - post_id
+        - type
+      title: CreateActivity
+    CreateActivityBase:
+      properties:
+        post_id:
+          type: integer
+          title: Post Id
+        type:
+          type: string
+          title: Type
+        activity_id:
+          type: integer
+          title: Activity Id
+      type: object
+      required:
+        - post_id
+        - type
+        - activity_id
+      title: CreateActivityBase
+    CreateBoard:
+      properties:
+        board_name:
+          type: string
+          title: Board Name
+        board_id:
+          type: integer
+          title: Board Id
+      type: object
+      required:
+        - board_name
+        - board_id
+      title: CreateBoard
+    CreateBook:
+      properties:
+        file_name:
+          type: string
+          title: File Name
+        student_name:
+          type: string
+          title: Student Name
+        subject_name:
+          type: string
+          title: Subject Name
+        book_name:
+          type: string
+          title: Book Name
+        is_active:
+          type: boolean
+          title: Is Active
+        book_id:
+          type: integer
+          title: Book Id
+      type: object
+      required:
+        - file_name
+        - student_name
+        - subject_name
+        - book_name
+        - is_active
+        - book_id
+      title: CreateBook
+    CreateLayout:
+      properties:
+        layout_id:
+          type: integer
+          title: Layout Id
+      type: object
+      required:
+        - layout_id
+      title: CreateLayout
+    CreatePost:
+      properties:
+        user_id:
+          type: integer
+          title: User Id
+        resource_url:
+          type: string
+          title: Resource Url
+        content_type:
+          type: string
+          title: Content Type
+        caption:
+          type: string
+          title: Caption
+        like_count:
+          type: integer
+          title: Like Count
+        comment_count:
+          type: integer
+          title: Comment Count
+        share_count:
+          type: integer
+          title: Share Count
+        view_count:
+          type: integer
+          title: View Count
+      type: object
+      required:
+        - user_id
+      title: CreatePost
+    CreateRequestResponse:
+      properties:
+        StartTime:
+          type: string
+          title: Starttime
+        EndTime:
+          type: string
+          title: Endtime
+        Directory:
+          type: string
+          title: Directory
+        FileName:
+          type: string
+          title: Filename
+        TextResponse:
+          type: string
+          title: Textresponse
+        FileID:
+          type: integer
+          title: Fileid
+      type: object
+      required:
+        - StartTime
+        - EndTime
+        - Directory
+        - FileName
+        - TextResponse
+        - FileID
+      title: CreateRequestResponse
+    CreateSegLayout:
+      properties:
+        Seglayout_id:
+          type: integer
+          title: Seglayout Id
+      type: object
+      required:
+        - Seglayout_id
+      title: CreateSegLayout
+    CreateStandard:
+      properties:
+        standard_id:
+          type: integer
+          title: Standard Id
+        age:
+          type: integer
+          title: Age
+        level:
+          type: string
+          title: Level
+      type: object
+      required:
+        - standard_id
+        - age
+        - level
+      title: CreateStandard
+    CreateStories:
+      properties:
+        title:
+          type: string
+          title: Title
+        description:
+          type: string
+          title: Description
+        name:
+          type: string
+          title: Name
+        source_url:
+          type: string
+          title: Source Url
+      type: object
+      required:
+        - title
+        - description
+        - name
+        - source_url
+      title: CreateStories
+    CreateStoriesBase:
+      properties:
+        title:
+          type: string
+          title: Title
+        description:
+          type: string
+          title: Description
+        name:
+          type: string
+          title: Name
+        source_url:
+          type: string
+          title: Source Url
+        stories_id:
+          type: integer
+          title: Stories Id
+      type: object
+      required:
+        - title
+        - description
+        - name
+        - source_url
+        - stories_id
+      title: CreateStoriesBase
+    CreateSubject:
+      properties:
+        subject_name:
+          type: string
+          title: Subject Name
+        subject_id:
+          type: integer
+          title: Subject Id
+      type: object
+      required:
+        - subject_name
+        - subject_id
+      title: CreateSubject
+    FetchBookName:
+      properties:
+        student_id:
+          type: integer
+          title: Student Id
+        book_name:
+          type: string
+          title: Book Name
+        subject_id:
+          type: integer
+          title: Subject Id
+      type: object
+      required:
+        - student_id
+        - book_name
+        - subject_id
+      title: FetchBookName
+    FetchRealTeachers:
+      properties:
+        student_id:
+          type: integer
+          title: Student Id
+        teacher_id:
+          type: integer
+          title: Teacher Id
+      type: object
+      required:
+        - student_id
+        - teacher_id
+      title: FetchRealTeachers
+    FetchVirtualTeachers:
+      properties:
+        student_id:
+          type: integer
+          title: Student Id
+        virtual_avatar_id:
+          type: integer
+          title: Virtual Avatar Id
+      type: object
+      required:
+        - student_id
+        - virtual_avatar_id
+      title: FetchVirtualTeachers
+    Fetch_Chapter:
+      properties:
+        book_id:
+          type: integer
+          title: Book Id
+        book_name:
+          type: string
+          title: Book Name
+        student_id:
+          type: integer
+          title: Student Id
+        chapter_name:
+          type: string
+          title: Chapter Name
+      type: object
+      required:
+        - book_id
+        - book_name
+        - student_id
+        - chapter_name
+      title: Fetch_Chapter
+    Fetch_Paragraph:
+      properties:
+        student_id:
+          type: integer
+          title: Student Id
+        topic_name:
+          type: string
+          title: Topic Name
+      type: object
+      required:
+        - student_id
+        - topic_name
+      title: Fetch_Paragraph
+    Fetch_Subjects_Teacher:
+      properties:
+        teacher_id:
+          type: integer
+          title: Teacher Id
+      type: object
+      required:
+        - teacher_id
+      title: Fetch_Subjects_Teacher
+    Fetch_Topic_name:
+      properties:
+        topic_name:
+          type: string
+          title: Topic Name
+        chapter_name:
+          type: string
+          title: Chapter Name
+        student_id:
+          type: integer
+          title: Student Id
+      type: object
+      required:
+        - topic_name
+        - chapter_name
+        - student_id
+      title: Fetch_Topic_name
+    FilesInfo:
+      properties:
+        FileID:
+          type: integer
+          title: Fileid
+        FileName:
+          type: string
+          title: Filename
+      type: object
+      required:
+        - FileID
+        - FileName
+      title: FilesInfo
+    GetStudent:
+      properties:
+        email_address:
+          type: string
+          title: Email Address
+        phone_number:
+          type: string
+          title: Phone Number
+      type: object
+      required:
+        - email_address
+        - phone_number
+      title: GetStudent
+    GetStudentByID:
+      properties:
+        student_id:
+          type: integer
+          title: Student Id
+      type: object
+      required:
+        - student_id
+      title: GetStudentByID
+    GetUserByID:
+      properties:
+        user_id:
+          type: integer
+          title: User Id
+      type: object
+      required:
+        - user_id
+      title: GetUserByID
+    Goal:
+      properties:
+        goal_id:
+          type: integer
+          title: Goal Id
+        student_id:
+          type: integer
+          title: Student Id
+        goals:
+          type: string
+          title: Goals
+        achieved:
+          type: boolean
+          title: Achieved
+      type: object
+      required:
+        - goal_id
+        - student_id
+        - goals
+        - achieved
+      title: Goal
+    GoalBase:
+      properties:
+        student_name:
+          type: string
+          title: Student Name
+        goals:
+          type: string
+          title: Goals
+        email_address:
+          type: string
+          title: Email Address
+      type: object
+      required:
+        - student_name
+        - goals
+        - email_address
+      title: GoalBase
+    GoalCreate:
+      properties:
+        student_name:
+          type: string
+          title: Student Name
+        goals:
+          type: string
+          title: Goals
+        email_address:
+          type: string
+          title: Email Address
+      type: object
+      required:
+        - student_name
+        - goals
+        - email_address
+      title: GoalCreate
+    HTTPValidationError:
+      properties:
+        detail:
+          items:
+            $ref: '#/components/schemas/ValidationError'
+          type: array
+          title: Detail
+      type: object
+      title: HTTPValidationError
+    Layout:
+      properties:
+        file_id:
+          type: integer
+          title: File Id
+        publay_flag:
+          type: integer
+          title: Publay Flag
+        publay_processing_time:
+          type: integer
+          title: Publay Processing Time
+        page_number:
+          type: integer
+          title: Page Number
+        layout_number:
+          type: integer
+          title: Layout Number
+        num_of_bboxes_per_page:
+          type: integer
+          title: Num Of Bboxes Per Page
+        passage:
+          type: string
+          title: Passage
+        topic_name:
+          type: string
+          title: Topic Name
+        chapter_name:
+          type: string
+          title: Chapter Name
+        book_id:
+          type: integer
+          title: Book Id
+        bbox:
+          type: string
+          title: Bbox
+        is_parent:
+          type: boolean
+          title: Is Parent
+        pub_label:
+          type: string
+          title: Pub Label
+        pageType:
+          type: string
+          title: Pagetype
+      type: object
+      required:
+        - file_id
+        - publay_flag
+        - publay_processing_time
+        - page_number
+        - layout_number
+        - num_of_bboxes_per_page
+        - passage
+        - topic_name
+        - chapter_name
+        - book_id
+        - bbox
+        - is_parent
+        - pub_label
+        - pageType
+      title: Layout
+    LayoutForSegFormer:
+      properties:
+        file_id:
+          type: integer
+          title: File Id
+        seg_flag:
+          type: integer
+          title: Seg Flag
+        segformer_processing_time:
+          type: integer
+          title: Segformer Processing Time
+        page_number:
+          type: integer
+          title: Page Number
+        layout_number:
+          type: integer
+          title: Layout Number
+        num_of_bboxes_per_page:
+          type: integer
+          title: Num Of Bboxes Per Page
+        passage:
+          type: string
+          title: Passage
+        topic_name:
+          type: string
+          title: Topic Name
+        chapter_name:
+          type: string
+          title: Chapter Name
+        book_id:
+          type: integer
+          title: Book Id
+        bbox:
+          type: string
+          title: Bbox
+        is_parent:
+          type: boolean
+          title: Is Parent
+        layout_label:
+          type: string
+          title: Layout Label
+        pageType:
+          type: string
+          title: Pagetype
+      type: object
+      required:
+        - file_id
+        - seg_flag
+        - segformer_processing_time
+        - page_number
+        - layout_number
+        - num_of_bboxes_per_page
+        - passage
+        - topic_name
+        - chapter_name
+        - book_id
+        - bbox
+        - is_parent
+        - layout_label
+        - pageType
+      title: LayoutForSegFormer
+    Like:
+      properties:
+        activity_id:
+          type: integer
+          title: Activity Id
+        user_name:
+          type: string
+          title: User Name
+      type: object
+      required:
+        - activity_id
+        - user_name
+      title: Like
+    LikeBase:
+      properties:
+        activity_id:
+          type: integer
+          title: Activity Id
+        user_name:
+          type: string
+          title: User Name
+        like_id:
+          type: integer
+          title: Like Id
+      type: object
+      required:
+        - activity_id
+        - user_name
+        - like_id
+      title: LikeBase
+    LimitedStudentInfo:
+      properties:
+        name:
+          type: string
+          title: Name
+        phone_number:
+          type: string
+          title: Phone Number
+        email_address:
+          type: string
+          title: Email Address
+        gender:
+          type: string
+          title: Gender
+        dob:
+          type: string
+          title: Dob
+      type: object
+      required:
+        - name
+        - phone_number
+        - email_address
+        - gender
+        - dob
+      title: LimitedStudentInfo
+    ParagraphTracker:
+      properties:
+        layout_id:
+          type: integer
+          title: Layout Id
+        passage:
+          type: string
+          title: Passage
+        Page_number:
+          type: integer
+          title: Page Number
+        Layout_number:
+          type: integer
+          title: Layout Number
+        topic_name:
+          type: string
+          title: Topic Name
+        chapter_name:
+          type: string
+          title: Chapter Name
+        book_id:
+          type: integer
+          title: Book Id
+      type: object
+      required:
+        - layout_id
+        - passage
+        - Page_number
+        - Layout_number
+        - topic_name
+        - chapter_name
+      title: ParagraphTracker
+    ParagraphTrackerBase:
+      properties:
+        paragraph:
+          type: string
+          title: Paragraph
+        is_active:
+          type: boolean
+          title: Is Active
+      type: object
+      required:
+        - paragraph
+        - is_active
+      title: ParagraphTrackerBase
+    PlanInfo:
+      properties:
+        plan_id:
+          type: integer
+          title: Plan Id
+        name:
+          type: string
+          title: Name
+        amount:
+          type: integer
+          title: Amount
+      type: object
+      required:
+        - plan_id
+        - name
+        - amount
+      title: PlanInfo
+    PlansInfo:
+      properties:
+        amount:
+          type: integer
+          title: Amount
+        name:
+          type: string
+          title: Name
+        days:
+          type: integer
+          title: Days
+      type: object
+      required:
+        - amount
+        - name
+        - days
+      title: PlansInfo
+    PostPlan:
+      properties:
+        plan:
+          items:
+            $ref: '#/components/schemas/PlansInfo'
+          type: array
+          title: Plan
+          default: []
+      type: object
+      title: PostPlan
+    PostSubsByID:
+      properties:
+        user_id:
+          type: integer
+          title: User Id
+        plan_id:
+          type: integer
+          title: Plan Id
+      type: object
+      required:
+        - user_id
+        - plan_id
+      title: PostSubsByID
+    QuestionAndAnswer:
+      properties:
+        id:
+          type: integer
+          title: Id
+        question:
+          type: string
+          title: Question
+        question_type:
+          $ref: '#/components/schemas/QuestionTypeEnum'
+        answer:
+          type: string
+          title: Answer
+        layout_id:
+          type: string
+          title: Layout Id
+        options:
+          type: string
+          title: Options
+        assessment_id:
+          type: string
+          title: Assessment Id
+        is_active:
+          type: boolean
+          title: Is Active
+      type: object
+      required:
+        - id
+        - question
+        - question_type
+        - answer
+        - layout_id
+        - options
+        - assessment_id
+        - is_active
+      title: QuestionAndAnswer
+    QuestionAndAnswer2:
+      properties:
+        id:
+          type: integer
+          title: Id
+        question:
+          type: string
+          title: Question
+        question_type:
+          $ref: '#/components/schemas/QuestionTypeEnum'
+        answer:
+          type: string
+          title: Answer
+        assessment_id:
+          type: string
+          title: Assessment Id
+        is_active:
+          type: boolean
+          title: Is Active
+      type: object
+      required:
+        - id
+        - question
+        - question_type
+        - answer
+        - assessment_id
+        - is_active
+      title: QuestionAndAnswer2
+    QuestionAndAnswerBase:
+      properties:
+        question:
+          type: string
+          title: Question
+        question_type:
+          $ref: '#/components/schemas/QuestionTypeEnum'
+        answer:
+          type: string
+          title: Answer
+        layout_id:
+          type: integer
+          title: Layout Id
+        options:
+          type: string
+          title: Options
+        assessment_name:
+          type: string
+          title: Assessment Name
+        is_active:
+          type: boolean
+          title: Is Active
+        new_layout_id:
+          type: integer
+          title: New Layout Id
+      type: object
+      required:
+        - question
+        - question_type
+        - answer
+        - layout_id
+        - options
+        - assessment_name
+        - is_active
+      title: QuestionAndAnswerBase
+    QuestionAndAnswerCreate2:
+      properties:
+        question:
+          type: string
+          title: Question
+        question_type:
+          $ref: '#/components/schemas/QuestionTypeEnum'
+        answer:
+          type: string
+          title: Answer
+        assessment_name:
+          type: string
+          title: Assessment Name
+        is_active:
+          type: boolean
+          title: Is Active
+      type: object
+      required:
+        - question
+        - question_type
+        - answer
+        - assessment_name
+        - is_active
+      title: QuestionAndAnswerCreate2
+    QuestionForResume:
+      properties:
+        resume_id:
+          type: integer
+          title: Resume Id
+        question:
+          type: string
+          title: Question
+        answer:
+          type: string
+          title: Answer
+      type: object
+      required:
+        - resume_id
+        - question
+        - answer
+      title: QuestionForResume
+    QuestionTypeEnum:
+      type: string
+      enum:
+        - MCQ
+        - OBJECTIVE
+      title: QuestionTypeEnum
+      description: An enumeration.
+    RequestResponse:
+      properties:
+        StartTime:
+          type: string
+          title: Starttime
+        EndTime:
+          type: string
+          title: Endtime
+        Directory:
+          type: string
+          title: Directory
+        FileName:
+          type: string
+          title: Filename
+        TextResponse:
+          type: string
+          title: Textresponse
+      type: object
+      required:
+        - StartTime
+        - EndTime
+        - Directory
+        - FileName
+        - TextResponse
+      title: RequestResponse
+    ResumeTable:
+      properties:
+        user_id:
+          type: integer
+          title: User Id
+        resume:
+          type: string
+          title: Resume
+      type: object
+      required:
+        - user_id
+        - resume
+      title: ResumeTable
+    SearchLayout:
+      properties:
+        layout_id:
+          type: integer
+          title: Layout Id
+        chapter_name:
+          type: string
+          title: Chapter Name
+        topic_name:
+          type: string
+          title: Topic Name
+      type: object
+      required:
+        - layout_id
+      title: SearchLayout
+    Share:
+      properties:
+        activity_id:
+          type: integer
+          title: Activity Id
+        user_name:
+          type: string
+          title: User Name
+      type: object
+      required:
+        - activity_id
+        - user_name
+      title: Share
+    ShareBase:
+      properties:
+        activity_id:
+          type: integer
+          title: Activity Id
+        user_name:
+          type: string
+          title: User Name
+        share_id:
+          type: integer
+          title: Share Id
+      type: object
+      required:
+        - activity_id
+        - user_name
+        - share_id
+      title: ShareBase
+    StandardInfo:
+      properties:
+        standard_id:
+          type: integer
+          title: Standard Id
+        standard:
+          type: string
+          title: Standard
+        institution_category:
+          type: integer
+          title: Institution Category
+      type: object
+      required:
+        - standard_id
+        - standard
+        - institution_category
+      title: StandardInfo
+    Student:
+      properties:
+        name:
+          type: string
+          title: Name
+        gender:
+          type: string
+          title: Gender
+        dob:
+          type: string
+          title: Dob
+        transliteration:
+          type: boolean
+          title: Transliteration
+          default: true
+        email_address:
+          type: string
+          title: Email Address
+        phone_number:
+          type: string
+          title: Phone Number
+        who_pays_for_course:
+          type: string
+          title: Who Pays For Course
+        english_proficiency:
+          type: string
+          title: English Proficiency
+        preferred_language:
+          type: string
+          title: Preferred Language
+        current_grade:
+          type: string
+          title: Current Grade
+        client_id:
+          type: string
+          title: Client Id
+        client_secret:
+          type: string
+          title: Client Secret
+      type: object
+      required:
+        - name
+        - gender
+        - dob
+        - email_address
+        - phone_number
+        - who_pays_for_course
+        - english_proficiency
+        - preferred_language
+        - client_id
+        - client_secret
+      title: Student
+    StudentsResponse:
+      properties:
+        id:
+          type: integer
+          title: Id
+        question_id:
+          type: integer
+          title: Question Id
+        student_id:
+          type: integer
+          title: Student Id
+        student_answer:
+          type: string
+          title: Student Answer
+        assessment_id:
+          type: integer
+          title: Assessment Id
+        f1score:
+          type: number
+          title: F1Score
+        recall:
+          type: number
+          title: Recall
+        emb_score:
+          type: number
+          title: Emb Score
+        is_active:
+          type: boolean
+          title: Is Active
+      type: object
+      required:
+        - id
+        - question_id
+        - student_id
+        - student_answer
+        - assessment_id
+        - f1score
+        - recall
+        - emb_score
+        - is_active
+      title: StudentsResponse
+    StudentsResponseCreate:
+      properties:
+        question_id:
+          type: integer
+          title: Question Id
+        student_id:
+          type: integer
+          title: Student Id
+        student_answer:
+          type: string
+          title: Student Answer
+        assessment_id:
+          type: integer
+          title: Assessment Id
+        f1score:
+          type: number
+          title: F1Score
+        recall:
+          type: number
+          title: Recall
+        emb_score:
+          type: number
+          title: Emb Score
+        is_active:
+          type: boolean
+          title: Is Active
+      type: object
+      required:
+        - question_id
+        - student_id
+        - student_answer
+        - assessment_id
+        - f1score
+        - recall
+        - emb_score
+        - is_active
+      title: StudentsResponseCreate
+    StudentsResponseGet:
+      properties:
+        assessment_id:
+          type: integer
+          title: Assessment Id
+        student_id:
+          type: integer
+          title: Student Id
+      type: object
+      required:
+        - assessment_id
+        - student_id
+      title: StudentsResponseGet
+    Subject:
+      properties:
+        subject_name:
+          type: string
+          title: Subject Name
+      type: object
+      required:
+        - subject_name
+      title: Subject
+    SubjectInfo:
+      properties:
+        subject_id:
+          type: integer
+          title: Subject Id
+        name:
+          type: string
+          title: Name
+      type: object
+      required:
+        - subject_id
+        - name
+      title: SubjectInfo
+    SubsbyPlan:
+      properties:
+        api_id:
+          type: integer
+          title: Api Id
+      type: object
+      required:
+        - api_id
+      title: SubsbyPlan
+    SubscriptionInfo:
+      properties:
+        user_id:
+          type: integer
+          title: User Id
+        subscription_expiry:
+          type: string
+          format: date
+          title: Subscription Expiry
+      type: object
+      required:
+        - user_id
+        - subscription_expiry
+      title: SubscriptionInfo
+    Teacher:
+      properties:
+        name:
+          type: string
+          title: Name
+        address:
+          type: string
+          title: Address
+        authorized_client_id:
+          type: integer
+          title: Authorized Client Id
+        is_active:
+          type: integer
+          title: Is Active
+        email:
+          type: string
+          title: Email
+        phone_number:
+          type: string
+          title: Phone Number
+      type: object
+      required:
+        - name
+        - address
+        - authorized_client_id
+        - is_active
+        - email
+        - phone_number
+      title: Teacher
+    TeacherAvatar:
+      properties:
+        image_name:
+          type: string
+          title: Image Name
+        image_url:
+          type: string
+          title: Image Url
+        user_id:
+          type: integer
+          title: User Id
+        is_cartoon:
+          type: boolean
+          title: Is Cartoon
+          default: false
+        in_use:
+          type: boolean
+          title: In Use
+          default: true
+      type: object
+      required:
+        - image_name
+        - image_url
+        - user_id
+      title: TeacherAvatar
+    TeacherBase:
+      properties:
+        name:
+          type: string
+          title: Name
+        address:
+          type: string
+          title: Address
+        email_address:
+          type: string
+          title: Email Address
+        phone_number:
+          type: string
+          title: Phone Number
+        client_secret:
+          type: string
+          title: Client Secret
+        haveclient:
+          type: string
+          title: Haveclient
+        client_id:
+          type: integer
+          title: Client Id
+        is_active:
+          type: boolean
+          title: Is Active
+        subject:
+          items: {}
+          type: array
+          title: Subject
+          default: []
+        standard:
+          items: {}
+          type: array
+          title: Standard
+          default: []
+      type: object
+      required:
+        - name
+        - address
+        - email_address
+        - phone_number
+        - client_secret
+        - haveclient
+        - client_id
+        - is_active
+      title: TeacherBase
+    UpdateFavouriteTeacher:
+      properties:
+        user_id:
+          type: integer
+          title: User Id
+        favourite_teacher_id:
+          type: integer
+          title: Favourite Teacher Id
+      type: object
+      required:
+        - user_id
+        - favourite_teacher_id
+      title: UpdateFavouriteTeacher
+    UserBase:
+      properties:
+        name:
+          type: string
+          title: Name
+        email_address:
+          type: string
+          title: Email Address
+        phone_number:
+          type: string
+          title: Phone Number
+        current_grade:
+          type: string
+          title: Current Grade
+        image_url:
+          type: string
+          title: Image Url
+        latitude:
+          type: string
+          title: Latitude
+        longitude:
+          type: string
+          title: Longitude
+        apis:
+          items:
+            $ref: '#/components/schemas/API'
+          type: array
+          title: Apis
+          default: []
+      type: object
+      required:
+        - name
+        - email_address
+        - phone_number
+        - current_grade
+        - image_url
+        - latitude
+        - longitude
+      title: UserBase
+    ValidationError:
+      properties:
+        loc:
+          items:
+            anyOf:
+              - type: string
+              - type: integer
+          type: array
+          title: Location
+        msg:
+          type: string
+          title: Message
+        type:
+          type: string
+          title: Error Type
+      type: object
+      required:
+        - loc
+        - msg
+        - type
+      title: ValidationError
+    View:
+      properties:
+        activity_id:
+          type: integer
+          title: Activity Id
+        user_name:
+          type: string
+          title: User Name
+      type: object
+      required:
+        - activity_id
+        - user_name
+      title: View
+    ViewBase:
+      properties:
+        activity_id:
+          type: integer
+          title: Activity Id
+        user_name:
+          type: string
+          title: User Name
+        view_id:
+          type: integer
+          title: View Id
+      type: object
+      required:
+        - activity_id
+        - user_name
+        - view_id
+      title: ViewBase
+    VoiceSample:
+      properties:
+        voice_sample_name:
+          type: string
+          title: Voice Sample Name
+        voice_sample_url:
+          type: string
+          title: Voice Sample Url
+        user_id:
+          type: integer
+          title: User Id
+        in_use:
+          type: boolean
+          title: In Use
+          default: true
+      type: object
+      required:
+        - voice_sample_name
+        - voice_sample_url
+        - user_id
+      title: VoiceSample
+    analogy_text:
+      properties:
+        layout_id:
+          type: integer
+          title: Layout Id
+        Seglayout_id:
+          type: integer
+          title: Seglayout Id
+        text:
+          type: string
+          title: Text
+        understanding_level_id:
+          type: integer
+          title: Understanding Level Id
+        sd_image:
+          type: string
+          title: Sd Image
+      type: object
+      required:
+        - text
+        - understanding_level_id
+        - sd_image
+      title: analogy_text
+    bookSubjectBoardInfo:
+      properties:
+        courseBatchBooks_offered:
+          items:
+            $ref: '#/components/schemas/BookSubjectBoard'
+          type: array
+          title: Coursebatchbooks Offered
+          default: []
+        user_id:
+          type: integer
+          title: User Id
+      type: object
+      required:
+        - user_id
+      title: bookSubjectBoardInfo
+    cartoon_image_doc:
+      properties:
+        conv_id:
+          type: integer
+          title: Conv Id
+        cartoon_id:
+          type: integer
+          title: Cartoon Id
+        voice_id:
+          type: integer
+          title: Voice Id
+        reference_txt:
+          type: string
+          title: Reference Txt
+        warper_txt:
+          type: string
+          title: Warper Txt
+        triangulation_txt:
+          type: string
+          title: Triangulation Txt
+        generated_audio_url:
+          type: string
+          title: Generated Audio Url
+        text:
+          type: string
+          title: Text
+      type: object
+      required:
+        - conv_id
+        - cartoon_id
+        - voice_id
+        - reference_txt
+        - warper_txt
+        - triangulation_txt
+        - generated_audio_url
+        - text
+      title: cartoon_image_doc
+    coursebatchbookInfo:
+      properties:
+        courseBatchBooks_offered:
+          items:
+            $ref: '#/components/schemas/CourseBatchBook'
+          type: array
+          title: Coursebatchbooks Offered
+          default: []
+        client_id:
+          type: integer
+          title: Client Id
+      type: object
+      required:
+        - client_id
+      title: coursebatchbookInfo
+    famous_character:
+      properties:
+        image_name:
+          type: string
+          title: Image Name
+        image_url:
+          type: string
+          title: Image Url
+        audio_url:
+          type: string
+          title: Audio Url
+        description:
+          type: string
+          title: Description
+        video_url:
+          type: string
+          title: Video Url
+      type: object
+      required:
+        - image_name
+        - image_url
+        - audio_url
+        - description
+        - video_url
+      title: famous_character
+    fetch_subjects:
+      properties:
+        student_id:
+          type: integer
+          title: Student Id
+      type: object
+      required:
+        - student_id
+      title: fetch_subjects
+    gen_res_video:
+      properties:
+        video_url:
+          type: string
+          title: Video Url
+        text:
+          type: string
+          title: Text
+        teacher_avatar_id:
+          type: integer
+          title: Teacher Avatar Id
+      type: object
+      required:
+        - video_url
+        - text
+        - teacher_avatar_id
+      title: gen_res_video
+    generated_video:
+      properties:
+        conv_id:
+          type: integer
+          title: Conv Id
+        video_url:
+          type: string
+          title: Video Url
+        teacher_avatar_id:
+          type: integer
+          title: Teacher Avatar Id
+        voice_id:
+          type: integer
+          title: Voice Id
+        text:
+          type: string
+          title: Text
+      type: object
+      required:
+        - conv_id
+        - video_url
+        - teacher_avatar_id
+        - voice_id
+        - text
+      title: generated_video
+    imageResponse:
+      properties:
+        teacher_avatar_id:
+          type: integer
+          title: Teacher Avatar Id
+        image_url:
+          type: string
+          title: Image Url
+        is_cartoon:
+          type: boolean
+          title: Is Cartoon
+        in_use:
+          type: boolean
+          title: In Use
+        upload_date:
+          type: string
+          format: date-time
+          title: Upload Date
+      type: object
+      required:
+        - teacher_avatar_id
+        - image_url
+        - is_cartoon
+        - in_use
+        - upload_date
+      title: imageResponse
+    institution:
+      properties:
+        institution_id:
+          type: integer
+          title: Institution Id
+        board_id:
+          type: integer
+          title: Board Id
+        name:
+          type: string
+          title: Name
+        address:
+          type: string
+          title: Address
+        is_active:
+          type: boolean
+          title: Is Active
+      type: object
+      required:
+        - institution_id
+        - board_id
+        - name
+        - address
+        - is_active
+      title: institution
+    institutionBase:
+      properties:
+        institution_name:
+          type: string
+          title: Institution Name
+        institution_address:
+          type: string
+          title: Institution Address
+        board_id:
+          type: integer
+          title: Board Id
+        client_id:
+          type: string
+          title: Client Id
+        phone_number:
+          type: string
+          title: Phone Number
+        email_address:
+          type: string
+          title: Email Address
+      type: object
+      required:
+        - institution_name
+        - institution_address
+        - board_id
+        - client_id
+        - phone_number
+        - email_address
+      title: institutionBase
+    loginRequest:
+      properties:
+        phone_number:
+          type: string
+          title: Phone Number
+      type: object
+      required:
+        - phone_number
+      title: loginRequest
+    opt2:
+      properties:
+        phone_number:
+          type: string
+          title: Phone Number
+        email_address:
+          type: string
+          title: Email Address
+        otp:
+          type: string
+          title: Otp
+      type: object
+      required:
+        - phone_number
+        - email_address
+        - otp
+      title: opt2
+    otp:
+      properties:
+        phone_number:
+          type: string
+          title: Phone Number
+        otp:
+          type: string
+          title: Otp
+      type: object
+      required:
+        - phone_number
+        - otp
+      title: otp
+    verifyStudent:
+      properties:
+        email_address:
+          type: string
+          title: Email Address
+        phone_number:
+          type: string
+          title: Phone Number
+      type: object
+      required:
+        - email_address
+        - phone_number
+      title: verifyStudent
+    verifyTeacher:
+      properties:
+        email_address:
+          type: string
+          title: Email Address
+        phone_number:
+          type: string
+          title: Phone Number
+      type: object
+      required:
+        - email_address
+        - phone_number
+      title: verifyTeacher
+    verifyTeacherByPhone:
+      properties:
+        phone_number:
+          type: string
+          title: Phone Number
+      type: object
+      required:
+        - phone_number
+      title: verifyTeacherByPhone
+    voiceSampleResponse:
+      properties:
+        voice_id:
+          type: integer
+          title: Voice Id
+        voice_sample_url:
+          type: string
+          title: Voice Sample Url
+        upload_date:
+          type: string
+          format: date-time
+          title: Upload Date
+      type: object
+      required:
+        - voice_id
+        - voice_sample_url
+        - upload_date
+      title: voiceSampleResponse
+

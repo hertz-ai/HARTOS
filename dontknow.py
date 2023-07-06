@@ -1,4 +1,4 @@
-from langchain.agents import ZeroShotAgent, Tool, AgentExecutor
+from langchain.agents import ZeroShotAgent, Tool, AgentExecutor, ConversationalAgent
 from langchain.memory import ConversationBufferMemory, ReadOnlySharedMemory
 from langchain import OpenAI, LLMChain, PromptTemplate
 from langchain.utilities import GoogleSearchAPIWrapper
@@ -14,6 +14,11 @@ from langchain.schema import AgentAction, AgentFinish, OutputParserException
 from langchain.chains import LLMMathChain
 from langchain.tools.python.tool import PythonREPLTool
 from langchain.chains.conversation.memory import ConversationSummaryMemory
+from langchain.tools import OpenAPISpec, APIOperation
+from langchain.chains import OpenAPIEndpointChain
+from langchain.requests import Requests
+from langchain.llms import OpenAI
+from langchain.chains.openai_functions.openapi import get_openapi_chain
 
 
 os.environ["OPENAI_API_KEY"] = "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"
@@ -28,7 +33,7 @@ search = GoogleSearchAPIWrapper(k=4)
 
 
 def get_action_user_details(user_id):
-    
+
 
     action_url = f"http://aws_hevolve.hertzai.com:6006/action_by_user_id?user_id={user_id}"
 
@@ -84,12 +89,6 @@ summry_chain = LLMChain(
 
 llm_math = LLMMathChain(llm=OpenAI())
 
-math_tool = Tool(
-    name='Calculator',
-    func=llm_math.run,
-    description='Useful for when you need to answer questions about math.'
-)
-
 search = GoogleSearchAPIWrapper()
 prompt2 = PromptTemplate(
     input_variables=["query"],
@@ -97,19 +96,34 @@ prompt2 = PromptTemplate(
 )
 llm_chain = LLMChain(llm=OpenAI(), prompt=prompt2,memory=ConversationSummaryMemory(llm=OpenAI()))
 
-# initialize the LLM tool
-llm_tool = Tool(
-    name='Language Model',
-    func=llm_chain.run,
-    description='use this tool for general purpose queries and logic'
+
+# openapi spec chain
+spec = OpenAPISpec.from_file(
+  "./openapi.yaml"
 )
 
+chain = get_openapi_chain(spec)
 
 tools = [
     Tool(
+        name='Language Model',
+        func=llm_chain.run,
+        description='Use this tool as priority. Try to use this tool first and then use other, This tool is useful for answering normal queries that can be available in LLM knowledge'
+    ),
+    Tool(
+        name='Calculator',
+        func=llm_math.run,
+        description='Useful for when you need to answer questions about math.'
+    ),
+    Tool(
+        name="OpenAPI Specification",
+        func=chain.run,
+        description="Use this when you need to search infomation from one of our api's that are available, If you need to get information about students, available book, user details, list of topics available."
+    ),
+    Tool(
         name="Search",
         func=search.run,
-        description="useful for when you need to answer questions about current events",
+        description="useful for when you need to answer questions about current events. This should be the last to be used and used when there is no answer using rest tools",
     ),
     Tool(
         name="Summary",
@@ -118,9 +132,8 @@ tools = [
     ),
 
 ]
-tools.append(math_tool)
-tools.append(llm_tool)
 tools.append(PythonREPLTool())
+
 class CustomOutputParser(AgentOutputParser):
 
     def parse(self, llm_output: str) -> Union[AgentAction, AgentFinish]:
@@ -158,12 +171,11 @@ def get_ans(user_id, query):
 
         Instructions:
         You will have to act like the world's best teacher who has knowledge in every field, and you will have to think of the consequences of the particular response you will give.
-        Your response should be meaningful, should not exceed more than 200 words, and should be as fast as possible.
+        Your response should be meaningful and should be as fast as possible.
         You are a highly knowledgeable teacher with a vast amount of information at your disposal.
         You also have access to a tool similar to Google Search that allows you to retrieve information from the web in real-time.
         As a teacher, your goal is to assist students by answering their questions and providing accurate and up-to-date information.
-        The aim is to maintain a natural and conversational tone throughout the interaction. When providing responses, make sure to address the user by their name only if there is a necessity.
-        When generating responses, prioritize delivering helpful information while using the user's name sparingly to enhance personalization when appropriate.
+	keep conversation casual and meaningful.
 
         {user_details}
 
@@ -172,17 +184,18 @@ def get_ans(user_id, query):
         You are Hevolve, a highly intelligent educational AI, developed by HertzAI, designed to answer questions, provide revisions, assessments,
         teach various topics and help with research for students and working professionals from various knowledge sources like books, websites, white papers.
         Your responses will be played to the user as a video using an avatar and text to speech in various languages.
-        
+
         This all are action performed by user till date
-        {actions} 
+        {actions}
         You have access to the following tools:"""
     suffix = """Begin!"
-
+    Relevant pieces of previous conversation. Must use if user is asking about his previous conversations:
     {chat_history}
+    (You do not need to use these pieces of information if not relevant)
     Question: {input}
     {agent_scratchpad}"""
 
-    prompt = ZeroShotAgent.create_prompt(
+    prompt = ConversationalAgent.create_prompt(
         tools,
         prefix=prefix,
         suffix=suffix,
@@ -190,7 +203,7 @@ def get_ans(user_id, query):
     )
 
     llm_chain = LLMChain(llm=OpenAI(temperature=0), prompt=prompt)
-    agent = ZeroShotAgent(llm_chain=llm_chain, tools=tools, verbose=True, output_parser=output_parser)
+    agent = ConversationalAgent(llm_chain=llm_chain, tools=tools, verbose=True)
     agent_chain = AgentExecutor.from_agent_and_tools(
         agent=agent, tools=tools, verbose=True, memory=memory
     )
