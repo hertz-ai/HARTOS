@@ -5,6 +5,7 @@ info:
   version: '1.0'
 servers:
     - url: https://awskong.hertzai.com:8443/db
+    
 tags:
   - name: Ping
     description: Get Hevovle-db-app status.
@@ -20,6 +21,8 @@ tags:
     description: Crud ops with Batches
   - name: Users
     description: Crud ops with Users
+  - name: Text To Image
+    description: Convert text into Image
 paths:
   /getstudent_by_user_id:
     post:
@@ -110,35 +113,6 @@ paths:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
 
-  /search:
-    get:
-      tags:
-        - search
-      summary: Search Chapter Or Topic
-      operationId: search_chapter_or_topic_search__get
-      parameters:
-        - required: true
-          schema:
-            type: string
-            title: Query
-          name: query
-          in: query
-      responses:
-        '200':
-          description: Successful Response
-          content:
-            application/json:
-              schema:
-                items:
-                  $ref: '#/components/schemas/SearchLayout'
-                type: array
-                title: Response Search Chapter Or Topic Search  Get
-        '422':
-          description: Validation Error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
 
   /list-of-topic:
     get:
@@ -153,6 +127,31 @@ paths:
             application/json:
               schema: {}
 
+  /txt2img:     
+    post:
+      tags:
+        - Text to Image
+      summary: convert given text into an image
+      operationId: textimage_txt2img_post
+      parameters:
+        - name: prompt
+          in: query
+          description: Prompt for generating an image.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  
 components:
   schemas:
     API:
@@ -1382,6 +1381,7 @@ components:
             $ref: '#/components/schemas/ValidationError'
           type: array
           title: Detail
+          maxItems: 100
       type: object
       title: HTTPValidationError
     Layout:
@@ -2260,6 +2260,7 @@ components:
               - type: integer
           type: array
           title: Location
+          maxItems: 100
         msg:
           type: string
           title: Message
@@ -2661,4 +2662,10 @@ components:
         - voice_sample_url
         - upload_date
       title: voiceSampleResponse
+  securitySchemes:
+    basicAuth:     # <-- arbitrary name for the security scheme
+      type: http
+      scheme: basic
 
+security:
+  - basicAuth: [] 

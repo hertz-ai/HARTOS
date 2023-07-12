@@ -13,12 +13,19 @@ from typing import List, Union
 from langchain.schema import AgentAction, AgentFinish, OutputParserException
 from langchain.chains import LLMMathChain
 from langchain.tools.python.tool import PythonREPLTool
-from langchain.chains.conversation.memory import ConversationSummaryMemory
+from langchain.chains.conversation.memory import ConversationSummaryMemory, ConversationBufferWindowMemory
 from langchain.tools import OpenAPISpec, APIOperation
 from langchain.chains import OpenAPIEndpointChain
 from langchain.requests import Requests
-from langchain.llms import OpenAI
+from langchain.llms import OpenAI, OpenAIChat
 from langchain.chains.openai_functions.openapi import get_openapi_chain
+import logging
+from langchain.chat_models import ChatOpenAI
+from typing import Any
+from langchain.agents import initialize_agent
+from langchain.agents import AgentType
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 os.environ["OPENAI_API_KEY"] = "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"
@@ -63,7 +70,7 @@ def get_action_user_details(user_id):
 
     user_details = f'''Below are the information about the user.
     user_name: {user_data["name"]} (Call the user by this name),gender: {user_data["gender"]},who_pays_for_course: {user_data["who_pays_for_course"]}(Entity Responsible for Paying the Course Fees),preferred_language: {user_data["preferred_language"]}(User's Preferred Language),date_of_birth: {user_data["dob"]},english_proficiency: {user_data["english_proficiency"]}(User's English Proficiency Level),created_date: {user_data["created_date"]}(user creation date),standard: {user_data["standard"]}(User's Standard in which user studying)
-    '''
+   '''
     return user_details, actions
 
 
@@ -75,26 +82,28 @@ template = """This is a conversation between a human and a bot:
 
 Write a summary of the conversation for {input}:
 """
+llm = OpenAI()
 
 prompt = PromptTemplate(input_variables=["input", "chat_history"], template=template)
-memory = ConversationBufferMemory(memory_key="chat_history")
+memory=ConversationBufferWindowMemory( k=5, return_messages=True, memory_key="chat_history")
 readonlymemory = ReadOnlySharedMemory(memory=memory)
 summry_chain = LLMChain(
-    llm=OpenAI(),
+    llm=llm,
     prompt=prompt,
     verbose=True,
     memory=readonlymemory,  # use the read-only memory to prevent the tool from modifying the memory
 )
 
 
-llm_math = LLMMathChain(llm=OpenAI())
+
+llm_math = LLMMathChain(llm=llm)
 
 search = GoogleSearchAPIWrapper()
 prompt2 = PromptTemplate(
-    input_variables=["query"],
-    template= "{query}"
+    input_variables=["input"],
+    template= "{input}"
 )
-llm_chain = LLMChain(llm=OpenAI(), prompt=prompt2,memory=ConversationSummaryMemory(llm=OpenAI()))
+llm_chain = LLMChain(llm=ChatOpenAI(temperature=0, model='gpt-3.5-turbo'), prompt=prompt2,memory=ConversationSummaryMemory(llm=llm))
 
 
 # openapi spec chain
@@ -108,7 +117,7 @@ tools = [
     Tool(
         name='Language Model',
         func=llm_chain.run,
-        description='Use this tool as priority. Try to use this tool first and then use other, This tool is useful for answering normal queries that can be available in LLM knowledge'
+        description= 'Useful when you need to answer from internal knowledge of LLM'
     ),
     Tool(
         name='Calculator',
@@ -118,19 +127,18 @@ tools = [
     Tool(
         name="OpenAPI Specification",
         func=chain.run,
-        description="Use this when you need to search infomation from one of our api's that are available, If you need to get information about students, available book, user details, list of topics available."
+        description="Use this when you need to search infomation from one of our api's that are available, use it when user ask for image from text, get information students, available book, user details, list of topics available."
     ),
     Tool(
         name="Search",
         func=search.run,
-        description="useful for when you need to answer questions about current events. This should be the last to be used and used when there is no answer using rest tools",
+        description="useful for when you need to answer questions about current events, current dates, weather.",
     ),
     Tool(
         name="Summary",
         func=summry_chain.run,
         description="useful for when you summarize a conversation. The input to this tool should be a string, representing who will read this summary.",
     ),
-
 ]
 tools.append(PythonREPLTool())
 
@@ -149,12 +157,8 @@ class CustomOutputParser(AgentOutputParser):
         regex = r"Action\s*\d*\s*:(.*?)\nAction\s*\d*\s*Input\s*\d*\s*:[\s]*(.*)"
         match = re.search(regex, llm_output, re.DOTALL)
         if not match:
-            return AgentFinish(
-                # Return values is generally always a dictionary with a single `output` key
-                # It is not recommended to try anything else at the moment :)
-                return_values={"output": llm_output.split("Final Answer:")[-1].strip()},
-                log=llm_output,
-            )
+            raise ValueError(f"Could not parse LLM output: `{llm_output}`")
+        logger.info(f"All interim LLM output: {llm_output}")
         action = match.group(1).strip()
         action_input = match.group(2)
         # Return the action and action input
@@ -162,6 +166,10 @@ class CustomOutputParser(AgentOutputParser):
 
 
 output_parser = CustomOutputParser()
+
+
+
+
 
 
 def get_ans(user_id, query):
@@ -175,7 +183,7 @@ def get_ans(user_id, query):
         You are a highly knowledgeable teacher with a vast amount of information at your disposal.
         You also have access to a tool similar to Google Search that allows you to retrieve information from the web in real-time.
         As a teacher, your goal is to assist students by answering their questions and providing accurate and up-to-date information.
-	keep conversation casual and meaningful.
+
 
         {user_details}
 
@@ -202,12 +210,12 @@ def get_ans(user_id, query):
         input_variables=["input", "chat_history", "agent_scratchpad"],
     )
 
-    llm_chain = LLMChain(llm=OpenAI(temperature=0), prompt=prompt)
-    agent = ConversationalAgent(llm_chain=llm_chain, tools=tools, verbose=True)
+    llm_chain_2 = LLMChain(llm=llm, prompt=prompt)
+    agent = ConversationalAgent(llm_chain=llm_chain_2, tools=tools, verbose=True, return_intermediate_steps=False)
     agent_chain = AgentExecutor.from_agent_and_tools(
         agent=agent, tools=tools, verbose=True, memory=memory
     )
-
+    #agent_chain = initialize_agent(tools, ChatOpenAI(), agent=AgentType.OPENAI_FUNCTIONS, verbose=True, memory=memory, handle_parsing_errors="Check your output and make sure it conforms!")
     ans = agent_chain.run(input=query)
     return ans
 
