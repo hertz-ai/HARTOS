@@ -24,6 +24,13 @@ from langchain.chat_models import ChatOpenAI
 from typing import Any
 from langchain.agents import initialize_agent
 from langchain.agents import AgentType
+from langchain.memory import ZepMemory
+from langchain.schema import HumanMessage, AIMessage
+
+
+
+
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -34,6 +41,8 @@ os.environ["GOOGLE_API_KEY"] = "AIzaSyCTEiyRiS8mfZlUp3Lc1JwmmyK4sZI_8Lo"
 os.environ["NEWS_API_KEY"] = "291350f6b8fd4df982f343888a4cabd5"
 os.environ["SERPAPI_API_KEY"] = "15916f6b8a0a976ab7f92ed1c4e3bc9bb40c73b40404ad2bbf219c5091394cb0"
 search = GoogleSearchAPIWrapper(k=4)
+
+ZEP_API_URL = "http://4.224.46.164:8000"
 
 
 
@@ -74,7 +83,14 @@ def get_action_user_details(user_id):
     return user_details, actions
 
 
-
+def get_memory(user_id:int):
+    session_id = "user_"+str(user_id)
+    memory = ZepMemory(
+        session_id=session_id,
+        url=ZEP_API_URL,
+        memory_key="chat_history",
+    )
+    return memory
 
 template = """This is a conversation between a human and a bot:
 
@@ -84,15 +100,7 @@ Write a summary of the conversation for {input}:
 """
 llm = OpenAI()
 
-prompt = PromptTemplate(input_variables=["input", "chat_history"], template=template)
-memory=ConversationBufferWindowMemory( k=5, return_messages=True, memory_key="chat_history")
-readonlymemory = ReadOnlySharedMemory(memory=memory)
-summry_chain = LLMChain(
-    llm=llm,
-    prompt=prompt,
-    verbose=True,
-    memory=readonlymemory,  # use the read-only memory to prevent the tool from modifying the memory
-)
+
 
 
 
@@ -103,44 +111,15 @@ prompt2 = PromptTemplate(
     input_variables=["input"],
     template= "{input}"
 )
-llm_chain = LLMChain(llm=ChatOpenAI(temperature=0, model='gpt-3.5-turbo'), prompt=prompt2,memory=ConversationSummaryMemory(llm=llm))
-
+llm_chain = LLMChain(llm=ChatOpenAI(temperature=0, model='gpt-3.5-turbo'), prompt=prompt2)
 
 # openapi spec chain
 spec = OpenAPISpec.from_file(
-  "./openapi.yaml"
+"./openapi.yaml"
 )
 
 chain = get_openapi_chain(spec)
 
-tools = [
-    Tool(
-        name='Language Model',
-        func=llm_chain.run,
-        description= 'Useful when you need to answer from internal knowledge of LLM'
-    ),
-    Tool(
-        name='Calculator',
-        func=llm_math.run,
-        description='Useful for when you need to answer questions about math.'
-    ),
-    Tool(
-        name="OpenAPI Specification",
-        func=chain.run,
-        description="Use this when you need to search infomation from one of our api's that are available, use it when user ask for image from text, get information students, available book, user details, list of topics available."
-    ),
-    Tool(
-        name="Search",
-        func=search.run,
-        description="useful for when you need to answer questions about current events, current dates, weather.",
-    ),
-    Tool(
-        name="Summary",
-        func=summry_chain.run,
-        description="useful for when you summarize a conversation. The input to this tool should be a string, representing who will read this summary.",
-    ),
-]
-tools.append(PythonREPLTool())
 
 class CustomOutputParser(AgentOutputParser):
 
@@ -174,6 +153,45 @@ output_parser = CustomOutputParser()
 
 def get_ans(user_id, query):
     user_details, actions = get_action_user_details(user_id=user_id)
+
+    prompt = PromptTemplate(input_variables=["input", "chat_history"], template=template)
+    memory=get_memory(user_id=user_id)
+    readonlymemory = ReadOnlySharedMemory(memory=memory)
+    summry_chain = LLMChain(
+        llm=llm,
+        prompt=prompt,
+        verbose=True,
+        memory=readonlymemory,  # use the read-only memory to prevent the tool from modifying the memory
+    )
+
+    tools = [
+        Tool(
+            name='Language Model',
+            func=llm_chain.run,
+            description= 'Useful when you need to answer from internal knowledge of LLM'
+        ),
+        Tool(
+            name='Calculator',
+            func=llm_math.run,
+            description='Useful for when you need to answer questions about math.'
+        ),
+        Tool(
+            name="OpenAPI Specification",
+            func=chain.run,
+            description="Use this when you need to search infomation from one of our api's that are available, use it when user ask for image from text, get information students, available book, user details, list of topics available."
+        ),
+        Tool(
+            name="Search",
+            func=search.run,
+            description="useful for when you need to answer questions about current events, current dates, weather.",
+        ),
+        Tool(
+            name="Summary",
+            func=summry_chain.run,
+            description="useful for when you summarize a conversation. The input to this tool should be a string, representing who will read this summary.",
+        ),
+    ]
+    tools.append(PythonREPLTool())
 
     prefix = f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
