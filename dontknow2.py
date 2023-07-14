@@ -1,4 +1,4 @@
-from langchain.agents import ZeroShotAgent, Tool, AgentExecutor, ConversationalAgent
+from langchain.agents import ZeroShotAgent, Tool, AgentExecutor, ConversationalAgent, ConversationalChatAgent
 from langchain.memory import ConversationBufferMemory, ReadOnlySharedMemory
 from langchain import OpenAI, LLMChain, PromptTemplate
 from langchain.utilities import GoogleSearchAPIWrapper
@@ -25,7 +25,8 @@ from typing import Any
 from langchain.agents import initialize_agent
 from langchain.agents import AgentType
 from langchain.memory import ZepMemory
-from langchain.schema import HumanMessage, AIMessage
+from langchain.schema import HumanMessage, AIMessage, SystemMessage
+from langchain.agents.conversational_chat.output_parser import ConvoOutputParser
 
 
 
@@ -89,9 +90,11 @@ def get_memory(user_id:int):
         session_id=session_id,
         url=ZEP_API_URL,
         memory_key="chat_history",
-	return_messages=True
+        return_messages=True
     )
     return memory
+
+
 
 template = """This is a conversation between a human and a bot:
 
@@ -123,27 +126,23 @@ chain = get_openapi_chain(spec)
 
 
 class CustomOutputParser(AgentOutputParser):
+    def get_format_instructions(self) -> str:
+        return FORMAT_INSTRUCTIONS
 
-    def parse(self, llm_output: str) -> Union[AgentAction, AgentFinish]:
-        # Check if agent should finish
-        if "Final Answer:" in llm_output:
-            return AgentFinish(
-                # Return values is generally always a dictionary with a single `output` key
-                # It is not recommended to try anything else at the moment :)
-                return_values={"output": llm_output.split("Final Answer:")[-1].strip()},
-                log=llm_output,
-            )
-        # Parse out the action and action input
-        regex = r"Action\s*\d*\s*:(.*?)\nAction\s*\d*\s*Input\s*\d*\s*:[\s]*(.*)"
-        match = re.search(regex, llm_output, re.DOTALL)
-        if not match:
-            raise ValueError(f"Could not parse LLM output: `{llm_output}`")
-        logger.info(f"All interim LLM output: {llm_output}")
-        action = match.group(1).strip()
-        action_input = match.group(2)
-        # Return the action and action input
-        return AgentAction(tool=action, tool_input=action_input.strip(" ").strip('"'), log=llm_output)
+    def parse(self, text: str) -> Union[AgentAction, AgentFinish]:
+        try:
+            response = parse_json_markdown(text)
+            action, action_input = response["action"], response["action_input"]
+            if action == "Final Answer":
+                return AgentFinish({"output": action_input}, text)
+            else:
+                return AgentAction(action, action_input, text)
+        except Exception as e:
+            raise OutputParserException(f"Could not parse LLM output: {text}") from e
 
+    @property
+    def _type(self) -> str:
+        return "conversational_chat"
 
 output_parser = CustomOutputParser()
 
@@ -159,7 +158,7 @@ def get_ans(user_id, query):
     memory=get_memory(user_id=user_id)
     readonlymemory = ReadOnlySharedMemory(memory=memory)
     summry_chain = LLMChain(
-        llm=llm,
+        llm=OpenAI(),
         prompt=prompt,
         verbose=True,
         memory=readonlymemory,  # use the read-only memory to prevent the tool from modifying the memory
@@ -167,30 +166,21 @@ def get_ans(user_id, query):
 
     tools = [
         Tool(
-            name='Language Model',
-            func=llm_chain.run,
-            description= 'Useful when you need to answer from internal knowledge of LLM'
-        ),
-        Tool(
             name='Calculator',
             func=llm_math.run,
             description='Useful for when you need to answer questions about math.'
         ),
         Tool(
-            name="OpenAPI Specification",
+            name="OpenAPI_Specification",
             func=chain.run,
-            description="Use this when you need to search infomation from one of our api's that are available, use it when user ask for image from text, get information students, available book, user details, list of topics available."
+            description="Use this when you need to search infomation from one of our api's that are available, use in this scenarious when user asking for image from text , get information students, available book, user details, list of topics available."
         ),
         Tool(
             name="Search",
             func=search.run,
             description="useful for when you need to answer questions about current events, current dates, weather.",
         ),
-        Tool(
-            name="Summary",
-            func=summry_chain.run,
-            description="useful for when you summarize a conversation. The input to this tool should be a string, representing who will read this summary.",
-        ),
+        
     ]
     tools.append(PythonREPLTool())
 
@@ -229,12 +219,17 @@ def get_ans(user_id, query):
         input_variables=["input", "chat_history", "agent_scratchpad"],
     )
 
-    llm_chain_2 = LLMChain(llm=llm, prompt=prompt)
-    agent = ConversationalAgent(llm_chain=llm_chain_2, tools=tools, verbose=True, return_intermediate_steps=False)
-    agent_chain = AgentExecutor.from_agent_and_tools(
-        agent=agent, tools=tools, verbose=True, memory=memory
-    )
-    #agent_chain = initialize_agent(tools, ChatOpenAI(), agent=AgentType.OPENAI_FUNCTIONS, verbose=True, memory=memory, handle_parsing_errors="Check your output and make sure it conforms!")
+    #llm_chain_2 = LLMChain(llm=ChatOpenAI(temperature=0, model="gpt-3.5-turbo-0613"), prompt=prompt)
+    #agent = ConversationalChatAgent(llm_chain=llm_chain_2, tools=tools, verbose=True, return_intermediate_steps=False)
+    #agent_chain = AgentExecutor.from_agent_and_tools(
+    #     agent=agent, tools=tools, verbose=True, memory=memory
+    #)
+
+    agent_kwargs={"system_message":prefix, "input_variables":["input", "chat_history", "agent_scratchpad"]}
+
+    agent_chain = initialize_agent(tools, ChatOpenAI(), agent=AgentType.CHAT_CONVERSATIONAL_REACT_DESCRIPTION, verbose=True, memory=memory, agent_kwargs=agent_kwargs)
+    #llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo-0613")
+    #agent_chain = initialize_agent(tools, llm, agent=AgentType.OPENAI_FUNCTIONS, verbose=True, memory=memory)
     ans = agent_chain.run(input=query)
     return ans
 
