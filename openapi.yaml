@@ -131,8 +131,8 @@ paths:
     post:
       tags:
         - Text to Image
-      summary: convert given text into an image
-      operationId: textimage_txt2img_post
+      summary: Use it when you need to convert given text into image
+      operationId: text_to_image
       parameters:
         - name: prompt
           in: query
