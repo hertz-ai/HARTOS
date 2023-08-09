@@ -36,6 +36,7 @@ from langchain.agents import initialize_agent
 from langchain.agents import AgentType
 import requests
 import pytz
+from langchain.experimental.plan_and_execute import PlanAndExecute, load_agent_executor, load_chat_planner
 
 
 class CustomGPT(LLM):
@@ -138,7 +139,7 @@ template = """This is a conversation between a human and a bot:
 
 Write a summary of the conversation for {input}:
 """
-llm = CustomGPT()
+llm = ChatOpenAI(temperature=0, model='gpt-3.5-turbo')
 
 
 
@@ -198,25 +199,28 @@ def get_time_based_history(prompt:str, session_id:str, start_date:str, end_date:
         session_id=session_id,
         url=ZEP_API_URL,
         memory_key="chat_history",
-
     )
 
-    messages = memory.chat_memory.search(prompt)
-    # messages = [message.message["content"] for message in messages if message.dist>0.8 and message.message["role"]!="system" and message.message["role"]!="ai"]
-    print("messages----->", messages)
-    try:
 
-        filtered_messages = [message.message['content'] for message in messages if message.message["role"]!="system" and datetime.fromisoformat(start_date.replace('Z', '+00:00')).replace(tzinfo=timezone.utc) <= datetime.fromisoformat(message.message['created_at'].replace('Z', '+00:00')).replace(tzinfo=timezone.utc) <= datetime.fromisoformat(end_date.replace('Z', '+00:00')).replace(tzinfo=timezone.utc) and message.dist>0.8 ]
-    #filtered_messages = [message.message['content'] for message in messages if message.message["role"] != "system" and
-    #                 datetime.strptime(start_date, '%Y-%m-%dT%H:%M:%S.%fZ').replace(tzinfo=timezone.utc) <=
-    #                 datetime.strptime(message.message['created_at'], '%Y-%m-%dT%H:%M:%S.%fZ').replace(tzinfo=timezone.utc) <=
-    #                 datetime.strptime(end_date, '%Y-%m-%dT%H:%M:%S.%fZ').replace(tzinfo=timezone.utc) and
-    #                 message.dist > 0.8 ]
-    #print("filter_messages ----->",filtered_messages)
-        res = "here are the messages related to your question ".join(filtered_messages)
-        return res
+    # messages = [message.message["content"] for message in messages if message.dist>0.8 and message.message["role"]!="system" and message.message["role"]!="ai"]
+    try:
+        messages = memory.chat_memory.search(prompt)
+
+        print("messages----->", messages)
+
+        filtered_messages = [[message.message['content'] for message in messages if message.message["role"]!="system" and datetime.fromisoformat(start_date.replace('Z', '+00:00')).replace(tzinfo=timezone.utc) <= datetime.fromisoformat(message.message['created_at'].replace('Z', '+00:00')).replace(tzinfo=timezone.utc) <= datetime.fromisoformat(end_date.replace('Z', '+00:00')).replace(tzinfo=timezone.utc) and message.dist>0.8 ]]
+        #filtered_messages = [message.message['content'] for message in messages if message.message["role"] != "system" and
+        #                 datetime.strptime(start_date, '%Y-%m-%dT%H:%M:%S.%fZ').replace(tzinfo=timezone.utc) <=
+        #                 datetime.strptime(message.message['created_at'], '%Y-%m-%dT%H:%M:%S.%fZ').replace(tzinfo=timezone.utc) <=
+        #                 datetime.strptime(end_date, '%Y-%m-%dT%H:%M:%S.%fZ').replace(tzinfo=timezone.utc) and
+        #                 message.dist > 0.8 ]
+        #print("filter_messages ----->",filtered_messages)
+        final_res = {'res':filter_messages}
+        
+        return json.dumps(final_res)
     except:
-        return [message.message['content'] for message in messages]
+        #return [message.message['content'] for message in messages]
+        return json.dumps({'res':memory.chat_memory.zep_summary})
 
 
 def parsing_string(string):
@@ -243,6 +247,11 @@ def get_ans(user_id, query):
 
     tools = [
         Tool(
+            name='Language Model',
+            func=llm_chain.run,
+            description= 'Useful when you need to answer from internal knowledge of LLM'
+        ),
+        Tool(
             name='Calculator',
             func=llm_math.run,
             description='Useful for when you need to answer questions about math.'
@@ -250,7 +259,7 @@ def get_ans(user_id, query):
         Tool(
             name="OpenAPI_Specification",
             func=chain.run,
-            description=f"Use this when you need to search infomation from one of our api's that are available, use in this scenarious when user asking for image from text , get information students, available book, user details give only for this {user_id}."
+            description=f"Use this when you need to search infomation from one of our api's that are available, use in this scenarious when user asking image generation using text , information students, available book, ."
         ),
         Tool(
             name="Search",
@@ -260,11 +269,11 @@ def get_ans(user_id, query):
         Tool(
             name="Historical Conversations",
             func=parsing_string,
-            description=f"""Use this tool if and only if conversation span is prior to today. The input required by this tool is a comma-separated list.
+            description=f"""Use this tool if and only if the information requested is from prior to today regarding current user. The input required by this tool is a comma-separated list.
             The list should include a prompt generated from user input text, a session_id is user_{user_id}, a start_date, and an end_date.
-            The start_date refers to the date from which the search begins and should always be in the ISO 8601 format. The end_date, also in the ISO 8601 format, represents the date at which the search ends.
+            The start_date refers to the date from which the user information search begins and should always be in the ISO 8601 format. The end_date, also in the ISO 8601 format, represents the date at which the search ends.
             If you can't determine the end_date, use the current datetime time.
-            For instance, if you want to search for a conversation from yesterday to today (assuming today's date is 2023-07-13T10:19:56.732291Z), your input would be 'what zep can do, user_123, 2023-07-12T10:19:56.732291Z, 2023-07-13T10:19:56.732291Z'."""
+            For instance, if you want to search for a user's conversation from yesterday till today (assuming today's date is 2023-07-13T10:19:56.732291Z), your input would be 'what zep can do, user_123, 2023-07-12T10:19:56.732291Z, 2023-07-13T10:19:56.732291Z'."""
         )
     ]
     #tools.append(PythonREPLTool())
@@ -279,7 +288,7 @@ def get_ans(user_id, query):
         You are a highly knowledgeable teacher with a vast amount of information at your disposal.
         You also have access to a tool similar to Google Search that allows you to retrieve information from the web in real-time.
         As a teacher, your goal is to assist students by answering their questions and providing accurate and up-to-date information.
-
+        Create a personality for yourself and don;t ever refer to user as human and yourself as just AI.
 
         {user_details}
 
@@ -292,19 +301,26 @@ def get_ans(user_id, query):
         These are all the actions performed by user till now:
         {actions}
 
-        Last 20 conversations or today's dialogue with the user along with timestamp of the conversations (recent_history except current dialogue) is:
-        {{chat_history}}
+        Today's date time is
+        {today_date}
 
-        Available tools
+        Last 20 conversations or today's dialogue with the user along with timestamp of the conversations (recent_history except current dialogue) is:
+	Always return json response
         """
-    suffix = """TOOLS
+    suffix = """
+        Only if this above history is not sufficient to fulfill the user's request then use tools.
+
+        TOOLS
+
         ------
-        Assistant can ask the user to use tools to look up information that may be helpful in answering the users original question. The tools the human can use are:
+
+        Assistant can use tools to look up information that may be helpful in answering the user's original question. The tools you can use are:
+
 
         {{tools}}
 
         {format_instructions}
-
+	always create parsable output
         USER'S INPUT
         --------------------
         Here is the user's input (remember to respond with a markdown code snippet of a json blob with a single action, and NOTHING else):
@@ -313,12 +329,18 @@ def get_ans(user_id, query):
 
 
     prompt = ConversationalChatAgent.create_prompt(
-        tools,
-        system_message=prefix,
-        human_message=suffix,
+        tools
     )
 
-    llm_chain_2 = LLMChain(llm=CustomGPT(), prompt=prompt)
+    #planner Agent
+    # model = ChatOpenAI(temperature=0)
+    # planner = load_chat_planner(model)
+    # executor = load_agent_executor(model, tools, verbose=True)
+    # agent = PlanAndExecute(planner=planner, executor=executor, verbose=True)
+    # ans = agent.run(query)
+    
+    #chat Agent
+    llm_chain_2 = LLMChain(llm=ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0.7), prompt=prompt)
 
 
     agent = ConversationalChatAgent(llm_chain=llm_chain_2, tools=tools, verbose=True, return_intermediate_steps=False)
@@ -326,6 +348,7 @@ def get_ans(user_id, query):
         agent=agent, tools=tools, verbose=True, memory=memory
     )
     ans = agent_chain.run(input=query)
+
 
     # agent_kwargs={"system_message":prefix, "human_message":suffix ,"input_variables":["input", "chat_history", "agent_scratchpad"] }
 

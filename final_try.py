@@ -1,0 +1,337 @@
+from langchain import OpenAI, LLMChain, PromptTemplate
+from langchain.agents import (
+    ZeroShotAgent, Tool, AgentExecutor, ConversationalAgent,
+    ConversationalChatAgent, LLMSingleActionAgent, AgentOutputParser,
+    load_tools, initialize_agent, AgentType
+)
+from langchain.prompts import (
+    ChatPromptTemplate,
+    MessagesPlaceholder,
+    SystemMessagePromptTemplate,
+    HumanMessagePromptTemplate
+)
+from langchain.chains import LLMMathChain, OpenAPIEndpointChain
+from langchain.chains.conversation.memory import ConversationSummaryMemory, ConversationBufferWindowMemory
+from langchain.chains.openai_functions.openapi import get_openapi_chain
+from langchain.chat_models import ChatOpenAI
+from langchain.experimental.plan_and_execute import PlanAndExecute, load_agent_executor, load_chat_planner
+from langchain.llms import OpenAI, OpenAIChat
+from langchain.llms.base import LLM
+from langchain.memory import ConversationBufferMemory, ReadOnlySharedMemory, ZepMemory
+from langchain.requests import Requests
+from langchain.schema import AgentAction, AgentFinish, OutputParserException, HumanMessage, AIMessage, SystemMessage
+from langchain.tools import OpenAPISpec, APIOperation, StructuredTool
+from langchain.tools.python.tool import PythonREPLTool
+from langchain.utilities import GoogleSearchAPIWrapper
+from flask import Flask, jsonify, request
+import json
+import os
+import re
+import logging
+import requests
+import pytz
+from datetime import datetime, timezone
+from typing import List, Union, Optional, Mapping, Any
+from langchain.agents.conversational_chat.output_parser import ConvoOutputParser
+
+
+user_id = 0
+
+#api and keys
+
+os.environ["OPENAI_API_KEY"] = "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"
+os.environ["GOOGLE_CSE_ID"] = "9589161c491c4493e"
+os.environ["GOOGLE_API_KEY"] = "AIzaSyCTEiyRiS8mfZlUp3Lc1JwmmyK4sZI_8Lo"
+os.environ["NEWS_API_KEY"] = "291350f6b8fd4df982f343888a4cabd5"
+os.environ["SERPAPI_API_KEY"] = "15916f6b8a0a976ab7f92ed1c4e3bc9bb40c73b40404ad2bbf219c5091394cb0"
+search = GoogleSearchAPIWrapper(k=4)
+ZEP_API_URL = "http://4.224.46.164:8000"
+
+#openAPI spec 
+spec = OpenAPISpec.from_file(
+    "./openapi.yaml"
+)
+
+
+#custom GPT
+class CustomGPT(LLM):
+    @property
+    def _llm_type(self) -> str:
+        return "custom"
+
+    def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
+        response = requests.post(
+            "http://aws_rasa.hertzai.com:5459/gpt-4",
+            json={
+              "model": "gpt-4",
+              "data": [{"role":"user","content":prompt}]
+            }
+        )
+        response.raise_for_status()
+        return response.json()["text"]
+
+    @property
+    def _identifying_params(self) -> Mapping[str, Any]:
+        """Get the identifying parameters."""
+        return {
+
+        }
+
+#helper functions
+def get_memory(user_id:int):
+    session_id = "user_"+str(user_id)
+    memory = ZepMemory(
+        session_id=session_id,
+        url=ZEP_API_URL,
+        memory_key="chat_history",
+        return_messages=True
+    )
+    return memory
+
+def get_action_user_details(user_id):
+
+
+    action_url = f"http://aws_hevolve.hertzai.com:6006/action_by_user_id?user_id={user_id}"
+
+    payload = {}
+    headers = {}
+
+    response = requests.request(
+        "GET", action_url, headers=headers, data=payload)
+
+    unwanted_actions=['Casual Conversation', 'Topic confirmation', 'Topic not found', 'Topic confirmation', 'Topic listing', 'Probe', 'Question Answering', 'Fallback']
+    data = response.json()
+    action_texts = [obj["action"] for obj in data if obj["action"] not in unwanted_actions]
+    if len(action_texts)==0:
+        action_texts=['user has not performed any actions yet']
+    actions = ", ".join(action_texts)
+
+
+    # user detail api
+
+    url = "http://aws_hevolve.hertzai.com:6006/getstudent_by_user_id"
+    payload = json.dumps({
+        "user_id": user_id
+    })
+    headers = {
+        'Content-Type': 'application/json'
+    }
+    response = requests.request("POST", url, headers=headers, data=payload)
+    # print()
+
+    user_data = response.json()
+
+    user_details = f'''Below are the information about the user.
+    user_name: {user_data["name"]} (Call the user by this name),gender: {user_data["gender"]},who_pays_for_course: {user_data["who_pays_for_course"]}(Entity Responsible for Paying the Course Fees),preferred_language: {user_data["preferred_language"]}(User's Preferred Language),date_of_birth: {user_data["dob"]},english_proficiency: {user_data["english_proficiency"]}(User's English Proficiency Level),created_date: {user_data["created_date"]}(user creation date),standard: {user_data["standard"]}(User's Standard in which user studying)
+   '''
+    return user_details, actions
+
+def get_time_based_history(prompt:str, session_id:str, start_date:str, end_date:str):
+    ZEP_API_URL = "http://4.224.46.164:8000"
+    # print(type(start_date))
+
+    memory = ZepMemory(
+        session_id=session_id,
+        url=ZEP_API_URL,
+        memory_key="chat_history",
+    )
+
+
+    # messages = [message.message["content"] for message in messages if message.dist>0.8 and message.message["role"]!="system" and message.message["role"]!="ai"]
+    
+    try:
+        messages = memory.chat_memory.search(prompt)
+
+        print("messages----->", messages)
+
+        filtered_messages = [[message.message['content'] for message in messages if message.message["role"]!="system" and datetime.fromisoformat(start_date.replace('Z', '+00:00')).replace(tzinfo=timezone.utc) <= datetime.fromisoformat(message.message['created_at'].replace('Z', '+00:00')).replace(tzinfo=timezone.utc) <= datetime.fromisoformat(end_date.replace('Z', '+00:00')).replace(tzinfo=timezone.utc) and message.dist>0.8 ]]
+        #filtered_messages = [message.message['content'] for message in messages if message.message["role"] != "system" and
+        #                 datetime.strptime(start_date, '%Y-%m-%dT%H:%M:%S.%fZ').replace(tzinfo=timezone.utc) <=
+        #                 datetime.strptime(message.message['created_at'], '%Y-%m-%dT%H:%M:%S.%fZ').replace(tzinfo=timezone.utc) <=
+        #                 datetime.strptime(end_date, '%Y-%m-%dT%H:%M:%S.%fZ').replace(tzinfo=timezone.utc) and
+        #                 message.dist > 0.8 ]
+        #print("filter_messages ----->",filtered_messages)
+        final_res = {'res':filter_messages}
+        
+        return json.dumps(final_res)
+    except:
+        #return [message.message['content'] for message in messages]
+        messages = memory.chat_memory.search(prompt)
+        return json.dumps({'res':memory.chat_memory.zep_summary})
+
+
+def parsing_string(string):
+    prompt, start_date, end_date = [s.strip() for s in string.split(",")]
+    global user_id
+    session_id = 'user_'+str(user_id)
+    return get_time_based_history(prompt, session_id, start_date, end_date)
+
+#constants
+chain = get_openapi_chain(spec)
+# llm = ChatOpenAI(model_name="gpt-3.5-turbo")
+# llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo-0613")
+llm = CustomGPT()
+llm_math = LLMMathChain(llm=llm)
+
+
+
+# output parser
+# from __future__ import annotations
+
+from typing import Union
+
+from langchain.agents import AgentOutputParser
+from langchain.agents.conversational_chat.prompt import FORMAT_INSTRUCTIONS
+from langchain.output_parsers.json import parse_json_markdown
+from langchain.schema import AgentAction, AgentFinish, OutputParserException
+
+
+class ConvoOutputParser(AgentOutputParser):
+    """Output parser for the conversational agent."""
+
+    def get_format_instructions(self) -> str:
+        return FORMAT_INSTRUCTIONS
+
+    def parse(self, text: str) -> Union[AgentAction, AgentFinish]:
+        try:
+            response = parse_json_markdown(text)
+            action, action_input = response["action"], response["action_input"]
+            if action == "Final Answer":
+                return AgentFinish({"output": action_input}, text)
+            else:
+                return AgentAction(action, action_input, text)
+        except Exception as e:
+        
+            raise OutputParserException(f"Could not parse LLM output: {text}") from e
+
+    @property
+    def _type(self) -> str:
+        return "conversational_chat"
+
+
+
+
+
+# main function
+def get_ans(user_id, query):
+    user_details, actions = get_action_user_details(user_id=user_id)
+    # memory = ConversationSummaryMemory(llm=llm, memory_key="chat_history",
+    #     return_messages=True)
+    memory=get_memory(user_id=user_id)
+    tools = [
+        Tool(
+            name='Calculator',
+            func=llm_math.run,
+            description='Useful for when you need to answer questions about math.'
+        ),
+        Tool(
+            name="OpenAPI_Specification",
+            func=chain.run,
+            description=f"Use this feature when you need to search for information from one of our available APIs. It is applicable in scenarios such as when a user is asking for image generation using text note while generating image use entire prompt as it is, information about students, or available books. This functionality should only be utilized when the intent falls within the categories of image generation using text, gathering information on students, or locating available books."
+        ),
+        Tool(
+            name="Search",
+            func=search.run,
+            description="useful for when you need to answer questions about current events, current dates, weather.",
+        ),
+        Tool(
+            name="Historical Conversations",
+            func=parsing_string,
+            description=f"""Utilize this utility exclusively when the information required predates the current day and pertains to the ongoing user. The necessary input for this tool comprises a list of values separated by commas.
+
+            The list should encompass a user-generated query, designated by user input text, a commencement date denoted as start_date, and an end date labeled as end_date. The start_date denotes the initiation date for the user information search and should consistently adhere to the ISO 8601 format. Meanwhile, the end_date, also conforming to the ISO 8601 format, signifies the conclusion date for the search.
+
+            In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what zep can do, 2023-07-12T10:19:56.732291Z, 2023-07-13T10:19:56.732291Z'.
+
+            Strive to apply this tool judiciously for scenarios in which retrospective user information is imperative. The inputs should be meticulously arranged to facilitate the extraction of accurate and pertinent data within the specified timeframe."""
+        )
+        
+    ]
+    tools.append(PythonREPLTool())
+
+    
+
+    prefix = f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+
+        Imagine that you are the world's leading teacher, possessing knowledge in every field. Consider the consequences of each response you provide. 
+        Your answers must be meaningful and delivered as quickly as possible. As a highly educated and informed teacher, you have access to an extensive wealth of information.  
+        Your primary goal as a teacher is to assist students by answering their questions, providing accurate and up-to-date information. 
+        Please create a distinct personality for yourself, and remember never to refer to the user as a human or yourself as mere AI.
+        
+        User details:
+        {user_details}
+
+        Before you respond, consider the context in which you are utilized. You are Hevolve, a highly intelligent educational AI developed by HertzAI. 
+        You are designed to answer questions, provide revisions, conduct assessments, teach various topics, and assist with research for both students and working professionals. 
+        Your expertise draws from various knowledge sources like books, websites, and white papers. Your responses will be conveyed to the user through a video, using an avatar and text-to-speech technology, and can be translated into various languages.
+
+        These are all the actions that the user has performed up to now:
+        {actions}
+        
+        
+        
+        always format your answer into parsable json format
+        """
+    suffix = """
+        Only if this above history is not sufficient to fulfill the user's request then use tools.
+
+        TOOLS
+
+        ------
+
+        Assistant can use tools to look up information that may be helpful in answering the user's original question. The tools you can use are:
+
+
+        {{tools}}
+
+        {format_instructions}
+	    always create parsable output
+        USER'S INPUT
+        --------------------
+        Here is the user's input (remember to respond with a markdown code snippet of a json blob with a single action, and NOTHING else):
+
+        {{{{input}}}}"""
+
+
+    prompt = ConversationalChatAgent.create_prompt(
+        tools,
+        system_message=prefix
+    )
+
+    
+    #chat Agent
+    llm_chain = LLMChain(llm=llm, prompt=prompt)
+
+
+    agent = ConversationalChatAgent(llm_chain=llm_chain, tools=tools, verbose=True, return_intermediate_steps=True)
+    agent_chain = AgentExecutor.from_agent_and_tools(
+        agent=agent, tools=tools, verbose=True, memory=memory
+    )
+    ans = agent_chain.run(input=query)
+
+  
+    # agent = initialize_agent(tools, llm, agent=AgentType.OPENAI_FUNCTIONS, verbose=True)
+    # ans = agent.run(query)
+
+    return ans
+
+
+
+app = Flask(__name__)
+
+
+@app.route('/chat', methods=['POST'])
+def chat():
+    data = request.get_json()
+
+    global user_id
+    user_id = data.get('user_id', None)
+
+    prompt = data.get('prompt', None)
+    ans = get_ans(user_id=user_id, query=prompt)
+
+    return jsonify({'response': ans})
+
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', debug=True, port=5000)
