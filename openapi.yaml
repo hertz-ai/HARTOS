@@ -49,31 +49,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
  
-  /allconversations/{user_id}:
-    get:
-      tags:
-        - Users
-      summary: Get All Conversations for perticular user based on user_id
-      operationId: get_all_conversations_allconversations__user_id__get
-      parameters:
-        - required: true
-          schema:
-            type: integer
-            title: User Id
-          name: user_id
-          in: path
-      responses:
-        '200':
-          description: Successful Response
-          content:
-            application/json:
-              schema: {}
-        '422':
-          description: Validation Error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
+
 
   /getbooks:
     get:
@@ -114,18 +90,6 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
 
 
-  /list-of-topic:
-    get:
-      tags:
-        - List Of Topic
-      summary: List Of Topic
-      operationId: list_of_topic_list_of_topic_get
-      responses:
-        '200':
-          description: Successful Response
-          content:
-            application/json:
-              schema: {}
 
   /txt2img:     
     post:
