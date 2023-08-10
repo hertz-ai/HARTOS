@@ -63,7 +63,7 @@ class CustomGPT(LLM):
         response = requests.post(
             "http://aws_rasa.hertzai.com:5459/gpt-4",
             json={
-              "model": "gpt-4",
+              "model": "gpt-3.5-turbo",
               "data": [{"role":"user","content":prompt}]
             }
         )
@@ -151,13 +151,14 @@ def get_time_based_history(prompt:str, session_id:str, start_date:str, end_date:
         #                 datetime.strptime(end_date, '%Y-%m-%dT%H:%M:%S.%fZ').replace(tzinfo=timezone.utc) and
         #                 message.dist > 0.8 ]
         #print("filter_messages ----->",filtered_messages)
-        final_res = {'res':filter_messages}
-        
+        final_res = {'res_in_filter':filter_messages}
+        print(final_res)
         return json.dumps(final_res)
     except:
         #return [message.message['content'] for message in messages]
         messages = memory.chat_memory.search(prompt)
-        return json.dumps({'res':memory.chat_memory.zep_summary})
+        # print(final_res)
+        return json.dumps({'res':[message.message['content'] for message in messages]})
 
 
 def parsing_string(string):
@@ -186,7 +187,7 @@ from langchain.output_parsers.json import parse_json_markdown
 from langchain.schema import AgentAction, AgentFinish, OutputParserException
 
 
-class ConvoOutputParser(AgentOutputParser):
+class CustomConvoOutputParser(AgentOutputParser):
     """Output parser for the conversational agent."""
 
     def get_format_instructions(self) -> str:
@@ -201,8 +202,17 @@ class ConvoOutputParser(AgentOutputParser):
             else:
                 return AgentAction(action, action_input, text)
         except Exception as e:
-        
-            raise OutputParserException(f"Could not parse LLM output: {text}") from e
+            # str = ""
+            if '"Final Answer"' in text:
+                # Extract the JSON part from the string
+                start_index = text.index('{')
+                end_index = text.rindex('}') + 1
+                json_string = text[start_index:end_index]
+                parsed_json = json.loads(json_string)
+                action_input = parsed_json["action_input"]
+                return AgentFinish({"output": action_input}, text)
+                # print(action_input_text)
+            # raise OutputParserException(f"Could not parse LLM output: {text}") from e
 
     @property
     def _type(self) -> str:
@@ -247,7 +257,7 @@ def get_ans(user_id, query):
         )
         
     ]
-    tools.append(PythonREPLTool())
+    # tools.append(PythonREPLTool())
 
     
 
@@ -302,8 +312,8 @@ def get_ans(user_id, query):
     #chat Agent
     llm_chain = LLMChain(llm=llm, prompt=prompt)
 
-
-    agent = ConversationalChatAgent(llm_chain=llm_chain, tools=tools, verbose=True, return_intermediate_steps=True)
+    custom_parser = CustomConvoOutputParser()
+    agent = ConversationalChatAgent(llm_chain=llm_chain, tools=tools, verbose=True, return_intermediate_steps=True, output_parser=custom_parser)
     agent_chain = AgentExecutor.from_agent_and_tools(
         agent=agent, tools=tools, verbose=True, memory=memory
     )
