@@ -47,7 +47,7 @@ os.environ["SERPAPI_API_KEY"] = "15916f6b8a0a976ab7f92ed1c4e3bc9bb40c73b40404ad2
 search = GoogleSearchAPIWrapper(k=4)
 ZEP_API_URL = "http://4.224.46.164:8000"
 
-#openAPI spec 
+#openAPI spec
 spec = OpenAPISpec.from_file(
     "./openapi.yaml"
 )
@@ -122,7 +122,7 @@ def get_action_user_details(user_id):
     user_data = response.json()
 
     user_details = f'''Below are the information about the user.
-    user_name: {user_data["name"]} (Call the user by this name),gender: {user_data["gender"]},who_pays_for_course: {user_data["who_pays_for_course"]}(Entity Responsible for Paying the Course Fees),preferred_language: {user_data["preferred_language"]}(User's Preferred Language),date_of_birth: {user_data["dob"]},english_proficiency: {user_data["english_proficiency"]}(User's English Proficiency Level),created_date: {user_data["created_date"]}(user creation date),standard: {user_data["standard"]}(User's Standard in which user studying)
+    user_name: {user_data["name"]} (Call the user by this name when required and not always),gender: {user_data["gender"]},who_pays_for_course: {user_data["who_pays_for_course"]}(Entity Responsible for Paying the Course Fees),preferred_language: {user_data["preferred_language"]}(User's Preferred Language),date_of_birth: {user_data["dob"]},english_proficiency: {user_data["english_proficiency"]}(User's English Proficiency Level),created_date: {user_data["created_date"]}(user creation date),standard: {user_data["standard"]}(User's Standard in which user studying)
    '''
     return user_details, actions
 
@@ -138,7 +138,7 @@ def get_time_based_history(prompt:str, session_id:str, start_date:str, end_date:
 
 
     # messages = [message.message["content"] for message in messages if message.dist>0.8 and message.message["role"]!="system" and message.message["role"]!="ai"]
-    
+
     try:
         messages = memory.chat_memory.search(prompt)
 
@@ -208,11 +208,18 @@ class CustomConvoOutputParser(AgentOutputParser):
                 start_index = text.index('{')
                 end_index = text.rindex('}') + 1
                 json_string = text[start_index:end_index]
-                parsed_json = json.loads(json_string)
+                parsed_json = parse_json_markdown(json_string)
                 action_input = parsed_json["action_input"]
                 return AgentFinish({"output": action_input}, text)
                 # print(action_input_text)
-            # raise OutputParserException(f"Could not parse LLM output: {text}") from e
+            else:
+                start_index = text.index('{')
+                end_index = text.rindex('}') + 1
+                json_string = text[start_index:end_index]
+                response = parse_json_markdown(json_string)
+                action, action_input = response["action"], response["action_input"]
+                return AgentAction(action, action_input, text)
+                # raise OutputParserException(f"Could not parse LLM output: {text}") from e
 
     @property
     def _type(self) -> str:
@@ -237,7 +244,12 @@ def get_ans(user_id, query):
         Tool(
             name="OpenAPI_Specification",
             func=chain.run,
-            description=f"Use this feature when you need to search for information from one of our available APIs. It is applicable in scenarios such as when a user is asking for image generation using text note while generating image use entire prompt as it is, information about students, or available books. This functionality should only be utilized when the intent falls within the categories of image generation using text, gathering information on students, or locating available books."
+            description="Use this feature only when the user's request specifically pertains to one of the following scenarios:\
+            Image Creation: When a request involves generating an image using text, this feature should be engaged. The entire text prompt must be used as it is for the image generation process.\
+            Student Information: If a request is made for information regarding students, this functionality should be utilized to retrieve the necessary details.\
+            Query Available Books: When the user is inquiring about available books, this feature should be used to locate and provide information about the required texts.\
+            Any CRUD operation which is not a READ or anything related to curriculum should not use this tool,  It is vital to ensure that the intent precisely falls within one of the above  categories before engaging this functionality.\
+            Don't use this to create a custom curriculum for user"
         ),
         Tool(
             name="Search",
@@ -248,38 +260,35 @@ def get_ans(user_id, query):
             name="Historical Conversations",
             func=parsing_string,
             description=f"""Utilize this utility exclusively when the information required predates the current day and pertains to the ongoing user. The necessary input for this tool comprises a list of values separated by commas.
-
             The list should encompass a user-generated query, designated by user input text, a commencement date denoted as start_date, and an end date labeled as end_date. The start_date denotes the initiation date for the user information search and should consistently adhere to the ISO 8601 format. Meanwhile, the end_date, also conforming to the ISO 8601 format, signifies the conclusion date for the search.
-
             In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what zep can do, 2023-07-12T10:19:56.732291Z, 2023-07-13T10:19:56.732291Z'.
-
             Strive to apply this tool judiciously for scenarios in which retrospective user information is imperative. The inputs should be meticulously arranged to facilitate the extraction of accurate and pertinent data within the specified timeframe."""
         )
-        
+
     ]
     # tools.append(PythonREPLTool())
 
-    
+
 
     prefix = f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
-        Imagine that you are the world's leading teacher, possessing knowledge in every field. Consider the consequences of each response you provide. 
-        Your answers must be meaningful and delivered as quickly as possible. As a highly educated and informed teacher, you have access to an extensive wealth of information.  
-        Your primary goal as a teacher is to assist students by answering their questions, providing accurate and up-to-date information. 
+        Imagine that you are the world's leading teacher, possessing knowledge in every field. Consider the consequences of each response you provide.
+        Your answers must be meaningful and delivered as quickly as possible. As a highly educated and informed teacher, you have access to an extensive wealth of information.
+        Your primary goal as a teacher is to assist students by answering their questions, providing accurate and up-to-date information.
         Please create a distinct personality for yourself, and remember never to refer to the user as a human or yourself as mere AI.
-        
+
         User details:
         {user_details}
 
-        Before you respond, consider the context in which you are utilized. You are Hevolve, a highly intelligent educational AI developed by HertzAI. 
-        You are designed to answer questions, provide revisions, conduct assessments, teach various topics, and assist with research for both students and working professionals. 
+        Before you respond, consider the context in which you are utilized. You are Hevolve, a highly intelligent educational AI developed by HertzAI.
+        You are designed to answer questions, provide revisions, conduct assessments, teach various topics, create personalised curriculum and assist with research for both students and working professionals.
         Your expertise draws from various knowledge sources like books, websites, and white papers. Your responses will be conveyed to the user through a video, using an avatar and text-to-speech technology, and can be translated into various languages.
 
         These are all the actions that the user has performed up to now:
         {actions}
-        
-        
-        
+
+
+
         always format your answer into parsable json format
         """
     suffix = """
@@ -295,7 +304,7 @@ def get_ans(user_id, query):
         {{tools}}
 
         {format_instructions}
-	    always create parsable output
+            always create parsable output
         USER'S INPUT
         --------------------
         Here is the user's input (remember to respond with a markdown code snippet of a json blob with a single action, and NOTHING else):
@@ -308,7 +317,7 @@ def get_ans(user_id, query):
         system_message=prefix
     )
 
-    
+
     #chat Agent
     llm_chain = LLMChain(llm=llm, prompt=prompt)
 
@@ -319,7 +328,7 @@ def get_ans(user_id, query):
     )
     ans = agent_chain.run(input=query)
 
-  
+
     # agent = initialize_agent(tools, llm, agent=AgentType.OPENAI_FUNCTIONS, verbose=True)
     # ans = agent.run(query)
 
