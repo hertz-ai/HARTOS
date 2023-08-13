@@ -245,7 +245,7 @@ def get_ans(user_id, query):
             name="OpenAPI_Specification",
             func=chain.run,
             description="Use this feature only when the user's request specifically pertains to one of the following scenarios:\
-            Image Creation: When a request involves generating an image using text, this feature should be engaged. The entire text prompt must be used as it is unless other requested to enhance further detail of prompt for the image generation process. If additional enahancement is needed , enrich the prompt to image generation with greater detail for learning.\
+            Image Creation: When a request involves generating an image using text, this feature should be engaged. The entire text prompt must be used as it is unless otherwise requested to enhance further detail of prompt for the image generation process. If additional enahancement is needed , enrich the prompt to image generation with greater detail for learning.\
             Student Information: If a request is made for information regarding students, this functionality should be utilized to retrieve the necessary details.\
             Query Available Books: When the user is inquiring about available books, this feature should be used to locate and provide information about the required texts.\
             Any CRUD operation which is not a READ or anything related to curriculum should not use this tool,  It is vital to ensure that the intent precisely falls within one of the above  categories before engaging this functionality.\
@@ -254,7 +254,7 @@ def get_ans(user_id, query):
         Tool(
             name="Search",
             func=search.run,
-            description="useful for when you need to answer questions about current events, current dates, weather, latest information or if you do not know user what user intends.",
+            description="useful for when you need to answer questions about current events, current dates, weather, latest information or if you do not know what user intends.",
         ),
         Tool(
             name="Historical Conversations",
