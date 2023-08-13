@@ -162,10 +162,19 @@ def get_time_based_history(prompt:str, session_id:str, start_date:str, end_date:
 
 
 def parsing_string(string):
-    prompt, start_date, end_date = [s.strip() for s in string.split(",")]
-    global user_id
-    session_id = 'user_'+str(user_id)
-    return get_time_based_history(prompt, session_id, start_date, end_date)
+    try:
+        prompt, start_date, end_date = [s.strip() for s in string.split(",")]
+        global user_id
+        session_id = 'user_'+str(user_id)
+        return get_time_based_history(prompt, session_id, start_date, end_date)
+    except:
+        # Get the current time
+        now = datetime.utcnow()
+
+        # Format the time in the desired format
+        formatted_time = now.strftime('%Y-%m-%dT%H:%M:%S.%f') + 'Z'
+        session_id = "user_"+str(user_id)
+        return get_time_based_history(string, session_id, formatted_time, formatted_time)
 
 #constants
 chain = get_openapi_chain(spec)
@@ -309,7 +318,7 @@ def get_ans(user_id, query):
 
         always create parsable output
 
-        USER CURRENT REQUEST INPUT
+        USER'S CURRENT REQUEST INPUT
         ----------------------------
         Here is the user's input (remember to respond with a markdown code snippet of a json blob with a single action, and NOTHING else):
 
