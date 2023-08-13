@@ -99,7 +99,7 @@ def get_action_user_details(user_id):
     response = requests.request(
         "GET", action_url, headers=headers, data=payload)
 
-    unwanted_actions=['Casual Conversation', 'Topic confirmation', 'Topic not found', 'Topic confirmation', 'Topic listing', 'Probe', 'Question Answering', 'Fallback']
+    unwanted_actions=['Casual Conversation', 'Topic confirmation', 'Topic not found', 'Topic Confirmation', 'Topic Listing', 'Probe', 'Question Answering', 'Fallback']
     data = response.json()
     action_texts = [obj["action"] for obj in data if obj["action"] not in unwanted_actions]
     if len(action_texts)==0:
@@ -122,7 +122,7 @@ def get_action_user_details(user_id):
     user_data = response.json()
 
     user_details = f'''Below are the information about the user.
-    user_name: {user_data["name"]} (Call the user by this name when required and not always),gender: {user_data["gender"]},who_pays_for_course: {user_data["who_pays_for_course"]}(Entity Responsible for Paying the Course Fees),preferred_language: {user_data["preferred_language"]}(User's Preferred Language),date_of_birth: {user_data["dob"]},english_proficiency: {user_data["english_proficiency"]}(User's English Proficiency Level),created_date: {user_data["created_date"]}(user creation date),standard: {user_data["standard"]}(User's Standard in which user studying)
+    user_name: {user_data["name"]} (Call the user by this name when required and not always),gender: {user_data["gender"]}, who_pays_for_course: {user_data["who_pays_for_course"]}(Entity Responsible for Paying the Course Fees), preferred_language: {user_data["preferred_language"]}(User's Preferred Language), date_of_birth: {user_data["dob"]}, english_proficiency: {user_data["english_proficiency"]}(User's English Proficiency Level), created_date: {user_data["created_date"]}(user creation date), standard: {user_data["standard"]}(User's Standard in which user studying)
    '''
     return user_details, actions
 
@@ -162,10 +162,19 @@ def get_time_based_history(prompt:str, session_id:str, start_date:str, end_date:
 
 
 def parsing_string(string):
-    prompt, start_date, end_date = [s.strip() for s in string.split(",")]
-    global user_id
-    session_id = 'user_'+str(user_id)
-    return get_time_based_history(prompt, session_id, start_date, end_date)
+    try:
+        prompt, start_date, end_date = [s.strip() for s in string.split(",")]
+        global user_id
+        session_id = 'user_'+str(user_id)
+        return get_time_based_history(prompt, session_id, start_date, end_date)
+    except:
+        # Get the current time
+        now = datetime.utcnow()
+
+        # Format the time in the desired format
+        formatted_time = now.strftime('%Y-%m-%dT%H:%M:%S.%f') + 'Z'
+        session_id = "user_"+str(user_id)
+        return get_time_based_history(string, session_id, formatted_time, formatted_time)
 
 #constants
 chain = get_openapi_chain(spec)
@@ -245,7 +254,7 @@ def get_ans(user_id, query):
             name="OpenAPI_Specification",
             func=chain.run,
             description="Use this feature only when the user's request specifically pertains to one of the following scenarios:\
-            Image Creation: When a request involves generating an image using text, this feature should be engaged. The entire text prompt must be used as it is for the image generation process.\
+            Image Creation: When a request involves generating an image using text, this feature should be engaged. The entire text prompt must be used as it is unless otherwise requested to enhance further detail of prompt for the image generation process. If additional enahancement is needed , enrich the prompt to image generation with greater detail for learning.\
             Student Information: If a request is made for information regarding students, this functionality should be utilized to retrieve the necessary details.\
             Query Available Books: When the user is inquiring about available books, this feature should be used to locate and provide information about the required texts.\
             Any CRUD operation which is not a READ or anything related to curriculum should not use this tool,  It is vital to ensure that the intent precisely falls within one of the above  categories before engaging this functionality.\
@@ -254,7 +263,7 @@ def get_ans(user_id, query):
         Tool(
             name="Search",
             func=search.run,
-            description="useful for when you need to answer questions about current events, current dates, weather.",
+            description="useful for when you need to answer questions about current events, current dates, weather, latest information or if you do not know what user intends.",
         ),
         Tool(
             name="Historical Conversations",
@@ -272,6 +281,7 @@ def get_ans(user_id, query):
 
     prefix = f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
+        Context:
         Imagine that you are the world's leading teacher, possessing knowledge in every field. Consider the consequences of each response you provide.
         Your answers must be meaningful and delivered as quickly as possible. As a highly educated and informed teacher, you have access to an extensive wealth of information.
         Your primary goal as a teacher is to assist students by answering their questions, providing accurate and up-to-date information.
@@ -288,11 +298,12 @@ def get_ans(user_id, query):
         {actions}
 
 
-
         always format your answer into parsable json format
+
+        Conversation History:
         """
     suffix = """
-        Only if this above history is not sufficient to fulfill the user's request then use tools.
+        Only if this above short conversation history is not sufficient to fulfill the user's request then use below tools. If results can be accomplished with above information skip tools section and move to format instructions.
 
         TOOLS
 
@@ -304,9 +315,11 @@ def get_ans(user_id, query):
         {{tools}}
 
         {format_instructions}
-            always create parsable output
-        USER'S INPUT
-        --------------------
+
+        always create parsable output
+
+        USER'S CURRENT REQUEST INPUT
+        ----------------------------
         Here is the user's input (remember to respond with a markdown code snippet of a json blob with a single action, and NOTHING else):
 
         {{{{input}}}}"""
@@ -314,7 +327,8 @@ def get_ans(user_id, query):
 
     prompt = ConversationalChatAgent.create_prompt(
         tools,
-        system_message=prefix
+        system_message=prefix,
+        human_message=suffix
     )
 
 
