@@ -101,10 +101,16 @@ def get_action_user_details(user_id):
 
     unwanted_actions=['Casual Conversation', 'Topic confirmation', 'Topic not found', 'Topic Confirmation', 'Topic Listing', 'Probe', 'Question Answering', 'Fallback']
     data = response.json()
-    action_texts = [obj["action"] for obj in data if obj["action"] not in unwanted_actions]
+    action_texts = [obj["action"] + ' on '+ obj["created_date"] for obj in data if obj["action"] not in unwanted_actions]
     if len(action_texts)==0:
-        action_texts=['user has not performed any actions yet']
+        action_texts=['user has not performed any actions yet.']
+
     actions = ", ".join(action_texts)
+    # Get the current time
+    now = datetime.utcnow()
+    # Format the time in the desired format
+    formatted_time = now.strftime('%Y-%m-%dT%H:%M:%S.%f') + 'Z'
+    actions = actions + ". List of actions ends. \n " + "Today's datetime in UTC is: "+  formatted_time
 
 
     # user detail api
@@ -266,7 +272,7 @@ def get_ans(user_id, query):
             description="useful for when you need to answer questions about current events, current dates, weather, latest information or if you do not know what user intends.",
         ),
         Tool(
-            name="Historical Conversations",
+            name="FULL_HISTORY",
             func=parsing_string,
             description=f"""Utilize this utility exclusively when the information required predates the current day and pertains to the ongoing user. The necessary input for this tool comprises a list of values separated by commas.
             The list should encompass a user-generated query, designated by user input text, a commencement date denoted as start_date, and an end date labeled as end_date. The start_date denotes the initiation date for the user information search and should consistently adhere to the ISO 8601 format. Meanwhile, the end_date, also conforming to the ISO 8601 format, signifies the conclusion date for the search.
@@ -293,6 +299,7 @@ def get_ans(user_id, query):
         Before you respond, consider the context in which you are utilized. You are Hevolve, a highly intelligent educational AI developed by HertzAI.
         You are designed to answer questions, provide revisions, conduct assessments, teach various topics, create personalised curriculum and assist with research for both students and working professionals.
         Your expertise draws from various knowledge sources like books, websites, and white papers. Your responses will be conveyed to the user through a video, using an avatar and text-to-speech technology, and can be translated into various languages.
+        Consider the user's location, time and context of previous dialogues with time to create a proper prompt for tools and follow up in-context questions.
 
         These are all the actions that the user has performed up to now:
         {actions}
@@ -303,7 +310,7 @@ def get_ans(user_id, query):
         Conversation History:
         """
     suffix = """
-        Only if this above short conversation history is not sufficient to fulfill the user's request then use below tools. If results can be accomplished with above information skip tools section and move to format instructions.
+        Only if this above conversation history is not sufficient to fulfill the user's request then use below FULL_HISTORY tool. If results can be accomplished with above information skip tools section and move to format instructions.
 
         TOOLS
 
@@ -318,9 +325,9 @@ def get_ans(user_id, query):
 
         always create parsable output
 
-        USER'S CURRENT REQUEST INPUT
-        ----------------------------
-        Here is the user's input (remember to respond with a markdown code snippet of a json blob with a single action, and NOTHING else):
+        USER'S INPUT
+        -------------
+        Here is the user's latest comment (remember to respond with a markdown code snippet of a json blob with a single action, and NOTHING else):
 
         {{{{input}}}}"""
 
