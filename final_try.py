@@ -63,7 +63,7 @@ class CustomGPT(LLM):
         response = requests.post(
             "http://aws_rasa.hertzai.com:5459/gpt-4",
             json={
-              "model": "gpt-3.5-turbo",
+              "model": "gpt-3.5-turbo-16k",
               "data": [{"role":"user","content":prompt}]
             }
         )
@@ -146,18 +146,26 @@ def get_time_based_history(prompt:str, session_id:str, start_date:str, end_date:
     # messages = [message.message["content"] for message in messages if message.dist>0.8 and message.message["role"]!="system" and message.message["role"]!="ai"]
 
     try:
-        messages = memory.chat_memory.search(prompt)
+
+        metadata={
+            "start_date": start_date,
+            "end_date":  end_date
+        }
+        #    "where": {"jsonpath": '$.system.entities[*] ? (@.Label == "WORK_OF_ART")'},
+
+
+        messages = memory.chat_memory.search(prompt,metadata=metadata)
 
         print("messages----->", messages)
 
-        filtered_messages = [[message.message['content'] for message in messages if message.message["role"]!="system" and datetime.fromisoformat(start_date.replace('Z', '+00:00')).replace(tzinfo=timezone.utc) <= datetime.fromisoformat(message.message['created_at'].replace('Z', '+00:00')).replace(tzinfo=timezone.utc) <= datetime.fromisoformat(end_date.replace('Z', '+00:00')).replace(tzinfo=timezone.utc) and message.dist>0.8 ]]
+        #filtered_messages = [[message.message['content'] for message in messages if message.message["role"]!="system" and datetime.fromisoformat(start_date.replace('Z', '+00:00')).replace(tzinfo=timezone.utc) <= datetime.fromisoformat(message.message['created_at'].replace('Z', '+00:00')).replace(tzinfo=timezone.utc) <= datetime.fromisoformat(end_date.replace('Z', '+00:00')).replace(tzinfo=timezone.utc) and message.dist>0.8 ]]
         #filtered_messages = [message.message['content'] for message in messages if message.message["role"] != "system" and
         #                 datetime.strptime(start_date, '%Y-%m-%dT%H:%M:%S.%fZ').replace(tzinfo=timezone.utc) <=
         #                 datetime.strptime(message.message['created_at'], '%Y-%m-%dT%H:%M:%S.%fZ').replace(tzinfo=timezone.utc) <=
         #                 datetime.strptime(end_date, '%Y-%m-%dT%H:%M:%S.%fZ').replace(tzinfo=timezone.utc) and
         #                 message.dist > 0.8 ]
         #print("filter_messages ----->",filtered_messages)
-        final_res = {'res_in_filter':filter_messages}
+        final_res = {'res_in_filter':messages}
         print(final_res)
         return json.dumps(final_res)
     except:
@@ -276,8 +284,8 @@ def get_ans(user_id, query):
             func=parsing_string,
             description=f"""Utilize this utility exclusively when the information required predates the current day and pertains to the ongoing user. The necessary input for this tool comprises a list of values separated by commas.
             The list should encompass a user-generated query, designated by user input text, a commencement date denoted as start_date, and an end date labeled as end_date. The start_date denotes the initiation date for the user information search and should consistently adhere to the ISO 8601 format. Meanwhile, the end_date, also conforming to the ISO 8601 format, signifies the conclusion date for the search.
-            In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what zep can do, 2023-07-12T10:19:56.732291Z, 2023-07-13T10:19:56.732291Z'.
-            Strive to apply this tool judiciously for scenarios in which retrospective user information is imperative. The inputs should be meticulously arranged to facilitate the extraction of accurate and pertinent data within the specified timeframe."""
+            In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what zep can do, 2023-07-12T10:19:56.732291Z, 2023-07-13T10:19:56.732291Z'. Remove any references to time based words like yesterday, today, last year since the date range you provide already accounts for that. e.g. if user has asked what did we discuss the day before yesterday then the text argument should just be what did we discuss followed by  start and end datetime.
+            Strive to apply this tool judiciously for scenarios in which retrospective user information is imperative. The inputs should be meticulously arranged  to facilitate the extraction of accurate and pertinent data within the specified timeframe."""
         )
 
     ]
@@ -325,11 +333,11 @@ def get_ans(user_id, query):
 
         always create parsable output
 
-        USER'S INPUT
-        -------------
-        Here is the user's latest comment (remember to respond with a markdown code snippet of a json blob with a single action, and NOTHING else):
+        Here is the User and AI conversation in reverse chronological order:
 
-        {{{{input}}}}"""
+        USER'S INPUT:
+        -------------
+        Latest USER'S INPUT For which you need to respond: {{{{input}}}}"""
 
 
     prompt = ConversationalChatAgent.create_prompt(
