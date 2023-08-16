@@ -2586,46 +2586,8 @@ components:
         - email_address
         - phone_number
       title: verifyStudent
-    verifyTeacher:
-      properties:
-        email_address:
-          type: string
-          title: Email Address
-        phone_number:
-          type: string
-          title: Phone Number
-      type: object
-      required:
-        - email_address
-        - phone_number
-      title: verifyTeacher
-    verifyTeacherByPhone:
-      properties:
-        phone_number:
-          type: string
-          title: Phone Number
-      type: object
-      required:
-        - phone_number
-      title: verifyTeacherByPhone
-    voiceSampleResponse:
-      properties:
-        voice_id:
-          type: integer
-          title: Voice Id
-        voice_sample_url:
-          type: string
-          title: Voice Sample Url
-        upload_date:
-          type: string
-          format: date-time
-          title: Upload Date
-      type: object
-      required:
-        - voice_id
-        - voice_sample_url
-        - upload_date
-      title: voiceSampleResponse
+    
+    
   securitySchemes:
     basicAuth:     # <-- arbitrary name for the security scheme
       type: http

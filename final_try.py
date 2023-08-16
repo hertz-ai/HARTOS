@@ -63,7 +63,7 @@ class CustomGPT(LLM):
         response = requests.post(
             "http://aws_rasa.hertzai.com:5459/gpt-4",
             json={
-              "model": "gpt-3.5-turbo",
+              "model": "gpt-3.5-turbo-16k",
               "data": [{"role":"user","content":prompt}]
             }
         )
@@ -99,12 +99,18 @@ def get_action_user_details(user_id):
     response = requests.request(
         "GET", action_url, headers=headers, data=payload)
 
-    unwanted_actions=['Casual Conversation', 'Topic confirmation', 'Topic not found', 'Topic confirmation', 'Topic listing', 'Probe', 'Question Answering', 'Fallback']
+    unwanted_actions=['Casual Conversation', 'Topic confirmation', 'Topic not found', 'Topic Confirmation', 'Topic Listing', 'Probe', 'Question Answering', 'Fallback']
     data = response.json()
-    action_texts = [obj["action"] for obj in data if obj["action"] not in unwanted_actions]
+    action_texts = [obj["action"] + ' on '+ obj["created_date"] for obj in data if obj["action"] not in unwanted_actions]
     if len(action_texts)==0:
-        action_texts=['user has not performed any actions yet']
+        action_texts=['user has not performed any actions yet.']
+
     actions = ", ".join(action_texts)
+    # Get the current time
+    now = datetime.utcnow()
+    # Format the time in the desired format
+    formatted_time = now.strftime('%Y-%m-%dT%H:%M:%S.%f') + 'Z'
+    actions = actions + ". List of actions ends. \n " + "Today's datetime in UTC is: "+  formatted_time
 
 
     # user detail api
@@ -122,7 +128,7 @@ def get_action_user_details(user_id):
     user_data = response.json()
 
     user_details = f'''Below are the information about the user.
-    user_name: {user_data["name"]} (Call the user by this name),gender: {user_data["gender"]},who_pays_for_course: {user_data["who_pays_for_course"]}(Entity Responsible for Paying the Course Fees),preferred_language: {user_data["preferred_language"]}(User's Preferred Language),date_of_birth: {user_data["dob"]},english_proficiency: {user_data["english_proficiency"]}(User's English Proficiency Level),created_date: {user_data["created_date"]}(user creation date),standard: {user_data["standard"]}(User's Standard in which user studying)
+    user_name: {user_data["name"]} (Call the user by this name when required and not always),gender: {user_data["gender"]}, who_pays_for_course: {user_data["who_pays_for_course"]}(Entity Responsible for Paying the Course Fees), preferred_language: {user_data["preferred_language"]}(User's Preferred Language), date_of_birth: {user_data["dob"]}, english_proficiency: {user_data["english_proficiency"]}(User's English Proficiency Level), created_date: {user_data["created_date"]}(user creation date), standard: {user_data["standard"]}(User's Standard in which user studying)
    '''
     return user_details, actions
 
@@ -140,18 +146,26 @@ def get_time_based_history(prompt:str, session_id:str, start_date:str, end_date:
     # messages = [message.message["content"] for message in messages if message.dist>0.8 and message.message["role"]!="system" and message.message["role"]!="ai"]
     
     try:
-        messages = memory.chat_memory.search(prompt)
+        
+        metadata={
+            "start_date": start_date,
+            "end_date":  end_date
+        }
+        #    "where": {"jsonpath": '$.system.entities[*] ? (@.Label == "WORK_OF_ART")'},
+        
+
+        messages = memory.chat_memory.search(prompt,metadata=metadata)
 
         print("messages----->", messages)
 
-        filtered_messages = [[message.message['content'] for message in messages if message.message["role"]!="system" and datetime.fromisoformat(start_date.replace('Z', '+00:00')).replace(tzinfo=timezone.utc) <= datetime.fromisoformat(message.message['created_at'].replace('Z', '+00:00')).replace(tzinfo=timezone.utc) <= datetime.fromisoformat(end_date.replace('Z', '+00:00')).replace(tzinfo=timezone.utc) and message.dist>0.8 ]]
+        #filtered_messages = [[message.message['content'] for message in messages if message.message["role"]!="system" and datetime.fromisoformat(start_date.replace('Z', '+00:00')).replace(tzinfo=timezone.utc) <= datetime.fromisoformat(message.message['created_at'].replace('Z', '+00:00')).replace(tzinfo=timezone.utc) <= datetime.fromisoformat(end_date.replace('Z', '+00:00')).replace(tzinfo=timezone.utc) and message.dist>0.8 ]]
         #filtered_messages = [message.message['content'] for message in messages if message.message["role"] != "system" and
         #                 datetime.strptime(start_date, '%Y-%m-%dT%H:%M:%S.%fZ').replace(tzinfo=timezone.utc) <=
         #                 datetime.strptime(message.message['created_at'], '%Y-%m-%dT%H:%M:%S.%fZ').replace(tzinfo=timezone.utc) <=
         #                 datetime.strptime(end_date, '%Y-%m-%dT%H:%M:%S.%fZ').replace(tzinfo=timezone.utc) and
         #                 message.dist > 0.8 ]
         #print("filter_messages ----->",filtered_messages)
-        final_res = {'res_in_filter':filter_messages}
+        final_res = {'res_in_filter':messages}
         print(final_res)
         return json.dumps(final_res)
     except:
@@ -162,10 +176,19 @@ def get_time_based_history(prompt:str, session_id:str, start_date:str, end_date:
 
 
 def parsing_string(string):
-    prompt, start_date, end_date = [s.strip() for s in string.split(",")]
-    global user_id
-    session_id = 'user_'+str(user_id)
-    return get_time_based_history(prompt, session_id, start_date, end_date)
+    try:
+        prompt, start_date, end_date = [s.strip() for s in string.split(",")]
+        global user_id
+        session_id = 'user_'+str(user_id)
+        return get_time_based_history(prompt, session_id, start_date, end_date)
+    except:
+        # Get the current time
+        now = datetime.utcnow()
+
+        # Format the time in the desired format
+        formatted_time = now.strftime('%Y-%m-%dT%H:%M:%S.%f') + 'Z'
+        session_id = "user_"+str(user_id)
+        return get_time_based_history(string, session_id, formatted_time, formatted_time)
 
 #constants
 chain = get_openapi_chain(spec)
@@ -208,11 +231,18 @@ class CustomConvoOutputParser(AgentOutputParser):
                 start_index = text.index('{')
                 end_index = text.rindex('}') + 1
                 json_string = text[start_index:end_index]
-                parsed_json = json.loads(json_string)
+                parsed_json = parse_json_markdown(json_string)
                 action_input = parsed_json["action_input"]
                 return AgentFinish({"output": action_input}, text)
                 # print(action_input_text)
-            # raise OutputParserException(f"Could not parse LLM output: {text}") from e
+            else:
+                start_index = text.index('{')
+                end_index = text.rindex('}') + 1
+                json_string = text[start_index:end_index]
+                response = parse_json_markdown(json_string)
+                action, action_input = response["action"], response["action_input"]
+                return AgentAction(action, action_input, text)
+		# raise OutputParserException(f"Could not parse LLM output: {text}") from e
 
     @property
     def _type(self) -> str:
@@ -237,23 +267,25 @@ def get_ans(user_id, query):
         Tool(
             name="OpenAPI_Specification",
             func=chain.run,
-            description=f"Use this feature when you need to search for information from one of our available APIs. It is applicable in scenarios such as when a user is asking for image generation using text note while generating image use entire prompt as it is, information about students, or available books. This functionality should only be utilized when the intent falls within the categories of image generation using text, gathering information on students, or locating available books."
+            description="Use this feature only when the user's request specifically pertains to one of the following scenarios:\
+            Image Creation: When a request involves generating an image using text, this feature should be engaged. The entire text prompt must be used as it is unless otherwise requested to enhance further detail of prompt for the image generation process. If additional enahancement is needed , enrich the prompt to image generation with greater detail for learning.\
+            Student Information: If a request is made for information regarding students, this functionality should be utilized to retrieve the necessary details.\
+            Query Available Books: When the user is inquiring about available books, this feature should be used to locate and provide information about the required texts.\
+            Any CRUD operation which is not a READ or anything related to curriculum should not use this tool,  It is vital to ensure that the intent precisely falls within one of the above  categories before engaging this functionality.\
+            Don't use this to create a custom curriculum for user"
         ),
         Tool(
             name="Search",
             func=search.run,
-            description="useful for when you need to answer questions about current events, current dates, weather.",
+            description="useful for when you need to answer questions about current events, current dates, weather, latest information or if you do not know what user intends.",
         ),
         Tool(
-            name="Historical Conversations",
+            name="FULL_HISTORY",
             func=parsing_string,
-            description=f"""Utilize this utility exclusively when the information required predates the current day and pertains to the ongoing user. The necessary input for this tool comprises a list of values separated by commas.
-
+            description=f"""Utilize this utility exclusively when the information required predates the current day and pertains to the ongoing user when there is neccessity of a conversational memory. The necessary input for this tool comprises a list of values separated by commas.
             The list should encompass a user-generated query, designated by user input text, a commencement date denoted as start_date, and an end date labeled as end_date. The start_date denotes the initiation date for the user information search and should consistently adhere to the ISO 8601 format. Meanwhile, the end_date, also conforming to the ISO 8601 format, signifies the conclusion date for the search.
-
-            In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what zep can do, 2023-07-12T10:19:56.732291Z, 2023-07-13T10:19:56.732291Z'.
-
-            Strive to apply this tool judiciously for scenarios in which retrospective user information is imperative. The inputs should be meticulously arranged to facilitate the extraction of accurate and pertinent data within the specified timeframe."""
+            In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what zep can do, 2023-07-12T10:19:56.732291Z, 2023-07-13T10:19:56.732291Z'. Remove any references to time based words like yesterday, today, last year since the date range you provide already accounts for that. e.g. if user has asked what did we discuss the day before yesterday then the text argument should just be what did we discuss followed by  start and end datetime.
+            Strive to apply this tool judiciously for scenarios in which retrospective user information is imperative. The inputs should be meticulously arranged  to facilitate the extraction of accurate and pertinent data within the specified timeframe."""
         )
         
     ]
@@ -261,51 +293,56 @@ def get_ans(user_id, query):
 
     
 
-    prefix = f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
-
-        Imagine that you are the world's leading teacher, possessing knowledge in every field. Consider the consequences of each response you provide. 
-        Your answers must be meaningful and delivered as quickly as possible. As a highly educated and informed teacher, you have access to an extensive wealth of information.  
+    prefix = f"""Imagine that you are one of the world's best teacher, possessing knowledge in every field. Consider the consequences of each response you provide. 
+        Your answers must be meaningful and delivered as quickly as possible. As a highly educated and informed teacher, you have access to an extensive wealth of information and conversation memory.  
         Your primary goal as a teacher is to assist students by answering their questions, providing accurate and up-to-date information. 
         Please create a distinct personality for yourself, and remember never to refer to the user as a human or yourself as mere AI.
         
-        User details:
+        User details
+        ------------
         {user_details}
 
         Before you respond, consider the context in which you are utilized. You are Hevolve, a highly intelligent educational AI developed by HertzAI. 
-        You are designed to answer questions, provide revisions, conduct assessments, teach various topics, and assist with research for both students and working professionals. 
-        Your expertise draws from various knowledge sources like books, websites, and white papers. Your responses will be conveyed to the user through a video, using an avatar and text-to-speech technology, and can be translated into various languages.
+        You are designed to answer questions, provide revisions, conduct assessments, teach various topics, create personalised curriculum and assist with research for both students and working professionals. 
+        Your expertise draws from various knowledge sources like books, websites, whitepapers and conversational memory. Your responses will be conveyed to the user through a video, using an avatar and text-to-speech technology, and can be translated into various languages.
+        Consider the user's location, time and context of previous dialogues with time to create a proper prompt for tools and follow up in-context questions.
+        Never say you do not have memory as you are integrated with a system to access memory on demand.
 
         These are all the actions that the user has performed up to now:
         {actions}
         
         
-        
         always format your answer into parsable json format
+
+        In-memory Dialogue History
+        --------------------------
         """
-    suffix = """
-        Only if this above history is not sufficient to fulfill the user's request then use tools.
+    suffix = """\n
+        System: Only if this above recent conversation history is not sufficient to fulfill the user's request then use below FULL_HISTORY tool. If results can be accomplished with above information skip tools section and move to format instructions. 
 
         TOOLS
-
-        ------
+        -----
 
         Assistant can use tools to look up information that may be helpful in answering the user's original question. The tools you can use are:
-
 
         {{tools}}
 
         {format_instructions}
-	    always create parsable output
-        USER'S INPUT
-        --------------------
-        Here is the user's input (remember to respond with a markdown code snippet of a json blob with a single action, and NOTHING else):
-
-        {{{{input}}}}"""
+	
+        Always create parsable output
+        
+        Here is the current User and AI conversation in chronological order:
+        
+        USER'S INPUT:
+        -------------
+        Latest USER'S INPUT for which you need to respond: {{{{input}}}}
+        \n"""
 
 
     prompt = ConversationalChatAgent.create_prompt(
         tools,
-        system_message=prefix
+        system_message=prefix,
+	    human_message=suffix
     )
 
     
@@ -341,6 +378,7 @@ def chat():
     ans = get_ans(user_id=user_id, query=prompt)
 
     return jsonify({'response': ans})
+
 
 
 if __name__ == '__main__':
