@@ -33,7 +33,7 @@ import pytz
 from datetime import datetime, timezone
 from typing import List, Union, Optional, Mapping, Any
 from langchain.agents.conversational_chat.output_parser import ConvoOutputParser
-
+import time
 
 user_id = 0
 
@@ -63,11 +63,13 @@ class CustomGPT(LLM):
         response = requests.post(
             "http://aws_rasa.hertzai.com:5459/gpt-4",
             json={
-              "model": "gpt-4",
+              "model": "gpt-3.5-turbo-16k",
               "data": [{"role":"user","content":prompt}]
             }
         )
         response.raise_for_status()
+        print("hellpppppppppppppppp-->", response.json()["text"])
+        time.sleep(10)
         return response.json()["text"]
 
     @property
@@ -192,7 +194,7 @@ def parsing_string(string):
 
 #constants
 chain = get_openapi_chain(spec)
-# llm = ChatOpenAI(model_name="gpt-3.5-turbo")
+# llm = ChatOpenAI(model_name="gpt-3.5-turbo-16k")
 # llm = ChatOpenAI(temperature=0, model="gpt-4")
 llm = CustomGPT()
 llm_math = LLMMathChain(llm=llm)
@@ -226,18 +228,29 @@ class CustomConvoOutputParser(AgentOutputParser):
                 return AgentAction(action, action_input, text)
         except Exception as e:
             # str = ""
+            print(text)
+            time.sleep
             if '"Final Answer"' in text:
                 # Extract the JSON part from the string
                 start_index = text.index('{')
-                end_index = text.rindex('}') + 1
+                try:
+                    end_index = text.rindex('}') + 1
+                except:
+                    text += '"}'
+                    end_index = text.rindex('}') + 1
                 json_string = text[start_index:end_index]
                 parsed_json = parse_json_markdown(json_string)
                 action_input = parsed_json["action_input"]
                 return AgentFinish({"output": action_input}, text)
                 # print(action_input_text)
             else:
+                print(text)
                 start_index = text.index('{')
-                end_index = text.rindex('}') + 1
+                try:
+                    end_index = text.rindex('}') + 1
+                except:
+                    text += '"}'
+                    end_index = text.rindex('}') + 1
                 json_string = text[start_index:end_index]
                 response = parse_json_markdown(json_string)
                 action, action_input = response["action"], response["action_input"]
@@ -258,12 +271,8 @@ def get_ans(user_id, query):
     # memory = ConversationSummaryMemory(llm=llm, memory_key="chat_history",
     #     return_messages=True)
     memory=get_memory(user_id=user_id)
-    tools = [
-        Tool(
-            name='Calculator',
-            func=llm_math.run,
-            description='Useful for when you need to answer questions about math.'
-        ),
+    tools = load_tools(["google-search"])
+    tool = [
         Tool(
             name="OpenAPI_Specification",
             func=chain.run,
@@ -275,20 +284,18 @@ def get_ans(user_id, query):
             Don't use this to create a custom curriculum for user"
         ),
         Tool(
-            name="Search",
-            func=search.run,
-            description="useful for when you need to answer questions about current events, current dates, weather, latest information or if you do not know what user intends.",
-        ),
-        Tool(
             name="FULL_HISTORY",
             func=parsing_string,
             description=f"""Utilize this utility exclusively when the information required predates the current day and pertains to the ongoing user. The necessary input for this tool comprises a list of values separated by commas.
             The list should encompass a user-generated query, designated by user input text, a commencement date denoted as start_date, and an end date labeled as end_date. The start_date denotes the initiation date for the user information search and should consistently adhere to the ISO 8601 format. Meanwhile, the end_date, also conforming to the ISO 8601 format, signifies the conclusion date for the search.
             In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what zep can do, 2023-07-12T10:19:56.732291Z, 2023-07-13T10:19:56.732291Z'. Remove any references to time based words like yesterday, today, last year since the date range you provide already accounts for that. e.g. if user has asked what did we discuss the day before yesterday then the text argument should just be what did we discuss followed by  start and end datetime.
             Strive to apply this tool judiciously for scenarios in which retrospective user information is imperative. The inputs should be meticulously arranged  to facilitate the extraction of accurate and pertinent data within the specified timeframe."""
-        )
-
+        )        
     ]
+    tools += tool
+    
+    print(type(tools))
+    
     # tools.append(PythonREPLTool())
 
 
@@ -299,7 +306,8 @@ def get_ans(user_id, query):
         Imagine that you are the world's leading teacher, possessing knowledge in every field. Consider the consequences of each response you provide.
         Your answers must be meaningful and delivered as quickly as possible. As a highly educated and informed teacher, you have access to an extensive wealth of information.
         Your primary goal as a teacher is to assist students by answering their questions, providing accurate and up-to-date information.
-        Please create a distinct personality for yourself, and remember never to refer to the user as a human or yourself as mere AI.
+        Please create a distinct personality for yourself, and remember never to refer to the user as a human or yourself as mere AI.\
+        your response should not be more than 200 words.
 
         User details:
         {user_details}
@@ -352,13 +360,11 @@ def get_ans(user_id, query):
     llm_chain = LLMChain(llm=llm, prompt=prompt)
 
     custom_parser = CustomConvoOutputParser()
-    agent = ConversationalChatAgent(llm_chain=llm_chain, tools=tools, verbose=True, return_intermediate_steps=True, output_parser=custom_parser)
+    agent = ConversationalChatAgent(llm_chain=llm_chain, tools=tools, verbose=True, output_parser=custom_parser)
     agent_chain = AgentExecutor.from_agent_and_tools(
-        agent=agent, tools=tools, verbose=True, memory=memory
+        agent=agent, tools=tools, verbose=True, memory=memory, 
     )
-    ans = agent_chain.run(input=query)
-
-
+    ans = agent_chain(query)
     # agent = initialize_agent(tools, llm, agent=AgentType.OPENAI_FUNCTIONS, verbose=True)
     # ans = agent.run(query)
 
