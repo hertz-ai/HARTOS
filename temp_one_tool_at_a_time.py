@@ -36,6 +36,7 @@ from langchain.agents.conversational_chat.output_parser import ConvoOutputParser
 import time
 
 user_id = 0
+recognized_intent = []
 
 #api and keys
 
@@ -60,8 +61,11 @@ class CustomGPT(LLM):
         return "custom"
 
     def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
+        start_time = time.time()
+    
+    
         response = requests.post(
-            "http://aws_rasa.hertzai.com:5459/gpt-4",
+            "http://aws_rasa.hertzai.com:5459/gpt-3-1000",
             json={
               "model": "gpt-3.5-turbo-16k",
               "data": [{"role":"user","content":prompt}]
@@ -69,8 +73,18 @@ class CustomGPT(LLM):
         )
         response.raise_for_status()
         print("hellpppppppppppppppp-->", response.json()["text"])
-        time.sleep(10)
-        return response.json()["text"]
+        global recognized_intent
+        try:
+            intents = json.loads(response.json()["text"])
+            recognized_intent.append(intents["action"])
+        except:
+            recognized_intent=["Final Answer"]
+        # time.sleep(10)
+        
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        print("time taken for this call is", elapsed_time)
+        return response.json()["text"].replace('\n', ' ').replace('\t', '')
 
     @property
     def _identifying_params(self) -> Mapping[str, Any]:
@@ -137,7 +151,7 @@ def get_action_user_details(user_id):
 def get_time_based_history(prompt:str, session_id:str, start_date:str, end_date:str):
     ZEP_API_URL = "http://4.224.46.164:8000"
     # print(type(start_date))
-
+    start_time = time.time()
     memory = ZepMemory(
         session_id=session_id,
         url=ZEP_API_URL,
@@ -146,7 +160,7 @@ def get_time_based_history(prompt:str, session_id:str, start_date:str, end_date:
 
 
     # messages = [message.message["content"] for message in messages if message.dist>0.8 and message.message["role"]!="system" and message.message["role"]!="ai"]
-
+   
     try:
 
         metadata={
@@ -169,11 +183,17 @@ def get_time_based_history(prompt:str, session_id:str, start_date:str, end_date:
         #print("filter_messages ----->",filtered_messages)
         final_res = {'res_in_filter':messages}
         print(final_res)
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        print("time taken for zep is", elapsed_time)
         return json.dumps(final_res)
     except:
         #return [message.message['content'] for message in messages]
         messages = memory.chat_memory.search(prompt)
         # print(final_res)
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        print("time taken for zep is", elapsed_time)
         return json.dumps({'res':[message.message['content'] for message in messages]})
 
 
@@ -310,22 +330,27 @@ def get_ans(user_id, query):
         your response should not be more than 200 words.
 
         User details:
+        <USER_DETAILS_START>
         {user_details}
-
+        <USER_DETAILS_END>
         Before you respond, consider the context in which you are utilized. You are Hevolve, a highly intelligent educational AI developed by HertzAI.
         You are designed to answer questions, provide revisions, conduct assessments, teach various topics, create personalised curriculum and assist with research for both students and working professionals.
         Your expertise draws from various knowledge sources like books, websites, and white papers. Your responses will be conveyed to the user through a video, using an avatar and text-to-speech technology, and can be translated into various languages.
         Consider the user's location, time and context of previous dialogues with time to create a proper prompt for tools and follow up in-context questions.
 
         These are all the actions that the user has performed up to now:
+        <PREVIOUS_USER_ACTION_START>
         {actions}
+        <PREVIOUS_USER_ACTION_END>
 
 
         always format your answer into parsable json format
 
         Conversation History:
+        <HISTORY_START>
         """
     suffix = """
+        <HISTORY_END>
         Only if this above conversation history is not sufficient to fulfill the user's request then use below FULL_HISTORY tool. If results can be accomplished with above information skip tools section and move to format instructions.
 
         TOOLS
@@ -335,9 +360,9 @@ def get_ans(user_id, query):
         Assistant can use tools to look up information that may be helpful in answering the user's 
         question. The tools you can use are:
 
-
+        <TOOLS_START>
         {{tools}}
-
+        <TOOLS_END>
         {format_instructions}
 
         always create parsable output
@@ -364,11 +389,11 @@ def get_ans(user_id, query):
     agent_chain = AgentExecutor.from_agent_and_tools(
         agent=agent, tools=tools, verbose=True, memory=memory, 
     )
-    ans = agent_chain(query)
+    ans = agent_chain.run(query)
     # agent = initialize_agent(tools, llm, agent=AgentType.OPENAI_FUNCTIONS, verbose=True)
     # ans = agent.run(query)
-
-    return ans
+    global recognized_intent
+    return ans, recognized_intent
 
 
 app = Flask(__name__)
@@ -382,9 +407,11 @@ def chat():
     user_id = data.get('user_id', None)
 
     prompt = data.get('prompt', None)
-    ans = get_ans(user_id=user_id, query=prompt)
+    ans, rec_intent = get_ans(user_id=user_id, query=prompt)
+    global recognized_intent
+    recognized_intent = []
 
-    return jsonify({'response': ans})
+    return jsonify({'response': ans, 'intent':rec_intent})
 
 @app.route('/add_history', methods=['POST'])
 def history():
