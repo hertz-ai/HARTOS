@@ -62,12 +62,12 @@ class CustomGPT(LLM):
 
     def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
         start_time = time.time()
-    
-    
+
+
         response = requests.post(
             "http://aws_rasa.hertzai.com:5459/gpt-3-1000",
             json={
-              "model": "gpt-3.5-turbo-16k",
+              "model": "gpt-4",
               "data": [{"role":"user","content":prompt}]
             }
         )
@@ -80,7 +80,7 @@ class CustomGPT(LLM):
         except:
             recognized_intent=["Final Answer"]
         # time.sleep(10)
-        
+
         end_time = time.time()
         elapsed_time = end_time - start_time
         print("time taken for this call is", elapsed_time)
@@ -160,7 +160,7 @@ def get_time_based_history(prompt:str, session_id:str, start_date:str, end_date:
 
 
     # messages = [message.message["content"] for message in messages if message.dist>0.8 and message.message["role"]!="system" and message.message["role"]!="ai"]
-   
+
     try:
 
         metadata={
@@ -211,6 +211,54 @@ def parsing_string(string):
         formatted_time = now.strftime('%Y-%m-%dT%H:%M:%S.%f') + 'Z'
         session_id = "user_"+str(user_id)
         return get_time_based_history(string, session_id, formatted_time, formatted_time)
+
+
+
+
+def parse_character_animation(string):
+    try:
+        global user_id
+        prompt = string
+        student_id_url = "http://aws_hevolve.hertzai.com:6006/getstudent_by_user_id"
+
+        payload = json.dumps({
+        "user_id": user_id
+        })
+        headers = {
+        'Content-Type': 'application/json'
+        }
+
+        response = requests.request("POST", student_id_url, headers=headers, data=payload)
+        favorite_teacher_id = response.json()["favorite_teacher_id"]
+
+        get_image_by_id_url = f"http://aws_hevolve.hertzai.com:6006/get_image_by_id/{favorite_teacher_id}"
+
+        payload = {}
+        headers = {}
+
+        response = requests.request("GET", get_image_by_id_url, headers=headers, data=payload)
+
+        image_name=response.json()["image_name"]
+
+        image_name = image_name.replace("vtoonify_", "", 1)
+        folder_name = image_name.split(".")[0]
+
+        inference_url = "http://aws_panohead.hertzai.com:5055/generate_images"
+        payload = json.dumps({
+            "weights_dir": f"/home/ubuntu/content/{folder_name}/stable_diffusion_weights/zwx/800",
+            "prompt": prompt
+        })
+        headers = {
+            'Content-Type': 'application/json'
+        }
+        response = requests.request("POST", inference_url, headers=headers, data=payload)
+        return response.json()["image_url"]
+    except:
+        return "something went wrong"
+
+
+
+
 
 #constants
 chain = get_openapi_chain(spec)
@@ -290,8 +338,10 @@ def get_ans(user_id, query):
     user_details, actions = get_action_user_details(user_id=user_id)
     # memory = ConversationSummaryMemory(llm=llm, memory_key="chat_history",
     #     return_messages=True)
+    print("query------>",query)
     memory=get_memory(user_id=user_id)
     tools = load_tools(["google-search"])
+    #calling_animation = f"use this for character animation use this user {user_id}, and extract prompt from user"
     tool = [
         Tool(
             name="OpenAPI_Specification",
@@ -301,7 +351,8 @@ def get_ans(user_id, query):
             Student Information: If a request is made for information regarding students, this functionality should be utilized to retrieve the necessary details.\
             Query Available Books: When the user is inquiring about available books, this feature should be used to locate and provide information about the required texts.\
             Any CRUD operation which is not a READ or anything related to curriculum should not use this tool,  It is vital to ensure that the intent precisely falls within one of the above  categories before engaging this functionality.\
-            Don't use this to create a custom curriculum for user"
+            Don't use this to create a custom curriculum for user \
+            "
         ),
         Tool(
             name="FULL_HISTORY",
@@ -310,12 +361,17 @@ def get_ans(user_id, query):
             The list should encompass a user-generated query, designated by user input text, a commencement date denoted as start_date, and an end date labeled as end_date. The start_date denotes the initiation date for the user information search and should consistently adhere to the ISO 8601 format. Meanwhile, the end_date, also conforming to the ISO 8601 format, signifies the conclusion date for the search.
             In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what zep can do, 2023-07-12T10:19:56.732291Z, 2023-07-13T10:19:56.732291Z'. Remove any references to time based words like yesterday, today, last year since the date range you provide already accounts for that. e.g. if user has asked what did we discuss the day before yesterday then the text argument should just be what did we discuss followed by  start and end datetime.
             Strive to apply this tool judiciously for scenarios in which retrospective user information is imperative. The inputs should be meticulously arranged  to facilitate the extraction of accurate and pertinent data within the specified timeframe."""
-        )        
+        ),
+        Tool(
+            name="Animate_Character",
+            func=parse_character_animation,
+            description='''Use this tool when a user asks to animate their selected character. Retrieve the prompt from the user's query, for example, "show me in a space suit, show yourself as cartoon standing in from of Taj Mahal" and return the image URL to the user.'''
+        )
     ]
     tools += tool
-    
+
     print(type(tools))
-    
+
     # tools.append(PythonREPLTool())
 
 
@@ -357,7 +413,7 @@ def get_ans(user_id, query):
 
         ------
 
-        Assistant can use tools to look up information that may be helpful in answering the user's 
+        Assistant can use tools to look up information that may be helpful in answering the user's
         question. The tools you can use are:
 
         <TOOLS_START>
@@ -387,7 +443,7 @@ def get_ans(user_id, query):
     custom_parser = CustomConvoOutputParser()
     agent = ConversationalChatAgent(llm_chain=llm_chain, tools=tools, verbose=True, output_parser=custom_parser)
     agent_chain = AgentExecutor.from_agent_and_tools(
-        agent=agent, tools=tools, verbose=True, memory=memory, 
+        agent=agent, tools=tools, verbose=True, memory=memory,
     )
     ans = agent_chain.run(query)
     # agent = initialize_agent(tools, llm, agent=AgentType.OPENAI_FUNCTIONS, verbose=True)
@@ -432,11 +488,13 @@ def history():
         return jsonify({'response':"Messages are saved!!!"}), 200
     else:
         return jsonify({'response':"Memory object not found"}), 400
-    
-    
-    
-    
-        
+
+
+@app.route('/status', methods=['GET'])
+def status():
+    return jsonify({'response':'Working...'})
+
+
 
 
 if __name__ == '__main__':

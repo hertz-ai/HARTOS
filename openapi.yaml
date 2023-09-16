@@ -13,6 +13,8 @@ tags:
     description: Convert given textual prompts into visual images.
   - name: Coursebatchbook
     description: Access operations for searching and listing available course-related books.
+  - name: Character Animation
+    description: animate user selected image as per prompt given by user. take two parameter user id and prompt.
 
 paths:
   /getstudent_by_user_id:
@@ -98,7 +100,39 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
-
+  
+  /generate_stable_image:
+    post: 
+      tags: 
+        -  Character Animation
+      summary: Convert the selected teacher avatar as per prompt given by user
+      operationId: character_animation
+      parameters: 
+        - name: user_id
+          in:  query
+          required: true
+          schema: 
+            type: integer
+            title: User Id
+        - name: prompt
+          in: query
+          required: true
+          schema: 
+            type: string
+            title: Prompt
+      responses: 
+        '200':
+          description: Successful Response
+          content: 
+            application/json:
+              schema: 
+                $ref: '#/components/schemas/CharacterAnimation'
+        '422':
+          description: Validation Error
+          content: 
+            application/json:
+              schema: 
+                $ref: "#/components/schemas/HTTPValidationError"  
 components:
   schemas:
     BookInfo:
@@ -130,6 +164,13 @@ components:
           type: string
           description: URL of the generated image
 
+    CharacterAnimation:
+      type: object
+      properties: 
+        imageUrl:
+          type: string
+          description: URL of image generated
+
     HTTPValidationError:
       type: object
       properties:
@@ -149,3 +190,4 @@ components:
           type: string
         type:
           type: string
+
