@@ -34,10 +34,10 @@ from datetime import datetime, timezone
 from typing import List, Union, Optional, Mapping, Any
 from langchain.agents.conversational_chat.output_parser import ConvoOutputParser
 import time
-
+import tiktoken
 user_id = 0
 recognized_intent = []
-
+encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
 #api and keys
 
 os.environ["OPENAI_API_KEY"] = "***REMOVED***"
@@ -63,14 +63,27 @@ class CustomGPT(LLM):
     def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
         start_time = time.time()
 
+        print("len---->",len(prompt.split(" ")))
+        #encoding = tiktoken.get_encoding("gpt-3.5-turbo")
+        num_tokens = len(encoding.encode(prompt))
+        print("len---->",num_tokens)
+        if num_tokens < 4000:
+            response = requests.post(
+                "http://aws_rasa.hertzai.com:5459/gpt-3-1000",
+                json={
+                "model": "gpt-3.5-turbo",
+                "data": [{"role":"user","content":prompt}]
+                }
+            )
+        else:
+            response = requests.post(
+                "http://aws_rasa.hertzai.com:5459/gpt-3-1000",
+                json={
+                "model": "gpt-3.5-turbo-16k",
+                "data": [{"role":"user","content":prompt}]
+                }
+            )
 
-        response = requests.post(
-            "http://aws_rasa.hertzai.com:5459/gpt-3-1000",
-            json={
-              "model": "gpt-4",
-              "data": [{"role":"user","content":prompt}]
-            }
-        )
         response.raise_for_status()
         print("hellpppppppppppppppp-->", response.json()["text"])
         global recognized_intent
@@ -124,9 +137,12 @@ def get_action_user_details(user_id):
     actions = ", ".join(action_texts)
     # Get the current time
     now = datetime.utcnow()
+    now1 = datetime.now()
+    current_time = now1.strftime("%H:%M:%S")
+
     # Format the time in the desired format
     formatted_time = now.strftime('%Y-%m-%dT%H:%M:%S.%f') + 'Z'
-    actions = actions + ". List of actions ends. \n " + "Today's datetime in UTC is: "+  formatted_time
+    actions = actions + ". List of actions ends. <PREVIOUS_USER_ACTION_END> \n " + "Today's datetime in UTC is: "+  formatted_time +  " and current time is: "+ current_time +" \n Whenever user is asking about current date or current time at perticular location then use this datetime format. Use the previous sentence datetime info to answer current time based questions coupled with google_search for current time or full_history for historical conversation based answers. Take a deep breath and think step by step.\n"
 
 
     # user detail api
@@ -144,7 +160,7 @@ def get_action_user_details(user_id):
     user_data = response.json()
 
     user_details = f'''Below are the information about the user.
-    user_name: {user_data["name"]} (Call the user by this name when required and not always),gender: {user_data["gender"]}, who_pays_for_course: {user_data["who_pays_for_course"]}(Entity Responsible for Paying the Course Fees), preferred_language: {user_data["preferred_language"]}(User's Preferred Language), date_of_birth: {user_data["dob"]}, english_proficiency: {user_data["english_proficiency"]}(User's English Proficiency Level), created_date: {user_data["created_date"]}(user creation date), standard: {user_data["standard"]}(User's Standard in which user studying)
+    user_name: {user_data["name"]} (Call the user by this name only when required and not always),gender: {user_data["gender"]}, who_pays_for_course: {user_data["who_pays_for_course"]}(Entity Responsible for Paying the Course Fees), preferred_language: {user_data["preferred_language"]}(User's Preferred Language), date_of_birth: {user_data["dob"]}, english_proficiency: {user_data["english_proficiency"]}(User's English Proficiency Level), created_date: {user_data["created_date"]}(user creation date), standard: {user_data["standard"]}(User's Standard in which user studying)
    '''
     return user_details, actions
 
@@ -262,8 +278,8 @@ def parse_character_animation(string):
 
 #constants
 chain = get_openapi_chain(spec)
-# llm = ChatOpenAI(model_name="gpt-3.5-turbo-16k")
-# llm = ChatOpenAI(temperature=0, model="gpt-4")
+#llm = ChatOpenAI(model_name="gpt-3.5-turbo-16k")
+#llm = ChatOpenAI(temperature=0, model="gpt-4")
 llm = CustomGPT()
 llm_math = LLMMathChain(llm=llm)
 
@@ -344,6 +360,11 @@ def get_ans(user_id, query):
     #calling_animation = f"use this for character animation use this user {user_id}, and extract prompt from user"
     tool = [
         Tool(
+            name='Calculator',
+            func=llm_math.run,
+            description='Useful for when you need to answer questions about math.'
+        ),
+        Tool(
             name="OpenAPI_Specification",
             func=chain.run,
             description="Use this feature only when the user's request specifically pertains to one of the following scenarios:\
@@ -351,8 +372,7 @@ def get_ans(user_id, query):
             Student Information: If a request is made for information regarding students, this functionality should be utilized to retrieve the necessary details.\
             Query Available Books: When the user is inquiring about available books, this feature should be used to locate and provide information about the required texts.\
             Any CRUD operation which is not a READ or anything related to curriculum should not use this tool,  It is vital to ensure that the intent precisely falls within one of the above  categories before engaging this functionality.\
-            Don't use this to create a custom curriculum for user \
-            "
+            Don't use this to create a custom curriculum for user"
         ),
         Tool(
             name="FULL_HISTORY",
@@ -360,48 +380,54 @@ def get_ans(user_id, query):
             description=f"""Utilize this utility exclusively when the information required predates the current day and pertains to the ongoing user. The necessary input for this tool comprises a list of values separated by commas.
             The list should encompass a user-generated query, designated by user input text, a commencement date denoted as start_date, and an end date labeled as end_date. The start_date denotes the initiation date for the user information search and should consistently adhere to the ISO 8601 format. Meanwhile, the end_date, also conforming to the ISO 8601 format, signifies the conclusion date for the search.
             In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what zep can do, 2023-07-12T10:19:56.732291Z, 2023-07-13T10:19:56.732291Z'. Remove any references to time based words like yesterday, today, last year since the date range you provide already accounts for that. e.g. if user has asked what did we discuss the day before yesterday then the text argument should just be what did we discuss followed by  start and end datetime.
-            Strive to apply this tool judiciously for scenarios in which retrospective user information is imperative. The inputs should be meticulously arranged  to facilitate the extraction of accurate and pertinent data within the specified timeframe."""
+            Strive to apply this tool judiciously for scenarios in which retrospective user information is imperative. The inputs should be meticulously arranged  to facilitate the extraction of accurate and pertinent data within the specified timeframe. Never use this tool for so what is the response to my last comment?"""
         ),
         Tool(
             name="Animate_Character",
             func=parse_character_animation,
-            description='''Use this tool when a user asks to animate their selected character. Retrieve the prompt from the user's query, for example, "show me in a space suit, show yourself as cartoon standing in from of Taj Mahal" and return the image URL to the user.'''
+            description='''Use this tool exclusively for animating the selected character or teacher as requested by the user; it is not intended for general requests or for animating random individuals. The user should specify their animation request in a query, such as 'Show me in a spacesuit' or 'Animate yourself as a cartoon standing in front of the Taj Mahal.' Once the request is made, the tool will generate the animation and return a URL link to the user that directs them to the animated image. Note that this tool is specifically designed to handle requests that involve animating a pre-selected character. It should not be used for general image generation tasks that don't pertain to animating the user's chosen character or teacher. For example, if a user queries 'Show me dancing in the rain,' and they have previously selected a specific character or teacher, the tool should be used to generate this animated scenario. However, if the user's request is something like 'Generate an image of a sunset,' which does not directly involve animating the selected character or teacher, then this tool should not be used.'''
         )
     ]
     tools += tool
 
-    print(type(tools))
+    #print(type(tools))
 
-    # tools.append(PythonREPLTool())
+    tools.append(PythonREPLTool())
 
 
 
     prefix = f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
+        <GENERAL_INSTRUCTION_START>
         Context:
         Imagine that you are the world's leading teacher, possessing knowledge in every field. Consider the consequences of each response you provide.
         Your answers must be meaningful and delivered as quickly as possible. As a highly educated and informed teacher, you have access to an extensive wealth of information.
         Your primary goal as a teacher is to assist students by answering their questions, providing accurate and up-to-date information.
         Please create a distinct personality for yourself, and remember never to refer to the user as a human or yourself as mere AI.\
         your response should not be more than 200 words.
-
+        <GENERAL_INSTRUCTION_END>
         User details:
         <USER_DETAILS_START>
         {user_details}
         <USER_DETAILS_END>
+        <CONTEXT_START>
         Before you respond, consider the context in which you are utilized. You are Hevolve, a highly intelligent educational AI developed by HertzAI.
         You are designed to answer questions, provide revisions, conduct assessments, teach various topics, create personalised curriculum and assist with research for both students and working professionals.
         Your expertise draws from various knowledge sources like books, websites, and white papers. Your responses will be conveyed to the user through a video, using an avatar and text-to-speech technology, and can be translated into various languages.
         Consider the user's location, time and context of previous dialogues with time to create a proper prompt for tools and follow up in-context questions.
-
+        <CONTEXT_END>
         These are all the actions that the user has performed up to now:
         <PREVIOUS_USER_ACTION_START>
         {actions}
-        <PREVIOUS_USER_ACTION_END>
 
-
-        always format your answer into parsable json format
-
+        <OUTPUT_FORMAT_INSTRUCTION_START>
+        Always format your answer into parsable json format
+        example:
+        <
+            'action':'action taken by agent'
+            'action_input':'input for the current action'
+        >
+        <OUTPUT_FORMAT_INSTRUCTION_END>
         Conversation History:
         <HISTORY_START>
         """
@@ -419,15 +445,30 @@ def get_ans(user_id, query):
         <TOOLS_START>
         {{tools}}
         <TOOLS_END>
+        <FORMAT_INSTRUCTION_START>
         {format_instructions}
-
+        <FORMAT_INSTRUCTION_END>
+        
         always create parsable output
 
         Here is the User and AI conversation in reverse chronological order:
 
         USER'S INPUT:
         -------------
-        Latest USER'S INPUT For which you need to respond: {{{{input}}}}"""
+        <USER_INPUT_START>
+        Latest USER'S INPUT For which you need to respond: {{{{input}}}}
+        <USER_INPUT_END>
+        """
+
+
+    TEMPLATE_TOOL_RESPONSE = """TOOL RESPONSE: 
+        ---------------------
+        {observation}
+
+        USER'S INPUT
+        --------------------
+
+        Okay, so what is reponse for this tool. If using information obtained from the tools you must mention it explicitly without mentioning the tool names - I have forgotten all TOOL RESPONSES! Remember to respond with a markdown code snippet of a json blob with a single action, and NOTHING else."""
 
 
     prompt = ConversationalChatAgent.create_prompt(
@@ -436,12 +477,12 @@ def get_ans(user_id, query):
         human_message=suffix
     )
 
-
+    
     #chat Agent
     llm_chain = LLMChain(llm=llm, prompt=prompt)
 
     custom_parser = CustomConvoOutputParser()
-    agent = ConversationalChatAgent(llm_chain=llm_chain, tools=tools, verbose=True, output_parser=custom_parser)
+    agent = ConversationalChatAgent(llm_chain=llm_chain, tools=tools, verbose=True, output_parser=custom_parser,template_tool_response=TEMPLATE_TOOL_RESPONSE)
     agent_chain = AgentExecutor.from_agent_and_tools(
         agent=agent, tools=tools, verbose=True, memory=memory,
     )
