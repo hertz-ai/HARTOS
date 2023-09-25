@@ -35,6 +35,8 @@ from typing import List, Union, Optional, Mapping, Any
 from langchain.agents.conversational_chat.output_parser import ConvoOutputParser
 import time
 import tiktoken
+from pytz import timezone 
+from datetime import datetime
 user_id = 0
 recognized_intent = []
 encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
@@ -136,13 +138,16 @@ def get_action_user_details(user_id):
 
     actions = ", ".join(action_texts)
     # Get the current time
-    now = datetime.utcnow()
+    now = datetime.now()
     now1 = datetime.now()
     current_time = now1.strftime("%H:%M:%S")
-
+    
+    time_zone = "Asia/Kolkata"
     # Format the time in the desired format
-    formatted_time = now.strftime('%Y-%m-%dT%H:%M:%S.%f') + 'Z'
-    actions = actions + ". List of actions ends. <PREVIOUS_USER_ACTION_END> \n " + "Today's datetime in UTC is: "+  formatted_time +  " and current time is: "+ current_time +" \n Whenever user is asking about current date or current time at perticular location then use this datetime format. Use the previous sentence datetime info to answer current time based questions coupled with google_search for current time or full_history for historical conversation based answers. Take a deep breath and think step by step.\n"
+    formatted_time = datetime.now(timezone(time_zone)).strftime('%Y-%m-%d %H:%M:%S.%f')
+    
+    actions = actions + ". List of actions ends. <PREVIOUS_USER_ACTION_END> \n " + "Today's datetime in "+time_zone + "is: "+  formatted_time +  " in this format:'%Y-%m-%dT%H:%M:%S.%f' \n Whenever user is asking about current date or current time at perticular location then use this datetime format. Use the previous sentence datetime info to answer current time based questions coupled with google_search for current time or full_history for historical conversation based answers. Take a deep breath and think step by step.\n"
+
 
 
     # user detail api
@@ -468,7 +473,7 @@ def get_ans(user_id, query):
         USER'S INPUT
         --------------------
 
-        Okay, so what is reponse for this tool. If using information obtained from the tools you must mention it explicitly without mentioning the tool names - I have forgotten all TOOL RESPONSES! Remember to respond with a markdown code snippet of a json blob with a single action, and NOTHING else."""
+        Okay, so what is response for this tool. If using information obtained from the tools you must mention it explicitly without mentioning the tool names - I have forgotten all TOOL RESPONSES! Remember to respond with a markdown code snippet of a json blob with a single action, and NOTHING else."""
 
 
     prompt = ConversationalChatAgent.create_prompt(
