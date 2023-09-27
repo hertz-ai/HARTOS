@@ -35,7 +35,7 @@ from typing import List, Union, Optional, Mapping, Any
 from langchain.agents.conversational_chat.output_parser import ConvoOutputParser
 import time
 import tiktoken
-from pytz import timezone 
+from pytz import timezone
 from datetime import datetime
 user_id = 0
 recognized_intent = []
@@ -58,18 +58,23 @@ spec = OpenAPISpec.from_file(
 
 #custom GPT
 class CustomGPT(LLM):
+    
+    count:int = 0
+    
     @property
     def _llm_type(self) -> str:
         return "custom"
 
     def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
         start_time = time.time()
+        self.count += 1
+        print(f'calling for {self.count} times')
 
         print("len---->",len(prompt.split(" ")))
         #encoding = tiktoken.get_encoding("gpt-3.5-turbo")
         num_tokens = len(encoding.encode(prompt))
         print("len---->",num_tokens)
-        if num_tokens < 4000:
+        if self.count < 5:
             response = requests.post(
                 "http://aws_rasa.hertzai.com:5459/gpt-3-1000",
                 json={
@@ -81,7 +86,7 @@ class CustomGPT(LLM):
             response = requests.post(
                 "http://aws_rasa.hertzai.com:5459/gpt-3-1000",
                 json={
-                "model": "gpt-3.5-turbo-16k",
+                "model": "gpt-4",
                 "data": [{"role":"user","content":prompt}]
                 }
             )
@@ -141,11 +146,11 @@ def get_action_user_details(user_id):
     now = datetime.now()
     now1 = datetime.now()
     current_time = now1.strftime("%H:%M:%S")
-    
+
     time_zone = "Asia/Kolkata"
     # Format the time in the desired format
     formatted_time = datetime.now(timezone(time_zone)).strftime('%Y-%m-%d %H:%M:%S.%f')
-    
+
     actions = actions + ". List of actions ends. <PREVIOUS_USER_ACTION_END> \n " + "Today's datetime in "+time_zone + "is: "+  formatted_time +  " in this format:'%Y-%m-%dT%H:%M:%S.%f' \n Whenever user is asking about current date or current time at perticular location then use this datetime format. Use the previous sentence datetime info to answer current time based questions coupled with google_search for current time or full_history for historical conversation based answers. Take a deep breath and think step by step.\n"
 
 
@@ -285,8 +290,8 @@ def parse_character_animation(string):
 chain = get_openapi_chain(spec)
 #llm = ChatOpenAI(model_name="gpt-3.5-turbo-16k")
 #llm = ChatOpenAI(temperature=0, model="gpt-4")
-llm = CustomGPT()
-llm_math = LLMMathChain(llm=llm)
+#llm = CustomGPT()
+llm_math = LLMMathChain(llm=ChatOpenAI(model_name="gpt-3.5-turbo"))
 
 
 
@@ -357,6 +362,7 @@ class CustomConvoOutputParser(AgentOutputParser):
 # main function
 def get_ans(user_id, query):
     user_details, actions = get_action_user_details(user_id=user_id)
+    llm = CustomGPT()
     # memory = ConversationSummaryMemory(llm=llm, memory_key="chat_history",
     #     return_messages=True)
     print("query------>",query)
@@ -453,7 +459,7 @@ def get_ans(user_id, query):
         <FORMAT_INSTRUCTION_START>
         {format_instructions}
         <FORMAT_INSTRUCTION_END>
-        
+
         always create parsable output
 
         Here is the User and AI conversation in reverse chronological order:
@@ -466,7 +472,7 @@ def get_ans(user_id, query):
         """
 
 
-    TEMPLATE_TOOL_RESPONSE = """TOOL RESPONSE: 
+    TEMPLATE_TOOL_RESPONSE = """TOOL RESPONSE:
         ---------------------
         {observation}
 
@@ -482,7 +488,7 @@ def get_ans(user_id, query):
         human_message=suffix
     )
 
-    
+
     #chat Agent
     llm_chain = LLMChain(llm=llm, prompt=prompt)
 
