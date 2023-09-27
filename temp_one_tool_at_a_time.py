@@ -58,9 +58,12 @@ spec = OpenAPISpec.from_file(
 
 #custom GPT
 class CustomGPT(LLM):
-    
+
     count:int = 0
-    
+    previous_intent: Optional[str]=None
+    call_gpt4:Optional[int]=0
+
+
     @property
     def _llm_type(self) -> str:
         return "custom"
@@ -74,11 +77,16 @@ class CustomGPT(LLM):
         #encoding = tiktoken.get_encoding("gpt-3.5-turbo")
         num_tokens = len(encoding.encode(prompt))
         print("len---->",num_tokens)
-        if self.count < 5:
+        if self.count >= 5 or self.call_gpt4 ==1:
+            print("call_gpt",self.call_gpt4)
+            # if self.call_gpt4:
+            #     print("calling gpt 4 while redundant intent")
+            # else:
+            #     print("counter reach limit of 5")
             response = requests.post(
                 "http://aws_rasa.hertzai.com:5459/gpt-3-1000",
                 json={
-                "model": "gpt-3.5-turbo",
+                "model": "gpt-4",
                 "data": [{"role":"user","content":prompt}]
                 }
             )
@@ -86,7 +94,7 @@ class CustomGPT(LLM):
             response = requests.post(
                 "http://aws_rasa.hertzai.com:5459/gpt-3-1000",
                 json={
-                "model": "gpt-4",
+                "model": "gpt-3.5-turbo",
                 "data": [{"role":"user","content":prompt}]
                 }
             )
@@ -96,6 +104,11 @@ class CustomGPT(LLM):
         global recognized_intent
         try:
             intents = json.loads(response.json()["text"])
+            curr_intent = intents["action"]
+            # print("current_intent",curr_intent,"previous_intent",self.previous_intent)
+            if self.previous_intent == curr_intent:
+                self.call_gpt4 = 1
+            self.previous_intent = curr_intent
             recognized_intent.append(intents["action"])
         except:
             recognized_intent=["Final Answer"]
