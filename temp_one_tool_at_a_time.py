@@ -339,6 +339,7 @@ class CustomConvoOutputParser(AgentOutputParser):
             time.sleep
             if '"Final Answer"' in text:
                 # Extract the JSON part from the string
+                escape_chars = ['\n', '\t', '\r', '\"', "\'", '\\', "'''", '"""']
                 start_index = text.index('{')
                 try:
                     end_index = text.rindex('}') + 1
@@ -346,10 +347,17 @@ class CustomConvoOutputParser(AgentOutputParser):
                     text += '"}'
                     end_index = text.rindex('}') + 1
                 json_string = text[start_index:end_index]
-                parsed_json = parse_json_markdown(json_string)
+                try:
+                    parsed_json = parse_json_markdown(json_string)
+                except Exception as e:
+                    parsed_json = parse_json_markdown(json_string.replace('\n', '').replace('\t', '').replace('\r', '').replace('\"', '').replace("\'", '').replace('\\', '').replace("'''", '').replace('"""', '').replace('```',''))
+                print("parsed_string",parsed_json)
                 action_input = parsed_json["action_input"]
                 return AgentFinish({"output": action_input}, text)
                 # print(action_input_text)
+            elif 'AI:' in text:
+                action_input = text.replace("AI:", "")
+                return AgentFinish({"output":action_input}, text)
             else:
                 print(text)
                 start_index = text.index('{')
@@ -405,7 +413,7 @@ def get_ans(user_id, query):
             The list should encompass a user-generated query, designated by user input text, a commencement date denoted as start_date, and an end date labeled as end_date. The start_date denotes the initiation date for the user information search and should consistently adhere to the ISO 8601 format. Meanwhile, the end_date, also conforming to the ISO 8601 format, signifies the conclusion date for the search.
             In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what zep can do, 2023-07-12T10:19:56.732291Z, 2023-07-13T10:19:56.732291Z'. Remove any references to time based words like yesterday, today, last year since the date range you provide already accounts for that. e.g. if user has asked what did we discuss the day before yesterday then the text argument should just be what did we discuss followed by  start and end datetime.
             Strive to apply this tool judiciously for scenarios in which retrospective user information is imperative. The inputs should be meticulously arranged  to facilitate the extraction of accurate and pertinent data within the specified timeframe. Never use this tool for so what is the response to my last comment?"""
-        ),
+        ),  
         Tool(
             name="Animate_Character",
             func=parse_character_animation,
@@ -416,7 +424,7 @@ def get_ans(user_id, query):
 
     #print(type(tools))
 
-    tools.append(PythonREPLTool())
+    # tools.append(PythonREPLTool())
 
 
 
