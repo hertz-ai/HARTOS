@@ -350,14 +350,10 @@ class CustomConvoOutputParser(AgentOutputParser):
                 try:
                     parsed_json = parse_json_markdown(json_string)
                 except Exception as e:
-                    parsed_json = parse_json_markdown(json_string.replace('\n', '').replace('\t', '').replace('\r', '').replace('\"', '').replace("\'", '').replace('\\', '').replace("'''", '').replace('"""', '').replace('```',''))
-                print("parsed_string",parsed_json)
+                    parsed_json = parse_json_markdown(json_string.replace('\n', '').replace('\t', '').replace('\r', '').replace('\"', '').replace("\'", '').replace('\\', '').replace("'''", '').replace('"""', '').replace('`',''))
                 action_input = parsed_json["action_input"]
                 return AgentFinish({"output": action_input}, text)
                 # print(action_input_text)
-            elif 'AI:' in text:
-                action_input = text.replace("AI:", "")
-                return AgentFinish({"output":action_input}, text)
             else:
                 print(text)
                 start_index = text.index('{')
