@@ -37,6 +37,23 @@ import time
 import tiktoken
 from pytz import timezone
 from datetime import datetime
+from waitress import serve
+import logging
+from logging.handlers import RotatingFileHandler
+
+
+## logging info
+logging.basicConfig(level=logging.DEBUG)
+handler = RotatingFileHandler('flask_app.log', maxBytes=100000, backupCount=3)
+
+# Set the logging level for the file handler
+handler.setLevel(logging.DEBUG)
+
+# Create a logging format
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+
+
 user_id = 0
 recognized_intent = []
 encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
@@ -95,7 +112,7 @@ class CustomGPT(LLM):
             response = requests.post(
                 "http://aws_rasa.hertzai.com:5454/chat",
                 json={
-                "model": "gpt-3.5-turbo",
+                "model": "gpt-4",
                 "data": [{"role":"user","content":prompt}],
                 "max_token":1000
                 }
@@ -299,6 +316,19 @@ def parse_character_animation(string):
 
 
 
+def parse_text_to_image(inp):
+    try:
+        
+        url = f'http://aws_rasa.hertzai.com:5459/txt2img?prompt={inp}'
+        payload = {}
+
+        headers = {}
+        response = requests.request("POST", url, headers=headers, data=payload)
+        return response.json()["img_url"]
+    except Exception as e:
+        return f"{e} Not able to generating image at this moment please try later"
+        
+        
 
 
 #constants
@@ -411,7 +441,12 @@ def get_ans(user_id, query):
             The list should encompass a user-generated query, designated by user input text, a commencement date denoted as start_date, and an end date labeled as end_date. The start_date denotes the initiation date for the user information search and should consistently adhere to the ISO 8601 format. Meanwhile, the end_date, also conforming to the ISO 8601 format, signifies the conclusion date for the search.
             In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what zep can do, 2023-07-12T10:19:56.732291Z, 2023-07-13T10:19:56.732291Z'. Remove any references to time based words like yesterday, today, last year since the date range you provide already accounts for that. e.g. if user has asked what did we discuss the day before yesterday then the text argument should just be what did we discuss followed by  start and end datetime.
             Strive to apply this tool judiciously for scenarios in which retrospective user information is imperative. The inputs should be meticulously arranged  to facilitate the extraction of accurate and pertinent data within the specified timeframe. Never use this tool for so what is the response to my last comment?"""
-        ),  
+        ),
+        Tool(
+            name="Text to image",
+            func=parse_text_to_image,
+            description="Based on user query generate visual representation of text. Extract prompt from user query and use it as input for function"  
+        ),
         Tool(
             name="Animate_Character",
             func=parse_character_animation,
@@ -569,4 +604,4 @@ def status():
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', debug=True, port=5000)
+    serve(app, host='0.0.0.0', port=5000)

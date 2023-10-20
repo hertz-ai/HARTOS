@@ -74,32 +74,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
-
-  /txt2img:
-    post:
-      tags:
-        - Text to Image
-      summary: Convert Text into Image
-      operationId: text_to_image
-      parameters:
-        - name: prompt
-          in: query
-          required: true
-          schema:
-            type: string
-      responses:
-        '200':
-          description: Successfully converted text into an image.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TextToImageResponse'
-        '422':
-          description: The request contained invalid parameters or failed validation.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
   
   /generate_stable_image:
     post: 
