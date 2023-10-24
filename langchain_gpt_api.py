@@ -66,6 +66,7 @@ os.environ["NEWS_API_KEY"] = "***REMOVED***"
 os.environ["SERPAPI_API_KEY"] = "***REMOVED***"
 search = GoogleSearchAPIWrapper(k=4)
 ZEP_API_URL = "http://4.224.46.164:8000"
+ZEP_API_KEY = "***REMOVED***"
 
 #openAPI spec
 spec = OpenAPISpec.from_file(
@@ -152,6 +153,7 @@ def get_memory(user_id:int):
         session_id=session_id,
         url=ZEP_API_URL,
         memory_key="chat_history",
+        api_key=ZEP_API_KEY,
         return_messages=True
     )
     return memory
@@ -213,6 +215,7 @@ def get_time_based_history(prompt:str, session_id:str, start_date:str, end_date:
     memory = ZepMemory(
         session_id=session_id,
         url=ZEP_API_URL,
+        api_key=ZEP_API_KEY,
         memory_key="chat_history",
     )
 
