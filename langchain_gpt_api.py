@@ -56,6 +56,8 @@ handler.setFormatter(formatter)
 
 user_id = 0
 recognized_intent = []
+req_total_tokens = 0
+res_total_tokens = 0
 encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
 #api and keys
 
@@ -74,12 +76,14 @@ spec = OpenAPISpec.from_file(
 )
 
 
+
 #custom GPT
 class CustomGPT(LLM):
 
     count:int = 0
     previous_intent: Optional[str]=None
     call_gpt4:Optional[int]=0
+    total_tokens:int = 0
 
 
     @property
@@ -87,13 +91,17 @@ class CustomGPT(LLM):
         return "custom"
 
     def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
+        global req_total_tokens
+        global res_total_tokens
         start_time = time.time()
         self.count += 1
+        # self.total_tokens = 0
         print(f'calling for {self.count} times')
 
         print("len---->",len(prompt.split(" ")))
         #encoding = tiktoken.get_encoding("gpt-3.5-turbo")
         num_tokens = len(encoding.encode(prompt))
+        req_total_tokens += num_tokens
         print("len---->",num_tokens)
         if self.count >= 5 or self.call_gpt4 ==1:
             print("call_gpt",self.call_gpt4)
@@ -113,7 +121,7 @@ class CustomGPT(LLM):
             response = requests.post(
                 "http://aws_rasa.hertzai.com:5454/chat",
                 json={
-                "model": "gpt-4",
+                "model": "gpt-3.5-turbo",
                 "data": [{"role":"user","content":prompt}],
                 "max_token":1000
                 }
@@ -137,6 +145,8 @@ class CustomGPT(LLM):
         end_time = time.time()
         elapsed_time = end_time - start_time
         print("time taken for this call is", elapsed_time)
+        num_tokens = len(encoding.encode(response.json()["text"].replace('\n', ' ').replace('\t', '')))
+        res_total_tokens += num_tokens
         return response.json()["text"].replace('\n', ' ').replace('\t', '')
 
     @property
@@ -558,7 +568,9 @@ def get_ans(user_id, query):
     # agent = initialize_agent(tools, llm, agent=AgentType.OPENAI_FUNCTIONS, verbose=True)
     # ans = agent.run(query)
     global recognized_intent
-    return ans, recognized_intent
+    global req_total_tokens
+    global res_total_tokens
+    return ans, recognized_intent, req_total_tokens, res_total_tokens
 
 
 app = Flask(__name__)
@@ -572,11 +584,15 @@ def chat():
     user_id = data.get('user_id', None)
 
     prompt = data.get('prompt', None)
-    ans, rec_intent = get_ans(user_id=user_id, query=prompt)
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+    global res_total_tokens
+    global req_total_tokens
+    req_total_tokens = 0
+    res_total_tokens = 0
     global recognized_intent
     recognized_intent = []
 
-    return jsonify({'response': ans, 'intent':rec_intent})
+    return jsonify({'response': ans, 'intent':rec_intent, 'req_token_count': req_token_count, 'res_token_count':res_token_count})
 
 @app.route('/add_history', methods=['POST'])
 def history():
