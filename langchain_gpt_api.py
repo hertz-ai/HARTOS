@@ -38,8 +38,12 @@ import tiktoken
 from pytz import timezone
 from datetime import datetime
 from waitress import serve
-import logging
 from logging.handlers import RotatingFileHandler
+from typing import Union
+from langchain.agents import AgentOutputParser
+from langchain.agents.conversational_chat.prompt import FORMAT_INSTRUCTIONS
+from langchain.output_parsers.json import parse_json_markdown
+from langchain.schema import AgentAction, AgentFinish, OutputParserException
 
 
 ## logging info
@@ -53,27 +57,58 @@ handler.setLevel(logging.DEBUG)
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 
+app = Flask(__name__)
 
-user_id = 0
-recognized_intent = []
-req_total_tokens = 0
-res_total_tokens = 0
-encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
-#api and keys
+app.logger.addHandler(handler)
 
-os.environ["OPENAI_API_KEY"] = "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"
-os.environ["GOOGLE_CSE_ID"] = "9589161c491c4493e"
-os.environ["GOOGLE_API_KEY"] = "AIzaSyCTEiyRiS8mfZlUp3Lc1JwmmyK4sZI_8Lo"
-os.environ["NEWS_API_KEY"] = "291350f6b8fd4df982f343888a4cabd5"
-os.environ["SERPAPI_API_KEY"] = "15916f6b8a0a976ab7f92ed1c4e3bc9bb40c73b40404ad2bbf219c5091394cb0"
-search = GoogleSearchAPIWrapper(k=4)
-ZEP_API_URL = "http://4.224.46.164:8000"
-ZEP_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.5NTb669plV5rLNHGQ5qKh2eLuTa5sWQn2w3BVnxAD1I"
+# Test logging
+app.logger.info('Logger initialized')
 
 #openAPI spec
 spec = OpenAPISpec.from_file(
     "./openapi.yaml"
 )
+
+
+
+with open("config.json", 'r') as f:
+    config = json.load(f)
+    
+
+
+# global variables
+user_id = 0
+recognized_intent = []
+req_total_tokens = 0
+res_total_tokens = 0
+encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
+
+#api and keys
+# app.logger.log(config['OPENAI_API_KEY'])
+os.environ["OPENAI_API_KEY"] = config['OPENAI_API_KEY']
+os.environ["GOOGLE_CSE_ID"] = config['GOOGLE_CSE_ID']
+os.environ["GOOGLE_API_KEY"] = config['GOOGLE_API_KEY']
+os.environ["NEWS_API_KEY"] = config['NEWS_API_KEY']
+os.environ["SERPAPI_API_KEY"] = config['SERPAPI_API_KEY']
+ZEP_API_URL = config['ZEP_API_URL']
+ZEP_API_KEY = config['ZEP_API_KEY']
+GPT_API = config['GPT_API']
+STUDENT_API= config['STUDENT_API']
+ACTION_API = config['ACTION_API']
+FAV_TEACHER_API = config['FAV_TEACHER_API']
+DREAMBOOTH_API= config['DREAMBOOTH_API']
+STABLE_DIFF_API = config['STABLE_DIFF_API']
+
+
+# google search API
+search = GoogleSearchAPIWrapper(k=4)
+
+#constants
+chain = get_openapi_chain(spec)
+#llm = ChatOpenAI(model_name="gpt-3.5-turbo-16k")
+#llm = ChatOpenAI(temperature=0, model="gpt-4")
+#llm = CustomGPT()
+llm_math = LLMMathChain(llm=ChatOpenAI(model_name="gpt-3.5-turbo"))
 
 
 
@@ -96,21 +131,16 @@ class CustomGPT(LLM):
         start_time = time.time()
         self.count += 1
         # self.total_tokens = 0
-        print(f'calling for {self.count} times')
+        app.logger.info(f'calling for {self.count} times')
 
-        print("len---->",len(prompt.split(" ")))
+        app.logger.info(f"len---->{len(prompt.split(' '))}")
         #encoding = tiktoken.get_encoding("gpt-3.5-turbo")
         num_tokens = len(encoding.encode(prompt))
         req_total_tokens += num_tokens
-        print("len---->",num_tokens)
+        app.logger.info(f"len---->{num_tokens}")
         if self.count >= 5 or self.call_gpt4 ==1:
-            print("call_gpt",self.call_gpt4)
-            # if self.call_gpt4:
-            #     print("calling gpt 4 while redundant intent")
-            # else:
-            #     print("counter reach limit of 5")
             response = requests.post(
-                "http://aws_rasa.hertzai.com:5454/chat",
+                GPT_API,
                 json={
                 "model": "gpt-4",
                 "data": [{"role":"user","content":prompt}],
@@ -119,7 +149,7 @@ class CustomGPT(LLM):
             )
         else:
             response = requests.post(
-                "http://aws_rasa.hertzai.com:5454/chat",
+                GPT_API,
                 json={
                 "model": "gpt-3.5-turbo",
                 "data": [{"role":"user","content":prompt}],
@@ -128,12 +158,11 @@ class CustomGPT(LLM):
             )
 
         response.raise_for_status()
-        print("hellpppppppppppppppp-->", response.json()["text"])
+        app.logger.info(f"hellpppppppppppppppp-->{response.json()['text']}")
         global recognized_intent
         try:
             intents = json.loads(response.json()["text"])
             curr_intent = intents["action"]
-            # print("current_intent",curr_intent,"previous_intent",self.previous_intent)
             if self.previous_intent == curr_intent:
                 self.call_gpt4 = 1
             self.previous_intent = curr_intent
@@ -144,7 +173,7 @@ class CustomGPT(LLM):
 
         end_time = time.time()
         elapsed_time = end_time - start_time
-        print("time taken for this call is", elapsed_time)
+        app.logger.info(f"time taken for this call is {elapsed_time}")
         num_tokens = len(encoding.encode(response.json()["text"].replace('\n', ' ').replace('\t', '')))
         res_total_tokens += num_tokens
         return response.json()["text"].replace('\n', ' ').replace('\t', '')
@@ -158,6 +187,9 @@ class CustomGPT(LLM):
 
 #helper functions
 def get_memory(user_id:int):
+    '''
+        Get memory object from zep
+    '''
     session_id = "user_"+str(user_id)
     memory = ZepMemory(
         session_id=session_id,
@@ -170,8 +202,10 @@ def get_memory(user_id:int):
 
 def get_action_user_details(user_id):
 
-
-    action_url = f"http://aws_hevolve.hertzai.com:6006/action_by_user_id?user_id={user_id}"
+    '''
+        This function help to extract action that user have perfomed till time
+    '''
+    action_url = f"{ACTION_API}?user_id={user_id}"
 
     payload = {}
     headers = {}
@@ -196,12 +230,9 @@ def get_action_user_details(user_id):
     formatted_time = datetime.now(timezone(time_zone)).strftime('%Y-%m-%d %H:%M:%S.%f')
 
     actions = actions + ". List of actions ends. <PREVIOUS_USER_ACTION_END> \n " + "Today's datetime in "+time_zone + "is: "+  formatted_time +  " in this format:'%Y-%m-%dT%H:%M:%S.%f' \n Whenever user is asking about current date or current time at perticular location then use this datetime format. Use the previous sentence datetime info to answer current time based questions coupled with google_search for current time or full_history for historical conversation based answers. Take a deep breath and think step by step.\n"
-
-
-
     # user detail api
 
-    url = "http://aws_hevolve.hertzai.com:6006/getstudent_by_user_id"
+    url = STUDENT_API
     payload = json.dumps({
         "user_id": user_id
     })
@@ -209,8 +240,6 @@ def get_action_user_details(user_id):
         'Content-Type': 'application/json'
     }
     response = requests.request("POST", url, headers=headers, data=payload)
-    # print()
-
     user_data = response.json()
 
     user_details = f'''Below are the information about the user.
@@ -219,8 +248,17 @@ def get_action_user_details(user_id):
     return user_details, actions
 
 def get_time_based_history(prompt:str, session_id:str, start_date:str, end_date:str):
-    ZEP_API_URL = "http://4.224.46.164:8000"
-    # print(type(start_date))
+    
+    '''
+        This function help to extract messages till specified time
+        inputs:
+            prompt: text from user from which we need to extract similar messages
+            session_id: user_{user_id}
+            start_date: time of search start
+            end_date: time till search
+    '''
+    
+    ZEP_API_URL = ZEP_API_URL
     start_time = time.time()
     memory = ZepMemory(
         session_id=session_id,
@@ -230,55 +268,38 @@ def get_time_based_history(prompt:str, session_id:str, start_date:str, end_date:
     )
 
 
-    # messages = [message.message["content"] for message in messages if message.dist>0.8 and message.message["role"]!="system" and message.message["role"]!="ai"]
-
     try:
 
         metadata={
             "start_date": start_date,
             "end_date":  end_date
         }
-        #    "where": {"jsonpath": '$.system.entities[*] ? (@.Label == "WORK_OF_ART")'},
 
 
         messages = memory.chat_memory.search(prompt,metadata=metadata)
-
-        print("messages----->", messages)
-
-        #filtered_messages = [[message.message['content'] for message in messages if message.message["role"]!="system" and datetime.fromisoformat(start_date.replace('Z', '+00:00')).replace(tzinfo=timezone.utc) <= datetime.fromisoformat(message.message['created_at'].replace('Z', '+00:00')).replace(tzinfo=timezone.utc) <= datetime.fromisoformat(end_date.replace('Z', '+00:00')).replace(tzinfo=timezone.utc) and message.dist>0.8 ]]
-        #filtered_messages = [message.message['content'] for message in messages if message.message["role"] != "system" and
-        #                 datetime.strptime(start_date, '%Y-%m-%dT%H:%M:%S.%fZ').replace(tzinfo=timezone.utc) <=
-        #                 datetime.strptime(message.message['created_at'], '%Y-%m-%dT%H:%M:%S.%fZ').replace(tzinfo=timezone.utc) <=
-        #                 datetime.strptime(end_date, '%Y-%m-%dT%H:%M:%S.%fZ').replace(tzinfo=timezone.utc) and
-        #                 message.dist > 0.8 ]
-        #print("filter_messages ----->",filtered_messages)
         final_res = {'res_in_filter':messages}
-        print(final_res)
         end_time = time.time()
         elapsed_time = end_time - start_time
-        print("time taken for zep is", elapsed_time)
         return json.dumps(final_res)
     except:
-        #return [message.message['content'] for message in messages]
         messages = memory.chat_memory.search(prompt)
-        # print(final_res)
         end_time = time.time()
         elapsed_time = end_time - start_time
-        print("time taken for zep is", elapsed_time)
+        app.logger.info("time taken for zep is {elapsed_time}")
         return json.dumps({'res':[message.message['content'] for message in messages]})
 
 
 def parsing_string(string):
+    '''
+        this function will extract infromation for above function ie prompt start date end date
+    '''
     try:
         prompt, start_date, end_date = [s.strip() for s in string.split(",")]
         global user_id
         session_id = 'user_'+str(user_id)
         return get_time_based_history(prompt, session_id, start_date, end_date)
     except:
-        # Get the current time
         now = datetime.utcnow()
-
-        # Format the time in the desired format
         formatted_time = now.strftime('%Y-%m-%dT%H:%M:%S.%f') + 'Z'
         session_id = "user_"+str(user_id)
         return get_time_based_history(string, session_id, formatted_time, formatted_time)
@@ -287,10 +308,18 @@ def parsing_string(string):
 
 
 def parse_character_animation(string):
+    '''
+        Dreambooth character animation api
+        input string
+        how this function works
+        1 get user information based on user_id
+        2 get fav teacher 
+        3 call dreambooth api with fav teacher name
+    '''
     try:
         global user_id
         prompt = string
-        student_id_url = "http://aws_hevolve.hertzai.com:6006/getstudent_by_user_id"
+        student_id_url = STUDENT_API
 
         payload = json.dumps({
         "user_id": user_id
@@ -302,7 +331,7 @@ def parse_character_animation(string):
         response = requests.request("POST", student_id_url, headers=headers, data=payload)
         favorite_teacher_id = response.json()["favorite_teacher_id"]
 
-        get_image_by_id_url = f"http://aws_hevolve.hertzai.com:6006/get_image_by_id/{favorite_teacher_id}"
+        get_image_by_id_url = f"{FAV_TEACHER_API}/{favorite_teacher_id}"
 
         payload = {}
         headers = {}
@@ -314,9 +343,9 @@ def parse_character_animation(string):
         image_name = image_name.replace("vtoonify_", "", 1)
         folder_name = image_name.split(".")[0]
 
-        inference_url = "http://aws_panohead.hertzai.com:5055/generate_images"
+        inference_url = f"{DREAMBOOTH_API}/generate_images"
         payload = json.dumps({
-            "weights_dir": f"/home/ubuntu/content/{folder_name}/stable_diffusion_weights/zwx/800",
+            "weights_dir": f"/usr/app/diffusers/examples/dreambooth/{folder_name}_result",
             "prompt": prompt
         })
         headers = {
@@ -330,9 +359,12 @@ def parse_character_animation(string):
 
 
 def parse_text_to_image(inp):
+    '''
+        stable diffusion 
+    '''
     try:
         
-        url = f'http://aws_rasa.hertzai.com:5459/txt2img?prompt={inp}'
+        url = f'{STABLE_DIFF_API}?prompt={inp}'
         payload = {}
 
         headers = {}
@@ -342,28 +374,7 @@ def parse_text_to_image(inp):
         return f"{e} Not able to generating image at this moment please try later"
         
         
-
-
-#constants
-chain = get_openapi_chain(spec)
-#llm = ChatOpenAI(model_name="gpt-3.5-turbo-16k")
-#llm = ChatOpenAI(temperature=0, model="gpt-4")
-#llm = CustomGPT()
-llm_math = LLMMathChain(llm=ChatOpenAI(model_name="gpt-3.5-turbo"))
-
-
-
-# output parser
-# from __future__ import annotations
-
-from typing import Union
-
-from langchain.agents import AgentOutputParser
-from langchain.agents.conversational_chat.prompt import FORMAT_INSTRUCTIONS
-from langchain.output_parsers.json import parse_json_markdown
-from langchain.schema import AgentAction, AgentFinish, OutputParserException
-
-
+        
 class CustomConvoOutputParser(AgentOutputParser):
     """Output parser for the conversational agent."""
 
@@ -380,7 +391,7 @@ class CustomConvoOutputParser(AgentOutputParser):
                 return AgentAction(action, action_input, text)
         except Exception as e:
             # str = ""
-            print(text)
+            app.logger.info(text)
             time.sleep
             if '"Final Answer"' in text:
                 # Extract the JSON part from the string
@@ -398,9 +409,8 @@ class CustomConvoOutputParser(AgentOutputParser):
                     parsed_json = parse_json_markdown(json_string.replace('\n', '').replace('\t', '').replace('\r', '').replace('\"', '').replace("\'", '').replace('\\', '').replace("'''", '').replace('"""', '').replace('`',''))
                 action_input = parsed_json["action_input"]
                 return AgentFinish({"output": action_input}, text)
-                # print(action_input_text)
             else:
-                print(text)
+                app.logger.info(text)
                 start_index = text.index('{')
                 try:
                     end_index = text.rindex('}') + 1
@@ -425,12 +435,9 @@ class CustomConvoOutputParser(AgentOutputParser):
 def get_ans(user_id, query):
     user_details, actions = get_action_user_details(user_id=user_id)
     llm = CustomGPT()
-    # memory = ConversationSummaryMemory(llm=llm, memory_key="chat_history",
-    #     return_messages=True)
-    print("query------>",query)
+    app.logger.info(f"query------> {query}")
     memory=get_memory(user_id=user_id)
     tools = load_tools(["google-search"])
-    #calling_animation = f"use this for character animation use this user {user_id}, and extract prompt from user"
     tool = [
         Tool(
             name='Calculator',
@@ -468,9 +475,6 @@ def get_ans(user_id, query):
     ]
     tools += tool
 
-    #print(type(tools))
-
-    # tools.append(PythonREPLTool())
 
 
 
@@ -565,15 +569,13 @@ def get_ans(user_id, query):
         agent=agent, tools=tools, verbose=True, memory=memory,
     )
     ans = agent_chain.run(query)
-    # agent = initialize_agent(tools, llm, agent=AgentType.OPENAI_FUNCTIONS, verbose=True)
-    # ans = agent.run(query)
     global recognized_intent
     global req_total_tokens
     global res_total_tokens
     return ans, recognized_intent, req_total_tokens, res_total_tokens
 
 
-app = Flask(__name__)
+
 
 
 @app.route('/chat', methods=['POST'])
