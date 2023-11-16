@@ -73,7 +73,7 @@ spec = OpenAPISpec.from_file(
 
 with open("config.json", 'r') as f:
     config = json.load(f)
-    
+
 
 
 # global variables
@@ -98,6 +98,7 @@ ACTION_API = config['ACTION_API']
 FAV_TEACHER_API = config['FAV_TEACHER_API']
 DREAMBOOTH_API= config['DREAMBOOTH_API']
 STABLE_DIFF_API = config['STABLE_DIFF_API']
+LLAVA_API = config['LLAVA_API']
 
 
 # google search API
@@ -185,6 +186,7 @@ class CustomGPT(LLM):
 
         }
 
+
 #helper functions
 def get_memory(user_id:int):
     '''
@@ -248,7 +250,7 @@ def get_action_user_details(user_id):
     return user_details, actions
 
 def get_time_based_history(prompt:str, session_id:str, start_date:str, end_date:str):
-    
+
     '''
         This function help to extract messages till specified time
         inputs:
@@ -257,8 +259,7 @@ def get_time_based_history(prompt:str, session_id:str, start_date:str, end_date:
             start_date: time of search start
             end_date: time till search
     '''
-    
-    ZEP_API_URL = ZEP_API_URL
+
     start_time = time.time()
     memory = ZepMemory(
         session_id=session_id,
@@ -313,7 +314,7 @@ def parse_character_animation(string):
         input string
         how this function works
         1 get user information based on user_id
-        2 get fav teacher 
+        2 get fav teacher
         3 call dreambooth api with fav teacher name
     '''
     try:
@@ -360,10 +361,10 @@ def parse_character_animation(string):
 
 def parse_text_to_image(inp):
     '''
-        stable diffusion 
+        stable diffusion
     '''
     try:
-        
+
         url = f'{STABLE_DIFF_API}?prompt={inp}'
         payload = {}
 
@@ -372,9 +373,29 @@ def parse_text_to_image(inp):
         return response.json()["img_url"]
     except Exception as e:
         return f"{e} Not able to generating image at this moment please try later"
+    
+def parse_image_to_text(inp):
+    '''
+        LlaVA implemetation
+    '''
+    
+    try:
+        inp_list = inp.split(',')
+        url = f'{LLAVA_API}'
+        payload = {
+            'url': inp_list[0],
+            'prompt': inp_list[1]
+        }
+        files=[]
+        headers={}
+        response = requests.request("POST", url, headers=headers, data=payload, files=files)
         
-        
-        
+        return response.text
+    except Exception as e:
+        return f'{e} Not able to generating answer at this moment please try later'
+
+
+
 class CustomConvoOutputParser(AgentOutputParser):
     """Output parser for the conversational agent."""
 
@@ -465,13 +486,20 @@ def get_ans(user_id, query):
         Tool(
             name="Text to image",
             func=parse_text_to_image,
-            description="Based on user query generate visual representation of text. Extract prompt from user query and use it as input for function"  
+            description="Based on user query generate visual representation of text. Extract prompt from user query and use it as input for function"
         ),
         Tool(
             name="Animate_Character",
             func=parse_character_animation,
             description='''Use this tool exclusively for animating the selected character or teacher as requested by the user; it is not intended for general requests or for animating random individuals. The user should specify their animation request in a query, such as 'Show me in a spacesuit' or 'Animate yourself as a cartoon standing in front of the Taj Mahal.' Once the request is made, the tool will generate the animation and return a URL link to the user that directs them to the animated image. Note that this tool is specifically designed to handle requests that involve animating a pre-selected character. It should not be used for general image generation tasks that don't pertain to animating the user's chosen character or teacher. For example, if a user queries 'Show me dancing in the rain,' and they have previously selected a specific character or teacher, the tool should be used to generate this animated scenario. However, if the user's request is something like 'Generate an image of a sunset,' which does not directly involve animating the selected character or teacher, then this tool should not be used.'''
+        ),
+        Tool(
+            name="Image_Inference_Tool",
+            func=parse_image_to_text,
+            description='''When a user provides a query containing an image download URL and a related question about that image, utilize this tool for support. Your objective is to extract both the image URL and the user's inquiry or prompt pertaining to that image from their query, and then convert these elements into comma seperated string. The format should be as follows: "image_url, user_query".
+            '''
         )
+        
     ]
     tools += tool
 
