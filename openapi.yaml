@@ -4,7 +4,7 @@ info:
   description: The Hevolve-db-app API provides programmatic access to educational resources such as student information, text-to-image conversion, and course-related book details. Explore the various endpoints to retrieve students by ID, convert textual prompts into images, and search or list available books.
   version: '1.0'
 servers:
-  - url: https://awskong.hertzai.com:8443/db
+  - url: https://azurekong.hertzai.com:8443/db
 
 tags:
   - name: Students

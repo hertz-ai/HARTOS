@@ -36,7 +36,7 @@ cd /opt/
 
 #clone repo
 cd /opt/
-git clone https://$TOKEN@github.com/hertz-ai/LLM-langchain_Chatbot-Agent.git
+git clone -b sahil https://$TOKEN@github.com/hertz-ai/LLM-langchain_Chatbot-Agent.git
 cd LLM-langchain_Chatbot-Agent
 
 sudo docker build -t langchain_gpt:latest .
