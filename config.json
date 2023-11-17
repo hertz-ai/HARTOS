@@ -12,7 +12,7 @@
     "ACTION_API": "http://aws_hevolve.hertzai.com:6006/action_by_user_id",
     "FAV_TEACHER_API": "http://aws_hevolve.hertzai.com:6006/get_image_by_id",
     "DREAMBOOTH_API": "http://azure_resume_parse.hertzai.com:5010",
-    "STABLE_DIFF_API": "http://aws_rasa.hertzai.com:5459/txt2img"
+    "STABLE_DIFF_API": "http://aws_rasa.hertzai.com:5459/txt2img",
     "LLAVA_API": "http://aws_llama_new.hertzai.com:5000/image_inference"
 
 }
