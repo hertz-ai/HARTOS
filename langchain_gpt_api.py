@@ -373,12 +373,12 @@ def parse_text_to_image(inp):
         return response.json()["img_url"]
     except Exception as e:
         return f"{e} Not able to generating image at this moment please try later"
-    
+
 def parse_image_to_text(inp):
     '''
         LlaVA implemetation
     '''
-    
+
     try:
         inp_list = inp.split(',')
         url = f'{LLAVA_API}'
@@ -389,7 +389,7 @@ def parse_image_to_text(inp):
         files=[]
         headers={}
         response = requests.request("POST", url, headers=headers, data=payload, files=files)
-        
+
         return response.text
     except Exception as e:
         return f'{e} Not able to generating answer at this moment please try later'
@@ -449,6 +449,33 @@ class CustomConvoOutputParser(AgentOutputParser):
         return "conversational_chat"
 
 
+def parse_user_id(inp: str):
+    url = 'https://azurekong.hertzai.com:8443/db/getstudent_by_user_id'
+
+
+    headers = {
+        'Content-Type': 'application/json'
+    }
+
+    try:
+        prov_user_id = re.findall('\d',inp)[0]
+    except:
+        pass
+    finally:
+        prov_user_id = ""
+
+    payload = json.dumps({
+        "user_id": user_id
+    })
+
+    response = requests.request("POST", url, headers=headers, data=payload)
+    if prov_user_id=="" or int(prov_user_id) != user_id:
+
+        return f"you might interested in finding your user detail here are details {response.text}"
+
+    else:
+        return response.text
+
 
 
 
@@ -470,7 +497,6 @@ def get_ans(user_id, query):
             func=chain.run,
             description="Use this feature only when the user's request specifically pertains to one of the following scenarios:\
             Image Creation: When a request involves generating an image using text, this feature should be engaged. The entire text prompt must be used as it is unless otherwise requested to enhance further detail of prompt for the image generation process. If additional enahancement is needed , enrich the prompt to image generation with greater detail for learning.\
-            Student Information: If a request is made for information regarding students, this functionality should be utilized to retrieve the necessary details.\
             Query Available Books: When the user is inquiring about available books, this feature should be used to locate and provide information about the required texts.\
             Any CRUD operation which is not a READ or anything related to curriculum should not use this tool,  It is vital to ensure that the intent precisely falls within one of the above  categories before engaging this functionality.\
             Don't use this to create a custom curriculum for user"
@@ -480,7 +506,7 @@ def get_ans(user_id, query):
             func=parsing_string,
             description=f"""Utilize this utility exclusively when the information required predates the current day and pertains to the ongoing user. The necessary input for this tool comprises a list of values separated by commas.
             The list should encompass a user-generated query, designated by user input text, a commencement date denoted as start_date, and an end date labeled as end_date. The start_date denotes the initiation date for the user information search and should consistently adhere to the ISO 8601 format. Meanwhile, the end_date, also conforming to the ISO 8601 format, signifies the conclusion date for the search.
-            In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what zep can do, 2023-07-12T10:19:56.00000Z, 2023-07-13T10:19:56.732291Z'. Remove any references to time based words like yesterday, today, last year since the date range you provide already accounts for that. e.g. if user has asked what did we discuss the day before yesterday then the text argument should just be what did we discuss followed by  start and end datetime.
+            In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what zep can do, 2023-07-12T00:00:00.000000Z, 2023-07-13T10:19:56.732291Z'. Remove any references to time based words like yesterday, today, last year since the date range you provide already accounts for that. e.g. if user has asked what did we discuss the day before yesterday then the text argument should just be what did we discuss followed by  start and end datetime.
             Strive to apply this tool judiciously for scenarios in which retrospective user information is imperative. The inputs should be meticulously arranged  to facilitate the extraction of accurate and pertinent data within the specified timeframe. Never use this tool for so what is the response to my last comment?"""
         ),
         Tool(
@@ -498,8 +524,13 @@ def get_ans(user_id, query):
             func=parse_image_to_text,
             description='''When a user provides a query containing an image download URL and a related question about that image, utilize this tool for support. Your objective is to extract both the image URL and the user's inquiry or prompt pertaining to that image from their query, and then convert these elements into comma seperated string. The format should be as follows: "image_url, user_query".
             '''
+        ),
+        Tool(
+            name="User_details_tool",
+            func=parse_user_id,
+            description="If a request is made for information regarding students, this functionality should be utilized to retrieve the necessary details. input for this api should Always be current user_id. except current id you should say you cannot have access to this user details."
         )
-        
+
     ]
     tools += tool
 
@@ -613,6 +644,9 @@ def chat():
     global user_id
     user_id = data.get('user_id', None)
 
+    req_id = data.get('request_id', None)
+
+
     prompt = data.get('prompt', None)
     ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
     global res_total_tokens
@@ -622,7 +656,7 @@ def chat():
     global recognized_intent
     recognized_intent = []
 
-    return jsonify({'response': ans, 'intent':rec_intent, 'req_token_count': req_token_count, 'res_token_count':res_token_count})
+    return jsonify({'response': ans, 'intent':rec_intent, 'req_token_count': req_token_count, 'res_token_count':res_token_count, 'historical_request_id':None})
 
 @app.route('/add_history', methods=['POST'])
 def history():
