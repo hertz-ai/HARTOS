@@ -414,7 +414,8 @@ class CustomConvoOutputParser(AgentOutputParser):
             # str = ""
             app.logger.info(text)
             time.sleep
-            if '"Final Answer"' in text:
+            pattern = r"final\s*[_]*answer"
+            if re.search(pattern, text, re.IGNORECASE):
                 # Extract the JSON part from the string
                 escape_chars = ['\n', '\t', '\r', '\"', "\'", '\\', "'''", '"""']
                 start_index = text.index('{')
