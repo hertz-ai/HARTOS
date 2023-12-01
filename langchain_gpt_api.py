@@ -97,6 +97,8 @@ FAV_TEACHER_API = config['FAV_TEACHER_API']
 DREAMBOOTH_API= config['DREAMBOOTH_API']
 STABLE_DIFF_API = config['STABLE_DIFF_API']
 LLAVA_API = config['LLAVA_API']
+BOOKPARSING_API = config['BOOKPARSING_API']
+CRAWLAB_API = config['CRAWLAB_API']
 
 
 # google search API
@@ -437,7 +439,80 @@ def parse_image_to_text(inp):
     except Exception as e:
         return f'{e} Not able to generating answer at this moment please try later'
 
+def parse_link_for_crwalab(inp):
+    '''
 
+        Use this function when user give url for any webpage or pdf
+    
+    '''
+    inp_list = inp.split(',')
+    input_url = inp_list[0]
+    link_type = inp_list[1].strip(' ')
+    print
+    try:
+        inp_list = inp.split(',')
+        input_url = inp_list[0]
+        link_type = inp_list[1].strip(' ')
+        if link_type == 'pdf':
+            try:
+                cwd = os.getcwd()
+                upload_folder_path = f'{cwd}/upload/'
+                pdf_file_name = input_url.split("/")[-1] 
+                
+                # Local path to save the PDF
+                if not os.path.exists(upload_folder_path):
+                    # If it does not exist, create it
+                    os.makedirs(upload_folder_path)
+                pdf_save_path = f'{upload_folder_path}/{pdf_file_name}'
+                
+                response = requests.get(input_url)
+                with open(pdf_save_path, 'wb') as file:
+                    file.write(response.content)
+                
+                    
+                
+                
+                payload = {
+                    'user_id': thread_local_data.get_user_id(),
+                    'request_id': thread_local_data.get_request_id()
+                }
+                
+                # Open the file and send it in the POST request
+                with open(pdf_save_path, 'rb') as file:
+                    files = [('file', (pdf_file_name, file, 'application/pdf'))]
+                    response = requests.post(BOOKPARSING_API, data=payload, files=files)
+                
+                os.remove(pdf_save_path)
+        
+                return f"your request has been sent and pdf is getting uploading into our system {response.text}"
+            except Exception as e:
+                app.logger.info(f"Got exception in book parsing api {e}")
+                return "sorry I am not able to process your request at this moment"
+        
+        elif link_type == 'website':
+            try:
+                
+                payload = {
+                    'link': input_url,
+                    'user_id': thread_local_data.get_user_id(),
+                    'request_id': thread_local_data.get_request_id()
+                }
+                files=[
+                    
+                ]
+                headers = {}
+                response = requests.request("POST", CRAWLAB_API, headers=headers, data=payload, files=files)
+        
+                return f"your url got uploaded and data extraction is being processes {response.text}"
+            except Exception as e:
+                app.logger.info(f"Got exception in crawlab api {e}")
+                return "sorry I am not able to process your request at this moment"
+                
+        else:
+            return "Sorry I am unable to process your request with this url type"
+    except Exception as e:
+        pass
+        
 
 class CustomConvoOutputParser(AgentOutputParser):
     """Output parser for the conversational agent."""
@@ -541,6 +616,13 @@ def get_ans(user_id, query):
             name="Image_Inference_Tool",
             func=parse_image_to_text,
             description='''When a user provides a query containing an image download URL and a related question about that image, utilize this tool for support. Your objective is to extract both the image URL and the user's inquiry or prompt pertaining to that image from their query, and then convert these elements into comma seperated string. The format should be as follows: "image_url, user_query".
+            '''
+        ),
+        Tool(
+            name="Data_Extraction_From_URL",
+            func=parse_link_for_crwalab,
+            description='''
+               Your task is to extract a URL and its type (either 'pdf' or 'website') from a user's query. Upon receiving a query that contains a URL and a specified URL type, you are to use a tool designed for this purpose. The objective is to accurately identify both the URL and its type from the query. Once identified, these elements should be formatted into a comma-separated string, adhering to the format: "url, url_type".
             '''
         )
 
