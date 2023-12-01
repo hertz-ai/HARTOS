@@ -47,14 +47,6 @@ from langchain.schema import AgentAction, AgentFinish, OutputParserException
 from langchain.tools.requests.tool import RequestsGetTool, TextRequestsWrapper
 from pydantic import BaseModel, Field, root_validator
 from threadlocal import thread_local_data
-# import pdb
-
-
-# import debugpy
-# debugpy.listen(('0.0.0.0', 5678))
-# debugpy.wait_for_client()  # Waits for a client to attach
-
-# pdb.set_trace()
 
 ## logging info
 logging.basicConfig(level=logging.DEBUG)
