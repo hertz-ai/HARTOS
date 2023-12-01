@@ -31,7 +31,7 @@ import logging
 import requests
 import pytz
 from datetime import datetime, timezone
-from typing import List, Union, Optional, Mapping, Any
+from typing import List, Union, Optional, Mapping, Any, Dict
 from langchain.agents.conversational_chat.output_parser import ConvoOutputParser
 import time
 import tiktoken
@@ -44,7 +44,9 @@ from langchain.agents import AgentOutputParser
 from langchain.agents.conversational_chat.prompt import FORMAT_INSTRUCTIONS
 from langchain.output_parsers.json import parse_json_markdown
 from langchain.schema import AgentAction, AgentFinish, OutputParserException
-
+from langchain.tools.requests.tool import RequestsGetTool, TextRequestsWrapper
+from pydantic import BaseModel, Field, root_validator
+from threadlocal import thread_local_data
 
 ## logging info
 logging.basicConfig(level=logging.DEBUG)
@@ -77,10 +79,6 @@ with open("config.json", 'r') as f:
 
 
 # global variables
-user_id = 0
-recognized_intent = []
-req_total_tokens = 0
-res_total_tokens = 0
 encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
 
 #api and keys
@@ -113,6 +111,10 @@ llm_math = LLMMathChain(llm=ChatOpenAI(model_name="gpt-3.5-turbo"))
 
 
 
+    
+    
+
+
 #custom GPT
 class CustomGPT(LLM):
 
@@ -127,8 +129,6 @@ class CustomGPT(LLM):
         return "custom"
 
     def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
-        global req_total_tokens
-        global res_total_tokens
         start_time = time.time()
         self.count += 1
         # self.total_tokens = 0
@@ -137,7 +137,7 @@ class CustomGPT(LLM):
         app.logger.info(f"len---->{len(prompt.split(' '))}")
         #encoding = tiktoken.get_encoding("gpt-3.5-turbo")
         num_tokens = len(encoding.encode(prompt))
-        req_total_tokens += num_tokens
+        thread_local_data.update_req_token_count(num_tokens)
         app.logger.info(f"len---->{num_tokens}")
         if self.count >= 5 or self.call_gpt4 ==1:
             response = requests.post(
@@ -160,23 +160,28 @@ class CustomGPT(LLM):
 
         response.raise_for_status()
         app.logger.info(f"hellpppppppppppppppp-->{response.json()['text']}")
-        global recognized_intent
         try:
-            intents = json.loads(response.json()["text"])
+            text = str(response.json()["text"])
+            try:
+                text = text.strip('`').replace('json\n','').strip()
+            except:
+                pass
+            intents = json.loads(text)
             curr_intent = intents["action"]
             if self.previous_intent == curr_intent:
                 self.call_gpt4 = 1
             self.previous_intent = curr_intent
-            recognized_intent.append(intents["action"])
-        except:
-            recognized_intent=["Final Answer"]
+            thread_local_data.update_recognize_intents(intents["action"])
+        except Exception as e:
+            app.logger.info(f"Exception occur while intent calcualtion and calling exception {e}")
+            # thread_local_data.update_recognize_intents("Final Answer")
         # time.sleep(10)
 
         end_time = time.time()
         elapsed_time = end_time - start_time
         app.logger.info(f"time taken for this call is {elapsed_time}")
         num_tokens = len(encoding.encode(response.json()["text"].replace('\n', ' ').replace('\t', '')))
-        res_total_tokens += num_tokens
+        thread_local_data.update_res_token_count(num_tokens)
         return response.json()["text"].replace('\n', ' ').replace('\t', '')
 
     @property
@@ -185,6 +190,29 @@ class CustomGPT(LLM):
         return {
 
         }
+
+
+
+class CustomAgentExecutor(AgentExecutor):
+
+    def prep_outputs(self, inputs: Dict[str, str],
+                    outputs: Dict[str, str],
+                    metadata: Optional[Dict[str, Any]] = None,
+                    return_only_outputs: bool = False) -> Dict[str, str]:
+        # pdb.set_trace()
+        self._validate_outputs(outputs)
+        req_id = thread_local_data.get_request_id()
+        metadata = {'request_Id':req_id}
+        app.logger.info(f"before: memory object is not none and metadata is {metadata}, {return_only_outputs}")
+        if self.memory is not None:
+            app.logger.info(f"memory object is not none and metadata is {metadata}")
+            self.memory.save_context(inputs, outputs, metadata)
+        app.logger.info(f"After: memory object is not none and metadata is {metadata}")
+        if return_only_outputs:
+            return outputs
+        else:
+            return {**inputs, **outputs}
+
 
 
 #helper functions
@@ -198,7 +226,8 @@ def get_memory(user_id:int):
         url=ZEP_API_URL,
         memory_key="chat_history",
         api_key=ZEP_API_KEY,
-        return_messages=True
+        return_messages=True,
+        input_key="input"
     )
     return memory
 
@@ -279,11 +308,27 @@ def get_time_based_history(prompt:str, session_id:str, start_date:str, end_date:
 
         messages = memory.chat_memory.search(prompt,metadata=metadata)
         final_res = {'res_in_filter':messages}
+        try:
+            extracted_metadata = [message.message['metadata'] for message in messages]
+            
+            list_req_ids = [data.get('request_Id', None) for data in extracted_metadata]
+            thread_local_data.set_reqid_list(list_req_ids)
+        except Exception as e:
+            app.logger.info(f"Error while getting req ids {e}")
+            
+        app.logger.info(f"final-->{final_res}")
         end_time = time.time()
         elapsed_time = end_time - start_time
         return json.dumps(final_res)
     except:
         messages = memory.chat_memory.search(prompt)
+        print(app.logger.info(f"final-->{messages}"))
+        try:
+            extracted_metadata = [message.message['metadata'] for message in messages]
+            list_req_ids = [data.get('request_Id', None) for data in extracted_metadata]
+            thread_local_data.set_reqid_list(list_req_ids)
+        except Exception as e:
+            app.logger.info(f"Error while getting req ids {e}")
         end_time = time.time()
         elapsed_time = end_time - start_time
         app.logger.info("time taken for zep is {elapsed_time}")
@@ -296,13 +341,12 @@ def parsing_string(string):
     '''
     try:
         prompt, start_date, end_date = [s.strip() for s in string.split(",")]
-        global user_id
-        session_id = 'user_'+str(user_id)
+        session_id = 'user_'+str(thread_local_data.get_user_id())
         return get_time_based_history(prompt, session_id, start_date, end_date)
     except:
         now = datetime.utcnow()
         formatted_time = now.strftime('%Y-%m-%dT%H:%M:%S.%f') + 'Z'
-        session_id = "user_"+str(user_id)
+        session_id = "user_"+str(thread_local_data.get_user_id())
         return get_time_based_history(string, session_id, formatted_time, formatted_time)
 
 
@@ -318,12 +362,11 @@ def parse_character_animation(string):
         3 call dreambooth api with fav teacher name
     '''
     try:
-        global user_id
         prompt = string
         student_id_url = STUDENT_API
 
         payload = json.dumps({
-        "user_id": user_id
+        "user_id": thread_local_data.get_user_id()
         })
         headers = {
         'Content-Type': 'application/json'
@@ -414,8 +457,7 @@ class CustomConvoOutputParser(AgentOutputParser):
             # str = ""
             app.logger.info(text)
             time.sleep
-            pattern = r"final\s*[_]*answer"
-            if re.search(pattern, text, re.IGNORECASE):
+            if '"Final Answer"' in text:
                 # Extract the JSON part from the string
                 escape_chars = ['\n', '\t', '\r', '\"', "\'", '\\', "'''", '"""']
                 start_index = text.index('{')
@@ -450,34 +492,6 @@ class CustomConvoOutputParser(AgentOutputParser):
         return "conversational_chat"
 
 
-def parse_user_id(inp: str):
-    url = 'https://azurekong.hertzai.com:8443/db/getstudent_by_user_id'
-
-
-    headers = {
-        'Content-Type': 'application/json'
-    }
-
-    try:
-        prov_user_id = re.findall('\d',inp)[0]
-    except:
-        pass
-    finally:
-        prov_user_id = ""
-
-    payload = json.dumps({
-        "user_id": user_id
-    })
-
-    response = requests.request("POST", url, headers=headers, data=payload)
-    if prov_user_id=="" or int(prov_user_id) != user_id:
-
-        return f"you might interested in finding your user detail here are details {response.text}"
-
-    else:
-        return response.text
-
-
 
 
 # main function
@@ -498,16 +512,19 @@ def get_ans(user_id, query):
             func=chain.run,
             description="Use this feature only when the user's request specifically pertains to one of the following scenarios:\
             Image Creation: When a request involves generating an image using text, this feature should be engaged. The entire text prompt must be used as it is unless otherwise requested to enhance further detail of prompt for the image generation process. If additional enahancement is needed , enrich the prompt to image generation with greater detail for learning.\
+            Student Information: If a request is made for information regarding students, this functionality should be utilized to retrieve the necessary details.\
             Query Available Books: When the user is inquiring about available books, this feature should be used to locate and provide information about the required texts.\
             Any CRUD operation which is not a READ or anything related to curriculum should not use this tool,  It is vital to ensure that the intent precisely falls within one of the above  categories before engaging this functionality.\
-            Don't use this to create a custom curriculum for user"
+            Don't use this to create a custom curriculum for user",
+
+
         ),
         Tool(
             name="FULL_HISTORY",
             func=parsing_string,
             description=f"""Utilize this utility exclusively when the information required predates the current day and pertains to the ongoing user. The necessary input for this tool comprises a list of values separated by commas.
             The list should encompass a user-generated query, designated by user input text, a commencement date denoted as start_date, and an end date labeled as end_date. The start_date denotes the initiation date for the user information search and should consistently adhere to the ISO 8601 format. Meanwhile, the end_date, also conforming to the ISO 8601 format, signifies the conclusion date for the search.
-            In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what zep can do, 2023-07-12T00:00:00.000000Z, 2023-07-13T10:19:56.732291Z'. Remove any references to time based words like yesterday, today, last year since the date range you provide already accounts for that. e.g. if user has asked what did we discuss the day before yesterday then the text argument should just be what did we discuss followed by  start and end datetime.
+            In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what zep can do, 2023-07-12T10:19:56.00000Z, 2023-07-13T10:19:56.732291Z'. Remove any references to time based words like yesterday, today, last year since the date range you provide already accounts for that. e.g. if user has asked what did we discuss the day before yesterday then the text argument should just be what did we discuss followed by  start and end datetime.
             Strive to apply this tool judiciously for scenarios in which retrospective user information is imperative. The inputs should be meticulously arranged  to facilitate the extraction of accurate and pertinent data within the specified timeframe. Never use this tool for so what is the response to my last comment?"""
         ),
         Tool(
@@ -525,11 +542,6 @@ def get_ans(user_id, query):
             func=parse_image_to_text,
             description='''When a user provides a query containing an image download URL and a related question about that image, utilize this tool for support. Your objective is to extract both the image URL and the user's inquiry or prompt pertaining to that image from their query, and then convert these elements into comma seperated string. The format should be as follows: "image_url, user_query".
             '''
-        ),
-        Tool(
-            name="User_details_tool",
-            func=parse_user_id,
-            description="If a request is made for information regarding students, this functionality should be utilized to retrieve the necessary details. input for this api should Always be current user_id. except current id you should say you cannot have access to this user details."
         )
 
     ]
@@ -616,23 +628,37 @@ def get_ans(user_id, query):
     prompt = ConversationalChatAgent.create_prompt(
         tools,
         system_message=prefix,
-        human_message=suffix
+        human_message=suffix,
+        input_variables=["input", "agent_scratchpad", "chat_history"]
     )
 
 
     #chat Agent
-    llm_chain = LLMChain(llm=llm, prompt=prompt)
+    llm_chain = LLMChain(
+        llm=llm, 
+        prompt=prompt,
+        memory=memory
+    )
 
     custom_parser = CustomConvoOutputParser()
-    agent = ConversationalChatAgent(llm_chain=llm_chain, tools=tools, verbose=True, output_parser=custom_parser,template_tool_response=TEMPLATE_TOOL_RESPONSE)
-    agent_chain = AgentExecutor.from_agent_and_tools(
-        agent=agent, tools=tools, verbose=True, memory=memory,
+    
+    agent = ConversationalChatAgent(
+        llm_chain=llm_chain,  
+        verbose=True, 
+        output_parser=custom_parser,
+        template_tool_response=TEMPLATE_TOOL_RESPONSE
+        )
+    
+    
+    
+    agent_chain = CustomAgentExecutor(
+        agent=agent, 
+        tools=tools, 
+        verbose=True, 
+        memory=memory
     )
-    ans = agent_chain.run(query)
-    global recognized_intent
-    global req_total_tokens
-    global res_total_tokens
-    return ans, recognized_intent, req_total_tokens, res_total_tokens
+    ans = agent_chain.run({'input':query})
+    return ans
 
 
 
@@ -641,23 +667,19 @@ def get_ans(user_id, query):
 @app.route('/chat', methods=['POST'])
 def chat():
     data = request.get_json()
-
-    global user_id
     user_id = data.get('user_id', None)
-
-    req_id = data.get('request_id', None)
-
+    request_id = data.get('request_id', None)
+    
+    thread_local_data.set_request_id(request_id=request_id)
+    thread_local_data.set_user_id(user_id=user_id)
+    thread_local_data.set_req_token_count(value=0)
+    thread_local_data.set_res_token_count(value=0)
+    thread_local_data.set_recognize_intents()
 
     prompt = data.get('prompt', None)
-    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
-    global res_total_tokens
-    global req_total_tokens
-    req_total_tokens = 0
-    res_total_tokens = 0
-    global recognized_intent
-    recognized_intent = []
+    ans= get_ans(user_id=user_id, query=prompt)
 
-    return jsonify({'response': ans, 'intent':rec_intent, 'req_token_count': req_token_count, 'res_token_count':res_token_count, 'historical_request_id':None})
+    return jsonify({'response': ans, 'intent':thread_local_data.get_recognize_intents(), 'req_token_count': thread_local_data.get_req_token_count(), 'res_token_count':thread_local_data.get_res_token_count(), 'history_request_id': thread_local_data.get_reqid_list()})
 
 @app.route('/add_history', methods=['POST'])
 def history():

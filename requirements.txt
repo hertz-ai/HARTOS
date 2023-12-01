@@ -16,7 +16,7 @@ coloredlogs==15.0.1
 dataclasses-json==0.5.8
 duckdb==0.8.1
 exceptiongroup==1.1.1
-faiss-gpu==1.7.2
+# faiss-gpu
 fastapi==0.98.0
 filelock==3.12.2
 Flask==2.3.2
@@ -63,18 +63,18 @@ networkx==3.1
 nltk==3.8.1
 numexpr==2.8.4
 numpy==1.24.3
-nvidia-cublas-cu11==11.10.3.66
-nvidia-cuda-cupti-cu11==11.7.101
-nvidia-cuda-nvrtc-cu11==11.7.99
-nvidia-cuda-runtime-cu11==11.7.99
-nvidia-cudnn-cu11==8.5.0.96
-nvidia-cufft-cu11==10.9.0.58
-nvidia-curand-cu11==10.2.10.91
-nvidia-cusolver-cu11==11.4.0.1
-nvidia-cusparse-cu11==11.7.4.91
-nvidia-nccl-cu11==2.14.3
-nvidia-nvtx-cu11==11.7.91
-onnxruntime==1.15.1
+# nvidia-cublas-cu11==11.10.3.66
+# nvidia-cuda-cupti-cu11==11.7.101
+# nvidia-cuda-nvrtc-cu11==11.7.99
+# nvidia-cuda-runtime-cu11==11.7.99
+# nvidia-cudnn-cu11==8.5.0.96
+# nvidia-cufft-cu11==10.9.0.58
+# nvidia-curand-cu11==10.2.10.91
+# nvidia-cusolver-cu11==11.4.0.1
+# nvidia-cusparse-cu11==11.7.4.91
+# nvidia-nccl-cu11==2.14.3
+# nvidia-nvtx-cu11==11.7.91
+# onnxruntime==1.15.1
 openai==0.27.8
 openapi-schema-pydantic==1.2.4
 overrides==7.3.1
@@ -97,8 +97,8 @@ redis==4.6.0
 regex==2023.6.3
 requests==2.31.0
 rsa==4.9
-safetensors==0.3.1
-scikit-learn==1.2.2
+# safetensors==0.3.1
+# scikit-learn==1.2.2
 scipy==1.10.1
 sentence-transformers==2.2.2
 sentencepiece==0.1.99
@@ -111,8 +111,8 @@ tenacity==8.2.2
 threadpoolctl==3.1.0
 tiktoken==0.5.1
 tokenizers==0.13.3
-torch==2.0.1
-torchvision==0.15.2
+# torch==2.0.1
+# torchvision==0.15.2
 tqdm==4.65.0
 transformers==4.30.2
 triton==2.0.0
