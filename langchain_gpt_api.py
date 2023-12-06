@@ -113,8 +113,8 @@ llm_math = LLMMathChain(llm=ChatOpenAI(model_name="gpt-3.5-turbo"))
 
 
 
-    
-    
+
+
 
 
 #custom GPT
@@ -246,9 +246,37 @@ def get_action_user_details(user_id):
     response = requests.request(
         "GET", action_url, headers=headers, data=payload)
 
-    unwanted_actions=['Casual Conversation', 'Topic confirmation', 'Topic not found', 'Topic Confirmation', 'Topic Listing', 'Probe', 'Question Answering', 'Fallback']
+    unwanted_actions=['Topic Cofirmation','Langchain','Assessment Ended','Casual Conversation', 'Topic confirmation', 'Topic not found', 'Topic Confirmation', 'Topic Listing', 'Probe', 'Question Answering', 'Fallback']
     data = response.json()
-    action_texts = [obj["action"] + ' on '+ obj["created_date"] for obj in data if obj["action"] not in unwanted_actions]
+    #action_texts = [obj["action"] + ' on '+ obj["created_date"] for obj in data if obj["action"] not in unwanted_actions]
+    # Filter out unwanted actions
+    filtered_data = [obj for obj in data if obj["action"] not in unwanted_actions]
+
+    # Dictionary to store the first and last occurrence dates for each action
+    action_occurrences = {}
+
+    # Iterate over the filtered data
+    for obj in filtered_data:
+        action = obj["action"]
+        date = parse_date(obj["created_date"])
+
+        if action not in action_occurrences:
+            action_occurrences[action] = [date, date]
+        else:
+            first_date, last_date = action_occurrences[action]
+            first_date = min(first_date, date)
+            last_date = max(last_date, date)
+            action_occurrences[action] = [first_date, last_date]
+
+    # Construct the final list of actions with first and last occurrences
+    action_texts = []
+    for action, dates in action_occurrences.items():
+        first_date, last_date = dates
+        first_action_text = f"{action} on {first_date.strftime('%Y-%m-%dT%H:%M:%S')}"
+        action_texts.append(first_action_text)
+        if first_date != last_date:
+            last_action_text = f"{action} on {last_date.strftime('%Y-%m-%dT%H:%M:%S')}"
+            action_texts.append(last_action_text)
     if len(action_texts)==0:
         action_texts=['user has not performed any actions yet.']
 
@@ -262,7 +290,7 @@ def get_action_user_details(user_id):
     # Format the time in the desired format
     formatted_time = datetime.now(timezone(time_zone)).strftime('%Y-%m-%d %H:%M:%S.%f')
 
-    actions = actions + ". List of actions ends. <PREVIOUS_USER_ACTION_END> \n " + "Today's datetime in "+time_zone + "is: "+  formatted_time +  " in this format:'%Y-%m-%dT%H:%M:%S.%f' \n Whenever user is asking about current date or current time at perticular location then use this datetime format. Use the previous sentence datetime info to answer current time based questions coupled with google_search for current time or full_history for historical conversation based answers. Take a deep breath and think step by step.\n"
+    actions = actions + ". List of actions ends. <PREVIOUS_USER_ACTION_END> \n " + "Today's datetime in "+time_zone + "is: "+  formatted_time +  " in this format:'%Y-%m-%dT%H:%M:%S.%f' \n Whenever user is asking about current date or current time at particular location then use this datetime format by asking what user's location is. Use the previous sentence datetime info to answer current time based questions coupled with google_search for current time or full_history for historical conversation based answers. Take a deep breath and think step by step.\n"
     # user detail api
 
     url = STUDENT_API
@@ -307,24 +335,40 @@ def get_time_based_history(prompt:str, session_id:str, start_date:str, end_date:
             "end_date":  end_date
         }
 
-
         messages = memory.chat_memory.search(prompt,metadata=metadata)
-        final_res = {'res_in_filter':messages}
         try:
             extracted_metadata = [message.message['metadata'] for message in messages]
-            
             list_req_ids = [data.get('request_Id', None) for data in extracted_metadata]
             thread_local_data.set_reqid_list(list_req_ids)
         except Exception as e:
             app.logger.info(f"Error while getting req ids {e}")
-            
+
+        # messages = [message.dict() for message in messages]
+        serialized_results = []
+        for result in messages:
+            serialized_result = result.dict(exclude_unset=True)
+            #Process the 'message' field to include only specific subfields
+            if 'message' in serialized_result and isinstance(serialized_result['message'], dict):
+                message = serialized_result['message']
+                filtered_message = {
+                    'content': message.get('content'),
+                    'role': message.get('role'),
+                    'created_at': message.get('created_at'),
+                    'request_id': message.get('metadata', {}).get('request_id') if 'metadata' in message else None
+                }
+                # Replace the original message with the filtered message
+                serialized_result['message'] = filtered_message
+            serialized_results.append(serialized_result)
+        messages = serialized_results
+        final_res = {'res_in_filter':messages}
         app.logger.info(f"final-->{final_res}")
         end_time = time.time()
         elapsed_time = end_time - start_time
         return json.dumps(final_res)
-    except:
+    except Exception as e:
+        app.logger.info(f"Exception {e}")
         messages = memory.chat_memory.search(prompt)
-        print(app.logger.info(f"final-->{messages}"))
+        app.logger.info(f"final messages in except-->{messages}")
         try:
             extracted_metadata = [message.message['metadata'] for message in messages]
             list_req_ids = [data.get('request_Id', None) for data in extracted_metadata]
@@ -351,6 +395,8 @@ def parsing_string(string):
         session_id = "user_"+str(thread_local_data.get_user_id())
         return get_time_based_history(string, session_id, formatted_time, formatted_time)
 
+def parse_date(date_str):
+    return datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%S")
 
 
 
@@ -443,7 +489,7 @@ def parse_link_for_crwalab(inp):
     '''
 
         Use this function when user give url for any webpage or pdf
-    
+
     '''
     inp_list = inp.split(',')
     input_url = inp_list[0]
@@ -457,62 +503,62 @@ def parse_link_for_crwalab(inp):
             try:
                 cwd = os.getcwd()
                 upload_folder_path = f'{cwd}/upload/'
-                pdf_file_name = input_url.split("/")[-1] 
-                
+                pdf_file_name = input_url.split("/")[-1]
+
                 # Local path to save the PDF
                 if not os.path.exists(upload_folder_path):
                     # If it does not exist, create it
                     os.makedirs(upload_folder_path)
                 pdf_save_path = f'{upload_folder_path}/{pdf_file_name}'
-                
+
                 response = requests.get(input_url)
                 with open(pdf_save_path, 'wb') as file:
                     file.write(response.content)
-                
-                    
-                
-                
+
+
+
+
                 payload = {
                     'user_id': thread_local_data.get_user_id(),
                     'request_id': thread_local_data.get_request_id()
                 }
-                
+
                 # Open the file and send it in the POST request
                 with open(pdf_save_path, 'rb') as file:
                     files = [('file', (pdf_file_name, file, 'application/pdf'))]
                     response = requests.post(BOOKPARSING_API, data=payload, files=files)
-                
+
                 os.remove(pdf_save_path)
-        
+
                 return f"your request has been sent and pdf is getting uploading into our system {response.text}"
             except Exception as e:
                 app.logger.info(f"Got exception in book parsing api {e}")
                 return "sorry I am not able to process your request at this moment"
-        
+
         elif link_type == 'website':
             try:
-                
+
                 payload = {
                     'link': input_url,
                     'user_id': thread_local_data.get_user_id(),
                     'request_id': thread_local_data.get_request_id()
                 }
                 files=[
-                    
+
                 ]
                 headers = {}
                 response = requests.request("POST", CRAWLAB_API, headers=headers, data=payload, files=files)
-        
+
                 return f"your url got uploaded and data extraction is being processes {response.text}"
             except Exception as e:
                 app.logger.info(f"Got exception in crawlab api {e}")
                 return "sorry I am not able to process your request at this moment"
-                
+
         else:
             return "Sorry I am unable to process your request with this url type"
     except Exception as e:
         pass
-        
+
 
 class CustomConvoOutputParser(AgentOutputParser):
     """Output parser for the conversational agent."""
@@ -524,7 +570,7 @@ class CustomConvoOutputParser(AgentOutputParser):
         try:
             response = parse_json_markdown(text)
             action, action_input = response["action"], response["action_input"]
-            if action == "Final Answer":
+            if action == "Final Answer" or action == "Final_Answer":
                 return AgentFinish({"output": action_input}, text)
             else:
                 return AgentAction(action, action_input, text)
@@ -532,7 +578,7 @@ class CustomConvoOutputParser(AgentOutputParser):
             # str = ""
             app.logger.info(text)
             time.sleep
-            if '"Final Answer"' in text:
+            if '"Final Answer"' in text or '"Final_Answer"' in text:
                 # Extract the JSON part from the string
                 escape_chars = ['\n', '\t', '\r', '\"', "\'", '\\', "'''", '"""']
                 start_index = text.index('{')
@@ -599,8 +645,8 @@ def get_ans(user_id, query):
             func=parsing_string,
             description=f"""Utilize this utility exclusively when the information required predates the current day and pertains to the ongoing user. The necessary input for this tool comprises a list of values separated by commas.
             The list should encompass a user-generated query, designated by user input text, a commencement date denoted as start_date, and an end date labeled as end_date. The start_date denotes the initiation date for the user information search and should consistently adhere to the ISO 8601 format. Meanwhile, the end_date, also conforming to the ISO 8601 format, signifies the conclusion date for the search.
-            In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what zep can do, 2023-07-12T10:19:56.00000Z, 2023-07-13T10:19:56.732291Z'. Remove any references to time based words like yesterday, today, last year since the date range you provide already accounts for that. e.g. if user has asked what did we discuss the day before yesterday then the text argument should just be what did we discuss followed by  start and end datetime.
-            Strive to apply this tool judiciously for scenarios in which retrospective user information is imperative. The inputs should be meticulously arranged  to facilitate the extraction of accurate and pertinent data within the specified timeframe. Never use this tool for so what is the response to my last comment?"""
+            In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what zep can do, 2023-07-12T10:19:56.00000Z, 2023-07-13T10:19:56.732291Z'. If query has any form of date or time by user, then start end datetime can be exact rather than till today for more accurate results. Remove any references to time based words (e.g. yesterday, today, datetimes, last year) since the date range you provide already accounts for that. e.g. if user has asked what did we discuss the day before yesterday then the text argument should just be what did we discuss followed by start and end datetime.
+            Strive to apply this tool judiciously for scenarios in which retrospective user information is imperative. If Full history tool response is present, forget other histories, the inputs should be meticulously arranged to facilitate the extraction of accurate and pertinent data within the specified timeframe. Never use this tool for what is the response to my last comment?"""
         ),
         Tool(
             name="Text to image",
@@ -656,14 +702,6 @@ def get_ans(user_id, query):
         <PREVIOUS_USER_ACTION_START>
         {actions}
 
-        <OUTPUT_FORMAT_INSTRUCTION_START>
-        Always format your answer into parsable json format
-        example:
-        <
-            'action':'action taken by agent'
-            'action_input':'input for the current action'
-        >
-        <OUTPUT_FORMAT_INSTRUCTION_END>
         Conversation History:
         <HISTORY_START>
         """
@@ -717,26 +755,26 @@ def get_ans(user_id, query):
 
     #chat Agent
     llm_chain = LLMChain(
-        llm=llm, 
+        llm=llm,
         prompt=prompt,
         memory=memory
     )
 
     custom_parser = CustomConvoOutputParser()
-    
+
     agent = ConversationalChatAgent(
-        llm_chain=llm_chain,  
-        verbose=True, 
+        llm_chain=llm_chain,
+        verbose=True,
         output_parser=custom_parser,
         template_tool_response=TEMPLATE_TOOL_RESPONSE
         )
-    
-    
-    
+
+
+
     agent_chain = CustomAgentExecutor(
-        agent=agent, 
-        tools=tools, 
-        verbose=True, 
+        agent=agent,
+        tools=tools,
+        verbose=True,
         memory=memory
     )
     ans = agent_chain.run({'input':query})
@@ -751,7 +789,7 @@ def chat():
     data = request.get_json()
     user_id = data.get('user_id', None)
     request_id = data.get('request_id', None)
-    
+
     thread_local_data.set_request_id(request_id=request_id)
     thread_local_data.set_user_id(user_id=user_id)
     thread_local_data.set_req_token_count(value=0)
