@@ -1,0 +1,683 @@
+2023-11-30 18:51:40,603 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 682, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 635, in get_ans
+    prompt = ChatPromptTemplate.create_prompt(
+AttributeError: type object 'ChatPromptTemplate' has no attribute 'create_prompt'
+2023-11-30 18:53:31,096 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 18:53:31,970 - langchain_gpt_api - INFO - inside class
+2023-11-30 18:53:36,954 - langchain_gpt_api - INFO - query------> hi
+2023-11-30 18:53:38,288 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 682, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 635, in get_ans
+    prompt = ChatPromptTemplate(
+TypeError: Serializable.__init__() takes 1 positional argument but 2 were given
+2023-11-30 19:06:45,481 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 19:06:46,637 - langchain_gpt_api - INFO - inside class
+2023-11-30 19:06:53,548 - langchain_gpt_api - INFO - query------> hi
+2023-11-30 19:06:55,418 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 682, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 664, in get_ans
+    ans = agent_chain.run({'input':query})
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 440, in run
+    return self(args[0], callbacks=callbacks, tags=tags, metadata=metadata)[
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 220, in __call__
+    inputs = self.prep_inputs(inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 374, in prep_inputs
+    self._validate_inputs(inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 132, in _validate_inputs
+    raise ValueError(f"Missing some input keys: {missing_keys}")
+ValueError: Missing some input keys: {'chat_history'}
+2023-11-30 19:09:21,178 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 19:09:22,113 - langchain_gpt_api - INFO - inside class
+2023-11-30 19:09:32,070 - langchain_gpt_api - INFO - query------> hi
+2023-11-30 19:09:33,602 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 691, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 643, in get_ans
+    prompt = ChatPromptTemplate.from_messages(
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\prompts\chat.py", line 223, in from_messages
+    return cls(input_variables=list(input_vars), messages=messages)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\load\serializable.py", line 74, in __init__
+    super().__init__(**kwargs)
+  File "pydantic\main.py", line 341, in pydantic.main.BaseModel.__init__
+pydantic.error_wrappers.ValidationError: 4 validation errors for ChatPromptTemplate
+messages -> 0
+  value is not a valid dict (type=type_error.dict)
+messages -> 0
+  value is not a valid dict (type=type_error.dict)
+messages -> 2
+  value is not a valid dict (type=type_error.dict)
+messages -> 2
+  value is not a valid dict (type=type_error.dict)
+2023-11-30 19:20:59,366 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 19:21:00,390 - langchain_gpt_api - INFO - inside class
+2023-11-30 19:21:08,523 - langchain_gpt_api - INFO - query------> hi
+2023-11-30 19:21:09,956 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 693, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 652, in get_ans
+    prompt = PromptTemplate(template=template, input_variables=["input", "agent_scratchpad", "chat_history"])
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\load\serializable.py", line 74, in __init__
+    super().__init__(**kwargs)
+  File "pydantic\main.py", line 341, in pydantic.main.BaseModel.__init__
+pydantic.error_wrappers.ValidationError: 1 validation error for PromptTemplate
+__root__
+  Invalid prompt schema; check for mismatched or missing input parameters. 'format_instructions' (type=value_error)
+2023-11-30 19:21:41,264 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 19:21:42,363 - langchain_gpt_api - INFO - inside class
+2023-11-30 19:21:46,268 - langchain_gpt_api - INFO - query------> hi
+2023-11-30 19:21:47,787 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 693, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 652, in get_ans
+    prompt = PromptTemplate(template=template, input_variables=["input", "agent_scratchpad", "chat_history"])
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\load\serializable.py", line 74, in __init__
+    super().__init__(**kwargs)
+  File "pydantic\main.py", line 341, in pydantic.main.BaseModel.__init__
+pydantic.error_wrappers.ValidationError: 1 validation error for PromptTemplate
+__root__
+  Invalid prompt schema; check for mismatched or missing input parameters. 'format_instructions' (type=value_error)
+2023-11-30 19:24:22,886 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 19:24:23,823 - langchain_gpt_api - INFO - inside class
+2023-11-30 19:24:30,954 - langchain_gpt_api - INFO - query------> hi
+2023-11-30 19:24:32,426 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 700, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 652, in get_ans
+    prompt = PromptTemplate.from_examples(
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\prompts\prompt.py", line 107, in from_examples
+    template = example_separator.join([prefix, *examples, suffix])
+TypeError: sequence item 1: expected str instance, GoogleSearchRun found
+2023-11-30 19:24:53,528 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 19:24:54,438 - langchain_gpt_api - INFO - inside class
+2023-11-30 19:24:57,851 - langchain_gpt_api - INFO - query------> hi
+2023-11-30 19:24:59,215 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 700, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 652, in get_ans
+    prompt = PromptTemplate.from_examples(
+TypeError: PromptTemplate.from_examples() missing 1 required positional argument: 'examples'
+2023-11-30 19:26:23,235 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 19:26:24,135 - langchain_gpt_api - INFO - inside class
+2023-11-30 19:26:27,671 - langchain_gpt_api - INFO - query------> hi
+2023-11-30 19:26:29,121 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 701, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 652, in get_ans
+    prompt = PromptTemplate.from_examples(
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\prompts\prompt.py", line 108, in from_examples
+    return cls(input_variables=input_variables, template=template, **kwargs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\load\serializable.py", line 74, in __init__
+    super().__init__(**kwargs)
+  File "pydantic\main.py", line 341, in pydantic.main.BaseModel.__init__
+pydantic.error_wrappers.ValidationError: 1 validation error for PromptTemplate
+__root__
+  Invalid prompt schema; check for mismatched or missing input parameters. 'format_instructions' (type=value_error)
+2023-11-30 19:33:50,875 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 19:33:51,930 - langchain_gpt_api - INFO - inside class
+2023-11-30 19:33:58,821 - langchain_gpt_api - INFO - query------> hi
+2023-11-30 19:34:00,480 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-30 19:34:00,481 - langchain_gpt_api - INFO - len---->2071
+2023-11-30 19:34:00,491 - langchain_gpt_api - INFO - len---->2242
+2023-11-30 19:34:06,599 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Hello Sahil, how can I further enhance your learning journey today?"
+}
+```
+2023-11-30 19:34:06,601 - langchain_gpt_api - INFO - time taken for this call is 6.122143983840942
+2023-11-30 19:34:06,603 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-30 19:34:06,603 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-30 19:34:06,604 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 702, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 684, in get_ans
+    ans = agent_chain.run({'input':query})
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 440, in run
+    return self(args[0], callbacks=callbacks, tags=tags, metadata=metadata)[
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 243, in __call__
+    raise e
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 237, in __call__
+    self._call(inputs, run_manager=run_manager)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\agents\agent.py", line 987, in _call
+    next_step_output = self._take_next_step(
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\agents\agent.py", line 792, in _take_next_step
+    output = self.agent.plan(
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\agents\agent.py", line 443, in plan
+    full_output = self.llm_chain.predict(callbacks=callbacks, **full_inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\llm.py", line 252, in predict
+    return self(kwargs, callbacks=callbacks)[self.output_key]
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 245, in __call__
+    final_outputs: Dict[str, Any] = self.prep_outputs(
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 212, in prep_outputs
+    self.memory.save_context(inputs, outputs, metadata)
+TypeError: ReadOnlySharedMemory.save_context() takes 3 positional arguments but 4 were given
+2023-11-30 19:34:39,610 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 19:34:40,502 - langchain_gpt_api - INFO - inside class
+2023-11-30 19:34:44,384 - langchain_gpt_api - INFO - query------> hi
+2023-11-30 19:34:45,997 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-30 19:34:45,999 - langchain_gpt_api - INFO - len---->2071
+2023-11-30 19:34:46,005 - langchain_gpt_api - INFO - len---->2242
+2023-11-30 19:34:48,759 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Hello there, Sahil! How may I assist you in your educational journey today?"
+}
+```
+2023-11-30 19:34:48,760 - langchain_gpt_api - INFO - time taken for this call is 2.7626945972442627
+2023-11-30 19:34:48,761 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-30 19:34:48,762 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-30 19:34:48,941 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-30 19:35:36,048 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 19:35:36,917 - langchain_gpt_api - INFO - inside class
+2023-11-30 19:35:42,911 - langchain_gpt_api - INFO - query------> hi
+2023-11-30 19:35:44,317 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 702, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 684, in get_ans
+    ans = agent_chain.run({'input':query})
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 440, in run
+    return self(args[0], callbacks=callbacks, tags=tags, metadata=metadata)[
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 220, in __call__
+    inputs = self.prep_inputs(inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 374, in prep_inputs
+    self._validate_inputs(inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 132, in _validate_inputs
+    raise ValueError(f"Missing some input keys: {missing_keys}")
+ValueError: Missing some input keys: {'chat_history'}
+2023-11-30 19:35:54,382 - langchain_gpt_api - INFO - query------> hi
+2023-11-30 19:35:55,508 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 702, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 684, in get_ans
+    ans = agent_chain.run({'input':query})
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 440, in run
+    return self(args[0], callbacks=callbacks, tags=tags, metadata=metadata)[
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 220, in __call__
+    inputs = self.prep_inputs(inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 374, in prep_inputs
+    self._validate_inputs(inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 132, in _validate_inputs
+    raise ValueError(f"Missing some input keys: {missing_keys}")
+ValueError: Missing some input keys: {'chat_history'}
+2023-11-30 19:36:09,402 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 19:36:10,563 - langchain_gpt_api - INFO - inside class
+2023-11-30 19:36:14,141 - langchain_gpt_api - INFO - query------> hi
+2023-11-30 19:36:15,550 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-30 19:36:15,551 - langchain_gpt_api - INFO - len---->2101
+2023-11-30 19:36:15,556 - langchain_gpt_api - INFO - len---->2284
+2023-11-30 19:36:18,552 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Hello Sahil! How may I assist you in your educational journey today?"
+}
+```
+2023-11-30 19:36:18,553 - langchain_gpt_api - INFO - time taken for this call is 3.002861976623535
+2023-11-30 19:36:18,555 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-30 19:36:18,555 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-30 19:36:18,738 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-30 19:38:29,763 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 19:38:31,061 - langchain_gpt_api - INFO - inside class
+2023-11-30 19:38:35,984 - langchain_gpt_api - INFO - query------> hi
+2023-11-30 19:38:37,701 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-30 19:38:37,704 - langchain_gpt_api - INFO - len---->2132
+2023-11-30 19:38:37,713 - langchain_gpt_api - INFO - len---->2337
+2023-11-30 19:38:42,258 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Welcome back, Sahil! How can I support your exploration and learning today?"
+}
+```
+2023-11-30 19:38:42,260 - langchain_gpt_api - INFO - time taken for this call is 4.55962061882019
+2023-11-30 19:38:42,263 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-30 19:38:42,264 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-30 19:38:42,463 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-30 19:40:42,582 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 19:40:43,537 - langchain_gpt_api - INFO - inside class
+2023-11-30 19:40:48,449 - langchain_gpt_api - INFO - query------> hi
+2023-11-30 19:40:50,194 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-30 19:40:50,195 - langchain_gpt_api - INFO - len---->2161
+2023-11-30 19:40:50,204 - langchain_gpt_api - INFO - len---->2378
+2023-11-30 19:40:54,828 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Hello Sahil! It's a pleasure to see you again. How may I assist you with your studies today?"
+}
+```
+2023-11-30 19:40:54,829 - langchain_gpt_api - INFO - time taken for this call is 4.635055065155029
+2023-11-30 19:40:54,831 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-30 19:40:54,831 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-30 19:40:55,051 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-30 19:40:55,059 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 703, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 685, in get_ans
+    memory.save_context(ans)
+TypeError: ZepMemory.save_context() missing 1 required positional argument: 'outputs'
+2023-11-30 19:41:31,578 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 19:41:32,561 - langchain_gpt_api - INFO - inside class
+2023-11-30 19:41:39,906 - langchain_gpt_api - INFO - query------> hi
+2023-11-30 19:41:41,567 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-30 19:41:41,568 - langchain_gpt_api - INFO - len---->2196
+2023-11-30 19:41:41,580 - langchain_gpt_api - INFO - len---->2426
+2023-11-30 19:41:45,308 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Hello Sahil! Good to see you again. How can I help enhance your learning experience today?"
+}
+```
+2023-11-30 19:41:45,311 - langchain_gpt_api - INFO - time taken for this call is 3.744171380996704
+2023-11-30 19:41:45,315 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-30 19:41:45,315 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-30 19:41:45,496 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-30 19:42:52,768 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 19:42:53,857 - langchain_gpt_api - INFO - inside class
+2023-11-30 19:43:06,973 - langchain_gpt_api - INFO - query------> how are you?
+2023-11-30 19:43:08,705 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-30 19:43:08,706 - langchain_gpt_api - INFO - len---->2201
+2023-11-30 19:43:08,714 - langchain_gpt_api - INFO - len---->2426
+2023-11-30 19:43:12,330 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "I'm an AI, so I don't have feelings, but I'm operational and ready to assist you. How can I help you with your studies today?"
+}
+```
+2023-11-30 19:43:12,331 - langchain_gpt_api - INFO - time taken for this call is 3.6261229515075684
+2023-11-30 19:43:12,332 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': 'Sahil10001'}, False
+2023-11-30 19:43:12,334 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': 'Sahil10001'}
+2023-11-30 19:43:12,521 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': 'Sahil10001'}
+2023-11-30 19:49:56,489 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 19:49:57,541 - langchain_gpt_api - INFO - inside class
+2023-11-30 19:50:00,792 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': 'Sahil10001'}, False
+2023-11-30 19:50:00,794 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': 'Sahil10001'}
+2023-11-30 19:50:00,960 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': 'Sahil10001'}
+2023-11-30 19:50:00,961 - langchain_gpt_api - INFO - Hello! How can I assist you today?
+2023-11-30 19:50:00,963 - langchain_gpt_api - INFO - Hello! How can I assist you today?
+2023-11-30 19:52:10,039 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 19:52:11,076 - langchain_gpt_api - INFO - inside class
+2023-11-30 19:52:18,176 - langchain_gpt_api - INFO - query------> how are you?
+2023-11-30 19:52:19,763 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 705, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 684, in get_ans
+    ans = agent_chain.run({'input':query})
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 440, in run
+    return self(args[0], callbacks=callbacks, tags=tags, metadata=metadata)[
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 220, in __call__
+    inputs = self.prep_inputs(inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 374, in prep_inputs
+    self._validate_inputs(inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 132, in _validate_inputs
+    raise ValueError(f"Missing some input keys: {missing_keys}")
+ValueError: Missing some input keys: {'chat_history'}
+2023-11-30 19:57:22,945 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 19:57:23,888 - langchain_gpt_api - INFO - inside class
+2023-11-30 19:57:29,197 - langchain_gpt_api - INFO - query------> how are you?
+2023-11-30 19:57:31,067 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-30 19:57:31,069 - langchain_gpt_api - INFO - len---->2208
+2023-11-30 19:57:31,081 - langchain_gpt_api - INFO - len---->2436
+2023-11-30 19:57:35,813 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Being an AI, I don't have feelings, but I'm fully operational and ready to assist you. What can I help you with today, Sahil?"
+}
+```
+2023-11-30 19:57:35,816 - langchain_gpt_api - INFO - time taken for this call is 4.748890161514282
+2023-11-30 19:57:36,028 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': 'Sahil10001'}, False
+2023-11-30 19:57:36,029 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': 'Sahil10001'}
+2023-11-30 19:57:36,235 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': 'Sahil10001'}
+2023-11-30 22:25:35,034 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 22:25:35,720 - langchain_gpt_api - INFO - inside class
+2023-11-30 22:25:45,185 - langchain_gpt_api - INFO - query------> how are you?
+2023-11-30 22:25:46,654 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 691, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 665, in get_ans
+    agent_chain = CustomAgentExecutor(
+TypeError: CustomAgentExecutor.__init__() got an unexpected keyword argument 'agent'
+2023-11-30 22:29:28,883 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 22:29:29,484 - langchain_gpt_api - INFO - inside class
+2023-11-30 22:29:34,179 - langchain_gpt_api - INFO - query------> how are you?
+2023-11-30 22:29:35,126 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 693, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 668, in get_ans
+    agent_chain = CustomAgentExecutor(
+TypeError: CustomAgentExecutor.__init__() got an unexpected keyword argument 'agent'
+2023-11-30 22:59:13,466 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 22:59:14,087 - langchain_gpt_api - INFO - inside class
+2023-11-30 22:59:21,542 - langchain_gpt_api - INFO - query------> how are you?
+2023-11-30 22:59:22,817 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-30 22:59:22,818 - langchain_gpt_api - INFO - len---->2278
+2023-11-30 22:59:22,824 - langchain_gpt_api - INFO - len---->2535
+2023-11-30 22:59:30,585 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "As an AI, I don't experience emotions or physical well-being like humans do, but thank you for asking, Sahil. I'm here and ready to assist you. What would you like to learn today?"
+}
+```
+2023-11-30 22:59:30,586 - langchain_gpt_api - INFO - time taken for this call is 7.770707607269287
+2023-11-30 22:59:31,132 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': None}, False
+2023-11-30 22:59:31,132 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': None}
+2023-11-30 22:59:31,326 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': None}
+2023-11-30 23:00:33,042 - langchain_gpt_api - INFO - query------> how are you?
+2023-11-30 23:00:34,133 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-30 23:00:34,134 - langchain_gpt_api - INFO - len---->2392
+2023-11-30 23:00:34,139 - langchain_gpt_api - INFO - len---->2676
+2023-11-30 23:00:43,557 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "As an AI, I don't have the physical or emotional states, Sahil. But let's not worry about me. I'm here, fully operational and ready to assist you in your learning journey. How can I assist you today?"
+}
+```
+2023-11-30 23:00:43,558 - langchain_gpt_api - INFO - time taken for this call is 9.425628423690796
+2023-11-30 23:00:43,804 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': 101}, False
+2023-11-30 23:00:43,804 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': 101}
+2023-11-30 23:00:43,991 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': 101}
+2023-11-30 23:04:09,581 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 23:04:10,280 - langchain_gpt_api - INFO - inside class
+2023-11-30 23:04:26,919 - langchain_gpt_api - INFO - query------> give me infromation about user 101
+2023-11-30 23:04:28,296 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-30 23:04:28,297 - langchain_gpt_api - INFO - len---->2583
+2023-11-30 23:04:28,302 - langchain_gpt_api - INFO - len---->2903
+2023-11-30 23:04:37,450 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "I'm afraid I can't assist with that. To respect privacy, I can only provide information about the current user. As for you, Sahil, you're in the 8th standard, your medium of communicating is English and you were born on June 3, 2020. On your learning journey, you've been taking care of the course fees yourself. I noticed that you joined on June 12, 2023. Is there anything specific you want to learn today?"
+}
+```
+2023-11-30 23:04:37,452 - langchain_gpt_api - INFO - time taken for this call is 9.155861377716064
+2023-11-30 23:04:37,695 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': 101}, False
+2023-11-30 23:04:37,697 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': 101}
+2023-11-30 23:04:37,893 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': 101}
+2023-12-01 13:14:40,734 - langchain_gpt_api - INFO - Logger initialized
+2023-12-01 13:14:59,910 - langchain_gpt_api - INFO - query------> list all question i have asked till now
+2023-12-01 13:15:01,968 - langchain_gpt_api - INFO - calling for 1 times
+2023-12-01 13:15:01,968 - langchain_gpt_api - INFO - len---->2759
+2023-12-01 13:15:01,977 - langchain_gpt_api - INFO - len---->3147
+2023-12-01 13:15:06,278 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "FULL_HISTORY",
+    "action_input": "questions asked by Sahil, 2023-06-12T08:07:27, 2023-12-01T13:14:59.661014"
+}
+```
+2023-12-01 13:15:06,278 - langchain_gpt_api - INFO - time taken for this call is 4.310708999633789
+2023-12-01 13:15:08,005 - langchain_gpt_api - INFO - final-->{'res_in_filter': [MemorySearchResult(message={'uuid': 'a2c4e6b2-fc18-433a-84d7-4fb70ed17174', 'created_at': '2023-11-30T12:54:59.557491Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': 'Hello, Sahil! Welcome back. What questions do you have for me today?', 'metadata': {'system': {'entities': [{'Label': 'PERSON', 'Matches': [{'End': 12, 'Start': 7, 'Text': 'Sahil'}], 'Name': 'Sahil'}, {'Label': 'DATE', 'Matches': [{'End': 67, 'Start': 62, 'Text': 'today'}], 'Name': 'Today'}], 'intent': "Greeting and inquiring about the subject's questions or concerns."}}, 'token_count': 19}, summary=None, metadata=None, dist=0.8911229372024536), MemorySearchResult(message={'uuid': '49bebada-30b0-4869-8872-bdbb0dc770e4', 'created_at': '2023-11-22T09:27:33.149351Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': 'Hello Sahil, how can I assist with your studies today?', 'metadata': {'system': {'entities': [{'Label': 'PERSON', 'Matches': [{'End': 11, 'Start': 6, 'Text': 'Sahil'}], 'Name': 'Sahil'}, {'Label': 'DATE', 'Matches': [{'End': 53, 'Start': 48, 'Text': 'today'}], 'Name': 'Today'}], 'intent': 'The subject is asking for assistance with their studies.'}}, 'token_count': 15}, summary=None, metadata=None, dist=0.8835830688476562), MemorySearchResult(message={'uuid': '5f9e5ae3-4940-429a-b331-59a66fd20aac', 'created_at': '2023-11-28T06:50:48.51984Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': 'Hello Sahil! How may I assist you with your studies today?', 'metadata': {'system': {'entities': [{'Label': 'PERSON', 'Matches': [{'End': 11, 'Start': 6, 'Text': 'Sahil'}], 'Name': 'Sahil'}, {'Label': 'DATE', 'Matches': [{'End': 57, 'Start': 52, 'Text': 'today'}], 'Name': 'Today'}], 'intent': 'None'}}, 'token_count': 16}, summary=None, metadata=None, dist=0.8791151642799377), MemorySearchResult(message={'uuid': '4d91cc40-3b58-4ddb-9103-11011b220dce', 'created_at': '2023-11-30T14:06:18.895167Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': 'Hello Sahil! How may I assist you in your educational journey today?', 'metadata': {'system': {'entities': [{'Label': 'PERSON', 'Matches': [{'End': 11, 'Start': 6, 'Text': 'Sahil'}], 'Name': 'Sahil'}, {'Label': 'DATE', 'Matches': [{'End': 67, 'Start': 62, 'Text': 'today'}], 'Name': 'Today'}], 'intent': "Greeting and offer of assistance in the subject's educational journey."}}, 'token_count': 17}, summary=None, metadata=None, dist=0.8768451809883118), MemorySearchResult(message={'uuid': '239dd721-ac82-4202-a2ee-0cc8ffe4f2ba', 'created_at': '2023-11-29T16:43:46.165119Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': 'Hello Sahil! How can I assist you in your learning journey today?', 'metadata': {'system': {'entities': [{'Label': 'PERSON', 'Matches': [{'End': 11, 'Start': 6, 'Text': 'Sahil'}], 'Name': 'Sahil'}, {'Label': 'DATE', 'Matches': [{'End': 64, 'Start': 59, 'Text': 'today'}], 'Name': 'Today'}], 'intent': 'The subject is asking for assistance in their learning journey.'}}, 'token_count': 17}, summary=None, metadata=None, dist=0.8760274648666382), MemorySearchResult(message={'uuid': '56a1a0ab-b438-4c25-97c9-85347f3779be', 'created_at': '2023-11-29T16:33:23.59443Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': "Hello Sahil! Here's the comprehensive list of all your notable queries for today: \n1. You asked 'list all queries asked today' thrice. \n2. You requested information about user 101 and user 100. \n3. You also initiated the conversation with a simple 'hi'. \nPlease let me know if you want to delve into any specific query or need information about anything else. Happy learning!", 'metadata': {'system': {'entities': [{'Label': 'PERSON', 'Matches': [{'End': 11, 'Start': 6, 'Text': 'Sahil'}], 'Name': 'Sahil'}, {'Label': 'DATE', 'Matches': [{'End': 80, 'Start': 75, 'Text': 'today'}, {'End': 125, 'Start': 120, 'Text': 'today'}], 'Name': 'Today'}, {'Label': 'CARDINAL', 'Matches': [{'End': 85, 'Start': 83, 'Text': '1.'}], 'Name': '1.'}, {'Label': 'CARDINAL', 'Matches': [{'End': 138, 'Start': 136, 'Text': '2.'}], 'Name': '2.'}, {'Label': 'CARDINAL', 'Matches': [{'End': 179, 'Start': 176, 'Text': '101'}], 'Name': '101'}, {'Label': 'CARDINAL', 'Matches': [{'End': 192, 'Start': 189, 'Text': '100'}], 'Name': '100'}, {'Label': 'CARDINAL', 'Matches': [{'End': 197, 'Start': 195, 'Text': '3.'}], 'Name': '3.'}], 'intent': 'None.'}}, 'token_count': 87}, summary=None, metadata=None, dist=0.8711038827896118), MemorySearchResult(message={'uuid': 'edb02e61-3706-45f7-9043-47727df90268', 'created_at': '2023-11-30T14:11:45.55436Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': 'Hello Sahil! Good to see you again. How can I help enhance your learning experience today?', 'metadata': {'system': {'entities': [{'Label': 'PERSON', 'Matches': [{'End': 11, 'Start': 6, 'Text': 'Sahil'}], 'Name': 'Sahil'}, {'Label': 'DATE', 'Matches': [{'End': 89, 'Start': 84, 'Text': 'today'}], 'Name': 'Today'}], 'intent': 'The subject is asking for assistance in enhancing their learning experience.'}}, 'token_count': 22}, summary=None, metadata=None, dist=0.8694353103637695), MemorySearchResult(message={'uuid': 'f5a61bb8-9b39-4804-bd9d-90b89db1c21e', 'created_at': '2023-11-29T17:36:55.62624Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': 'Hello again, Sahil! What new learning do you seek today?', 'metadata': {'system': {'entities': [{'Label': 'PERSON', 'Matches': [{'End': 18, 'Start': 13, 'Text': 'Sahil'}], 'Name': 'Sahil'}, {'Label': 'DATE', 'Matches': [{'End': 55, 'Start': 50, 'Text': 'today'}], 'Name': 'Today'}], 'intent': 'None'}}, 'token_count': 16}, summary=None, metadata=None, dist=0.8644452095031738), MemorySearchResult(message={'uuid': '82ed7f5c-a1b3-4a4d-b4a1-b501115015f7', 'created_at': '2023-11-30T12:57:38.177977Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': 'Hello Sahil, always a pleasure to see you again! How can I assist you with your learning journey today?', 'metadata': {'system': {'entities': [{'Label': 'PERSON', 'Matches': [{'End': 11, 'Start': 6, 'Text': 'Sahil'}], 'Name': 'Sahil'}, {'Label': 'DATE', 'Matches': [{'End': 102, 'Start': 97, 'Text': 'today'}], 'Name': 'Today'}], 'intent': 'The subject is seeking assistance with their learning journey.'}}, 'token_count': 25}, summary=None, metadata=None, dist=0.8625115156173706), MemorySearchResult(message={'uuid': 'ab3ee12d-8825-475a-995f-1d19b7340560', 'created_at': '2023-11-29T17:42:44.106335Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': "Hello, Sahil! I'm glad to see you again. How can I assist you in your studies today?", 'metadata': {'system': {'entities': [{'Label': 'PERSON', 'Matches': [{'End': 12, 'Start': 7, 'Text': 'Sahil'}], 'Name': 'Sahil'}, {'Label': 'DATE', 'Matches': [{'End': 83, 'Start': 78, 'Text': 'today'}], 'Name': 'Today'}], 'intent': 'Greeting and offering assistance.'}}, 'token_count': 25}, summary=None, metadata=None, dist=0.8605167865753174)]}
+2023-12-01 13:15:08,666 - langchain_gpt_api - INFO - final-->[MemorySearchResult(message={'uuid': 'a2c4e6b2-fc18-433a-84d7-4fb70ed17174', 'created_at': '2023-11-30T12:54:59.557491Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': 'Hello, Sahil! Welcome back. What questions do you have for me today?', 'metadata': {'system': {'entities': [{'Label': 'PERSON', 'Matches': [{'End': 12, 'Start': 7, 'Text': 'Sahil'}], 'Name': 'Sahil'}, {'Label': 'DATE', 'Matches': [{'End': 67, 'Start': 62, 'Text': 'today'}], 'Name': 'Today'}], 'intent': "Greeting and inquiring about the subject's questions or concerns."}}, 'token_count': 19}, summary=None, metadata=None, dist=0.8911229372024536), MemorySearchResult(message={'uuid': '49bebada-30b0-4869-8872-bdbb0dc770e4', 'created_at': '2023-11-22T09:27:33.149351Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': 'Hello Sahil, how can I assist with your studies today?', 'metadata': {'system': {'entities': [{'Label': 'PERSON', 'Matches': [{'End': 11, 'Start': 6, 'Text': 'Sahil'}], 'Name': 'Sahil'}, {'Label': 'DATE', 'Matches': [{'End': 53, 'Start': 48, 'Text': 'today'}], 'Name': 'Today'}], 'intent': 'The subject is asking for assistance with their studies.'}}, 'token_count': 15}, summary=None, metadata=None, dist=0.8835830688476562), MemorySearchResult(message={'uuid': '5f9e5ae3-4940-429a-b331-59a66fd20aac', 'created_at': '2023-11-28T06:50:48.51984Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': 'Hello Sahil! How may I assist you with your studies today?', 'metadata': {'system': {'entities': [{'Label': 'PERSON', 'Matches': [{'End': 11, 'Start': 6, 'Text': 'Sahil'}], 'Name': 'Sahil'}, {'Label': 'DATE', 'Matches': [{'End': 57, 'Start': 52, 'Text': 'today'}], 'Name': 'Today'}], 'intent': 'None'}}, 'token_count': 16}, summary=None, metadata=None, dist=0.8791151642799377), MemorySearchResult(message={'uuid': '4d91cc40-3b58-4ddb-9103-11011b220dce', 'created_at': '2023-11-30T14:06:18.895167Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': 'Hello Sahil! How may I assist you in your educational journey today?', 'metadata': {'system': {'entities': [{'Label': 'PERSON', 'Matches': [{'End': 11, 'Start': 6, 'Text': 'Sahil'}], 'Name': 'Sahil'}, {'Label': 'DATE', 'Matches': [{'End': 67, 'Start': 62, 'Text': 'today'}], 'Name': 'Today'}], 'intent': "Greeting and offer of assistance in the subject's educational journey."}}, 'token_count': 17}, summary=None, metadata=None, dist=0.8768451809883118), MemorySearchResult(message={'uuid': '239dd721-ac82-4202-a2ee-0cc8ffe4f2ba', 'created_at': '2023-11-29T16:43:46.165119Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': 'Hello Sahil! How can I assist you in your learning journey today?', 'metadata': {'system': {'entities': [{'Label': 'PERSON', 'Matches': [{'End': 11, 'Start': 6, 'Text': 'Sahil'}], 'Name': 'Sahil'}, {'Label': 'DATE', 'Matches': [{'End': 64, 'Start': 59, 'Text': 'today'}], 'Name': 'Today'}], 'intent': 'The subject is asking for assistance in their learning journey.'}}, 'token_count': 17}, summary=None, metadata=None, dist=0.8760274648666382), MemorySearchResult(message={'uuid': '56a1a0ab-b438-4c25-97c9-85347f3779be', 'created_at': '2023-11-29T16:33:23.59443Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': "Hello Sahil! Here's the comprehensive list of all your notable queries for today: \n1. You asked 'list all queries asked today' thrice. \n2. You requested information about user 101 and user 100. \n3. You also initiated the conversation with a simple 'hi'. \nPlease let me know if you want to delve into any specific query or need information about anything else. Happy learning!", 'metadata': {'system': {'entities': [{'Label': 'PERSON', 'Matches': [{'End': 11, 'Start': 6, 'Text': 'Sahil'}], 'Name': 'Sahil'}, {'Label': 'DATE', 'Matches': [{'End': 80, 'Start': 75, 'Text': 'today'}, {'End': 125, 'Start': 120, 'Text': 'today'}], 'Name': 'Today'}, {'Label': 'CARDINAL', 'Matches': [{'End': 85, 'Start': 83, 'Text': '1.'}], 'Name': '1.'}, {'Label': 'CARDINAL', 'Matches': [{'End': 138, 'Start': 136, 'Text': '2.'}], 'Name': '2.'}, {'Label': 'CARDINAL', 'Matches': [{'End': 179, 'Start': 176, 'Text': '101'}], 'Name': '101'}, {'Label': 'CARDINAL', 'Matches': [{'End': 192, 'Start': 189, 'Text': '100'}], 'Name': '100'}, {'Label': 'CARDINAL', 'Matches': [{'End': 197, 'Start': 195, 'Text': '3.'}], 'Name': '3.'}], 'intent': 'None.'}}, 'token_count': 87}, summary=None, metadata=None, dist=0.8711038827896118), MemorySearchResult(message={'uuid': 'edb02e61-3706-45f7-9043-47727df90268', 'created_at': '2023-11-30T14:11:45.55436Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': 'Hello Sahil! Good to see you again. How can I help enhance your learning experience today?', 'metadata': {'system': {'entities': [{'Label': 'PERSON', 'Matches': [{'End': 11, 'Start': 6, 'Text': 'Sahil'}], 'Name': 'Sahil'}, {'Label': 'DATE', 'Matches': [{'End': 89, 'Start': 84, 'Text': 'today'}], 'Name': 'Today'}], 'intent': 'The subject is asking for assistance in enhancing their learning experience.'}}, 'token_count': 22}, summary=None, metadata=None, dist=0.8694353103637695), MemorySearchResult(message={'uuid': 'f5a61bb8-9b39-4804-bd9d-90b89db1c21e', 'created_at': '2023-11-29T17:36:55.62624Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': 'Hello again, Sahil! What new learning do you seek today?', 'metadata': {'system': {'entities': [{'Label': 'PERSON', 'Matches': [{'End': 18, 'Start': 13, 'Text': 'Sahil'}], 'Name': 'Sahil'}, {'Label': 'DATE', 'Matches': [{'End': 55, 'Start': 50, 'Text': 'today'}], 'Name': 'Today'}], 'intent': 'None'}}, 'token_count': 16}, summary=None, metadata=None, dist=0.8644452095031738), MemorySearchResult(message={'uuid': '82ed7f5c-a1b3-4a4d-b4a1-b501115015f7', 'created_at': '2023-11-30T12:57:38.177977Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': 'Hello Sahil, always a pleasure to see you again! How can I assist you with your learning journey today?', 'metadata': {'system': {'entities': [{'Label': 'PERSON', 'Matches': [{'End': 11, 'Start': 6, 'Text': 'Sahil'}], 'Name': 'Sahil'}, {'Label': 'DATE', 'Matches': [{'End': 102, 'Start': 97, 'Text': 'today'}], 'Name': 'Today'}], 'intent': 'The subject is seeking assistance with their learning journey.'}}, 'token_count': 25}, summary=None, metadata=None, dist=0.8625115156173706), MemorySearchResult(message={'uuid': 'ab3ee12d-8825-475a-995f-1d19b7340560', 'created_at': '2023-11-29T17:42:44.106335Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': "Hello, Sahil! I'm glad to see you again. How can I assist you in your studies today?", 'metadata': {'system': {'entities': [{'Label': 'PERSON', 'Matches': [{'End': 12, 'Start': 7, 'Text': 'Sahil'}], 'Name': 'Sahil'}, {'Label': 'DATE', 'Matches': [{'End': 83, 'Start': 78, 'Text': 'today'}], 'Name': 'Today'}], 'intent': 'Greeting and offering assistance.'}}, 'token_count': 25}, summary=None, metadata=None, dist=0.8605167865753174)]
+2023-12-01 13:15:08,672 - langchain_gpt_api - INFO - time taken for zep is {elapsed_time}
+2023-12-01 13:15:08,820 - langchain_gpt_api - INFO - calling for 2 times
+2023-12-01 13:15:08,821 - langchain_gpt_api - INFO - len---->3084
+2023-12-01 13:15:08,826 - langchain_gpt_api - INFO - len---->3607
+2023-12-01 13:15:17,762 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Hello again, Sahil! Here are some of the key interactions we've had today:\n1. You greeted me multiple times and each time I returned the greeting and asked how I could assist you in your education.\n2. You also asked about 'user 101' but due to privacy constraints, I'm only able to share information about the current user.\n3. Lastly, you asked to list all the questions you had asked today which is why I'm providing you with this summary. Let's continue our learning journey, what's next?"
+}
+```
+2023-12-01 13:15:17,763 - langchain_gpt_api - INFO - time taken for this call is 8.943199396133423
+2023-12-01 13:15:18,038 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': 101}, False
+2023-12-01 13:15:18,038 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': 101}
+2023-12-01 13:15:18,221 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': 101}
+2023-12-01 14:29:24,208 - langchain_gpt_api - INFO - Logger initialized
+2023-12-01 14:29:31,844 - langchain_gpt_api - INFO - query------> list all question i have asked till now
+2023-12-01 14:29:33,978 - langchain_gpt_api - INFO - calling for 1 times
+2023-12-01 14:29:33,979 - langchain_gpt_api - INFO - len---->2430
+2023-12-01 14:29:33,988 - langchain_gpt_api - INFO - len---->2750
+2023-12-01 14:29:40,713 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Hello again, Sahil! Here are some of the key interactions we've had today:\n1. You greeted me multiple times and each time I returned the greeting and asked how I could assist you in your education.\n2. You also asked about 'user 101' but due to privacy constraints, I'm only able to share information about the current user.\n3. Lastly, you asked to list all the questions you had asked today which is why I'm providing you with this summary. Let's continue our learning journey, what's next?"
+}
+```
+2023-12-01 14:29:40,714 - langchain_gpt_api - INFO - time taken for this call is 6.735710859298706
+2023-12-01 14:29:40,934 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': 101}, False
+2023-12-01 14:29:40,934 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': 101}
+2023-12-01 14:29:41,097 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': 101}
+2023-12-01 14:30:08,229 - langchain_gpt_api - INFO - query------> list all question i have asked till now
+2023-12-01 14:30:09,394 - langchain_gpt_api - INFO - calling for 1 times
+2023-12-01 14:30:09,394 - langchain_gpt_api - INFO - len---->1885
+2023-12-01 14:30:09,397 - langchain_gpt_api - INFO - len---->2018
+2023-12-01 14:30:13,377 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "FULL_HISTORY",
+    "action_input": "list all question i have asked till now, 2023-06-15T09:28:06, 2023-12-01 14:30:07.969219"
+}
+```
+2023-12-01 14:30:13,378 - langchain_gpt_api - INFO - time taken for this call is 3.983469247817993
+2023-12-01 14:30:15,180 - langchain_gpt_api - INFO - Error while getting req ids
+2023-12-01 14:30:15,182 - langchain_gpt_api - INFO - final-->{'res_in_filter': [MemorySearchResult(message={'uuid': 'cbb108fb-56e9-441e-9a49-2dc8efca5f5f', 'created_at': '2023-12-01T09:00:16.92341Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'list all question i have asked till now', 'metadata': {'system': {'intent': 'The subject is asking for a list of all the questions they have asked.'}}, 'token_count': 10}, summary=None, metadata=None, dist=0.9999978542327881), MemorySearchResult(message={'uuid': '7c3e2bda-41a1-4a29-9ff8-52780276cdbb', 'created_at': '2023-11-21T14:30:45.4527Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'give me details about user 101', 'metadata': {'system': {'entities': [{'Label': 'CARDINAL', 'Matches': [{'End': 30, 'Start': 27, 'Text': '101'}], 'Name': '101'}], 'intent': 'The subject is asking for information about "user 101."'}}, 'token_count': 9}, summary=None, metadata=None, dist=0.756878674030304), MemorySearchResult(message={'uuid': '770f7e81-4af6-4678-8a72-0d035f839996', 'created_at': '2023-11-21T14:30:45.468818Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': 'Rajesh, to respect your privacy, I can only reveal your own user details. You are a boy, born in 2006, with high English proficiency. You study in standard 8 and pay your course fees yourself. Your preferred language is English-US, and you started using this platform on 15th June 2023. You also have transliteration enabled.', 'metadata': {'system': {'entities': [{'Label': 'DATE', 'Matches': [{'End': 101, 'Start': 97, 'Text': '2006'}], 'Name': '2006'}, {'Label': 'NORP', 'Matches': [{'End': 120, 'Start': 113, 'Text': 'English'}, {'End': 227, 'Start': 220, 'Text': 'English'}], 'Name': 'English'}, {'Label': 'CARDINAL', 'Matches': [{'End': 157, 'Start': 156, 'Text': '8'}], 'Name': '8'}, {'Label': 'GPE', 'Matches': [{'End': 230, 'Start': 228, 'Text': 'US'}], 'Name': 'US'}, {'Label': 'DATE', 'Matches': [{'End': 285, 'Start': 271, 'Text': '15th June 2023'}], 'Name': '15th June 2023'}], 'intent': 'Confirming personal details of the subject'}}, 'token_count': 77}, summary=None, metadata=None, dist=0.7553462386131287)]}
+2023-12-01 14:30:15,943 - langchain_gpt_api - INFO - final-->[MemorySearchResult(message={'uuid': 'cbb108fb-56e9-441e-9a49-2dc8efca5f5f', 'created_at': '2023-12-01T09:00:16.92341Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'list all question i have asked till now', 'metadata': {'system': {'intent': 'The subject is asking for a list of all the questions they have asked.'}}, 'token_count': 10}, summary=None, metadata=None, dist=0.9999998807907104), MemorySearchResult(message={'uuid': '9a3b0318-6d24-4b06-8d60-850cae299c92', 'created_at': '2023-12-01T09:00:17.023191Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': '```json {     "action": "FULL_HISTORY",     "action_input": "list all question i have asked till now, 2023-06-15T09:28:06, 2023-12-01 14:30:07.969219" } ```', 'metadata': {'system': {'entities': [{'Label': 'DATE', 'Matches': [{'End': 121, 'Start': 102, 'Text': '2023-06-15T09:28:06'}], 'Name': '2023-06-15T09:28:06'}, {'Label': 'DATE', 'Matches': [{'End': 149, 'Start': 123, 'Text': '2023-12-01 14:30:07.969219'}], 'Name': '2023-12-01 14:30:07.969219'}]}}, 'token_count': 61}, summary=None, metadata=None, dist=0.7836304306983948), MemorySearchResult(message={'uuid': '7c3e2bda-41a1-4a29-9ff8-52780276cdbb', 'created_at': '2023-11-21T14:30:45.4527Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'give me details about user 101', 'metadata': {'system': {'entities': [{'Label': 'CARDINAL', 'Matches': [{'End': 30, 'Start': 27, 'Text': '101'}], 'Name': '101'}], 'intent': 'The subject is asking for information about "user 101."'}}, 'token_count': 9}, summary=None, metadata=None, dist=0.7569777965545654), MemorySearchResult(message={'uuid': '770f7e81-4af6-4678-8a72-0d035f839996', 'created_at': '2023-11-21T14:30:45.468818Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': 'Rajesh, to respect your privacy, I can only reveal your own user details. You are a boy, born in 2006, with high English proficiency. You study in standard 8 and pay your course fees yourself. Your preferred language is English-US, and you started using this platform on 15th June 2023. You also have transliteration enabled.', 'metadata': {'system': {'entities': [{'Label': 'DATE', 'Matches': [{'End': 101, 'Start': 97, 'Text': '2006'}], 'Name': '2006'}, {'Label': 'NORP', 'Matches': [{'End': 120, 'Start': 113, 'Text': 'English'}, {'End': 227, 'Start': 220, 'Text': 'English'}], 'Name': 'English'}, {'Label': 'CARDINAL', 'Matches': [{'End': 157, 'Start': 156, 'Text': '8'}], 'Name': '8'}, {'Label': 'GPE', 'Matches': [{'End': 230, 'Start': 228, 'Text': 'US'}], 'Name': 'US'}, {'Label': 'DATE', 'Matches': [{'End': 285, 'Start': 271, 'Text': '15th June 2023'}], 'Name': '15th June 2023'}], 'intent': 'Confirming personal details of the subject'}}, 'token_count': 77}, summary=None, metadata=None, dist=0.7554633021354675)]
+2023-12-01 14:30:15,945 - langchain_gpt_api - INFO - time taken for zep is {elapsed_time}
+2023-12-01 14:30:16,011 - langchain_gpt_api - INFO - calling for 2 times
+2023-12-01 14:30:16,012 - langchain_gpt_api - INFO - len---->2133
+2023-12-01 14:30:16,016 - langchain_gpt_api - INFO - len---->2387
+2023-12-01 14:30:24,557 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Rajesh, here is a list of all the questions you have asked till now along with the responses: 1. 'Give me details about user 101' and the response was 'Rajesh, to respect your privacy, I can only reveal your own user details. You are a boy, born in 2006, with high English proficiency. You study in standard 8 and pay your course fees yourself. Your preferred language is English-US, and you started using this platform on 15th June 2023. You also have transliteration enabled.' 2. 'List all question I have asked till now' and the response was 'I'll fetch the information for you'. Hope this helps!" 
+}
+```
+2023-12-01 14:30:24,558 - langchain_gpt_api - INFO - time taken for this call is 8.547017812728882
+2023-12-01 14:30:24,795 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': 101}, False
+2023-12-01 14:30:24,795 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': 101}
+2023-12-01 14:30:24,954 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': 101}
+2023-12-01 14:31:36,849 - langchain_gpt_api - INFO - Logger initialized
+2023-12-01 14:31:45,515 - langchain_gpt_api - INFO - query------> list all question i have asked till now
+2023-12-01 14:31:46,632 - langchain_gpt_api - INFO - calling for 1 times
+2023-12-01 14:31:46,633 - langchain_gpt_api - INFO - len---->2182
+2023-12-01 14:31:46,641 - langchain_gpt_api - INFO - len---->2403
+2023-12-01 14:31:50,401 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "FULL_HISTORY",
+    "action_input": "list all question i have asked till now, 2023-06-15T09:28:06, 2023-12-01 14:31:45.245113"
+}
+```
+2023-12-01 14:31:50,403 - langchain_gpt_api - INFO - time taken for this call is 3.770807981491089
+2023-12-01 14:31:52,107 - langchain_gpt_api - INFO - Error while getting req ids
+2023-12-01 14:31:52,108 - langchain_gpt_api - INFO - final-->{'res_in_filter': [MemorySearchResult(message={'uuid': '5a7a6905-fc9a-47c7-a2ce-9a6e5d3f705c', 'created_at': '2023-12-01T09:01:53.950891Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'list all question i have asked till now', 'metadata': {'system': {'intent': 'The subject is requesting a list of all the questions they have asked.'}}, 'token_count': 10}, summary=None, metadata=None, dist=0.9999998807907104), MemorySearchResult(message={'uuid': 'd1db4052-7633-49fd-a307-c1abca6f2593', 'created_at': '2023-12-01T09:01:54.034855Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': '```json {     "action": "FULL_HISTORY",     "action_input": "list all question i have asked till now, 2023-06-15T09:28:06, 2023-12-01 14:31:45.245113" } ```', 'metadata': {'system': {'entities': [{'Label': 'DATE', 'Matches': [{'End': 121, 'Start': 102, 'Text': '2023-06-15T09:28:06'}], 'Name': '2023-06-15T09:28:06'}, {'Label': 'DATE', 'Matches': [{'End': 133, 'Start': 123, 'Text': '2023-12-01'}], 'Name': '2023-12-01'}]}}, 'token_count': 61}, summary=None, metadata=None, dist=0.7847937941551208), MemorySearchResult(message={'uuid': '8eeeeba0-a105-40eb-9a28-a3fee3d71b31', 'created_at': '2023-11-24T17:27:56.487416Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'hi', 'metadata': {'system': {'intent': 'Greeting'}}, 'token_count': 3}, summary=None, metadata=None, dist=0.7841780185699463), MemorySearchResult(message={'uuid': '9cb915f3-9bcf-4987-b967-39831a271c83', 'created_at': '2023-11-28T04:54:50.485122Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'hi', 'metadata': {'request_Id': '10010000', 'system': {'intent': 'Greeting'}}, 'token_count': 3}, summary=None, metadata=None, dist=0.7841780185699463), MemorySearchResult(message={'uuid': 'a528dfec-a76a-4e3d-a325-fb049ac591ba', 'created_at': '2023-11-24T17:25:37.46219Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'hi', 'metadata': {'system': {'intent': 'None'}}, 'token_count': 3}, summary=None, metadata=None, dist=0.7841780185699463), MemorySearchResult(message={'uuid': '92a7ad9e-0c42-4d76-8b3c-e84d45049040', 'created_at': '2023-11-24T17:46:41.599517Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'hi', 'metadata': {'system': {'intent': 'Greeting'}}, 'token_count': 3}, summary=None, metadata=None, dist=0.7841780185699463), MemorySearchResult(message={'uuid': '0fe88cd4-b73a-4438-9f5e-2a3d74e6f68f', 'created_at': '2023-11-28T04:53:46.157593Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'hi', 'metadata': {'system': {'intent': 'None'}}, 'token_count': 3}, summary=None, metadata=None, dist=0.7841780185699463), MemorySearchResult(message={'uuid': '81857f9c-bf4a-4e62-be0d-0e55461dc56c', 'created_at': '2023-11-24T08:15:44.716879Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'hi', 'metadata': {'system': {'intent': 'Greeting'}}, 'token_count': 3}, summary=None, metadata=None, dist=0.7841780185699463), MemorySearchResult(message={'uuid': '04fcfe10-5f91-4d4b-a013-12713b9a34e4', 'created_at': '2023-11-28T04:53:36.576341Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'hi', 'metadata': {'request_Id': '10010000', 'system': {'intent': 'Greeting'}}, 'token_count': 3}, summary=None, metadata=None, dist=0.7841780185699463), MemorySearchResult(message={'uuid': '77669c55-fa70-4b0b-a26c-dd9fa5279f47', 'created_at': '2023-11-28T04:57:05.275333Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'hi', 'metadata': {'system': {'intent': 'Greeting'}}, 'token_count': 3}, summary=None, metadata=None, dist=0.7841780185699463)]}
+2023-12-01 14:31:52,756 - langchain_gpt_api - INFO - final-->[MemorySearchResult(message={'uuid': '5a7a6905-fc9a-47c7-a2ce-9a6e5d3f705c', 'created_at': '2023-12-01T09:01:53.950891Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'list all question i have asked till now', 'metadata': {'system': {'intent': 'The subject is requesting a list of all the questions they have asked.'}}, 'token_count': 10}, summary=None, metadata=None, dist=0.9999998807907104), MemorySearchResult(message={'uuid': 'd1db4052-7633-49fd-a307-c1abca6f2593', 'created_at': '2023-12-01T09:01:54.034855Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': '```json {     "action": "FULL_HISTORY",     "action_input": "list all question i have asked till now, 2023-06-15T09:28:06, 2023-12-01 14:31:45.245113" } ```', 'metadata': {'system': {'entities': [{'Label': 'DATE', 'Matches': [{'End': 121, 'Start': 102, 'Text': '2023-06-15T09:28:06'}], 'Name': '2023-06-15T09:28:06'}, {'Label': 'DATE', 'Matches': [{'End': 133, 'Start': 123, 'Text': '2023-12-01'}], 'Name': '2023-12-01'}]}}, 'token_count': 61}, summary=None, metadata=None, dist=0.7847937941551208), MemorySearchResult(message={'uuid': '8eeeeba0-a105-40eb-9a28-a3fee3d71b31', 'created_at': '2023-11-24T17:27:56.487416Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'hi', 'metadata': {'system': {'intent': 'Greeting'}}, 'token_count': 3}, summary=None, metadata=None, dist=0.7841780185699463), MemorySearchResult(message={'uuid': '9cb915f3-9bcf-4987-b967-39831a271c83', 'created_at': '2023-11-28T04:54:50.485122Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'hi', 'metadata': {'request_Id': '10010000', 'system': {'intent': 'Greeting'}}, 'token_count': 3}, summary=None, metadata=None, dist=0.7841780185699463), MemorySearchResult(message={'uuid': 'a528dfec-a76a-4e3d-a325-fb049ac591ba', 'created_at': '2023-11-24T17:25:37.46219Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'hi', 'metadata': {'system': {'intent': 'None'}}, 'token_count': 3}, summary=None, metadata=None, dist=0.7841780185699463), MemorySearchResult(message={'uuid': '92a7ad9e-0c42-4d76-8b3c-e84d45049040', 'created_at': '2023-11-24T17:46:41.599517Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'hi', 'metadata': {'system': {'intent': 'Greeting'}}, 'token_count': 3}, summary=None, metadata=None, dist=0.7841780185699463), MemorySearchResult(message={'uuid': '0fe88cd4-b73a-4438-9f5e-2a3d74e6f68f', 'created_at': '2023-11-28T04:53:46.157593Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'hi', 'metadata': {'system': {'intent': 'None'}}, 'token_count': 3}, summary=None, metadata=None, dist=0.7841780185699463), MemorySearchResult(message={'uuid': '81857f9c-bf4a-4e62-be0d-0e55461dc56c', 'created_at': '2023-11-24T08:15:44.716879Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'hi', 'metadata': {'system': {'intent': 'Greeting'}}, 'token_count': 3}, summary=None, metadata=None, dist=0.7841780185699463), MemorySearchResult(message={'uuid': '04fcfe10-5f91-4d4b-a013-12713b9a34e4', 'created_at': '2023-11-28T04:53:36.576341Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'hi', 'metadata': {'request_Id': '10010000', 'system': {'intent': 'Greeting'}}, 'token_count': 3}, summary=None, metadata=None, dist=0.7841780185699463), MemorySearchResult(message={'uuid': '77669c55-fa70-4b0b-a26c-dd9fa5279f47', 'created_at': '2023-11-28T04:57:05.275333Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'hi', 'metadata': {'system': {'intent': 'Greeting'}}, 'token_count': 3}, summary=None, metadata=None, dist=0.7841780185699463)]
+2023-12-01 14:31:52,760 - langchain_gpt_api - INFO - Error while getting req ids
+2023-12-01 14:31:52,760 - langchain_gpt_api - INFO - time taken for zep is {elapsed_time}
+2023-12-01 14:31:52,838 - langchain_gpt_api - INFO - calling for 2 times
+2023-12-01 14:31:52,840 - langchain_gpt_api - INFO - len---->2377
+2023-12-01 14:31:52,846 - langchain_gpt_api - INFO - len---->2710
+2023-12-01 14:31:58,583 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Here are all the questions you've asked till now, Monisha: 1. What is the weather in Nagpur, Maharashtra. 2. You have greeted me four times. 3. And finally, you requested for the list of all the questions you've asked. How can I assist you further?"
+}
+```
+2023-12-01 14:31:58,584 - langchain_gpt_api - INFO - time taken for this call is 5.745913028717041
+2023-12-01 14:31:58,848 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': 101}, False
+2023-12-01 14:31:58,849 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': 101}
+2023-12-01 14:31:59,022 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': 101}
+2023-12-01 14:41:02,950 - langchain_gpt_api - INFO - Logger initialized
+2023-12-01 14:41:10,273 - langchain_gpt_api - INFO - query------> lsta all request from yesterday
+2023-12-01 14:41:11,664 - langchain_gpt_api - INFO - calling for 1 times
+2023-12-01 14:41:11,664 - langchain_gpt_api - INFO - len---->2258
+2023-12-01 14:41:11,674 - langchain_gpt_api - INFO - len---->2525
+2023-12-01 14:41:15,973 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "FULL_HISTORY",
+    "action_input": "list all request, 2023-11-30T00:00:00, 2023-12-01 14:41:09.925326"
+}
+```
+2023-12-01 14:41:15,975 - langchain_gpt_api - INFO - time taken for this call is 4.311134338378906
+2023-12-01 14:41:52,390 - langchain_gpt_api - INFO - Error while getting req ids
+2023-12-01 14:41:52,391 - langchain_gpt_api - INFO - final-->{'res_in_filter': [MemorySearchResult(message={'uuid': '6bad8e12-9db4-4904-9906-4482d1143146', 'created_at': '2023-12-01T09:11:19.537303Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'lsta all request from yesterday', 'metadata': {'system': {'entities': [{'Label': 'DATE', 'Matches': [{'End': 31, 'Start': 22, 'Text': 'yesterday'}], 'Name': 'Yesterday'}], 'intent': 'The subject is requesting a list of all the requests from the previous day.'}}, 'token_count': 8}, summary=None, metadata=None, dist=0.8168820738792419), MemorySearchResult(message={'uuid': '6880798b-ce45-4fd1-bda2-5d079638d60d', 'created_at': '2023-12-01T09:02:02.193096Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'list all question i have asked till now', 'metadata': {'system': {'intent': 'The subject is asking the assistant to provide a list of all the questions they have asked so far.'}}, 'token_count': 10}, summary=None, metadata=None, dist=0.8056932687759399), MemorySearchResult(message={'uuid': '5a7a6905-fc9a-47c7-a2ce-9a6e5d3f705c', 'created_at': '2023-12-01T09:01:53.950891Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'list all question i have asked till now', 'metadata': {'system': {'intent': 'The subject is requesting a list of all the questions they have asked.'}}, 'token_count': 10}, summary=None, metadata=None, dist=0.8056932687759399), MemorySearchResult(message={'uuid': '722492e1-8485-4c8e-85fe-35e521356a23', 'created_at': '2023-12-01T09:02:02.38121Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'list all question i have asked till now', 'metadata': {'request_Id': 101, 'system': {'intent': 'The subject is requesting a list of all the questions they have asked previously.'}}, 'token_count': 10}, summary=None, metadata=None, dist=0.8056932687759399), MemorySearchResult(message={'uuid': 'fef0454e-c8f1-4fd8-a932-3aa8f20399ee', 'created_at': '2023-12-01T09:11:19.672848Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': '```json {     "action": "FULL_HISTORY",     "action_input": "list all request, 2023-11-30T00:00:00, 2023-12-01 14:41:09.925326" } ```', 'metadata': {'system': {'entities': [{'Label': 'DATE', 'Matches': [{'End': 98, 'Start': 79, 'Text': '2023-11-30T00:00:00'}], 'Name': '2023-11-30T00:00:00'}, {'Label': 'DATE', 'Matches': [{'End': 110, 'Start': 100, 'Text': '2023-12-01'}], 'Name': '2023-12-01'}]}}, 'token_count': 56}, summary=None, metadata=None, dist=0.7812886238098145), MemorySearchResult(message={'uuid': 'd1db4052-7633-49fd-a307-c1abca6f2593', 'created_at': '2023-12-01T09:01:54.034855Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': '```json {     "action": "FULL_HISTORY",     "action_input": "list all question i have asked till now, 2023-06-15T09:28:06, 2023-12-01 14:31:45.245113" } ```', 'metadata': {'system': {'entities': [{'Label': 'DATE', 'Matches': [{'End': 121, 'Start': 102, 'Text': '2023-06-15T09:28:06'}], 'Name': '2023-06-15T09:28:06'}, {'Label': 'DATE', 'Matches': [{'End': 133, 'Start': 123, 'Text': '2023-12-01'}], 'Name': '2023-12-01'}], 'intent': 'The subject is requesting to retrieve a list of all the questions they have asked until a specified date and time.'}}, 'token_count': 61}, summary=None, metadata=None, dist=0.7430825233459473), MemorySearchResult(message={'uuid': 'af805cd9-488d-46e2-a52d-1887a76c0c96', 'created_at': '2023-12-01T09:02:02.301126Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': '```json {     "action": "Final Answer",     "action_input": "Here are all the questions you\'ve asked till now, Monisha: 1. What is the weather in Nagpur, Maharashtra. 2. You have greeted me four times. 3. And finally, you requested for the list of all the questions you\'ve asked. How can I assist you further?" } ```', 'metadata': {'system': {'entities': [{'Label': 'GPE', 'Matches': [{'End': 118, 'Start': 111, 'Text': 'Monisha'}], 'Name': 'Monisha'}, {'Label': 'CARDINAL', 'Matches': [{'End': 121, 'Start': 120, 'Text': '1'}], 'Name': '1'}, {'Label': 'GPE', 'Matches': [{'End': 152, 'Start': 146, 'Text': 'Nagpur'}], 'Name': 'Nagpur'}, {'Label': 'CARDINAL', 'Matches': [{'End': 169, 'Start': 167, 'Text': '2.'}], 'Name': '2.'}, {'Label': 'CARDINAL', 'Matches': [{'End': 194, 'Start': 190, 'Text': 'four'}], 'Name': 'Four'}, {'Label': 'CARDINAL', 'Matches': [{'End': 204, 'Start': 202, 'Text': '3.'}], 'Name': '3.'}], 'intent': 'The subject is requesting a list of all the questions they have asked.'}}, 'token_count': 84}, summary=None, metadata=None, dist=0.7323439717292786), MemorySearchResult(message={'uuid': '3dccd3c9-ebfc-435f-afc3-89be430c6abc', 'created_at': '2023-12-01T09:02:02.473313Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': "Here are all the questions you've asked till now, Monisha: 1. What is the weather in Nagpur, Maharashtra. 2. You have greeted me four times. 3. And finally, you requested for the list of all the questions you've asked. How can I assist you further?", 'metadata': {'request_Id': 101, 'system': {'entities': [{'Label': 'GPE', 'Matches': [{'End': 57, 'Start': 50, 'Text': 'Monisha'}], 'Name': 'Monisha'}, {'Label': 'CARDINAL', 'Matches': [{'End': 60, 'Start': 59, 'Text': '1'}], 'Name': '1'}, {'Label': 'GPE', 'Matches': [{'End': 91, 'Start': 85, 'Text': 'Nagpur'}], 'Name': 'Nagpur'}, {'Label': 'CARDINAL', 'Matches': [{'End': 108, 'Start': 106, 'Text': '2.'}], 'Name': '2.'}, {'Label': 'CARDINAL', 'Matches': [{'End': 133, 'Start': 129, 'Text': 'four'}], 'Name': 'Four'}, {'Label': 'CARDINAL', 'Matches': [{'End': 143, 'Start': 141, 'Text': '3.'}], 'Name': '3.'}], 'intent': 'The subject is asking how the assistant can provide further assistance.'}}, 'token_count': 65}, summary=None, metadata=None, dist=0.7289769053459167)]}
+2023-12-01 14:41:53,106 - langchain_gpt_api - INFO - final-->[MemorySearchResult(message={'uuid': '6bad8e12-9db4-4904-9906-4482d1143146', 'created_at': '2023-12-01T09:11:19.537303Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'lsta all request from yesterday', 'metadata': {'system': {'entities': [{'Label': 'DATE', 'Matches': [{'End': 31, 'Start': 22, 'Text': 'yesterday'}], 'Name': 'Yesterday'}], 'intent': 'The subject is requesting a list of all the requests from the previous day.'}}, 'token_count': 8}, summary=None, metadata=None, dist=0.8168820738792419), MemorySearchResult(message={'uuid': '5a7a6905-fc9a-47c7-a2ce-9a6e5d3f705c', 'created_at': '2023-12-01T09:01:53.950891Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'list all question i have asked till now', 'metadata': {'system': {'intent': 'The subject is requesting a list of all the questions they have asked.'}}, 'token_count': 10}, summary=None, metadata=None, dist=0.8056932687759399), MemorySearchResult(message={'uuid': '6880798b-ce45-4fd1-bda2-5d079638d60d', 'created_at': '2023-12-01T09:02:02.193096Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'list all question i have asked till now', 'metadata': {'system': {'intent': 'The subject is asking the assistant to provide a list of all the questions they have asked so far.'}}, 'token_count': 10}, summary=None, metadata=None, dist=0.8056932687759399), MemorySearchResult(message={'uuid': '722492e1-8485-4c8e-85fe-35e521356a23', 'created_at': '2023-12-01T09:02:02.38121Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'list all question i have asked till now', 'metadata': {'request_Id': 101, 'system': {'intent': 'The subject is requesting a list of all the questions they have asked previously.'}}, 'token_count': 10}, summary=None, metadata=None, dist=0.8056932687759399), MemorySearchResult(message={'uuid': 'fef0454e-c8f1-4fd8-a932-3aa8f20399ee', 'created_at': '2023-12-01T09:11:19.672848Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': '```json {     "action": "FULL_HISTORY",     "action_input": "list all request, 2023-11-30T00:00:00, 2023-12-01 14:41:09.925326" } ```', 'metadata': {'system': {'entities': [{'Label': 'DATE', 'Matches': [{'End': 98, 'Start': 79, 'Text': '2023-11-30T00:00:00'}], 'Name': '2023-11-30T00:00:00'}, {'Label': 'DATE', 'Matches': [{'End': 110, 'Start': 100, 'Text': '2023-12-01'}], 'Name': '2023-12-01'}], 'intent': 'The subject is requesting the assistant to provide a full history of requests made between the specified dates and times.'}}, 'token_count': 56}, summary=None, metadata=None, dist=0.7812886238098145), MemorySearchResult(message={'uuid': '586e50bf-8835-48f1-a9eb-81c23671c99a', 'created_at': '2023-11-21T14:34:45.014752Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'give me details about user 101', 'metadata': {'system': {'entities': [{'Label': 'CARDINAL', 'Matches': [{'End': 30, 'Start': 27, 'Text': '101'}], 'Name': '101'}], 'intent': 'The subject is requesting information about "user 101".'}}, 'token_count': 9}, summary=None, metadata=None, dist=0.7445532083511353), MemorySearchResult(message={'uuid': '5b74523c-a94e-436e-ab0d-a3a024d2210e', 'created_at': '2023-11-21T04:43:50.190969Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'give me details about user 101', 'metadata': {'system': {'entities': [{'Label': 'CARDINAL', 'Matches': [{'End': 30, 'Start': 27, 'Text': '101'}], 'Name': '101'}], 'intent': 'The subject is requesting information or details about a specific user with the identifier "101".'}}, 'token_count': 9}, summary=None, metadata=None, dist=0.7445532083511353), MemorySearchResult(message={'uuid': '922ed8e4-b242-423d-ae77-e6d46d8f1bc7', 'created_at': '2023-11-23T13:31:06.115976Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'give me details about user 101', 'metadata': {'system': {'entities': [{'Label': 'CARDINAL', 'Matches': [{'End': 30, 'Start': 27, 'Text': '101'}], 'Name': '101'}], 'intent': 'The subject is asking for information about a specific user (user 101).'}}, 'token_count': 9}, summary=None, metadata=None, dist=0.7444305419921875), MemorySearchResult(message={'uuid': '8d4ee7e7-02aa-4ab0-bd8b-fc7eaba37b81', 'created_at': '2023-11-25T09:15:09.56942Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'hi ', 'metadata': {'request_Id': '10010000', 'system': {'intent': 'Greeting'}}, 'token_count': 4}, summary=None, metadata=None, dist=0.7436557412147522), MemorySearchResult(message={'uuid': '2e90c6ff-b4f2-48d6-bc58-9c298ea1a626', 'created_at': '2023-11-27T04:24:29.910905Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'hi ', 'metadata': {'request_Id': '10010000', 'system': {'intent': 'Greeting'}}, 'token_count': 4}, summary=None, metadata=None, dist=0.7436557412147522)]
+2023-12-01 14:42:27,949 - langchain_gpt_api - INFO - Error while getting req ids
+2023-12-01 14:42:27,951 - langchain_gpt_api - INFO - time taken for zep is {elapsed_time}
+2023-12-01 14:42:28,086 - langchain_gpt_api - INFO - calling for 2 times
+2023-12-01 14:42:28,088 - langchain_gpt_api - INFO - len---->2397
+2023-12-01 14:42:28,091 - langchain_gpt_api - INFO - len---->2720
+2023-12-01 14:42:34,470 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Monisha, here are all the actions you performed yesterday: 1. You asked me to list all the requests you made from yesterday. 2. You asked me several times to list all the questions you've asked until now. 3. You asked me to give you details about user 101 twice. 4. And, you greeted me twice. I hope this helps! Please let me know how I can further assist you."
+}
+```
+2023-12-01 14:42:34,471 - langchain_gpt_api - INFO - time taken for this call is 6.385090589523315
+2023-12-01 14:42:34,709 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': 101}, False
+2023-12-01 14:42:34,709 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': 101}
+2023-12-01 14:42:34,867 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': 101}
+2023-12-01 14:42:53,833 - langchain_gpt_api - INFO - query------> lsta all request from yesterday
+2023-12-01 14:42:55,134 - langchain_gpt_api - INFO - calling for 1 times
+2023-12-01 14:42:55,135 - langchain_gpt_api - INFO - len---->2375
+2023-12-01 14:42:55,140 - langchain_gpt_api - INFO - len---->2677
+2023-12-01 14:42:59,608 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "FULL_HISTORY",
+    "action_input": "list all request, 2023-11-30T00:00:00, 2023-12-01T14:42:53.568648"
+}
+```
+2023-12-01 14:42:59,609 - langchain_gpt_api - INFO - time taken for this call is 4.475381374359131
+2023-12-01 14:43:09,949 - langchain_gpt_api - INFO - Error while getting req ids
+2023-12-01 14:43:09,950 - langchain_gpt_api - INFO - final-->{'res_in_filter': [MemorySearchResult(message={'uuid': '6499d7f8-2031-44f3-886c-d2e7d1fcefb0', 'created_at': '2023-12-01T09:13:03.172346Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'lsta all request from yesterday', 'metadata': {'system': {'entities': [{'Label': 'DATE', 'Matches': [{'End': 31, 'Start': 22, 'Text': 'yesterday'}], 'Name': 'Yesterday'}], 'intent': 'The subject is requesting a list of all the requests that were made yesterday.'}}, 'token_count': 8}, summary=None, metadata=None, dist=0.8168820738792419), MemorySearchResult(message={'uuid': '6bad8e12-9db4-4904-9906-4482d1143146', 'created_at': '2023-12-01T09:11:19.537303Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'lsta all request from yesterday', 'metadata': {'system': {'entities': [{'Label': 'DATE', 'Matches': [{'End': 31, 'Start': 22, 'Text': 'yesterday'}], 'Name': 'Yesterday'}], 'intent': 'The subject is requesting a list of all the requests from the previous day.'}}, 'token_count': 8}, summary=None, metadata=None, dist=0.8168820738792419), MemorySearchResult(message={'uuid': '17a4b117-ebd1-45f9-86a2-047958aa5b74', 'created_at': '2023-12-01T09:12:38.103542Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'lsta all request from yesterday', 'metadata': {'system': {'entities': [{'Label': 'DATE', 'Matches': [{'End': 31, 'Start': 22, 'Text': 'yesterday'}], 'Name': 'Yesterday'}], 'intent': 'The subject is requesting a list of all the requests from the previous day.'}}, 'token_count': 8}, summary=None, metadata=None, dist=0.8168820738792419), MemorySearchResult(message={'uuid': 'd5345d96-6015-4726-8011-f46e75d6193b', 'created_at': '2023-12-01T09:12:38.262562Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'lsta all request from yesterday', 'metadata': {'request_Id': 101, 'system': {'entities': [{'Label': 'DATE', 'Matches': [{'End': 31, 'Start': 22, 'Text': 'yesterday'}], 'Name': 'Yesterday'}], 'intent': 'The subject is asking the assistant to list all the requests from the previous day.'}}, 'token_count': 8}, summary=None, metadata=None, dist=0.8168820738792419), MemorySearchResult(message={'uuid': '722492e1-8485-4c8e-85fe-35e521356a23', 'created_at': '2023-12-01T09:02:02.38121Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'list all question i have asked till now', 'metadata': {'request_Id': 101, 'system': {'intent': 'The subject is requesting a list of all the questions they have asked previously.'}}, 'token_count': 10}, summary=None, metadata=None, dist=0.8056932687759399), MemorySearchResult(message={'uuid': '6880798b-ce45-4fd1-bda2-5d079638d60d', 'created_at': '2023-12-01T09:02:02.193096Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'list all question i have asked till now', 'metadata': {'system': {'intent': 'The subject is asking the assistant to provide a list of all the questions they have asked so far.'}}, 'token_count': 10}, summary=None, metadata=None, dist=0.8056932687759399), MemorySearchResult(message={'uuid': '5a7a6905-fc9a-47c7-a2ce-9a6e5d3f705c', 'created_at': '2023-12-01T09:01:53.950891Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'human', 'content': 'list all question i have asked till now', 'metadata': {'system': {'intent': 'The subject is requesting a list of all the questions they have asked.'}}, 'token_count': 10}, summary=None, metadata=None, dist=0.8056932687759399), MemorySearchResult(message={'uuid': 'dece214e-4788-475e-966a-975c8a81454d', 'created_at': '2023-12-01T09:12:38.342519Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': "Monisha, here are all the actions you performed yesterday: 1. You asked me to list all the requests you made from yesterday. 2. You asked me several times to list all the questions you've asked until now. 3. You asked me to give you details about user 101 twice. 4. And, you greeted me twice. I hope this helps! Please let me know how I can further assist you.", 'metadata': {'request_Id': 101, 'system': {'entities': [{'Label': 'DATE', 'Matches': [{'End': 57, 'Start': 48, 'Text': 'yesterday'}, {'End': 123, 'Start': 114, 'Text': 'yesterday'}], 'Name': 'Yesterday'}, {'Label': 'CARDINAL', 'Matches': [{'End': 61, 'Start': 59, 'Text': '1.'}], 'Name': '1.'}, {'Label': 'CARDINAL', 'Matches': [{'End': 127, 'Start': 125, 'Text': '2.'}], 'Name': '2.'}, {'Label': 'CARDINAL', 'Matches': [{'End': 207, 'Start': 205, 'Text': '3.'}], 'Name': '3.'}, {'Label': 'CARDINAL', 'Matches': [{'End': 255, 'Start': 252, 'Text': '101'}], 'Name': '101'}, {'Label': 'CARDINAL', 'Matches': [{'End': 265, 'Start': 263, 'Text': '4.'}], 'Name': '4.'}], 'intent': 'None'}}, 'token_count': 91}, summary=None, metadata=None, dist=0.7813224792480469), MemorySearchResult(message={'uuid': 'fef0454e-c8f1-4fd8-a932-3aa8f20399ee', 'created_at': '2023-12-01T09:11:19.672848Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': '```json {     "action": "FULL_HISTORY",     "action_input": "list all request, 2023-11-30T00:00:00, 2023-12-01 14:41:09.925326" } ```', 'metadata': {'system': {'entities': [{'Label': 'DATE', 'Matches': [{'End': 98, 'Start': 79, 'Text': '2023-11-30T00:00:00'}], 'Name': '2023-11-30T00:00:00'}, {'Label': 'DATE', 'Matches': [{'End': 110, 'Start': 100, 'Text': '2023-12-01'}], 'Name': '2023-12-01'}], 'intent': 'The subject is requesting the assistant to provide a full history of requests made between the specified dates and times.'}}, 'token_count': 56}, summary=None, metadata=None, dist=0.7812886238098145), MemorySearchResult(message={'uuid': 'd1db4052-7633-49fd-a307-c1abca6f2593', 'created_at': '2023-12-01T09:01:54.034855Z', 'updated_at': '0001-01-01T00:00:00Z', 'role': 'ai', 'content': '```json {     "action": "FULL_HISTORY",     "action_input": "list all question i have asked till now, 2023-06-15T09:28:06, 2023-12-01 14:31:45.245113" } ```', 'metadata': {'system': {'entities': [{'Label': 'DATE', 'Matches': [{'End': 121, 'Start': 102, 'Text': '2023-06-15T09:28:06'}], 'Name': '2023-06-15T09:28:06'}, {'Label': 'DATE', 'Matches': [{'End': 133, 'Start': 123, 'Text': '2023-12-01'}], 'Name': '2023-12-01'}], 'intent': 'The subject is requesting to retrieve a list of all the questions they have asked until a specified date and time.'}}, 'token_count': 61}, summary=None, metadata=None, dist=0.7430825233459473)]}

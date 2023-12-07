@@ -14,7 +14,7 @@ from langchain.chains import LLMMathChain, OpenAPIEndpointChain
 from langchain.chains.conversation.memory import ConversationSummaryMemory, ConversationBufferWindowMemory
 from langchain.chains.openai_functions.openapi import get_openapi_chain
 from langchain.chat_models import ChatOpenAI
-from langchain.experimental.plan_and_execute import PlanAndExecute, load_agent_executor, load_chat_planner
+# from langchain.experimental.plan_and_execute import PlanAndExecute, load_agent_executor, load_chat_planner
 from langchain.llms import OpenAI, OpenAIChat
 from langchain.llms.base import LLM
 from langchain.memory import ConversationBufferMemory, ReadOnlySharedMemory, ZepMemory
@@ -50,7 +50,7 @@ from threadlocal import thread_local_data
 
 ## logging info
 logging.basicConfig(level=logging.DEBUG)
-handler = RotatingFileHandler('flask_app.log', maxBytes=100000, backupCount=3)
+handler = RotatingFileHandler('langchain.log', maxBytes=100000, backupCount=3)
 
 # Set the logging level for the file handler
 handler.setLevel(logging.DEBUG)
@@ -105,7 +105,6 @@ CRAWLAB_API = config['CRAWLAB_API']
 search = GoogleSearchAPIWrapper(k=4)
 
 #constants
-chain = get_openapi_chain(spec)
 #llm = ChatOpenAI(model_name="gpt-3.5-turbo-16k")
 #llm = ChatOpenAI(temperature=0, model="gpt-4")
 #llm = CustomGPT()
@@ -114,6 +113,8 @@ llm_math = LLMMathChain(llm=ChatOpenAI(model_name="gpt-3.5-turbo"))
 
 
 
+
+chain = get_openapi_chain(spec)
 
 
 
@@ -192,6 +193,7 @@ class CustomGPT(LLM):
         return {
 
         }
+
 
 
 
@@ -646,7 +648,8 @@ def get_ans(user_id, query):
             description=f"""Utilize this utility exclusively when the information required predates the current day and pertains to the ongoing user. The necessary input for this tool comprises a list of values separated by commas.
             The list should encompass a user-generated query, designated by user input text, a commencement date denoted as start_date, and an end date labeled as end_date. The start_date denotes the initiation date for the user information search and should consistently adhere to the ISO 8601 format. Meanwhile, the end_date, also conforming to the ISO 8601 format, signifies the conclusion date for the search.
             In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what zep can do, 2023-07-12T10:19:56.00000Z, 2023-07-13T10:19:56.732291Z'. If query has any form of date or time by user, then start end datetime can be exact rather than till today for more accurate results. Remove any references to time based words (e.g. yesterday, today, datetimes, last year) since the date range you provide already accounts for that. e.g. if user has asked what did we discuss the day before yesterday then the text argument should just be what did we discuss followed by start and end datetime.
-            Strive to apply this tool judiciously for scenarios in which retrospective user information is imperative. If Full history tool response is present, forget other histories, the inputs should be meticulously arranged to facilitate the extraction of accurate and pertinent data within the specified timeframe. Never use this tool for what is the response to my last comment?"""
+            Strive to apply this tool judiciously for scenarios in which retrospective user information is imperative. If Full history tool response is present, forget other histories, the inputs should be meticulously arranged to facilitate the extraction of accurate and pertinent data within the specified timeframe. Never use this tool for what is the response to my last comment? 
+            Remember whatever user query is regarding search history understand what user is asking about and rephrase it properly then send to tool"""
         ),
         Tool(
             name="Text to image",
