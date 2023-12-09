@@ -56,7 +56,8 @@ handler = RotatingFileHandler('langchain.log', maxBytes=100000, backupCount=3)
 handler.setLevel(logging.DEBUG)
 
 # Create a logging format
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+req_id = thread_local_data.get_request_id()
+formatter = logging.Formatter('%(asctime)s - %(req_id)s - %(name)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 
 app = Flask(__name__)
@@ -562,6 +563,35 @@ def parse_link_for_crwalab(inp):
         pass
 
 
+def parse_user_id(inp: str):
+    url = 'https://azurekong.hertzai.com:8443/db/getstudent_by_user_id'
+
+
+    headers = {
+        'Content-Type': 'application/json'
+    }
+
+    try:
+        prov_user_id = re.findall('\d',inp)[0]
+    except:
+        pass
+    finally:
+        prov_user_id = ""
+
+    payload = json.dumps({
+        "user_id": thread_local_data.get_user_id()
+    })
+
+    response = requests.request("POST", url, headers=headers, data=payload)
+    if prov_user_id=="" or int(prov_user_id) != thread_local_data.get_user_id():
+
+        return f"you might interested in finding your user detail here are details {response.text}"
+
+    else:
+        return response.text
+
+
+
 class CustomConvoOutputParser(AgentOutputParser):
     """Output parser for the conversational agent."""
 
@@ -580,7 +610,8 @@ class CustomConvoOutputParser(AgentOutputParser):
             # str = ""
             app.logger.info(text)
             time.sleep
-            if '"Final Answer"' in text or '"Final_Answer"' in text:
+            pattern = r"final\s*[_]*answer"
+            if re.search(pattern, text, re.IGNORECASE):
                 # Extract the JSON part from the string
                 escape_chars = ['\n', '\t', '\r', '\"', "\'", '\\', "'''", '"""']
                 start_index = text.index('{')
@@ -649,7 +680,7 @@ def get_ans(user_id, query):
             The list should encompass a user-generated query, designated by user input text, a commencement date denoted as start_date, and an end date labeled as end_date. The start_date denotes the initiation date for the user information search and should consistently adhere to the ISO 8601 format. Meanwhile, the end_date, also conforming to the ISO 8601 format, signifies the conclusion date for the search.
             In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what zep can do, 2023-07-12T10:19:56.00000Z, 2023-07-13T10:19:56.732291Z'. If query has any form of date or time by user, then start end datetime can be exact rather than till today for more accurate results. Remove any references to time based words (e.g. yesterday, today, datetimes, last year) since the date range you provide already accounts for that. e.g. if user has asked what did we discuss the day before yesterday then the text argument should just be what did we discuss followed by start and end datetime.
             Strive to apply this tool judiciously for scenarios in which retrospective user information is imperative. If Full history tool response is present, forget other histories, the inputs should be meticulously arranged to facilitate the extraction of accurate and pertinent data within the specified timeframe. Never use this tool for what is the response to my last comment? 
-            Remember whatever user query is regarding search history understand what user is asking about and rephrase it properly then send to tool"""
+            Remember whatever user query is regarding search history understand what user is asking about and rephrase it properly then send to tool. Before framing the final from this tool consult corresponding created_at date time to give more accurate response"""
         ),
         Tool(
             name="Text to image",
@@ -673,6 +704,11 @@ def get_ans(user_id, query):
             description='''
                Your task is to extract a URL and its type (either 'pdf' or 'website') from a user's query. Upon receiving a query that contains a URL and a specified URL type, you are to use a tool designed for this purpose. The objective is to accurately identify both the URL and its type from the query. Once identified, these elements should be formatted into a comma-separated string, adhering to the format: "url, url_type".
             '''
+        ),
+        Tool(
+            name="User_details_tool",
+            func=parse_user_id,
+            description="If a request is made for information regarding students, this functionality should be utilized to retrieve the necessary details. input for this api should Always be current user_id. except current id you should say you cannot have access to this user details."
         )
 
     ]
@@ -728,12 +764,10 @@ def get_ans(user_id, query):
 
         always create parsable output
 
-        Here is the User and AI conversation in reverse chronological order:
-
         USER'S INPUT:
         -------------
         <USER_INPUT_START>
-        Latest USER'S INPUT For which you need to respond: {{{{input}}}}
+        Latest USER'S INPUT For which you need to respond consulting history context: {{{{input}}}}
         <USER_INPUT_END>
         """
 
@@ -834,3 +868,5 @@ def status():
 
 if __name__ == '__main__':
     serve(app, host='0.0.0.0', port=5000)
+
+
