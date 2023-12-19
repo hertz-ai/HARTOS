@@ -610,41 +610,49 @@ class CustomConvoOutputParser(AgentOutputParser):
             # str = ""
             app.logger.info(text)
             app.logger.info(f"Caught Exception while parsing output {e}")
-            time.sleep
             pattern = r"final\s*[_]*answer"
-            if re.search(pattern, text, re.IGNORECASE):
-                # Extract the JSON part from the string
-                escape_chars = ['\n', '\t', '\r', '\"', "\'", '\\', "'''", '"""']
-                start_index = text.index('{')
-                try:
-                    end_index = text.rindex('}') + 1
-                except:
-                    text += '"}'
-                    end_index = text.rindex('}') + 1
-                json_string = text[start_index:end_index]
-                try:
-                    parsed_json = parse_json_markdown(json_string)
-                except Exception as e:
-                    parsed_json = parse_json_markdown(json_string.replace('\n', '').replace('\t', '').replace('\r', '').replace('\"', '').replace("\'", '').replace('\\', '').replace("'''", '').replace('"""', '').replace('`',''))
-                action_input = parsed_json["action_input"]
-                return AgentFinish({"output": action_input}, text)
-            else:
-                app.logger.info(text)
-                start_index = text.index('{')
-                try:
-                    end_index = text.rindex('}') + 1
-                except:
-                    text += '"}'
-                    end_index = text.rindex('}') + 1
-                try:
+            try:
+                if re.search(pattern, text, re.IGNORECASE):
+                    # Extract the JSON part from the string
+                    escape_chars = ['\n', '\t', '\r', '\"', "\'", '\\', "'''", '"""']
+                    start_index = text.index('{')
+                    try:
+                        end_index = text.rindex('}') + 1
+                    except:
+                        text += '"}'
+                        end_index = text.rindex('}') + 1
                     json_string = text[start_index:end_index]
-                    response = parse_json_markdown(json_string)
-                    action, action_input = response["action"], response["action_input"]
-                except Exception as innerException:
-                    app.logger.info("Caught inner Exception: {innerException}")
-                    return AgentFinish({"output": text}, text)
-                return AgentAction(action, action_input, text)
-                # raise OutputParserException(f"Could not parse LLM output: {text}") from e
+                    try:
+                        parsed_json = parse_json_markdown(json_string)
+                    except Exception as e:
+                        parsed_json = parse_json_markdown(json_string.replace('\n', '').replace('\t', '').replace('\r', '').replace('\"', '').replace("\'", '').replace('\\', '').replace("'''", '').replace('"""', '').replace('`',''))
+                    action_input = parsed_json["action_input"]
+                    return AgentFinish({"output": action_input}, text)
+                else:
+                    app.logger.info(text)
+                    start_index = text.index('{')
+                    try:
+                        end_index = text.rindex('}') + 1
+                    except:
+                        text += '"}'
+                        end_index = text.rindex('}') + 1
+                    try:
+                        json_string = text[start_index:end_index]
+                        response = parse_json_markdown(json_string)
+                        action, action_input = response["action"], response["action_input"]
+                    except Exception as innerException:
+                        app.logger.info("Caught inner Exception: {innerException}")
+                        return AgentFinish({"output": text}, text)
+                    return AgentAction(action, action_input, text)
+                    # raise OutputParserException(f"Could not parse LLM output: {text}") from e
+            except Exception as e:
+                app.logger.info(f"Encounter an except {e} for ai msg")
+                # Check for the 'AI:' pattern in the response
+                ai_pattern = r"AI: (.+)"
+                ai_match = re.search(ai_pattern, text, re.IGNORECASE)
+                if ai_match:
+                    final_answer = ai_match.group(1).strip()
+                    return AgentFinish({"output": final_answer}, text)
 
     @property
     def _type(self) -> str:
