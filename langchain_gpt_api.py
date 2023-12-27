@@ -48,7 +48,17 @@ from langchain.tools.requests.tool import RequestsGetTool, TextRequestsWrapper
 from pydantic import BaseModel, Field, root_validator
 from threadlocal import thread_local_data
 
+
+class RequestLogRecord(logging.LogRecord):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Safely get the req_id from thread-local storage
+        self.req_id = thread_local_data.get_request_id()
+
+
 ## logging info
+# Use the custom log record factory
+logging.setLogRecordFactory(RequestLogRecord)
 logging.basicConfig(level=logging.DEBUG)
 handler = RotatingFileHandler('langchain.log', maxBytes=100000, backupCount=3)
 
@@ -57,7 +67,7 @@ handler.setLevel(logging.DEBUG)
 
 # Create a logging format
 req_id = thread_local_data.get_request_id()
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+formatter = logging.Formatter('%(asctime)s - %(name)s- [RequestID: %(req_id)s] - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 
 app = Flask(__name__)
@@ -100,6 +110,27 @@ STABLE_DIFF_API = config['STABLE_DIFF_API']
 LLAVA_API = config['LLAVA_API']
 BOOKPARSING_API = config['BOOKPARSING_API']
 CRAWLAB_API = config['CRAWLAB_API']
+
+## task scheduling and logging
+from enum import Enum
+            
+class TaskStatus(Enum):
+    INITIALIZED = "INITIALIZED"
+    SCHEDULED = "SCHEDULED"
+    EXECUTING = "EXECUTING"
+    TIMEOUT = "TIMEOUT"
+    COMPELETED = "COMPELETED"
+    ERROR = "ERROR"
+    
+
+class TaskNames(Enum):
+    GET_ACTION_USER_DETAILS = "GET_ACTION_USER_DETAILS"
+    GET_TIME_BASED_HISTORY = "GET_TIME_BASED_HISTORY"
+    ANIMATE_CHARACTER = "ANIMATE_CHARACTER"
+    STABLE_DIFF = "STABLE_DIFF"
+    LLAVA = "LLAVA"
+    CRAWLAB = "CRAWLAB"
+    USER_ID_RETRIEVER = "USER_ID_RETRIEVER"
 
 
 # google search API
@@ -241,6 +272,7 @@ def get_action_user_details(user_id):
     '''
         This function help to extract action that user have perfomed till time
     '''
+    unwanted_actions=['Topic Cofirmation','Langchain','Assessment Ended','Casual Conversation', 'Topic confirmation', 'Topic not found', 'Topic Confirmation', 'Topic Listing', 'Probe', 'Question Answering', 'Fallback']
     action_url = f"{ACTION_API}?user_id={user_id}"
 
     payload = {}
@@ -248,53 +280,61 @@ def get_action_user_details(user_id):
 
     response = requests.request(
         "GET", action_url, headers=headers, data=payload)
+    
+    if response.status_code == 200:
+        
 
-    unwanted_actions=['Topic Cofirmation','Langchain','Assessment Ended','Casual Conversation', 'Topic confirmation', 'Topic not found', 'Topic Confirmation', 'Topic Listing', 'Probe', 'Question Answering', 'Fallback']
-    data = response.json()
-    #action_texts = [obj["action"] + ' on '+ obj["created_date"] for obj in data if obj["action"] not in unwanted_actions]
-    # Filter out unwanted actions
-    filtered_data = [obj for obj in data if obj["action"] not in unwanted_actions]
+        data = response.json()
+        #action_texts = [obj["action"] + ' on '+ obj["created_date"] for obj in data if obj["action"] not in unwanted_actions]
+        # Filter out unwanted actions
+        filtered_data = [obj for obj in data if obj["action"] not in unwanted_actions]
 
-    # Dictionary to store the first and last occurrence dates for each action
-    action_occurrences = {}
+        # Dictionary to store the first and last occurrence dates for each action
+        action_occurrences = {}
 
-    # Iterate over the filtered data
-    for obj in filtered_data:
-        action = obj["action"]
-        date = parse_date(obj["created_date"])
+        # Iterate over the filtered data
+        for obj in filtered_data:
+            action = obj["action"]
+            date = parse_date(obj["created_date"])
 
-        if action not in action_occurrences:
-            action_occurrences[action] = [date, date]
-        else:
-            first_date, last_date = action_occurrences[action]
-            first_date = min(first_date, date)
-            last_date = max(last_date, date)
-            action_occurrences[action] = [first_date, last_date]
+            if action not in action_occurrences:
+                action_occurrences[action] = [date, date]
+            else:
+                first_date, last_date = action_occurrences[action]
+                first_date = min(first_date, date)
+                last_date = max(last_date, date)
+                action_occurrences[action] = [first_date, last_date]
 
-    # Construct the final list of actions with first and last occurrences
-    action_texts = []
-    for action, dates in action_occurrences.items():
-        first_date, last_date = dates
-        first_action_text = f"{action} on {first_date.strftime('%Y-%m-%dT%H:%M:%S')}"
-        action_texts.append(first_action_text)
-        if first_date != last_date:
-            last_action_text = f"{action} on {last_date.strftime('%Y-%m-%dT%H:%M:%S')}"
-            action_texts.append(last_action_text)
-    if len(action_texts)==0:
-        action_texts=['user has not performed any actions yet.']
+        # Construct the final list of actions with first and last occurrences
+        action_texts = []
+        for action, dates in action_occurrences.items():
+            first_date, last_date = dates
+            first_action_text = f"{action} on {first_date.strftime('%Y-%m-%dT%H:%M:%S')}"
+            action_texts.append(first_action_text)
+            if first_date != last_date:
+                last_action_text = f"{action} on {last_date.strftime('%Y-%m-%dT%H:%M:%S')}"
+                action_texts.append(last_action_text)
+        if len(action_texts)==0:
+            action_texts=['user has not performed any actions yet.']
 
-    actions = ", ".join(action_texts)
-    # Get the current time
-    now = datetime.now()
-    now1 = datetime.now()
-    current_time = now1.strftime("%H:%M:%S")
+        actions = ", ".join(action_texts)
+        # Get the current time
+        now = datetime.now()
+        now1 = datetime.now()
+        current_time = now1.strftime("%H:%M:%S")
 
-    time_zone = "Asia/Kolkata"
-    # Format the time in the desired format
-    formatted_time = datetime.now(timezone(time_zone)).strftime('%Y-%m-%d %H:%M:%S.%f')
+        time_zone = "Asia/Kolkata"
+        # Format the time in the desired format
+        formatted_time = datetime.now(timezone(time_zone)).strftime('%Y-%m-%d %H:%M:%S.%f')
 
-    actions = actions + ". List of actions ends. <PREVIOUS_USER_ACTION_END> \n " + "Today's datetime in "+time_zone + "is: "+  formatted_time +  " in this format:'%Y-%m-%dT%H:%M:%S.%f' \n Whenever user is asking about current date or current time at particular location then use this datetime format by asking what user's location is. Use the previous sentence datetime info to answer current time based questions coupled with google_search for current time or full_history for historical conversation based answers. Take a deep breath and think step by step.\n"
-    # user detail api
+        actions = actions + ". List of actions ends. <PREVIOUS_USER_ACTION_END> \n " + "Today's datetime in "+time_zone + "is: "+  formatted_time +  " in this format:'%Y-%m-%dT%H:%M:%S.%f' \n Whenever user is asking about current date or current time at particular location then use this datetime format by asking what user's location is. Use the previous sentence datetime info to answer current time based questions coupled with google_search for current time or full_history for historical conversation based answers. Take a deep breath and think step by step.\n"
+        # user detail api
+    else:
+        post_dict= {'user_id':user_id, 'status': TaskStatus.ERROR.value,'task_name':TaskNames.GET_ACTION_USER_DETAILS.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':'Exception happend at get action api end'} 
+        try:
+            client.publish('com.hertzai.longrunning.log', post_dict)
+        except Exception as e:
+            logging.error("Error while publish at com.hertzai.longrunning.log topic")
 
     url = STUDENT_API
     payload = json.dumps({
@@ -304,11 +344,18 @@ def get_action_user_details(user_id):
         'Content-Type': 'application/json'
     }
     response = requests.request("POST", url, headers=headers, data=payload)
-    user_data = response.json()
+    if response.status_code == 200:
+        user_data = response.json()
 
-    user_details = f'''Below are the information about the user.
-    user_name: {user_data["name"]} (Call the user by this name only when required and not always),gender: {user_data["gender"]}, who_pays_for_course: {user_data["who_pays_for_course"]}(Entity Responsible for Paying the Course Fees), preferred_language: {user_data["preferred_language"]}(User's Preferred Language), date_of_birth: {user_data["dob"]}, english_proficiency: {user_data["english_proficiency"]}(User's English Proficiency Level), created_date: {user_data["created_date"]}(user creation date), standard: {user_data["standard"]}(User's Standard in which user studying)
-   '''
+        user_details = f'''Below are the information about the user.
+        user_name: {user_data["name"]} (Call the user by this name only when required and not always),gender: {user_data["gender"]}, who_pays_for_course: {user_data["who_pays_for_course"]}(Entity Responsible for Paying the Course Fees), preferred_language: {user_data["preferred_language"]}(User's Preferred Language), date_of_birth: {user_data["dob"]}, english_proficiency: {user_data["english_proficiency"]}(User's English Proficiency Level), created_date: {user_data["created_date"]}(user creation date), standard: {user_data["standard"]}(User's Standard in which user studying)
+        '''
+    else:
+        post_dict= {'user_id':user_id, 'status': TaskStatus.ERROR.value,'task_name':TaskNames.GET_ACTION_USER_DETAILS.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':'Exception happend at get user detail api end'} 
+        try:
+            client.publish('com.hertzai.longrunning.log', post_dict)
+        except Exception as e:
+            logging.error("Error while publish at com.hertzai.longrunning.log topic")
     return user_details, actions
 
 def get_time_based_history(prompt:str, session_id:str, start_date:str, end_date:str):
@@ -338,7 +385,14 @@ def get_time_based_history(prompt:str, session_id:str, start_date:str, end_date:
             "end_date":  end_date
         }
 
-        messages = memory.chat_memory.search(prompt,metadata=metadata)
+        try:
+            messages = memory.chat_memory.search(prompt,metadata=metadata)
+        except:
+            post_dict= {'user_id':'', 'status': TaskStatus.ERROR.value,'task_name':TaskNames.GET_TIME_BASED_HISTORY.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':'Exception happend at zep api end memory object found none'} 
+            try:
+                client.publish('com.hertzai.longrunning.log', post_dict)
+            except Exception as e:
+                logging.error("Error while publish at com.hertzai.longrunning.log topic")
         try:
             extracted_metadata = [message.message['metadata'] for message in messages]
             list_req_ids = [data.get('request_Id', None) for data in extracted_metadata]
@@ -370,7 +424,15 @@ def get_time_based_history(prompt:str, session_id:str, start_date:str, end_date:
         return json.dumps(final_res)
     except Exception as e:
         app.logger.info(f"Exception {e}")
-        messages = memory.chat_memory.search(prompt)
+        try:
+            messages = memory.chat_memory.search(prompt)
+        except:
+            post_dict= {'user_id':'', 'status': TaskStatus.ERROR.value,'task_name':TaskNames.GET_TIME_BASED_HISTORY.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':'Exception happend at zep api end memory object found none'} 
+            try:
+                client.publish('com.hertzai.longrunning.log', post_dict)
+            except Exception as e:
+                logging.error("Error while publish at com.hertzai.longrunning.log topic")
+        
         app.logger.info(f"final messages in except-->{messages}")
         try:
             extracted_metadata = [message.message['metadata'] for message in messages]
@@ -413,6 +475,11 @@ def parse_character_animation(string):
         3 call dreambooth api with fav teacher name
     '''
     try:
+        post_dict= {'user_id':'', 'task_type':'async', 'status': TaskStatus.EXECUTING.value ,'task_name': TaskNames.ANIMATE_CHARACTER.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.ANIMATE_CHARACTER.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id()}
+        try:
+            client.publish('com.hertzai.longrunning.log', post_dict)
+        except Exception as e:
+            logging.error("Error while publish at com.hertzai.longrunning.log topic")
         prompt = string
         student_id_url = STUDENT_API
 
@@ -424,7 +491,9 @@ def parse_character_animation(string):
         }
 
         response = requests.request("POST", student_id_url, headers=headers, data=payload)
-        favorite_teacher_id = response.json()["favorite_teacher_id"]
+        if response.status_code == 200:
+            favorite_teacher_id = response.json()["favorite_teacher_id"]
+        
 
         get_image_by_id_url = f"{FAV_TEACHER_API}/{favorite_teacher_id}"
 
@@ -437,7 +506,6 @@ def parse_character_animation(string):
 
         image_name = image_name.replace("vtoonify_", "", 1)
         folder_name = image_name.split(".")[0]
-
         inference_url = f"{DREAMBOOTH_API}/generate_images"
         payload = json.dumps({
             "weights_dir": f"/home/azureuser/dreambooth/diffusers/examples/dreambooth/{folder_name}_result",
@@ -446,9 +514,23 @@ def parse_character_animation(string):
         headers = {
             'Content-Type': 'application/json'
         }
-        response = requests.request("POST", inference_url, headers=headers, data=payload)
-        return response.json()["image_url"]
+        
+        response = requests.request("POST", inference_url, headers=headers, data=payload, timeout=180)
+        if response.status_code == 200:
+            return response.json()["image_url"]
+        else:
+            post_dict= {'user_id':thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value,'task_name':TaskNames.ANIMATE_CHARACTER.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.ANIMATE_CHARACTER.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':f'Exception happend at dreamooth api end for re {thread_local_data.get_request_id()}'} 
+            try:
+                client.publish('com.hertzai.longrunning.log', post_dict)
+            except Exception as e:
+                logging.error("Error while publish at com.hertzai.longrunning.log topic")
+        
     except:
+        post_dict= {'user_id':thread_local_data.get_user_id(), 'status': TaskStatus.TIMEOUT.value,'task_name':TaskNames.ANIMATE_CHARACTER.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.ANIMATE_CHARACTER.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':f'Exception happend at dreamooth api end for req_id {thread_local_data.get_request_id()} timed out'} 
+        try:
+            client.publish('com.hertzai.longrunning.log', post_dict)
+        except Exception as e:
+            logging.error("Error while publish at com.hertzai.longrunning.log topic")
         return "something went wrong"
 
 
@@ -459,13 +541,31 @@ def parse_text_to_image(inp):
     '''
     try:
 
+        post_dict= {'user_id':'', 'task_type':'async', 'status': TaskStatus.EXECUTING.value ,'task_name': TaskNames.STABLE_DIFF.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.STABLE_DIFF.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id()}
+        try:
+            client.publish('com.hertzai.longrunning.log', post_dict)
+        except Exception as e:
+            logging.error("Error while publish at com.hertzai.longrunning.log topic")
+
         url = f'{STABLE_DIFF_API}?prompt={inp}'
         payload = {}
 
         headers = {}
-        response = requests.request("POST", url, headers=headers, data=payload)
-        return response.json()["img_url"]
+        response = requests.request("POST", url, headers=headers, data=payload. timeout=240)
+        if response.status_code == 200:
+            return response.json()["img_url"]
+        else:
+            post_dict= {'user_id':thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value,'task_name':TaskNames.STABLE_DIFF.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.STABLE_DIFF.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':f'Exception happend at stable diff for req_id: {thread_local_data.get_request_id()}'} 
+            try:
+                client.publish('com.hertzai.longrunning.log', post_dict)
+            except Exception as e:
+                logging.error("Error while publish at com.hertzai.longrunning.log topic")
     except Exception as e:
+        post_dict= {'user_id':thread_local_data.get_user_id(), 'status': TaskStatus.TIMEOUT.value,'task_name':TaskNames.ANIMATE_CHARACTER.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.ANIMATE_CHARACTER.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':f'Exception happend at stable diff for req_id: {thread_local_data.get_request_id()} timed out'} 
+        try:
+            client.publish('com.hertzai.longrunning.log', post_dict)
+        except Exception as e:
+            logging.error("Error while publish at com.hertzai.longrunning.log topic")
         return f"{e} Not able to generating image at this moment please try later"
 
 def parse_image_to_text(inp):
@@ -474,6 +574,11 @@ def parse_image_to_text(inp):
     '''
 
     try:
+        post_dict= {'user_id':'', 'task_type':'async', 'status': TaskStatus.EXECUTING.value ,'task_name': TaskNames.LLAVA.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.LLAVA.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id()}
+        try:
+            client.publish('com.hertzai.longrunning.log', post_dict)
+        except Exception as e:
+            logging.error("Error while publish at com.hertzai.longrunning.log topic")
         inp_list = inp.split(',')
         url = f'{LLAVA_API}'
         payload = {
@@ -482,10 +587,22 @@ def parse_image_to_text(inp):
         }
         files=[]
         headers={}
-        response = requests.request("POST", url, headers=headers, data=payload, files=files)
-
-        return response.text
+        
+        response = requests.request("POST", url, headers=headers, data=payload, files=files, timeout=300)
+        if response.status_code == 200:
+            return response.text
+        else:
+            post_dict= {'user_id':thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value,'task_name':TaskNames.LLAVA.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.LLAVA.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':f'Exception happend at LLAVA for req_id: {thread_local_data.get_request_id()}'} 
+            try:
+                client.publish('com.hertzai.longrunning.log', post_dict)
+            except Exception as e:
+                logging.error("Error while publish at com.hertzai.longrunning.log topic")
     except Exception as e:
+        post_dict= {'user_id':thread_local_data.get_user_id(), 'status': TaskStatus.TIMEOUT.value,'task_name':TaskNames.LLAVA.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.LLAVA.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':f'Exception happend at LLAVA for req_id: {thread_local_data.get_request_id()} timed out'} 
+        try:
+            client.publish('com.hertzai.longrunning.log', post_dict)
+        except Exception as e:
+            logging.error("Error while publish at com.hertzai.longrunning.log topic")
         return f'{e} Not able to generating answer at this moment please try later'
 
 def parse_link_for_crwalab(inp):
@@ -499,6 +616,11 @@ def parse_link_for_crwalab(inp):
     link_type = inp_list[1].strip(' ')
     print
     try:
+        post_dict= {'user_id':'', 'task_type':'async', 'status': TaskStatus.EXECUTING.value ,'task_name': TaskNames.CRAWLAB.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.CRAWLAB.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id()}
+        try:
+            client.publish('com.hertzai.longrunning.log', post_dict)
+        except Exception as e:
+            logging.error("Error while publish at com.hertzai.longrunning.log topic")
         inp_list = inp.split(',')
         input_url = inp_list[0]
         link_type = inp_list[1].strip(' ')
@@ -536,6 +658,11 @@ def parse_link_for_crwalab(inp):
                 return f"your request has been sent and pdf is getting uploading into our system {response.text}"
             except Exception as e:
                 app.logger.info(f"Got exception in book parsing api {e}")
+                post_dict= {'user_id':thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value,'task_name':TaskNames.CRAWLAB.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.CRAWLAB.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':f'Exception happend at CRWALAB for req_id: {thread_local_data.get_request_id()} for pdf upload'} 
+                try:
+                    client.publish('com.hertzai.longrunning.log', post_dict)
+                except Exception as e:
+                    logging.error("Error while publish at com.hertzai.longrunning.log topic")
                 return "sorry I am not able to process your request at this moment"
 
         elif link_type == 'website':
@@ -555,6 +682,11 @@ def parse_link_for_crwalab(inp):
                 return f"your url got uploaded and data extraction is being processes {response.text}"
             except Exception as e:
                 app.logger.info(f"Got exception in crawlab api {e}")
+                post_dict= {'user_id':thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value,'task_name':TaskNames.CRAWLAB.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.CRAWLAB.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':f'Exception happend at CRWALAB for req_id: {thread_local_data.get_request_id()} for weblink upload'} 
+                try:
+                    client.publish('com.hertzai.longrunning.log', post_dict)
+                except Exception as e:
+                    logging.error("Error while publish at com.hertzai.longrunning.log topic")
                 return "sorry I am not able to process your request at this moment"
 
         else:
@@ -838,9 +970,16 @@ def get_ans(user_id, query):
 
 @app.route('/chat', methods=['POST'])
 def chat():
+    
     data = request.get_json()
     user_id = data.get('user_id', None)
     request_id = data.get('request_id', None)
+
+    post_dict= {'user_id':user_id, 'status':'INITIALIZED','task_name':"CHAT", 'uid':request_id, 'task_id': f"CHAT_{str(request_id)}", 'request_id': request_id}
+    try:
+        client.publish('com.hertzai.longrunning.log', post_dict)
+    except Exception as e:
+        print("Error while publish at com.hertzai.longrunning.log topic")
 
     thread_local_data.set_request_id(request_id=request_id)
     thread_local_data.set_user_id(user_id=user_id)
@@ -850,6 +989,18 @@ def chat():
 
     prompt = data.get('prompt', None)
     ans= get_ans(user_id=user_id, query=prompt)
+    if ans != "":
+        post_dict= {'user_id':user_id, 'status':'FINISHED','task_name':"CHAT", 'uid':request_id, 'task_id': f"CHAT_{str(request_id)}", 'request_id': request_id}
+        try:
+            client.publish('com.hertzai.longrunning.log', post_dict)
+        except Exception as e:
+            print("Error while publish at com.hertzai.longrunning.log topic")
+    else:
+        post_dict= {'user_id':user_id, 'status':'ERROR','task_name':"CHAT", 'uid':request_id, 'task_id': f"CHAT_{str(request_id)}", 'request_id': request_id, 'failure_reason':'Got null response from GPT'}
+        try:
+            client.publish('com.hertzai.longrunning.log', post_dict)
+        except Exception as e:
+            print("Error while publish at com.hertzai.longrunning.log topic")
 
     return jsonify({'response': ans, 'intent':thread_local_data.get_recognize_intents(), 'req_token_count': thread_local_data.get_req_token_count(), 'res_token_count':thread_local_data.get_res_token_count(), 'history_request_id': thread_local_data.get_reqid_list()})
 
