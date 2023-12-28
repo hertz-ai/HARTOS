@@ -47,6 +47,7 @@ from langchain.schema import AgentAction, AgentFinish, OutputParserException
 from langchain.tools.requests.tool import RequestsGetTool, TextRequestsWrapper
 from pydantic import BaseModel, Field, root_validator
 from threadlocal import thread_local_data
+from crossbarhttp import Client
 
 
 class RequestLogRecord(logging.LogRecord):
@@ -149,7 +150,7 @@ llm_math = LLMMathChain(llm=ChatOpenAI(model_name="gpt-3.5-turbo"))
 chain = get_openapi_chain(spec)
 
 
-
+client = Client('http://aws_rasa.hertzai.com:8088/publish')
 #custom GPT
 class CustomGPT(LLM):
 
@@ -551,7 +552,7 @@ def parse_text_to_image(inp):
         payload = {}
 
         headers = {}
-        response = requests.request("POST", url, headers=headers, data=payload. timeout=240)
+        response = requests.request("POST", url, headers=headers, data=payload, timeout=240)
         if response.status_code == 200:
             return response.json()["img_url"]
         else:
@@ -970,7 +971,7 @@ def get_ans(user_id, query):
 
 @app.route('/chat', methods=['POST'])
 def chat():
-    
+    print("hii")
     data = request.get_json()
     user_id = data.get('user_id', None)
     request_id = data.get('request_id', None)
