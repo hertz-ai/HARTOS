@@ -48,6 +48,9 @@ from langchain.tools.requests.tool import RequestsGetTool, TextRequestsWrapper
 from pydantic import BaseModel, Field, root_validator
 from threadlocal import thread_local_data
 from crossbarhttp import Client
+from langchain.retrievers.document_compressors import cohere_rerank
+import asyncio
+import aiohttp
 
 
 class RequestLogRecord(logging.LogRecord):
@@ -188,7 +191,7 @@ class CustomGPT(LLM):
             response = requests.post(
                 GPT_API,
                 json={
-                "model": "gpt-4",
+                "model": "gpt-3.5-turbo-16k",
                 "data": [{"role":"user","content":prompt}],
                 "max_token":1000
                 }
@@ -605,6 +608,30 @@ def parse_image_to_text(inp):
         except Exception as e:
             logging.error("Error while publish at com.hertzai.longrunning.log topic")
         return f'{e} Not able to generating answer at this moment please try later'
+    
+    
+async def call_crwalab_api(input_url):
+    try:
+        payload = {
+            'link': input_url,
+            'user_id': thread_local_data.get_user_id(),
+            'request_id': thread_local_data.get_request_id()
+        }
+        files=[]
+        headers = {}
+        async with aiohttp.ClientSession() as session:
+            async with session.post(CRAWLAB_API, headers=headers, data=payload, files=files) as response:
+                pass
+    except:
+        url = "http://65.0.183.250:5005/get_ans"
+
+        payload = {'url': input_url}
+        files=[]
+        headers = {}
+
+        response = requests.request("POST", url, headers=headers, data=payload, files=files)
+        return f'your url got uploaded and data extraction is being processes. Here is some brief information about url you hava provided {response.text}'
+
 
 def parse_link_for_crwalab(inp):
     '''
@@ -668,19 +695,30 @@ def parse_link_for_crwalab(inp):
 
         elif link_type == 'website':
             try:
+                
+                url = "http://65.0.183.250:5005/get_ans"
 
-                payload = {
-                    'link': input_url,
-                    'user_id': thread_local_data.get_user_id(),
-                    'request_id': thread_local_data.get_request_id()
-                }
-                files=[
-
-                ]
+                payload = {'url': input_url}
+                files=[]
                 headers = {}
-                response = requests.request("POST", CRAWLAB_API, headers=headers, data=payload, files=files)
 
-                return f"your url got uploaded and data extraction is being processes {response.text}"
+                response = requests.request("POST", url, headers=headers, data=payload, files=files)
+
+                print(response.text)
+                
+                try:
+                
+                    task1 = asyncio.create_task(call_crwalab_api(input_url))
+                except:
+                    app.logger.info(f"Got exception in crawlab api {e}")
+                    post_dict= {'user_id':thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value,'task_name':TaskNames.CRAWLAB.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.CRAWLAB.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':f'Exception happend at CRWALAB for req_id: {thread_local_data.get_request_id()} for weblink upload'} 
+                    try:
+                        client.publish('com.hertzai.longrunning.log', post_dict)
+                    except Exception as e:
+                        logging.error("Error while publish at com.hertzai.longrunning.log topic")
+                    return f"sorry I am not able to process your request at this moment but here is some brief information about url you hava provided {response.text}" 
+                
+                return f"your url got uploaded and data extraction is being processes. Here is some brief information about url you hava provided {response.text}"
             except Exception as e:
                 app.logger.info(f"Got exception in crawlab api {e}")
                 post_dict= {'user_id':thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value,'task_name':TaskNames.CRAWLAB.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.CRAWLAB.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':f'Exception happend at CRWALAB for req_id: {thread_local_data.get_request_id()} for weblink upload'} 
@@ -722,6 +760,30 @@ def parse_user_id(inp: str):
 
     else:
         return response.text
+from bs4 import BeautifulSoup
+
+def top5_results(query):
+    final_res = []
+    top_2_search_res = search.results(query, 2)
+    top_2_search_res_link = [res['link'] for res in top_2_search_res]
+    for link in top_2_search_res_link:
+        try:
+            response = requests.get(link)
+            html = response.text
+            soup = BeautifulSoup(html, 'html.parser')
+            text = soup.get_text()
+        except:
+            continue
+
+        # Removing punctuation and extra characters
+        cleaned_text = re.sub(r'[^\w\s]', '', text)  # Remove punctuation
+        cleaned_text = re.sub(r'\n+', '\n', cleaned_text).strip()  # Remove extra newlines and leading/trailing whitespaces
+        final_res.append({'text': cleaned_text, 'source':link})
+        
+    if len(final_res) == 0:
+        return search.results(query, 4)
+    
+    return final_res
 
 
 
@@ -800,8 +862,14 @@ def get_ans(user_id, query):
     llm = CustomGPT()
     app.logger.info(f"query------> {query}")
     memory=get_memory(user_id=user_id)
-    tools = load_tools(["google-search"])
+    tools = []
     tool = [
+        Tool(
+            name="Google Search Snippets",
+            description="Search Google for recent results. construct in a such way return search response with url from where you got response. Always return url link from which data is extracted in response ALWAYS",
+            func=top5_results,
+        ),
+        
         Tool(
             name='Calculator',
             func=llm_math.run,
