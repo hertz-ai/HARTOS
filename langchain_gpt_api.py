@@ -114,6 +114,7 @@ STABLE_DIFF_API = config['STABLE_DIFF_API']
 LLAVA_API = config['LLAVA_API']
 BOOKPARSING_API = config['BOOKPARSING_API']
 CRAWLAB_API = config['CRAWLAB_API']
+RAG_API = config['RAG_API']
 
 ## task scheduling and logging
 from enum import Enum
@@ -623,7 +624,7 @@ async def call_crwalab_api(input_url):
             async with session.post(CRAWLAB_API, headers=headers, data=payload, files=files) as response:
                 pass
     except:
-        url = "http://65.0.183.250:5005/get_ans"
+        url = RAG_API
 
         payload = {'url': input_url}
         files=[]
@@ -696,7 +697,7 @@ def parse_link_for_crwalab(inp):
         elif link_type == 'website':
             try:
                 
-                url = "http://65.0.183.250:5005/get_ans"
+                url = RAG_API
 
                 payload = {'url': input_url}
                 files=[]
@@ -886,7 +887,7 @@ def get_ans(user_id, query):
     tool = [
         Tool(
             name="Google Search Snippets",
-            description="Search Google for recent results and retrieve URLs that are suitable for web crawling. Ensure that the search responses include the source URL from which the data was extracted. Always present this URL in the response as an HTML anchor tag. This approach ensures clear attribution and easy navigation to the original source for each piece of extracted information.",
+            description="Search Google for recent results and retrieve URLs that are suitable for web crawling. Ensure that the search responses include the source URL from which the data was extracted. Always present this URL in the response as an HTML anchor tag. This approach ensures clear attribution and easy navigation to the original source for each piece of extracted information. Give urls for the source",
             func=top5_results,
         ),
         
