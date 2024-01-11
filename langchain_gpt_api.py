@@ -762,23 +762,42 @@ def parse_user_id(inp: str):
         return response.text
 from bs4 import BeautifulSoup
 
+async def fetch(session, url):
+    try:
+        async with session.get(url) as response:
+            start_time = time.time()
+            html = await response.text()
+            soup = BeautifulSoup(html, 'html.parser')
+            end_time = time.time()
+            elapsed_time = end_time - start_time
+            print(f"time taken to crawl {url} is {elapsed_time}")
+            return soup.get_text()
+    except Exception as e:
+        print(f"An error occurred while fetching {url}: {e}")
+        return ""
+    
+async def async_main(urls):
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch(session, url) for url in urls]
+        return await asyncio.gather(*tasks)
+    
+
+
 def top5_results(query):
     final_res = []
     top_2_search_res = search.results(query, 2)
     top_2_search_res_link = [res['link'] for res in top_2_search_res]
-    for link in top_2_search_res_link:
-        try:
-            response = requests.get(link)
-            html = response.text
-            soup = BeautifulSoup(html, 'html.parser')
-            text = soup.get_text()
-        except:
-            continue
-
+    try:
+        text =  asyncio.run(async_main(top_2_search_res_link))
         # Removing punctuation and extra characters
-        cleaned_text = re.sub(r'[^\w\s]', '', text)  # Remove punctuation
+        print(text)
+        cleaned_text = re.sub(r'[^\w\s]', '', text[0]+" "+text[1])  # Remove punctuation
         cleaned_text = re.sub(r'\n+', '\n', cleaned_text).strip()  # Remove extra newlines and leading/trailing whitespaces
-        final_res.append({'text': cleaned_text, 'source':link})
+    except RuntimeError as e:
+        print(f"Runtime error occurred: {e}")
+        
+    final_res.append({'text': cleaned_text, 'source':top_2_search_res_link})
+    print(f"res:-->{final_res}")
         
     if len(final_res) == 0:
         return search.results(query, 4)
@@ -858,6 +877,7 @@ class CustomConvoOutputParser(AgentOutputParser):
 
 # main function
 def get_ans(user_id, query):
+    start_time = time.time()
     user_details, actions = get_action_user_details(user_id=user_id)
     llm = CustomGPT()
     app.logger.info(f"query------> {query}")
@@ -866,7 +886,7 @@ def get_ans(user_id, query):
     tool = [
         Tool(
             name="Google Search Snippets",
-            description="Search Google for recent results. construct in a such way return search response with url from where you got response. Always return url link from which data is extracted in response ALWAYS",
+            description="Search Google for recent results and retrieve URLs that are suitable for web crawling. Ensure that the search responses include the source URL from which the data was extracted. Always present this URL in the response as an HTML anchor tag. This approach ensures clear attribution and easy navigation to the original source for each piece of extracted information.",
             func=top5_results,
         ),
         
@@ -1031,6 +1051,8 @@ def get_ans(user_id, query):
         memory=memory
     )
     ans = agent_chain.run({'input':query})
+    end_time = time.time()
+    elapse_time = end_time-start_time
     return ans
 
 
@@ -1040,6 +1062,8 @@ def get_ans(user_id, query):
 @app.route('/chat', methods=['POST'])
 def chat():
     print("hii")
+    
+    start_time = time.time()
     data = request.get_json()
     user_id = data.get('user_id', None)
     request_id = data.get('request_id', None)
@@ -1070,6 +1094,10 @@ def chat():
             client.publish('com.hertzai.longrunning.log', post_dict)
         except Exception as e:
             print("Error while publish at com.hertzai.longrunning.log topic")
+    
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    app.logger.info(f"time taken for this call is {elapsed_time}")
 
     return jsonify({'response': ans, 'intent':thread_local_data.get_recognize_intents(), 'req_token_count': thread_local_data.get_req_token_count(), 'res_token_count':thread_local_data.get_res_token_count(), 'history_request_id': thread_local_data.get_reqid_list()})
 
