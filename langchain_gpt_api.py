@@ -1033,7 +1033,7 @@ def get_ans(user_id, query):
     llm_chain = LLMChain(
         llm=llm,
         prompt=prompt,
-        memory=memory
+        # memory=memory
     )
 
     custom_parser = CustomConvoOutputParser()
