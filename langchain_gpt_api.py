@@ -185,7 +185,8 @@ class CustomGPT(LLM):
                 json={
                 "model": "gpt-4",
                 "data": [{"role":"user","content":prompt}],
-                "max_token":1000
+                "max_token":1000,
+                "request_id":str(thread_local_data.get_request_id())
                 }
             )
         else:
@@ -194,7 +195,8 @@ class CustomGPT(LLM):
                 json={
                 "model": "gpt-3.5-turbo-16k",
                 "data": [{"role":"user","content":prompt}],
-                "max_token":1000
+                "max_token":1000,
+                "request_id":str(thread_local_data.get_request_id())
                 }
             )
 
