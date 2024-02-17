@@ -175,11 +175,11 @@ class CustomGPT(LLM):
         num_tokens = len(encoding.encode(prompt))
         thread_local_data.update_req_token_count(num_tokens)
         app.logger.info(f"len---->{num_tokens}")
-        if self.count >= 5 or self.call_gpt4 ==1:
+        if self.count > 1 or self.call_gpt4 ==1:
             response = requests.post(
                 GPT_API,
                 json={
-                "model": "gpt-4",
+                "model": "gpt35-turbo-1106",
                 "data": [{"role":"user","content":prompt}],
                 "max_token":1000
                 }
@@ -452,6 +452,7 @@ def parsing_string(string):
         this function will extract infromation for above function ie prompt start date end date
     '''
     try:
+        app.logger.info(" The string to parse: {string}")
         prompt, start_date, end_date = [s.strip() for s in string.split(",")]
         session_id = 'user_'+str(thread_local_data.get_user_id())
         return get_time_based_history(prompt, session_id, start_date, end_date)
@@ -667,12 +668,16 @@ def parse_link_for_crwalab(inp):
                 return "sorry I am not able to process your request at this moment"
 
         elif link_type == 'website':
+            input_url_list = [input_url]
+            input_str_list = repr(input_url_list)
             try:
 
                 payload = {
-                    'link': input_url,
+                    'link': input_str_list,
                     'user_id': thread_local_data.get_user_id(),
-                    'request_id': thread_local_data.get_request_id()
+                    'request_id': thread_local_data.get_request_id(),
+                    'depth':'0',
+
                 }
                 files=[
 
