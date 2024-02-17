@@ -4,8 +4,8 @@
     "GOOGLE_API_KEY": "AIzaSyCTEiyRiS8mfZlUp3Lc1JwmmyK4sZI_8Lo",
     "NEWS_API_KEY" : "291350f6b8fd4df982f343888a4cabd5",
     "SERPAPI_API_KEY": "15916f6b8a0a976ab7f92ed1c4e3bc9bb40c73b40404ad2bbf219c5091394cb0",
-    "ZEP_API_KEY": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.5NTb669plV5rLNHGQ5qKh2eLuTa5sWQn2w3BVnxAD1I",
-    "ZEP_API_URL": "http://azure_toonifvm.hertzai.com:8000",
+    "ZEP_API_KEY": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.J8GYPZN-tVnkiTnS5tyjpQ9FdohZKZo_s5CgasXOqSU",
+    "ZEP_API_URL": "http://aws_ttsenglish.hertzai.com:8000",
     "VM_IP": "http://azure_langchaingpt.hertzai.com",
     "GPT_API": "http://aws_rasa.hertzai.com:5459/gpt-json",
     "STUDENT_API": "http://aws_hevolve.hertzai.com:6006/getstudent_by_user_id",
@@ -14,7 +14,7 @@
     "DREAMBOOTH_API": "http://azure_resume_parse.hertzai.com:5010",
     "STABLE_DIFF_API": "http://aws_rasa.hertzai.com:5459/txt2img",
     "LLAVA_API": "http://azurekong.hertzai.com:8000/llava/image_inference",
-    "CRAWLAB_API": "http://aws_crawlab_dataset.hertzai.com:5500/process_link",
+    "CRAWLAB_API": "http://aws_crawlab_2.hertzai.com:5500/process_link",
     "BOOKPARSING_API": "http://aws_pipelinevm.hertzai.com:5454/book_parsing_upload_api"
 
 }
