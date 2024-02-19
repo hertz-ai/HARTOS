@@ -48,6 +48,9 @@ from langchain.tools.requests.tool import RequestsGetTool, TextRequestsWrapper
 from pydantic import BaseModel, Field, root_validator
 from threadlocal import thread_local_data
 from crossbarhttp import Client
+from langchain.retrievers.document_compressors import cohere_rerank
+import asyncio
+import aiohttp
 
 
 class RequestLogRecord(logging.LogRecord):
@@ -111,6 +114,7 @@ STABLE_DIFF_API = config['STABLE_DIFF_API']
 LLAVA_API = config['LLAVA_API']
 BOOKPARSING_API = config['BOOKPARSING_API']
 CRAWLAB_API = config['CRAWLAB_API']
+RAG_API = config['RAG_API']
 
 ## task scheduling and logging
 from enum import Enum
@@ -181,16 +185,18 @@ class CustomGPT(LLM):
                 json={
                 "model": "gpt35-turbo-1106",
                 "data": [{"role":"user","content":prompt}],
-                "max_token":1000
+                "max_token":1000,
+                "request_id":str(thread_local_data.get_request_id())
                 }
             )
         else:
             response = requests.post(
                 GPT_API,
                 json={
-                "model": "gpt-4",
+                "model": "gpt-3.5-turbo-16k",
                 "data": [{"role":"user","content":prompt}],
-                "max_token":1000
+                "max_token":1000,
+                "request_id":str(thread_local_data.get_request_id())
                 }
             )
 
@@ -606,6 +612,30 @@ def parse_image_to_text(inp):
         except Exception as e:
             logging.error("Error while publish at com.hertzai.longrunning.log topic")
         return f'{e} Not able to generating answer at this moment please try later'
+    
+    
+async def call_crwalab_api(input_url):
+    try:
+        payload = {
+            'link': input_url,
+            'user_id': thread_local_data.get_user_id(),
+            'request_id': thread_local_data.get_request_id()
+        }
+        files=[]
+        headers = {}
+        async with aiohttp.ClientSession() as session:
+            async with session.post(CRAWLAB_API, headers=headers, data=payload, files=files) as response:
+                pass
+    except:
+        url = RAG_API
+
+        payload = {'url': input_url}
+        files=[]
+        headers = {}
+
+        response = requests.request("POST", url, headers=headers, data=payload, files=files)
+        return f'your url got uploaded and data extraction is being processes. Here is some brief information about url you hava provided {response.text}'
+
 
 def parse_link_for_crwalab(inp):
     '''
@@ -671,6 +701,9 @@ def parse_link_for_crwalab(inp):
             input_url_list = [input_url]
             input_str_list = repr(input_url_list)
             try:
+                
+                url = RAG_API
+
 
                 payload = {
                     'link': input_str_list,
@@ -682,10 +715,26 @@ def parse_link_for_crwalab(inp):
                 files=[
 
                 ]
-                headers = {}
-                response = requests.request("POST", CRAWLAB_API, headers=headers, data=payload, files=files)
 
-                return f"your url got uploaded and data extraction is being processes {response.text}"
+                headers = {}
+
+                response = requests.request("POST", url, headers=headers, data=payload, files=files)
+
+                print(response.text)
+                
+                try:
+                
+                    task1 = asyncio.create_task(call_crwalab_api(input_url))
+                except:
+                    app.logger.info(f"Got exception in crawlab api {e}")
+                    post_dict= {'user_id':thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value,'task_name':TaskNames.CRAWLAB.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.CRAWLAB.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':f'Exception happend at CRWALAB for req_id: {thread_local_data.get_request_id()} for weblink upload'} 
+                    try:
+                        client.publish('com.hertzai.longrunning.log', post_dict)
+                    except Exception as e:
+                        logging.error("Error while publish at com.hertzai.longrunning.log topic")
+                    return f"sorry I am not able to process your request at this moment but here is some brief information about url you hava provided {response.text}" 
+                
+                return f"your url got uploaded and data extraction is being processes. Here is some brief information about url you hava provided {response.text}"
             except Exception as e:
                 app.logger.info(f"Got exception in crawlab api {e}")
                 post_dict= {'user_id':thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value,'task_name':TaskNames.CRAWLAB.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.CRAWLAB.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':f'Exception happend at CRWALAB for req_id: {thread_local_data.get_request_id()} for weblink upload'} 
@@ -727,6 +776,49 @@ def parse_user_id(inp: str):
 
     else:
         return response.text
+from bs4 import BeautifulSoup
+
+async def fetch(session, url):
+    try:
+        async with session.get(url) as response:
+            start_time = time.time()
+            html = await response.text()
+            soup = BeautifulSoup(html, 'html.parser')
+            end_time = time.time()
+            elapsed_time = end_time - start_time
+            print(f"time taken to crawl {url} is {elapsed_time}")
+            return soup.get_text()
+    except Exception as e:
+        print(f"An error occurred while fetching {url}: {e}")
+        return ""
+    
+async def async_main(urls):
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch(session, url) for url in urls]
+        return await asyncio.gather(*tasks)
+    
+
+
+def top5_results(query):
+    final_res = []
+    top_2_search_res = search.results(query, 2)
+    top_2_search_res_link = [res['link'] for res in top_2_search_res]
+    try:
+        text =  asyncio.run(async_main(top_2_search_res_link))
+        # Removing punctuation and extra characters
+        print(text)
+        cleaned_text = re.sub(r'[^\w\s]', '', text[0]+" "+text[1])  # Remove punctuation
+        cleaned_text = re.sub(r'\n+', '\n', cleaned_text).strip()  # Remove extra newlines and leading/trailing whitespaces
+    except RuntimeError as e:
+        print(f"Runtime error occurred: {e}")
+        
+    final_res.append({'text': cleaned_text, 'source':top_2_search_res_link})
+    print(f"res:-->{final_res}")
+        
+    if len(final_res) == 0:
+        return search.results(query, 4)
+    
+    return final_res
 
 
 
@@ -801,12 +893,19 @@ class CustomConvoOutputParser(AgentOutputParser):
 
 # main function
 def get_ans(user_id, query):
+    start_time = time.time()
     user_details, actions = get_action_user_details(user_id=user_id)
     llm = CustomGPT()
     app.logger.info(f"query------> {query}")
     memory=get_memory(user_id=user_id)
-    tools = load_tools(["google-search"])
+    tools = []
     tool = [
+        Tool(
+            name="Google Search Snippets",
+            description="Search Google for recent results and retrieve URLs that are suitable for web crawling. Ensure that the search responses include the source URL from which the data was extracted. Always present this URL in the response as an HTML anchor tag. This approach ensures clear attribution and easy navigation to the original source for each piece of extracted information. Give urls for the source",
+            func=top5_results,
+        ),
+        
         Tool(
             name='Calculator',
             func=llm_math.run,
@@ -947,7 +1046,7 @@ def get_ans(user_id, query):
     llm_chain = LLMChain(
         llm=llm,
         prompt=prompt,
-        memory=memory
+        # memory=memory
     )
 
     custom_parser = CustomConvoOutputParser()
@@ -968,6 +1067,8 @@ def get_ans(user_id, query):
         memory=memory
     )
     ans = agent_chain.run({'input':query})
+    end_time = time.time()
+    elapse_time = end_time-start_time
     return ans
 
 
@@ -977,6 +1078,8 @@ def get_ans(user_id, query):
 @app.route('/chat', methods=['POST'])
 def chat():
     print("hii")
+    
+    start_time = time.time()
     data = request.get_json()
     user_id = data.get('user_id', None)
     request_id = data.get('request_id', None)
@@ -1007,6 +1110,10 @@ def chat():
             client.publish('com.hertzai.longrunning.log', post_dict)
         except Exception as e:
             print("Error while publish at com.hertzai.longrunning.log topic")
+    
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    app.logger.info(f"time taken for this call is {elapsed_time}")
 
     return jsonify({'response': ans, 'intent':thread_local_data.get_recognize_intents(), 'req_token_count': thread_local_data.get_req_token_count(), 'res_token_count':thread_local_data.get_res_token_count(), 'history_request_id': thread_local_data.get_reqid_list()})
 
