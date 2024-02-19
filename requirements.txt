@@ -131,3 +131,7 @@ yarl==1.9.2
 zep-python==0.32
 zipp==3.15.0
 zstandard==0.21.0
+faiss-cpu
+crossbarhttp3
+
+
