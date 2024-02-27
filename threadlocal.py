@@ -52,6 +52,12 @@ class ThreadLocalData:
     def get_recognize_intents(self):
         return getattr(self._local, 'recognize_intent', None)
     
+    def set_global_intent(self, global_intent):
+        self._local.global_intent = global_intent
+        
+    def get_global_intent(self):
+        return getattr(self._local, 'global_intent', None)
+        
         
 
 thread_local_data = ThreadLocalData()

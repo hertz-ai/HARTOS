@@ -21,7 +21,7 @@ from langchain.memory import ConversationBufferMemory, ReadOnlySharedMemory, Zep
 from langchain.requests import Requests
 from langchain.schema import AgentAction, AgentFinish, OutputParserException, HumanMessage, AIMessage, SystemMessage
 from langchain.tools import OpenAPISpec, APIOperation, StructuredTool
-from langchain.tools.python.tool import PythonREPLTool
+# from langchain.tools.python.tool import PythonREPLTool
 from langchain.utilities import GoogleSearchAPIWrapper
 from flask import Flask, jsonify, request
 import json
@@ -47,7 +47,7 @@ from langchain.schema import AgentAction, AgentFinish, OutputParserException
 from langchain.tools.requests.tool import RequestsGetTool, TextRequestsWrapper
 from pydantic import BaseModel, Field, root_validator
 from threadlocal import thread_local_data
-from crossbarhttp import Client
+import crossbarhttp
 from langchain.retrievers.document_compressors import cohere_rerank
 import asyncio
 import aiohttp
@@ -154,7 +154,190 @@ llm_math = LLMMathChain(llm=ChatOpenAI(model_name="gpt-3.5-turbo"))
 chain = get_openapi_chain(spec)
 
 
-client = Client('http://aws_rasa.hertzai.com:8088/publish')
+client = crossbarhttp.Client('http://aws_rasa.hertzai.com:8088/publish')
+
+
+# create prompt
+def create_prompt(tools):
+    user_details, actions = get_action_user_details(user_id=thread_local_data.get_user_id())
+    prefix = f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+
+        <GENERAL_INSTRUCTION_START>
+        Context:
+        Imagine that you are the world's leading teacher, possessing knowledge in every field. Consider the consequences of each response you provide.
+        Your answers must be meaningful and delivered as quickly as possible. As a highly educated and informed teacher, you have access to an extensive wealth of information.
+        Your primary goal as a teacher is to assist students by answering their questions, providing accurate and up-to-date information.
+        Please create a distinct personality for yourself, and remember never to refer to the user as a human or yourself as mere AI.\
+        your response should not be more than 200 words.
+        <GENERAL_INSTRUCTION_END>
+        User details:
+        <USER_DETAILS_START>
+        {user_details}
+        <USER_DETAILS_END>
+        <CONTEXT_START>
+        Before you respond, consider the context in which you are utilized. You are Hevolve, a highly intelligent educational AI developed by HertzAI.
+        You are designed to answer questions, provide revisions, conduct assessments, teach various topics, create personalised curriculum and assist with research for both students and working professionals.
+        Your expertise draws from various knowledge sources like books, websites, and white papers. Your responses will be conveyed to the user through a video, using an avatar and text-to-speech technology, and can be translated into various languages.
+        Consider the user's location, time and context of previous dialogues with time to create a proper prompt for tools and follow up in-context questions.
+        <CONTEXT_END>
+        These are all the actions that the user has performed up to now:
+        <PREVIOUS_USER_ACTION_START>
+        {actions}
+
+        Conversation History:
+        <HISTORY_START>
+        """
+    suffix = """
+        <HISTORY_END>
+        Only if this above conversation history is not sufficient to fulfill the user's request then use below FULL_HISTORY tool. Important: If results can be accomplished with above information skip tools section and move to format instructions.
+
+        TOOLS
+
+        ------
+
+        Assistant can use tools to look up information that may be helpful in answering the user's
+        question. The tools you can use are:
+
+        <TOOLS_START>
+        {{tools}}
+        <TOOLS_END>
+        <FORMAT_INSTRUCTION_START>
+        {format_instructions}
+        <FORMAT_INSTRUCTION_END>
+
+        always create parsable output.
+
+        Here is the User and AI conversation in reverse chronological order:
+
+        USER'S INPUT:
+        -------------
+        <USER_INPUT_START>
+        Latest USER'S INPUT For which you need to respond (consult recent history only when needed for more context): {{{{input}}}}
+        <USER_INPUT_END>
+        """
+    
+    prompt = ConversationalChatAgent.create_prompt(
+        tools,
+        system_message=prefix,
+        human_message=suffix,
+        input_variables=["input", "agent_scratchpad", "chat_history"]
+    )
+    # prompt_string = prompt.render()
+    # prompt.rende
+    return prompt
+
+def get_tools(req_tool):
+    
+    tools_dict = {1:'google_search', 2:'Calculator', 3:'OpenAPI_Specification', 4:'FULL_HISTORY', 5:'Text to image', 6:'Image_Inference_Tool', 7:'Data_Extraction_From_URL', 8:'User_details_tool'}
+    tool_desc = {
+        'google_search': '''Search Google for recent results and retrieve URLs that are suitable for web crawling. Ensure that the search responses include the source URL from which the data was extracted. Always present this URL in the response as an HTML anchor tag. This approach ensures clear attribution and easy navigation to the original source for each piece of extracted information. Give urls for the source''',
+        'Calculator': '''Useful for when you need to answer questions about math.''',
+        'OpenAPI_Specification':'''Use this feature only when the user's request specifically pertains to one of the following scenarios:\
+            Image Creation: When a request involves generating an image using text, this feature should be engaged. The entire text prompt must be used as it is unless otherwise requested to enhance further detail of prompt for the image generation process. If additional enahancement is needed , enrich the prompt to image generation with greater detail for learning.\
+            Student Information: If a request is made for information regarding students, this functionality should be utilized to retrieve the necessary details.\
+            Query Available Books: When the user is inquiring about available books, this feature should be used to locate and provide information about the required texts.\
+            Any CRUD operation which is not a READ or anything related to curriculum should not use this tool,  It is vital to ensure that the intent precisely falls within one of the above  categories before engaging this functionality.\
+            Don't use this to create a custom curriculum for user''',
+        'FULL_HISTORY':'''Utilize this tool exclusively when the information required predates the current day & pertains to the ongoing user query or when there is a need to recall certain things we spoke earlier. The necessary input for this tool comprises a list of values separated by commas.
+            The list should encompass a user-generated query, designated by user input text, a commencement date denoted as start_date, and an end date labeled as end_date. The start_date denotes the initiation date for the user information search and should consistently adhere to the ISO 8601 format. Meanwhile, the end_date, also conforming to the ISO 8601 format, signifies the conclusion date for the search.
+            In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what zep can do, 2023-07-12T10:19:56.00000Z, 2023-07-13T10:19:56.732291Z'. If query has any form of date or time by user, then start end datetime can be exact rather than till today for more accurate results. Remove any references to time based words (e.g. yesterday, today, datetimes, last year) since the date range you provide already accounts for that. e.g. if user has asked what did we discuss the day before yesterday then the text argument should just be empty since it does not have any named entity for fuzzy search followed by start and end datetime.
+            Strive to apply this tool judiciously for scenarios in which retrospective user information is imperative. If Full history tool response is present, forget other histories, the inputs should be meticulously arranged to facilitate the extraction of accurate and pertinent data within the specified timeframe. Never use this tool for what is the response to my last comment?
+            Remember whatever user query is regarding search history understand what user is asking about and rephrase it properly then send to tool. Before framing the final tool response from this tool consult corresponding created_at date time to give more accurate response''',
+        'Text to image':'''Based on user query generate visual representation of text. Extract prompt from user query and use it as input for function''',
+        'Image_Inference_Tool':'''When a user provides a query containing an image download URL and a related question about that image, utilize this tool for support. Your objective is to extract both the image URL and the user's inquiry or prompt pertaining to that image from their query, and then convert these elements into comma seperated string. The format should be as follows: "image_url, user_query".''',
+        'Data_Extraction_From_URL':'''Your task is to extract a URL and its type (either 'pdf' or 'website') from a user's query. Upon receiving a query that contains a URL and a specified URL type, you are to use a tool designed for this purpose. The objective is to accurately identify both the URL and its type from the query. Once identified, these elements should be formatted into a comma-separated string, adhering to the format: "url, url_type".''',
+        'User_details_tool':'''If a request is made for information regarding students or users, this functionality should be utilized to retrieve the necessary details. input for this api should Always be current user_id. Except current user id you should say you cannot have access other user's details.'''
+    }
+    tools_func = {
+        'google_search':top5_results,
+        'Calculator':llm_math.run,
+        'OpenAPI_Specificationd':chain.run,
+        'FULL_HISTORY':parsing_string,
+        'Text to image':parse_text_to_image,
+        'Image_Inference_Tool':parse_image_to_text,
+        'Data_Extraction_From_URL':parse_link_for_crwalab,
+        'User_details_tool':parse_user_id
+    }
+    if req_tool == "google_search":
+        req_tool = "Google Search Snippets"
+    if req_tool is not None and req_tool in tools_dict.values():
+        tool_description = tool_desc[req_tool]
+        tool_func = tools_func[req_tool]
+        req_tool_from_user = [
+            Tool(
+                name=req_tool,
+                func = tool_func,
+                description=tool_description
+            )
+        ]
+        
+    else:
+        tool_description = ""
+        tool_func=""  
+    
+    
+    
+    tools = []
+    tools += req_tool_from_user
+    tool = [
+        Tool(
+            name="Google Search Snippets",
+            description="Search Google for recent results and retrieve URLs that are suitable for web crawling. Ensure that the search responses include the source URL from which the data was extracted. Always present this URL in the response as an HTML anchor tag. This approach ensures clear attribution and easy navigation to the original source for each piece of extracted information. Give urls for the source",
+            func=top5_results,
+        ),
+        
+        Tool(
+            name='Calculator',
+            func=llm_math.run,
+            description='Useful for when you need to answer questions about math.'
+        ),
+        Tool(
+            name="OpenAPI_Specification",
+            func=chain.run,
+            description="Use the specialized feature for image generation, student information retrieval, and querying available books, while avoiding its use for non-READ CRUD operations or custom curriculum creation.",
+        ),
+        Tool(
+            name="FULL_HISTORY",
+            func=parsing_string,
+            description=f"""Use the tool for retrieving historical user information within a specified timeframe, including user-generated queries, start and end dates in ISO 8601 format, and carefully rephrase queries related to search history for accurate responses, avoiding use for responses to the last comment."""
+        ),
+        Tool(
+            name="Text to image",
+            func=parse_text_to_image,
+            description="Based on user query generate visual representation of text. Extract prompt from user query and use it as input for function"
+        ),
+        # Tool(
+        #     name="Animate_Character",
+        #     func=parse_character_animation,
+        #     description='''Use this tool exclusively for animating the selected character or teacher as requested by the user; it is not intended for general requests or for animating random individuals. The user should specify their animation request in a query, such as 'Show me in a spacesuit' or 'Animate yourself as a cartoon standing in front of the Taj Mahal.' Once the request is made, the tool will generate the animation and return a URL link to the user that directs them to the animated image. Note that this tool is specifically designed to handle requests that involve animating a pre-selected character. It should not be used for general image generation tasks that don't pertain to animating the user's chosen character or teacher. For example, if a user queries 'Show me dancing in the rain,' and they have previously selected a specific character or teacher, the tool should be used to generate this animated scenario. However, if the user's request is something like 'Generate an image of a sunset,' which does not directly involve animating the selected character or teacher, then this tool should not be used.'''
+        # ),
+        Tool(
+            name="Image_Inference_Tool",
+            func=parse_image_to_text,
+            description='''Utilize the tool to extract and format both the image URL and the user's inquiry from a query containing an image download URL into a comma-separated string: "image_url, user_query".'''
+        ),
+        Tool(
+            name="Data_Extraction_From_URL",
+            func=parse_link_for_crwalab,
+            description='''Utilize the designated tool to extract and format a URL and its type (either 'pdf' or 'website') from a user's query into a comma-separated string: "url, url_type".'''
+        ),
+        Tool(
+            name="User_details_tool",
+            func=parse_user_id,
+            description="Utilize this functionality to retrieve information about students or users, requiring the current user_id as the only acceptable input; access to other user details is not allowed."
+        )
+
+    ]
+    final_tool = []
+    for new_tool in tool:
+        if new_tool not in tools:
+            final_tool.append(new_tool)
+            
+    tools += final_tool
+    
+    tool_strings = "\n".join(f"\n> {tool.name}: {tool.description}" for tool in tools)
+    return tool_strings
+
 #custom GPT
 class CustomGPT(LLM):
 
@@ -179,6 +362,20 @@ class CustomGPT(LLM):
         num_tokens = len(encoding.encode(prompt))
         thread_local_data.update_req_token_count(num_tokens)
         app.logger.info(f"len---->{num_tokens}")
+        
+        print("first time calling",len(prompt))
+        
+        if self.count > 1 and thread_local_data.get_global_intent() != self.previous_intent:
+            tools = get_tools(thread_local_data.get_global_intent())  
+            start_index = prompt.find("<TOOLS_START>")  
+            end_index = prompt.find("<TOOLS_END>") + len("<TOOLS_END>")
+            prompt = prompt[:start_index]+ tools + prompt[end_index:]
+            print("second time calling",len(prompt))
+            
+            # prompt = create_prompt(tools)
+            print(prompt)
+            time.sleep(10)
+        
         if self.count > 1 or self.call_gpt4 ==1:
             response = requests.post(
                 GPT_API,
@@ -193,13 +390,14 @@ class CustomGPT(LLM):
             response = requests.post(
                 GPT_API,
                 json={
-                "model": "gpt-3.5-turbo-16k",
+                "model": "gpt-4",
                 "data": [{"role":"user","content":prompt}],
                 "max_token":1000,
                 "request_id":str(thread_local_data.get_request_id())
                 }
             )
 
+        
         response.raise_for_status()
         app.logger.info(f"hellpppppppppppppppp-->{response.json()['text']}")
         try:
@@ -209,6 +407,7 @@ class CustomGPT(LLM):
             except:
                 pass
             intents = json.loads(text)
+            
             curr_intent = intents["action"]
             if self.previous_intent == curr_intent:
                 self.call_gpt4 = 1
@@ -892,13 +1091,23 @@ class CustomConvoOutputParser(AgentOutputParser):
 
 
 # main function
-def get_ans(user_id, query):
+def get_ans(req_tool, tool_description, tool_func, user_id, query):
     start_time = time.time()
     user_details, actions = get_action_user_details(user_id=user_id)
     llm = CustomGPT()
     app.logger.info(f"query------> {query}")
     memory=get_memory(user_id=user_id)
+    if req_tool == "google_search":
+        req_tool = "Google Search Snippets"
+    req_tool_from_user = [
+        Tool(
+            name=req_tool,
+            func = tool_func,
+            description=tool_description
+        )
+    ]
     tools = []
+    tools += req_tool_from_user
     tool = [
         Tool(
             name="Google Search Snippets",
@@ -914,55 +1123,51 @@ def get_ans(user_id, query):
         Tool(
             name="OpenAPI_Specification",
             func=chain.run,
-            description="Use this feature only when the user's request specifically pertains to one of the following scenarios:\
-            Image Creation: When a request involves generating an image using text, this feature should be engaged. The entire text prompt must be used as it is unless otherwise requested to enhance further detail of prompt for the image generation process. If additional enahancement is needed , enrich the prompt to image generation with greater detail for learning.\
-            Student Information: If a request is made for information regarding students, this functionality should be utilized to retrieve the necessary details.\
-            Query Available Books: When the user is inquiring about available books, this feature should be used to locate and provide information about the required texts.\
-            Any CRUD operation which is not a READ or anything related to curriculum should not use this tool,  It is vital to ensure that the intent precisely falls within one of the above  categories before engaging this functionality.\
-            Don't use this to create a custom curriculum for user",
-
-
+            description="Use the specialized feature for image generation, student information retrieval, and querying available books, while avoiding its use for non-READ CRUD operations or custom curriculum creation.",
         ),
         Tool(
             name="FULL_HISTORY",
             func=parsing_string,
-            description=f"""Utilize this tool exclusively when the information required predates the current day & pertains to the ongoing user query or when there is a need to recall certain things we spoke earlier. The necessary input for this tool comprises a list of values separated by commas.
-            The list should encompass a user-generated query, designated by user input text, a commencement date denoted as start_date, and an end date labeled as end_date. The start_date denotes the initiation date for the user information search and should consistently adhere to the ISO 8601 format. Meanwhile, the end_date, also conforming to the ISO 8601 format, signifies the conclusion date for the search.
-            In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what zep can do, 2023-07-12T10:19:56.00000Z, 2023-07-13T10:19:56.732291Z'. If query has any form of date or time by user, then start end datetime can be exact rather than till today for more accurate results. Remove any references to time based words (e.g. yesterday, today, datetimes, last year) since the date range you provide already accounts for that. e.g. if user has asked what did we discuss the day before yesterday then the text argument should just be empty since it does not have any named entity for fuzzy search followed by start and end datetime.
-            Strive to apply this tool judiciously for scenarios in which retrospective user information is imperative. If Full history tool response is present, forget other histories, the inputs should be meticulously arranged to facilitate the extraction of accurate and pertinent data within the specified timeframe. Never use this tool for what is the response to my last comment?
-            Remember whatever user query is regarding search history understand what user is asking about and rephrase it properly then send to tool. Before framing the final tool response from this tool consult corresponding created_at date time to give more accurate response"""
+            description=f"""Use the tool for retrieving historical user information within a specified timeframe, including user-generated queries, start and end dates in ISO 8601 format, and carefully rephrase queries related to search history for accurate responses, avoiding use for responses to the last comment.
+            For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what zep can do, 2023-07-12T10:19:56.00000Z, 2023-07-13T10:19:56.732291Z'. If query has any form of date or time by user, then start end datetime can be exact rather than till today for more accurate results. Remove any references to time based words (e.g. yesterday, today, datetimes, last year) since the date range you provide already accounts for that."""
         ),
         Tool(
             name="Text to image",
             func=parse_text_to_image,
             description="Based on user query generate visual representation of text. Extract prompt from user query and use it as input for function"
         ),
-        Tool(
-            name="Animate_Character",
-            func=parse_character_animation,
-            description='''Use this tool exclusively for animating the selected character or teacher as requested by the user; it is not intended for general requests or for animating random individuals. The user should specify their animation request in a query, such as 'Show me in a spacesuit' or 'Animate yourself as a cartoon standing in front of the Taj Mahal.' Once the request is made, the tool will generate the animation and return a URL link to the user that directs them to the animated image. Note that this tool is specifically designed to handle requests that involve animating a pre-selected character. It should not be used for general image generation tasks that don't pertain to animating the user's chosen character or teacher. For example, if a user queries 'Show me dancing in the rain,' and they have previously selected a specific character or teacher, the tool should be used to generate this animated scenario. However, if the user's request is something like 'Generate an image of a sunset,' which does not directly involve animating the selected character or teacher, then this tool should not be used.'''
-        ),
+        # Tool(
+        #     name="Animate_Character",
+        #     func=parse_character_animation,
+        #     description='''Use this tool exclusively for animating the selected character or teacher as requested by the user; it is not intended for general requests or for animating random individuals. The user should specify their animation request in a query, such as 'Show me in a spacesuit' or 'Animate yourself as a cartoon standing in front of the Taj Mahal.' Once the request is made, the tool will generate the animation and return a URL link to the user that directs them to the animated image. Note that this tool is specifically designed to handle requests that involve animating a pre-selected character. It should not be used for general image generation tasks that don't pertain to animating the user's chosen character or teacher. For example, if a user queries 'Show me dancing in the rain,' and they have previously selected a specific character or teacher, the tool should be used to generate this animated scenario. However, if the user's request is something like 'Generate an image of a sunset,' which does not directly involve animating the selected character or teacher, then this tool should not be used.'''
+        # ),
         Tool(
             name="Image_Inference_Tool",
             func=parse_image_to_text,
-            description='''When a user provides a query containing an image download URL and a related question about that image, utilize this tool for support. Your objective is to extract both the image URL and the user's inquiry or prompt pertaining to that image from their query, and then convert these elements into comma seperated string. The format should be as follows: "image_url, user_query".
-            '''
+            description='''Utilize the tool to extract and format both the image URL and the user's inquiry from a query containing an image download URL into a comma-separated string: "image_url, user_query".'''
         ),
         Tool(
             name="Data_Extraction_From_URL",
             func=parse_link_for_crwalab,
-            description='''
-               Your task is to extract a URL and its type (either 'pdf' or 'website') from a user's query. Upon receiving a query that contains a URL and a specified URL type, you are to use a tool designed for this purpose. The objective is to accurately identify both the URL and its type from the query. Once identified, these elements should be formatted into a comma-separated string, adhering to the format: "url, url_type".
-            '''
+            description='''Utilize the designated tool to extract and format a URL and its type (either 'pdf' or 'website') from a user's query into a comma-separated string: "url, url_type".'''
         ),
         Tool(
             name="User_details_tool",
             func=parse_user_id,
-            description="If a request is made for information regarding students or users, this functionality should be utilized to retrieve the necessary details. input for this api should Always be current user_id. Except current user id you should say you cannot have access other user's details."
+            description="Utilize this functionality to retrieve information about students or users, requiring the current user_id as the only acceptable input; access to other user details is not allowed."
         )
 
     ]
-    tools += tool
+    final_tool = []
+    for new_tool in tool:
+        if new_tool not in tools:
+            final_tool.append(new_tool)
+            
+    tools += final_tool
+    
+    app.logger.info(f'tools {type(tools)}')
+    
+            
 
 
 
@@ -1040,6 +1245,7 @@ def get_ans(user_id, query):
         human_message=suffix,
         input_variables=["input", "agent_scratchpad", "chat_history"]
     )
+    # prompt.input_variables
 
 
     #chat Agent
@@ -1083,7 +1289,47 @@ def chat():
     data = request.get_json()
     user_id = data.get('user_id', None)
     request_id = data.get('request_id', None)
+    req_tool = data.get('tools', None)
+    tools_dict = {1:'google_search', 2:'Calculator', 3:'OpenAPI_Specification', 4:'FULL_HISTORY', 5:'Text to image', 6:'Image_Inference_Tool', 7:'Data_Extraction_From_URL', 8:'User_details_tool'}
+    tool_desc = {
+        'google_search': '''Search Google for recent results and retrieve URLs that are suitable for web crawling. Ensure that the search responses include the source URL from which the data was extracted. Always present this URL in the response as an HTML anchor tag. This approach ensures clear attribution and easy navigation to the original source for each piece of extracted information. Give urls for the source''',
+        'Calculator': '''Useful for when you need to answer questions about math.''',
+        'OpenAPI_Specification':'''Use this feature only when the user's request specifically pertains to one of the following scenarios:\
+            Image Creation: When a request involves generating an image using text, this feature should be engaged. The entire text prompt must be used as it is unless otherwise requested to enhance further detail of prompt for the image generation process. If additional enahancement is needed , enrich the prompt to image generation with greater detail for learning.\
+            Student Information: If a request is made for information regarding students, this functionality should be utilized to retrieve the necessary details.\
+            Query Available Books: When the user is inquiring about available books, this feature should be used to locate and provide information about the required texts.\
+            Any CRUD operation which is not a READ or anything related to curriculum should not use this tool,  It is vital to ensure that the intent precisely falls within one of the above  categories before engaging this functionality.\
+            Don't use this to create a custom curriculum for user''',
+        'FULL_HISTORY':'''Utilize this tool exclusively when the information required predates the current day & pertains to the ongoing user query or when there is a need to recall certain things we spoke earlier. The necessary input for this tool comprises a list of values separated by commas.
+            The list should encompass a user-generated query, designated by user input text, a commencement date denoted as start_date, and an end date labeled as end_date. The start_date denotes the initiation date for the user information search and should consistently adhere to the ISO 8601 format. Meanwhile, the end_date, also conforming to the ISO 8601 format, signifies the conclusion date for the search.
+            In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what zep can do, 2023-07-12T10:19:56.00000Z, 2023-07-13T10:19:56.732291Z'. If query has any form of date or time by user, then start end datetime can be exact rather than till today for more accurate results. Remove any references to time based words (e.g. yesterday, today, datetimes, last year) since the date range you provide already accounts for that. e.g. if user has asked what did we discuss the day before yesterday then the text argument should just be empty since it does not have any named entity for fuzzy search followed by start and end datetime.
+            Strive to apply this tool judiciously for scenarios in which retrospective user information is imperative. If Full history tool response is present, forget other histories, the inputs should be meticulously arranged to facilitate the extraction of accurate and pertinent data within the specified timeframe. Never use this tool for what is the response to my last comment?
+            Remember whatever user query is regarding search history understand what user is asking about and rephrase it properly then send to tool. Before framing the final tool response from this tool consult corresponding created_at date time to give more accurate response''',
+        'Text to image':'''Based on user query generate visual representation of text. Extract prompt from user query and use it as input for function''',
+        'Image_Inference_Tool':'''When a user provides a query containing an image download URL and a related question about that image, utilize this tool for support. Your objective is to extract both the image URL and the user's inquiry or prompt pertaining to that image from their query, and then convert these elements into comma seperated string. The format should be as follows: "image_url, user_query".''',
+        'Data_Extraction_From_URL':'''Your task is to extract a URL and its type (either 'pdf' or 'website') from a user's query. Upon receiving a query that contains a URL and a specified URL type, you are to use a tool designed for this purpose. The objective is to accurately identify both the URL and its type from the query. Once identified, these elements should be formatted into a comma-separated string, adhering to the format: "url, url_type".''',
+        'User_details_tool':'''If a request is made for information regarding students or users, this functionality should be utilized to retrieve the necessary details. input for this api should Always be current user_id. Except current user id you should say you cannot have access other user's details.'''
+    }
+    tools_func = {
+        'google_search':top5_results,
+        'Calculator':llm_math.run,
+        'OpenAPI_Specificationd':chain.run,
+        'FULL_HISTORY':parsing_string,
+        'Text to image':parse_text_to_image,
+        'Image_Inference_Tool':parse_image_to_text,
+        'Data_Extraction_From_URL':parse_link_for_crwalab,
+        'User_details_tool':parse_user_id
+    }
+    if req_tool is not None and req_tool in tools_dict.values():
+        tool_description = tool_desc[req_tool]
+        tool_func = tools_func[req_tool]
+        
+    else:
+        tool_description = ""
+        tool_func=""
 
+    app.logger.info(f'helli {tool_description}, {tool_func}')
+    time.sleep(2)
     post_dict= {'user_id':user_id, 'status':'INITIALIZED','task_name':"CHAT", 'uid':request_id, 'task_id': f"CHAT_{str(request_id)}", 'request_id': request_id}
     try:
         client.publish('com.hertzai.longrunning.log', post_dict)
@@ -1095,9 +1341,10 @@ def chat():
     thread_local_data.set_req_token_count(value=0)
     thread_local_data.set_res_token_count(value=0)
     thread_local_data.set_recognize_intents()
+    thread_local_data.set_global_intent(global_intent=req_tool)
 
     prompt = data.get('prompt', None)
-    ans= get_ans(user_id=user_id, query=prompt)
+    ans= get_ans(req_tool, tool_description, tool_func, user_id=user_id, query=prompt)
     if ans != "":
         post_dict= {'user_id':user_id, 'status':'FINISHED','task_name':"CHAT", 'uid':request_id, 'task_id': f"CHAT_{str(request_id)}", 'request_id': request_id}
         try:
