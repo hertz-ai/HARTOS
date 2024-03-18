@@ -51,6 +51,7 @@ import crossbarhttp
 from langchain.retrievers.document_compressors import cohere_rerank
 import asyncio
 import aiohttp
+import sys  
 
 
 class RequestLogRecord(logging.LogRecord):
@@ -64,6 +65,7 @@ class RequestLogRecord(logging.LogRecord):
 # Use the custom log record factory
 logging.setLogRecordFactory(RequestLogRecord)
 logging.basicConfig(level=logging.DEBUG)
+stream_handler = logging.StreamHandler(sys.stdout)
 handler = RotatingFileHandler('langchain.log', maxBytes=100000, backupCount=3)
 
 # Set the logging level for the file handler
@@ -73,9 +75,11 @@ handler.setLevel(logging.DEBUG)
 req_id = thread_local_data.get_request_id()
 formatter = logging.Formatter('%(asctime)s - %(name)s- [RequestID: %(req_id)s] - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
+stream_handler.setFormatter(formatter)
 
 app = Flask(__name__)
 
+app.logger.addHandler(stream_handler)
 app.logger.addHandler(handler)
 
 # Test logging
@@ -231,12 +235,7 @@ def get_tools(req_tool, is_first: bool = False):
     if is_first:
         tools = load_tools(["google-search"])
         tool = [
-            Tool(
-                name="Google Search Snippets",
-                description="Search Google for recent results and retrieve URLs that are suitable for web crawling. Ensure that the search responses include the source URL from which the data was extracted. Always present this URL in the response as an HTML anchor tag. This approach ensures clear attribution and easy navigation to the original source for each piece of extracted information. Give urls for the source",
-                func=top5_results,
-            ),
-            
+                        
             Tool(
                 name='Calculator',
                 func=llm_math.run,
@@ -339,22 +338,20 @@ def get_tools(req_tool, is_first: bool = False):
                     description=tool_description
                 )
             ]
+            tools = load_tools(["google-search"])
+            tools += req_tool_from_user
             
         else:
             tool_description = ""
             tool_func=""  
+            tools = load_tools(["google-search"])
+            # tools += req_tool_from_user
         
         
         
-        tools = []
-        tools += req_tool_from_user
+        
         tool = [
-            Tool(
-                name="Google Search Snippets",
-                description="Search Google for recent results and retrieve URLs that are suitable for web crawling. Ensure that the search responses include the source URL from which the data was extracted. Always present this URL in the response as an HTML anchor tag. This approach ensures clear attribution and easy navigation to the original source for each piece of extracted information. Give urls for the source",
-                func=top5_results,
-            ),
-            
+                        
             Tool(
                 name='Calculator',
                 func=llm_math.run,
@@ -443,7 +440,7 @@ class CustomGPT(LLM):
             
             # prompt = create_prompt(tools)
             app.logger.info(prompt)
-            time.sleep(10)
+            # time.sleep(10)
         
         if self.count > 1 or self.call_gpt4 ==1:
             response = requests.post(
@@ -513,7 +510,8 @@ class CustomAgentExecutor(AgentExecutor):
         # pdb.set_trace()
         self._validate_outputs(outputs)
         req_id = thread_local_data.get_request_id()
-        metadata = {'request_Id':req_id}
+        prom_id = thread_local_data.get_prompt_id()
+        metadata = {'request_Id': req_id, 'prompt_id': prom_id}
         app.logger.info(f"before: memory object is not none and metadata is {metadata}, {return_only_outputs}")
         if self.memory is not None:
             app.logger.info(f"memory object is not none and metadata is {metadata}")
@@ -523,6 +521,56 @@ class CustomAgentExecutor(AgentExecutor):
             return outputs
         else:
             return {**inputs, **outputs}
+        
+    def prep_inputs(self, inputs: Union[Dict[str, Any], Any]) -> Dict[str, str]:
+        """Validate and prepare chain inputs, including adding inputs from memory.
+
+        Args:
+            inputs: Dictionary of raw inputs, or single input if chain expects
+                only one param. Should contain all inputs specified in
+                `Chain.input_keys` except for inputs that will be set by the chain's
+                 memory.
+
+        Returns:
+            A dictionary of all inputs, including those added by the chain's memory.
+        """
+        if not isinstance(inputs, dict):
+            
+            
+            _input_keys = set(self.input_keys)
+            if self.memory is not None:
+                # If there are multiple input keys, but some get set by memory so that
+                # only one is not set, we can still figure out which key it is.
+                _input_keys = _input_keys.difference(self.memory.memory_variables)
+            if len(_input_keys) != 1:
+                raise ValueError(
+                    f"A single string input was passed in, but this chain expects "
+                    f"multiple inputs ({_input_keys}). When a chain expects "
+                    f"multiple inputs, please call it by passing in a dictionary, "
+                    "eg `chain({'foo': 1, 'bar': 2})`"
+                )
+            inputs = {list(_input_keys)[0]: inputs}
+        if self.memory is not None:
+
+            
+            external_context = self.memory.load_memory_variables(inputs)
+            
+            inputs = dict(inputs, **external_context)
+            filtered_messages = []
+            for msg in inputs['chat_history']:
+                try:
+                    if msg.additional_kwargs['metadata']['prompt_id'] == thread_local_data.get_prompt_id():
+                    # If it does, append the message content to the filtered_messages list
+                        filtered_messages.append(msg)
+                except:
+                    pass
+                    
+            inputs['chat_history'] = filtered_messages[-8:]
+                
+            # time.sleep(4)
+        self._validate_inputs(inputs)
+        return inputs
+
 
 
 
@@ -1159,7 +1207,7 @@ class CustomConvoOutputParser(AgentOutputParser):
 
 
 # main function
-def get_ans(req_tool, user_id, query):
+def get_ans(req_tool, user_id, query, custom_prompt):
     start_time = time.time()
     user_details, actions = get_action_user_details(user_id=user_id)
     llm = CustomGPT()
@@ -1191,7 +1239,7 @@ def get_ans(req_tool, user_id, query):
         {user_details}
         <USER_DETAILS_END>
         <CONTEXT_START>
-        Before you respond, consider the context in which you are utilized. You are Hevolve, a highly intelligent educational AI developed by HertzAI.
+        Before you respond, consider the context in which you are utilized. {custom_prompt}
         You are designed to answer questions, provide revisions, conduct assessments, teach various topics, create personalised curriculum and assist with research for both students and working professionals.
         Your expertise draws from various knowledge sources like books, websites, and white papers. Your responses will be conveyed to the user through a video, using an avatar and text-to-speech technology, and can be translated into various languages.
         Consider the user's location, time and context of previous dialogues with time to create a proper prompt for tools and follow up in-context questions.
@@ -1269,12 +1317,15 @@ def get_ans(req_tool, user_id, query):
         )
 
 
-
+    prom_id = thread_local_data.get_prompt_id()
+    metadata = {"where": {
+        "jsonpath": '$[*] ? (@.prompt_id == {})'.format(prom_id)}}
     agent_chain = CustomAgentExecutor(
         agent=agent,
         tools=tools,
         verbose=True,
-        memory=memory
+        memory=memory,
+        metadata=metadata
     )
     ans = agent_chain.run({'input':query})
     end_time = time.time()
@@ -1282,6 +1333,7 @@ def get_ans(req_tool, user_id, query):
     return ans
 
 
+Hevolve = "You are Hevolve, a highly intelligent educational AI developed by HertzAI."
 
 
 
@@ -1294,25 +1346,39 @@ def chat():
     user_id = data.get('user_id', None)
     request_id = data.get('request_id', None)
     req_tool = data.get('tools', None)
+    prompt_id = data.get('prompt_id', None)
+    thread_local_data.set_request_id(request_id=request_id)
     
-
-    # app.logger.info(f'helli {tool_description}, {tool_func}')
-    time.sleep(2)
+    if prompt_id:
+        try:
+            res = requests.get(
+                f'https://mailer.hertzai.com/getprompt/?prompt_id={prompt_id}').json()
+            # use config for url
+            custom_prompt = res[0]['prompt']
+            
+        except:
+            print(f'failed to get prompt from id:- {prompt_id}')
+            custom_prompt = Hevolve
+    else:
+        custom_prompt = Hevolve  # use Hevolve from config/template
+        prompt_id = 0
+    app.logger.info(f'{custom_prompt}-->{prompt_id}')    
+    
     post_dict= {'user_id':user_id, 'status':'INITIALIZED','task_name':"CHAT", 'uid':request_id, 'task_id': f"CHAT_{str(request_id)}", 'request_id': request_id}
     try:
         client.publish('com.hertzai.longrunning.log', post_dict)
     except Exception as e:
         app.logger.error("Error while publish at com.hertzai.longrunning.log topic")
 
-    thread_local_data.set_request_id(request_id=request_id)
     thread_local_data.set_user_id(user_id=user_id)
     thread_local_data.set_req_token_count(value=0)
     thread_local_data.set_res_token_count(value=0)
     thread_local_data.set_recognize_intents()
     thread_local_data.set_global_intent(global_intent=req_tool)
+    thread_local_data.set_prompt_id(prompt_id)
 
     prompt = data.get('prompt', None)
-    ans= get_ans(req_tool, user_id=user_id, query=prompt)
+    ans= get_ans(req_tool, user_id=user_id, query=prompt, custom_prompt=custom_prompt)
     if ans != "":
         post_dict= {'user_id':user_id, 'status':'FINISHED','task_name':"CHAT", 'uid':request_id, 'task_id': f"CHAT_{str(request_id)}", 'request_id': request_id}
         try:
@@ -1344,9 +1410,11 @@ def history():
     if memory:
         memory.chat_memory.add_message(
             HumanMessage(content=human_msg),
+            metadata={'prompt_id':0}
         )
         memory.chat_memory.add_message(
             AIMessage(content=ai_msg),
+            metadata={'prompt_id':0}
         )
         return jsonify({'response':"Messages are saved!!!"}), 200
     else:
