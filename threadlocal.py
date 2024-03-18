@@ -57,7 +57,12 @@ class ThreadLocalData:
         
     def get_global_intent(self):
         return getattr(self._local, 'global_intent', None)
-        
+    
+    def set_prompt_id(self, prompt_id):
+        self._local.prompt_id = prompt_id
+
+    def get_prompt_id(self):
+        return getattr(self._local, 'prompt_id', None) 
         
 
 thread_local_data = ThreadLocalData()
