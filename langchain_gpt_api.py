@@ -1480,7 +1480,7 @@ def chat():
                 app.logger.info('found Learn languague getting user preffered language')
                 lang = requests.post('{}/getstudent_by_user_id'.format(DB_URL),
                         data=json.dumps({"user_id": user_id})).json()
-                language = lang['preferred_language']
+                language = lang['preferred_language'][:2]
                 app.logger.info(f'user preffered language is {language}')  
                 custom_prompt = custom_prompt+f' The Language selected is {language}'
                 app.logger.info(f"custom prompt is: {custom_prompt}")
