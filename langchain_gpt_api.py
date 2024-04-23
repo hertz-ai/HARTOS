@@ -4,6 +4,7 @@ from langchain.agents import (
     ConversationalChatAgent, LLMSingleActionAgent, AgentOutputParser,
     load_tools, initialize_agent, AgentType
 )
+import time
 from langchain.prompts import (
     ChatPromptTemplate,
     MessagesPlaceholder,
@@ -14,6 +15,7 @@ from langchain.chains import LLMMathChain, OpenAPIEndpointChain
 from langchain.chains.conversation.memory import ConversationSummaryMemory, ConversationBufferWindowMemory
 from langchain.chains.openai_functions.openapi import get_openapi_chain
 from langchain.chat_models import ChatOpenAI
+from langchain_groq import ChatGroq
 # from langchain.experimental.plan_and_execute import PlanAndExecute, load_agent_executor, load_chat_planner
 from langchain.llms import OpenAI, OpenAIChat
 from langchain.llms.base import LLM
@@ -51,8 +53,15 @@ import crossbarhttp
 from langchain.retrievers.document_compressors import cohere_rerank
 import asyncio
 import aiohttp
-import sys  
-
+import sys
+from threading import Thread
+from dotenv import load_dotenv
+load_dotenv()
+os.environ['LANGCHAIN_TRACING_V2'] = 'true'
+os.environ['LANGCHAIN_ENDPOINT'] = 'https://api.smith.langchain.com'
+os.environ['LANGCHAIN_API_KEY'] = os.getenv("LANGCHAIN_API_KEY")
+os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGCHAIN_PROJECT")
+groq_api_key = os.environ['GROQ_API_KEY']
 
 class RequestLogRecord(logging.LogRecord):
     def __init__(self, *args, **kwargs):
@@ -66,7 +75,7 @@ class RequestLogRecord(logging.LogRecord):
 logging.setLogRecordFactory(RequestLogRecord)
 logging.basicConfig(level=logging.DEBUG)
 stream_handler = logging.StreamHandler(sys.stdout)
-handler = RotatingFileHandler('langchain.log', maxBytes=100000, backupCount=3)
+handler = RotatingFileHandler('langchain.log', maxBytes=100000, backupCount=0)
 
 # Set the logging level for the file handler
 handler.setLevel(logging.DEBUG)
@@ -122,7 +131,7 @@ RAG_API = config['RAG_API']
 
 ## task scheduling and logging
 from enum import Enum
-            
+
 class TaskStatus(Enum):
     INITIALIZED = "INITIALIZED"
     SCHEDULED = "SCHEDULED"
@@ -130,7 +139,7 @@ class TaskStatus(Enum):
     TIMEOUT = "TIMEOUT"
     COMPELETED = "COMPELETED"
     ERROR = "ERROR"
-    
+
 
 class TaskNames(Enum):
     GET_ACTION_USER_DETAILS = "GET_ACTION_USER_DETAILS"
@@ -149,11 +158,17 @@ search = GoogleSearchAPIWrapper(k=4)
 #llm = ChatOpenAI(model_name="gpt-3.5-turbo-16k")
 #llm = ChatOpenAI(temperature=0, model="gpt-4")
 #llm = CustomGPT()
+# The above code is creating an instance of the `LLMMathChain` class with an `open_ai_llm` attribute
+# initialized with a `ChatOpenAI` object using the model name "gpt-3.5-turbo".
+
+# llm_math = LLMMathChain(ChatOpenAI(model_name="gpt-3.5-turbo"))
 llm_math = LLMMathChain(llm=ChatOpenAI(model_name="gpt-3.5-turbo"))
+# llm_math = LLMMathChain(llm= ChatGroq(groq_api_key=groq_api_key,
+#                model_name = "mixtral-8x7b-32768"))
 
+llm= ChatGroq(groq_api_key=groq_api_key,model_name = "llama3-70b-8192", temperature=1)
 
-
-
+# app.logger.info(llm.invoke("hi how are you?"))
 
 chain = get_openapi_chain(spec)
 
@@ -219,7 +234,7 @@ def create_prompt(tools):
         Latest USER'S INPUT For which you need to respond (consult recent history only when needed for more context): {{{{input}}}}
         <USER_INPUT_END>
         """
-    
+
     prompt = ConversationalChatAgent.create_prompt(
         tools,
         system_message=prefix,
@@ -235,7 +250,7 @@ def get_tools(req_tool, is_first: bool = False):
     if is_first:
         tools = load_tools(["google-search"])
         tool = [
-                        
+
             Tool(
                 name='Calculator',
                 func=llm_math.run,
@@ -294,7 +309,7 @@ def get_tools(req_tool, is_first: bool = False):
         ]
         tools += tool
         return tools
-        
+
     else:
         tools_dict = {1:'google_search', 2:'Calculator', 3:'OpenAPI_Specification', 4:'FULL_HISTORY', 5:'Text to image', 6:'Image_Inference_Tool', 7:'Data_Extraction_From_URL', 8:'User_details_tool'}
         tool_desc = {
@@ -340,18 +355,18 @@ def get_tools(req_tool, is_first: bool = False):
             ]
             tools = load_tools(["google-search"])
             tools += req_tool_from_user
-            
+
         else:
             tool_description = ""
-            tool_func=""  
+            tool_func=""
             tools = load_tools(["google-search"])
             # tools += req_tool_from_user
-        
-        
-        
-        
+
+
+
+
         tool = [
-                        
+
             Tool(
                 name='Calculator',
                 func=llm_math.run,
@@ -398,9 +413,9 @@ def get_tools(req_tool, is_first: bool = False):
         for new_tool in tool:
             if new_tool not in tools:
                 final_tool.append(new_tool)
-                
+
         tools += final_tool
-        
+
         tool_strings = "\n".join(f"\n> {tool.name}: {tool.description}" for tool in tools)
         return tool_strings
 
@@ -428,53 +443,93 @@ class CustomGPT(LLM):
         num_tokens = len(encoding.encode(prompt))
         thread_local_data.update_req_token_count(num_tokens)
         app.logger.info(f"len---->{num_tokens}")
-        
+
         app.logger.info(f"first time calling {len(prompt)}")
-        
+
         if self.count > 1 and thread_local_data.get_global_intent() != self.previous_intent:
-            tools = get_tools(thread_local_data.get_global_intent())  
-            start_index = prompt.find("<TOOLS_START>")  
+            tools = get_tools(thread_local_data.get_global_intent())
+            start_index = prompt.find("<TOOLS_START>")
             end_index = prompt.find("<TOOLS_END>") + len("<TOOLS_END>")
             prompt = prompt[:start_index]+ tools + prompt[end_index:]
             app.logger.info(f"second time calling {len(prompt)}")
-            
+
             # prompt = create_prompt(tools)
             app.logger.info(prompt)
             # time.sleep(10)
-        
-        if self.count > 1 or self.call_gpt4 ==1:
-            response = requests.post(
-                GPT_API,
-                json={
-                "model": "gpt35-turbo-1106",
-                "data": [{"role":"user","content":prompt}],
-                "max_token":1000,
-                "request_id":str(thread_local_data.get_request_id())
-                }
-            )
-        else:
-            response = requests.post(
-                GPT_API,
-                json={
-                "model": "gpt-4",
-                "data": [{"role":"user","content":prompt}],
-                "max_token":1000,
-                "request_id":str(thread_local_data.get_request_id())
-                }
-            )
 
-        
-        response.raise_for_status()
-        app.logger.info(f"hellpppppppppppppppp-->{response.json()['text']}")
+        if self.count > 1 or self.call_gpt4 ==1:
+            # app.logger.info(f"the prompt we are sending is {prompt}")
+            start= time.time()
+            # response = requests.post(
+            #     GPT_API,
+            #     json={
+            #     "model": "gpt35-turbo-1106",
+            #     "data": [{"role":"user","content":prompt}],
+            #     "max_token":1000,
+            #     "request_id":str(thread_local_data.get_request_id())
+            #     })
+            # app.logger.info(f"gpt 3.5 response format is {response.json()}")
+            # app.logger.info(f"gpt 3.5 response format type is {type(response.json())}")
+            # app.logger.info("finish in {}".format(time.time()-start))
+            response_from_groq = llm.invoke(prompt)
+            app.logger.info("groq response in streaming way")
+            app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+            for chunk in llm.stream(prompt):
+                print(chunk.content, end="", flush=True)
+            app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+            # app.logger.info(f" response from groq api {response}")
+            # app.logger.info(f" response from groq api {type(response)}")
+            response = json.loads(response_from_groq.content)
+            app.logger.info(f" response from groq api after {response}")
+            app.logger.info(f" response from groq api after {type(response)}")
+            
+            app.logger.info("finish in groq {}".format(time.time()-start))
+        else:
+            # app.logger.info(f"the prompt we are sending is {prompt}")
+            start=time.time()
+            
+            # response = requests.post(
+            #     GPT_API,
+            #     json={
+            #     "model": "gpt-4",
+            #     "data": [{"role":"user","content":prompt}],
+            #     "max_token":1000,
+            #     "request_id":str(thread_local_data.get_request_id())
+            #     }
+            # )
+            # app.logger.info(f"gpt 4 response format is {response.json()}")
+            # app.logger.info(f"gpt 4 response format type is {type(response.json())}")
+            # app.logger.info("finish in {}".format(time.time()-start))
+            response_from_groq = llm.invoke(prompt)
+            app.logger.info("groq response in streaming way")
+            app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+            for chunk in llm.stream(prompt):
+                print(chunk.content, end="", flush=True)
+            app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+
+            # app.logger.info(f" response from groq api {response}")
+            # app.logger.info(f" response from groq api type {type(response)}")
+            response = json.loads(response_from_groq.content)
+            app.logger.info(f" response from groq api after {response}")
+            app.logger.info(f" response from groq api after {type(response)}")
+            app.logger.info("finish in groq {}".format(time.time()-start))
+
+
+        # response.raise_for_status()
+        # app.logger.info(f"hellpppppppppppppppp-->{response.json()['text']}")
         try:
-            text = str(response.json()["text"])
+            app.logger.info(f"full response that came from the gpt{response}")
+            text = str(response)
+            app.logger.info(f"text got from gpt {text}")
             try:
                 text = text.strip('`').replace('json\n','').strip()
             except:
                 pass
             intents = json.loads(text)
-            
+            app.logger.info(f"the intents are: {intents}")
+
             curr_intent = intents["action"]
+            app.logger.info(f"curr_intent is: {curr_intent}")
             if self.previous_intent == curr_intent:
                 self.call_gpt4 = 1
             self.previous_intent = curr_intent
@@ -487,9 +542,12 @@ class CustomGPT(LLM):
         end_time = time.time()
         elapsed_time = end_time - start_time
         app.logger.info(f"time taken for this call is {elapsed_time}")
-        num_tokens = len(encoding.encode(response.json()["text"].replace('\n', ' ').replace('\t', '')))
+        num_tokens = len(encoding.encode(str(response).replace('\n', ' ').replace('\t', '')))
+        app.logger.info(f"current num_tokens: {num_tokens}")
         thread_local_data.update_res_token_count(num_tokens)
-        return response.json()["text"].replace('\n', ' ').replace('\t', '')
+        end_result = str(response).replace('\n', ' ').replace('\t', '')
+        app.logger.info(f"the end response is {end_result}")
+        return response_from_groq.content.replace('\n', ' ').replace('\t', '')
 
     @property
     def _identifying_params(self) -> Mapping[str, Any]:
@@ -521,7 +579,7 @@ class CustomAgentExecutor(AgentExecutor):
             return outputs
         else:
             return {**inputs, **outputs}
-        
+
     def prep_inputs(self, inputs: Union[Dict[str, Any], Any]) -> Dict[str, str]:
         """Validate and prepare chain inputs, including adding inputs from memory.
 
@@ -535,8 +593,8 @@ class CustomAgentExecutor(AgentExecutor):
             A dictionary of all inputs, including those added by the chain's memory.
         """
         if not isinstance(inputs, dict):
-            
-            
+
+
             _input_keys = set(self.input_keys)
             if self.memory is not None:
                 # If there are multiple input keys, but some get set by memory so that
@@ -552,9 +610,9 @@ class CustomAgentExecutor(AgentExecutor):
             inputs = {list(_input_keys)[0]: inputs}
         if self.memory is not None:
 
-            
+
             external_context = self.memory.load_memory_variables(inputs)
-            
+
             inputs = dict(inputs, **external_context)
             filtered_messages = []
             for msg in inputs['chat_history']:
@@ -564,9 +622,9 @@ class CustomAgentExecutor(AgentExecutor):
                         filtered_messages.append(msg)
                 except:
                     pass
-                    
+
             inputs['chat_history'] = filtered_messages[-8:]
-                
+
             # time.sleep(4)
         self._validate_inputs(inputs)
         return inputs
@@ -603,9 +661,9 @@ def get_action_user_details(user_id):
 
     response = requests.request(
         "GET", action_url, headers=headers, data=payload)
-    
+
     if response.status_code == 200:
-        
+
 
         data = response.json()
         #action_texts = [obj["action"] + ' on '+ obj["created_date"] for obj in data if obj["action"] not in unwanted_actions]
@@ -653,7 +711,7 @@ def get_action_user_details(user_id):
         actions = actions + ". List of actions ends. <PREVIOUS_USER_ACTION_END> \n " + "Today's datetime in "+time_zone + "is: "+  formatted_time +  " in this format:'%Y-%m-%dT%H:%M:%S.%f' \n Whenever user is asking about current date or current time at particular location then use this datetime format by asking what user's location is. Use the previous sentence datetime info to answer current time based questions coupled with google_search for current time or full_history for historical conversation based answers. Take a deep breath and think step by step.\n"
         # user detail api
     else:
-        post_dict= {'user_id':user_id, 'status': TaskStatus.ERROR.value,'task_name':TaskNames.GET_ACTION_USER_DETAILS.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':'Exception happend at get action api end'} 
+        post_dict= {'user_id':user_id, 'status': TaskStatus.ERROR.value,'task_name':TaskNames.GET_ACTION_USER_DETAILS.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':'Exception happend at get action api end'}
         try:
             client.publish('com.hertzai.longrunning.log', post_dict)
         except Exception as e:
@@ -674,7 +732,7 @@ def get_action_user_details(user_id):
         user_name: {user_data["name"]} (Call the user by this name only when required and not always),gender: {user_data["gender"]}, who_pays_for_course: {user_data["who_pays_for_course"]}(Entity Responsible for Paying the Course Fees), preferred_language: {user_data["preferred_language"]}(User's Preferred Language), date_of_birth: {user_data["dob"]}, english_proficiency: {user_data["english_proficiency"]}(User's English Proficiency Level), created_date: {user_data["created_date"]}(user creation date), standard: {user_data["standard"]}(User's Standard in which user studying)
         '''
     else:
-        post_dict= {'user_id':user_id, 'status': TaskStatus.ERROR.value,'task_name':TaskNames.GET_ACTION_USER_DETAILS.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':'Exception happend at get user detail api end'} 
+        post_dict= {'user_id':user_id, 'status': TaskStatus.ERROR.value,'task_name':TaskNames.GET_ACTION_USER_DETAILS.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':'Exception happend at get user detail api end'}
         try:
             client.publish('com.hertzai.longrunning.log', post_dict)
         except Exception as e:
@@ -711,7 +769,7 @@ def get_time_based_history(prompt:str, session_id:str, start_date:str, end_date:
         try:
             messages = memory.chat_memory.search(prompt,metadata=metadata)
         except:
-            post_dict= {'user_id':'', 'status': TaskStatus.ERROR.value,'task_name':TaskNames.GET_TIME_BASED_HISTORY.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':'Exception happend at zep api end memory object found none'} 
+            post_dict= {'user_id':'', 'status': TaskStatus.ERROR.value,'task_name':TaskNames.GET_TIME_BASED_HISTORY.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':'Exception happend at zep api end memory object found none'}
             try:
                 client.publish('com.hertzai.longrunning.log', post_dict)
             except Exception as e:
@@ -750,12 +808,12 @@ def get_time_based_history(prompt:str, session_id:str, start_date:str, end_date:
         try:
             messages = memory.chat_memory.search(prompt)
         except:
-            post_dict= {'user_id':'', 'status': TaskStatus.ERROR.value,'task_name':TaskNames.GET_TIME_BASED_HISTORY.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':'Exception happend at zep api end memory object found none'} 
+            post_dict= {'user_id':'', 'status': TaskStatus.ERROR.value,'task_name':TaskNames.GET_TIME_BASED_HISTORY.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':'Exception happend at zep api end memory object found none'}
             try:
                 client.publish('com.hertzai.longrunning.log', post_dict)
             except Exception as e:
                 logging.error("Error while publish at com.hertzai.longrunning.log topic")
-        
+
         app.logger.info(f"final messages in except-->{messages}")
         try:
             extracted_metadata = [message.message['metadata'] for message in messages]
@@ -817,7 +875,7 @@ def parse_character_animation(string):
         response = requests.request("POST", student_id_url, headers=headers, data=payload)
         if response.status_code == 200:
             favorite_teacher_id = response.json()["favorite_teacher_id"]
-        
+
 
         get_image_by_id_url = f"{FAV_TEACHER_API}/{favorite_teacher_id}"
 
@@ -838,19 +896,19 @@ def parse_character_animation(string):
         headers = {
             'Content-Type': 'application/json'
         }
-        
+
         response = requests.request("POST", inference_url, headers=headers, data=payload, timeout=180)
         if response.status_code == 200:
             return response.json()["image_url"]
         else:
-            post_dict= {'user_id':thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value,'task_name':TaskNames.ANIMATE_CHARACTER.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.ANIMATE_CHARACTER.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':f'Exception happend at dreamooth api end for re {thread_local_data.get_request_id()}'} 
+            post_dict= {'user_id':thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value,'task_name':TaskNames.ANIMATE_CHARACTER.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.ANIMATE_CHARACTER.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':f'Exception happend at dreamooth api end for re {thread_local_data.get_request_id()}'}
             try:
                 client.publish('com.hertzai.longrunning.log', post_dict)
             except Exception as e:
                 logging.error("Error while publish at com.hertzai.longrunning.log topic")
-        
+
     except:
-        post_dict= {'user_id':thread_local_data.get_user_id(), 'status': TaskStatus.TIMEOUT.value,'task_name':TaskNames.ANIMATE_CHARACTER.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.ANIMATE_CHARACTER.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':f'Exception happend at dreamooth api end for req_id {thread_local_data.get_request_id()} timed out'} 
+        post_dict= {'user_id':thread_local_data.get_user_id(), 'status': TaskStatus.TIMEOUT.value,'task_name':TaskNames.ANIMATE_CHARACTER.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.ANIMATE_CHARACTER.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':f'Exception happend at dreamooth api end for req_id {thread_local_data.get_request_id()} timed out'}
         try:
             client.publish('com.hertzai.longrunning.log', post_dict)
         except Exception as e:
@@ -879,13 +937,13 @@ def parse_text_to_image(inp):
         if response.status_code == 200:
             return response.json()["img_url"]
         else:
-            post_dict= {'user_id':thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value,'task_name':TaskNames.STABLE_DIFF.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.STABLE_DIFF.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':f'Exception happend at stable diff for req_id: {thread_local_data.get_request_id()}'} 
+            post_dict= {'user_id':thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value,'task_name':TaskNames.STABLE_DIFF.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.STABLE_DIFF.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':f'Exception happend at stable diff for req_id: {thread_local_data.get_request_id()}'}
             try:
                 client.publish('com.hertzai.longrunning.log', post_dict)
             except Exception as e:
                 logging.error("Error while publish at com.hertzai.longrunning.log topic")
     except Exception as e:
-        post_dict= {'user_id':thread_local_data.get_user_id(), 'status': TaskStatus.TIMEOUT.value,'task_name':TaskNames.ANIMATE_CHARACTER.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.ANIMATE_CHARACTER.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':f'Exception happend at stable diff for req_id: {thread_local_data.get_request_id()} timed out'} 
+        post_dict= {'user_id':thread_local_data.get_user_id(), 'status': TaskStatus.TIMEOUT.value,'task_name':TaskNames.ANIMATE_CHARACTER.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.ANIMATE_CHARACTER.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':f'Exception happend at stable diff for req_id: {thread_local_data.get_request_id()} timed out'}
         try:
             client.publish('com.hertzai.longrunning.log', post_dict)
         except Exception as e:
@@ -911,40 +969,49 @@ def parse_image_to_text(inp):
         }
         files=[]
         headers={}
-        
+
         response = requests.request("POST", url, headers=headers, data=payload, files=files, timeout=300)
         if response.status_code == 200:
             return response.text
         else:
-            post_dict= {'user_id':thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value,'task_name':TaskNames.LLAVA.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.LLAVA.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':f'Exception happend at LLAVA for req_id: {thread_local_data.get_request_id()}'} 
+            post_dict= {'user_id':thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value,'task_name':TaskNames.LLAVA.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.LLAVA.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':f'Exception happend at LLAVA for req_id: {thread_local_data.get_request_id()}'}
             try:
                 client.publish('com.hertzai.longrunning.log', post_dict)
             except Exception as e:
                 logging.error("Error while publish at com.hertzai.longrunning.log topic")
     except Exception as e:
-        post_dict= {'user_id':thread_local_data.get_user_id(), 'status': TaskStatus.TIMEOUT.value,'task_name':TaskNames.LLAVA.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.LLAVA.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':f'Exception happend at LLAVA for req_id: {thread_local_data.get_request_id()} timed out'} 
+        post_dict= {'user_id':thread_local_data.get_user_id(), 'status': TaskStatus.TIMEOUT.value,'task_name':TaskNames.LLAVA.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.LLAVA.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':f'Exception happend at LLAVA for req_id: {thread_local_data.get_request_id()} timed out'}
         try:
             client.publish('com.hertzai.longrunning.log', post_dict)
         except Exception as e:
             logging.error("Error while publish at com.hertzai.longrunning.log topic")
         return f'{e} Not able to generating answer at this moment please try later'
-    
-    
-async def call_crwalab_api(input_url):
+
+
+async def call_crwalab_api(input_url, input_str_list, user_id , request_id):
     try:
+        app.logger.info("enter in call_crawlab_api function")
+        app.logger.info(f"the input url is {input_url} and input_str_list is {input_str_list}")
         payload = {
-            'link': input_url,
-            'user_id': thread_local_data.get_user_id(),
-            'request_id': thread_local_data.get_request_id()
+            'link': input_str_list,
+            'user_id': user_id,
+            'request_id': request_id,
+            'depth':'1',
+
         }
-        files=[]
+        app.logger.info("in crawlab api")
+        app.logger.info(f"this is crawlab payload: - {payload}")
+
         headers = {}
         async with aiohttp.ClientSession() as session:
-            async with session.post(CRAWLAB_API, headers=headers, data=payload, files=files) as response:
-                pass
-    except:
+            async with session.post(CRAWLAB_API, headers=headers, data=payload) as response:
+                response_text = await response.text()
+                app.logger.info(f" this is response text : - {response_text}")
+                return response_text
+    except Exception as e:
+        app.logger.info(f"we are in except of call_crawlab_api the error is {e}")
         url = RAG_API
-
+        app.logger.info("going to except in Rag api")
         payload = {'url': input_url}
         files=[]
         headers = {}
@@ -952,6 +1019,15 @@ async def call_crwalab_api(input_url):
         response = requests.request("POST", url, headers=headers, data=payload, files=files)
         return f'your url got uploaded and data extraction is being processes. Here is some brief information about url you hava provided {response.text}'
 
+def start_async_tasks(coroutine):
+    def run():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(coroutine)
+        finally:
+            loop.close()
+    Thread(target=run).start()
 
 def parse_link_for_crwalab(inp):
     '''
@@ -960,8 +1036,15 @@ def parse_link_for_crwalab(inp):
 
     '''
     inp_list = inp.split(',')
+    app.logger.info(inp_list)
     input_url = inp_list[0]
+    app.logger.info(input_url)
     link_type = inp_list[1].strip(' ')
+    app.logger.info(link_type)
+    app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+    user_id= thread_local_data.get_user_id()
+    request_id= thread_local_data.get_request_id()
+
     try:
         post_dict= {'user_id':'', 'task_type':'async', 'status': TaskStatus.EXECUTING.value ,'task_name': TaskNames.CRAWLAB.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.CRAWLAB.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id()}
         try:
@@ -1003,56 +1086,50 @@ def parse_link_for_crwalab(inp):
                 os.remove(pdf_save_path)
 
                 return f"your request has been sent and pdf is getting uploading into our system {response.text}"
-            except Exception as e:
-                app.logger.info(f"Got exception in book parsing api {e}")
-                post_dict= {'user_id':thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value,'task_name':TaskNames.CRAWLAB.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.CRAWLAB.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':f'Exception happend at CRWALAB for req_id: {thread_local_data.get_request_id()} for pdf upload'} 
+            except:
+                app.logger.info("Got exception in book parsing api {e}")
+                post_dict= {'user_id':thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value,'task_name':TaskNames.CRAWLAB.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.CRAWLAB.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':f'Exception happend at CRWALAB for req_id: {thread_local_data.get_request_id()} for pdf upload'}
                 try:
                     client.publish('com.hertzai.longrunning.log', post_dict)
-                except Exception as e:
+                except:
                     logging.error("Error while publish at com.hertzai.longrunning.log topic")
                 return "sorry I am not able to process your request at this moment"
 
         elif link_type == 'website':
             input_url_list = [input_url]
+            app.logger.info(f"link type is {link_type}")
             input_str_list = repr(input_url_list)
             try:
-                
+
                 url = RAG_API
 
-
-                payload = {
-                    'link': input_str_list,
-                    'user_id': thread_local_data.get_user_id(),
-                    'request_id': thread_local_data.get_request_id(),
-                    'depth':'0',
-
-                }
-                files=[
-
-                ]
-
+                payload = {'url': input_url}
+                files=[]
                 headers = {}
 
                 response = requests.request("POST", url, headers=headers, data=payload, files=files)
 
                 app.logger.info(response.text)
-                
+                app.logger.info(f"RAG_API response {response.text}")
+                app.logger.info("completed rag")
                 try:
-                
-                    task1 = asyncio.create_task(call_crwalab_api(input_url))
-                except:
+                    app.logger.info("going for crawlab api")
+                    start_async_tasks(call_crwalab_api(input_url, input_str_list, user_id, request_id))
+                    app.logger.info("done for crawlab api")
+                    return response.text
+                except Exception as e:
                     app.logger.info(f"Got exception in crawlab api {e}")
-                    post_dict= {'user_id':thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value,'task_name':TaskNames.CRAWLAB.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.CRAWLAB.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':f'Exception happend at CRWALAB for req_id: {thread_local_data.get_request_id()} for weblink upload'} 
+                    post_dict= {'user_id':thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value,'task_name':TaskNames.CRAWLAB.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.CRAWLAB.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':f'Exception happend at CRWALAB for req_id: {thread_local_data.get_request_id()} for weblink upload'}
                     try:
                         client.publish('com.hertzai.longrunning.log', post_dict)
                     except Exception as e:
                         logging.error("Error while publish at com.hertzai.longrunning.log topic")
-                    return f"sorry I am not able to process your request at this moment but here is some brief information about url you hava provided {response.text}" 
-                
+                    return f"sorry I am not able to process your request at this moment but here is some brief information about url you hava provided {response.text}"
+
                 return f"your url got uploaded and data extraction is being processes. Here is some brief information about url you hava provided {response.text}"
             except Exception as e:
                 app.logger.info(f"Got exception in crawlab api {e}")
-                post_dict= {'user_id':thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value,'task_name':TaskNames.CRAWLAB.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.CRAWLAB.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':f'Exception happend at CRWALAB for req_id: {thread_local_data.get_request_id()} for weblink upload'} 
+                post_dict= {'user_id':thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value,'task_name':TaskNames.CRAWLAB.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.CRAWLAB.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':f'Exception happend at CRWALAB for req_id: {thread_local_data.get_request_id()} for weblink upload'}
                 try:
                     client.publish('com.hertzai.longrunning.log', post_dict)
                 except Exception as e:
@@ -1106,12 +1183,12 @@ async def fetch(session, url):
     except Exception as e:
         app.logger.error(f"An error occurred while fetching {url}: {e}")
         return ""
-    
+
 async def async_main(urls):
     async with aiohttp.ClientSession() as session:
         tasks = [fetch(session, url) for url in urls]
         return await asyncio.gather(*tasks)
-    
+
 
 
 def top5_results(query):
@@ -1126,13 +1203,13 @@ def top5_results(query):
         cleaned_text = re.sub(r'\n+', '\n', cleaned_text).strip()  # Remove extra newlines and leading/trailing whitespaces
     except RuntimeError as e:
         app.logger.error(f"Runtime error occurred: {e}")
-        
+
     final_res.append({'text': cleaned_text, 'source':top_2_search_res_link})
     app.logger.info(f"res:-->{final_res}")
-        
+
     if len(final_res) == 0:
         return search.results(query, 4)
-    
+
     return final_res
 
 
@@ -1207,19 +1284,26 @@ class CustomConvoOutputParser(AgentOutputParser):
 
 
 # main function
-def get_ans(req_tool, user_id, query, custom_prompt):
+def get_ans(causal_conv, req_tool, user_id, query, custom_prompt):
     start_time = time.time()
     user_details, actions = get_action_user_details(user_id=user_id)
+    app.logger.info("time taken by get_action_user_details %s seconds", time.time() - start_time)
+
     llm = CustomGPT()
     app.logger.info(f"query------> {query}")
+    memory_start_time = time.time()
     memory=get_memory(user_id=user_id)
-    
-            
+    app.logger.info("time taken by get_memory %s seconds", time.time() - memory_start_time)
+
+
+
+    tools_start_time = time.time()
     tools = get_tools(req_tool=req_tool, is_first=True)
-    
+    app.logger.info("time taken by get_tools %s seconds", time.time() - tools_start_time)
+
     app.logger.info(f'tools {type(tools)}')
-    
-            
+
+
 
 
 
@@ -1251,35 +1335,63 @@ def get_ans(req_tool, user_id, query, custom_prompt):
         Conversation History:
         <HISTORY_START>
         """
-    suffix = """
-        <HISTORY_END>
-        Only if this above conversation history is not sufficient to fulfill the user's request then use below FULL_HISTORY tool. Important: If results can be accomplished with above information skip tools section and move to format instructions.
+    
+    if not causal_conv:
+        suffix = """
+            <HISTORY_END>
+            Only if this above conversation history is not sufficient to fulfill the user's request then use below FULL_HISTORY tool. Important: If results can be accomplished with above information skip tools section and move to format instructions.
 
-        TOOLS
+            TOOLS
 
-        ------
+            ------
 
-        Assistant can use tools to look up information that may be helpful in answering the user's
-        question. The tools you can use are:
+            Assistant can use tools to look up information that may be helpful in answering the user's
+            question. The tools you can use are:
 
-        <TOOLS_START>
-        {{tools}}
-        <TOOLS_END>
-        <FORMAT_INSTRUCTION_START>
-        {format_instructions}
-        <FORMAT_INSTRUCTION_END>
+            <TOOLS_START>
+            {{tools}}
+            <TOOLS_END>
+            <FORMAT_INSTRUCTION_START>
+            {format_instructions}
+            <FORMAT_INSTRUCTION_END>
 
-        always create parsable output.
+            always create parsable output.
 
-        Here is the User and AI conversation in reverse chronological order:
+            Here is the User and AI conversation in reverse chronological order:
 
-        USER'S INPUT:
-        -------------
-        <USER_INPUT_START>
-        Latest USER'S INPUT For which you need to respond (consult recent history only when needed for more context): {{{{input}}}}
-        <USER_INPUT_END>
-        """
+            USER'S INPUT:
+            -------------
+            <USER_INPUT_START>
+            Latest USER'S INPUT For which you need to respond (consult recent history only when needed for more context): {{{{input}}}}
+            <USER_INPUT_END>
+            """
+    else:
+        suffix = """
+            <HISTORY_END>
+            Only if this above conversation history is not sufficient to fulfill the user's request then use below FULL_HISTORY tool. Important: If results can be accomplished with above information skip tools section and move to format instructions.
 
+            TOOLS
+
+            ------
+
+            Assistant can use tools to look up information that may be helpful in answering the user's
+            question. The tools you can use are:
+
+            
+            <FORMAT_INSTRUCTION_START>
+            {format_instructions}
+            <FORMAT_INSTRUCTION_END>
+
+            always create parsable output.
+
+            Here is the User and AI conversation in reverse chronological order:
+
+            USER'S INPUT:
+            -------------
+            <USER_INPUT_START>
+            Latest USER'S INPUT For which you need to respond (consult recent history only when needed for more context): {{{{input}}}}
+            <USER_INPUT_END>
+            """
 
     TEMPLATE_TOOL_RESPONSE = """TOOL RESPONSE:
         ---------------------
@@ -1327,9 +1439,12 @@ def get_ans(req_tool, user_id, query, custom_prompt):
         memory=memory,
         metadata=metadata
     )
+    agent_chain_start_time = time.time()
     ans = agent_chain.run({'input':query})
+    app.logger.info("time taken by chain agent run %s seconds", time.time() - agent_chain_start_time)
     end_time = time.time()
     elapse_time = end_time-start_time
+    app.logger.info(f"total time taken by get_ans function %s seconds", elapse_time)
     return ans
 
 
@@ -1340,30 +1455,36 @@ Hevolve = "You are Hevolve, a highly intelligent educational AI developed by Her
 @app.route('/chat', methods=['POST'])
 def chat():
     # print("hii")
-    
+
     start_time = time.time()
     data = request.get_json()
     user_id = data.get('user_id', None)
     request_id = data.get('request_id', None)
     req_tool = data.get('tools', None)
     prompt_id = data.get('prompt_id', None)
+    causal_conv = data.get('causal_conv', None)
+    app.logger.info(f"causal_conv type {causal_conv}")
+
+    # return ""
     thread_local_data.set_request_id(request_id=request_id)
-    
+
+
+
     if prompt_id:
         try:
             res = requests.get(
                 f'https://mailer.hertzai.com/getprompt/?prompt_id={prompt_id}').json()
             # use config for url
             custom_prompt = res[0]['prompt']
-            
+
         except:
             print(f'failed to get prompt from id:- {prompt_id}')
             custom_prompt = Hevolve
     else:
         custom_prompt = Hevolve  # use Hevolve from config/template
         prompt_id = 0
-    app.logger.info(f'{custom_prompt}-->{prompt_id}')    
-    
+    app.logger.info(f'{custom_prompt}-->{prompt_id}')
+
     post_dict= {'user_id':user_id, 'status':'INITIALIZED','task_name':"CHAT", 'uid':request_id, 'task_id': f"CHAT_{str(request_id)}", 'request_id': request_id}
     try:
         client.publish('com.hertzai.longrunning.log', post_dict)
@@ -1378,7 +1499,10 @@ def chat():
     thread_local_data.set_prompt_id(prompt_id)
 
     prompt = data.get('prompt', None)
-    ans= get_ans(req_tool, user_id=user_id, query=prompt, custom_prompt=custom_prompt)
+    app.logger.info("the time taken before get ans in main api is %s seconds", time.time() - start_time)
+    ans_start_time = time.time()
+    ans= get_ans(causal_conv,req_tool, user_id=user_id, query=prompt, custom_prompt=custom_prompt)
+    app.logger.info("the time taken by get ans in main api is %s seconds", time.time() - ans_start_time)
     if ans != "":
         post_dict= {'user_id':user_id, 'status':'FINISHED','task_name':"CHAT", 'uid':request_id, 'task_id': f"CHAT_{str(request_id)}", 'request_id': request_id}
         try:
@@ -1391,10 +1515,10 @@ def chat():
             client.publish('com.hertzai.longrunning.log', post_dict)
         except Exception as e:
             app.logger.error("Error while publish at com.hertzai.longrunning.log topic")
-    
+
     end_time = time.time()
     elapsed_time = end_time - start_time
-    app.logger.info(f"time taken for this call is {elapsed_time}")
+    app.logger.info(f"time taken for this full call is {elapsed_time}")
 
     return jsonify({'response': ans, 'intent':thread_local_data.get_recognize_intents(), 'req_token_count': thread_local_data.get_req_token_count(), 'res_token_count':thread_local_data.get_res_token_count(), 'history_request_id': thread_local_data.get_reqid_list()})
 
@@ -1429,4 +1553,4 @@ def status():
 
 
 if __name__ == '__main__':
-    serve(app, host='0.0.0.0', port=5000)
+    serve(app, host='0.0.0.0', port=5055)
