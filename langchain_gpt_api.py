@@ -57,10 +57,10 @@ import sys
 from threading import Thread
 from dotenv import load_dotenv
 load_dotenv()
-os.environ['LANGCHAIN_TRACING_V2'] = 'true'
-os.environ['LANGCHAIN_ENDPOINT'] = 'https://api.smith.langchain.com'
-os.environ['LANGCHAIN_API_KEY'] = os.getenv("LANGCHAIN_API_KEY")
-os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGCHAIN_PROJECT")
+# os.environ['LANGCHAIN_TRACING_V2'] = 'true'
+# os.environ['LANGCHAIN_ENDPOINT'] = 'https://api.smith.langchain.com'
+# os.environ['LANGCHAIN_API_KEY'] = os.getenv("LANGCHAIN_API_KEY")
+# os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGCHAIN_PROJECT")
 groq_api_key = os.environ['GROQ_API_KEY']
 
 class RequestLogRecord(logging.LogRecord):
@@ -128,7 +128,7 @@ LLAVA_API = config['LLAVA_API']
 BOOKPARSING_API = config['BOOKPARSING_API']
 CRAWLAB_API = config['CRAWLAB_API']
 RAG_API = config['RAG_API']
-
+DB_URL = config['DB_URL']
 ## task scheduling and logging
 from enum import Enum
 
@@ -472,11 +472,11 @@ class CustomGPT(LLM):
             # app.logger.info(f"gpt 3.5 response format type is {type(response.json())}")
             # app.logger.info("finish in {}".format(time.time()-start))
             response_from_groq = llm.invoke(prompt)
-            app.logger.info("groq response in streaming way")
-            app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
-            for chunk in llm.stream(prompt):
-                print(chunk.content, end="", flush=True)
-            app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+            # app.logger.info("groq response in streaming way")
+            # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+            # for chunk in llm.stream(prompt):
+            #     print(chunk.content, end="", flush=True)
+            # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
             # app.logger.info(f" response from groq api {response}")
             # app.logger.info(f" response from groq api {type(response)}")
             response = json.loads(response_from_groq.content)
@@ -501,11 +501,11 @@ class CustomGPT(LLM):
             # app.logger.info(f"gpt 4 response format type is {type(response.json())}")
             # app.logger.info("finish in {}".format(time.time()-start))
             response_from_groq = llm.invoke(prompt)
-            app.logger.info("groq response in streaming way")
-            app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
-            for chunk in llm.stream(prompt):
-                print(chunk.content, end="", flush=True)
-            app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+            # app.logger.info("groq response in streaming way")
+            # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+            # for chunk in llm.stream(prompt):
+            #     print(chunk.content, end="", flush=True)
+            # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
 
             # app.logger.info(f" response from groq api {response}")
             # app.logger.info(f" response from groq api type {type(response)}")
@@ -1473,9 +1473,18 @@ def chat():
     if prompt_id:
         try:
             res = requests.get(
-                f'https://mailer.hertzai.com/getprompt/?prompt_id={prompt_id}').json()
-            # use config for url
+                            f'{DB_URL}/getprompt/?prompt_id={prompt_id}').json()
+                        # use config for url
             custom_prompt = res[0]['prompt']
+            if res[0]['prompt']=='Learn Language':
+                app.logger.info('found Learn languague getting user preffered language')
+                lang = requests.post('{}/getstudent_by_user_id'.format(DB_URL),
+                        data=json.dumps({"user_id": user_id})).json()
+                language = lang['preferred_language']
+                app.logger.info(f'user preffered language is {language}')  
+                custom_prompt = custom_prompt+f' The Language selected is {language}'
+                app.logger.info(f"custom prompt is: {custom_prompt}")
+
 
         except:
             print(f'failed to get prompt from id:- {prompt_id}')
