@@ -456,98 +456,160 @@ class CustomGPT(LLM):
             # prompt = create_prompt(tools)
             app.logger.info(prompt)
             # time.sleep(10)
-
+        checker = None
         if self.count > 1 or self.call_gpt4 ==1:
-            # app.logger.info(f"the prompt we are sending is {prompt}")
-            start= time.time()
-            # response = requests.post(
-            #     GPT_API,
-            #     json={
-            #     "model": "gpt35-turbo-1106",
-            #     "data": [{"role":"user","content":prompt}],
-            #     "max_token":1000,
-            #     "request_id":str(thread_local_data.get_request_id())
-            #     })
-            # app.logger.info(f"gpt 3.5 response format is {response.json()}")
-            # app.logger.info(f"gpt 3.5 response format type is {type(response.json())}")
-            # app.logger.info("finish in {}".format(time.time()-start))
-            response_from_groq = llm.invoke(prompt)
-            # app.logger.info("groq response in streaming way")
-            # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
-            # for chunk in llm.stream(prompt):
-            #     print(chunk.content, end="", flush=True)
-            # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
-            # app.logger.info(f" response from groq api {response}")
-            # app.logger.info(f" response from groq api {type(response)}")
-            response = json.loads(response_from_groq.content)
-            app.logger.info(f" response from groq api after {response}")
-            app.logger.info(f" response from groq api after {type(response)}")
-            
-            app.logger.info("finish in groq {}".format(time.time()-start))
+            try:
+                # app.logger.info(f"the prompt we are sending is {prompt}")
+                start= time.time()
+                # response = requests.post(
+                #     GPT_API,
+                #     json={
+                #     "model": "gpt35-turbo-1106",
+                #     "data": [{"role":"user","content":prompt}],
+                #     "max_token":1000,
+                #     "request_id":str(thread_local_data.get_request_id())
+                #     })
+                # app.logger.info(f"gpt 3.5 response format is {response.json()}")
+                # app.logger.info(f"gpt 3.5 response format type is {type(response.json())}")
+                # app.logger.info("finish in {}".format(time.time()-start))
+                response_from_groq = llm.invoke(prompt)
+                # app.logger.info("groq response in streaming way")
+                # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+                # for chunk in llm.stream(prompt):
+                #     print(chunk.content, end="", flush=True)
+                # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+                # app.logger.info(f" response from groq api {response}")
+                # app.logger.info(f" response from groq api {type(response)}")
+                response = json.loads(response_from_groq.content)
+                app.logger.info(f" response from groq api after {response}")
+                app.logger.info(f" response from groq api after {type(response)}")
+                
+                app.logger.info("finish in groq {}".format(time.time()-start))
+                checker = 0
+            except Exception as e:
+                app.logger.info(f"In except the exception is {e}")
+                start= time.time()
+                response = requests.post(
+                    GPT_API,
+                    json={
+                    "model": "gpt35-turbo-1106",
+                    "data": [{"role":"user","content":prompt}],
+                    "max_token":1000,
+                    "request_id":str(thread_local_data.get_request_id())
+                    })
+                app.logger.info(f"gpt 3.5 response format is {response.json()}")
+                app.logger.info(f"gpt 3.5 response format type is {type(response.json())}")
+                app.logger.info("finish in {}".format(time.time()-start))
+                checker = 1
         else:
-            # app.logger.info(f"the prompt we are sending is {prompt}")
-            start=time.time()
-            
-            # response = requests.post(
-            #     GPT_API,
-            #     json={
-            #     "model": "gpt-4",
-            #     "data": [{"role":"user","content":prompt}],
-            #     "max_token":1000,
-            #     "request_id":str(thread_local_data.get_request_id())
-            #     }
-            # )
-            # app.logger.info(f"gpt 4 response format is {response.json()}")
-            # app.logger.info(f"gpt 4 response format type is {type(response.json())}")
-            # app.logger.info("finish in {}".format(time.time()-start))
-            response_from_groq = llm.invoke(prompt)
-            # app.logger.info("groq response in streaming way")
-            # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
-            # for chunk in llm.stream(prompt):
-            #     print(chunk.content, end="", flush=True)
-            # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+            try:
+                # app.logger.info(f"the prompt we are sending is {prompt}")
+                start=time.time()
+                
+                # response = requests.post(
+                #     GPT_API,
+                #     json={
+                #     "model": "gpt-4",
+                #     "data": [{"role":"user","content":prompt}],
+                #     "max_token":1000,
+                #     "request_id":str(thread_local_data.get_request_id())
+                #     }
+                # )
+                # app.logger.info(f"gpt 4 response format is {response.json()}")
+                # app.logger.info(f"gpt 4 response format type is {type(response.json())}")
+                # app.logger.info("finish in {}".format(time.time()-start))
+                response_from_groq = llm.invoke(prompt)
+                # app.logger.info("groq response in streaming way")
+                # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+                # for chunk in llm.stream(prompt):
+                #     print(chunk.content, end="", flush=True)
+                # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
 
-            # app.logger.info(f" response from groq api {response}")
-            # app.logger.info(f" response from groq api type {type(response)}")
-            response = json.loads(response_from_groq.content)
-            app.logger.info(f" response from groq api after {response}")
-            app.logger.info(f" response from groq api after {type(response)}")
-            app.logger.info("finish in groq {}".format(time.time()-start))
+                # app.logger.info(f" response from groq api {response}")
+                # app.logger.info(f" response from groq api type {type(response)}")
+                response = json.loads(response_from_groq.content)
+                app.logger.info(f" response from groq api after {response}")
+                app.logger.info(f" response from groq api after {type(response)}")
+                app.logger.info("finish in groq {}".format(time.time()-start))
+                checker = 0
+            except Exception as e:
+                app.logger.info(f"In except the exception is {e}")
+                start=time.time()
+            
+                response = requests.post(
+                    GPT_API,
+                    json={
+                    "model": "gpt-4",
+                    "data": [{"role":"user","content":prompt}],
+                    "max_token":1000,
+                    "request_id":str(thread_local_data.get_request_id())
+                    }
+                )
+                app.logger.info(f"gpt 4 response format is {response.json()}")
+                app.logger.info(f"gpt 4 response format type is {type(response.json())}")
+                app.logger.info("finish in {}".format(time.time()-start))
+                checker = 1
 
 
         # response.raise_for_status()
         # app.logger.info(f"hellpppppppppppppppp-->{response.json()['text']}")
-        try:
-            app.logger.info(f"full response that came from the gpt{response}")
-            text = str(response)
-            app.logger.info(f"text got from gpt {text}")
+        if checker == 0:
             try:
-                text = text.strip('`').replace('json\n','').strip()
-            except:
-                pass
-            intents = json.loads(text)
-            app.logger.info(f"the intents are: {intents}")
+                app.logger.info(f"full response that came from the gpt{response}")
+                text = str(response)
+                app.logger.info(f"text got from gpt {text}")
+                try:
+                    text = text.strip('`').replace('json\n','').strip()
+                except:
+                    pass
+                intents = json.loads(text)
+                app.logger.info(f"the intents are: {intents}")
 
-            curr_intent = intents["action"]
-            app.logger.info(f"curr_intent is: {curr_intent}")
-            if self.previous_intent == curr_intent:
-                self.call_gpt4 = 1
-            self.previous_intent = curr_intent
-            thread_local_data.update_recognize_intents(intents["action"])
-        except Exception as e:
-            app.logger.info(f"Exception occur while intent calcualtion and calling exception {e}")
-            # thread_local_data.update_recognize_intents("Final Answer")
-        # time.sleep(10)
+                curr_intent = intents["action"]
+                app.logger.info(f"curr_intent is: {curr_intent}")
+                if self.previous_intent == curr_intent:
+                    self.call_gpt4 = 1
+                self.previous_intent = curr_intent
+                thread_local_data.update_recognize_intents(intents["action"])
+            except Exception as e:
+                app.logger.info(f"Exception occur while intent calcualtion and calling exception {e}")
+                # thread_local_data.update_recognize_intents("Final Answer")
+            # time.sleep(10)
 
-        end_time = time.time()
-        elapsed_time = end_time - start_time
-        app.logger.info(f"time taken for this call is {elapsed_time}")
-        num_tokens = len(encoding.encode(str(response).replace('\n', ' ').replace('\t', '')))
-        app.logger.info(f"current num_tokens: {num_tokens}")
-        thread_local_data.update_res_token_count(num_tokens)
-        end_result = str(response).replace('\n', ' ').replace('\t', '')
-        app.logger.info(f"the end response is {end_result}")
-        return response_from_groq.content.replace('\n', ' ').replace('\t', '')
+            end_time = time.time()
+            elapsed_time = end_time - start_time
+            app.logger.info(f"time taken for this call is {elapsed_time}")
+            num_tokens = len(encoding.encode(str(response).replace('\n', ' ').replace('\t', '')))
+            app.logger.info(f"current num_tokens: {num_tokens}")
+            thread_local_data.update_res_token_count(num_tokens)
+            end_result = str(response).replace('\n', ' ').replace('\t', '')
+            app.logger.info(f"the end response is {end_result}")
+            return response_from_groq.content.replace('\n', ' ').replace('\t', '')
+        if checker == 1:
+            try:
+                text = str(response.json()["text"])
+                try:
+                    text = text.strip('`').replace('json\n','').strip()
+                except:
+                    pass
+                intents = json.loads(text)
+                
+                curr_intent = intents["action"]
+                if self.previous_intent == curr_intent:
+                    self.call_gpt4 = 1
+                self.previous_intent = curr_intent
+                thread_local_data.update_recognize_intents(intents["action"])
+            except Exception as e:
+                app.logger.info(f"Exception occur while intent calcualtion and calling exception {e}")
+                # thread_local_data.update_recognize_intents("Final Answer")
+                # time.sleep(10)
+
+            end_time = time.time()
+            elapsed_time = end_time - start_time
+            app.logger.info(f"time taken for this call is {elapsed_time}")
+            num_tokens = len(encoding.encode(response.json()["text"].replace('\n', ' ').replace('\t', '')))
+            thread_local_data.update_res_token_count(num_tokens)
+            return response.json()["text"].replace('\n', ' ').replace('\t', '')
 
     @property
     def _identifying_params(self) -> Mapping[str, Any]:
@@ -1284,7 +1346,7 @@ class CustomConvoOutputParser(AgentOutputParser):
 
 
 # main function
-def get_ans(causal_conv, req_tool, user_id, query, custom_prompt):
+def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
     start_time = time.time()
     user_details, actions = get_action_user_details(user_id=user_id)
     app.logger.info("time taken by get_action_user_details %s seconds", time.time() - start_time)
@@ -1336,7 +1398,7 @@ def get_ans(causal_conv, req_tool, user_id, query, custom_prompt):
         <HISTORY_START>
         """
     
-    if not causal_conv:
+    if not casual_conv:
         suffix = """
             <HISTORY_END>
             Only if this above conversation history is not sufficient to fulfill the user's request then use below FULL_HISTORY tool. Important: If results can be accomplished with above information skip tools section and move to format instructions.
@@ -1462,8 +1524,8 @@ def chat():
     request_id = data.get('request_id', None)
     req_tool = data.get('tools', None)
     prompt_id = data.get('prompt_id', None)
-    causal_conv = data.get('causal_conv', None)
-    app.logger.info(f"causal_conv type {causal_conv}")
+    casual_conv = data.get('casual_conv', None)
+    app.logger.info(f"casual_conv type {casual_conv}")
 
     # return ""
     thread_local_data.set_request_id(request_id=request_id)
@@ -1510,7 +1572,7 @@ def chat():
     prompt = data.get('prompt', None)
     app.logger.info("the time taken before get ans in main api is %s seconds", time.time() - start_time)
     ans_start_time = time.time()
-    ans= get_ans(causal_conv,req_tool, user_id=user_id, query=prompt, custom_prompt=custom_prompt)
+    ans= get_ans(casual_conv,req_tool, user_id=user_id, query=prompt, custom_prompt=custom_prompt)
     app.logger.info("the time taken by get ans in main api is %s seconds", time.time() - ans_start_time)
     if ans != "":
         post_dict= {'user_id':user_id, 'status':'FINISHED','task_name':"CHAT", 'uid':request_id, 'task_id': f"CHAT_{str(request_id)}", 'request_id': request_id}
