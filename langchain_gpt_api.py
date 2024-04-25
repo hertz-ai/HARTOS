@@ -421,6 +421,10 @@ def get_tools(req_tool, is_first: bool = False):
 
 #custom GPT
 class CustomGPT(LLM):
+    casual_conv :bool
+
+
+
 
     count:int = 0
     previous_intent: Optional[str]=None
@@ -460,32 +464,47 @@ class CustomGPT(LLM):
         if self.count > 1 or self.call_gpt4 ==1:
             try:
                 # app.logger.info(f"the prompt we are sending is {prompt}")
-                start= time.time()
-                # response = requests.post(
-                #     GPT_API,
-                #     json={
-                #     "model": "gpt35-turbo-1106",
-                #     "data": [{"role":"user","content":prompt}],
-                #     "max_token":1000,
-                #     "request_id":str(thread_local_data.get_request_id())
-                #     })
-                # app.logger.info(f"gpt 3.5 response format is {response.json()}")
-                # app.logger.info(f"gpt 3.5 response format type is {type(response.json())}")
-                # app.logger.info("finish in {}".format(time.time()-start))
-                response_from_groq = llm.invoke(prompt)
-                # app.logger.info("groq response in streaming way")
-                # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
-                # for chunk in llm.stream(prompt):
-                #     print(chunk.content, end="", flush=True)
-                # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
-                # app.logger.info(f" response from groq api {response}")
-                # app.logger.info(f" response from groq api {type(response)}")
-                response = json.loads(response_from_groq.content)
-                app.logger.info(f" response from groq api after {response}")
-                app.logger.info(f" response from groq api after {type(response)}")
-                
-                app.logger.info("finish in groq {}".format(time.time()-start))
-                checker = 0
+                if not self.casual_conv:
+                    app.logger.info(f"casual conv!")
+                    start= time.time()
+                    response = requests.post(
+                        GPT_API,
+                        json={
+                        "model": "gpt35-turbo-1106",
+                        "data": [{"role":"user","content":prompt}],
+                        "max_token":1000,
+                        "request_id":str(thread_local_data.get_request_id())
+                        })
+                    app.logger.info(f"gpt 3.5 response format is {response.json()}")
+                    app.logger.info(f"gpt 3.5 response format type is {type(response.json())}")
+                    app.logger.info(" gpt 3.5 finish in {}".format(time.time()-start))
+                    checker = 1
+
+                if self.casual_conv:
+                    app.logger.info("Non casual conv")
+                    start=time.time()
+                    # `response_from_groq`.
+                    # response_from_groq = llm.invoke(prompt)
+                    # app.logger.info("groq response in streaming way")
+                    # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+                    response_from_groq = ""
+                    for chunk in llm.stream(prompt):
+                        print(chunk.content)
+                        app.logger.info(f"chunk in stream {chunk}")
+                        app.logger.info(f"chunk content in straming way {chunk.content}")
+                        response_from_groq +=chunk.content
+
+                    # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+                    # app.logger.info(f" response from groq api {response_from_groq}")
+                    # app.logger.info(f" response from groq api {type(response_from_groq)}")
+                    
+                    app.logger.info("finish in groq {}".format(time.time()-start))
+                    response = json.loads(response_from_groq)
+                    # response = json.loads(response_from_groq.content)
+                    response = json.dumps(response)
+                    app.logger.info(f" response from groq api after {response}")
+                    app.logger.info(f" response from groq api after {type(response)}")
+                    checker = 0
             except Exception as e:
                 app.logger.info(f"In except the exception is {e}")
                 start= time.time()
@@ -504,34 +523,53 @@ class CustomGPT(LLM):
         else:
             try:
                 # app.logger.info(f"the prompt we are sending is {prompt}")
-                start=time.time()
-                
-                # response = requests.post(
-                #     GPT_API,
-                #     json={
-                #     "model": "gpt-4",
-                #     "data": [{"role":"user","content":prompt}],
-                #     "max_token":1000,
-                #     "request_id":str(thread_local_data.get_request_id())
-                #     }
-                # )
-                # app.logger.info(f"gpt 4 response format is {response.json()}")
-                # app.logger.info(f"gpt 4 response format type is {type(response.json())}")
-                # app.logger.info("finish in {}".format(time.time()-start))
-                response_from_groq = llm.invoke(prompt)
-                # app.logger.info("groq response in streaming way")
-                # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
-                # for chunk in llm.stream(prompt):
-                #     print(chunk.content, end="", flush=True)
-                # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+                if not self.casual_conv:
 
-                # app.logger.info(f" response from groq api {response}")
-                # app.logger.info(f" response from groq api type {type(response)}")
-                response = json.loads(response_from_groq.content)
-                app.logger.info(f" response from groq api after {response}")
-                app.logger.info(f" response from groq api after {type(response)}")
-                app.logger.info("finish in groq {}".format(time.time()-start))
-                checker = 0
+                    app.logger.info(f"the casual conv line 519 casual conv {self.casual_conv} type of casual conv {type(self.casual_conv)}")
+                    start=time.time()
+                    
+                    response = requests.post(
+                        GPT_API,
+                        json={
+                        "model": "gpt35-turbo-1106",
+                        "data": [{"role":"user","content":prompt}],
+                        "max_token":1000,
+                        "request_id":str(thread_local_data.get_request_id())
+                        }
+                    )
+                    app.logger.info(f"gpt 3.5 response format is {response.json()}")
+                    app.logger.info(f"gpt 3.5 response format type is {type(response.json())}")
+                    app.logger.info("gpt 3.5 finish in {}".format(time.time()-start))
+                    checker = 1
+                if self.casual_conv:
+                    try:
+                        app.logger.info("non casual conv")
+                        start=time.time()
+                        # response_from_groq = llm.invoke(prompt)
+
+                        response_from_groq = ""
+                        for chunk in llm.stream(prompt):
+                            print(chunk.content)
+                            app.logger.info(f"chunk in stream {chunk}")
+                            app.logger.info(f"chunk content in straming way {chunk.content}")
+                            response_from_groq +=chunk.content
+                        # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+                        # app.logger.info(f" response from groq api {response_from_groq}")
+                        # app.logger.info(f" response from groq api {type(response_from_groq)}")
+                        app.logger.info("finish in groq {}".format(time.time()-start))
+                        app.logger.info(f"this is response from groq {response_from_groq}")
+                        # app.logger.info(f"this is response content from groq {response_from_groq.content}")
+                        # app.logger.info(f"this is the type of response content from groq {type(response_from_groq.content)}")
+                        # response = json.loads(response_from_groq.content)
+                        response = json.loads(response_from_groq)
+                        # response = json.loads(response_from_groq.content)
+                        response = json.dumps(response)
+                        
+                        app.logger.info(f" response from groq api after {response}")
+                        app.logger.info(f" response from groq api after {type(response)}")
+                        checker = 0
+                    except Exception as e:
+                        app.logger.info(f" the error is {e}")
             except Exception as e:
                 app.logger.info(f"In except the exception is {e}")
                 start=time.time()
@@ -584,7 +622,8 @@ class CustomGPT(LLM):
             thread_local_data.update_res_token_count(num_tokens)
             end_result = str(response).replace('\n', ' ').replace('\t', '')
             app.logger.info(f"the end response is {end_result}")
-            return response_from_groq.content.replace('\n', ' ').replace('\t', '')
+            return response_from_groq.replace('\n', ' ').replace('\t', '')
+            # return response_from_groq.content.replace('\n', ' ').replace('\t', '')
         if checker == 1:
             try:
                 text = str(response.json()["text"])
@@ -1350,8 +1389,8 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
     start_time = time.time()
     user_details, actions = get_action_user_details(user_id=user_id)
     app.logger.info("time taken by get_action_user_details %s seconds", time.time() - start_time)
-
-    llm = CustomGPT()
+    app.logger.info(casual_conv)
+    llm = CustomGPT(casual_conv=casual_conv)
     app.logger.info(f"query------> {query}")
     memory_start_time = time.time()
     memory=get_memory(user_id=user_id)
@@ -1624,4 +1663,4 @@ def status():
 
 
 if __name__ == '__main__':
-    serve(app, host='0.0.0.0', port=5000)
+    serve(app, host='0.0.0.0', port=5055)
