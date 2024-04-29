@@ -57,10 +57,10 @@ import sys
 from threading import Thread
 from dotenv import load_dotenv
 load_dotenv()
-# os.environ['LANGCHAIN_TRACING_V2'] = 'true'
-# os.environ['LANGCHAIN_ENDPOINT'] = 'https://api.smith.langchain.com'
-# os.environ['LANGCHAIN_API_KEY'] = os.getenv("LANGCHAIN_API_KEY")
-# os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGCHAIN_PROJECT")
+os.environ['LANGCHAIN_TRACING_V2'] = 'true'
+os.environ['LANGCHAIN_ENDPOINT'] = 'https://api.smith.langchain.com'
+os.environ['LANGCHAIN_API_KEY'] = os.getenv("LANGCHAIN_API_KEY")
+os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGCHAIN_PROJECT")
 groq_api_key = os.environ['GROQ_API_KEY']
 
 class RequestLogRecord(logging.LogRecord):
@@ -1710,5 +1710,5 @@ def status():
 
 
 if __name__ == '__main__':
-    # serve(app, host='0.0.0.0', port=5055)
-    serve(app, host='0.0.0.0', port=5000)
+    serve(app, host='0.0.0.0', port=5055)
+    # serve(app, host='0.0.0.0', port=5000)
