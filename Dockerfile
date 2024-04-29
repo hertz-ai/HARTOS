@@ -4,6 +4,8 @@ WORKDIR /app
 
 COPY . .
 
+RUN touch /app/langchain.log
+
 RUN pip install --upgrade pip
 RUN pip install bs4
 RUN pip install -r requirements.txt
