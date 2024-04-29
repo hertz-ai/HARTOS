@@ -10,4 +10,4 @@ sudo pip install --upgrade pip
 sudo docker build -t langchain_gpt1:v1 .
 sudo docker kill langchain
 sudo docker rm langchain
-sudo docker run -dp 5000:5000 --network host -v "/opt/LLM-langchain_Chatbot-Agent/langchain.log:/usr/app/langchain.log" --name langchain langchain_gpt1:v1
+sudo docker run -dp 5000:5000 --network host -v "/opt/LLM-langchain_Chatbot-Agent/langchain.log:/app/langchain.log" --name langchain langchain_gpt1:v1
