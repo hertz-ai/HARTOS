@@ -9,14 +9,21 @@ from langchain.chains import ConversationChain
 import json
 from flask import Flask, request, jsonify
 import os
-
+os.environ["OPENAI_API_VERSION"] = "2023-12-01-preview"
+os.environ["AZURE_OPENAI_ENDPOINT"] ="https://hertzai2.openai.azure.com/"
+os.environ["AZURE_OPENAI_API_KEY"] = "19747230185b406f835cf9c94736d1d4"
+from langchain_openai import AzureOpenAI
+llm = AzureOpenAI(  
+    deployment_name="gpt-35-turbo-instruct"
+)   
+print(llm.invoke("Tell me a joke"))
 
 os.environ["OPENAI_API_KEY"] = "***REMOVED***"
 
 
 app = Flask(__name__)
 
-llm = OpenAI(temperature=0) # Can be any valid LLM
+# llm = OpenAI(temperature=0) # Can be any valid LLM
 _DEFAULT_TEMPLATE = """You are student and you need to act according to your age give in input.
 anser as per your age if you don't know the answer just say Sorry! I don't know the answer
 
@@ -53,15 +60,21 @@ def api():
         for conv in conversation:
             memory.save_context({"input": conv[0]}, {"output": conv[1]})
     
-    conversation_with_summary = ConversationChain(
-        llm=llm, 
-        prompt=PROMPT,
-        # We set a very low max_token_limit for the purposes of testing.
-        memory=memory,
-        verbose=True
-    )  
-    ans = conversation_with_summary.predict(input=prompt) 
+    # conversation_with_summary = ConversationChain(
+    #     llm=llm, 
+    #     prompt=PROMPT,
+    #     # We set a very low max_token_limit for the purposes of testing.
+    #     memory=memory,
+    #     verbose=True
+    # )  
+    # ans = conversation_with_summary.predict(input=prompt) 
+    ans = llm.invoke(PROMPT)
+    print(ans)
+    print(type(ans))
+    
     return ans
 
 if __name__=="__main__":
-    app.run(host="0.0.0.0", debug=True, port=8088)
+    # app.run(host="0.0.0.0", debug=True, port=8088)
+    from waitress import serve
+    serve(app, host='0.0.0.0', port=8088)
