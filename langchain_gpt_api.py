@@ -50,13 +50,14 @@ from langchain.tools.requests.tool import RequestsGetTool, TextRequestsWrapper
 from pydantic import BaseModel, Field, root_validator
 from threadlocal import thread_local_data
 import crossbarhttp
+from PIL import Image
+import numpy as np
 from langchain.retrievers.document_compressors import cohere_rerank
 import asyncio
 import aiohttp
 import sys
 import redis
 import pickle
-import cv2
 from threading import Thread
 from dotenv import load_dotenv
 load_dotenv()
@@ -1325,7 +1326,10 @@ def parse_visual_context(inp: str):
     frame = get_frame(str(user_id))
     if frame is not None:
         image_path = f"output_images/{user_id}_{request_id}_call.jpg"
-        cv2.imwrite(image_path, frame)
+        # Convert the frame (which is a NumPy array) to a PIL image
+        image = Image.fromarray(frame)
+        # Save the image
+        image.save(image_path)
         url = "http://20.193.147.18:9890/upload"
         payload = {
             'prompt': f'Instruction: Respond in first person singular speech\ninput:-{inp}'}
