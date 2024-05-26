@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y \
     libgl1-mesa-glx
 RUN pip install --upgrade pip
 RUN pip install bs4
-RUN pip install -r requirements.txt
+RUN pip install -r requirements.txt --use-feature=2020-resolver
 
 EXPOSE 5000
 
