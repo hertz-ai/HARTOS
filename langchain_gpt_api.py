@@ -54,6 +54,9 @@ from langchain.retrievers.document_compressors import cohere_rerank
 import asyncio
 import aiohttp
 import sys
+import redis
+import pickle
+import cv2
 from threading import Thread
 from dotenv import load_dotenv
 load_dotenv()
@@ -304,6 +307,11 @@ def get_tools(req_tool, is_first: bool = False):
                 name="User_details_tool",
                 func=parse_user_id,
                 description="If a request is made for information regarding students or users, this functionality should be utilized to retrieve the necessary details. input for this api should Always be current user_id. Except current user id you should say you cannot have access other user's details."
+            ),
+            Tool(
+                name="Visual_Context_Camera",
+                func=parse_visual_context,
+                description="If there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input should be the user input and output should be as if you are seeing the user scene via video call"
             )
 
         ]
@@ -311,7 +319,7 @@ def get_tools(req_tool, is_first: bool = False):
         return tools
 
     else:
-        tools_dict = {1:'google_search', 2:'Calculator', 3:'OpenAPI_Specification', 4:'FULL_HISTORY', 5:'Text to image', 6:'Image_Inference_Tool', 7:'Data_Extraction_From_URL', 8:'User_details_tool'}
+        tools_dict = {1:'google_search', 2:'Calculator', 3:'OpenAPI_Specification', 4:'FULL_HISTORY', 5:'Text to image', 6:'Image_Inference_Tool', 7:'Data_Extraction_From_URL', 8:'User_details_tool',9:'Visual_Context_Camera'}
         tool_desc = {
             'google_search': '''Search Google for recent results and retrieve URLs that are suitable for web crawling. Ensure that the search responses include the source URL from which the data was extracted. Always present this URL in the response as an HTML anchor tag. This approach ensures clear attribution and easy navigation to the original source for each piece of extracted information. Give urls for the source''',
             'Calculator': '''Useful for when you need to answer questions about math.''',
@@ -329,7 +337,8 @@ def get_tools(req_tool, is_first: bool = False):
             'Text to image':'''Based on user query generate visual representation of text. Extract prompt from user query and use it as input for function''',
             'Image_Inference_Tool':'''When a user provides a query containing an image download URL and a related question about that image, utilize this tool for support. Your objective is to extract both the image URL and the user's inquiry or prompt pertaining to that image from their query, and then convert these elements into comma seperated string. The format should be as follows: "image_url, user_query".''',
             'Data_Extraction_From_URL':'''Your task is to extract a URL and its type (either 'pdf' or 'website') from a user's query. Upon receiving a query that contains a URL and a specified URL type, you are to use a tool designed for this purpose. The objective is to accurately identify both the URL and its type from the query. Once identified, these elements should be formatted into a comma-separated string, adhering to the format: "url, url_type".''',
-            'User_details_tool':'''If a request is made for information regarding students or users, this functionality should be utilized to retrieve the necessary details. input for this api should Always be current user_id. Except current user id you should say you cannot have access other user's details.'''
+            'User_details_tool':'''If a request is made for information regarding students or users, this functionality should be utilized to retrieve the necessary details. input for this api should Always be current user_id. Except current user id you should say you cannot have access other user's details.''',
+            'Visual_Context_Camera':'''If there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input should be the user input and output should be as if you are seeing the user scene via video call.'''
         }
         tools_func = {
             'google_search':top5_results,
@@ -339,7 +348,8 @@ def get_tools(req_tool, is_first: bool = False):
             'Text to image':parse_text_to_image,
             'Image_Inference_Tool':parse_image_to_text,
             'Data_Extraction_From_URL':parse_link_for_crwalab,
-            'User_details_tool':parse_user_id
+            'User_details_tool':parse_user_id,
+            'Visual_Context_Camera':parse_visual_context
         }
         if req_tool == "google_search":
             req_tool = "Google Search Snippets"
@@ -406,6 +416,11 @@ def get_tools(req_tool, is_first: bool = False):
                 name="User_details_tool",
                 func=parse_user_id,
                 description="Utilize this functionality to retrieve information about students or users, requiring the current user_id as the only acceptable input; access to other user details is not allowed."
+            ),
+            Tool(
+                name="Visual_Context_Camera",
+                func=parse_visual_context,
+                description="If there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input should be the user input and output should be as if you are seeing the user scene via video call"
             )
 
         ]
@@ -1289,6 +1304,44 @@ def parse_link_for_crwalab(inp):
     except Exception as e:
         pass
 
+
+redis_client = redis.StrictRedis(host='40.80.82.130', port=6379, db=0)
+
+def get_frame(user_id):
+    serialized_frame = redis_client.get(user_id)
+    if serialized_frame is not None:
+        frame = pickle.loads(serialized_frame)
+        print(f"Frame for user_id {user_id} retrieved successfully.")
+        return frame
+    else:
+        print(f"No frame found for user_id {user_id}.")
+        return None
+
+
+def parse_visual_context(inp: str):
+    user_id= thread_local_data.get_user_id()
+    request_id= thread_local_data.get_request_id()
+    print('Using Vision to answer question')
+    frame = get_frame(str(user_id))
+    if frame is not None:
+        image_path = f"output_images/{user_id}_{request_id}_call.jpg"
+        cv2.imwrite(image_path, frame)
+        url = "http://20.193.147.18:9890/upload"
+        payload = {
+            'prompt': f'Instruction: Respond in first person singular speech\ninput:-{inp}'}
+        files = [
+            ('file', ('call.jpg', open(image_path, 'rb'), 'image/jpeg'))
+        ]
+        headers = {}
+        try:
+            response = requests.post(
+                url, headers=headers, data=payload, files=files)
+            print(response.text)
+            response = response.text
+
+            return response
+        except Exception as e:
+            app.logger.error('Got error in visal QA')
 
 def parse_user_id(inp: str):
     url = 'https://azurekong.hertzai.com:8443/db/getstudent_by_user_id'
