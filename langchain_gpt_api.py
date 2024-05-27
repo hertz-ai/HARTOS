@@ -201,7 +201,7 @@ def create_prompt(tools):
         Before you respond, consider the context in which you are utilized. You are Hevolve, a highly intelligent educational AI developed by HertzAI.
         You are designed to answer questions, provide revisions, conduct assessments, teach various topics, create personalised curriculum and assist with research for both students and working professionals.
         Your expertise draws from various knowledge sources like books, websites, and white papers. Your responses will be conveyed to the user through a video, using an avatar and text-to-speech technology, and can be translated into various languages.
-        Consider the user's location, time and context of previous dialogues with time to create a proper prompt for tools and follow up in-context questions.
+        Consider the user's location, time and context of previous dialogues with time to create a proper prompt for tools and follow up in-context questions.You have ability to see using Visual_Context_Camera tool.
         <CONTEXT_END>
         These are all the actions that the user has performed up to now:
         <PREVIOUS_USER_ACTION_START>
@@ -312,7 +312,7 @@ def get_tools(req_tool, is_first: bool = False):
             Tool(
                 name="Visual_Context_Camera",
                 func=parse_visual_context,
-                description="If there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input should be the user input and output should be as if you are seeing the user scene via video call"
+                description="To see user or If there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input should be the user input and output should be as if you are seeing the user scene via video call"
             )
 
         ]
@@ -339,7 +339,7 @@ def get_tools(req_tool, is_first: bool = False):
             'Image_Inference_Tool':'''When a user provides a query containing an image download URL and a related question about that image, utilize this tool for support. Your objective is to extract both the image URL and the user's inquiry or prompt pertaining to that image from their query, and then convert these elements into comma seperated string. The format should be as follows: "image_url, user_query".''',
             'Data_Extraction_From_URL':'''Your task is to extract a URL and its type (either 'pdf' or 'website') from a user's query. Upon receiving a query that contains a URL and a specified URL type, you are to use a tool designed for this purpose. The objective is to accurately identify both the URL and its type from the query. Once identified, these elements should be formatted into a comma-separated string, adhering to the format: "url, url_type".''',
             'User_details_tool':'''If a request is made for information regarding students or users, this functionality should be utilized to retrieve the necessary details. input for this api should Always be current user_id. Except current user id you should say you cannot have access other user's details.''',
-            'Visual_Context_Camera':'''If there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input should be the user input and output should be as if you are seeing the user scene via video call.'''
+            'Visual_Context_Camera':'''To see user or If there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input should be the user input and output should be as if you are seeing the user scene via video call.'''
         }
         tools_func = {
             'google_search':top5_results,
@@ -421,7 +421,7 @@ def get_tools(req_tool, is_first: bool = False):
             Tool(
                 name="Visual_Context_Camera",
                 func=parse_visual_context,
-                description="If there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input should be the user input and output should be as if you are seeing the user scene via video call"
+                description="To see or If there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input should be the user input and output should be as if you are seeing the user scene via video call"
             )
 
         ]
@@ -532,7 +532,7 @@ class CustomGPT(LLM):
                 #     # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
                 #     # app.logger.info(f" response from groq api {response_from_groq}")
                 #     # app.logger.info(f" response from groq api {type(response_from_groq)}")
-                    
+
                 #     app.logger.info("finish in groq {}".format(time.time()-start))
                 #     response = json.loads(response_from_groq)
                 #     # response = json.loads(response_from_groq.content)
@@ -562,7 +562,7 @@ class CustomGPT(LLM):
 
             #         app.logger.info(f"the casual conv line 519 casual conv {self.casual_conv} type of casual conv {type(self.casual_conv)}")
             #         start=time.time()
-                    
+
             #         response = requests.post(
             #             GPT_API,
             #             json={
@@ -599,7 +599,7 @@ class CustomGPT(LLM):
             #             response = json.loads(response_from_groq)
             #             # response = json.loads(response_from_groq.content)
             #             response = json.dumps(response)
-                        
+
             #             app.logger.info(f" response from groq api after {response}")
             #             app.logger.info(f" response from groq api after {type(response)}")
             #             checker = 0
@@ -608,7 +608,7 @@ class CustomGPT(LLM):
             # except Exception as e:
             #     app.logger.info(f"In except the exception is {e}")
             #     start=time.time()
-            
+
             #     response = requests.post(
             #         GPT_API,
             #         json={
@@ -637,7 +637,7 @@ class CustomGPT(LLM):
                 app.logger.info(f"gpt 3.5 response format is {response.json()}")
                 app.logger.info(f"gpt 3.5 response format type is {type(response.json())}")
                 app.logger.info("gpt 3.5 finish in {}".format(time.time()-start))
-                checker = 1            
+                checker = 1
             except:
                 app.logger.info("gpt fail!! in line 623")
 
@@ -649,7 +649,7 @@ class CustomGPT(LLM):
 
 
 
-        
+
 
 
         # response.raise_for_status()
@@ -695,7 +695,7 @@ class CustomGPT(LLM):
                 except:
                     pass
                 intents = json.loads(text)
-                
+
                 curr_intent = intents["action"]
                 if self.previous_intent == curr_intent:
                     self.call_gpt4 = 1
@@ -1326,6 +1326,10 @@ def parse_visual_context(inp: str):
     frame = get_frame(str(user_id))
     if frame is not None:
         image_path = f"output_images/{user_id}_{request_id}_call.jpg"
+        # Ensure the directory exists
+        directory = os.path.dirname(image_path)
+        if not os.path.exists(directory):
+            os.makedirs(directory)
         # Convert the frame (which is a NumPy array) to a PIL image
         image = Image.fromarray(frame)
         # Save the image
@@ -1532,6 +1536,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
         You are designed to answer questions, provide revisions, conduct assessments, teach various topics, create personalised curriculum and assist with research for both students and working professionals.
         Your expertise draws from various knowledge sources like books, websites, and white papers. Your responses will be conveyed to the user through a video, using an avatar and text-to-speech technology, and can be translated into various languages.
         Consider the user's location, time and context of previous dialogues with time to create a proper prompt for tools and follow up in-context questions.
+        Your responses will be conveyed to the user through a video, using an avatar and you have ability to see using Visual_Context_Camera tool.
         <CONTEXT_END>
         These are all the actions that the user has performed up to now:
         <PREVIOUS_USER_ACTION_START>
@@ -1540,7 +1545,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
         Conversation History:
         <HISTORY_START>
         """
-    
+
     if not casual_conv:
         suffix = """
             <HISTORY_END>
@@ -1582,7 +1587,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
             Assistant can use tools to look up information that may be helpful in answering the user's
             question. The tools you can use are:
 
-            
+
             <FORMAT_INSTRUCTION_START>
             {format_instructions}
             <FORMAT_INSTRUCTION_END>
@@ -1686,7 +1691,7 @@ def chat():
                 lang = requests.post('{}/getstudent_by_user_id'.format(DB_URL),
                         data=json.dumps({"user_id": user_id})).json()
                 language = lang['preferred_language'][:2]
-                app.logger.info(f'user preffered language is {language}')  
+                app.logger.info(f'user preffered language is {language}')
                 custom_prompt = custom_prompt+f' The Language selected is {language}'
                 app.logger.info(f"custom prompt is: {custom_prompt}")
 
