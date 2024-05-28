@@ -1311,8 +1311,9 @@ redis_client = redis.StrictRedis(host='40.80.82.130', port=6379, db=0)
 def get_frame(user_id):
     serialized_frame = redis_client.get(user_id)
     if serialized_frame is not None:
-        frame = pickle.loads(serialized_frame)
+        frame_bgr = pickle.loads(serialized_frame)
         print(f"Frame for user_id {user_id} retrieved successfully.")
+        frame = frame_bgr[:, :, ::-1]
         return frame
     else:
         print(f"No frame found for user_id {user_id}.")
