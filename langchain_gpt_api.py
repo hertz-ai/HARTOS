@@ -312,7 +312,7 @@ def get_tools(req_tool, is_first: bool = False):
             Tool(
                 name="Visual_Context_Camera",
                 func=parse_visual_context,
-                description="To see user or If there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input should be the user input and output should be as if you are seeing the user scene via video call"
+                description="To see user or If there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input to this tool function should be the user query/input via video call, format the tool response as if you are seeing the scene via videocall"
             )
 
         ]
@@ -339,7 +339,7 @@ def get_tools(req_tool, is_first: bool = False):
             'Image_Inference_Tool':'''When a user provides a query containing an image download URL and a related question about that image, utilize this tool for support. Your objective is to extract both the image URL and the user's inquiry or prompt pertaining to that image from their query, and then convert these elements into comma seperated string. The format should be as follows: "image_url, user_query".''',
             'Data_Extraction_From_URL':'''Your task is to extract a URL and its type (either 'pdf' or 'website') from a user's query. Upon receiving a query that contains a URL and a specified URL type, you are to use a tool designed for this purpose. The objective is to accurately identify both the URL and its type from the query. Once identified, these elements should be formatted into a comma-separated string, adhering to the format: "url, url_type".''',
             'User_details_tool':'''If a request is made for information regarding students or users, this functionality should be utilized to retrieve the necessary details. input for this api should Always be current user_id. Except current user id you should say you cannot have access other user's details.''',
-            'Visual_Context_Camera':'''To see user or If there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input should be the user input and output should be as if you are seeing the user scene via video call.'''
+            'Visual_Context_Camera':'''To see user or If there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input to this tool function should be the user query/input via video call, format the tool response as if you are seeing the scene via videocall.'''
         }
         tools_func = {
             'google_search':top5_results,
@@ -421,7 +421,7 @@ def get_tools(req_tool, is_first: bool = False):
             Tool(
                 name="Visual_Context_Camera",
                 func=parse_visual_context,
-                description="To see or If there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input should be the user input and output should be as if you are seeing the user scene via video call"
+                description="To see or If there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input to this tool function should be the user query/input via video call, format the tool response as if you are seeing the scene via videocall."
             )
 
         ]
@@ -1336,7 +1336,7 @@ def parse_visual_context(inp: str):
         image.save(image_path)
         url = "http://20.193.147.18:9890/upload"
         payload = {
-            'prompt': f'Instruction: Respond in first person singular speech\ninput:-{inp}'}
+            'prompt': f'Instruction: Respond in second person point of view\ninput:-{inp}'}
         files = [
             ('file', ('call.jpg', open(image_path, 'rb'), 'image/jpeg'))
         ]
