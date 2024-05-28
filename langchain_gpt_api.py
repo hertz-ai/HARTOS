@@ -485,9 +485,9 @@ class CustomGPT(LLM):
                 response = requests.post(
                     GPT_API,
                     json={
-                    "model": "gpt35-turbo-1106",
+                    "model": "gpt-4o",
                     "data": [{"role":"user","content":prompt}],
-                    "max_token":1000,
+                    "max_token":2000,
                     "request_id":str(thread_local_data.get_request_id())
                     })
                 app.logger.info(f"gpt 3.5 response format is {response.json()}")
@@ -524,7 +524,7 @@ class CustomGPT(LLM):
                 #     # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
                 #     response_from_groq = ""
                 #     for chunk in llm.stream(prompt):
-                #         print(chunk.content)
+                #         app.logger.info(chunk.content)
                 #         app.logger.info(f"chunk in stream {chunk}")
                 #         app.logger.info(f"chunk content in straming way {chunk.content}")
                 #         response_from_groq +=chunk.content
@@ -584,7 +584,7 @@ class CustomGPT(LLM):
 
             #             response_from_groq = ""
             #             for chunk in llm.stream(prompt):
-            #                 print(chunk.content)
+            #                 app.logger.info(chunk.content)
             #                 app.logger.info(f"chunk in stream {chunk}")
             #                 app.logger.info(f"chunk content in straming way {chunk.content}")
             #                 response_from_groq +=chunk.content
@@ -628,9 +628,9 @@ class CustomGPT(LLM):
                 response = requests.post(
                     GPT_API,
                     json={
-                    "model": "gpt35-turbo-1106",
+                    "model": "gpt-4o",
                     "data": [{"role":"user","content":prompt}],
-                    "max_token":1000,
+                    "max_token":2000,
                     "request_id":str(thread_local_data.get_request_id())
                     }
                 )
@@ -1312,18 +1312,18 @@ def get_frame(user_id):
     serialized_frame = redis_client.get(user_id)
     if serialized_frame is not None:
         frame_bgr = pickle.loads(serialized_frame)
-        print(f"Frame for user_id {user_id} retrieved successfully.")
+        app.logger.info(f"Frame for user_id {user_id} retrieved successfully.")
         frame = frame_bgr[:, :, ::-1]
         return frame
     else:
-        print(f"No frame found for user_id {user_id}.")
+        app.logger.info(f"No frame found for user_id {user_id}.")
         return None
 
 
 def parse_visual_context(inp: str):
     user_id= thread_local_data.get_user_id()
     request_id= thread_local_data.get_request_id()
-    print('Using Vision to answer question')
+    app.logger.info('Using Vision to answer question')
     frame = get_frame(str(user_id))
     if frame is not None:
         image_path = f"output_images/{user_id}_{request_id}_call.jpg"
@@ -1345,7 +1345,7 @@ def parse_visual_context(inp: str):
         try:
             response = requests.post(
                 url, headers=headers, data=payload, files=files)
-            print(response.text)
+            app.logger.info(response.text)
             response = response.text
 
             return response
@@ -1622,7 +1622,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
     )
     # prompt.input_variables
 
-
+    app.logger.info(f"the prompt for user {user_id} is {prompt} ")
     #chat Agent
     llm_chain = LLMChain(
         llm=llm,
@@ -1665,7 +1665,7 @@ Hevolve = "You are Hevolve, a highly intelligent educational AI developed by Her
 
 @app.route('/chat', methods=['POST'])
 def chat():
-    # print("hii")
+    # app.logger.info("hii")
 
     start_time = time.time()
     data = request.get_json()
@@ -1698,7 +1698,7 @@ def chat():
 
 
         except:
-            print(f'failed to get prompt from id:- {prompt_id}')
+            app.logger.info(f'failed to get prompt from id:- {prompt_id}')
             custom_prompt = Hevolve
     else:
         custom_prompt = Hevolve  # use Hevolve from config/template
