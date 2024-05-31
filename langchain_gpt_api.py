@@ -1629,7 +1629,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
     )
     # prompt.input_variables
 
-    app.logger.info(f"the prompt for user {user_id} is {prompt} ")
+
     #chat Agent
     llm_chain = LLMChain(
         llm=llm,
