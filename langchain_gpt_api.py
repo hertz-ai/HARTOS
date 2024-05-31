@@ -38,7 +38,7 @@ from langchain.agents.conversational_chat.output_parser import ConvoOutputParser
 import time
 import tiktoken
 from pytz import timezone
-from datetime import datetime
+from datetime import datetime, timedelta
 from waitress import serve
 from logging.handlers import RotatingFileHandler
 from typing import Union
@@ -477,7 +477,7 @@ class CustomGPT(LLM):
             app.logger.info(prompt)
             # time.sleep(10)
         checker = None
-        if self.count > 1 or self.call_gpt4 ==1:
+        if (self.count > 1 or self.call_gpt4 ==1):
             try:
                 # app.logger.info(f"the prompt we are sending is {prompt}")
 
@@ -485,9 +485,9 @@ class CustomGPT(LLM):
                 response = requests.post(
                     GPT_API,
                     json={
-                    "model": "gpt-4o",
+                    "model": "gpt35-turbo-1106",
                     "data": [{"role":"user","content":prompt}],
-                    "max_token":2000,
+                    "max_token":1000,
                     "request_id":str(thread_local_data.get_request_id())
                     })
                 app.logger.info(f"gpt 3.5 response format is {response.json()}")
@@ -524,7 +524,7 @@ class CustomGPT(LLM):
                 #     # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
                 #     response_from_groq = ""
                 #     for chunk in llm.stream(prompt):
-                #         app.logger.info(chunk.content)
+                #         print(chunk.content)
                 #         app.logger.info(f"chunk in stream {chunk}")
                 #         app.logger.info(f"chunk content in straming way {chunk.content}")
                 #         response_from_groq +=chunk.content
@@ -584,7 +584,7 @@ class CustomGPT(LLM):
 
             #             response_from_groq = ""
             #             for chunk in llm.stream(prompt):
-            #                 app.logger.info(chunk.content)
+            #                 print(chunk.content)
             #                 app.logger.info(f"chunk in stream {chunk}")
             #                 app.logger.info(f"chunk content in straming way {chunk.content}")
             #                 response_from_groq +=chunk.content
@@ -628,9 +628,9 @@ class CustomGPT(LLM):
                 response = requests.post(
                     GPT_API,
                     json={
-                    "model": "gpt-4o",
+                    "model": "gpt35-turbo-1106",
                     "data": [{"role":"user","content":prompt}],
-                    "max_token":2000,
+                    "max_token":1000,
                     "request_id":str(thread_local_data.get_request_id())
                     }
                 )
@@ -841,7 +841,14 @@ def get_action_user_details(user_id):
         for obj in filtered_data:
             action = obj["action"]
             date = parse_date(obj["created_date"])
+            gpt3_label = obj["gpt3_label"]
 
+            if gpt3_label == 'Visual Context':
+                now = datetime.now()
+                # Check if the action is older than 5 minutes
+                if (now - date) > timedelta(minutes=5):
+                    continue
+                action = gpt3_label+':'+action
             if action not in action_occurrences:
                 action_occurrences[action] = [date, date]
             else:
@@ -1312,18 +1319,18 @@ def get_frame(user_id):
     serialized_frame = redis_client.get(user_id)
     if serialized_frame is not None:
         frame_bgr = pickle.loads(serialized_frame)
-        app.logger.info(f"Frame for user_id {user_id} retrieved successfully.")
+        print(f"Frame for user_id {user_id} retrieved successfully.")
         frame = frame_bgr[:, :, ::-1]
         return frame
     else:
-        app.logger.info(f"No frame found for user_id {user_id}.")
+        print(f"No frame found for user_id {user_id}.")
         return None
 
 
 def parse_visual_context(inp: str):
     user_id= thread_local_data.get_user_id()
     request_id= thread_local_data.get_request_id()
-    app.logger.info('Using Vision to answer question')
+    print('Using Vision to answer question')
     frame = get_frame(str(user_id))
     if frame is not None:
         image_path = f"output_images/{user_id}_{request_id}_call.jpg"
@@ -1345,7 +1352,7 @@ def parse_visual_context(inp: str):
         try:
             response = requests.post(
                 url, headers=headers, data=payload, files=files)
-            app.logger.info(response.text)
+            print(response.text)
             response = response.text
 
             return response
@@ -1622,7 +1629,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
     )
     # prompt.input_variables
 
-    app.logger.info(f"the prompt for user {user_id} is {prompt} ")
+
     #chat Agent
     llm_chain = LLMChain(
         llm=llm,
@@ -1665,7 +1672,7 @@ Hevolve = "You are Hevolve, a highly intelligent educational AI developed by Her
 
 @app.route('/chat', methods=['POST'])
 def chat():
-    # app.logger.info("hii")
+    # print("hii")
 
     start_time = time.time()
     data = request.get_json()
@@ -1698,7 +1705,7 @@ def chat():
 
 
         except:
-            app.logger.info(f'failed to get prompt from id:- {prompt_id}')
+            print(f'failed to get prompt from id:- {prompt_id}')
             custom_prompt = Hevolve
     else:
         custom_prompt = Hevolve  # use Hevolve from config/template
