@@ -38,7 +38,7 @@ from langchain.agents.conversational_chat.output_parser import ConvoOutputParser
 import time
 import tiktoken
 from pytz import timezone
-from datetime import datetime
+from datetime import datetime, timedelta
 from waitress import serve
 from logging.handlers import RotatingFileHandler
 from typing import Union
@@ -477,7 +477,7 @@ class CustomGPT(LLM):
             app.logger.info(prompt)
             # time.sleep(10)
         checker = None
-        if self.count > 1 or self.call_gpt4 ==1:
+        if (self.count > 1 or self.call_gpt4 ==1):
             try:
                 # app.logger.info(f"the prompt we are sending is {prompt}")
 
@@ -841,7 +841,14 @@ def get_action_user_details(user_id):
         for obj in filtered_data:
             action = obj["action"]
             date = parse_date(obj["created_date"])
+            gpt3_label = obj["gpt3_label"]
 
+            if gpt3_label == 'Visual Context':
+                now = datetime.now()
+                # Check if the action is older than 5 minutes
+                if (now - date) > timedelta(minutes=5):
+                    continue
+                action = gpt3_label+':'+action
             if action not in action_occurrences:
                 action_occurrences[action] = [date, date]
             else:
