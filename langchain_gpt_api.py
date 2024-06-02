@@ -312,7 +312,7 @@ def get_tools(req_tool, is_first: bool = False):
             Tool(
                 name="Visual_Context_Camera",
                 func=parse_visual_context,
-                description="To see user or If there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input to this tool function should be the user query/input via video call, format the tool response as if you are seeing the scene via videocall"
+                description="To see user or If there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input to this tool function should be the user query/input via video call, format the tool response as if you are seeing the scene via videocall. If last 16 seconds Visual context information is present & is enough, then craft answer from Previous Visual Context without using this tool"
             )
 
         ]
@@ -421,7 +421,7 @@ def get_tools(req_tool, is_first: bool = False):
             Tool(
                 name="Visual_Context_Camera",
                 func=parse_visual_context,
-                description="To see or If there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input to this tool function should be the user query/input via video call, format the tool response as if you are seeing the scene via videocall."
+                description="To see or If there is a need to look at user's live camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input to this tool function should be the user query/input via video call, format the tool response as if you are seeing the scene via videocall."
             )
 
         ]
