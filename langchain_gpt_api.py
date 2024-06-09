@@ -289,7 +289,7 @@ def get_tools(req_tool, is_first: bool = False):
             Tool(
                 name="Animate_Character",
                 func=parse_character_animation,
-                description='''Use this tool exclusively for animating the selected character or teacher as requested by the user; it is not intended for general requests or for animating random individuals. The user should specify their animation request in a query, such as 'Show me in a spacesuit' or 'Animate yourself as a cartoon standing in front of the Taj Mahal.' Once the request is made, the tool will generate the animation and return a URL link to the user that directs them to the animated image. Note that this tool is specifically designed to handle requests that involve animating a pre-selected character. It should not be used for general image generation tasks that don't pertain to animating the user's chosen character or teacher. For example, if a user queries 'Show me dancing in the rain,' and they have previously selected a specific character or teacher, the tool should be used to generate this animated scenario. However, if the user's request is something like 'Generate an image of a sunset,' which does not directly involve animating the selected character or teacher, then this tool should not be used.'''
+                description='''Use this tool exclusively for animating the selected character or teacher as requested by the user. The user should specify their animation request in a query, such as 'Show me in a spacesuit' or 'Animate yourself as a cartoon standing in front of the Taj Mahal.' This tool handles requests involving animating a pre-selected character and should not be used for general image generation tasks. For example, use it for 'Show me a picture of yourself dancing in the rain' but not for 'Generate an image of a sunset.' input'''
             ),
             Tool(
                 name="Image_Inference_Tool",
@@ -312,7 +312,7 @@ def get_tools(req_tool, is_first: bool = False):
             Tool(
                 name="Visual_Context_Camera",
                 func=parse_visual_context,
-                description="To see user or If there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input to this tool function should be the user query/input via video call, format the tool response as if you are seeing the scene via videocall. If last 16 seconds Visual context information is present & is enough, then craft answer from Previous Visual Context without using this tool"
+                description="To see user or if there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input to this tool function should be the user query/input via video call. Only if last 16 seconds Visual Context information is present & is enough, then use that to craft a better creative, better, cohesive, correlated , summarised natural response, format this tool response togather with Previous 15 minutes Visual Context information if you are seeing the scene via videocall."
             )
 
         ]
@@ -339,7 +339,7 @@ def get_tools(req_tool, is_first: bool = False):
             'Image_Inference_Tool':'''When a user provides a query containing an image download URL and a related question about that image, utilize this tool for support. Your objective is to extract both the image URL and the user's inquiry or prompt pertaining to that image from their query, and then convert these elements into comma seperated string. The format should be as follows: "image_url, user_query".''',
             'Data_Extraction_From_URL':'''Your task is to extract a URL and its type (either 'pdf' or 'website') from a user's query. Upon receiving a query that contains a URL and a specified URL type, you are to use a tool designed for this purpose. The objective is to accurately identify both the URL and its type from the query. Once identified, these elements should be formatted into a comma-separated string, adhering to the format: "url, url_type".''',
             'User_details_tool':'''If a request is made for information regarding students or users, this functionality should be utilized to retrieve the necessary details. input for this api should Always be current user_id. Except current user id you should say you cannot have access other user's details.''',
-            'Visual_Context_Camera':'''To see user or If there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input to this tool function should be the user query/input via video call, format the tool response as if you are seeing the scene via videocall.'''
+            'Visual_Context_Camera':'''This tool captures the user's visual context during a video call, providing real-time captions. Use it for visual question answering, scene understanding, recognizing objects, activities, & monitoring the user. Input will be the user's input/query. If the last 16 seconds of visual context are available and sufficient, it crafts a creative, cohesive response. If not, inform the user of the glitch accessing the current camera feed and guess using the Last_5_Minutes_Visual_Context. Ensure responses are natural, avoiding lists of captions, and format them as if you are seeing the user scene via video call. Analyze the current tool response and previous visual context captions to recognize user activities and infer actions from multiple frames. If the user requests continuous narration without active input, adapt the response to include past, present, and future tenses for dynamic and contextually aware commentary.'''
         }
         tools_func = {
             'google_search':top5_results,
@@ -421,7 +421,7 @@ def get_tools(req_tool, is_first: bool = False):
             Tool(
                 name="Visual_Context_Camera",
                 func=parse_visual_context,
-                description="To see or If there is a need to look at user's live camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input to this tool function should be the user query/input via video call, format the tool response as if you are seeing the scene via videocall."
+                description="This tool captures the user's visual context during a video call, providing real-time captions. Use it for visual question answering, scene understanding, recognizing objects, activities, & monitoring the user. Input will be the user's input/query. If the last 16 seconds of visual context are available and sufficient, it crafts a creative, cohesive response. If not, inform the user of the glitch accessing the current camera feed and guess using the Last_5_Minutes_Visual_Context. Ensure responses are natural, avoiding lists of captions, and format them as if you are seeing the user scene via video call. Analyze the current tool response and previous visual context captions to recognize user activities and infer actions from multiple frames. If the user requests continuous narration without active input, adapt the response to include past, present, and future tenses for dynamic and contextually aware commentary."
             )
 
         ]
@@ -817,7 +817,7 @@ def get_action_user_details(user_id):
     '''
         This function help to extract action that user have perfomed till time
     '''
-    unwanted_actions=['Topic Cofirmation','Langchain','Assessment Ended','Casual Conversation', 'Topic confirmation', 'Topic not found', 'Topic Confirmation', 'Topic Listing', 'Probe', 'Question Answering', 'Fallback']
+    unwanted_actions=['Topic Cofirmation','Langchain','Assessment Ended','Casual Conversation', 'Topic confirmation', 'Topic not found', 'Topic Confirmation', 'Topic Listing', 'Probe', 'Question Answering', 'Fallback', 'Video Reasoning']
     action_url = f"{ACTION_API}?user_id={user_id}"
 
     payload = {}
@@ -828,12 +828,12 @@ def get_action_user_details(user_id):
 
     if response.status_code == 200:
 
-
         data = response.json()
-        #action_texts = [obj["action"] + ' on '+ obj["created_date"] for obj in data if obj["action"] not in unwanted_actions]
+
         # Filter out unwanted actions
         filtered_data = [obj for obj in data if obj["action"] not in unwanted_actions]
 
+        filtered_data_video = [obj for obj in data if obj["action"] == 'Video Reasoning']
         # Dictionary to store the first and last occurrence dates for each action
         action_occurrences = {}
 
@@ -843,12 +843,6 @@ def get_action_user_details(user_id):
             date = parse_date(obj["created_date"])
             gpt3_label = obj["gpt3_label"]
 
-            if gpt3_label == 'Visual Context':
-                now = datetime.now()
-                # Check if the action is older than 5 minutes
-                if (now - date) > timedelta(minutes=5):
-                    continue
-                action = gpt3_label+':'+action
             if action not in action_occurrences:
                 action_occurrences[action] = [date, date]
             else:
@@ -866,8 +860,30 @@ def get_action_user_details(user_id):
             if first_date != last_date:
                 last_action_text = f"{action} on {last_date.strftime('%Y-%m-%dT%H:%M:%S')}"
                 action_texts.append(last_action_text)
-        if len(action_texts)==0:
-            action_texts=['user has not performed any actions yet.']
+
+        # Process video data
+        video_context_texts = []
+        for obj in filtered_data_video:
+            action = obj["action"]
+            date = parse_date(obj["created_date"])
+            gpt3_label = obj["gpt3_label"]
+
+            if gpt3_label == 'Visual Context':
+                now = datetime.now()
+                # Check if the action is older than 5 minutes
+                if (now - date) > timedelta(minutes=5):
+                    continue
+
+            first_action_text = f"{action} on {date.strftime('%Y-%m-%dT%H:%M:%S')}"
+            video_context_texts.append(first_action_text)
+
+        if video_context_texts:
+            action_texts.append('<Last_5_Minutes_Visual_Context_Start>')
+            action_texts.extend(video_context_texts)
+            action_texts.append('<Last_5_Minutes_Visual_Context_End>')
+
+        if len(action_texts) == 2:
+            action_texts = ['user has not performed any actions yet.']
 
         actions = ", ".join(action_texts)
         # Get the current time
