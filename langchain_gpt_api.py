@@ -1730,6 +1730,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
 
 Hevolve = "You are Hevolve, a highly intelligent educational AI developed by HertzAI."
 PROBE_TEMPLATE = "You are Hevolve, a highly intelligent educational AI developed by HertzAI. Try starting a conversation by considering the user's visual context from the last five minutes and initiate a conversation accordingly"
+INTERMEDIATE_CONTINUATION = "You are Hevolve, a highly intelligent educational AI developed by HertzAI. continue your response from where you left in the last conversation considering the new input as the continuation of last request"
 
 
 @app.route('/chat', methods=['POST'])
@@ -1744,6 +1745,7 @@ def chat():
     prompt_id = data.get('prompt_id', None)
     casual_conv = data.get('casual_conv', None)
     probe = data.get('probe', None)
+    intermediate = data.get('intermediate', None)
     app.logger.info(f"casual_conv type {casual_conv}")
 
     # return ""
@@ -1771,6 +1773,9 @@ def chat():
             custom_prompt = Hevolve
     elif probe:
         custom_prompt = PROBE_TEMPLATE
+        prompt_id = 0
+    elif intermediate:
+        custom_prompt = INTERMEDIATE_CONTINUATION
         prompt_id = 0
     else:
         custom_prompt = Hevolve  # use Hevolve from config/template
