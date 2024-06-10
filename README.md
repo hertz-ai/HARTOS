@@ -76,3 +76,7 @@ License
 ---
 
 📝 This project is licensed under the MIT License. See the LICENSE file for details.
+
+
+docker build -t langchain_gpt .
+docker run -dp 5000:5000 --name langchain langchain_gpt:latest

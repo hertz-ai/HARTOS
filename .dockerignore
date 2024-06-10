@@ -1,0 +1,42 @@
+#led / optimized / DLL files
+__pycache__/
+
+# Editor directories/files
+.chroma
+.vscode/
+
+# Project directories
+demo/
+doc/
+img/
+logs/
+vectorstore/
+temp/
+temp_db/
+
+# Misc
+.gitignore
+
+
+# Individual unneccessary files
+app.py
+chat.py
+chat_with_gpt.py  
+documents.txt    
+flush_memort.py       
+temp3.py
+chat2.py       
+dontknow.py      
+temp4.py
+chat3.py
+custom_gpt.py     
+dontknow2.py     
+req.txt            
+chat4.py       
+temp_one_tool_at_a_time.py
+chat_4_gpt.py  
+requirements1.txt  
+chat_gpt_2.py  
+new_change_gpt.py              
+vicuna_config.py
+

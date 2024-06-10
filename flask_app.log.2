@@ -1,0 +1,1231 @@
+2023-11-02 08:21:55,527 - langchain_gpt_api - INFO - Logger initialized
+2023-11-02 09:06:02,003 - langchain_gpt_api - INFO - Logger initialized
+2023-11-02 09:08:13,931 - langchain_gpt_api - INFO - Logger initialized
+2023-11-02 09:08:36,389 - langchain_gpt_api - INFO - Logger initialized
+2023-11-02 09:09:01,538 - langchain_gpt_api - INFO - Logger initialized
+2023-11-02 09:09:15,329 - langchain_gpt_api - INFO - Logger initialized
+2023-11-02 09:09:32,382 - langchain_gpt_api - INFO - Logger initialized
+2023-11-27 21:57:13,803 - langchain_gpt_api - INFO - Logger initialized
+2023-11-27 21:57:45,128 - langchain_gpt_api - INFO - Logger initialized
+2023-11-27 21:58:07,467 - langchain_gpt_api - INFO - Logger initialized
+2023-11-27 21:58:40,726 - langchain_gpt_api - INFO - query------> hi 
+2023-11-27 21:58:40,729 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\memory\chat_message_histories\zep.py", line 62, in __init__
+    from zep_python import ZepClient
+ModuleNotFoundError: No module named 'zep_python'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 652, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 488, in get_ans
+    memory=get_memory(user_id=user_id)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 196, in get_memory
+    memory = ZepMemory(
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\memory\zep_memory.py", line 90, in __init__
+    chat_message_history = ZepChatMessageHistory(
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\memory\chat_message_histories\zep.py", line 64, in __init__
+    raise ValueError(
+ValueError: Could not import zep-python package. Please install it with `pip install zep-python`.
+2023-11-27 21:59:03,210 - langchain_gpt_api - INFO - Logger initialized
+2023-11-27 21:59:08,009 - langchain_gpt_api - INFO - query------> hi 
+2023-11-27 21:59:10,559 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-27 21:59:10,560 - langchain_gpt_api - INFO - len---->2027
+2023-11-27 21:59:10,569 - langchain_gpt_api - INFO - len---->2218
+2023-11-27 21:59:15,789 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Hello Monisha! How can I assist you with your studies today?"
+}
+```
+2023-11-27 21:59:15,790 - langchain_gpt_api - INFO - time taken for this call is 5.2311177253723145
+2023-11-27 22:03:23,535 - langchain_gpt_api - INFO - Logger initialized
+2023-11-27 22:03:53,026 - langchain_gpt_api - INFO - Logger initialized
+2023-11-27 22:04:02,992 - langchain_gpt_api - INFO - query------> hi 
+2023-11-27 22:04:05,249 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-27 22:04:05,251 - langchain_gpt_api - INFO - len---->2040
+2023-11-27 22:04:05,258 - langchain_gpt_api - INFO - len---->2238
+2023-11-27 22:04:10,721 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Hello Monisha! How can I assist you with your studies today?"
+}
+```
+2023-11-27 22:04:10,722 - langchain_gpt_api - INFO - time taken for this call is 5.472510099411011
+2023-11-27 22:04:10,723 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-27 22:04:10,724 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-27 22:04:10,724 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 673, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 652, in get_ans
+    ans = agent_chain.run(query)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 440, in run
+    return self(args[0], callbacks=callbacks, tags=tags, metadata=metadata)[
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 243, in __call__
+    raise e
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 237, in __call__
+    self._call(inputs, run_manager=run_manager)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\agents\agent.py", line 987, in _call
+    next_step_output = self._take_next_step(
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\agents\agent.py", line 792, in _take_next_step
+    output = self.agent.plan(
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\agents\agent.py", line 443, in plan
+    full_output = self.llm_chain.predict(callbacks=callbacks, **full_inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\llm.py", line 252, in predict
+    return self(kwargs, callbacks=callbacks)[self.output_key]
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 245, in __call__
+    final_outputs: Dict[str, Any] = self.prep_outputs(
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 202, in prep_outputs
+    self.memory.save_context(inputs, outputs, metadata)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\memory\zep_memory.py", line 122, in save_context
+    input_str, output_str = self._get_input_output(inputs, outputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\memory\chat_memory.py", line 21, in _get_input_output
+    prompt_input_key = get_prompt_input_key(inputs, self.memory_variables)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\memory\utils.py", line 21, in get_prompt_input_key
+    raise ValueError(f"One input key expected got {prompt_input_keys}")
+ValueError: One input key expected got ['input', 'agent_scratchpad']
+2023-11-27 22:05:02,710 - langchain_gpt_api - INFO - Logger initialized
+2023-11-27 22:05:09,354 - langchain_gpt_api - INFO - query------> hi 
+2023-11-27 22:05:12,524 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-27 22:05:12,525 - langchain_gpt_api - INFO - len---->2040
+2023-11-27 22:05:12,533 - langchain_gpt_api - INFO - len---->2238
+2023-11-27 22:05:17,841 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Hello again, Monisha! How may I assist you with your studies today?"
+}
+```
+2023-11-27 22:05:17,843 - langchain_gpt_api - INFO - time taken for this call is 5.319158554077148
+2023-11-27 22:05:17,845 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-27 22:05:17,845 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-27 22:05:17,846 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 674, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 653, in get_ans
+    ans = agent_chain.run(query)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 440, in run
+    return self(args[0], callbacks=callbacks, tags=tags, metadata=metadata)[
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 243, in __call__
+    raise e
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 237, in __call__
+    self._call(inputs, run_manager=run_manager)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\agents\agent.py", line 987, in _call
+    next_step_output = self._take_next_step(
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\agents\agent.py", line 792, in _take_next_step
+    output = self.agent.plan(
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\agents\agent.py", line 443, in plan
+    full_output = self.llm_chain.predict(callbacks=callbacks, **full_inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\llm.py", line 252, in predict
+    return self(kwargs, callbacks=callbacks)[self.output_key]
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 245, in __call__
+    final_outputs: Dict[str, Any] = self.prep_outputs(
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 202, in prep_outputs
+    self.memory.save_context(inputs, outputs, metadata)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\memory\zep_memory.py", line 122, in save_context
+    input_str, output_str = self._get_input_output(inputs, outputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\memory\chat_memory.py", line 21, in _get_input_output
+    prompt_input_key = get_prompt_input_key(inputs, self.memory_variables)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\memory\utils.py", line 21, in get_prompt_input_key
+    raise ValueError(f"One input key expected got {prompt_input_keys}")
+ValueError: One input key expected got ['input', 'agent_scratchpad']
+2023-11-27 22:06:16,669 - langchain_gpt_api - INFO - Logger initialized
+2023-11-27 22:06:17,541 - langchain_gpt_api - INFO - inside class
+2023-11-27 22:06:29,008 - langchain_gpt_api - INFO - query------> hi 
+2023-11-27 22:06:30,557 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 669, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 651, in get_ans
+    ans = agent_chain.run(query)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 440, in run
+    return self(args[0], callbacks=callbacks, tags=tags, metadata=metadata)[
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 220, in __call__
+    inputs = self.prep_inputs(inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 364, in prep_inputs
+    raise ValueError(
+ValueError: A single string input was passed in, but this chain expects multiple inputs ({'input', 'chat_history'}). When a chain expects multiple inputs, please call it by passing in a dictionary, eg `chain({'foo': 1, 'bar': 2})`
+2023-11-27 22:06:53,247 - langchain_gpt_api - INFO - Logger initialized
+2023-11-27 22:06:54,101 - langchain_gpt_api - INFO - inside class
+2023-11-27 22:06:57,987 - langchain_gpt_api - INFO - query------> hi 
+2023-11-27 22:06:59,938 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-27 22:06:59,939 - langchain_gpt_api - INFO - len---->2028
+2023-11-27 22:06:59,946 - langchain_gpt_api - INFO - len---->2207
+2023-11-27 22:07:07,612 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Hello again, Monisha! It seems like we may be having some communication issues as I'm seeing repeated greetings from you. Let's navigate to learning. Is there a specific topic or question you need help with?"
+}
+```
+2023-11-27 22:07:07,613 - langchain_gpt_api - INFO - time taken for this call is 7.675310850143433
+2023-11-27 22:07:07,614 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-27 22:07:07,615 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-27 22:07:08,023 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-27 22:10:27,749 - langchain_gpt_api - INFO - Logger initialized
+2023-11-27 22:10:28,571 - langchain_gpt_api - INFO - inside class
+2023-11-27 22:14:05,278 - langchain_gpt_api - INFO - Logger initialized
+2023-11-27 22:14:06,594 - langchain_gpt_api - INFO - inside class
+2023-11-27 22:14:18,452 - langchain_gpt_api - INFO - query------> hi 
+2023-11-27 22:14:21,272 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-27 22:14:21,273 - langchain_gpt_api - INFO - len---->2047
+2023-11-27 22:14:21,286 - langchain_gpt_api - INFO - len---->2226
+2023-11-27 22:14:29,763 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Hello again, Monisha! It seems we're stuck in a loop of hellos. Let's redirect our focus to your studies. Please share any specific topic or question you need help with."
+}
+```
+2023-11-27 22:14:29,764 - langchain_gpt_api - INFO - time taken for this call is 8.493435382843018
+2023-11-27 22:15:31,865 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-27 22:15:41,646 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-27 22:16:13,251 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-27 22:16:37,906 - langchain_gpt_api - INFO - query------> hi 
+2023-11-27 22:16:40,619 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-27 22:16:40,620 - langchain_gpt_api - INFO - len---->2075
+2023-11-27 22:16:40,627 - langchain_gpt_api - INFO - len---->2256
+2023-11-27 22:16:49,529 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Hello once more, Monisha! It seems like we are stuck in a cycle of greetings. Could we instead move our focus to your studies? Please do tell, which specific subject or query can I assist you with?"
+}
+```
+2023-11-27 22:16:49,532 - langchain_gpt_api - INFO - time taken for this call is 8.912900447845459
+2023-11-27 22:17:03,327 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-27 22:17:08,020 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-27 22:17:20,823 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-27 22:18:14,561 - langchain_gpt_api - INFO - Logger initialized
+2023-11-27 22:18:16,198 - langchain_gpt_api - INFO - inside class
+2023-11-27 22:18:31,527 - langchain_gpt_api - INFO - query------> hi 
+2023-11-27 22:18:33,457 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-27 22:18:33,459 - langchain_gpt_api - INFO - len---->2169
+2023-11-27 22:18:33,470 - langchain_gpt_api - INFO - len---->2375
+2023-11-27 22:18:41,756 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Greetings once more, Monisha! Let's channel our engagements to your learning. Please share a specific topic or question you would like to explore. I'm here to help."
+}
+```
+2023-11-27 22:18:41,759 - langchain_gpt_api - INFO - time taken for this call is 8.302248477935791
+2023-11-27 22:19:17,300 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-27 22:19:21,230 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-27 22:19:24,089 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-28 09:56:50,402 - langchain_gpt_api - INFO - Logger initialized
+2023-11-28 09:56:52,174 - langchain_gpt_api - INFO - inside class
+2023-11-28 09:57:14,034 - langchain_gpt_api - INFO - query------> what is the weaher in nagpur maharashtra 
+2023-11-28 09:57:16,921 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-28 09:57:16,922 - langchain_gpt_api - INFO - len---->2158
+2023-11-28 09:57:16,939 - langchain_gpt_api - INFO - len---->2359
+2023-11-28 09:57:21,554 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "google_search", 
+    "action_input": "current weather in Nagpur Maharashtra"
+}
+```
+2023-11-28 09:57:21,555 - langchain_gpt_api - INFO - time taken for this call is 4.634418964385986
+2023-11-28 10:02:55,264 - langchain_gpt_api - INFO - Logger initialized
+2023-11-28 10:02:57,074 - langchain_gpt_api - INFO - inside class
+2023-11-28 10:03:02,835 - langchain_gpt_api - INFO - query------> what is the weaher in nagpur maharashtra 
+2023-11-28 10:03:13,999 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-28 10:03:14,003 - langchain_gpt_api - INFO - len---->2158
+2023-11-28 10:03:14,024 - langchain_gpt_api - INFO - len---->2359
+2023-11-28 10:03:17,897 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "google_search",
+    "action_input": "current weather in Nagpur Maharashtra"
+}
+```
+2023-11-28 10:03:17,900 - langchain_gpt_api - INFO - time taken for this call is 3.900505304336548
+2023-11-28 10:03:28,307 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-28 10:03:30,303 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-28 10:03:33,204 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-28 10:03:34,873 - langchain_gpt_api - INFO - calling for 2 times
+2023-11-28 10:03:34,875 - langchain_gpt_api - INFO - len---->2527
+2023-11-28 10:03:34,881 - langchain_gpt_api - INFO - len---->2896
+2023-11-28 10:03:43,023 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Currently in Nagpur, Maharashtra, the weather is misty. The temperature varies from 19 to 27 degrees Celsius with a humidity of around 95%. Please be aware that this is an approximate forecast and the actual conditions may vary."
+}
+```
+2023-11-28 10:03:43,027 - langchain_gpt_api - INFO - time taken for this call is 8.154387712478638
+2023-11-28 10:03:46,706 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-28 10:03:49,638 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-28 10:03:52,672 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-28 10:10:21,840 - langchain_gpt_api - INFO - query------> hi
+2023-11-28 10:10:38,002 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-28 10:10:38,006 - langchain_gpt_api - INFO - len---->2148
+2023-11-28 10:10:38,012 - langchain_gpt_api - INFO - len---->2361
+2023-11-28 10:10:42,486 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Hello again, Monisha! How can I assist you with your studies today? If you have any questions or need clarification on any topic, feel free to ask."
+}
+```
+2023-11-28 10:10:42,488 - langchain_gpt_api - INFO - time taken for this call is 4.485612154006958
+2023-11-28 10:17:00,778 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-28 10:20:34,622 - langchain_gpt_api - INFO - Logger initialized
+2023-11-28 10:20:35,899 - langchain_gpt_api - INFO - inside class
+2023-11-28 10:21:39,993 - langchain_gpt_api - INFO - Logger initialized
+2023-11-28 10:21:41,488 - langchain_gpt_api - INFO - inside class
+2023-11-28 10:22:39,755 - langchain_gpt_api - INFO - Logger initialized
+2023-11-28 10:22:41,335 - langchain_gpt_api - INFO - inside class
+2023-11-28 10:22:57,025 - langchain_gpt_api - INFO - query------> hi
+2023-11-28 10:23:05,315 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-28 10:23:05,317 - langchain_gpt_api - INFO - len---->2148
+2023-11-28 10:23:05,335 - langchain_gpt_api - INFO - len---->2361
+2023-11-28 10:23:08,221 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Hello, Monisha! Hope you're having a good day. How may I assist you in your studies today?"
+}
+```
+2023-11-28 10:23:08,224 - langchain_gpt_api - INFO - time taken for this call is 2.908790349960327
+2023-11-28 10:23:11,817 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-28 10:23:23,505 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-28 10:23:39,171 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-28 10:23:55,991 - langchain_gpt_api - INFO - Logger initialized
+2023-11-28 10:23:57,183 - langchain_gpt_api - INFO - inside class
+2023-11-28 10:24:01,788 - langchain_gpt_api - INFO - query------> hi
+2023-11-28 10:24:16,545 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-28 10:24:16,548 - langchain_gpt_api - INFO - len---->2121
+2023-11-28 10:24:16,566 - langchain_gpt_api - INFO - len---->2319
+2023-11-28 10:24:19,731 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Hello, Monisha! I am here to assist you with your learning. What can I help you with today?"
+}
+```
+2023-11-28 10:24:19,733 - langchain_gpt_api - INFO - time taken for this call is 3.189479112625122
+2023-11-28 10:24:26,195 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-28 10:24:36,469 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-28 10:26:58,265 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-28 10:30:18,709 - langchain_gpt_api - INFO - Logger initialized
+2023-11-28 10:30:20,919 - langchain_gpt_api - INFO - inside class
+2023-11-29 21:35:19,879 - langchain_gpt_api - INFO - Logger initialized
+2023-11-29 21:35:20,870 - langchain_gpt_api - INFO - inside class
+2023-11-29 21:35:50,802 - langchain_gpt_api - INFO - Logger initialized
+2023-11-29 21:35:51,722 - langchain_gpt_api - INFO - inside class
+2023-11-29 21:36:07,247 - langchain_gpt_api - INFO - Logger initialized
+2023-11-29 21:36:08,054 - langchain_gpt_api - INFO - inside class
+2023-11-29 21:36:11,895 - langchain_gpt_api - INFO - Hello! How can I assist you today?
+2023-11-29 21:36:11,896 - langchain_gpt_api - INFO - Hello! How can I assist you today?
+2023-11-29 21:38:02,555 - langchain_gpt_api - INFO - Logger initialized
+2023-11-29 21:38:03,444 - langchain_gpt_api - INFO - inside class
+2023-11-29 21:38:10,802 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-29 21:38:10,803 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-29 21:38:11,212 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-29 21:38:11,214 - langchain_gpt_api - INFO - Hello! How can I assist you today?
+2023-11-29 21:38:11,214 - langchain_gpt_api - INFO - Hello! How can I assist you today?
+2023-11-29 21:44:03,195 - langchain_gpt_api - INFO - Logger initialized
+2023-11-29 21:44:04,157 - langchain_gpt_api - INFO - inside class
+2023-11-29 21:44:58,646 - langchain_gpt_api - INFO - query------> hi
+2023-11-29 21:45:00,196 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 669, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 651, in get_ans
+    ans = agent_chain.run(input=query)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 445, in run
+    return self(kwargs, callbacks=callbacks, tags=tags, metadata=metadata)[
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 220, in __call__
+    inputs = self.prep_inputs(inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 374, in prep_inputs
+    self._validate_inputs(inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 132, in _validate_inputs
+    raise ValueError(f"Missing some input keys: {missing_keys}")
+ValueError: Missing some input keys: {'chat_history'}
+2023-11-29 21:46:30,772 - langchain_gpt_api - INFO - Logger initialized
+2023-11-29 21:46:31,718 - langchain_gpt_api - INFO - inside class
+2023-11-29 21:46:35,756 - langchain_gpt_api - INFO - query------> hi
+2023-11-29 21:46:37,236 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 669, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 651, in get_ans
+    ans = agent_chain.run(input=query)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 445, in run
+    return self(kwargs, callbacks=callbacks, tags=tags, metadata=metadata)[
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 220, in __call__
+    inputs = self.prep_inputs(inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 374, in prep_inputs
+    self._validate_inputs(inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 132, in _validate_inputs
+    raise ValueError(f"Missing some input keys: {missing_keys}")
+ValueError: Missing some input keys: {'chat_history'}
+2023-11-29 21:47:26,166 - langchain_gpt_api - INFO - Logger initialized
+2023-11-29 21:47:27,029 - langchain_gpt_api - INFO - inside class
+2023-11-29 21:47:36,133 - langchain_gpt_api - INFO - query------> hi
+2023-11-29 21:47:37,783 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 669, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 651, in get_ans
+    ans = agent_chain.run(query)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 440, in run
+    return self(args[0], callbacks=callbacks, tags=tags, metadata=metadata)[
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 220, in __call__
+    inputs = self.prep_inputs(inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 364, in prep_inputs
+    raise ValueError(
+ValueError: A single string input was passed in, but this chain expects multiple inputs ({'chat_history', 'input'}). When a chain expects multiple inputs, please call it by passing in a dictionary, eg `chain({'foo': 1, 'bar': 2})`
+2023-11-29 21:48:57,389 - langchain_gpt_api - INFO - Logger initialized
+2023-11-29 21:48:58,239 - langchain_gpt_api - INFO - inside class
+2023-11-29 21:49:02,120 - langchain_gpt_api - INFO - query------> hi
+2023-11-29 21:49:03,584 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 669, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 651, in get_ans
+    ans = agent_chain.run(query)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 440, in run
+    return self(args[0], callbacks=callbacks, tags=tags, metadata=metadata)[
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 220, in __call__
+    inputs = self.prep_inputs(inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 364, in prep_inputs
+    raise ValueError(
+ValueError: A single string input was passed in, but this chain expects multiple inputs ({'input', 'chat_history'}). When a chain expects multiple inputs, please call it by passing in a dictionary, eg `chain({'foo': 1, 'bar': 2})`
+2023-11-29 21:51:05,323 - langchain_gpt_api - INFO - Logger initialized
+2023-11-29 21:51:06,262 - langchain_gpt_api - INFO - inside class
+2023-11-29 21:51:11,527 - langchain_gpt_api - INFO - query------> hi
+2023-11-29 21:51:13,152 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-29 21:51:13,153 - langchain_gpt_api - INFO - len---->1963
+2023-11-29 21:51:13,163 - langchain_gpt_api - INFO - len---->2118
+2023-11-29 21:51:19,766 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Hello Sahil! How can I assist you today in your studies?"
+}
+```
+2023-11-29 21:51:19,768 - langchain_gpt_api - INFO - time taken for this call is 6.6221723556518555
+2023-11-29 21:51:19,770 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-29 21:51:19,771 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-29 21:51:20,076 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-29 21:53:38,410 - langchain_gpt_api - INFO - query------> list all queries asked today
+2023-11-29 21:53:39,842 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-29 21:53:39,844 - langchain_gpt_api - INFO - len---->1995
+2023-11-29 21:53:39,849 - langchain_gpt_api - INFO - len---->2161
+2023-11-29 21:53:44,246 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "FULL_HISTORY",
+    "action_input": "list all queries asked, 2023-11-29T00:00:00.000000, 2023-11-29T21:53:38.104632"
+}
+```
+2023-11-29 21:53:44,249 - langchain_gpt_api - INFO - time taken for this call is 4.406703233718872
+2023-11-29 21:53:44,250 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-29 21:53:44,250 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-29 21:53:44,454 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-29 21:53:47,463 - langchain_gpt_api - INFO - time taken for zep is {elapsed_time}
+2023-11-29 21:53:47,535 - langchain_gpt_api - INFO - calling for 2 times
+2023-11-29 21:53:47,536 - langchain_gpt_api - INFO - len---->2184
+2023-11-29 21:53:47,541 - langchain_gpt_api - INFO - len---->2477
+2023-11-29 21:53:55,613 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Hello Sahil! Here's a list of all the queries you asked today: \n1. List all queries asked today\n2. Give me details about user 101\n3. Hi\nPlease let me know if you need details on any specific query or if there's anything else you'd like to know."
+}
+```
+2023-11-29 21:53:55,616 - langchain_gpt_api - INFO - time taken for this call is 8.080751180648804
+2023-11-29 21:53:55,617 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-29 21:53:55,618 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-29 21:53:56,126 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-29 22:00:02,966 - langchain_gpt_api - INFO - Logger initialized
+2023-11-29 22:00:03,914 - langchain_gpt_api - INFO - inside class
+2023-11-29 22:00:10,489 - langchain_gpt_api - INFO - query------> list all queries asked today
+2023-11-29 22:00:11,969 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 674, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 638, in get_ans
+    prompt = ConversationalChatAgent.create_prompt(
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\agents\conversational_chat\base.py", line 76, in create_prompt
+    final_prompt = format_instructions.format(
+KeyError: 'chat_history'
+2023-11-29 22:02:56,496 - langchain_gpt_api - INFO - Logger initialized
+2023-11-29 22:02:57,404 - langchain_gpt_api - INFO - inside class
+2023-11-29 22:03:03,040 - langchain_gpt_api - INFO - query------> list all queries asked today
+2023-11-29 22:03:04,737 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-29 22:03:04,737 - langchain_gpt_api - INFO - len---->2063
+2023-11-29 22:03:04,744 - langchain_gpt_api - INFO - len---->2277
+2023-11-29 22:03:11,523 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "FULL_HISTORY",
+    "action_input": "list all queries asked, 2023-11-29T00:00:00.000000, 2023-11-29T22:03:02.770012"
+}
+```
+2023-11-29 22:03:11,525 - langchain_gpt_api - INFO - time taken for this call is 6.789800643920898
+2023-11-29 22:03:11,534 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-29 22:03:11,535 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-29 22:03:11,841 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-29 22:03:15,037 - langchain_gpt_api - INFO - time taken for zep is {elapsed_time}
+2023-11-29 22:03:15,116 - langchain_gpt_api - INFO - calling for 2 times
+2023-11-29 22:03:15,117 - langchain_gpt_api - INFO - len---->2340
+2023-11-29 22:03:15,123 - langchain_gpt_api - INFO - len---->2743
+2023-11-29 22:03:23,089 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Hello Sahil! Here's the comprehensive list of all your notable queries for today: \n1. You asked 'list all queries asked today' thrice. \n2. You requested information about user 101 and user 100. \n3. You also initiated the conversation with a simple 'hi'. \nPlease let me know if you want to delve into any specific query or need information about anything else. Happy learning!"
+}
+```
+2023-11-29 22:03:23,091 - langchain_gpt_api - INFO - time taken for this call is 7.975522518157959
+2023-11-29 22:03:23,093 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-29 22:03:23,093 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-29 22:03:23,338 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-29 22:13:39,773 - langchain_gpt_api - INFO - query------> hi
+2023-11-29 22:13:42,170 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-29 22:13:42,173 - langchain_gpt_api - INFO - len---->2143
+2023-11-29 22:13:42,180 - langchain_gpt_api - INFO - len---->2382
+2023-11-29 22:13:45,701 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Hello Sahil! How can I assist you in your learning journey today?"
+}
+```
+2023-11-29 22:13:45,702 - langchain_gpt_api - INFO - time taken for this call is 3.531078815460205
+2023-11-29 22:13:45,703 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-29 22:13:45,703 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-29 22:13:45,894 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-29 22:21:54,358 - langchain_gpt_api - INFO - Logger initialized
+2023-11-29 22:21:55,295 - langchain_gpt_api - INFO - inside class
+2023-11-29 22:22:00,036 - langchain_gpt_api - INFO - query------> hi
+2023-11-29 22:22:01,801 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-29 22:22:01,802 - langchain_gpt_api - INFO - len---->2185
+2023-11-29 22:22:01,809 - langchain_gpt_api - INFO - len---->2443
+2023-11-29 22:22:09,558 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Hello Sahil! How can I assist you in your learning journey today?"
+}
+```
+2023-11-29 22:22:09,560 - langchain_gpt_api - INFO - time taken for this call is 7.758292198181152
+2023-11-29 22:22:09,561 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-29 22:22:09,561 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-29 22:22:09,971 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-29 22:23:53,420 - langchain_gpt_api - INFO - Logger initialized
+2023-11-29 22:23:54,434 - langchain_gpt_api - INFO - inside class
+2023-11-29 22:23:57,816 - langchain_gpt_api - INFO - query------> hi
+2023-11-29 22:23:59,250 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 669, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 651, in get_ans
+    ans = agent_chain.run(query)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 440, in run
+    return self(args[0], callbacks=callbacks, tags=tags, metadata=metadata)[
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 220, in __call__
+    inputs = self.prep_inputs(inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 364, in prep_inputs
+    raise ValueError(
+ValueError: A single string input was passed in, but this chain expects multiple inputs ({'input', 'chat_history'}). When a chain expects multiple inputs, please call it by passing in a dictionary, eg `chain({'foo': 1, 'bar': 2})`
+2023-11-29 22:29:03,729 - langchain_gpt_api - INFO - Logger initialized
+2023-11-29 22:29:04,695 - langchain_gpt_api - INFO - inside class
+2023-11-29 22:29:14,351 - langchain_gpt_api - INFO - query------> hi
+2023-11-29 22:29:15,868 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 669, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 635, in get_ans
+    prompt = ConversationalChatAgent.create_prompt(
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\agents\conversational_chat\base.py", line 87, in create_prompt
+    return ChatPromptTemplate(input_variables=input_variables, messages=messages)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\load\serializable.py", line 74, in __init__
+    super().__init__(**kwargs)
+  File "pydantic\main.py", line 341, in pydantic.main.BaseModel.__init__
+pydantic.error_wrappers.ValidationError: 1 validation error for ChatPromptTemplate
+__root__
+  Got mismatched input_variables. Expected: {'agent_scratchpad', 'chat_history', 'input'}. Got: ['input', 'agent_scratchpad'] (type=value_error)
+2023-11-29 22:43:28,625 - langchain_gpt_api - INFO - Logger initialized
+2023-11-29 22:43:29,550 - langchain_gpt_api - INFO - inside class
+2023-11-29 22:43:36,118 - langchain_gpt_api - INFO - query------> hi
+2023-11-29 22:43:37,570 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 669, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 651, in get_ans
+    ans = agent_chain.run(query)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 440, in run
+    return self(args[0], callbacks=callbacks, tags=tags, metadata=metadata)[
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 220, in __call__
+    inputs = self.prep_inputs(inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 364, in prep_inputs
+    raise ValueError(
+ValueError: A single string input was passed in, but this chain expects multiple inputs ({'chat_history', 'input'}). When a chain expects multiple inputs, please call it by passing in a dictionary, eg `chain({'foo': 1, 'bar': 2})`
+2023-11-29 22:53:42,647 - langchain_gpt_api - INFO - Logger initialized
+2023-11-29 22:53:43,626 - langchain_gpt_api - INFO - inside class
+2023-11-29 22:57:53,876 - langchain_gpt_api - INFO - Logger initialized
+2023-11-29 22:57:54,810 - langchain_gpt_api - INFO - inside class
+2023-11-29 22:58:03,836 - langchain_gpt_api - INFO - query------> hi
+2023-11-29 22:58:05,404 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 670, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 652, in get_ans
+    ans = agent_chain.run(query)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 440, in run
+    return self(args[0], callbacks=callbacks, tags=tags, metadata=metadata)[
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 220, in __call__
+    inputs = self.prep_inputs(inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 364, in prep_inputs
+    raise ValueError(
+ValueError: A single string input was passed in, but this chain expects multiple inputs ({'chat_history', 'input'}). When a chain expects multiple inputs, please call it by passing in a dictionary, eg `chain({'foo': 1, 'bar': 2})`
+2023-11-29 23:06:17,585 - langchain_gpt_api - INFO - Logger initialized
+2023-11-29 23:06:18,468 - langchain_gpt_api - INFO - inside class
+2023-11-29 23:06:23,947 - langchain_gpt_api - INFO - query------> hi
+2023-11-29 23:06:25,422 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 669, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 651, in get_ans
+    ans = agent_chain.run(query)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 440, in run
+    return self(args[0], callbacks=callbacks, tags=tags, metadata=metadata)[
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 220, in __call__
+    inputs = self.prep_inputs(inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 364, in prep_inputs
+    raise ValueError(
+ValueError: A single string input was passed in, but this chain expects multiple inputs ({'chat_history', 'input'}). When a chain expects multiple inputs, please call it by passing in a dictionary, eg `chain({'foo': 1, 'bar': 2})`
+2023-11-29 23:06:43,725 - langchain_gpt_api - INFO - Logger initialized
+2023-11-29 23:06:44,579 - langchain_gpt_api - INFO - inside class
+2023-11-29 23:06:49,786 - langchain_gpt_api - INFO - query------> hi
+2023-11-29 23:06:51,345 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-29 23:06:51,346 - langchain_gpt_api - INFO - len---->2059
+2023-11-29 23:06:51,355 - langchain_gpt_api - INFO - len---->2227
+2023-11-29 23:06:55,209 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Hello again, Sahil! What new learning do you seek today?"
+}
+```
+2023-11-29 23:06:55,210 - langchain_gpt_api - INFO - time taken for this call is 3.8661155700683594
+2023-11-29 23:06:55,217 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-29 23:06:55,219 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-29 23:12:29,243 - langchain_gpt_api - INFO - Logger initialized
+2023-11-29 23:12:30,102 - langchain_gpt_api - INFO - inside class
+2023-11-29 23:12:34,705 - langchain_gpt_api - INFO - query------> hi
+2023-11-29 23:12:36,273 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-29 23:12:36,274 - langchain_gpt_api - INFO - len---->2070
+2023-11-29 23:12:36,279 - langchain_gpt_api - INFO - len---->2247
+2023-11-29 23:12:43,563 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Hello, Sahil! I'm glad to see you again. How can I assist you in your studies today?"
+}
+```
+2023-11-29 23:12:43,564 - langchain_gpt_api - INFO - time taken for this call is 7.292123556137085
+2023-11-29 23:12:43,566 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-29 23:12:43,567 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-30 18:05:37,168 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 18:05:38,179 - langchain_gpt_api - INFO - inside class
+2023-11-30 18:05:47,618 - langchain_gpt_api - INFO - query------> hi
+2023-11-30 18:05:49,505 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 669, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 651, in get_ans
+    ans = agent_chain.run({'input':query})
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 440, in run
+    return self(args[0], callbacks=callbacks, tags=tags, metadata=metadata)[
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 220, in __call__
+    inputs = self.prep_inputs(inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 374, in prep_inputs
+    self._validate_inputs(inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 132, in _validate_inputs
+    raise ValueError(f"Missing some input keys: {missing_keys}")
+ValueError: Missing some input keys: {'chat_history'}
+2023-11-30 18:10:26,060 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 18:10:26,982 - langchain_gpt_api - INFO - inside class
+2023-11-30 18:10:34,935 - langchain_gpt_api - INFO - query------> hi
+2023-11-30 18:10:36,284 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 679, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 661, in get_ans
+    ans = agent_chain.run({'input':query})
+AttributeError: 'ConversationalChatAgent' object has no attribute 'run'
+2023-11-30 18:10:59,288 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 18:11:00,134 - langchain_gpt_api - INFO - inside class
+2023-11-30 18:11:03,323 - langchain_gpt_api - INFO - query------> hi
+2023-11-30 18:11:04,733 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 679, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 661, in get_ans
+    ans = agent_chain(query)
+TypeError: 'ConversationalChatAgent' object is not callable
+2023-11-30 18:17:17,514 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 18:17:18,424 - langchain_gpt_api - INFO - inside class
+2023-11-30 18:17:25,761 - langchain_gpt_api - INFO - query------> hi
+2023-11-30 18:17:27,144 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 669, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 651, in get_ans
+    ans = agent_chain.run({'input':query})
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 440, in run
+    return self(args[0], callbacks=callbacks, tags=tags, metadata=metadata)[
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 220, in __call__
+    inputs = self.prep_inputs(inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 374, in prep_inputs
+    self._validate_inputs(inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 132, in _validate_inputs
+    raise ValueError(f"Missing some input keys: {missing_keys}")
+ValueError: Missing some input keys: {'chat_history'}
+2023-11-30 18:22:06,046 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 18:22:06,966 - langchain_gpt_api - INFO - inside class
+2023-11-30 18:22:16,028 - langchain_gpt_api - INFO - query------> hi
+2023-11-30 18:22:17,441 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 669, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 651, in get_ans
+    ans = agent_chain.run({'input':query})
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 440, in run
+    return self(args[0], callbacks=callbacks, tags=tags, metadata=metadata)[
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 220, in __call__
+    inputs = self.prep_inputs(inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 374, in prep_inputs
+    self._validate_inputs(inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 132, in _validate_inputs
+    raise ValueError(f"Missing some input keys: {missing_keys}")
+ValueError: Missing some input keys: {'chat_history'}
+2023-11-30 18:24:43,443 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 18:24:44,440 - langchain_gpt_api - INFO - inside class
+2023-11-30 18:24:50,049 - langchain_gpt_api - INFO - query------> hi
+2023-11-30 18:24:51,601 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-30 18:24:51,603 - langchain_gpt_api - INFO - len---->2088
+2023-11-30 18:24:51,612 - langchain_gpt_api - INFO - len---->2276
+2023-11-30 18:24:55,374 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Hello, Sahil! Welcome back. What questions do you have for me today?"
+}
+```
+2023-11-30 18:24:55,378 - langchain_gpt_api - INFO - time taken for this call is 3.7762155532836914
+2023-11-30 18:24:55,380 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-30 18:24:55,380 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-30 18:27:23,189 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 18:27:24,201 - langchain_gpt_api - INFO - inside class
+2023-11-30 18:27:28,458 - langchain_gpt_api - INFO - query------> hi
+2023-11-30 18:27:29,975 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-30 18:27:29,976 - langchain_gpt_api - INFO - len---->2048
+2023-11-30 18:27:29,981 - langchain_gpt_api - INFO - len---->2220
+2023-11-30 18:27:33,936 - langchain_gpt_api - INFO - hellpppppppppppppppp-->```json
+{
+    "action": "Final Answer",
+    "action_input": "Hello Sahil, always a pleasure to see you again! How can I assist you with your learning journey today?"
+}
+```
+2023-11-30 18:27:33,939 - langchain_gpt_api - INFO - time taken for this call is 3.9640297889709473
+2023-11-30 18:27:33,940 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-30 18:27:33,941 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-30 18:28:26,649 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 18:28:27,488 - langchain_gpt_api - INFO - inside class
+2023-11-30 18:28:33,496 - langchain_gpt_api - INFO - query------> hi
+2023-11-30 18:28:34,871 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 669, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 651, in get_ans
+    ans = agent_chain.run({'input':query})
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 440, in run
+    return self(args[0], callbacks=callbacks, tags=tags, metadata=metadata)[
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 220, in __call__
+    inputs = self.prep_inputs(inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 374, in prep_inputs
+    self._validate_inputs(inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 132, in _validate_inputs
+    raise ValueError(f"Missing some input keys: {missing_keys}")
+ValueError: Missing some input keys: {'chat_history'}
+2023-11-30 18:32:39,137 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 18:32:40,048 - langchain_gpt_api - INFO - inside class
+2023-11-30 18:32:53,361 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\urllib3\connection.py", line 203, in _new_conn
+    sock = connection.create_connection(
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\urllib3\util\connection.py", line 85, in create_connection
+    raise err
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\urllib3\util\connection.py", line 73, in create_connection
+    sock.connect(sa)
+ConnectionRefusedError: [WinError 10061] No connection could be made because the target machine actively refused it
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\urllib3\connectionpool.py", line 790, in urlopen
+    response = self._make_request(
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\urllib3\connectionpool.py", line 496, in _make_request
+    conn.request(
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\urllib3\connection.py", line 395, in request
+    self.endheaders()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\http\client.py", line 1278, in endheaders
+    self._send_output(message_body, encode_chunked=encode_chunked)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\http\client.py", line 1038, in _send_output
+    self.send(msg)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\http\client.py", line 976, in send
+    self.connect()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\urllib3\connection.py", line 243, in connect
+    self.sock = self._new_conn()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\urllib3\connection.py", line 218, in _new_conn
+    raise NewConnectionError(
+urllib3.exceptions.NewConnectionError: <urllib3.connection.HTTPConnection object at 0x00000207D60B3250>: Failed to establish a new connection: [WinError 10061] No connection could be made because the target machine actively refused it
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\requests\adapters.py", line 486, in send
+    resp = conn.urlopen(
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\urllib3\connectionpool.py", line 844, in urlopen
+    retries = retries.increment(
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\urllib3\util\retry.py", line 515, in increment
+    raise MaxRetryError(_pool, url, reason) from reason  # type: ignore[arg-type]
+urllib3.exceptions.MaxRetryError: HTTPConnectionPool(host='aws_hevolve.hertzai.com', port=6006): Max retries exceeded with url: /getstudent_by_user_id (Caused by NewConnectionError('<urllib3.connection.HTTPConnection object at 0x00000207D60B3250>: Failed to establish a new connection: [WinError 10061] No connection could be made because the target machine actively refused it'))
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 684, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 506, in get_ans
+    user_details, actions = get_action_user_details(user_id=user_id)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 276, in get_action_user_details
+    response = requests.request("POST", url, headers=headers, data=payload)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\requests\api.py", line 59, in request
+    return session.request(method=method, url=url, **kwargs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\requests\sessions.py", line 589, in request
+    resp = self.send(prep, **send_kwargs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\requests\sessions.py", line 703, in send
+    r = adapter.send(request, **kwargs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\requests\adapters.py", line 519, in send
+    raise ConnectionError(e, request=request)
+requests.exceptions.ConnectionError: HTTPConnectionPool(host='aws_hevolve.hertzai.com', port=6006): Max retries exceeded with url: /getstudent_by_user_id (Caused by NewConnectionError('<urllib3.connection.HTTPConnection object at 0x00000207D60B3250>: Failed to establish a new connection: [WinError 10061] No connection could be made because the target machine actively refused it'))
+2023-11-30 18:33:09,438 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\urllib3\connection.py", line 203, in _new_conn
+    sock = connection.create_connection(
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\urllib3\util\connection.py", line 85, in create_connection
+    raise err
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\urllib3\util\connection.py", line 73, in create_connection
+    sock.connect(sa)
+ConnectionRefusedError: [WinError 10061] No connection could be made because the target machine actively refused it
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\urllib3\connectionpool.py", line 790, in urlopen
+    response = self._make_request(
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\urllib3\connectionpool.py", line 496, in _make_request
+    conn.request(
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\urllib3\connection.py", line 395, in request
+    self.endheaders()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\http\client.py", line 1278, in endheaders
+    self._send_output(message_body, encode_chunked=encode_chunked)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\http\client.py", line 1038, in _send_output
+    self.send(msg)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\http\client.py", line 976, in send
+    self.connect()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\urllib3\connection.py", line 243, in connect
+    self.sock = self._new_conn()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\urllib3\connection.py", line 218, in _new_conn
+    raise NewConnectionError(
+urllib3.exceptions.NewConnectionError: <urllib3.connection.HTTPConnection object at 0x00000207D6382BC0>: Failed to establish a new connection: [WinError 10061] No connection could be made because the target machine actively refused it
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\requests\adapters.py", line 486, in send
+    resp = conn.urlopen(
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\urllib3\connectionpool.py", line 844, in urlopen
+    retries = retries.increment(
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\urllib3\util\retry.py", line 515, in increment
+    raise MaxRetryError(_pool, url, reason) from reason  # type: ignore[arg-type]
+urllib3.exceptions.MaxRetryError: HTTPConnectionPool(host='aws_hevolve.hertzai.com', port=6006): Max retries exceeded with url: /action_by_user_id?user_id=96 (Caused by NewConnectionError('<urllib3.connection.HTTPConnection object at 0x00000207D6382BC0>: Failed to establish a new connection: [WinError 10061] No connection could be made because the target machine actively refused it'))
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 684, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 506, in get_ans
+    user_details, actions = get_action_user_details(user_id=user_id)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 247, in get_action_user_details
+    response = requests.request(
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\requests\api.py", line 59, in request
+    return session.request(method=method, url=url, **kwargs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\requests\sessions.py", line 589, in request
+    resp = self.send(prep, **send_kwargs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\requests\sessions.py", line 703, in send
+    r = adapter.send(request, **kwargs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\requests\adapters.py", line 519, in send
+    raise ConnectionError(e, request=request)
+requests.exceptions.ConnectionError: HTTPConnectionPool(host='aws_hevolve.hertzai.com', port=6006): Max retries exceeded with url: /action_by_user_id?user_id=96 (Caused by NewConnectionError('<urllib3.connection.HTTPConnection object at 0x00000207D6382BC0>: Failed to establish a new connection: [WinError 10061] No connection could be made because the target machine actively refused it'))
+2023-11-30 18:34:05,930 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 18:34:06,798 - langchain_gpt_api - INFO - inside class
+2023-11-30 18:34:10,269 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-30 18:34:10,269 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-30 18:34:10,271 - langchain_gpt_api - INFO - Hello! How can I assist you today?
+2023-11-30 18:34:10,272 - langchain_gpt_api - INFO - Hello! How can I assist you today?
+2023-11-30 18:34:39,995 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 18:34:40,924 - langchain_gpt_api - INFO - inside class
+2023-11-30 18:34:44,669 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-30 18:34:44,670 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-30 18:34:44,671 - langchain_gpt_api - INFO - Hello! How can I assist you today?
+2023-11-30 18:34:44,671 - langchain_gpt_api - INFO - Hello! How can I assist you today?
+2023-11-30 18:34:53,185 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 18:34:54,040 - langchain_gpt_api - INFO - inside class
+2023-11-30 18:35:02,281 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-30 18:35:02,281 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-30 18:35:02,283 - langchain_gpt_api - INFO - I am OpenAI's language model, known as GPT-3. I'm capable of understanding and generating human-like text based on the prompts I receive. Keep in mind, I don't have access to personal data about individuals unless it has been shared with me in the course of our conversation. I am designed to respect user privacy and confidentiality.
+2023-11-30 18:35:02,284 - langchain_gpt_api - INFO - I am OpenAI's language model, known as GPT-3. I'm capable of understanding and generating human-like text based on the prompts I receive. Keep in mind, I don't have access to personal data about individuals unless it has been shared with me in the course of our conversation. I am designed to respect user privacy and confidentiality.
+2023-11-30 18:40:04,571 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 18:40:05,605 - langchain_gpt_api - INFO - inside class
+2023-11-30 18:40:11,730 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-30 18:40:11,731 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-30 18:40:11,732 - langchain_gpt_api - INFO - I am an artificial intelligence designed to assist and communicate effectively. I can perform various tasks such as providing information, answering questions, setting reminders, and even having casual conversations. I continuously learn and adapt to provide better assistance.
+2023-11-30 18:40:11,733 - langchain_gpt_api - INFO - I am an artificial intelligence designed to assist and communicate effectively. I can perform various tasks such as providing information, answering questions, setting reminders, and even having casual conversations. I continuously learn and adapt to provide better assistance.
+2023-11-30 18:40:21,072 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 18:40:21,897 - langchain_gpt_api - INFO - inside class
+2023-11-30 18:40:24,318 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-30 18:40:24,318 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-30 18:40:24,319 - langchain_gpt_api - INFO - Hello! How can I assist you today?
+2023-11-30 18:40:24,320 - langchain_gpt_api - INFO - Hello! How can I assist you today?
+2023-11-30 18:42:30,354 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 18:42:31,296 - langchain_gpt_api - INFO - inside class
+2023-11-30 18:42:35,084 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-30 18:42:35,085 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-30 18:42:35,284 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-30 18:42:35,285 - langchain_gpt_api - INFO - Hello! How can I assist you today?
+2023-11-30 18:42:35,287 - langchain_gpt_api - INFO - Hello! How can I assist you today?
+2023-11-30 18:43:50,908 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 18:43:51,773 - langchain_gpt_api - INFO - inside class
+2023-11-30 18:44:00,256 - langchain_gpt_api - INFO - query------> hi
+2023-11-30 18:44:01,603 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 682, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 664, in get_ans
+    ans = agent_chain.run({'input':query})
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 440, in run
+    return self(args[0], callbacks=callbacks, tags=tags, metadata=metadata)[
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 220, in __call__
+    inputs = self.prep_inputs(inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 374, in prep_inputs
+    self._validate_inputs(inputs)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 132, in _validate_inputs
+    raise ValueError(f"Missing some input keys: {missing_keys}")
+ValueError: Missing some input keys: {'chat_history'}
+2023-11-30 18:44:34,742 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 18:44:35,601 - langchain_gpt_api - INFO - inside class
+2023-11-30 18:44:40,103 - langchain_gpt_api - INFO - query------> hi
+2023-11-30 18:44:41,481 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 682, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 644, in get_ans
+    llm_chain = CustomChain(
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\load\serializable.py", line 74, in __init__
+    super().__init__(**kwargs)
+  File "pydantic\main.py", line 341, in pydantic.main.BaseModel.__init__
+pydantic.error_wrappers.ValidationError: 1 validation error for CustomChain
+prompt
+  field required (type=value_error.missing)
+2023-11-30 18:45:32,311 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 18:45:33,196 - langchain_gpt_api - INFO - inside class
+2023-11-30 18:45:37,038 - langchain_gpt_api - INFO - query------> hi
+2023-11-30 18:45:38,396 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 683, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 647, in get_ans
+    prompt=PromptTemplate.from_template(prompt),
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\prompts\prompt.py", line 136, in from_template
+    v for _, v, _, _ in Formatter().parse(template) if v is not None
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\string.py", line 259, in parse
+    return _string.formatter_parser(format_string)
+TypeError: expected str, got ChatPromptTemplate
+2023-11-30 18:46:09,510 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 18:46:10,378 - langchain_gpt_api - INFO - inside class
+2023-11-30 18:46:14,204 - langchain_gpt_api - INFO - query------> hi
+2023-11-30 18:46:15,734 - langchain_gpt_api - INFO - calling for 1 times
+2023-11-30 18:46:15,735 - langchain_gpt_api - INFO - len---->7
+2023-11-30 18:46:15,737 - langchain_gpt_api - INFO - len---->9
+2023-11-30 18:46:17,481 - langchain_gpt_api - INFO - hellpppppppppppppppp-->Hello! How can I assist you today?
+2023-11-30 18:46:17,481 - langchain_gpt_api - INFO - time taken for this call is 1.747319221496582
+2023-11-30 18:46:17,483 - langchain_gpt_api - INFO - before: memory object is not none and metadata is {'request_Id': '10010000'}, False
+2023-11-30 18:46:17,484 - langchain_gpt_api - INFO - memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-30 18:46:17,894 - langchain_gpt_api - INFO - After: memory object is not none and metadata is {'request_Id': '10010000'}
+2023-11-30 18:46:17,895 - langchain_gpt_api - INFO - Hello! How can I assist you today?
+2023-11-30 18:46:17,895 - langchain_gpt_api - INFO - Hello! How can I assist you today?
+2023-11-30 18:46:17,896 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 439, in parse
+    response = parse_json_markdown(text)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\output_parsers\json.py", line 34, in parse_json_markdown
+    parsed = json.loads(json_str)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\json\__init__.py", line 346, in loads
+    return _default_decoder.decode(s)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\json\decoder.py", line 337, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\json\decoder.py", line 355, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 683, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 665, in get_ans
+    ans = agent_chain.run({'input':query})
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 440, in run
+    return self(args[0], callbacks=callbacks, tags=tags, metadata=metadata)[
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 243, in __call__
+    raise e
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\chains\base.py", line 237, in __call__
+    self._call(inputs, run_manager=run_manager)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\agents\agent.py", line 987, in _call
+    next_step_output = self._take_next_step(
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\agents\agent.py", line 792, in _take_next_step
+    output = self.agent.plan(
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\agents\agent.py", line 444, in plan
+    return self.output_parser.parse(full_output)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 467, in parse
+    start_index = text.index('{')
+ValueError: substring not found
+2023-11-30 18:47:02,765 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 18:47:03,678 - langchain_gpt_api - INFO - inside class
+2023-11-30 18:47:09,043 - langchain_gpt_api - INFO - query------> hi
+2023-11-30 18:47:10,474 - langchain_gpt_api - ERROR - Exception on /chat [POST]
+Traceback (most recent call last):
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 1455, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 869, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 867, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\flask\app.py", line 852, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 682, in chat
+    ans, rec_intent, req_token_count, res_token_count = get_ans(user_id=user_id, query=prompt)
+  File "C:\Users\sahil\Downloads\hertzai_files\LLM-langchain_Chatbot-Agent\langchain_gpt_api.py", line 635, in get_ans
+    prompt = ConversationalChatAgent.create_prompt(
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\agents\conversational_chat\base.py", line 87, in create_prompt
+    return ChatPromptTemplate(input_variables=input_variables, messages=messages)
+  File "C:\Users\sahil\anaconda3\envs\langchain_gpt\lib\site-packages\langchain\load\serializable.py", line 74, in __init__
+    super().__init__(**kwargs)
+  File "pydantic\main.py", line 341, in pydantic.main.BaseModel.__init__
+pydantic.error_wrappers.ValidationError: 1 validation error for ChatPromptTemplate
+__root__
+  Got mismatched input_variables. Expected: {'agent_scratchpad', 'chat_history', 'input'}. Got: ['input', 'agent_scratchpad'] (type=value_error)
+2023-11-30 18:51:31,080 - langchain_gpt_api - INFO - Logger initialized
+2023-11-30 18:51:32,014 - langchain_gpt_api - INFO - inside class
+2023-11-30 18:51:39,110 - langchain_gpt_api - INFO - query------> hi
