@@ -820,6 +820,12 @@ def get_action_user_details(user_id):
     unwanted_actions=['Topic Cofirmation','Langchain','Assessment Ended','Casual Conversation', 'Topic confirmation', 'Topic not found', 'Topic Confirmation', 'Topic Listing', 'Probe', 'Question Answering', 'Fallback', 'Video Reasoning']
     action_url = f"{ACTION_API}?user_id={user_id}"
 
+    # Todo: get, and populate timezone from client
+    time_zone = "Asia/Kolkata"
+
+    india_tz = pytz.timezone(time_zone)
+
+
     payload = {}
     headers = {}
 
@@ -855,10 +861,10 @@ def get_action_user_details(user_id):
         action_texts = []
         for action, dates in action_occurrences.items():
             first_date, last_date = dates
-            first_action_text = f"{action} on {first_date.strftime('%Y-%m-%dT%H:%M:%S')}"
+            first_action_text = f"{action} on {first_date.astimezone(india_tz).strftime('%Y-%m-%dT%H:%M:%S')}"
             action_texts.append(first_action_text)
             if first_date != last_date:
-                last_action_text = f"{action} on {last_date.strftime('%Y-%m-%dT%H:%M:%S')}"
+                last_action_text = f"{action} on {last_date.astimezone(india_tz).strftime('%Y-%m-%dT%H:%M:%S')}"
                 action_texts.append(last_action_text)
 
         # Process video data
@@ -873,8 +879,8 @@ def get_action_user_details(user_id):
                 # Check if the action is older than 5 minutes
                 if (now - date) > timedelta(minutes=5):
                     continue
+            first_action_text = f"{action} on {date.astimezone(india_tz).strftime('%Y-%m-%dT%H:%M:%S')}"
 
-            first_action_text = f"{action} on {date.strftime('%Y-%m-%dT%H:%M:%S')}"
             video_context_texts.append(first_action_text)
 
         if video_context_texts:
@@ -887,15 +893,11 @@ def get_action_user_details(user_id):
 
         actions = ", ".join(action_texts)
         # Get the current time
-        now = datetime.now()
-        now1 = datetime.now()
-        current_time = now1.strftime("%H:%M:%S")
 
-        time_zone = "Asia/Kolkata"
         # Format the time in the desired format
-        formatted_time = datetime.now(timezone(time_zone)).strftime('%Y-%m-%d %H:%M:%S.%f')
+        formatted_time = datetime.now(pytz.utc).astimezone(india_tz).strftime('%Y-%m-%d %H:%M:%S')
 
-        actions = actions + ". List of actions ends. <PREVIOUS_USER_ACTION_END> \n " + "Today's datetime in "+time_zone + "is: "+  formatted_time +  " in this format:'%Y-%m-%dT%H:%M:%S.%f' \n Whenever user is asking about current date or current time at particular location then use this datetime format by asking what user's location is. Use the previous sentence datetime info to answer current time based questions coupled with google_search for current time or full_history for historical conversation based answers. Take a deep breath and think step by step.\n"
+        actions = actions + ". List of actions ends. <PREVIOUS_USER_ACTION_END> \n " + "Today's datetime in "+time_zone + "is: "+  formatted_time +  " in this format:'%Y-%m-%dT%H:%M:%S' \n Whenever user is asking about current date or current time at particular location then use this datetime format by asking what user's location is. Use the previous sentence datetime info to answer current time based questions coupled with google_search for current time or full_history for historical conversation based answers. Take a deep breath and think step by step.\n"
         # user detail api
     else:
         post_dict= {'user_id':user_id, 'status': TaskStatus.ERROR.value,'task_name':TaskNames.GET_ACTION_USER_DETAILS.value, 'uid':thread_local_data.get_request_id(), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason':'Exception happend at get action api end'}
@@ -1683,7 +1685,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
 
 
 Hevolve = "You are Hevolve, a highly intelligent educational AI developed by HertzAI."
-
+PROBE_TEMPLATE = "You are Hevolve, a highly intelligent educational AI developed by HertzAI. Weave the conversation history along with the Last_5_Minutes_Visual_Context if present to create a clear, engaging, coherent conversation flow that encourages the user to respond."
 
 
 @app.route('/chat', methods=['POST'])
@@ -1697,6 +1699,7 @@ def chat():
     req_tool = data.get('tools', None)
     prompt_id = data.get('prompt_id', None)
     casual_conv = data.get('casual_conv', None)
+    probe = data.get('probe', None)
     app.logger.info(f"casual_conv type {casual_conv}")
 
     # return ""
@@ -1723,6 +1726,9 @@ def chat():
         except:
             app.logger.info(f'failed to get prompt from id:- {prompt_id}')
             custom_prompt = Hevolve
+    elif probe:
+        custom_prompt = PROBE_TEMPLATE
+        prompt_id = 0
     else:
         custom_prompt = Hevolve  # use Hevolve from config/template
         prompt_id = 0
