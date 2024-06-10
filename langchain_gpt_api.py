@@ -837,7 +837,7 @@ def get_action_user_details(user_id):
                          not in unwanted_actions]
 
         filtered_data_video = [
-            obj for obj in data if obj["action"] == 'Video Reasoning']
+            obj for obj in data if obj["zeroshot_label"] == 'Video Reasoning']
         # Dictionary to store the first and last occurrence dates for each action
         action_occurrences = {}
 
@@ -1731,6 +1731,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
 
 Hevolve = "You are Hevolve, a highly intelligent educational AI developed by HertzAI."
 PROBE_TEMPLATE = "You are Hevolve, a highly intelligent educational AI developed by HertzAI. Weave the conversation history along with the Last_5_Minutes_Visual_Context if present to create a clear, engaging, coherent conversation flow that encourages the user to respond."
+INTERMEDIATE_CONTINUATION = "You are Hevolve, a highly intelligent educational AI developed by HertzAI. continue your response from where you left in the last conversation considering the new input as the continuation of last request"
 
 
 @app.route('/chat', methods=['POST'])
@@ -1745,6 +1746,7 @@ def chat():
     prompt_id = data.get('prompt_id', None)
     casual_conv = data.get('casual_conv', None)
     probe = data.get('probe', None)
+    intermediate = data.get('intermediate', None)
     app.logger.info(f"casual_conv type {casual_conv}")
 
     # return ""
@@ -1772,6 +1774,9 @@ def chat():
             custom_prompt = Hevolve
     elif probe:
         custom_prompt = PROBE_TEMPLATE
+        prompt_id = 0
+    elif intermediate:
+        custom_prompt = INTERMEDIATE_CONTINUATION
         prompt_id = 0
     else:
         custom_prompt = Hevolve  # use Hevolve from config/template
