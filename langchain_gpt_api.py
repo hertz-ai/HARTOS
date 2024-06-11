@@ -1731,7 +1731,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
 
 Hevolve = "You are Hevolve, a highly intelligent educational AI developed by HertzAI."
 PROBE_TEMPLATE = "You are Hevolve, a highly intelligent educational AI developed by HertzAI. Weave the conversation history along with the Last_5_Minutes_Visual_Context if present to create a clear, engaging, coherent conversation flow that encourages the user to respond."
-INTERMEDIATE_CONTINUATION = "You are Hevolve, a highly intelligent educational AI developed by HertzAI. continue your response from where you left in the last conversation considering the new input as the continuation of last request"
+INTERMEDIATE_CONTINUATION = "You are Hevolve, a highly intelligent educational AI developed by HertzAI. Continue your response from where you left off in the last conversation, considering the new input as a continuation of the last request. Ensure a smooth transition from the previous response and start this response as a continuation of the previous one.\n INSTRUCTIONS: Start your response with transitional words or phrases that can be used as a continuation of the previous response."
 
 
 @app.route('/chat', methods=['POST'])
