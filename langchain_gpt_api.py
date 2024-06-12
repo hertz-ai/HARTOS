@@ -317,7 +317,7 @@ def get_tools(req_tool, is_first: bool = False):
             Tool(
                 name="Visual_Context_Camera",
                 func=parse_visual_context,
-                description="To see user or if there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input to this tool function should be the user query/input via video call. Only if last 16 seconds Visual Context information is present & is enough, then use that to craft a better creative, better, cohesive, correlated , summarised natural response, format this tool response togather with Previous 15 minutes Visual Context information if you are seeing the scene via videocall."
+                description="To see user or if there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input to this tool function should be the user query/input. Only if last 16 seconds Visual Context information is present & is enough, then use that to craft a better creative, better, cohesive, correlated , summarised natural response, format this tool response togather with Previous 15 minutes Visual Context information if you are seeing the scene via videocall from the other end. If there are more than 1 person try to give an identity to each across frames to track the subjects through time by framing the tool input accordingly."
             )
 
         ]
@@ -478,6 +478,7 @@ class CustomGPT(LLM):
             # prompt = create_prompt(tools)
             app.logger.info(prompt)
             # time.sleep(10)
+
         checker = None
         if (self.count > 1 or self.call_gpt4 == 1):
             try:
@@ -814,7 +815,7 @@ def get_action_user_details(user_id):
         This function help to extract action that user have perfomed till time
     '''
     unwanted_actions = ['Topic Cofirmation', 'Langchain', 'Assessment Ended', 'Casual Conversation', 'Topic confirmation',
-                        'Topic not found', 'Topic Confirmation', 'Topic Listing', 'Probe', 'Question Answering', 'Fallback', 'Video Reasoning']
+                        'Topic not found', 'Topic Confirmation', 'Topic Listing', 'Probe', 'Question Answering', 'Fallback']
     action_url = f"{ACTION_API}?user_id={user_id}"
 
     # Todo: get, and populate timezone from client
@@ -834,7 +835,8 @@ def get_action_user_details(user_id):
 
         # Filter out unwanted actions
         filtered_data = [obj for obj in data if obj["action"]
-                         not in unwanted_actions]
+                         not in unwanted_actions and obj["zeroshot_label"]
+                         not in ['Video Reasoning']]
 
         filtered_data_video = [
             obj for obj in data if obj["zeroshot_label"] == 'Video Reasoning']
@@ -885,8 +887,9 @@ def get_action_user_details(user_id):
             action_texts.append('<Last_5_Minutes_Visual_Context_Start>')
             action_texts.extend(video_context_texts)
             action_texts.append('<Last_5_Minutes_Visual_Context_End>')
+            action_texts.append('If a person is identified in Visual_Context section that\'s most probably the user (me) & most likely not taking any selfie.')
 
-        if len(action_texts) == 2:
+        if len(action_texts) == 0:
             action_texts = ['user has not performed any actions yet.']
 
         actions = ", ".join(action_texts)
