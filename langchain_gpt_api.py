@@ -1803,6 +1803,8 @@ def chat():
     thread_local_data.set_prompt_id(prompt_id)
 
     prompt = data.get('prompt', None)
+    if probe:
+        prompt = 'Create/Continue the Conversation from where we left or try creating a new comversation from the Last_5_Minutes_Visual_Context or with some interesting facts/ knowledge information. Do Not Repeat Your Responses'
     app.logger.info(
         "the time taken before get ans in main api is %s seconds", time.time() - start_time)
     ans_start_time = time.time()
