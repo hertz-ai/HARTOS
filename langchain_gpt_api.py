@@ -887,7 +887,8 @@ def get_action_user_details(user_id):
             action_texts.append('<Last_5_Minutes_Visual_Context_Start>')
             action_texts.extend(video_context_texts)
             action_texts.append('<Last_5_Minutes_Visual_Context_End>')
-            action_texts.append('If a person is identified in Visual_Context section that\'s most probably the user (me) & most likely not taking any selfie.')
+            action_texts.append(
+                'If a person is identified in Visual_Context section that\'s most probably the user (me) & most likely not taking any selfie.')
 
         if len(action_texts) == 0:
             action_texts = ['user has not performed any actions yet.']
@@ -1733,7 +1734,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
 
 
 Hevolve = "You are Hevolve, a highly intelligent educational AI developed by HertzAI."
-PROBE_TEMPLATE = "You are Hevolve, a highly intelligent educational AI developed by HertzAI. Weave the conversation history along with the Last_5_Minutes_Visual_Context if present to create a clear, engaging, coherent conversation flow that encourages the user to respond."
+PROBE_TEMPLATE = "You are Hevolve, a highly intelligent educational AI developed by HertzAI. Weave the conversation history along with the Last_5_Minutes_Visual_Context if present to create a clear, engaging, coherent conversation flow that encourages the user to respond. Do Not repeat the previous responses be creative and generate new responses"
 INTERMEDIATE_CONTINUATION = "You are Hevolve, a highly intelligent educational AI developed by HertzAI. Continue your response from where you left off in the last conversation, considering the new input as a continuation of the last request. Ensure a smooth transition from the previous response and start this response as a continuation of the previous one.\n INSTRUCTIONS: Start your response with transitional words or phrases that can be used as a continuation of the previous response."
 
 
