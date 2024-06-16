@@ -402,9 +402,9 @@ def get_tools(req_tool, is_first: bool = False):
                 description="Based on user query generate visual representation of text. Extract prompt from user query and use it as input for function"
             ),
             # Tool(
-            #     name="Animate_Character",
+            #     name="Animate_Yourself",
             #     func=parse_character_animation,
-            #     description='''Use this tool exclusively for animating the selected character or teacher as requested by the user; it is not intended for general requests or for animating random individuals. The user should specify their animation request in a query, such as 'Show me in a spacesuit' or 'Animate yourself as a cartoon standing in front of the Taj Mahal.' Once the request is made, the tool will generate the animation and return a URL link to the user that directs them to the animated image. Note that this tool is specifically designed to handle requests that involve animating a pre-selected character. It should not be used for general image generation tasks that don't pertain to animating the user's chosen character or teacher. For example, if a user queries 'Show me dancing in the rain,' and they have previously selected a specific character or teacher, the tool should be used to generate this animated scenario. However, if the user's request is something like 'Generate an image of a sunset,' which does not directly involve animating the selected character or teacher, then this tool should not be used.'''
+            #     description='''Use this tool exclusively for animating the selected AI character or teacher as requested by the user; it is not intended for general requests or for animating random images or individuals other than AI teacher avatars. The user should specify their animation request in a query, e.g. 'Show me yourself in a spacesuit' or 'Animate yourself as a person riding a bike.' Once the request is made, the tool will generate the animation and return an URL link to the user that directs them to the animated image. This tool should not be used for general image generation tasks that don't pertain to animating the user's chosen character or teacher. For example, if a user queries 'Show me dancing in the rain,' and they have previously selected a specific character or teacher, the tool should be used to generate this animated scenario. However, if the user's request is something like 'Generate an image of a sunset,' which does not directly involve animating the selected character or teacher, then this tool should not be used.'''
             # ),
             Tool(
                 name="Image_Inference_Tool",
@@ -1733,7 +1733,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
 
 
 Hevolve = "You are Hevolve, a highly intelligent educational AI developed by HertzAI."
-PROBE_TEMPLATE = "You are Hevolve, a highly intelligent educational AI developed by HertzAI. Weave the conversation history along with the Last_5_Minutes_Visual_Context if present to create a clear, engaging, coherent conversation flow that encourages the user to respond."
+PROBE_TEMPLATE = "You are Hevolve, a highly intelligent educational AI developed by HertzAI. Weave the conversation history along with the Last_5_Minutes_Visual_Context if present to create a clear, engaging, coherent conversation flow that encourages the user to respond. Neither repeat the previous responses nor be monotonous, be creative and talk about intriguing awe-inspiring facts. Greet if & only if the context demands you to, build a dialogue, use user\'s name only when neccessary, Do not sound robotic. If the user is not actively engaging or if visual context is present but user not visible or if user visible but not looking at camera (based on visual and conversation history timestamps) call out their name loud or try singing a song to bring back their attention using a SEEK_ATTENTION tool with input like a song made of knowledge based on user's age, or calling their name loud e.g. tool input: \'<seek_attend_loud>Hey <username>, are you there</seek_attend_loud>\' or  \'<seek_attend_lyrics>Some awesome lyrics</seek_attend>\' . Continue the Conversation from where I or you left off."
 INTERMEDIATE_CONTINUATION = "You are Hevolve, a highly intelligent educational AI developed by HertzAI. Continue your response from where you left off in the last conversation, considering the new input as a continuation of the last request. Ensure a smooth transition from the previous response and start this response as a continuation of the previous one.\n INSTRUCTIONS: Start your response with transitional words or phrases that can be used as a continuation of the previous response."
 
 
@@ -1802,6 +1802,9 @@ def chat():
     thread_local_data.set_prompt_id(prompt_id)
 
     prompt = data.get('prompt', None)
+    if probe:
+        prompt = ''
+
     app.logger.info(
         "the time taken before get ans in main api is %s seconds", time.time() - start_time)
     ans_start_time = time.time()
