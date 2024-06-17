@@ -402,7 +402,7 @@ def get_tools(req_tool, is_first: bool = False):
                 description="Based on user query generate visual representation of text. Extract prompt from user query and use it as input for function"
             ),
             # Tool(
-            #     name="Animate_Yourself",
+            #     name="Animate_Character",
             #     func=parse_character_animation,
             #     description='''Use this tool exclusively for animating the selected AI character or teacher as requested by the user; it is not intended for general requests or for animating random images or individuals other than AI teacher avatars. The user should specify their animation request in a query, e.g. 'Show me yourself in a spacesuit' or 'Animate yourself as a person riding a bike.' Once the request is made, the tool will generate the animation and return an URL link to the user that directs them to the animated image. This tool should not be used for general image generation tasks that don't pertain to animating the user's chosen character or teacher. For example, if a user queries 'Show me dancing in the rain,' and they have previously selected a specific character or teacher, the tool should be used to generate this animated scenario. However, if the user's request is something like 'Generate an image of a sunset,' which does not directly involve animating the selected character or teacher, then this tool should not be used.'''
             # ),
