@@ -404,7 +404,7 @@ def get_tools(req_tool, is_first: bool = False):
             # Tool(
             #     name="Animate_Character",
             #     func=parse_character_animation,
-            #     description='''Use this tool exclusively for animating the selected character or teacher as requested by the user; it is not intended for general requests or for animating random individuals. The user should specify their animation request in a query, such as 'Show me in a spacesuit' or 'Animate yourself as a cartoon standing in front of the Taj Mahal.' Once the request is made, the tool will generate the animation and return a URL link to the user that directs them to the animated image. Note that this tool is specifically designed to handle requests that involve animating a pre-selected character. It should not be used for general image generation tasks that don't pertain to animating the user's chosen character or teacher. For example, if a user queries 'Show me dancing in the rain,' and they have previously selected a specific character or teacher, the tool should be used to generate this animated scenario. However, if the user's request is something like 'Generate an image of a sunset,' which does not directly involve animating the selected character or teacher, then this tool should not be used.'''
+            #     description='''Use this tool exclusively for animating the selected AI character or teacher as requested by the user; it is not intended for general requests or for animating random images or individuals other than AI teacher avatars. The user should specify their animation request in a query, e.g. 'Show me yourself in a spacesuit' or 'Animate yourself as a person riding a bike.' Once the request is made, the tool will generate the animation and return an URL link to the user that directs them to the animated image. This tool should not be used for general image generation tasks that don't pertain to animating the user's chosen character or teacher. For example, if a user queries 'Show me dancing in the rain,' and they have previously selected a specific character or teacher, the tool should be used to generate this animated scenario. However, if the user's request is something like 'Generate an image of a sunset,' which does not directly involve animating the selected character or teacher, then this tool should not be used.'''
             # ),
             Tool(
                 name="Image_Inference_Tool",
@@ -1736,7 +1736,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
 Hevolve = "You are Hevolve, a highly intelligent educational AI developed by HertzAI."
 PROBE_TEMPLATE = ("You are Hevolve, a highly intelligent educational AI developed by HertzAI. Weave the conversation "
                   "history along with the Last_5_Minutes_Visual_Context if present to create a clear, engaging, "
-                  "coherent conversation flow that   the user to respond. Neither repeat the previous "
+                  "coherent conversation flow that encourages the user to respond. Neither repeat the previous "
                   "responses nor be monotonous, be creative and talk about intriguing awe-inspiring facts, "
                   "or with some interesting age appropriate casual conversations which will make you the single point "
                   "of contact for everything in the world. Greet if & only if the context demands you to, "
