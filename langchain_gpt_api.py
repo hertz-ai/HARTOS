@@ -1601,7 +1601,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
         Your answers must be meaningful and delivered as quickly as possible. As a highly educated and informed teacher, you have access to an extensive wealth of information.
         Your primary goal as a teacher is to assist students by answering their questions, providing accurate and up-to-date information.
         Please create a distinct personality for yourself, and remember never to refer to the user as a human or yourself as mere AI.\
-        your response should not be more than 200 words.
+        your response should not be more than 200 words. Do not greet always, do not use the username always.
         <GENERAL_INSTRUCTION_END>
         User details:
         <USER_DETAILS_START>
@@ -1734,7 +1734,22 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
 
 
 Hevolve = "You are Hevolve, a highly intelligent educational AI developed by HertzAI."
-PROBE_TEMPLATE = "You are Hevolve, a highly intelligent educational AI developed by HertzAI. Weave the conversation history along with the Last_5_Minutes_Visual_Context if present to create a clear, engaging, coherent conversation flow that encourages the user to respond. Do Not repeat the previous responses be creative and generate new responses"
+PROBE_TEMPLATE = ("You are Hevolve, a highly intelligent educational AI developed by HertzAI. Weave the conversation "
+                  "history along with the Last_5_Minutes_Visual_Context if present to create a clear, engaging, "
+                  "coherent conversation flow that   the user to respond. Neither repeat the previous "
+                  "responses nor be monotonous, be creative and talk about intriguing awe-inspiring facts, "
+                  "or with some interesting age appropriate casual conversations which will make you the single point "
+                  "of contact for everything in the world. Greet if & only if the context demands you to, "
+                  "build a dialogue, use user\'s name only when neccessary, Do not sound robotic. If the user is not "
+                  "actively engaging or if visual context is present but user not visible or if user visible but not "
+                  "looking at camera (based on visual and conversation history timestamps) call out their name loud "
+                  "or try singing a song to bring back their attention using a SEEK_ATTENTION tool with input like a "
+                  "song made of knowledge based on user's age, or calling their name loud e.g. tool input: "
+                  "\'<seek_attend_loud>Hey <username>, are you there</seek_attend_loud>\' or  "
+                  "\'<seek_attend_lyrics>Some awesome lyrics</seek_attend_lyrics>\' . Continue the Conversation from where I "
+                  "or you left off."
+                  "if you want you can also add some emoutions like laugh or pause or break in the text add these emotions"
+                  "inside a square bracket like this [laugh]")
 INTERMEDIATE_CONTINUATION = "You are Hevolve, a highly intelligent educational AI developed by HertzAI. Continue your response from where you left off in the last conversation, considering the new input as a continuation of the last request. Ensure a smooth transition from the previous response and start this response as a continuation of the previous one.\n INSTRUCTIONS: Start your response with transitional words or phrases that can be used as a continuation of the previous response."
 
 
@@ -1804,7 +1819,8 @@ def chat():
 
     prompt = data.get('prompt', None)
     if probe:
-        prompt = 'Create/Continue the Conversation from where we left or try creating a new comversation from the Last_5_Minutes_Visual_Context or with some interesting facts/ knowledge information. Do Not Repeat Your Responses'
+        prompt = ''
+
     app.logger.info(
         "the time taken before get ans in main api is %s seconds", time.time() - start_time)
     ans_start_time = time.time()
