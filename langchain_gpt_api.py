@@ -317,7 +317,7 @@ def get_tools(req_tool, is_first: bool = False):
             Tool(
                 name="Visual_Context_Camera",
                 func=parse_visual_context,
-                description="To see user or if there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input to this tool function should be the user query/input via video call. Only if last 16 seconds Visual Context information is present & is enough, then use that to craft a better creative, better, cohesive, correlated , summarised natural response, format this tool response togather with Previous 15 minutes Visual Context information if you are seeing the scene via videocall."
+                description="To see user or if there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input to this tool function should be the user query/input. Only if last 16 seconds Visual Context information is present & is enough, then use that to craft a better creative, better, cohesive, correlated , summarised natural response, format this tool response togather with Previous 15 minutes Visual Context information if you are seeing the scene via videocall from the other end. If there are more than 1 person try to give an identity to each across frames to track the subjects through time by framing the tool input accordingly."
             )
 
         ]
@@ -404,7 +404,7 @@ def get_tools(req_tool, is_first: bool = False):
             # Tool(
             #     name="Animate_Character",
             #     func=parse_character_animation,
-            #     description='''Use this tool exclusively for animating the selected character or teacher as requested by the user; it is not intended for general requests or for animating random individuals. The user should specify their animation request in a query, such as 'Show me in a spacesuit' or 'Animate yourself as a cartoon standing in front of the Taj Mahal.' Once the request is made, the tool will generate the animation and return a URL link to the user that directs them to the animated image. Note that this tool is specifically designed to handle requests that involve animating a pre-selected character. It should not be used for general image generation tasks that don't pertain to animating the user's chosen character or teacher. For example, if a user queries 'Show me dancing in the rain,' and they have previously selected a specific character or teacher, the tool should be used to generate this animated scenario. However, if the user's request is something like 'Generate an image of a sunset,' which does not directly involve animating the selected character or teacher, then this tool should not be used.'''
+            #     description='''Use this tool exclusively for animating the selected AI character or teacher as requested by the user; it is not intended for general requests or for animating random images or individuals other than AI teacher avatars. The user should specify their animation request in a query, e.g. 'Show me yourself in a spacesuit' or 'Animate yourself as a person riding a bike.' Once the request is made, the tool will generate the animation and return an URL link to the user that directs them to the animated image. This tool should not be used for general image generation tasks that don't pertain to animating the user's chosen character or teacher. For example, if a user queries 'Show me dancing in the rain,' and they have previously selected a specific character or teacher, the tool should be used to generate this animated scenario. However, if the user's request is something like 'Generate an image of a sunset,' which does not directly involve animating the selected character or teacher, then this tool should not be used.'''
             # ),
             Tool(
                 name="Image_Inference_Tool",
@@ -478,6 +478,7 @@ class CustomGPT(LLM):
             # prompt = create_prompt(tools)
             app.logger.info(prompt)
             # time.sleep(10)
+
         checker = None
         if (self.count > 1 or self.call_gpt4 == 1):
             try:
@@ -814,7 +815,7 @@ def get_action_user_details(user_id):
         This function help to extract action that user have perfomed till time
     '''
     unwanted_actions = ['Topic Cofirmation', 'Langchain', 'Assessment Ended', 'Casual Conversation', 'Topic confirmation',
-                        'Topic not found', 'Topic Confirmation', 'Topic Listing', 'Probe', 'Question Answering', 'Fallback', 'Video Reasoning']
+                        'Topic not found', 'Topic Confirmation', 'Topic Listing', 'Probe', 'Question Answering', 'Fallback']
     action_url = f"{ACTION_API}?user_id={user_id}"
 
     # Todo: get, and populate timezone from client
@@ -834,7 +835,8 @@ def get_action_user_details(user_id):
 
         # Filter out unwanted actions
         filtered_data = [obj for obj in data if obj["action"]
-                         not in unwanted_actions]
+                         not in unwanted_actions and obj["zeroshot_label"]
+                         not in ['Video Reasoning']]
 
         filtered_data_video = [
             obj for obj in data if obj["zeroshot_label"] == 'Video Reasoning']
@@ -885,8 +887,10 @@ def get_action_user_details(user_id):
             action_texts.append('<Last_5_Minutes_Visual_Context_Start>')
             action_texts.extend(video_context_texts)
             action_texts.append('<Last_5_Minutes_Visual_Context_End>')
+            action_texts.append(
+                'If a person is identified in Visual_Context section that\'s most probably the user (me) & most likely not taking any selfie.')
 
-        if len(action_texts) == 2:
+        if len(action_texts) == 0:
             action_texts = ['user has not performed any actions yet.']
 
         actions = ", ".join(action_texts)
@@ -1378,7 +1382,7 @@ def parse_link_for_crwalab(inp):
         pass
 
 
-redis_client = redis.StrictRedis(host='40.80.82.130', port=6379, db=0)
+redis_client = redis.StrictRedis(host='aws_ttsenglish.hertzai.com', port=6379, db=0)
 
 
 def get_frame(user_id):
@@ -1597,7 +1601,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
         Your answers must be meaningful and delivered as quickly as possible. As a highly educated and informed teacher, you have access to an extensive wealth of information.
         Your primary goal as a teacher is to assist students by answering their questions, providing accurate and up-to-date information.
         Please create a distinct personality for yourself, and remember never to refer to the user as a human or yourself as mere AI.\
-        your response should not be more than 200 words.
+        your response should not be more than 200 words. Do not greet always, do not use the username always.
         <GENERAL_INSTRUCTION_END>
         User details:
         <USER_DETAILS_START>
@@ -1730,8 +1734,24 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
 
 
 Hevolve = "You are Hevolve, a highly intelligent educational AI developed by HertzAI."
-PROBE_TEMPLATE = "You are Hevolve, a highly intelligent educational AI developed by HertzAI. Weave the conversation history along with the Last_5_Minutes_Visual_Context if present to create a clear, engaging, coherent conversation flow that encourages the user to respond."
-INTERMEDIATE_CONTINUATION = "You are Hevolve, a highly intelligent educational AI developed by HertzAI. continue your response from where you left in the last conversation considering the new input as the continuation of last request"
+PROBE_TEMPLATE = ("You are Hevolve, a highly intelligent educational AI developed by HertzAI. Weave the conversation "
+                  "history along with the Last_5_Minutes_Visual_Context if present to create a clear, engaging, "
+                  "coherent conversation flow that encourages the user to respond. Neither repeat the previous "
+                  "responses nor be monotonous, be creative and talk about intriguing awe-inspiring facts, "
+                  "or with some interesting age appropriate casual conversations which will make you the single point "
+                  "of contact for everything in the world. Greet if & only if the context demands you to, "
+                  "always express feelings like laugh or pause in your response, the format for laugh is '[laugh]["
+                  "lbreak]' and for break is '[uv_break][break]', use these markers frequently"
+                  "build a dialogue, use user\'s name only when necessary, Do not sound robotic. If the user is not "
+                  "actively engaging or if visual context is present but user not visible or if user visible but not "
+                  "looking at camera (based on visual and conversation history timestamps) call out their name loud "
+                  "or try singing a song to bring back their attention using a SEEK_ATTENTION tool with input like a "
+                  "song made of knowledge based on user's age, or calling their name loud e.g. tool input: "
+                  "\'<seek_attend_loud>Hey <username>, are you there</seek_attend_loud>\' or  "
+                  "\'<seek_attend_lyrics>Some awesome lyrics</seek_attend_lyrics>\' . Continue the Conversation from "
+                  "where I or you left off."
+                  )
+INTERMEDIATE_CONTINUATION = "You are Hevolve, a highly intelligent educational AI developed by HertzAI. Continue your response from where you left off in the last conversation, considering the new input as a continuation of the last request. Ensure a smooth transition from the previous response and start this response as a continuation of the previous one.\n INSTRUCTIONS: Start your response with transitional words or phrases that can be used as a continuation of the previous response."
 
 
 @app.route('/chat', methods=['POST'])
@@ -1799,6 +1819,9 @@ def chat():
     thread_local_data.set_prompt_id(prompt_id)
 
     prompt = data.get('prompt', None)
+    if probe:
+        prompt = ''
+
     app.logger.info(
         "the time taken before get ans in main api is %s seconds", time.time() - start_time)
     ans_start_time = time.time()
