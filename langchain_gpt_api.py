@@ -887,7 +887,8 @@ def get_action_user_details(user_id):
             action_texts.append('<Last_5_Minutes_Visual_Context_Start>')
             action_texts.extend(video_context_texts)
             action_texts.append('<Last_5_Minutes_Visual_Context_End>')
-            action_texts.append('If a person is identified in Visual_Context section that\'s most probably the user (me) & most likely not taking any selfie.')
+            action_texts.append(
+                'If a person is identified in Visual_Context section that\'s most probably the user (me) & most likely not taking any selfie.')
 
         if len(action_texts) == 0:
             action_texts = ['user has not performed any actions yet.']
@@ -1747,7 +1748,8 @@ PROBE_TEMPLATE = ("You are Hevolve, a highly intelligent educational AI develope
                   "song made of knowledge based on user's age, or calling their name loud e.g. tool input: "
                   "\'<seek_attend_loud>Hey <username>, are you there</seek_attend_loud>\' or  "
                   "\'<seek_attend_lyrics>Some awesome lyrics</seek_attend_lyrics>\' . Continue the Conversation from where I "
-                  "or you left off.")
+                  "or you left off."
+                  )
 INTERMEDIATE_CONTINUATION = "You are Hevolve, a highly intelligent educational AI developed by HertzAI. Continue your response from where you left off in the last conversation, considering the new input as a continuation of the last request. Ensure a smooth transition from the previous response and start this response as a continuation of the previous one.\n INSTRUCTIONS: Start your response with transitional words or phrases that can be used as a continuation of the previous response."
 
 
