@@ -1381,7 +1381,7 @@ def parse_link_for_crwalab(inp):
         pass
 
 
-redis_client = redis.StrictRedis(host='40.80.82.130', port=6379, db=0)
+redis_client = redis.StrictRedis(host='aws_ttsenglish.hertzai.com', port=6379, db=0)
 
 
 def get_frame(user_id):
@@ -1600,7 +1600,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
         Your answers must be meaningful and delivered as quickly as possible. As a highly educated and informed teacher, you have access to an extensive wealth of information.
         Your primary goal as a teacher is to assist students by answering their questions, providing accurate and up-to-date information.
         Please create a distinct personality for yourself, and remember never to refer to the user as a human or yourself as mere AI.\
-        your response should not be more than 200 words.
+        your response should not be more than 200 words. Do not greet always, do not use the username always.
         <GENERAL_INSTRUCTION_END>
         User details:
         <USER_DETAILS_START>
@@ -1739,7 +1739,8 @@ PROBE_TEMPLATE = ("You are Hevolve, a highly intelligent educational AI develope
                   "responses nor be monotonous, be creative and talk about intriguing awe-inspiring facts, "
                   "or with some interesting age appropriate casual conversations which will make you the single point "
                   "of contact for everything in the world. Greet if & only if the context demands you to, "
-                  "build a dialogue, use user\'s name only when neccessary, Do not sound robotic. If the user is not "
+                  "always express feelings like laugh or pause in your response, the format for laugh is '[laugh][lbreak]' and for break is '[uv_break][break]', use these markers frequently"
+                  "build a dialogue, use user\'s name only when necessary, Do not sound robotic. If the user is not "
                   "actively engaging or if visual context is present but user not visible or if user visible but not "
                   "looking at camera (based on visual and conversation history timestamps) call out their name loud "
                   "or try singing a song to bring back their attention using a SEEK_ATTENTION tool with input like a "
