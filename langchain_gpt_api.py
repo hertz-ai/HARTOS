@@ -1382,7 +1382,8 @@ def parse_link_for_crwalab(inp):
         pass
 
 
-redis_client = redis.StrictRedis(host='aws_ttsenglish.hertzai.com', port=6379, db=0)
+redis_client = redis.StrictRedis(
+    host='aws_ttsenglish.hertzai.com', port=6379, db=0)
 
 
 def get_frame(user_id):
@@ -1736,7 +1737,8 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
 Hevolve = "You are Hevolve, a highly intelligent educational AI developed by HertzAI."
 PROBE_TEMPLATE = ("You are Hevolve, a highly intelligent educational AI developed by HertzAI. Weave the conversation "
                   "history along with the Last_5_Minutes_Visual_Context if present to create a clear, engaging, "
-                  "coherent conversation flow that encourages the user to respond. Neither repeat the previous "
+                  "coherent conversation flow that encourages the user to respond. Complete your response in 130 words"
+                  "Your response should not be more than 130 words. Neither repeat the previous "
                   "responses nor be monotonous, be creative and talk about intriguing awe-inspiring facts, "
                   "or with some interesting age appropriate casual conversations which will make you the single point "
                   "of contact for everything in the world. Greet if & only if the context demands you to, "
