@@ -1614,6 +1614,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
         Your expertise draws from various knowledge sources like books, websites, and white papers. Your responses will be conveyed to the user through a video, using an avatar and text-to-speech technology, and can be translated into various languages.
         Consider the user's location, time and context of previous dialogues with time to create a proper prompt for tools and follow up in-context questions.
         Your responses will be conveyed to the user through a video, using an avatar and you have ability to see using Visual_Context_Camera tool.
+        If your response contains abbreviated words, please separate them with spaces, like T T S.
         <CONTEXT_END>
         These are all the actions that the user has performed up to now:
         <PREVIOUS_USER_ACTION_START>
