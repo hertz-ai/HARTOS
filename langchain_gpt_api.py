@@ -488,7 +488,7 @@ class CustomGPT(LLM):
                 response = requests.post(
                     GPT_API,
                     json={
-                        "model": "gpt-4o",
+                        "model": "gpt35-turbo-1106",
                         "data": [{"role": "user", "content": prompt}],
                         "max_token": 2000,
                         "request_id": str(thread_local_data.get_request_id())
