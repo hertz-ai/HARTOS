@@ -401,11 +401,11 @@ def get_tools(req_tool, is_first: bool = False):
                 func=parse_text_to_image,
                 description="Based on user query generate visual representation of text. Extract prompt from user query and use it as input for function"
             ),
-            # Tool(
-            #     name="Animate_Character",
-            #     func=parse_character_animation,
-            #     description='''Use this tool exclusively for animating the selected AI character or teacher as requested by the user; it is not intended for general requests or for animating random images or individuals other than AI teacher avatars. The user should specify their animation request in a query, e.g. 'Show me yourself in a spacesuit' or 'Animate yourself as a person riding a bike.' Once the request is made, the tool will generate the animation and return an URL link to the user that directs them to the animated image. This tool should not be used for general image generation tasks that don't pertain to animating the user's chosen character or teacher. For example, if a user queries 'Show me dancing in the rain,' and they have previously selected a specific character or teacher, the tool should be used to generate this animated scenario. However, if the user's request is something like 'Generate an image of a sunset,' which does not directly involve animating the selected character or teacher, then this tool should not be used.'''
-            # ),
+            Tool(
+                name="Animate_Character",
+                func=parse_character_animation,
+                description='''Use this tool exclusively for animating the selected AI character or teacher as requested by the user; it is not intended for general requests or for animating random images or individuals other than AI teacher avatars. The user should specify their animation request in a query, e.g. 'Show me yourself in a spacesuit' or 'Animate yourself as a person riding a bike.' Once the request is made, the tool will generate the animation and return an URL link to the user that directs them to the animated image. This tool should not be used for general image generation tasks that don't pertain to animating the user's chosen character or teacher. For example, if a user queries 'Show me dancing in the rain,' and they have previously selected a specific character or teacher, the tool should be used to generate this animated scenario. However, if the user's request is something like 'Generate an image of a sunset,' which does not directly involve animating the selected character or teacher, then this tool should not be used.'''
+            ),
             Tool(
                 name="Image_Inference_Tool",
                 func=parse_image_to_text,
@@ -1093,21 +1093,25 @@ def parse_character_animation(string):
 
         image_name = response.json()["image_name"]
 
+        image_url = response.json()["image_url"]
+        image_response = requests.get(image_url)
+        image_content = image_response.content
+        
+        
+
         image_name = image_name.replace("vtoonify_", "", 1)
         folder_name = image_name.split(".")[0]
         inference_url = f"{DREAMBOOTH_API}/generate_images"
-        payload = json.dumps({
-            "weights_dir": f"/home/azureuser/dreambooth/diffusers/examples/dreambooth/{folder_name}_result",
-            "prompt": prompt
-        })
-        headers = {
-            'Content-Type': 'application/json'
-        }
-
-        response = requests.request(
-            "POST", inference_url, headers=headers, data=payload, timeout=180)
+        payload = {'prompt': prompt}
+        headers = {}
+        logging.info("done till here")
+        files = [
+            ('image', ('image.jpeg', image_content, 'image/jpeg'))  # Use the correct content type
+        ]
+        url = "http://20.197.30.74:8000/generate_image/"
+        response = requests.post(url, headers=headers, data=payload, files=files)
         if response.status_code == 200:
-            return response.json()["image_url"]
+            return response.json()["url"]
         else:
             post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.ANIMATE_CHARACTER.value, 'uid': thread_local_data.get_request_id(
             ), 'task_id': f"{TaskNames.ANIMATE_CHARACTER.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at dreamooth api end for re {thread_local_data.get_request_id()}'}
@@ -1117,7 +1121,9 @@ def parse_character_animation(string):
                 logging.error(
                     "Error while publish at com.hertzai.longrunning.log topic")
 
-    except:
+    except Exception as e:
+        # logging.info(f"exception {e}")
+        time.sleep(30)
         post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.TIMEOUT.value, 'task_name': TaskNames.ANIMATE_CHARACTER.value, 'uid': thread_local_data.get_request_id(
         ), 'task_id': f"{TaskNames.ANIMATE_CHARACTER.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at dreamooth api end for req_id {thread_local_data.get_request_id()} timed out'}
         try:
