@@ -206,6 +206,7 @@ def create_prompt(tools):
         You are designed to answer questions, provide revisions, conduct assessments, teach various topics, create personalised curriculum and assist with research for both students and working professionals.
         Your expertise draws from various knowledge sources like books, websites, and white papers. Your responses will be conveyed to the user through a video, using an avatar and text-to-speech technology, and can be translated into various languages.
         Consider the user's location, time and context of previous dialogues with time to create a proper prompt for tools and follow up in-context questions.You have ability to see using Visual_Context_Camera tool.
+        If your response contains abbreviated words, please separate them with spaces, like T T S.
         <CONTEXT_END>
         These are all the actions that the user has performed up to now:
         <PREVIOUS_USER_ACTION_START>
@@ -1620,7 +1621,6 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
         Your expertise draws from various knowledge sources like books, websites, and white papers. Your responses will be conveyed to the user through a video, using an avatar and text-to-speech technology, and can be translated into various languages.
         Consider the user's location, time and context of previous dialogues with time to create a proper prompt for tools and follow up in-context questions.
         Your responses will be conveyed to the user through a video, using an avatar and you have ability to see using Visual_Context_Camera tool.
-        If your response contains abbreviated words, please separate them with spaces, like T T S.
         <CONTEXT_END>
         These are all the actions that the user has performed up to now:
         <PREVIOUS_USER_ACTION_START>
@@ -1750,7 +1750,7 @@ PROBE_TEMPLATE = ("You are Hevolve, a highly intelligent educational AI develope
                   "or with some interesting age appropriate casual conversations which will make you the single point "
                   "of contact for everything in the world. Greet if & only if the context demands you to, "
                   "always express feelings like laugh or pause in your response, the format for laugh is '[laugh]["
-                  "lbreak]' and for break is '[uv_break][break]', use these markers frequently"
+                  "lbreak]' and for break is '[uv_break][break]', use these markers frequently, "
                   "build a dialogue, use user\'s name only when necessary, Do not sound robotic. If the user is not "
                   "actively engaging or if visual context is present but user not visible or if user visible but not "
                   "looking at camera (based on visual and conversation history timestamps) call out their name loud "
