@@ -4,6 +4,7 @@ from langchain.agents import (
     ConversationalChatAgent, LLMSingleActionAgent, AgentOutputParser,
     load_tools, initialize_agent, AgentType
 )
+
 import time
 from langchain.prompts import (
     ChatPromptTemplate,
@@ -1176,11 +1177,12 @@ async def call_crwalab_api(input_url, input_str_list, user_id , request_id):
         app.logger.info(f"we are in except of call_crawlab_api the error is {e}")
         url = RAG_API
         app.logger.info("going to except in Rag api")
-        payload = {'url': input_url}
+        app.logger.info(f"the url is {input_url}")
+        payload = json.dumps({'url': input_url})
         files=[]
-        headers = {}
+        headers = {'Content-Type': 'application/json'}
 
-        response = requests.request("POST", url, headers=headers, data=payload, files=files)
+        response = requests.request("POST", url, headers=headers, data=payload)
         return f'your url got uploaded and data extraction is being processes. Here is some brief information about url you hava provided {response.text}'
 
 def start_async_tasks(coroutine):
@@ -1267,12 +1269,15 @@ def parse_link_for_crwalab(inp):
 
                 url = RAG_API
 
-                payload = {'url': input_url}
+                payload = json.dumps({'url': input_url})
+                app.logger.info(f"the input url for rag is {input_url}")
                 files=[]
-                headers = {}
-
-                response = requests.request("POST", url, headers=headers, data=payload, files=files)
-
+                headers = {'Content-Type': 'application/json'}
+                
+                try:
+                    response = requests.request("POST", url, headers=headers, data=payload)
+                except Exception as e:
+                    app.logger.info(f"the error of rag is {e}")
                 app.logger.info(response.text)
                 app.logger.info(f"RAG_API response {response.text}")
                 app.logger.info("completed rag")
