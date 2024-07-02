@@ -14,7 +14,7 @@
     "FAV_TEACHER_API": "https://mailer.hertzai.com/get_image_by_id",
     "DREAMBOOTH_API": "http://azure_resume_parse.hertzai.com:5010",
     "STABLE_DIFF_API": "http://aws_rasa.hertzai.com:5459/txt2img",
-    "LLAVA_API": "http://azurekong.hertzai.com:8000/llava/image_inference",
+    "LLAVA_API": "http://azure_all_vms.hertzai.com:5000/image_inference",
     "CRAWLAB_API": "https://azurekong.hertzai.com:8443/crawlab/process_link",
     "BOOKPARSING_API": "http://aws_pipelinevm.hertzai.com:5454/book_parsing_upload_api",
     "RAG_API" : "http://llava2_aws.hertzai.com:5005/get_ans"
