@@ -1390,7 +1390,7 @@ def parse_link_for_crwalab(inp):
 
 
 redis_client = redis.StrictRedis(
-    host='aws_ttsenglish.hertzai.com', port=6379, db=0)
+    host='azure_all_vms.hertzai.com', port=6369, db=0)
 
 
 def get_frame(user_id):
