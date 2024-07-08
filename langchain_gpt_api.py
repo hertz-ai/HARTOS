@@ -1395,15 +1395,20 @@ redis_client = redis.StrictRedis(
 
 def get_frame(user_id):
     serialized_frame = redis_client.get(user_id)
-    if serialized_frame is not None:
-        frame_bgr = pickle.loads(serialized_frame)
-        app.logger.info(f"Frame for user_id {user_id} retrieved successfully.")
-        frame = frame_bgr[:, :, ::-1]
-        return frame
-    else:
-        app.logger.info(f"No frame found for user_id {user_id}.")
-        return None
-
+    try:
+        if serialized_frame is not None:
+            frame_bgr = pickle.loads(serialized_frame)
+            app.logger.info(f"Frame for user_id {user_id} retrieved successfully.")
+            frame = frame_bgr[:, :, ::-1]
+            return frame
+        else:
+            app.logger.info(f"No frame found for user_id {user_id}.")
+            return None
+    except ModuleNotFoundError as e:
+        app.logger.info("ModuleNotFoundError: %s", "Numpy errr", exc_info=True)
+        app.logger.info("Numpy version: %s", np.__version__)
+        app.logger.info("Numpy location: %s", np.__file__)
+        raise e
 
 def parse_visual_context(inp: str):
     user_id = thread_local_data.get_user_id()
