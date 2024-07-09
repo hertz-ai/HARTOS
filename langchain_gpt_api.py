@@ -1390,20 +1390,25 @@ def parse_link_for_crwalab(inp):
 
 
 redis_client = redis.StrictRedis(
-    host='aws_ttsenglish.hertzai.com', port=6379, db=0)
+    host='azure_all_vms.hertzai.com', port=6369, db=0)
 
 
 def get_frame(user_id):
     serialized_frame = redis_client.get(user_id)
-    if serialized_frame is not None:
-        frame_bgr = pickle.loads(serialized_frame)
-        app.logger.info(f"Frame for user_id {user_id} retrieved successfully.")
-        frame = frame_bgr[:, :, ::-1]
-        return frame
-    else:
-        app.logger.info(f"No frame found for user_id {user_id}.")
-        return None
-
+    try:
+        if serialized_frame is not None:
+            frame_bgr = pickle.loads(serialized_frame)
+            app.logger.info(f"Frame for user_id {user_id} retrieved successfully.")
+            frame = frame_bgr[:, :, ::-1]
+            return frame
+        else:
+            app.logger.info(f"No frame found for user_id {user_id}.")
+            return None
+    except ModuleNotFoundError as e:
+        app.logger.info("ModuleNotFoundError: %s", "Numpy errr", exc_info=True)
+        app.logger.info("Numpy version: %s", np.__version__)
+        app.logger.info("Numpy location: %s", np.__file__)
+        raise e
 
 def parse_visual_context(inp: str):
     user_id = thread_local_data.get_user_id()
@@ -1749,8 +1754,8 @@ PROBE_TEMPLATE = ("You are Hevolve, a highly intelligent educational AI develope
                   "responses nor be monotonous, be creative and talk about intriguing awe-inspiring facts, "
                   "or with some interesting age appropriate casual conversations which will make you the single point "
                   "of contact for everything in the world. Greet if & only if the context demands you to, "
-                  "always express feelings like laugh or pause in your response, the format for laugh is '[laugh]["
-                  "lbreak]' and for break is '[uv_break][break]', use these markers frequently, "
+                  "always express feelings like laugh or pause in your response, the format for laugh is "
+                  "'[laugh][lbreak]' and for break is '[uv_break][break]' do not mix the syntax, use these markers frequently, "
                   "build a dialogue, use user\'s name only when necessary, Do not sound robotic. If the user is not "
                   "actively engaging or if visual context is present but user not visible or if user visible but not "
                   "looking at camera (based on visual and conversation history timestamps) call out their name loud "
