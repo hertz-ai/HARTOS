@@ -5,7 +5,7 @@
     "NEWS_API_KEY" : "291350f6b8fd4df982f343888a4cabd5",
     "SERPAPI_API_KEY": "15916f6b8a0a976ab7f92ed1c4e3bc9bb40c73b40404ad2bbf219c5091394cb0",
     "ZEP_API_KEY": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.J8GYPZN-tVnkiTnS5tyjpQ9FdohZKZo_s5CgasXOqSU",
-    "ZEP_API_URL": "http://aws_ttsenglish.hertzai.com:8000",
+    "ZEP_API_URL": "http://aws_vtoonify.hertzai.com:8000",
     "DB_URL": "https://mailer.hertzai.com",
     "VM_IP": "http://azure_langchaingpt.hertzai.com",
     "GPT_API": "http://aws_rasa.hertzai.com:5459/gpt-json",
