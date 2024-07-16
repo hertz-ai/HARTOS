@@ -1425,7 +1425,7 @@ def parse_visual_context(inp: str):
         image = Image.fromarray(frame)
         # Save the image
         image.save(image_path)
-        url = "http://20.193.147.18:9890/upload"
+        url = "http://azurekong.hertzai.com:8000/minicpm/upload"
         payload = {
             'prompt': f'Instruction: Respond in second person point of view\ninput:-{inp}'}
         files = [
