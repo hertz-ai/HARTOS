@@ -631,7 +631,6 @@ class CustomGPT(LLM):
             #     checker = 1
             try:
                 start = time.time()
-
                 response = requests.post(
                     GPT_API,
                     json={
