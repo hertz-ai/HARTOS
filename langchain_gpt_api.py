@@ -6,6 +6,7 @@ from langchain.agents import (
     ConversationalChatAgent, LLMSingleActionAgent, AgentOutputParser,
     load_tools, initialize_agent, AgentType
 )
+
 import time
 from langchain.prompts import (
     ChatPromptTemplate,
@@ -206,6 +207,7 @@ def create_prompt(tools):
         You are designed to answer questions, provide revisions, conduct assessments, teach various topics, create personalised curriculum and assist with research for both students and working professionals.
         Your expertise draws from various knowledge sources like books, websites, and white papers. Your responses will be conveyed to the user through a video, using an avatar and text-to-speech technology, and can be translated into various languages.
         Consider the user's location, time and context of previous dialogues with time to create a proper prompt for tools and follow up in-context questions.You have ability to see using Visual_Context_Camera tool.
+        If your response contains abbreviated words, please separate them with spaces, like T T S.
         <CONTEXT_END>
         These are all the actions that the user has performed up to now:
         <PREVIOUS_USER_ACTION_START>
@@ -401,11 +403,11 @@ def get_tools(req_tool, is_first: bool = False):
                 func=parse_text_to_image,
                 description="Based on user query generate visual representation of text. Extract prompt from user query and use it as input for function"
             ),
-            # Tool(
-            #     name="Animate_Character",
-            #     func=parse_character_animation,
-            #     description='''Use this tool exclusively for animating the selected AI character or teacher as requested by the user; it is not intended for general requests or for animating random images or individuals other than AI teacher avatars. The user should specify their animation request in a query, e.g. 'Show me yourself in a spacesuit' or 'Animate yourself as a person riding a bike.' Once the request is made, the tool will generate the animation and return an URL link to the user that directs them to the animated image. This tool should not be used for general image generation tasks that don't pertain to animating the user's chosen character or teacher. For example, if a user queries 'Show me dancing in the rain,' and they have previously selected a specific character or teacher, the tool should be used to generate this animated scenario. However, if the user's request is something like 'Generate an image of a sunset,' which does not directly involve animating the selected character or teacher, then this tool should not be used.'''
-            # ),
+            Tool(
+                name="Animate_Character",
+                func=parse_character_animation,
+                description='''Use this tool exclusively for animating the selected AI character or teacher as requested by the user; it is not intended for general requests or for animating random images or individuals other than AI teacher avatars. The user should specify their animation request in a query, e.g. 'Show me yourself in a spacesuit' or 'Animate yourself as a person riding a bike.' Once the request is made, the tool will generate the animation and return an URL link to the user that directs them to the animated image. This tool should not be used for general image generation tasks that don't pertain to animating the user's chosen character or teacher. For example, if a user queries 'Show me dancing in the rain,' and they have previously selected a specific character or teacher, the tool should be used to generate this animated scenario. However, if the user's request is something like 'Generate an image of a sunset,' which does not directly involve animating the selected character or teacher, then this tool should not be used.'''
+            ),
             Tool(
                 name="Image_Inference_Tool",
                 func=parse_image_to_text,
@@ -488,7 +490,7 @@ class CustomGPT(LLM):
                 response = requests.post(
                     GPT_API,
                     json={
-                        "model": "gpt-4o",
+                        "model": "gpt-4o-mini",
                         "data": [{"role": "user", "content": prompt}],
                         "max_token": 2000,
                         "request_id": str(thread_local_data.get_request_id())
@@ -629,11 +631,10 @@ class CustomGPT(LLM):
             #     checker = 1
             try:
                 start = time.time()
-
                 response = requests.post(
                     GPT_API,
                     json={
-                        "model": "gpt-4o",
+                        "model": "gpt-4o-mini",
                         "data": [{"role": "user", "content": prompt}],
                         "max_token": 2000,
                         "request_id": str(thread_local_data.get_request_id())
@@ -1093,21 +1094,25 @@ def parse_character_animation(string):
 
         image_name = response.json()["image_name"]
 
+        image_url = response.json()["image_url"]
+        image_response = requests.get(image_url)
+        image_content = image_response.content
+        
+        
+
         image_name = image_name.replace("vtoonify_", "", 1)
         folder_name = image_name.split(".")[0]
         inference_url = f"{DREAMBOOTH_API}/generate_images"
-        payload = json.dumps({
-            "weights_dir": f"/home/azureuser/dreambooth/diffusers/examples/dreambooth/{folder_name}_result",
-            "prompt": prompt
-        })
-        headers = {
-            'Content-Type': 'application/json'
-        }
-
-        response = requests.request(
-            "POST", inference_url, headers=headers, data=payload, timeout=180)
+        payload = {'prompt': prompt}
+        headers = {}
+        logging.info("done till here")
+        files = [
+            ('image', ('image.jpeg', image_content, 'image/jpeg'))  # Use the correct content type
+        ]
+        url = "http://20.197.30.74:8000/generate_image/"
+        response = requests.post(url, headers=headers, data=payload, files=files)
         if response.status_code == 200:
-            return response.json()["image_url"]
+            return response.json()["url"]
         else:
             post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.ANIMATE_CHARACTER.value, 'uid': thread_local_data.get_request_id(
             ), 'task_id': f"{TaskNames.ANIMATE_CHARACTER.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at dreamooth api end for re {thread_local_data.get_request_id()}'}
@@ -1117,7 +1122,9 @@ def parse_character_animation(string):
                 logging.error(
                     "Error while publish at com.hertzai.longrunning.log topic")
 
-    except:
+    except Exception as e:
+        # logging.info(f"exception {e}")
+        time.sleep(30)
         post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.TIMEOUT.value, 'task_name': TaskNames.ANIMATE_CHARACTER.value, 'uid': thread_local_data.get_request_id(
         ), 'task_id': f"{TaskNames.ANIMATE_CHARACTER.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at dreamooth api end for req_id {thread_local_data.get_request_id()} timed out'}
         try:
@@ -1335,7 +1342,6 @@ def parse_link_for_crwalab(inp):
             try:
 
                 url = RAG_API
-
                 payload = {'url': input_url}
                 files = []
                 headers = {}
@@ -1382,20 +1388,26 @@ def parse_link_for_crwalab(inp):
         pass
 
 
-redis_client = redis.StrictRedis(host='aws_ttsenglish.hertzai.com', port=6379, db=0)
+redis_client = redis.StrictRedis(
+    host='azure_all_vms.hertzai.com', port=6369, db=0)
 
 
 def get_frame(user_id):
     serialized_frame = redis_client.get(user_id)
-    if serialized_frame is not None:
-        frame_bgr = pickle.loads(serialized_frame)
-        app.logger.info(f"Frame for user_id {user_id} retrieved successfully.")
-        frame = frame_bgr[:, :, ::-1]
-        return frame
-    else:
-        app.logger.info(f"No frame found for user_id {user_id}.")
-        return None
-
+    try:
+        if serialized_frame is not None:
+            frame_bgr = pickle.loads(serialized_frame)
+            app.logger.info(f"Frame for user_id {user_id} retrieved successfully.")
+            frame = frame_bgr[:, :, ::-1]
+            return frame
+        else:
+            app.logger.info(f"No frame found for user_id {user_id}.")
+            return None
+    except ModuleNotFoundError as e:
+        app.logger.info("ModuleNotFoundError: %s", "Numpy errr", exc_info=True)
+        app.logger.info("Numpy version: %s", np.__version__)
+        app.logger.info("Numpy location: %s", np.__file__)
+        raise e
 
 def parse_visual_context(inp: str):
     user_id = thread_local_data.get_user_id()
@@ -1412,7 +1424,7 @@ def parse_visual_context(inp: str):
         image = Image.fromarray(frame)
         # Save the image
         image.save(image_path)
-        url = "http://20.193.147.18:9890/upload"
+        url = "http://azurekong.hertzai.com:8000/minicpm/upload"
         payload = {
             'prompt': f'Instruction: Respond in second person point of view\ninput:-{inp}'}
         files = [
@@ -1736,12 +1748,13 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
 Hevolve = "You are Hevolve, a highly intelligent educational AI developed by HertzAI."
 PROBE_TEMPLATE = ("You are Hevolve, a highly intelligent educational AI developed by HertzAI. Weave the conversation "
                   "history along with the Last_5_Minutes_Visual_Context if present to create a clear, engaging, "
-                  "coherent conversation flow that encourages the user to respond. Neither repeat the previous "
+                  "coherent conversation flow that encourages the user to respond. Complete your response in 130 words"
+                  "Your response should not be more than 130 words. Neither repeat the previous "
                   "responses nor be monotonous, be creative and talk about intriguing awe-inspiring facts, "
                   "or with some interesting age appropriate casual conversations which will make you the single point "
                   "of contact for everything in the world. Greet if & only if the context demands you to, "
-                  "always express feelings like laugh or pause in your response, the format for laugh is '[laugh]["
-                  "lbreak]' and for break is '[uv_break][break]', use these markers frequently"
+                  "always express feelings like laugh or pause in your response, the format for laugh is "
+                  "'[laugh][lbreak]' and for break is '[uv_break][break]' do not mix the syntax, use these markers frequently, "
                   "build a dialogue, use user\'s name only when necessary, Do not sound robotic. If the user is not "
                   "actively engaging or if visual context is present but user not visible or if user visible but not "
                   "looking at camera (based on visual and conversation history timestamps) call out their name loud "

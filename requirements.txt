@@ -85,11 +85,11 @@ mypy-extensions==1.0.0
 networkx==3.1
 nltk==3.8.1
 numexpr==2.8.4
-numpy==1.24.3
+numpy==1.25.2
 onnxruntime==1.16.3
 openai==0.27.8
 openapi-schema-pydantic==1.2.4
-opencv-python==3.4.11
+opencv-python
 orjson==3.10.1
 overrides==7.3.1
 packaging==23.2
@@ -155,4 +155,4 @@ yarl==1.9.2
 zep-python==0.32
 zipp==3.15.0
 zstandard==0.21.0
-streamlit~=1.19.0
+#streamlit~=1.19.0
