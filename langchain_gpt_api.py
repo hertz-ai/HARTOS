@@ -483,6 +483,7 @@ class CustomGPT(LLM):
 
         checker = None
         if (self.count > 1 or self.call_gpt4 == 1):
+
             try:
                 # app.logger.info(f"the prompt we are sending is {prompt}")
 
@@ -490,6 +491,7 @@ class CustomGPT(LLM):
                 response = requests.post(
                     GPT_API,
                     json={
+
                         "model": "gpt-4o-mini",
                         "data": [{"role": "user", "content": prompt}],
                         "max_token": 2000,
@@ -531,7 +533,7 @@ class CustomGPT(LLM):
                 #     # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
                 #     response_from_groq = ""
                 #     for chunk in llm.stream(prompt):
-                #         app.logger.info(chunk.content)
+                #         print(chunk.content)
                 #         app.logger.info(f"chunk in stream {chunk}")
                 #         app.logger.info(f"chunk content in straming way {chunk.content}")
                 #         response_from_groq +=chunk.content
@@ -591,7 +593,7 @@ class CustomGPT(LLM):
 
             #             response_from_groq = ""
             #             for chunk in llm.stream(prompt):
-            #                 app.logger.info(chunk.content)
+            #                 print(chunk.content)
             #                 app.logger.info(f"chunk in stream {chunk}")
             #                 app.logger.info(f"chunk content in straming way {chunk.content}")
             #                 response_from_groq +=chunk.content
@@ -634,6 +636,7 @@ class CustomGPT(LLM):
                 response = requests.post(
                     GPT_API,
                     json={
+
                         "model": "gpt-4o-mini",
                         "data": [{"role": "user", "content": prompt}],
                         "max_token": 2000,
@@ -849,6 +852,7 @@ def get_action_user_details(user_id):
             action = obj["action"]
             date = parse_date(obj["created_date"])
             gpt3_label = obj["gpt3_label"]
+
 
             if action not in action_occurrences:
                 action_occurrences[action] = [date, date]
@@ -1394,6 +1398,7 @@ redis_client = redis.StrictRedis(
 
 def get_frame(user_id):
     serialized_frame = redis_client.get(user_id)
+
     try:
         if serialized_frame is not None:
             frame_bgr = pickle.loads(serialized_frame)
@@ -1434,7 +1439,7 @@ def parse_visual_context(inp: str):
         try:
             response = requests.post(
                 url, headers=headers, data=payload, files=files)
-            app.logger.info(response.text)
+            print(response.text)
             response = response.text
 
             return response
@@ -1708,7 +1713,9 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
     )
     # prompt.input_variables
 
+
     # chat Agent
+
     llm_chain = LLMChain(
         llm=llm,
         prompt=prompt,
@@ -1769,7 +1776,7 @@ INTERMEDIATE_CONTINUATION = "You are Hevolve, a highly intelligent educational A
 
 @app.route('/chat', methods=['POST'])
 def chat():
-    # app.logger.info("hii")
+    # print("hii")
 
     start_time = time.time()
     data = request.get_json()
@@ -1803,7 +1810,7 @@ def chat():
                 app.logger.info(f"custom prompt is: {custom_prompt}")
 
         except:
-            app.logger.info(f'failed to get prompt from id:- {prompt_id}')
+            print(f'failed to get prompt from id:- {prompt_id}')
             custom_prompt = Hevolve
     elif probe:
         custom_prompt = PROBE_TEMPLATE
