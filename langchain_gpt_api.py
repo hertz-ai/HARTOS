@@ -490,7 +490,7 @@ class CustomGPT(LLM):
                 response = requests.post(
                     GPT_API,
                     json={
-                        "model": "gpt35-turbo-1106",
+                        "model": "gpt-4o-mini",
                         "data": [{"role": "user", "content": prompt}],
                         "max_token": 2000,
                         "request_id": str(thread_local_data.get_request_id())
@@ -631,11 +631,10 @@ class CustomGPT(LLM):
             #     checker = 1
             try:
                 start = time.time()
-
                 response = requests.post(
                     GPT_API,
                     json={
-                        "model": "gpt-4o",
+                        "model": "gpt-4o-mini",
                         "data": [{"role": "user", "content": prompt}],
                         "max_token": 2000,
                         "request_id": str(thread_local_data.get_request_id())
@@ -1425,7 +1424,7 @@ def parse_visual_context(inp: str):
         image = Image.fromarray(frame)
         # Save the image
         image.save(image_path)
-        url = "http://20.193.147.18:9890/upload"
+        url = "http://azurekong.hertzai.com:8000/minicpm/upload"
         payload = {
             'prompt': f'Instruction: Respond in second person point of view\ninput:-{inp}'}
         files = [
