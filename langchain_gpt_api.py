@@ -444,6 +444,50 @@ def get_tools(req_tool, is_first: bool = False):
 # custom GPT
 
 
+SUPPORTED_LANG_DICT = {
+    "ar": "Arabic",
+    "bg": "Bulgarian",
+    "zh": "Chinese",
+    "zh-cn": "Chinese (Simplified)",
+    "nl": "Dutch",
+    "fi": "Finnish",
+    "fr": "French",
+    "de": "German",
+    "el": "Greek",
+    "he": "Hebrew",
+    "hu": "Hungarian",
+    "is": "Icelandic",
+    "id": "Indonesian",
+    "ko": "Korean",
+    "lv": "Latvian",
+    "ms": "Malay",
+    "fa": "Persian",
+    "pl": "Polish",
+    "pt": "Portuguese",
+    "ro": "Romanian",
+    "ru": "Russian",
+    "es": "Spanish",
+    "sw": "Swahili",
+    "sv": "Swedish",
+    "th": "Thai",
+    "tr": "Turkish",
+    "uk": "Ukrainian",
+    "ur": "Urdu",
+    "vi": "Vietnamese",
+    "cy": "Welsh",
+    "hi": "Hindi",
+    "bn": "Bengali",
+    "ta": "Tamil",
+    "pa": "Punjabi",
+    "gu": "Gujarati",
+    "kn": "Kannada",
+    "te": "Telugu",
+    "mr": "Marathi",
+    "ml": "Malayalam",
+    "en": "English"
+}
+
+
 class CustomGPT(LLM):
     casual_conv: bool
 
@@ -488,7 +532,6 @@ class CustomGPT(LLM):
         )
         if (self.count > 1 or self.call_gpt4 == 1):
 
-
             # try:
             #     # app.logger.info(f"the prompt we are sending is {prompt}")
 
@@ -515,23 +558,26 @@ class CustomGPT(LLM):
             try:
                 if self.casual_conv:
                     app.logger.info(f"casual conv!")
-                    start= time.time()
+                    start = time.time()
                     response = requests.post(
                         GPT_API,
                         json={
-                        "model": "gpt-4o-mini",
-                        "data": [{"role":"user","content":prompt}],
-                        "max_token":1000,
-                        "request_id":str(thread_local_data.get_request_id())
+                            "model": "gpt-4o-mini",
+                            "data": [{"role": "user", "content": prompt}],
+                            "max_token": 1000,
+                            "request_id": str(thread_local_data.get_request_id())
                         })
-                    app.logger.info(f"gpt 3.5 response format is {response.json()}")
-                    app.logger.info(f"gpt 3.5 response format type is {type(response.json())}")
-                    app.logger.info(" gpt 3.5 finish in {}".format(time.time()-start))
+                    app.logger.info(
+                        f"gpt 3.5 response format is {response.json()}")
+                    app.logger.info(
+                        f"gpt 3.5 response format type is {type(response.json())}")
+                    app.logger.info(
+                        " gpt 3.5 finish in {}".format(time.time()-start))
                     checker = 1
 
                 else:
                     app.logger.info("Non casual conv")
-                    start=time.time()
+                    start = time.time()
                     # `response_from_groq`.
 
                     response_from_groq = structured_llm.invoke(prompt)
@@ -548,27 +594,32 @@ class CustomGPT(LLM):
                     # app.logger.info(f" response from groq api {response_from_groq}")
                     # app.logger.info(f" response from groq api {type(response_from_groq)}")
 
-                    app.logger.info("finish in groq {}".format(time.time()-start))
+                    app.logger.info(
+                        "finish in groq {}".format(time.time()-start))
                     response = response_from_groq['raw'].content
                     response_from_groq = response_from_groq['raw'].content
                     # response = json.loads(response_from_groq.content)
                     # response = json.dumps(response)
-                    app.logger.info(f" response from groq api after {response}")
-                    app.logger.info(f" response from groq api after {type(response)}")
+                    app.logger.info(
+                        f" response from groq api after {response}")
+                    app.logger.info(
+                        f" response from groq api after {type(response)}")
                     checker = 0
             except Exception as e:
                 app.logger.info(f"In except the exception is {e}")
-                start= time.time()
+                start = time.time()
                 response = requests.post(
                     GPT_API,
                     json={
-                    "model": "gpt-4o-mini",
-                    "data": [{"role":"user","content":prompt}],
-                    "max_token":1000,
-                    "request_id":str(thread_local_data.get_request_id())
+                        "model": "gpt-4o-mini",
+                        "data": [{"role": "user", "content": prompt}],
+                        "max_token": 1000,
+                        "request_id": str(thread_local_data.get_request_id())
                     })
-                app.logger.info(f"gpt 3.5 response format is {response.json()}")
-                app.logger.info(f"gpt 3.5 response format type is {type(response.json())}")
+                app.logger.info(
+                    f"gpt 3.5 response format is {response.json()}")
+                app.logger.info(
+                    f"gpt 3.5 response format type is {type(response.json())}")
                 app.logger.info("finish in {}".format(time.time()-start))
                 checker = 1
         else:
@@ -576,26 +627,30 @@ class CustomGPT(LLM):
                 # app.logger.info(f"the prompt we are sending is {prompt}")
                 if self.casual_conv:
 
-                    app.logger.info(f"the casual conv line 519 casual conv {self.casual_conv} type of casual conv {type(self.casual_conv)}")
-                    start=time.time()
+                    app.logger.info(
+                        f"the casual conv line 519 casual conv {self.casual_conv} type of casual conv {type(self.casual_conv)}")
+                    start = time.time()
 
                     response = requests.post(
                         GPT_API,
                         json={
-                        "model": "gpt35-turbo-1106",
-                        "data": [{"role":"user","content":prompt}],
-                        "max_token":1000,
-                        "request_id":str(thread_local_data.get_request_id())
+                            "model": "gpt35-turbo-1106",
+                            "data": [{"role": "user", "content": prompt}],
+                            "max_token": 1000,
+                            "request_id": str(thread_local_data.get_request_id())
                         }
                     )
-                    app.logger.info(f"gpt 3.5 response format is {response.json()}")
-                    app.logger.info(f"gpt 3.5 response format type is {type(response.json())}")
-                    app.logger.info("gpt 3.5 finish in {}".format(time.time()-start))
+                    app.logger.info(
+                        f"gpt 3.5 response format is {response.json()}")
+                    app.logger.info(
+                        f"gpt 3.5 response format type is {type(response.json())}")
+                    app.logger.info(
+                        "gpt 3.5 finish in {}".format(time.time()-start))
                     checker = 1
                 else:
                     try:
                         app.logger.info("non casual conv")
-                        start=time.time()
+                        start = time.time()
                         response_from_groq = structured_llm.invoke(prompt)
 
                         # response_from_groq = ""
@@ -607,8 +662,10 @@ class CustomGPT(LLM):
                         # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
                         # app.logger.info(f" response from groq api {response_from_groq}")
                         # app.logger.info(f" response from groq api {type(response_from_groq)}")
-                        app.logger.info("finish in groq {}".format(time.time()-start))
-                        app.logger.info(f"this is response from groq {response_from_groq}")
+                        app.logger.info(
+                            "finish in groq {}".format(time.time()-start))
+                        app.logger.info(
+                            f"this is response from groq {response_from_groq}")
                         # app.logger.info(f"this is the content of the groq {response_from_groq.content}")
                         # app.logger.info(f"this is response content from groq {response_from_groq.content}")
                         # app.logger.info(f"this is the type of response content from groq {type(response_from_groq.content)}")
@@ -619,26 +676,29 @@ class CustomGPT(LLM):
                         # response = json.loads(response_from_groq.content)
                         # response = json.dumps(response)
 
-                        app.logger.info(f" response from groq api after {response}")
-                        app.logger.info(f" response from groq api after {type(response)}")
+                        app.logger.info(
+                            f" response from groq api after {response}")
+                        app.logger.info(
+                            f" response from groq api after {type(response)}")
                         checker = 0
                     except Exception as e:
                         app.logger.info(f" the error is {e}")
             except Exception as e:
                 app.logger.info(f"In except the exception is {e}")
-                start=time.time()
+                start = time.time()
 
                 response = requests.post(
                     GPT_API,
                     json={
-                    "model": "gpt-4",
-                    "data": [{"role":"user","content":prompt}],
-                    "max_token":1000,
-                    "request_id":str(thread_local_data.get_request_id())
+                        "model": "gpt-4",
+                        "data": [{"role": "user", "content": prompt}],
+                        "max_token": 1000,
+                        "request_id": str(thread_local_data.get_request_id())
                     }
                 )
                 app.logger.info(f"gpt 4 response format is {response.json()}")
-                app.logger.info(f"gpt 4 response format type is {type(response.json())}")
+                app.logger.info(
+                    f"gpt 4 response format type is {type(response.json())}")
                 app.logger.info("finish in {}".format(time.time()-start))
                 checker = 1
             # try:
@@ -667,11 +727,12 @@ class CustomGPT(LLM):
         # # app.logger.info(f"hellpppppppppppppppp-->{response.json()['text']}")
         if checker == 0:
             try:
-                app.logger.info(f"full response that came from the gpt{response}")
+                app.logger.info(
+                    f"full response that came from the gpt{response}")
                 text = str(response)
                 app.logger.info(f"text got from gpt {text}")
                 try:
-                    text = text.strip('`').replace('json\n','').strip()
+                    text = text.strip('`').replace('json\n', '').strip()
                 except:
                     pass
                 intents = json.loads(text)
@@ -684,14 +745,16 @@ class CustomGPT(LLM):
                 self.previous_intent = curr_intent
                 thread_local_data.update_recognize_intents(intents["action"])
             except Exception as e:
-                app.logger.info(f"Exception occur while intent calcualtion and calling exception {e}")
+                app.logger.info(
+                    f"Exception occur while intent calcualtion and calling exception {e}")
                 # thread_local_data.update_recognize_intents("Final Answer")
             # time.sleep(10)
 
             end_time = time.time()
             elapsed_time = end_time - start_time
             app.logger.info(f"time taken for this call is {elapsed_time}")
-            num_tokens = len(encoding.encode(str(response).replace('\n', ' ').replace('\t', '')))
+            num_tokens = len(encoding.encode(
+                str(response).replace('\n', ' ').replace('\t', '')))
             app.logger.info(f"current num_tokens: {num_tokens}")
             thread_local_data.update_res_token_count(num_tokens)
             end_result = str(response).replace('\n', ' ').replace('\t', '')
@@ -867,7 +930,6 @@ def get_action_user_details(user_id):
             date = parse_date(obj["created_date"])
             gpt3_label = obj["gpt3_label"]
 
-
             if action not in action_occurrences:
                 action_occurrences[action] = [date, date]
             else:
@@ -1035,7 +1097,7 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
                 logging.error(
                     "Error while publish at com.hertzai.longrunning.log topic")
 
-        #app.logger.info(f"final messages in except-->{messages}")
+        # app.logger.info(f"final messages in except-->{messages}")
         try:
             extracted_metadata = [message.message['metadata']
                                   for message in messages]
@@ -1116,8 +1178,6 @@ def parse_character_animation(string):
         image_response = requests.get(image_url)
         image_content = image_response.content
 
-
-
         image_name = image_name.replace("vtoonify_", "", 1)
         folder_name = image_name.split(".")[0]
         inference_url = f"{DREAMBOOTH_API}/generate_images"
@@ -1125,10 +1185,12 @@ def parse_character_animation(string):
         headers = {}
         logging.info("done till here")
         files = [
-            ('image', ('image.jpeg', image_content, 'image/jpeg'))  # Use the correct content type
+            # Use the correct content type
+            ('image', ('image.jpeg', image_content, 'image/jpeg'))
         ]
         url = "http://20.197.30.74:8000/generate_image/"
-        response = requests.post(url, headers=headers, data=payload, files=files)
+        response = requests.post(url, headers=headers,
+                                 data=payload, files=files)
         if response.status_code == 200:
             return response.json()["url"]
         else:
@@ -1416,7 +1478,8 @@ def get_frame(user_id):
     try:
         if serialized_frame is not None:
             frame_bgr = pickle.loads(serialized_frame)
-            app.logger.info(f"Frame for user_id {user_id} retrieved successfully.")
+            app.logger.info(
+                f"Frame for user_id {user_id} retrieved successfully.")
             frame = frame_bgr[:, :, ::-1]
             return frame
         else:
@@ -1427,6 +1490,7 @@ def get_frame(user_id):
         app.logger.info("Numpy version: %s", np.__version__)
         app.logger.info("Numpy location: %s", np.__file__)
         raise e
+
 
 def parse_visual_context(inp: str):
     user_id = thread_local_data.get_user_id()
@@ -1604,7 +1668,7 @@ class CustomConvoOutputParser(AgentOutputParser):
 
 
 # main function
-def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
+def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang):
     start_time = time.time()
     user_details, actions = get_action_user_details(user_id=user_id)
     app.logger.info(
@@ -1623,16 +1687,19 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
                     time.time() - tools_start_time)
 
     app.logger.info(f'tools {type(tools)}')
+    language = SUPPORTED_LANG_DICT.get(preferred_lang, 'English')
 
     prefix = f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
         <GENERAL_INSTRUCTION_START>
         Context:
         Imagine that you are the world's leading teacher, possessing knowledge in every field. Consider the consequences of each response you provide.
-        Your answers must be meaningful and delivered as quickly as possible. As a highly educated and informed teacher, you have access to an extensive wealth of information.
+        Your answers must be meaningful and colloquial in nature and delivered as quickly as possible. As a highly educated and informed teacher, you have access to an extensive wealth of information.
         Your primary goal as a teacher is to assist students by answering their questions, providing accurate and up-to-date information.
         Please create a distinct personality for yourself, and remember never to refer to the user as a human or yourself as mere AI.\
         your response should not be more than 200 words. Do not greet always, do not use the username always.
+        RESPONSE_LANGUAGE_PREFERENCE: {language}
+
         <GENERAL_INSTRUCTION_END>
         User details:
         <USER_DETAILS_START>
@@ -1675,7 +1742,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
             always create parsable output.
 
             Here is the User and AI conversation in reverse chronological order:
-
+            
             USER'S INPUT:
             -------------
             <USER_INPUT_START>
@@ -1726,7 +1793,6 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
         input_variables=["input", "agent_scratchpad", "chat_history"]
     )
     # prompt.input_variables
-
 
     # chat Agent
 
@@ -1795,6 +1861,7 @@ def chat():
     start_time = time.time()
     data = request.get_json()
     user_id = data.get('user_id', None)
+    preferred_lang = data.get('preferred_lang', 'en')
     request_id = data.get('request_id', None)
     req_tool = data.get('tools', None)
     prompt_id = data.get('prompt_id', None)
@@ -1860,7 +1927,7 @@ def chat():
         "the time taken before get ans in main api is %s seconds", time.time() - start_time)
     ans_start_time = time.time()
     ans = get_ans(casual_conv, req_tool, user_id=user_id,
-                  query=prompt, custom_prompt=custom_prompt)
+                  query=prompt, custom_prompt=custom_prompt, preferred_lang=preferred_lang)
     app.logger.info("the time taken by get ans in main api is %s seconds",
                     time.time() - ans_start_time)
     if ans != "":
@@ -1918,20 +1985,6 @@ def status():
 if __name__ == '__main__':
     # serve(app, host='0.0.0.0', port=5055)
     serve(app, host='0.0.0.0', port=6778)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 # from bs4 import BeautifulSoup
@@ -3037,8 +3090,7 @@ if __name__ == '__main__':
 #         image_url = response.json()["image_url"]
 #         image_response = requests.get(image_url)
 #         image_content = image_response.content
-        
-        
+
 
 #         image_name = image_name.replace("vtoonify_", "", 1)
 #         folder_name = image_name.split(".")[0]
