@@ -1688,6 +1688,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
 
     app.logger.info(f'tools {type(tools)}')
     language = SUPPORTED_LANG_DICT.get(preferred_lang, 'English')
+    colloquial = False if language == 'English'else True
 
     prefix = f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
@@ -1739,7 +1740,11 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
             {format_instructions}
             <FORMAT_INSTRUCTION_END>
 
-            always create parsable output.
+            always create parsable output."""+f'''
+            <RESPONSE_INSTRUCTIONS_START>
+            The response should be Colloquial in nature: {colloquial}
+            The response langugae should be: {language}'''+"""
+            <RESPONSE_INSTRUCTIONS_END>
 
             Here is the User and AI conversation in reverse chronological order:
             
@@ -1766,7 +1771,11 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
             {format_instructions}
             <FORMAT_INSTRUCTION_END>
 
-            always create parsable output.
+            always create parsable output."""+f'''
+            <RESPONSE_INSTRUCTIONS_START>
+            The response should be Colloquial in nature: {colloquial}
+            The response langugae should be: {language}'''+"""
+            <RESPONSE_INSTRUCTIONS_END>
 
             Here is the User and AI conversation in reverse chronological order:
 
