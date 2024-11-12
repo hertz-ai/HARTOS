@@ -63,6 +63,8 @@ import redis
 import pickle
 from threading import Thread
 from dotenv import load_dotenv
+import autogen
+from typing import Dict, Tuple
 load_dotenv()
 # os.environ['LANGCHAIN_TRACING_V2'] = 'true'
 # os.environ['LANGCHAIN_ENDPOINT'] = 'https://api.smith.langchain.com'
@@ -1667,6 +1669,152 @@ class CustomConvoOutputParser(AgentOutputParser):
         return "conversational_chat"
 
 
+# Store user-specific agents and their chat history
+user_agents_creator: Dict[str, Tuple[autogen.AssistantAgent,
+                                     autogen.UserProxyAgent]] = {}
+
+# Store agents for each user
+user_agents: Dict[str, Tuple[autogen.ConversableAgent,
+                             autogen.ConversableAgent]] = {}
+
+
+def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]:
+    """Create new assistant and user proxy agents for a user with basic configuration."""
+    config_list = [{
+        "model": os.getenv("deployment_name"),
+        "api_type": "azure",
+        "api_key": os.getenv("azure_api_key"),
+        "base_url": os.getenv("azure_endpoint"),
+        "api_version": "2024-02-15-preview"
+    }]
+
+    # Create a basic function calling config
+    llm_config = {
+        "config_list": config_list,
+        "seed": 42
+    }
+
+    # Create the assistant agent with context awareness
+    assistant = autogen.AssistantAgent(
+        name=f"assistant_{user_id}",
+        llm_config=llm_config,
+        is_termination_msg=lambda x: True if "TERMINATE" in x.get(
+            "content") else False,
+        system_message="""You are a custom agent bot creator. Your task is to interact with the user to gather all the necessary details to create an agent. Once you have collected all the required information, you will generate a complete agent configuration.
+
+        The information you need to collect includes:
+
+        Name: The name of the agent.
+        Purpose: A brief description of the agent's purpose.
+        Flow: The operational flow of the agent.
+        Actions: The actions the agent will perform.
+        Goal: The ultimate goal of the agent.
+        Guidelines for Responses:
+
+        If you are still gathering information, your response should be formatted as: { "status": "pending", "question": "The question you want to ask" }
+        Once all the requirements are complete and you are ready to provide the agent configuration, your response should be formatted as: { "status": "completed", "name": "","Recipe":"", "purpose": "", "tools": "", "flow": { "actions": [] }, "goal": ""}
+        the recipe should be containing all the steps
+        necessary and name for it. Suggest well-documented, generalized python function(s)
+        to perform similar tasks for coding steps in future. Make sure coding steps and
+        non-coding steps are never mixed in one function. In the docstr of the function(s),
+        clarify what non-coding steps are needed to use the language skill of the assistant.
+        """
+    )
+
+    # Create the user proxy agent
+    user_proxy = autogen.UserProxyAgent(
+        name=f"user_proxy_{user_id}",
+        human_input_mode="NEVER",
+        is_termination_msg=lambda x: True if "TERMINATE" in x.get(
+            "content") else False,
+        code_execution_config={"work_dir": "coding", "use_docker": False}
+    )
+
+    return assistant, user_proxy
+
+
+def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.UserProxyAgent, message: str) -> str:
+    """Get a single response from the agent for the given message."""
+    try:
+        # Get the current chat history
+        current_chat = user_proxy.chat_messages.get(assistant.name, [])
+
+        # Create context from previous messages (last 5 messages for efficiency)
+        context = current_chat[-5:] if current_chat else []
+        context_str = "\n".join(
+            [f"{msg['role']}: {msg['content']}" for msg in context])
+
+        # Append context to the message if there's history
+        enhanced_message = message
+        if context:
+            enhanced_message = f"Previous conversation:\n{context_str}\n\nCurrent message: {message}"
+
+        # Send message and get response
+        response = user_proxy.send(
+            enhanced_message,
+            assistant,
+            request_reply=True
+        )
+
+        key = list(user_proxy.chat_messages.keys())[0]
+
+        return user_proxy.chat_messages[key][-1]['content']
+
+    except Exception as e:
+        return f"Error getting response: {str(e)}"
+
+
+def create_agents(user_id: str) -> Tuple[autogen.ConversableAgent, autogen.ConversableAgent]:
+    """Create new assistant and user agents for a given user_id"""
+
+    llm_config = {
+        "temperature": 0.7,
+        "config_list": [{
+            "model": os.getenv("deployment_name"),
+            "api_type": "azure",
+            "api_key": os.getenv("azure_api_key"),
+            "base_url": os.getenv("azure_endpoint"),
+            "api_version": "2024-02-15-preview"
+        }],
+    }
+
+    # Create assistant agent
+    assistant = autogen.ConversableAgent(
+        name=f"assistant_{user_id}",
+        llm_config=llm_config,
+        is_termination_msg=lambda x: True if "TERMINATE" in x.get(
+            "content") else False,
+        system_message="""This recipe is available for you to reuse..
+        1. Start with teaching basic words.
+            Wait for the user to confirm they have learned these words before proceeding.
+        2. Form sentences using the taught words.
+            Wait for the user to confirm they are comfortable with the sentences before moving to the next step.
+        3. Conduct a test with 5 questions on the taught content.
+            Provide a short test with 5 questions based on the taught words and sentences.
+            Collect the user's responses.
+        4. Evaluate the test.
+            Calculate the user's score.
+        5. If the score is greater than 80%, proceed to the next advanced level.
+            If the user scores more than 80%, congratulate them and move to the next advanced content.
+        6. If the score is 80% or less, reteach the same content in a different manner.
+            If the user scores 80% or less, provide a revised method to review the words and sentences.
+            Wait for the user to confirm they are ready to retake the test.
+        Note: Teach the user in conversation style for eg.'In Hindi, we say "Namaste" (नमस्ते) instead of "hello."'"""
+    )
+
+    # Create user agent
+    user = autogen.ConversableAgent(
+        name=f"user_{user_id}",
+        is_termination_msg=lambda x: True if "TERMINATE" in x.get(
+            "content") else False,
+        llm_config=None,  # User agent doesn't need LLM
+        human_input_mode="NEVER",  # We'll manually send messages
+        max_consecutive_auto_reply=1  # Limit to 1 auto reply
+    )
+
+    return user, assistant
+
+
 # main function
 def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang):
     start_time = time.time()
@@ -1848,10 +1996,7 @@ PROBE_TEMPLATE = ("You are Hevolve, a highly intelligent educational AI develope
                   "Your response should not be more than 130 words. Neither repeat the previous "
                   "responses nor be monotonous, be creative and talk about intriguing awe-inspiring facts, "
                   "or with some interesting age appropriate casual conversations which will make you the single point "
-                  "of contact for everything in the world. Greet if & only if the context demands you to, "
-                  "always express feelings like laugh or pause in your response, the format for laugh is "
-                  "'[laugh][lbreak]' and for break is '[uv_break][break]' do not mix the syntax, use these markers frequently, "
-                  "build a dialogue, use user\'s name only when necessary, Do not sound robotic. If the user is not "
+                  "of contact for everything in the world. use user\'s name only when necessary, Do not sound robotic. If the user is not "
                   "actively engaging or if visual context is present but user not visible or if user visible but not "
                   "looking at camera (based on visual and conversation history timestamps) call out their name loud "
                   "or try singing a song to bring back their attention using a SEEK_ATTENTION tool with input like a "
@@ -1874,6 +2019,8 @@ def chat():
     request_id = data.get('request_id', None)
     req_tool = data.get('tools', None)
     prompt_id = data.get('prompt_id', None)
+    create_bot = data.get('create_bot', None)
+    use_bot = data.get('use_bot', None)
     casual_conv = data.get('casual_conv', None)
     probe = data.get('probe', None)
     intermediate = data.get('intermediate', None)
@@ -1881,6 +2028,53 @@ def chat():
 
     # return ""
     thread_local_data.set_request_id(request_id=request_id)
+    if create_bot:
+        prompt = data.get('prompt', None)
+        if not user_id or not prompt:
+            return jsonify({'response': 'Need user_id and text to create agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
+
+        # Get or create agents for this user
+        if user_id not in user_agents_creator:
+            user_agents_creator[user_id] = create_agents_for_user(user_id)
+
+        assistant, user_proxy = user_agents_creator[user_id]
+
+        # Get response from the agent
+        response = get_agent_response(assistant, user_proxy, prompt)
+        try:
+            new_res = eval(response)
+            if new_res['status'] == 'pending':
+                return jsonify({'response': new_res['question'], 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
+            else:
+                print(
+                    'Agent Created Successfully saving it and reusing it for further purpose')
+                name = new_res['name'].replace(' ', '_')
+                name += '.json'
+                with open(name, "w") as json_file:
+                    json.dump(new_res, json_file)
+                print(f"Dictionary saved to {name}")
+                return jsonify({'response': 'Agent Created Successfully', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
+        except Exception as e:
+            print('GOT some error while eval and returning the response')
+            return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
+
+    if use_bot:
+        prompt = data.get('prompt', None)
+        if not user_id or not prompt:
+            return jsonify({'response': 'Need user_id and text to use agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
+        # Get or create agents for this user
+        if user_id not in user_agents:
+            user_agent, assistant_agent = create_agents(user_id)
+            user_agents[user_id] = (user_agent, assistant_agent)
+        else:
+            user_agent, assistant_agent = user_agents[user_id]
+        # Send message and get response
+        user_agent.send(prompt, assistant_agent, request_reply=True)
+
+        # Get the last message from the assistant's chat history
+        chat_history = assistant_agent.chat_messages.get(user_agent, [])
+        last_response = chat_history[-1]['content'] if chat_history else "No response"
+        return jsonify({'response': last_response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
 
     if prompt_id:
         try:
@@ -3756,10 +3950,7 @@ if __name__ == '__main__':
 #                   "Your response should not be more than 130 words. Neither repeat the previous "
 #                   "responses nor be monotonous, be creative and talk about intriguing awe-inspiring facts, "
 #                   "or with some interesting age appropriate casual conversations which will make you the single point "
-#                   "of contact for everything in the world. Greet if & only if the context demands you to, "
-#                   "always express feelings like laugh or pause in your response, the format for laugh is "
-#                   "'[laugh][lbreak]' and for break is '[uv_break][break]' do not mix the syntax, use these markers frequently, "
-#                   "build a dialogue, use user\'s name only when necessary, Do not sound robotic. If the user is not "
+#                   "of contact for everything in the world. use user\'s name only when necessary, Do not sound robotic. If the user is not "
 #                   "actively engaging or if visual context is present but user not visible or if user visible but not "
 #                   "looking at camera (based on visual and conversation history timestamps) call out their name loud "
 #                   "or try singing a song to bring back their attention using a SEEK_ATTENTION tool with input like a "
