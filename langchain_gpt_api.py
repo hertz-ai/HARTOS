@@ -1681,10 +1681,10 @@ user_agents: Dict[str, Tuple[autogen.ConversableAgent,
 def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]:
     """Create new assistant and user proxy agents for a user with basic configuration."""
     config_list = [{
-        "model": os.getenv("deployment_name"),
+        "model": 'hertzai-4o',
         "api_type": "azure",
-        "api_key": os.getenv("azure_api_key"),
-        "base_url": os.getenv("azure_endpoint"),
+        "api_key": '8f3cd49e1c3346128ba77d09ee9c824c',
+        "base_url": 'https://hertzai-gpt4.openai.azure.com/',
         "api_version": "2024-02-15-preview"
     }]
 
@@ -1764,7 +1764,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.Us
         return f"Error getting response: {str(e)}"
 
 
-def create_agents(user_id: str) -> Tuple[autogen.ConversableAgent, autogen.ConversableAgent]:
+def create_agents(user_id: str,recipe:str) -> Tuple[autogen.ConversableAgent, autogen.ConversableAgent]:
     """Create new assistant and user agents for a given user_id"""
 
     llm_config = {
@@ -1784,22 +1784,7 @@ def create_agents(user_id: str) -> Tuple[autogen.ConversableAgent, autogen.Conve
         llm_config=llm_config,
         is_termination_msg=lambda x: True if "TERMINATE" in x.get(
             "content") else False,
-        system_message="""This recipe is available for you to reuse..
-        1. Start with teaching basic words.
-            Wait for the user to confirm they have learned these words before proceeding.
-        2. Form sentences using the taught words.
-            Wait for the user to confirm they are comfortable with the sentences before moving to the next step.
-        3. Conduct a test with 5 questions on the taught content.
-            Provide a short test with 5 questions based on the taught words and sentences.
-            Collect the user's responses.
-        4. Evaluate the test.
-            Calculate the user's score.
-        5. If the score is greater than 80%, proceed to the next advanced level.
-            If the user scores more than 80%, congratulate them and move to the next advanced content.
-        6. If the score is 80% or less, reteach the same content in a different manner.
-            If the user scores 80% or less, provide a revised method to review the words and sentences.
-            Wait for the user to confirm they are ready to retake the test.
-        Note: Teach the user in conversation style for eg.'In Hindi, we say "Namaste" (नमस्ते) instead of "hello."'"""
+        system_message=recipe
     )
 
     # Create user agent
@@ -1996,7 +1981,8 @@ PROBE_TEMPLATE = ("You are Hevolve, a highly intelligent educational AI develope
                   "Your response should not be more than 130 words. Neither repeat the previous "
                   "responses nor be monotonous, be creative and talk about intriguing awe-inspiring facts, "
                   "or with some interesting age appropriate casual conversations which will make you the single point "
-                  "of contact for everything in the world. use user\'s name only when necessary, Do not sound robotic. If the user is not "
+                  "of contact for everything in the world. Greet if & only if the context demands you to, "
+                  "build a dialogue, use user\'s name only when necessary, Do not sound robotic. If the user is not "
                   "actively engaging or if visual context is present but user not visible or if user visible but not "
                   "looking at camera (based on visual and conversation history timestamps) call out their name loud "
                   "or try singing a song to bring back their attention using a SEEK_ATTENTION tool with input like a "
@@ -2019,8 +2005,7 @@ def chat():
     request_id = data.get('request_id', None)
     req_tool = data.get('tools', None)
     prompt_id = data.get('prompt_id', None)
-    create_bot = data.get('create_bot', None)
-    use_bot = data.get('use_bot', None)
+    create_agent = data.get('create_agent', None)
     casual_conv = data.get('casual_conv', None)
     probe = data.get('probe', None)
     intermediate = data.get('intermediate', None)
@@ -2028,7 +2013,7 @@ def chat():
 
     # return ""
     thread_local_data.set_request_id(request_id=request_id)
-    if create_bot:
+    if create_agent:
         prompt = data.get('prompt', None)
         if not user_id or not prompt:
             return jsonify({'response': 'Need user_id and text to create agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
@@ -2046,10 +2031,11 @@ def chat():
             if new_res['status'] == 'pending':
                 return jsonify({'response': new_res['question'], 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
             else:
+                new_res['prompt_id'] = prompt_id
+                new_res['creator_user_id'] = user_id
                 print(
                     'Agent Created Successfully saving it and reusing it for further purpose')
-                name = new_res['name'].replace(' ', '_')
-                name += '.json'
+                name = f'prompts/{prompt_id}.json'
                 with open(name, "w") as json_file:
                     json.dump(new_res, json_file)
                 print(f"Dictionary saved to {name}")
@@ -2058,13 +2044,21 @@ def chat():
             print('GOT some error while eval and returning the response')
             return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
 
-    if use_bot:
-        prompt = data.get('prompt', None)
+    if prompt_id and os.path.exists(f'prompts/{prompt_id}.json'):
+        
+        with open(f'prompts/{prompt_id}.json', "r") as file:
+            created_json = json.load(file)
+            
+            
+        prompt = created_json.get('Recipe', None)
+        if not prompt:
+            prompt = created_json.get('recipe', None)
+            
         if not user_id or not prompt:
             return jsonify({'response': 'Need user_id and text to use agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
         # Get or create agents for this user
         if user_id not in user_agents:
-            user_agent, assistant_agent = create_agents(user_id)
+            user_agent, assistant_agent = create_agents(user_id,prompt)
             user_agents[user_id] = (user_agent, assistant_agent)
         else:
             user_agent, assistant_agent = user_agents[user_id]
