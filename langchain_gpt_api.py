@@ -1715,7 +1715,7 @@ def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autoge
         Once all the requirements are complete and you are ready to provide the agent configuration, your response should be formatted as: { "status": "completed", "name": "","Recipe":"", "purpose": "", "tools": "", "flow": { "actions": [] }, "goal": ""}
         the recipe should be containing all the steps
         necessary and name for it. Suggest well-documented, generalized python function(s)
-        only if necessary if the task is achievable with python then dont give python code just give the prompt
+        only if necessary if the task is achievable without python then dont give python code just give the prompt
         to perform similar tasks for coding steps in future. Make sure coding steps and
         non-coding steps are never mixed in one function. In the docstr of the function(s),
         clarify what non-coding steps are needed to use the language skill of the assistant.
@@ -1778,6 +1778,9 @@ def create_agents(user_id: str,recipe:str) -> Tuple[autogen.ConversableAgent, au
         "api_version": "2024-02-15-preview"
     }],
     }
+    conversation = True
+    if conversation:
+        recipe = recipe+'\n Note: Wait for user confirmation to proceed after every action.'
 
     # Create assistant agent
     assistant = autogen.ConversableAgent(
