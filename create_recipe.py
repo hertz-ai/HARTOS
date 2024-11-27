@@ -3,8 +3,6 @@ from typing import Dict, Tuple
 import os
 import json
 
-from autogen.coding import DockerCommandLineCodeExecutor
-
 
 user_agents: Dict[str, Tuple[autogen.ConversableAgent, autogen.ConversableAgent]] = {}
 config_list = [{
@@ -15,11 +13,7 @@ config_list = [{
         "api_version": "2024-02-15-preview"
     }]
 
-executor_docker = DockerCommandLineCodeExecutor(
-    image="python:3.12-slim",  # Execute code using the given docker image name.
-    timeout=10,  # Timeout for each code execution in seconds.
-    work_dir='coding',  # Use the temporary directory to store the code files.
-)
+
 
 executor_config = {
     "llm_config": {
