@@ -6,10 +6,10 @@ import json
 
 user_agents: Dict[str, Tuple[autogen.ConversableAgent, autogen.ConversableAgent]] = {}
 config_list = [{
-        "model": os.getenv("deployment_name"),
+        "model": "hertzai-4o",
         "api_type": "azure",
-        "api_key": os.getenv("azure_api_key"),
-        "base_url": os.getenv("azure_endpoint"),
+        "api_key": "8f3cd49e1c3346128ba77d09ee9c824c",
+        "base_url": "https://hertzai-gpt4.openai.azure.com/",
         "api_version": "2024-02-15-preview"
     }]
 
@@ -69,12 +69,12 @@ def create_agents(user_id: str) -> Tuple[autogen.ConversableAgent, autogen.Conve
     llm_config = {
         "temperature": 0.7,
         "config_list": [{
-            "model": os.getenv("deployment_name"),
-            "api_type": "azure",
-            "api_key": os.getenv("azure_api_key"),
-            "base_url": os.getenv("azure_endpoint"),
-            "api_version": "2024-02-15-preview"
-        }],
+        "model": "hertzai-4o",
+        "api_type": "azure",
+        "api_key": "8f3cd49e1c3346128ba77d09ee9c824c",
+        "base_url": "https://hertzai-gpt4.openai.azure.com/",
+        "api_version": "2024-02-15-preview"
+    }],
     }
     
     

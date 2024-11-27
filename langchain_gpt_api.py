@@ -1965,8 +1965,8 @@ PROBE_TEMPLATE = ("You are Hevolve, a highly intelligent educational AI develope
 INTERMEDIATE_CONTINUATION = "You are Hevolve, a highly intelligent educational AI developed by HertzAI. Continue your response from where you left off in the last conversation, considering the new input as a continuation of the last request. Ensure a smooth transition from the previous response and start this response as a continuation of the previous one.\n INSTRUCTIONS: Start your response with transitional words or phrases that can be used as a continuation of the previous response."
 
 first_promts = []
-review_agents = {}
-conversation_agent = {}
+review_agents = {"10086":True}
+conversation_agent = {"10086":True}
 @app.route('/chat', methods=['POST'])
 def chat():
     # print("hii")
@@ -1979,15 +1979,16 @@ def chat():
     req_tool = data.get('tools', None)
     prompt_id = data.get('prompt_id', None)
     create_agent = data.get('create_agent', None)
-    casual_conv = data.get('casual_conv', None)
+    casual_conv = data.get('casual_conv', True)
     probe = data.get('probe', None)
     intermediate = data.get('intermediate', None)
     app.logger.info(f"casual_conv type {casual_conv}")
 
     # return ""
     thread_local_data.set_request_id(request_id=request_id)
+    prompt = data.get('prompt', None)
     if create_agent:
-        if user_id not in review_agents or review_agents[user_id] == False:
+        if user_id not in review_agents.keys() or review_agents[user_id] == False:
             review_agents[user_id] = False
             prompt = data.get('prompt', None)
             if prompt_id not in first_promts:
@@ -1999,11 +2000,16 @@ def chat():
                 return jsonify({'response': 'Need user_id and text to create agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
 
             response = gather_info(user_id,prompt)
+            response = response.replace('true','True').replace("false", "False")
+            print('AFTER GATHER INFO')
             try:
                 new_res = eval(response)
+                print('AFTER EVAL')
                 if new_res['status'] == 'pending':
+                    print('PENDING STATUS')
                     return jsonify({'response': new_res['question'], 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
                 else:
+                    print('COMPLETED STATUS')
                     new_res['prompt_id'] = prompt_id
                     new_res['creator_user_id'] = user_id
                     conversation_agent[user_id] = new_res['conversable_agent']
@@ -2017,6 +2023,7 @@ def chat():
                     return jsonify({'response': 'Review Agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
             except Exception as e:
                 print('GOT some error while eval and returning the response')
+                print(e)
                 return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
         elif review_agents[user_id] and not conversation_agent[user_id]:
             response = recipe(user_id,prompt,prompt_id)
@@ -2031,15 +2038,13 @@ def chat():
             created_json = json.load(file)
             
             
-        prompt = created_json.get('Recipe', None)
-        if not prompt:
-            prompt = created_json.get('recipe', None)
+        response = chat_agent(user_id,prompt,prompt_id)
             
-        if not user_id or not prompt:
-            return jsonify({'response': 'Need user_id and text to use agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
-        last_response = ''
+        # if not user_id or not prompt:
+        #     return jsonify({'response': 'Need user_id and text to use agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
+        # last_response = ''
         #create and user use_recipe.py
-        return jsonify({'response': last_response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
+        return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
 
     if prompt_id:
         try:
