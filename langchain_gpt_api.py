@@ -70,6 +70,7 @@ load_dotenv()
 #autogen requirements
 from gather_agentdetails import gather_info
 from create_recipe import recipe
+from reuse_recipe import chat_agent
 
 # os.environ['LANGCHAIN_TRACING_V2'] = 'true'
 # os.environ['LANGCHAIN_ENDPOINT'] = 'https://api.smith.langchain.com'
@@ -660,29 +661,13 @@ class CustomGPT(LLM):
                         start = time.time()
                         response_from_groq = structured_llm.invoke(prompt)
 
-                        # response_from_groq = ""
-                        # for chunk in llm.stream(prompt):
-                        #     print(chunk.content)
-                        #     app.logger.info(f"chunk in stream {chunk}")
-                        #     app.logger.info(f"chunk content in straming way {chunk.content}")
-                        #     response_from_groq +=chunk.content
-                        # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
-                        # app.logger.info(f" response from groq api {response_from_groq}")
-                        # app.logger.info(f" response from groq api {type(response_from_groq)}")
+                        
                         app.logger.info(
                             "finish in groq {}".format(time.time()-start))
                         app.logger.info(
                             f"this is response from groq {response_from_groq}")
-                        # app.logger.info(f"this is the content of the groq {response_from_groq.content}")
-                        # app.logger.info(f"this is response content from groq {response_from_groq.content}")
-                        # app.logger.info(f"this is the type of response content from groq {type(response_from_groq.content)}")
-                        # response = json.loads(response_from_groq.content)
                         response = response_from_groq['raw'].content
                         response_from_groq = response_from_groq['raw'].content
-
-                        # response = json.loads(response_from_groq.content)
-                        # response = json.dumps(response)
-
                         app.logger.info(
                             f" response from groq api after {response}")
                         app.logger.info(
@@ -708,30 +693,7 @@ class CustomGPT(LLM):
                     f"gpt 4 response format type is {type(response.json())}")
                 app.logger.info("finish in {}".format(time.time()-start))
                 checker = 1
-            # try:
-            #     start = time.time()
-            #     response = requests.post(
-            #         GPT_API,
-            #         json={
-
-            #             "model": "gpt-4o-mini",
-            #             "data": [{"role": "user", "content": prompt}],
-            #             "max_token": 2000,
-            #             "request_id": str(thread_local_data.get_request_id())
-            #         }
-            #     )
-            #     app.logger.info(
-            #         f"gpt 3.5 response format is {response.json()}")
-            #     app.logger.info(
-            #         f"gpt 3.5 response format type is {type(response.json())}")
-            #     app.logger.info(
-            #         "gpt 3.5 finish in {}".format(time.time()-start))
-            #     checker = 1
-            # except:
-            #     app.logger.info("gpt fail!! in line 623")
-
-        # response.raise_for_status()
-        # # app.logger.info(f"hellpppppppppppppppp-->{response.json()['text']}")
+            
         if checker == 0:
             try:
                 app.logger.info(
@@ -2004,6 +1966,7 @@ INTERMEDIATE_CONTINUATION = "You are Hevolve, a highly intelligent educational A
 
 first_promts = []
 review_agents = {}
+conversation_agent = {}
 @app.route('/chat', methods=['POST'])
 def chat():
     # print("hii")
@@ -2043,6 +2006,7 @@ def chat():
                 else:
                     new_res['prompt_id'] = prompt_id
                     new_res['creator_user_id'] = user_id
+                    conversation_agent[user_id] = new_res['conversable_agent']
                     print(
                         'Agent Created Successfully saving it and reusing it for further purpose')
                     name = f'prompts/{prompt_id}.json'
@@ -2054,8 +2018,11 @@ def chat():
             except Exception as e:
                 print('GOT some error while eval and returning the response')
                 return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
-        elif review_agents[user_id]:
-            response = recipe(user_id,prompt)
+        elif review_agents[user_id] and not conversation_agent[user_id]:
+            response = recipe(user_id,prompt,prompt_id)
+            return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
+        elif review_agents[user_id] and conversation_agent[user_id]:
+            response = chat_agent(user_id,prompt,prompt_id)
             return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
 
     if prompt_id and os.path.exists(f'prompts/{prompt_id}.json'):
