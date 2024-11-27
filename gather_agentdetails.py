@@ -34,6 +34,8 @@ def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autoge
 
         {"name": "The name of the agent",
         "goal": "The ultimate goal of the agent",
+        "conversable_agent":True/False,
+        "number_of_persona":"no of agents to be create only ask if conversable_agent is true else make it 1"
         "flows": [{"flow_name":"","actions":['string array with actions(with tool usage) to perform to reach the sub goal for this flow'],"sub_goal":"the goal for this flow"]
         }
         Guidelines for Responses:
@@ -41,7 +43,7 @@ def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autoge
         for flows, first ask number of flows and then each flow name and actions.
         If you are still gathering information, your response should be formatted as: { "status": "pending", "question": "The question you want to ask" }
         if there is any python code to run please execute and test the code first and then go to next step
-        after this you should give your response as { "status": "completed", "name": "", "tools": "", "flows": [{"flow_name", "actions": [],"sub_goal":"" }] "goal": ""}
+        after this you should give your response as { "status": "completed", "name": "","conversable_agent":bool,"number_of_persona":"" "tools": "", "flows": [{"flow_name", "actions": [],"sub_goal":"" }] "goal": ""}
         
         """
     )
@@ -60,17 +62,17 @@ def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autoge
 def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.UserProxyAgent, message: str) -> str:
     """Get a single response from the agent for the given message."""
     try:
-        # Get the current chat history
-        current_chat = user_proxy.chat_messages.get(assistant.name, [])
+        # # Get the current chat history
+        # current_chat = user_proxy.chat_messages.get(assistant.name, [])
         
-        # Create context from previous messages (last 5 messages for efficiency)
-        context = current_chat[-5:] if current_chat else []
-        context_str = "\n".join([f"{msg['role']}: {msg['content']}" for msg in context])
+        # # Create context from previous messages (last 5 messages for efficiency)
+        # context = current_chat[-5:] if current_chat else []
+        # context_str = "\n".join([f"{msg['role']}: {msg['content']}" for msg in context])
         
-        # Append context to the message if there's history
+        # # Append context to the message if there's history
         enhanced_message = message
-        if context:
-            enhanced_message = f"Previous conversation:\n{context_str}\n\nCurrent message: {message}"
+        # # if context:
+        # #     enhanced_message = f"Previous conversation:\n{context_str}\n\nCurrent message: {message}"
 
         # Send message and get response
         response = user_proxy.send(
