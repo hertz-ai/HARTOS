@@ -66,6 +66,11 @@ from dotenv import load_dotenv
 import autogen
 from typing import Dict, Tuple
 load_dotenv()
+
+#autogen requirements
+from gather_agentdetails import gather_info
+from create_recipe import recipe
+
 # os.environ['LANGCHAIN_TRACING_V2'] = 'true'
 # os.environ['LANGCHAIN_ENDPOINT'] = 'https://api.smith.langchain.com'
 # os.environ['LANGCHAIN_API_KEY'] = os.getenv("LANGCHAIN_API_KEY")
@@ -1998,6 +2003,7 @@ PROBE_TEMPLATE = ("You are Hevolve, a highly intelligent educational AI develope
 INTERMEDIATE_CONTINUATION = "You are Hevolve, a highly intelligent educational AI developed by HertzAI. Continue your response from where you left off in the last conversation, considering the new input as a continuation of the last request. Ensure a smooth transition from the previous response and start this response as a continuation of the previous one.\n INSTRUCTIONS: Start your response with transitional words or phrases that can be used as a continuation of the previous response."
 
 first_promts = []
+review_agents = {}
 @app.route('/chat', methods=['POST'])
 def chat():
     # print("hii")
@@ -2018,39 +2024,38 @@ def chat():
     # return ""
     thread_local_data.set_request_id(request_id=request_id)
     if create_agent:
-        prompt = data.get('prompt', None)
-        if prompt_id not in first_promts:
-            first_promts.append(prompt_id)
-            res = requests.get(
-                f'{DB_URL}/getprompt/?prompt_id={prompt_id}').json()
-            prompt = prompt+f" name:{res[0]['name']} goal:{res[0]['prompt']}"
-        if not user_id or not prompt:
-            return jsonify({'response': 'Need user_id and text to create agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
+        if user_id not in review_agents or review_agents[user_id] == False:
+            review_agents[user_id] = False
+            prompt = data.get('prompt', None)
+            if prompt_id not in first_promts:
+                first_promts.append(prompt_id)
+                res = requests.get(
+                    f'{DB_URL}/getprompt/?prompt_id={prompt_id}').json()
+                prompt = prompt+f" name:{res[0]['name']} goal:{res[0]['prompt']}"
+            if not user_id or not prompt:
+                return jsonify({'response': 'Need user_id and text to create agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
 
-        # Get or create agents for this user
-        if user_id not in user_agents_creator:
-            user_agents_creator[user_id] = create_agents_for_user(user_id)
-
-        assistant, user_proxy = user_agents_creator[user_id]
-
-        # Get response from the agent
-        response = get_agent_response(assistant, user_proxy, prompt)
-        try:
-            new_res = eval(response)
-            if new_res['status'] == 'pending':
-                return jsonify({'response': new_res['question'], 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
-            else:
-                new_res['prompt_id'] = prompt_id
-                new_res['creator_user_id'] = user_id
-                print(
-                    'Agent Created Successfully saving it and reusing it for further purpose')
-                name = f'prompts/{prompt_id}.json'
-                with open(name, "w") as json_file:
-                    json.dump(new_res, json_file)
-                print(f"Dictionary saved to {name}")
-                return jsonify({'response': 'Agent Created Successfully', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
-        except Exception as e:
-            print('GOT some error while eval and returning the response')
+            response = gather_info(user_id,prompt)
+            try:
+                new_res = eval(response)
+                if new_res['status'] == 'pending':
+                    return jsonify({'response': new_res['question'], 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
+                else:
+                    new_res['prompt_id'] = prompt_id
+                    new_res['creator_user_id'] = user_id
+                    print(
+                        'Agent Created Successfully saving it and reusing it for further purpose')
+                    name = f'prompts/{prompt_id}.json'
+                    with open(name, "w") as json_file:
+                        json.dump(new_res, json_file)
+                    print(f"Dictionary saved to {name}")
+                    review_agents[user_id] = True
+                    return jsonify({'response': 'Review Agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
+            except Exception as e:
+                print('GOT some error while eval and returning the response')
+                return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
+        elif review_agents[user_id]:
+            response = recipe(user_id,prompt)
             return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
 
     if prompt_id and os.path.exists(f'prompts/{prompt_id}.json'):
@@ -2065,18 +2070,8 @@ def chat():
             
         if not user_id or not prompt:
             return jsonify({'response': 'Need user_id and text to use agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
-        # Get or create agents for this user
-        if user_id not in user_agents:
-            user_agent, assistant_agent = create_agents(user_id,prompt)
-            user_agents[user_id] = (user_agent, assistant_agent)
-        else:
-            user_agent, assistant_agent = user_agents[user_id]
-        # Send message and get response
-        user_agent.send(prompt, assistant_agent, request_reply=True)
-
-        # Get the last message from the assistant's chat history
-        chat_history = assistant_agent.chat_messages.get(user_agent, [])
-        last_response = chat_history[-1]['content'] if chat_history else "No response"
+        last_response = ''
+        #create and user use_recipe.py
         return jsonify({'response': last_response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
 
     if prompt_id:
