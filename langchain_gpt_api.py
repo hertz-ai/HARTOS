@@ -181,8 +181,8 @@ llm_math = LLMMathChain(llm=ChatOpenAI(model_name="gpt-3.5-turbo"))
 # llm_math = LLMMathChain(llm= ChatGroq(groq_api_key=groq_api_key,
 #                model_name = "mixtral-8x7b-32768"))
 
-llm = ChatGroq(groq_api_key=groq_api_key,
-               model_name="llama-3.1-8b-instant", temperature=0.3)
+# llm = ChatGroq(groq_api_key=groq_api_key,
+#                model_name="llama-3.1-8b-instant", temperature=0.3)
 
 # app.logger.info(llm.invoke("hi how are you?"))
 
@@ -534,10 +534,10 @@ class CustomGPT(LLM):
             # time.sleep(10)
 
         checker = None
-        structured_llm = llm.with_structured_output(
-            method="json_mode",
-            include_raw=True
-        )
+        # structured_llm = llm.with_structured_output(
+        #     method="json_mode",
+        #     include_raw=True
+        # )
         if (self.count > 1 or self.call_gpt4 == 1):
 
             # try:
@@ -586,33 +586,49 @@ class CustomGPT(LLM):
                 else:
                     app.logger.info("Non casual conv")
                     start = time.time()
-                    # `response_from_groq`.
-
-                    response_from_groq = structured_llm.invoke(prompt)
-                    # app.logger.info("groq response in streaming way")
-                    # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
-                    # response_from_groq = ""
-                    # for chunk in llm.stream(prompt):
-                    #     print(chunk.content)
-                    #     app.logger.info(f"chunk in stream {chunk}")
-                    #     app.logger.info(f"chunk content in straming way {chunk.content}")
-                    #     response_from_groq +=chunk.content
-
-                    # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
-                    # app.logger.info(f" response from groq api {response_from_groq}")
-                    # app.logger.info(f" response from groq api {type(response_from_groq)}")
-
+                    response = requests.post(
+                        GPT_API,
+                        json={
+                            "model": "gpt-4o-mini",
+                            "data": [{"role": "user", "content": prompt}],
+                            "max_token": 1000,
+                            "request_id": str(thread_local_data.get_request_id())
+                        })
                     app.logger.info(
-                        "finish in groq {}".format(time.time()-start))
-                    response = response_from_groq['raw'].content
-                    response_from_groq = response_from_groq['raw'].content
-                    # response = json.loads(response_from_groq.content)
-                    # response = json.dumps(response)
+                        f"gpt 3.5 response format is {response.json()}")
                     app.logger.info(
-                        f" response from groq api after {response}")
+                        f"gpt 3.5 response format type is {type(response.json())}")
                     app.logger.info(
-                        f" response from groq api after {type(response)}")
-                    checker = 0
+                        " gpt 3.5 finish in {}".format(time.time()-start))
+                    checker = 1
+                    
+                    # # `response_from_groq`.
+
+                    # response_from_groq = structured_llm.invoke(prompt)
+                    # # app.logger.info("groq response in streaming way")
+                    # # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+                    # # response_from_groq = ""
+                    # # for chunk in llm.stream(prompt):
+                    # #     print(chunk.content)
+                    # #     app.logger.info(f"chunk in stream {chunk}")
+                    # #     app.logger.info(f"chunk content in straming way {chunk.content}")
+                    # #     response_from_groq +=chunk.content
+
+                    # # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+                    # # app.logger.info(f" response from groq api {response_from_groq}")
+                    # # app.logger.info(f" response from groq api {type(response_from_groq)}")
+
+                    # app.logger.info(
+                    #     "finish in groq {}".format(time.time()-start))
+                    # response = response_from_groq['raw'].content
+                    # response_from_groq = response_from_groq['raw'].content
+                    # # response = json.loads(response_from_groq.content)
+                    # # response = json.dumps(response)
+                    # app.logger.info(
+                    #     f" response from groq api after {response}")
+                    # app.logger.info(
+                    #     f" response from groq api after {type(response)}")
+                    # checker = 0
             except Exception as e:
                 app.logger.info(f"In except the exception is {e}")
                 start = time.time()
@@ -642,7 +658,7 @@ class CustomGPT(LLM):
                     response = requests.post(
                         GPT_API,
                         json={
-                            "model": "gpt35-turbo-1106",
+                            "model": "gpt-4o-mini",
                             "data": [{"role": "user", "content": prompt}],
                             "max_token": 1000,
                             "request_id": str(thread_local_data.get_request_id())
@@ -659,20 +675,37 @@ class CustomGPT(LLM):
                     try:
                         app.logger.info("non casual conv")
                         start = time.time()
-                        response_from_groq = structured_llm.invoke(prompt)
+                        response = requests.post(
+                            GPT_API,
+                            json={
+                                "model": "gpt-4o-mini",
+                                "data": [{"role": "user", "content": prompt}],
+                                "max_token": 1000,
+                                "request_id": str(thread_local_data.get_request_id())
+                            }
+                        )
+                        app.logger.info(
+                            f"gpt 3.5 response format is {response.json()}")
+                        app.logger.info(
+                            f"gpt 3.5 response format type is {type(response.json())}")
+                        app.logger.info(
+                            "gpt 3.5 finish in {}".format(time.time()-start))
+                        checker = 1
+                        
+                        # response_from_groq = structured_llm.invoke(prompt)
 
                         
-                        app.logger.info(
-                            "finish in groq {}".format(time.time()-start))
-                        app.logger.info(
-                            f"this is response from groq {response_from_groq}")
-                        response = response_from_groq['raw'].content
-                        response_from_groq = response_from_groq['raw'].content
-                        app.logger.info(
-                            f" response from groq api after {response}")
-                        app.logger.info(
-                            f" response from groq api after {type(response)}")
-                        checker = 0
+                        # app.logger.info(
+                        #     "finish in groq {}".format(time.time()-start))
+                        # app.logger.info(
+                        #     f"this is response from groq {response_from_groq}")
+                        # response = response_from_groq['raw'].content
+                        # response_from_groq = response_from_groq['raw'].content
+                        # app.logger.info(
+                        #     f" response from groq api after {response}")
+                        # app.logger.info(
+                        #     f" response from groq api after {type(response)}")
+                        # checker = 0
                     except Exception as e:
                         app.logger.info(f" the error is {e}")
             except Exception as e:
@@ -682,7 +715,7 @@ class CustomGPT(LLM):
                 response = requests.post(
                     GPT_API,
                     json={
-                        "model": "gpt-4",
+                        "model": "gpt-4o-mini",
                         "data": [{"role": "user", "content": prompt}],
                         "max_token": 1000,
                         "request_id": str(thread_local_data.get_request_id())
@@ -769,6 +802,8 @@ class CustomGPT(LLM):
 
         }
 
+
+# llm = CustomGPT(casual_conv=True)
 
 class CustomAgentExecutor(AgentExecutor):
 
@@ -1014,22 +1049,26 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
 
         try:
             messages = memory.chat_memory.search(prompt, metadata=metadata)
-        except:
+            app.logger.info(f'GOT THE messages from search {messages}')
+        except Exception as e:
+            app.logger.error(
+                    f"Error while data search in zep response: {e}")
             post_dict = {'user_id': '', 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.GET_TIME_BASED_HISTORY.value, 'uid': thread_local_data.get_request_id(
             ), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': 'Exception happend at zep api end memory object found none'}
             try:
                 client.publish('com.hertzai.longrunning.log', post_dict)
             except Exception as e:
-                logging.error(
+                app.logger.error(
                     "Error while publish at com.hertzai.longrunning.log topic")
         try:
             extracted_metadata = [message.message['metadata']
                                   for message in messages]
             list_req_ids = [data.get('request_Id', None)
                             for data in extracted_metadata]
+            app.logger.info(f'GOT THE EXTRACTED METADATA AS {extracted_metadata}')
             thread_local_data.set_reqid_list(list_req_ids)
         except Exception as e:
-            app.logger.info(f"Error while getting req ids {e}")
+            app.logger.error(f"Error while getting req ids {e}")
 
         # messages = [message.dict() for message in messages]
         serialized_results = []
