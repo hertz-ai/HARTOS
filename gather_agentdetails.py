@@ -8,10 +8,10 @@ user_agents: Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]] = 
 def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]:
     """Create new assistant and user proxy agents for a user with basic configuration."""
     config_list = [{
-        "model": "hertzai-4o",
+        "model": 'hertzai-4o',
         "api_type": "azure",
-        "api_key": "8f3cd49e1c3346128ba77d09ee9c824c",
-        "base_url": "https://hertzai-gpt4.openai.azure.com/",
+        "api_key": '8f3cd49e1c3346128ba77d09ee9c824c',
+        "base_url": 'https://hertzai-gpt4.openai.azure.com/',
         "api_version": "2024-02-15-preview"
     }]
 
@@ -34,17 +34,17 @@ def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autoge
 
         {"name": "The name of the agent",
         "goal": "The ultimate goal of the agent",
-        "conversable_agent":True/False,
-        "number_of_persona":"no of agents to be create only ask if conversable_agent is true else make it 1"
+        "conversational_agent":True/False,
+        "number_of_persona":[{"name":"","description":""}] //if conversational_agent is false then by deafult it should be [{"name":"user","description":"user"}]
         "flows": [{"flow_name":"","actions":['string array with actions(with tool usage) to perform to reach the sub goal for this flow'],"sub_goal":"the goal for this flow"]
         }
         Guidelines for Responses:
 
         for flows, first ask number of flows and then each flow name and actions.
         If you are still gathering information, your response should be formatted as: { "status": "pending", "question": "The question you want to ask" }
-        if there is any python code to run please execute and test the code first and then go to next step
-        after this you should give your response as { "status": "completed", "name": "","conversable_agent":bool,"number_of_persona":"" "tools": "", "flows": [{"flow_name", "actions": [],"sub_goal":"" }] "goal": ""}
-        
+        after gettings actions please ask user that are there any more actions the user want to add
+        after reviewing you should give your response as { "status": "completed", "name": "","conversational_agent":bool,"number_of_persona":"" "tools": "", "flows": [{"flow_name", "actions": [],"sub_goal":"" }] "goal": ""}
+        before going to completed state give all the details to user so that user can review it once the response format for this should be {"status":"pending","review_details":"details here"}
         """
     )
 
@@ -58,6 +58,7 @@ def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autoge
     )
 
     return assistant, user_proxy
+
 
 def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.UserProxyAgent, message: str) -> str:
     """Get a single response from the agent for the given message."""
