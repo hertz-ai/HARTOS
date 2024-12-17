@@ -2004,8 +2004,8 @@ PROBE_TEMPLATE = ("You are Hevolve, a highly intelligent educational AI develope
 INTERMEDIATE_CONTINUATION = "You are Hevolve, a highly intelligent educational AI developed by HertzAI. Continue your response from where you left off in the last conversation, considering the new input as a continuation of the last request. Ensure a smooth transition from the previous response and start this response as a continuation of the previous one.\n INSTRUCTIONS: Start your response with transitional words or phrases that can be used as a continuation of the previous response."
 
 first_promts = []
-review_agents = {"10086":True}
-conversation_agent = {"10086":True}
+review_agents = {}
+conversation_agent = {}
 @app.route('/chat', methods=['POST'])
 def chat():
     # print("hii")
@@ -2016,6 +2016,7 @@ def chat():
     preferred_lang = data.get('preferred_lang', 'en')
     request_id = data.get('request_id', None)
     req_tool = data.get('tools', None)
+    file_id = data.get('file_id', None)
     prompt_id = data.get('prompt_id', None)
     create_agent = data.get('create_agent', None)
     casual_conv = data.get('casual_conv', True)
@@ -2046,12 +2047,13 @@ def chat():
                 print('AFTER EVAL')
                 if new_res['status'] == 'pending':
                     print('PENDING STATUS')
-                    return jsonify({'response': new_res['question'], 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
+                    ans = new_res['question'] if 'question' in new_res else new_res['review_details']
+                    return jsonify({'response': ans, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
                 else:
                     print('COMPLETED STATUS')
                     new_res['prompt_id'] = prompt_id
                     new_res['creator_user_id'] = user_id
-                    conversation_agent[user_id] = new_res['conversable_agent']
+                    conversation_agent[user_id] = False
                     print(
                         'Agent Created Successfully saving it and reusing it for further purpose')
                     name = f'prompts/{prompt_id}.json'
@@ -2065,10 +2067,12 @@ def chat():
                 print(e)
                 return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
         elif review_agents[user_id] and not conversation_agent[user_id]:
-            response = recipe(user_id,prompt,prompt_id)
+            response = recipe(user_id,prompt,prompt_id,file_id)
+            if response =='Agent Created Successfully':
+                conversation_agent[user_id] = True
             return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
         elif review_agents[user_id] and conversation_agent[user_id]:
-            response = chat_agent(user_id,prompt,prompt_id)
+            response = chat_agent(user_id,prompt,prompt_id,file_id)
             return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
 
     if prompt_id and os.path.exists(f'prompts/{prompt_id}.json'):
@@ -2077,7 +2081,7 @@ def chat():
             created_json = json.load(file)
             
             
-        response = chat_agent(user_id,prompt,prompt_id)
+        response = chat_agent(user_id,prompt,prompt_id,file_id)
             
         # if not user_id or not prompt:
         #     return jsonify({'response': 'Need user_id and text to use agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})

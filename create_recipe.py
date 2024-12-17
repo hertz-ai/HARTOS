@@ -13,6 +13,9 @@ import re
 from autogen import register_function
 import json
 
+from crossbarhttp import Client
+client = Client('http://aws_rasa.hertzai.com:8088/publish')
+
 scheduler = BackgroundScheduler()
 scheduler.start()
 
@@ -122,7 +125,7 @@ def create_agents(user_id: str,task) -> Tuple[autogen.ConversableAgent, autogen.
         Note: Your Working Directory is "/home/hertzai2019/newauto/coding/" use this if you need.
         If you need any information first ask the question and then route the request to user.
         
-        """+f"Extra Information: below are the list of actions the chat_manager is gonna give you keep this in mind but dont use this directly\n{task.actions}",
+        """+f"Extra Information: below are the list of actions the chat_manager is gonna give you keep this in mind but dont use this directly\n{user_tasks[user_id].actions}",
         is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
     )
     
@@ -201,7 +204,7 @@ def create_agents(user_id: str,task) -> Tuple[autogen.ConversableAgent, autogen.
     @helper.register_for_execution()
     @assistant.register_for_llm(api_style="function",description="Text to image Creator")
     def txt2img(text: Annotated[str, "Text to create image"]) -> str:
-        print('INSIDE TXT2IMG')
+        print('INSIDE txt2img')
         url = f"http://aws_rasa.hertzai.com:5459/txt2img?prompt={text}"
 
         payload = ""
@@ -209,6 +212,53 @@ def create_agents(user_id: str,task) -> Tuple[autogen.ConversableAgent, autogen.
 
         response = requests.post(url, headers=headers, data=payload)
         return response.json()['img_url']
+    
+    # @helper.register_for_execution()
+    # @assistant.register_for_llm(api_style="function",description="This tool will give you the file_id of user uploaded file")
+    # def get_uploaded_file() -> str:
+    #     print('INSIDE get_uploaded_file')
+    #     if user_id in recent_file_id:
+    #         return recent_file_id[user_id]
+    #     return 'No File uploaded yet'
+    
+    # @helper.register_for_execution()
+    # @assistant.register_for_llm(api_style="function",description="This tool will give you page details from file_id and page_number")
+    # def get_page_details(file_id: Annotated[str, "File_id to get page url and content from file"],page_number: Annotated[str, "Page number to get details always start with 0"]) -> str:
+    #     print('INSIDE get_page_details')
+    #     res = requests.get(
+    #         f"https://mailer.hertzai.com/get_file_by_id/{file_id}")
+    #     res = res.json()
+    #     filename = res['FileName'].split('.')[0]
+    #     image_url = f'http://azure_pipeline.hertzai.com:5454/image/output1/{filename}/page_{page_number}/_segformer/segformer_overall_Final_Image.jpg'
+        
+    #     url = f'https://mailer.hertzai.com/get_just_passagebypage/?book_name={filename}&page_start={page_number}&page_end={page_number+1}'
+    #     headers = {'Content-Type': 'application/json'}
+    #     try:
+    #         passage = requests.get(url,headers=headers).json()
+    #     except:
+    #         passage = ''
+    #     return {'page_image_url':image_url,'page_text':passage}
+    
+    
+    @helper.register_for_execution()
+    @assistant.register_for_llm(api_style="function",description="Image to Text")
+    def img2txt(image_url: Annotated[str, "image url of which you want text"],text: Annotated[str, "the details you want from image"]='Describe the Images and Text data in this image in detail') -> str:
+        print('INSIDE img2txt')
+        url = "http://azure_all_vms.hertzai.com:6066/image_inference"
+
+        payload = {
+            'url': image_url,
+            'prompt': text
+        }
+        files = []
+        headers = {}
+
+        response = requests.request(
+            "POST", url, headers=headers, data=payload, files=files, timeout=300)
+        if response.status_code == 200:
+            return response.text
+        else:
+            return 'Not able to get this page details try later'
     
     @helper.register_for_execution()
     @assistant.register_for_llm(api_style="function", description="Creates time-based jobs using APScheduler to schedule jobs")
@@ -267,6 +317,12 @@ def create_agents(user_id: str,task) -> Tuple[autogen.ConversableAgent, autogen.
                 if json_obj['status'].lower() == 'error':
                     return author
                 elif json_obj['status'].lower() == 'completed':
+                    if 'recipe' in json_obj.keys():
+                        print('Recipe created successfully')
+                        name = f'prompts/50_recipe.json'
+                        with open(name, "w") as json_file:
+                            json.dump(json_obj, json_file)
+                        print(f"Dictionary saved to {name}")
                     if 'action_id' in json_obj.keys():
                         task.actions[json_obj['action_id']-1] = json_obj['action']
                     return chat_instructor
@@ -328,12 +384,13 @@ details = { "status": "completed",
 }
 
 task = Action(details['flows'][0]['actions'])
+user_tasks = {}
 
-def get_response_group(user_id,text):
+def get_response_group(user_id,text,prompt_id):
     
     # Get or create agents for this user
     if user_id not in user_agents:
-        author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = create_agents(user_id,task)
+        author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = create_agents(user_id,user_tasks[user_id])
         user_agents[user_id] = (author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object)
         messages[user_id] = []
     else:
@@ -343,7 +400,7 @@ def get_response_group(user_id,text):
         # last_agent, last_message = manager.resume(messages=messages[user_id])
         agents_object['user'].initiate_chat(recipient=manager, message=text, clear_history=False,silent=False)
     else:
-        message = '''Chat instructor, please provide the first action.'''
+        message = '''Ask the actions to chat_instructor agent'''
         author.initiate_chat(
             manager,
             message=message,
@@ -355,11 +412,11 @@ def get_response_group(user_id,text):
         print('inside while')
         if group_chat.messages[-1]['name'] == 'chat_instructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
             print('resuming chat')
-            if task.current_action==len(task.actions):
-                task.current_action += 1
-                print(f'Save this actions as final verified actions {task.actions}')
+            if user_tasks[user_id].current_action==len(user_tasks[user_id].actions):
+                user_tasks[user_id].current_action += 1
+                print(f'Save this actions as final verified actions {user_tasks[user_id].actions}')
                 message = '''Reflect on the sequence and create a recipe containing all the necessary steps and a name for it.
-                Provide the response in JSON format as {"status":"completed","recipe": "","scheduled_tasks":[{"cron_expression":"","job_description":""}]}. 
+                Provide the response in JSON format as {"status":"completed","steps":[],"recipe": "","scheduled_tasks":[{"cron_expression":"","job_description":""}]}. 
                 The recipe should: 
                     Suggest well-documented, generalized Python function(s) to perform similar tasks for coding steps in the future.
                     Avoid storing information directly from the author in the recipe; instead, create placeholders for such variables and use them.
@@ -368,23 +425,27 @@ def get_response_group(user_id,text):
                 print(f'{message}')
                 chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
             else:
-                print(f'current action {task.current_action} and fallback {task.fallback}')
-                message = task.get_action(task.current_action)
-                if task.fallback == True:
+                print(f'current action {user_tasks[user_id].current_action} and fallback {user_tasks[user_id].fallback}')
+                message = user_tasks[user_id].get_action(user_tasks[user_id].current_action)
+                if user_tasks[user_id].fallback == True:
                     
-                    message = f" Action {task.current_action} fallback:ask user what actions should be taken if current actions fail in the future after you get the response from user give the conversaation to status_verifier"
+                    message = f" Action {user_tasks[user_id].current_action} fallback:ask user what actions should be taken if current actions fail in the future after you get the response from user give the conversaation to status_verifier"
                 else:
-                    task.current_action = task.current_action+1
-                    message = f'Action {task.current_action}: {message} '
-                task.fallback = not task.fallback
+                    user_tasks[user_id].current_action = user_tasks[user_id].current_action+1
+                    message = f'Action {user_tasks[user_id].current_action}: {message} '
+                user_tasks[user_id].fallback = not user_tasks[user_id].fallback
                 print(f'{message}')
+                crossbar_message = {"text": ["Working on "+message], "priority": 99, "action": 'Agent', "historical_request_id": [], "preffered_language": 'en-US', "options": [], "newoptions": [], "bot_type": 'Agent', "page_image_url": "", "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
+                'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0}, 'bottom_left': {'x': 0, 'y': 0}}}
+                result = client.publish(
+                    f"com.hertzai.hevolve.chat.{user_id}", crossbar_message)
                 chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
                 
         else:
             break
             
-        if task.current_action >len(task.actions):
-            print(f'current action {task.current_action} is greater than legth {len(task.actions)}')
+        if user_tasks[user_id].current_action >len(user_tasks[user_id].actions):
+            print(f'current action {user_tasks[user_id].current_action} is greater than legth {len(user_tasks[user_id].actions)}')
             break
             
             
@@ -396,13 +457,31 @@ def get_response_group(user_id,text):
     return last_message
 
 messages = {}
+recent_file_id = {}
 
-def recipe(user_id, text,prompt_id):
+def recipe(user_id, text,prompt_id,file_id):
+    if file_id:
+            recent_file_id[user_id] = file_id
+
+    if user_id not in user_tasks.keys():
+        with open(f"prompts/{prompt_id}.json", 'r') as f:
+            config = json.load(f)
+        user_tasks[user_id] = Action(config['flows'][0]['actions'])
     try:
         useagent = False
         
         last_response = get_response_group(user_id,text,prompt_id)
         
+        try:
+            json_response = eval(last_response)
+            if 'status' in json_response.keys(): 
+                if 'recipe' in json_response.keys():
+                    return 'Agent Created Successfully'
+                else:
+                    return json_response['message']
+            
+        except:
+            pass
         return last_response
         
     except Exception as e:

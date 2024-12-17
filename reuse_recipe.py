@@ -7,11 +7,15 @@ import time
 from typing_extensions import Annotated
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-
+import json
+import mimetypes
 
 # Store user-specific agents and their chat history
 user_agents: Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]] = {}
 
+scheduler = BackgroundScheduler()
+scheduler.start()
+agents_session = {}
 
 def execute_python_file(task_description:str,user_id: int):
     print('inside calling user agent at time')
@@ -27,7 +31,7 @@ def execute_python_file(task_description:str,user_id: int):
     return 'done'
 
 
-def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]:
+def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]:
     """Create new assistant and user proxy agents for a user with basic configuration."""
     config_list = [{
         "model": 'hertzai-4o',
@@ -43,19 +47,37 @@ def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autoge
         "seed": 42
     }
     
-    # Create the assistant agent with context awareness
+    personas = []
+    try:
+        with open(f"prompts/{prompt_id}.json", 'r') as f:
+            config = json.load(f)
+            personas = config['number_of_persona']
+    except Exception as e:
+        print(e)
+    if len(personas)>0: # and also check if we have record in db/agents_session to reuser
+        temp = personas.copy()
+        temp.append([])
+        
+        agent_prompt = f'''You are a Helpful Assistant follow below action's to help user
+        initiate the conversation by asking user which persona they belong to among the available personas: {personas} // give user the persona names and ask to select one
+        Actions: {recipes[prompt_id]['steps']}
+        '''
+    else:     
+        # Create the assistant agent with context awareness
+        agent_prompt = f'''You are a Helpful Assistant follow below action's to help user
+            
+            Actions: {recipes[prompt_id]['steps']}
+            '''
     assistant = autogen.AssistantAgent(
         name=f"assistant_{user_id}",
         llm_config=llm_config,
         max_consecutive_auto_reply=10,
         is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
         code_execution_config={"work_dir": "coding", "use_docker": False},
-        system_message='''You are a Helpful Assistant follow below action's to help user
-        
-        Actions: ["initiate the conversation by create an image on some topic on your own", "send the image to user", "wait for user understanding about the image", "evaluate the response", "return the actual response of what the flash card is about"]
-        time based action: ["everyday at 10:10 a give a image of a dragon to user"]
-        '''
+        system_message=agent_prompt
     )
+    
+    print(f'creating agent with propt {agent_prompt}')
 
     # Create the user proxy agent
     user_proxy = autogen.UserProxyAgent(
@@ -85,40 +107,26 @@ def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autoge
 
         response = requests.post(url, headers=headers, data=payload)
         return response.json()['img_url']
-    
+        
     @helper.register_for_execution()
-    @assistant.register_for_llm(api_style="function",description="Creates time-based tasks using APScheduler to schedule tasks")
-    def create_scheduled_tasks(
-        cron_expression: Annotated[str, "Cron expression for scheduling"],
-        task_description: Annotated[str, "Description of the task to be performed"],
-        user_id: Annotated[int, "User ID"] = 5) -> str:
-        """
-        Creates time-based tasks using APScheduler to schedule tasks
-        
-        Args:
-            cron_expression: When to run the task (e.g., "0 9 * * *" for daily at 9 AM)
-            task_description: What the AutoGen agents should discuss/accomplish
-            user_id: Identifier for the user creating the task
-        
-        Returns:
-            str: Success message or error details
-        """
+    @assistant.register_for_llm(api_style="function",description="Image to Text")
+    def img2txt(image_url: Annotated[str, "image url of which you want text"],text: Annotated[str, "the details you want from image"]='Describe the Images and Text data in this image in detail') -> str:
+        print('INSIDE img2txt')
+        url = "http://azure_all_vms.hertzai.com:6066/image_inference"
 
-        print(f'Creating scheduled task for user: {user_id}')
-        if not scheduler.running:
-            scheduler.start()
-        job_id = str(uuid.uuid4())
-        
-        try:
-            trigger = CronTrigger.from_crontab(cron_expression)
-            job_id = f"job_{int(time.time())}"
-            scheduler.add_job(execute_python_file, trigger=trigger, id=job_id,args=[task_description,user_id])
-            print('Successfully created scheduler job')
-            return 'Successfully created scheduler job'
-        except Exception as e:
-            return f"Error creating scheduled task: {str(e)}"
-        
-      
+        payload = {
+            'url': image_url,
+            'prompt': text
+        }
+        files = []
+        headers = {}
+
+        response = requests.request(
+            "POST", url, headers=headers, data=payload, files=files, timeout=300)
+        if response.status_code == 200:
+            return response.text
+        else:
+            return 'Not able to get this page details try later'
     
     @helper.register_for_execution()
     @assistant.register_for_llm(api_style="function",description="Send some text to 3rd person")
@@ -126,6 +134,57 @@ def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autoge
         print('INSIDE contact_parent')
         print(f'send this text to {person} {text}')
         return 'contacted parent successfully'
+    
+    @helper.register_for_execution()
+    @assistant.register_for_llm(api_style="function", description="Creates time-based jobs using APScheduler to schedule jobs")
+    def create_scheduled_jobs(cron_expression: Annotated[str, "Cron expression for scheduling"], 
+                            job_description: Annotated[str, "Description of the job to be performed"],
+                            user_id: Annotated[int, "User ID"] = 5) -> str:
+        print('INSIDE create_scheduled_jobs')
+        if not scheduler.running:
+            scheduler.start()
+        
+        try:
+            trigger = CronTrigger.from_crontab(cron_expression)
+            job_id = f"job_{int(time.time())}"
+            scheduler.add_job(execute_python_file, trigger=trigger, id=job_id, args=[job_description, user_id])
+            print('Successfully created scheduler job')
+            return 'Successfully created scheduler job'
+        except Exception as e:
+            print(f'Error in create_scheduled_jobs: {str(e)}')
+            return f"Error creating scheduled job: {str(e)}"
+
+    @helper.register_for_execution()
+    @assistant.register_for_llm(api_style="function",description="Upload a file and generate a downloadable URL. Accepts any file type (images, documents, etc.) and returns the download URL.")
+    def upload_file(file_path: Annotated[str, "Full path to the file you want to upload"]) -> str:
+        try:
+            # Validate file exists
+            if not os.path.exists(file_path):
+                raise FileNotFoundError(f"File not found: {file_path}")
+            # Generate unique request ID
+            request_id = str(uuid.uuid4())
+            file_name = os.path.basename(file_path)
+            mime_type = mimetypes.guess_type(file_path)[0] or 'application/octet-stream'
+            # Prepare upload request
+            url = "https://azurekong.hertzai.com:8443/makeit/upload_file"
+            payload = {
+                'request_id': request_id,
+                'agent': True
+            }
+            with open(file_path, 'rb') as file:
+                files = [
+                    ('file', (file_name, file, mime_type))
+                ]
+                response = requests.post(url, data=payload, files=files) 
+                response.raise_for_status()
+                return response.json().get('file_url', 'URL not provided in response')
+                
+        except FileNotFoundError as e:
+            raise e
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"Upload failed: {str(e)}")
+        except Exception as e:
+            raise Exception(f"Unexpected error during upload: {str(e)}")
     
 
     
@@ -135,6 +194,7 @@ def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autoge
     
     
     def state_transition(last_speaker, groupchat):
+        messages = groupchat.messages
         if last_speaker == user_proxy:
             return assistant
         if 'TERMINATE' in messages[-1]["content"].upper():
@@ -178,12 +238,29 @@ def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.Us
         return f"Error getting response: {str(e)}"
 
 
-def chat_agent(user_id,text,prompt_id):
+recent_file_id = {}
+recipes = {}
+def chat_agent(user_id,text,prompt_id,file_id):
     try:
         use_recipe = True
+        if file_id:
+            recent_file_id[user_id] = file_id
 
         # Get or create agents for this user
         if user_id not in user_agents:
+            
+            with open(f"prompts/{prompt_id}_recipe.json", 'r') as f:
+                config = json.load(f)
+                try:
+                    if 'scheduled_tasks' in config and len(config['scheduled_tasks'])>0:
+                        print('Creating scheduled tasks')
+                        trigger = CronTrigger.from_crontab(config['scheduled_tasks'][0]['cron_expression'])
+                        job_id = f"job_{int(time.time())}"
+                        scheduler.add_job(execute_python_file, trigger=trigger, id=job_id,args=[config['scheduled_tasks'][0]['job_description'],user_id])
+                        print('Successfully created scheduler job')
+                except:
+                    print('Some Error in creating scheduled tasks')
+                recipes[prompt_id] = config
             user_agents[user_id] = create_agents_for_user(user_id,prompt_id)
 
         assistant, user_proxy, group_chat, manager, helper = user_agents[user_id]

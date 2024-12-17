@@ -8,7 +8,7 @@ RUN touch /app/langchain.log
 RUN pip install --upgrade pip
 RUN pip install bs4
 RUN pip install -r requirements.txt
-RUN pip install autogen-agentchat==0.2.37
+RUN pip install autogen-agentchat==0.2.37 apscheduler
 
 EXPOSE 6777
 

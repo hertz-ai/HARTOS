@@ -1,17 +1,50 @@
 {
-  "status": "completed",
-  "name": "learn language",
-  "Recipe": "1. Initiate conversation and teach basic words.\n2. Pause to wait for the user's response.\n3. Teach sentences using the previously taught words.\n4. Pause to wait for the user's response.\n5. Ask 5 questions based on the taught material.\n6. Pause to wait for the user's response.\n7. Evaluate the user's responses.\n8. If the user scores greater than 80%, appreciate and move to the next level.\n9. If the user scores less than 80%, reteach the material using a different approach and retest.\nPython Functions:\n\ndef init_conversation(language):\n    \"\"\"\n    Initiate conversation teaching basic words in the specified language.\n\n    Non-Coding Steps:\n    1. Identify the language skill level of the user.\n    2. Select basic words relevant to the user's learning level.\n    \"\"\"\n    pass\n\n\ndef teach_sentences(words):\n    \"\"\"\n    Teach sentences using the provided words.\n\n    Non-Coding Steps:\n    1. Select sentences that incorporate the basic words.\n    2. Structure the sentences in a simple, understandable way.\n    \"\"\"\n    pass\n\n\ndef take_assessment(sentences):\n    \"\"\"\n    Ask assessment questions based on the sentences taught.\n\n    Non-Coding Steps:\n    1. Formulate questions that test the user's understanding of the material.\n    \"\"\"\n    pass\n\n\ndef evaluate_assessment(response, correct_answers):\n    \"\"\"\n    Evaluate the user's responses against the correct answers.\n\n    Non-Coding Steps:\n    1. Calculate the user's score based on correct responses.\n    \"\"\"\n    pass\n\n\ndef decision_based_on_evaluation(score):\n    \"\"\"\n    Take appropriate action based on the evaluation score.\n\n    Non-Coding Steps:\n    1. If the score is above the threshold, proceed to the next level of teaching.\n    2. If the score is below the threshold, select a different approach to reteach the material.\n    \"\"\"\n    pass\n",
-  "purpose": "To teach users the language they want to learn.",
-  "tools": "Python",
-  "flow": {
-    "actions": [
-      "teach words",
-      "teach sentences",
-      "take assessment",
-      "evaluate assessment",
-      "take appropriate decision"
-    ]
-  },
-  "goal": "Help users learn the language they desire."
+  "10077_89": [
+    {
+      "agentInstanceID": "com.hertzai.hevolve.chat.89.10077",
+      "user_id": 10077,
+      "role": "Parent",
+      "deviceID": "somestring"
+    },
+    {
+      "agentInstanceID": "com.hertzai.hevolve.chat.89.10077",
+      "user_id": 10077,
+      "role": "user",
+      "deviceID": "somenewsting" //if user is same and device id and user role is different then only create this entry
+    },
+    {
+      "agentInstanceID": "com.hertzai.hevolve.chat.89.10077",
+      "user_id": 10077,
+      "role": "Parent",
+      "deviceID": "1somestring" // if user and role are same but device id is unique crete new record
+    }
+  ],
+  "10086_80": [
+    {
+      "agentInstanceID": "com.hertzai.hevolve.chat.80.1078687",
+      "user_id": 1078687,
+      "role": "Parent",
+      "deviceID": "somestring"
+    },
+    {
+      "agentInstanceID": "com.hertzai.hevolve.chat.80.10086",
+      "user_id": 10086,
+      "role": "user",
+      "deviceID": "somenewsting" //if user is same and device id and user role is different then only create this entry
+    }
+  ],
+  "10725_80": [
+    {
+      "agentInstanceID": "com.hertzai.hevolve.chat.80.10725",
+      "user_id": 10725,
+      "role": "user",
+      "deviceID": "somenewsting" //if user is same and device id and user role is different then only create this entry
+    },
+    {
+      "agentInstanceID": "com.hertzai.hevolve.chat.80.10086",
+      "user_id": 10086,
+      "role": "Parent",
+      "deviceID": "somestring"
+    }
+  ]
 }
