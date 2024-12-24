@@ -583,13 +583,13 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         if last_message['content'] == 'TERMINATE':
             last_message = group_chat.messages[-2]
         #sending response to receiver agent
-        send_message_to_user(user_id,last_message,task_description)
+        send_message_to_user(user_id,last_message,'')
         
         text = f'The Response from main Agent: {last_message}'
         time_user.initiate_chat(time,message=text)
         key = list(time_user.chat_messages.keys())[0]
         last_message = user_proxy.chat_messages[key][-1]['content'].replace('TERMINATE','')
-        send_message_to_user(user_id,last_message,task_description)
+        send_message_to_user(user_id,last_message,'')
         
     # Register the tool signature with the assistant agent.
     time.register_for_llm(name="Connect to main agent", description="Connects time agent to main aget to perform actions which time agent cannot perform")(connect_time_main)

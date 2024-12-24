@@ -770,7 +770,7 @@ class CustomGPT(LLM):
             print("*"*500)
             app.logger.info("we are end of this class.")
 
-            return response_from_groq.replace('\n', ' ').replace('\t', '')
+            return 'response_from_groq'.replace('\n', ' ').replace('\t', '')
             # return response_from_groq.content.replace('\n', ' ').replace('\t', '')
         if checker == 1:
             try:

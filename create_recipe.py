@@ -58,7 +58,7 @@ def send_message_to_user(user_id,response,inp):
     url = 'http://aws_rasa.hertzai.com:9890/autogen_response'
     body = json.dumps({'user_id':user_id,'message':response,'inp':inp})
     headers = {'Content-Type': 'application/json'}
-    res = request.post(url,data=body,headers=headers)
+    res = requests.post(url,data=body,headers=headers)
 
 def execute_python_file(job_description:str,user_id: int):
     print('inside calling user agent at time')
