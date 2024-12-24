@@ -70,7 +70,12 @@ load_dotenv()
 #autogen requirements
 from gather_agentdetails import gather_info
 from create_recipe import recipe
-from reuse_recipe import chat_agent
+from reuse_recipe import chat_agent, crossbar_multiagent
+from autobahn.twisted.wamp import Application
+from autobahn.twisted.component import Component, run
+from twisted.internet import reactor
+from twisted.internet.defer import inlineCallbacks
+import threading
 
 # os.environ['LANGCHAIN_TRACING_V2'] = 'true'
 # os.environ['LANGCHAIN_ENDPOINT'] = 'https://api.smith.langchain.com'
@@ -2004,8 +2009,8 @@ PROBE_TEMPLATE = ("You are Hevolve, a highly intelligent educational AI develope
 INTERMEDIATE_CONTINUATION = "You are Hevolve, a highly intelligent educational AI developed by HertzAI. Continue your response from where you left off in the last conversation, considering the new input as a continuation of the last request. Ensure a smooth transition from the previous response and start this response as a continuation of the previous one.\n INSTRUCTIONS: Start your response with transitional words or phrases that can be used as a continuation of the previous response."
 
 first_promts = []
-review_agents = {}
-conversation_agent = {}
+review_agents = {"10077":True,10077:True}
+conversation_agent = {"10077":False,10077:False}
 @app.route('/chat', methods=['POST'])
 def chat():
     # print("hii")
@@ -2061,7 +2066,7 @@ def chat():
                         json.dump(new_res, json_file)
                     print(f"Dictionary saved to {name}")
                     review_agents[user_id] = True
-                    return jsonify({'response': 'Review Agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
+                    # return jsonify({'response': 'Review Agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
             except Exception as e:
                 print('GOT some error while eval and returning the response')
                 print(e)
@@ -2197,8 +2202,31 @@ def history():
 def status():
     return jsonify({'response': 'Working...'})
 
+# Crossbar/WAMP component setup
+url = "ws://aws_rasa.hertzai.com:8088/ws"
+url = os.environ.get('CBURL', url)
+realmvalue = os.environ.get('CBREALM', 'realm1')
+component = Component(transports=url, realm=realmvalue)
+@component.on_join
+@inlineCallbacks
+def joined(session, details):
+    print("session ready")
+
+    def onevent(msg):
+        print("event received:", msg)
+        crossbar_multiagent(msg)
+    try:
+        yield session.subscribe(onevent, "com.hertzai.hevolve.agent.multichat")
+        print("subscribed to topic")
+    except Exception as e:
+        print("could not subscribe to topic: {0}".format(e))
 
 if __name__ == '__main__':
-    # serve(app, host='0.0.0.0', port=5055)
-    serve(app, host='0.0.0.0', port=6777)
+    # serve(app, host='0.0.0.0', port=6777)
+    flask_thread = threading.Thread(target=lambda: serve(app, host='0.0.0.0', port=6777))
+    flask_thread.daemon = True
+    flask_thread.start()
+
+    # Run the WAMP client
+    run([component])
 
