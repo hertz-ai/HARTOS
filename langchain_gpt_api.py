@@ -68,7 +68,7 @@ from typing import Dict, Tuple
 load_dotenv()
 
 #autogen requirements
-from gather_agentdetails import gather_info
+
 from create_recipe import recipe
 from reuse_recipe import chat_agent, crossbar_multiagent
 from autobahn.twisted.wamp import Application
@@ -94,12 +94,12 @@ class RequestLogRecord(logging.LogRecord):
 # logging info
 # Use the custom log record factory
 logging.setLogRecordFactory(RequestLogRecord)
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 stream_handler = logging.StreamHandler(sys.stdout)
 handler = RotatingFileHandler('langchain.log', maxBytes=100000, backupCount=0)
 
 # Set the logging level for the file handler
-handler.setLevel(logging.DEBUG)
+handler.setLevel(logging.INFO)
 
 # Create a logging format
 req_id = thread_local_data.get_request_id()
@@ -614,7 +614,6 @@ class CustomGPT(LLM):
                     # # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
                     # # response_from_groq = ""
                     # # for chunk in llm.stream(prompt):
-                    # #     print(chunk.content)
                     # #     app.logger.info(f"chunk in stream {chunk}")
                     # #     app.logger.info(f"chunk content in straming way {chunk.content}")
                     # #     response_from_groq +=chunk.content
@@ -766,9 +765,6 @@ class CustomGPT(LLM):
             thread_local_data.update_res_token_count(num_tokens)
             end_result = str(response).replace('\n', ' ').replace('\t', '')
             app.logger.info(f"the end response is {end_result}")
-            print(f"we are end of this class.")
-            print("*"*500)
-            app.logger.info("we are end of this class.")
 
             return 'response_from_groq'.replace('\n', ' ').replace('\t', '')
             # return response_from_groq.content.replace('\n', ' ').replace('\t', '')
@@ -1530,7 +1526,7 @@ def parse_visual_context(inp: str):
         try:
             response = requests.post(
                 url, headers=headers, data=payload, files=files)
-            print(response.text)
+            app.logger.info(response.text)
             response = response.text
 
             return response
@@ -2013,7 +2009,6 @@ review_agents = {"10077":True,10077:True}
 conversation_agent = {"10077":False,10077:False}
 @app.route('/chat', methods=['POST'])
 def chat():
-    # print("hii")
 
     start_time = time.time()
     data = request.get_json()
@@ -2043,40 +2038,53 @@ def chat():
                 prompt = prompt+f" name:{res[0]['name']} goal:{res[0]['prompt']}"
             if not user_id or not prompt:
                 return jsonify({'response': 'Need user_id and text to create agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
-
+            from gather_agentdetails import gather_info
             response = gather_info(user_id,prompt)
-            response = response.replace('true','True').replace("false", "False")
-            print('AFTER GATHER INFO')
+            new_response = response.replace('true','True').replace("false", "False")
+            app.logger.info('AFTER GATHER INFO')
             try:
-                new_res = eval(response)
-                print('AFTER EVAL')
+                try:
+                    new_res = eval(new_response)
+                except Exception as e:
+                    app.logger.error(f'Got some error while will try with re match error:{e}')
+                    json_match = re.search(r'{[\s\S]*}', response)
+                    app.logger.info(f'Json match result: {json_match}')
+                    if json_match:
+                        app.logger.info(f'Inside json_match')
+                        json_part = json_match.group(0)
+                        app.logger.info(f'Before loads json_part:{json_part}')
+                        new_res = json.loads(json_part)
+                        app.logger.info(f'After loads new_res:{new_res}')
+                    else:
+                        raise 'No Json in response'
+                app.logger.info('AFTER EVAL')
                 if new_res['status'] == 'pending':
-                    print('PENDING STATUS')
+                    app.logger.info('PENDING STATUS')
                     ans = new_res['question'] if 'question' in new_res else new_res['review_details']
                     return jsonify({'response': ans, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
                 else:
-                    print('COMPLETED STATUS')
+                    app.logger.info('COMPLETED STATUS')
                     new_res['prompt_id'] = prompt_id
                     new_res['creator_user_id'] = user_id
                     conversation_agent[user_id] = False
-                    print(
+                    app.logger.info(
                         'Agent Created Successfully saving it and reusing it for further purpose')
                     name = f'prompts/{prompt_id}.json'
                     with open(name, "w") as json_file:
                         json.dump(new_res, json_file)
-                    print(f"Dictionary saved to {name}")
+                    app.logger.info(f"Dictionary saved to {name}")
                     review_agents[user_id] = True
                     # return jsonify({'response': 'Review Agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
             except Exception as e:
-                print('GOT some error while eval and returning the response')
-                print(e)
+                app.logger.error('GOT some error while eval and returning the response')
+                app.logger.error(e)
                 return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
-        elif review_agents[user_id] and not conversation_agent[user_id]:
+        if review_agents[user_id] and not conversation_agent[user_id]:
             response = recipe(user_id,prompt,prompt_id,file_id)
             if response =='Agent Created Successfully':
                 conversation_agent[user_id] = True
             return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
-        elif review_agents[user_id] and conversation_agent[user_id]:
+        if review_agents[user_id] and conversation_agent[user_id]:
             response = chat_agent(user_id,prompt,prompt_id,file_id)
             return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
 
@@ -2112,7 +2120,7 @@ def chat():
                 app.logger.info(f"custom prompt is: {custom_prompt}")
 
         except:
-            print(f'failed to get prompt from id:- {prompt_id}')
+            app.logger.error(f'failed to get prompt from id:- {prompt_id}')
             custom_prompt = Hevolve
     elif probe:
         custom_prompt = PROBE_TEMPLATE
@@ -2210,16 +2218,16 @@ component = Component(transports=url, realm=realmvalue)
 @component.on_join
 @inlineCallbacks
 def joined(session, details):
-    print("session ready")
+    app.logger.info("session ready")
 
     def onevent(msg):
-        print("event received:", msg)
+        app.logger.info("event received:", msg)
         crossbar_multiagent(msg)
     try:
         yield session.subscribe(onevent, "com.hertzai.hevolve.agent.multichat")
-        print("subscribed to topic")
+        app.logger.info("subscribed to topic")
     except Exception as e:
-        print("could not subscribe to topic: {0}".format(e))
+        app.logger.error("could not subscribe to topic: {}".format(e))
 
 if __name__ == '__main__':
     # serve(app, host='0.0.0.0', port=6777)

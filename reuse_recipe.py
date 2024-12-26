@@ -21,6 +21,7 @@ from twisted.internet.defer import inlineCallbacks
 import threading
 from autogen import ConversableAgent
 import requests
+from flask import current_app
 
 client = Client('http://aws_rasa.hertzai.com:8088/publish')
 scheduler = BackgroundScheduler()
@@ -46,9 +47,9 @@ def send_message_to_user(user_id,response,inp):
     res = requests.post(url,data=body,headers=headers)
 
 def execute_python_file(task_description:str,user_id: int):
-    print('inside calling user agent at time')
+    current_app.logger.info('inside calling user agent at time')
     if user_id not in user_agents:
-        print('user_id is not present')
+        current_app.logger.info('user_id is not present')
     else:
         assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time, time_user = user_agents[user_id]
         # author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = user_agents[user_id]
@@ -70,12 +71,12 @@ def get_frame(user_id):
     try:
         if serialized_frame is not None:
             frame_bgr = pickle.loads(serialized_frame)
-            print(
+            current_app.logger.info(
                 f"Frame for user_id {user_id} retrieved successfully.")
             frame = frame_bgr[:, :, ::-1]
             return frame
         else:
-            print(f"No frame found for user_id {user_id}.")
+            current_app.logger.info(f"No frame found for user_id {user_id}.")
             return None
     except ModuleNotFoundError as e:
         raise e
@@ -108,17 +109,17 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
 
         try:
             messages = memory.chat_memory.search(prompt, metadata=metadata)
-            print(f'GOT THE messages from search {messages}')
+            current_app.logger.info(f'GOT THE messages from search {messages}')
         except Exception as e:
-            print(f'Error: {e}')
+            current_app.logger.info(f'Error: {e}')
         try:
             extracted_metadata = [message.message['metadata']
                                   for message in messages]
             list_req_ids = [data.get('request_Id', None)
                             for data in extracted_metadata]
-            print(f'GOT THE EXTRACTED METADATA AS {extracted_metadata}')
+            current_app.logger.info(f'GOT THE EXTRACTED METADATA AS {extracted_metadata}')
         except Exception as e:
-            print(f"Error while getting req ids {e}")
+            current_app.logger.info(f"Error while getting req ids {e}")
 
         # messages = [message.dict() for message in messages]
         serialized_results = []
@@ -138,36 +139,36 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
             serialized_results.append(serialized_result)
         messages = serialized_results
         final_res = {'res_in_filter': messages}
-        print(f"final-->{final_res}")
+        current_app.logger.info(f"final-->{final_res}")
         end_time = time.time()
         elapsed_time = end_time - start_time
         return json.dumps(final_res)
     except Exception as e:
-        print(f"Exception {e}")
+        current_app.logger.info(f"Exception {e}")
         try:
             messages = memory.chat_memory.search(prompt)
         except:
-           print(f'Error: {e}')
+           current_app.logger.info(f'Error: {e}')
 
-        # print(f"final messages in except-->{messages}")
+        # current_app.logger.info(f"final messages in except-->{messages}")
         try:
             extracted_metadata = [message.message['metadata']
                                   for message in messages]
             list_req_ids = [data.get('request_Id', None)
                             for data in extracted_metadata]
         except Exception as e:
-            print(f"Error while getting req ids {e}")
+            current_app.logger.info(f"Error while getting req ids {e}")
         end_time = time.time()
         elapsed_time = end_time - start_time
-        print("time taken for zep is {elapsed_time}")
+        current_app.logger.info("time taken for zep is {elapsed_time}")
         return json.dumps({'res': [message.message['content'] for message in messages]})
 
 
 
 def execute_python_file(task_description:str,user_id: int):
-    print('inside calling user agent at time')
+    current_app.logger.info('inside calling user agent at time')
     if user_id not in user_agents:
-        print('user_id is not present')
+        current_app.logger.info('user_id is not present')
     else:
         author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = user_agents[user_id]
         current_time = datetime.now()
@@ -199,7 +200,7 @@ def create_agents_for_role(user_id: str,prompt_id):
             config = json.load(f)
             personas = config['number_of_persona']
     except Exception as e:
-        print(e)
+        current_app.logger.info(e)
     if len(personas)>0: # and also check if we have record in db/agents_session to reuser
         temp = personas.copy()
         # temp.append({"name":"user","description":"User who will use this app"})
@@ -241,11 +242,11 @@ def create_agents_for_role(user_id: str,prompt_id):
                            description: Annotated[str, "The persona description user selected"],
                            new: Annotated[bool, "Wethere it is a new chat or no"],
                            contact_number: Annotated[str, "user's contact of which we will join conversation"]) -> str:
-            print('INSIDE update_persona')
-            print(f'agents_session {agents_session}')
-            print(f'chat_joinees {chat_joinees}')
+            current_app.logger.info('INSIDE update_persona')
+            current_app.logger.info(f'agents_session {agents_session}')
+            current_app.logger.info(f'chat_joinees {chat_joinees}')
             if new:
-                print('Creating new chat')
+                current_app.logger.info('Creating new chat')
                 if f"{user_id}_{prompt_id}" not in agents_session.keys():
                     agents_session[f"{user_id}_{prompt_id}"] = [{'agentInstanceID':f'com.hertzai.hevolve.chat.{prompt_id}.{user_id}',
                                                 'user_id':user_id,'role':name,'deviceID':'something'}]
@@ -254,27 +255,27 @@ def create_agents_for_role(user_id: str,prompt_id):
                     agents_session[f"{user_id}_{prompt_id}"].append({'agentInstanceID':f'com.hertzai.hevolve.chat.{prompt_id}.{user_id}',
                                                 'user_id':user_id,'role':name,'deviceID':'something'})
                     agents_roles[f"{user_id}_{prompt_id}"][user_id] = name
-                print(f'After persona update {agents_session[f"{user_id}_{prompt_id}"]}')
+                current_app.logger.info(f'After persona update {agents_session[f"{user_id}_{prompt_id}"]}')
                 return 'terminate'
             else:
-                print('adding in existing chat')
+                current_app.logger.info('adding in existing chat')
                 if contact_number in temp_users.keys():
-                    print('user found with contact number')
+                    current_app.logger.info('user found with contact number')
                     if f"{temp_users[contact_number]}_{prompt_id}" in agents_session.keys():
-                        print('user found with contact number in agents_sessiion')
+                        current_app.logger.info('user found with contact number in agents_sessiion')
                         agents_session[f"{temp_users[contact_number]}_{prompt_id}"].append({'agentInstanceID':f'com.hertzai.hevolve.chat.{prompt_id}.{user_id}',
                                                     'user_id':user_id,'role':name,'deviceID':'something'})
                         agents_roles[f"{user_id}_{prompt_id}"][user_id] = name
-                        print('after append in agent_sessions')
+                        current_app.logger.info('after append in agent_sessions')
                         chat_joinees[user_id] = {prompt_id : temp_users[contact_number]}
                         
-                        print(f'agents_session {agents_session}')
-                        print(f'chat_joinees {chat_joinees}')
+                        current_app.logger.info(f'agents_session {agents_session}')
+                        current_app.logger.info(f'chat_joinees {chat_joinees}')
                         return 'terminate'
                     else:
                         return f'Ask the user with contact number:{contact_number} to create a new chat'
                 else:
-                    print('user found not with contact number')
+                    current_app.logger.info('user found not with contact number')
                     return f'Ask the user with contact number:{contact_number} to create a new chat'
         
         
@@ -288,7 +289,7 @@ def create_agents_for_role(user_id: str,prompt_id):
             if last_speaker == user_proxy:
                 return assistant
             if 'TERMINATE' in messages[-1]["content"].upper():
-                print('TERMINATING BECAUSE OF TERMINATE')
+                current_app.logger.info('TERMINATING BECAUSE OF TERMINATE')
                 # retrieve: action 1 -> action 2
                 return None
             return "auto"
@@ -364,7 +365,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         system_message=agent_prompt
     )
     
-    print(f'creating agent with propt {agent_prompt}')
+    current_app.logger.info(f'creating agent with propt {agent_prompt}')
 
     # Create the user proxy agent
     user_proxy = autogen.UserProxyAgent(
@@ -395,43 +396,43 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     @assistant.register_for_llm(api_style="function", description="sends message/ask questions to different roles/personas")
     def send_message_to_roles(role: Annotated[str, "the role to which the message to send"], 
                             message: Annotated[str, "The question to ask or message to send"]) -> str:
-        print('INSIDE send_message_to_roles')
+        current_app.logger.info('INSIDE send_message_to_roles')
         if f"{user_id}_{prompt_id}" in agents_session.keys():
             for i in agents_session[f"{user_id}_{prompt_id}"]:
                 if i['role'] == role:
-                    print(f'got role: {i}')
+                    current_app.logger.info(f'got role: {i}')
                     crossbar_message = i
                     crossbar_message['message'] = message
                     crossbar_message['caller_role'] = agents_roles[f"{user_id}_{prompt_id}"][user_id]
                     crossbar_message['caller_user_id'] = user_id
                     result = client.publish(
                         f"com.hertzai.hevolve.agent.multichat", crossbar_message)
-                    print('Published to chat')  
+                    current_app.logger.info('Published to chat')  
                     return 'Message sent Successfully'
             return 'Not able to send Message try again later' 
         elif user_id in chat_joinees.keys() and prompt_id in chat_joinees[user_id].keys():
-            print('contacting user with chat_joinees')
-            print(f'chat_joinees[user_id][prompt_id] {chat_joinees[user_id][prompt_id]}  prompt_id{prompt_id}')
+            current_app.logger.info('contacting user with chat_joinees')
+            current_app.logger.info(f'chat_joinees[user_id][prompt_id] {chat_joinees[user_id][prompt_id]}  prompt_id{prompt_id}')
             chat_creator_user_id = f"{chat_joinees[user_id][prompt_id]}_{prompt_id}"
-            print(f'chat_creator_user_id {chat_creator_user_id}')
+            current_app.logger.info(f'chat_creator_user_id {chat_creator_user_id}')
             for i in agents_session[f"{chat_creator_user_id}"]:
                 if i['role'] == role:
-                    print(f'got role: {i}')
+                    current_app.logger.info(f'got role: {i}')
                     crossbar_message = i
                     crossbar_message['message'] = message
                     crossbar_message['caller_role'] = agents_roles[chat_creator_user_id][user_id]
                     crossbar_message['caller_user_id'] = user_id
                     result = client.publish(
                         f"com.hertzai.hevolve.agent.multichat", crossbar_message)
-                    print(result)
-                    print('Published to chat') 
+                    current_app.logger.info(result)
+                    current_app.logger.info('Published to chat') 
                     return 'Message sent Successfully'
             return 'Not able to send Message try again later' 
     
     @helper.register_for_execution()
     @assistant.register_for_llm(api_style="function",description="Text to image Creator")
     def txt2img(text: Annotated[str, "Text to create image"]) -> str:
-        print('INSIDE TXT2IMG')
+        current_app.logger.info('INSIDE TXT2IMG')
         url = f"http://aws_rasa.hertzai.com:5459/txt2img?prompt={text}"
 
         payload = ""
@@ -443,7 +444,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     @helper.register_for_execution()
     @assistant.register_for_llm(api_style="function",description="Image to Text/Question Answering from image")
     def img2txt(image_url: Annotated[str, "image url of which you want text"],text: Annotated[str, "the details you want from image"]='Describe the Images and Text data in this image in detail') -> str:
-        print('INSIDE img2txt')
+        current_app.logger.info('INSIDE img2txt')
         url = "http://azure_all_vms.hertzai.com:6066/image_inference"
 
         payload = {
@@ -464,7 +465,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     @assistant.register_for_llm(api_style="function",description="Get user's visual information to process somethings")
     def user_camera_inp(inp: Annotated[str, "The Question to check from visual context"]) -> str:
         request_id = 'Autogent_1234'
-        print('Using Vision to answer question')
+        current_app.logger.info('Using Vision to answer question')
         frame = get_frame(str(user_id))
         if frame is not None:
             image_path = f"output_images/{user_id}_{request_id}_call.jpg"
@@ -486,17 +487,17 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
             try:
                 response = requests.post(
                     url, headers=headers, data=payload, files=files)
-                print(response.text)
+                current_app.logger.info(response.text)
                 response = response.text
 
                 return response
             except Exception as e:
-                print('ERROR: Got error in visal QA')
+                current_app.logger.info('ERROR: Got error in visal QA')
 
     @helper.register_for_execution()
     @assistant.register_for_llm(api_style="function",description="Get Chat history based on text and start and end date")
     def get_chat_history(text: Annotated[str, "Text related to which you want history"],start: Annotated[str, "start date in format %Y-%m-%dT%H:%M:%S.%fZ"],end: Annotated[str, "end date in format %Y-%m-%dT%H:%M:%S.%fZ"]) -> str:
-        print('INSIDE get_chat_history')
+        current_app.logger.info('INSIDE get_chat_history')
         return get_time_based_history(text, f'user_{user_id}', start, end)
     
     @helper.register_for_execution()
@@ -504,7 +505,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     def create_scheduled_jobs(cron_expression: Annotated[str, "Cron expression for scheduling"], 
                             job_description: Annotated[str, "Description of the job to be performed"],
                             user_id: Annotated[int, "User ID"] = 5) -> str:
-        print('INSIDE create_scheduled_jobs')
+        current_app.logger.info('INSIDE create_scheduled_jobs')
         if not scheduler.running:
             scheduler.start()
         
@@ -512,10 +513,10 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
             trigger = CronTrigger.from_crontab(cron_expression)
             job_id = f"job_{int(time.time())}"
             scheduler.add_job(execute_python_file, trigger=trigger, id=job_id, args=[job_description, user_id])
-            print('Successfully created scheduler job')
+            current_app.logger.info('Successfully created scheduler job')
             return 'Successfully created scheduler job'
         except Exception as e:
-            print(f'Error in create_scheduled_jobs: {str(e)}')
+            current_app.logger.info(f'Error in create_scheduled_jobs: {str(e)}')
             return f"Error creating scheduled job: {str(e)}"
 
     @helper.register_for_execution()
@@ -592,10 +593,10 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         send_message_to_user(user_id,last_message,'')
         
     # Register the tool signature with the assistant agent.
-    time.register_for_llm(name="Connect to main agent", description="Connects time agent to main aget to perform actions which time agent cannot perform")(connect_time_main)
+    time.register_for_llm(name="Connect_to_main_agent", description="Connects time agent to main aget to perform actions which time agent cannot perform")(connect_time_main)
 
     # Register the tool function with the user proxy agent.
-    time_user.register_for_execution(name="Connect to main agent")(connect_time_main)  
+    time_user.register_for_execution(name="Connect_to_main_agent")(connect_time_main)  
     
     assistant.description = 'Agent that is designed to do some specific tasks'
     user_proxy.description = 'Agent will act as user and perform task assigned to user'
@@ -608,7 +609,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         if last_speaker == user_proxy or last_speaker == multi_role_agent:
             return assistant
         if 'TERMINATE' in messages[-1]["content"].upper():
-            print('TERMINATING BECAUSE OF TERMINATE')
+            current_app.logger.info('TERMINATING BECAUSE OF TERMINATE')
             # retrieve: action 1 -> action 2
             return None
         return "auto"
@@ -642,13 +643,14 @@ def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.Us
         return last_message
 
     except Exception as e:
-        print(f'Got some error {e}')
+        current_app.logger.info(f'Got some error {e}')
         return f"Error getting response: {str(e)}"
 
 
 recent_file_id = {}
 recipes = {}
 def chat_agent(user_id,text,prompt_id,file_id):
+    current_app.logger.info('--'*100)
     user_message = text
     try:
         if file_id:
@@ -668,13 +670,13 @@ def chat_agent(user_id,text,prompt_id,file_id):
                     config = json.load(f)
                     try:
                         if 'scheduled_tasks' in config and len(config['scheduled_tasks'])>0:
-                            print('Creating scheduled tasks')
+                            current_app.logger.info('Creating scheduled tasks')
                             trigger = CronTrigger.from_crontab(config['scheduled_tasks'][0]['cron_expression'])
                             job_id = f"job_{int(time.time())}"
                             scheduler.add_job(execute_python_file, trigger=trigger, id=job_id,args=[config['scheduled_tasks'][0]['job_description'],user_id])
-                            print('Successfully created scheduler job')
+                            current_app.logger.info('Successfully created scheduler job')
                     except:
-                        print('Some Error in creating scheduled tasks')
+                        current_app.logger.info('Some Error in creating scheduled tasks')
                     recipes[prompt_id] = config
                 user_agents[user_id] = create_agents_for_user(user_id,prompt_id)
                 user_journey[user_id] = 'UseBot'
@@ -695,11 +697,12 @@ def chat_agent(user_id,text,prompt_id,file_id):
             response = get_agent_response(assistant, user_proxy,manager,group_chat, user_message)
             return response
     except Exception as e:
-        print(f'Some ERROR IN REUSE RECIPE {e}')
+        current_app.logger.info(f'Some ERROR IN REUSE RECIPE {e}')
         raise
     
 def crossbar_multiagent(msg):
-    print("insde crossbar_multiagent")
+    current_app.logger.info("insde crossbar_multiagent")
+    current_app.logger.info('--'*100)
     assistant, user_proxy, group_chat, manager, helper, multi_role_agent = user_agents[msg['user_id']]
     message = f"Role: {msg['caller_role']}\n Message: {msg['message']}"
     response = multi_role_agent.initiate_chat(manager, message=message,speaker_selection={"speaker": "assistant"}, clear_history=False)
