@@ -1,7 +1,7 @@
 from typing import Dict, Tuple
 import autogen
 import os
-
+from flask import current_app
 # Store user-specific agents and their chat history
 user_agents: Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]] = {}
 
@@ -35,7 +35,7 @@ def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autoge
 
         {"name": "The name of the agent",
         "goal": "The ultimate goal of the agent",
-        "broadcast_agent":True/False, // ask yes or no
+        "broadcast_agent":'yes/no', // ask yes or no
         "number_of_persona":[{"name":"the role of the person comes here","description":" description on what the person can do here"}] //if broadcast_agent is true then by deafult it should be blank [] else ask of number of persona/people involved in this agent
         "flows": [{"flow_name":"","actions":['string array with actions(with tool usage) to perform to reach the sub goal for this flow'],"sub_goal":"the goal for this flow"}]
         }
@@ -94,7 +94,8 @@ def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.Us
 
 
 def gather_info(user_id,user_message):
-    print('INSIDE GATHER INFo')
+    current_app.logger.info('INSIDE GATHER INFo')
+    current_app.logger.info('--'*100)
     try:
 
         # Get or create agents for this user
@@ -108,10 +109,10 @@ def gather_info(user_id,user_message):
 
         # Get chat history length for debugging
         # history_length = len(user_proxy.chat_messages.get(assistant.name, []))
-        print('INSIDE GATHER INFo Respponse')
+        current_app.logger.info('INSIDE GATHER INFo Respponse')
         return response
 
     except Exception as e:
-        print(f'ERROR IN GATHERING AGENTDETAILS ERROR IS:- {e}')
+        current_app.logger.error(f'ERROR IN GATHERING AGENTDETAILS ERROR IS:- {e}')
         raise
 

@@ -13,6 +13,7 @@ import re
 from autogen import register_function
 import json
 from autogen import ConversableAgent
+from flask import current_app
 
 from crossbarhttp import Client
 client = Client('http://aws_rasa.hertzai.com:8088/publish')
@@ -61,9 +62,9 @@ def send_message_to_user(user_id,response,inp):
     res = requests.post(url,data=body,headers=headers)
 
 def execute_python_file(job_description:str,user_id: int):
-    print('inside calling user agent at time')
+    current_app.logger.info('inside calling user agent at time')
     if user_id not in user_agents:
-        print('user_id is not present')
+        current_app.logger.info('user_id is not present')
     else:
         author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = user_agents[user_id]
         current_time = datetime.now()
@@ -88,7 +89,7 @@ class Action:
     def get_action(self,current_action):
         return self.actions[current_action]
 
-def create_agents(user_id: str,task) -> Tuple[autogen.ConversableAgent, autogen.ConversableAgent]:
+def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent, autogen.ConversableAgent]:
     """Create new assistant and user agents for a given user_id"""
     
     llm_config = {
@@ -225,7 +226,7 @@ def create_agents(user_id: str,task) -> Tuple[autogen.ConversableAgent, autogen.
     @helper.register_for_execution()
     @assistant.register_for_llm(api_style="function",description="Text to image Creator")
     def txt2img(text: Annotated[str, "Text to create image"]) -> str:
-        print('INSIDE txt2img')
+        current_app.logger.info('INSIDE txt2img')
         url = f"http://aws_rasa.hertzai.com:5459/txt2img?prompt={text}"
 
         payload = ""
@@ -238,7 +239,7 @@ def create_agents(user_id: str,task) -> Tuple[autogen.ConversableAgent, autogen.
     @helper.register_for_execution()
     @assistant.register_for_llm(api_style="function",description="Image to Text")
     def img2txt(image_url: Annotated[str, "image url of which you want text"],text: Annotated[str, "the details you want from image"]='Describe the Images and Text data in this image in detail') -> str:
-        print('INSIDE img2txt')
+        current_app.logger.info('INSIDE img2txt')
         url = "http://azure_all_vms.hertzai.com:6066/image_inference"
 
         payload = {
@@ -260,7 +261,7 @@ def create_agents(user_id: str,task) -> Tuple[autogen.ConversableAgent, autogen.
     def create_scheduled_jobs(cron_expression: Annotated[str, "Cron expression for scheduling"], 
                             job_description: Annotated[str, "Description of the job to be performed"],
                             user_id: Annotated[int, "User ID"] = 5) -> str:
-        print('INSIDE create_scheduled_jobs')
+        current_app.logger.info('INSIDE create_scheduled_jobs')
         if not scheduler.running:
             scheduler.start()
         
@@ -268,10 +269,10 @@ def create_agents(user_id: str,task) -> Tuple[autogen.ConversableAgent, autogen.
             trigger = CronTrigger.from_crontab(cron_expression)
             job_id = f"job_{int(time.time())}"
             scheduler.add_job(execute_python_file, trigger=trigger, id=job_id, args=[job_description, user_id])
-            print('Successfully created scheduler job')
+            current_app.logger.info('Successfully created scheduler job')
             return 'Successfully created scheduler job'
         except Exception as e:
-            print(f'Error in create_scheduled_jobs: {str(e)}')
+            current_app.logger.info(f'Error in create_scheduled_jobs: {str(e)}')
             return f"Error creating scheduled job: {str(e)}"
         
       
@@ -301,9 +302,9 @@ def create_agents(user_id: str,task) -> Tuple[autogen.ConversableAgent, autogen.
         
         try:
             json_obj = eval(messages[-1]["content"])
-            print(f'got json object {json_obj}')
+            current_app.logger.info(f'got json object {json_obj}')
         except:
-            # print('it is not a json object')
+            # current_app.logger.info('it is not a json object')
             pass
         if not json_obj:
             try:
@@ -319,11 +320,11 @@ def create_agents(user_id: str,task) -> Tuple[autogen.ConversableAgent, autogen.
                     return author
                 elif json_obj['status'].lower() == 'completed' or json_obj['status'].lower() == 'success':
                     if 'recipe' in json_obj.keys():
-                        print('Recipe created successfully')
-                        name = f'prompts/50_recipe.json'
+                        current_app.logger.info('Recipe created successfully')
+                        name = f'prompts/{prompt_id}_recipe.json'
                         with open(name, "w") as json_file:
                             json.dump(json_obj, json_file)
-                        print(f"Dictionary saved to {name}")
+                        current_app.logger.info(f"Dictionary saved to {name}")
                     if 'action_id' in json_obj.keys():
                         user_tasks[user_id].actions[json_obj['action_id']-1] = json_obj['action']
                         user_tasks[user_id].new_json.append(json_obj)
@@ -344,7 +345,7 @@ def create_agents(user_id: str,task) -> Tuple[autogen.ConversableAgent, autogen.
                 return 'auto'
         
         if 'TERMINATE' in messages[-1]["content"].upper():
-            print('TERMINATING BECAUSE OF TERMINATE')
+            current_app.logger.info('TERMINATING BECAUSE OF TERMINATE')
             # retrieve: action 1 -> action 2
             return None
         else:
@@ -352,9 +353,9 @@ def create_agents(user_id: str,task) -> Tuple[autogen.ConversableAgent, autogen.
     
     
     all_agents = [assistant, executor, author, chat_instructor,helper,verify]
-    print(f'len of agent before custom agents {len(all_agents)}')
+    current_app.logger.info(f'len of agent before custom agents {len(all_agents)}')
     all_agents.extend(custom_agents)
-    print(f'len of agent after custom agents {len(all_agents)}')
+    current_app.logger.info(f'len of agent after custom agents {len(all_agents)}')
     group_chat = autogen.GroupChat(
         agents=all_agents,
         messages=[],
@@ -399,7 +400,7 @@ def get_response_group(user_id,text,prompt_id):
     
     # Get or create agents for this user
     if user_id not in user_agents:
-        author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = create_agents(user_id,user_tasks[user_id])
+        author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = create_agents(user_id,user_tasks[user_id],prompt_id)
         user_agents[user_id] = (author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object)
         messages[user_id] = []
     else:
@@ -419,13 +420,13 @@ def get_response_group(user_id,text,prompt_id):
         chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
         
     while True:
-        print('inside while')
+        current_app.logger.info('inside while')
         if group_chat.messages[-1]['name'] == 'chat_instructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
-            # print(f"group_chat.messages[-1]['content'] {group_chat.messages[-1]['content']}")
-            print(f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content']}")
+            # current_app.logger.info(f"group_chat.messages[-1]['content'] {group_chat.messages[-1]['content']}")
+            current_app.logger.info(f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content']}")
             try:
                 json_obj = eval(group_chat.messages[-2]["content"])
-                print(f'got json object {json_obj}')
+                current_app.logger.info(f'got json object {json_obj}')
             except:
                 try:
                     json_match = re.search(r'{[\s\S]*}', messages[-1]["content"])
@@ -433,23 +434,23 @@ def get_response_group(user_id,text,prompt_id):
                         json_part = json_match.group(0)
                         json_obj = json.loads(json_part)
                 except:
-                    print('it is not a json object You should ask status verifier to give response in proper format and not move ahead to next action')
+                    current_app.logger.info('it is not a json object You should ask status verifier to give response in proper format and not move ahead to next action')
                     message = 'status_verifier Please verify the status of the action performed. Respond in the following format {"status": "status here","action": "current action","action_id": 1,"message": "message here","fallback_action": "fallback action here"}'
                     assistant_agent.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
                     continue
-            print('resuming chat')
+            current_app.logger.info('resuming chat')
             if user_tasks[user_id].current_action==len(user_tasks[user_id].actions):
                 user_tasks[user_id].new_json.append(json_obj)
                 user_tasks[user_id].current_action += 1
-                name = f'prompts/50_new.json'
+                name = f'prompts/{prompt_id}_new.json'
                 with open(name, "w") as json_file:
                     json.dump(user_tasks[user_id].new_json, json_file)
-                print('updating updated action in .json')
+                current_app.logger.info('updating updated action in .json')
                 details['flows'][0]['actions'] = user_tasks[user_id].actions
-                name = f'prompts/50.json'
+                name = f'prompts/{prompt_id}.json'
                 with open(name, "w") as json_file:
                     json.dump(details, json_file)
-                print(f'Save this actions as final verified actions {user_tasks[user_id].actions}')
+                current_app.logger.info(f'Save this actions as final verified actions {user_tasks[user_id].actions}')
                 message = '''Reflect on the sequence and create a recipe containing all the necessary steps and a name for it.
                 Provide the response in JSON format as:
                 {"status":"completed","steps":[{ "action": "Action here", "action_id": 1, "persona": "the persona this action belongs to" }],"recipe": "","scheduled_tasks":[{"cron_expression":"","job_description":""}]}. 
@@ -458,11 +459,11 @@ def get_response_group(user_id,text,prompt_id):
                     Avoid storing information directly from the author in the recipe; instead, create placeholders for such variables and use them.
                     Ensure coding steps and non-coding steps are never mixed in the same function.
                     Include detailed docstrings in the function(s) to clarify the non-coding steps required to use the assistant's language skills.'''
-                print(f'{message}')
+                current_app.logger.info(f'{message}')
                 chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
             else:
                 user_tasks[user_id].current_action = json_obj['action_id']
-                print(f'current action {user_tasks[user_id].current_action} and fallback {user_tasks[user_id].fallback}')
+                current_app.logger.info(f'current action {user_tasks[user_id].current_action} and fallback {user_tasks[user_id].fallback}')
                 user_tasks[user_id].new_json.append(json_obj)
                 message = user_tasks[user_id].get_action(user_tasks[user_id].current_action)
                 if user_tasks[user_id].fallback == True:
@@ -472,7 +473,7 @@ def get_response_group(user_id,text,prompt_id):
                     user_tasks[user_id].current_action = user_tasks[user_id].current_action+1
                     message = f'Action {user_tasks[user_id].current_action}: {message} '
                 user_tasks[user_id].fallback = not user_tasks[user_id].fallback
-                print(f'{message}')
+                current_app.logger.info(f'{message}')
                 crossbar_message = {"text": ["Working on "+message], "priority": 99, "action": 'Agent', "historical_request_id": [], "preffered_language": 'en-US', "options": [], "newoptions": [], "bot_type": 'Agent', "page_image_url": "", "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
                 'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0}, 'bottom_left': {'x': 0, 'y': 0}}}
                 result = client.publish(
@@ -483,7 +484,7 @@ def get_response_group(user_id,text,prompt_id):
             break
             
         if user_tasks[user_id].current_action >len(user_tasks[user_id].actions):
-            print(f'current action {user_tasks[user_id].current_action} is greater than legth {len(user_tasks[user_id].actions)}')
+            current_app.logger.info(f'current action {user_tasks[user_id].current_action} is greater than legth {len(user_tasks[user_id].actions)}')
             break            
 
     messages[user_id] = group_chat.messages
@@ -496,6 +497,7 @@ messages = {}
 recent_file_id = {}
 
 def recipe(user_id, text,prompt_id,file_id):
+    current_app.logger.info('--'*100)
     if file_id:
             recent_file_id[user_id] = file_id
 
@@ -520,5 +522,5 @@ def recipe(user_id, text,prompt_id,file_id):
         return last_response
         
     except Exception as e:
-        print(f"Error occurred in create Recipe: {str(e)}")  # Add logging for debugging
+        current_app.logger.info(f"Error occurred in create Recipe: {str(e)}")  # Add logging for debugging
         raise
