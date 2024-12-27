@@ -2027,6 +2027,15 @@ def chat():
     # return ""
     thread_local_data.set_request_id(request_id=request_id)
     prompt = data.get('prompt', None)
+    if prompt_id:
+        if not os.path.exists(f'prompts/{prompt_id}.json'):
+            create_agent = True
+            review_agents[user_id] = False
+        elif not os.path.exists(f'prompts/{prompt_id}_recipe.json'):
+            create_agent = True
+            review_agents[user_id] = True
+            conversation_agent[user_id] = False
+        
     if create_agent:
         if user_id not in review_agents.keys() or review_agents[user_id] == False:
             review_agents[user_id] = False

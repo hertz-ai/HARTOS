@@ -1,50 +1,28 @@
 {
-  "10077_89": [
+  "status": "completed",
+  "name": "Pitch Deck Review",
+  "goal": "Update the pitch deck file as per rules",
+  "broadcast_agent": false,
+  "number_of_persona": [
     {
-      "agentInstanceID": "com.hertzai.hevolve.chat.89.10077",
-      "user_id": 10077,
-      "role": "Parent",
-      "deviceID": "somestring"
-    },
-    {
-      "agentInstanceID": "com.hertzai.hevolve.chat.89.10077",
-      "user_id": 10077,
-      "role": "user",
-      "deviceID": "somenewsting" //if user is same and device id and user role is different then only create this entry
-    },
-    {
-      "agentInstanceID": "com.hertzai.hevolve.chat.89.10077",
-      "user_id": 10077,
-      "role": "Parent",
-      "deviceID": "1somestring" // if user and role are same but device id is unique crete new record
+      "name": "Entrepreneur",
+      "description": "The user who wants to update their pitch deck file"
     }
   ],
-  "10086_80": [
+  "flows": [
     {
-      "agentInstanceID": "com.hertzai.hevolve.chat.80.1078687",
-      "user_id": 1078687,
-      "role": "Parent",
-      "deviceID": "somestring"
-    },
-    {
-      "agentInstanceID": "com.hertzai.hevolve.chat.80.10086",
-      "user_id": 10086,
-      "role": "user",
-      "deviceID": "somenewsting" //if user is same and device id and user role is different then only create this entry
+      "flow_name": "Pitch Deck Updation Process",
+      "sub_goal": "To update the pitch deck file effectively",
+      "actions": [
+        "Initiate conversation by asking user to upload a file",
+        "after getting file_id this this API'https://mailer.hertzai.com/get_file_by_id/{file_id}' to check if files is processed properly or not by doing a GET request",
+        "Upon receiving the response from the previous API, do a GET request to another API to get the page details 'http://azure_pipeline.hertzai.com:5454/image/output1/{file_name}/page_{page_number}/_segformer/segformer_overall_Final_Image.jpg'. Use the file_name (without extension) from the previous API response and start the page_number from 0",
+        "After getting the page image, get all the details from that page and check if it follows the pitch deck standards",
+        "Repeat this for all the pages in the file",
+        "Once all the pages are completed, create an updated PDF and provide the file URL to the user"
+      ]
     }
   ],
-  "10725_80": [
-    {
-      "agentInstanceID": "com.hertzai.hevolve.chat.80.10725",
-      "user_id": 10725,
-      "role": "user",
-      "deviceID": "somenewsting" //if user is same and device id and user role is different then only create this entry
-    },
-    {
-      "agentInstanceID": "com.hertzai.hevolve.chat.80.10086",
-      "user_id": 10086,
-      "role": "Parent",
-      "deviceID": "somestring"
-    }
-  ]
+  "prompt_id": "67",
+  "creator_user_id": 10086
 }
