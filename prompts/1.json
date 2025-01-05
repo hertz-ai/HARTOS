@@ -26,7 +26,7 @@
   "scheduled_tasks": [
     {
       "cron_expression": "*/2 * * * *",
-      "job_description": "Fetch and provide a new news item Every 2 minutes"
+      "job_description": "Fetch and provide a new news"
     }
   ],
   "generalized_functions": [

@@ -505,7 +505,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                 current_app.logger.info(f'Save this actions as final verified actions {user_tasks[user_id].actions}')
                 message = '''Reflect on the sequence & create a recipe containing all the necessary steps & a name for it.
                 Provide the response in JSON format as:
-                {"status":"completed","steps":[{ "action": "Action here", "action_id": 1, "persona": "the persona this action belongs to" }],"recipe": "Final recipe with steps and generalized function here","generalized_functions":[],"scheduled_tasks":[{"cron_expression":"","job_description":""}]}. 
+                {"status":"completed","steps":[{ "action": "Action here", "action_id": 1, "persona": "the persona this action belongs to" }],"recipe": "Final recipe with steps and generalized function here","generalized_functions":[],"scheduled_tasks":[{"cron_expression":"","job_description":"just mention the job description no time or frequency needed"}]}. 
                 The recipe should have: 
                     Suggest well-documented, generalized Python function(s) to perform similar tasks for coding steps in the future.
                     Avoid storing information directly from the author in the recipe; instead, create placeholders for such variables & use them.
