@@ -2,11 +2,11 @@ from typing import Dict, Tuple
 import autogen
 import os
 from flask import current_app
-# Store user-specific agents and their chat history
+# Store user-specific agents & their chat history
 user_agents: Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]] = {}
 
 def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]:
-    """Create new assistant and user proxy agents for a user with basic configuration."""
+    """Create new assistant & user proxy agents for a user with basic configuration."""
     config_list = [{
         "model": 'hertzai-4o',
         "api_type": "azure",
@@ -29,7 +29,7 @@ def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autoge
         is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
         code_execution_config={"work_dir": "coding", "use_docker": False},
         system_message="""You are a custom agent bot creator. Your task is to interact with the user to gather all the necessary details to create an agent. Once you have collected all the required information, you will generate a complete agent configuration.
-        Your role is to assist in a co-creative manner. You should actively suggest actions or improvements, but always confirm with the user before implementing them. Ensure that any actions or suggestions are realistic, humanly possible, and ethical. Avoid proposing anything beyond practical feasibility, such as tasks like taking the user to the moon. Your primary goal is to enhance the collaboration while adhering to these boundaries.
+        Your role is to assist in a co-creative manner. You should actively suggest actions or improvements, but always confirm with the user before implementing them. Ensure that any actions or suggestions are realistic, humanly possible & ethical. Avoid proposing anything beyond practical feasibility, such as tasks like taking the user to the moon. Your primary goal is to enhance the collaboration while adhering to these boundaries.
         Speak in casual, playful, & respectful tone, while keeping it natural, funny, colloquial, & relatable. Expressions should be clear, accurate, grammatically, & contextually correct, avoiding tense confusion. Switch to a more formal tone only if the user keeps it formal.
         The information you need to collect includes:
 
@@ -41,10 +41,10 @@ def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autoge
         }
         Guidelines for Responses:
 
-        for flows, first ask number of flows and then each flow name and actions.
+        for flows, first ask number of flows & then each flow name & actions.
         If you are still gathering information, your response should be formatted as: { "status": "pending", "question": "The question you want to ask" }
         after getting actions ask user please provide additional actions for this flow
-        first get the actions and then suggest a flow name based on actions and ask if user is ok with this suggested name or ask for a new name
+        first get the actions & then suggest a flow name based on actions & ask if user is ok with this suggested name or ask for a new name
         after reviewing you should give your response as { "status": "completed", "name": "","broadcast_agent":bool,"number_of_persona":"" "tools": "", "flows": [{"flow_name", "actions": [],"sub_goal":"" }] "goal": ""}
         before going to completed state give all the details to user so that user can review it once. the response format for this should be {"status":"pending","review_details":"details here"}
         """
@@ -77,7 +77,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.Us
         # # if context:
         # #     enhanced_message = f"Previous conversation:\n{context_str}\n\nCurrent message: {message}"
 
-        # Send message and get response
+        # Send message & get response
         response = user_proxy.send(
             enhanced_message,
             assistant,
