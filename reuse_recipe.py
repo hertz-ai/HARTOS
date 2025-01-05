@@ -20,7 +20,7 @@ from autobahn.twisted.component import Component, run
 from twisted.internet import reactor
 from twisted.internet.defer import inlineCallbacks
 import threading
-from autogen import ConversableAgent
+from autogen import ConversableAgent, register_function
 import requests
 from flask import current_app
 
@@ -73,7 +73,7 @@ def execute_python_file(task_description:str,user_id: int):
         text = f'This is the time now {current_time}\n you must perform this task {task_description}'
         time_user.initiate_chat(time_agent,message=text)
         key = list(time_user.chat_messages.keys())[0]
-        last_message = user_proxy.chat_messages[key][-1]['content'].replace('TERMINATE','')
+        last_message = time_user.chat_messages[key][-1]['content'].replace('TERMINATE','')
         
         
         #sending response to receiver agent
@@ -374,6 +374,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         5. Keep track of action and only go to text action when the current action is completed successfully
         6. Always use code from recipe given below
         7. If there is any action which is like to perform a task continously you should not do it.
+        8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
 
         Actions: <actionsStart>{recipes[prompt_id]['steps']}<actionEnd>
         Recipe: <recipeStart>{recipes[prompt_id]['recipe']}<recipeEnd>
@@ -414,6 +415,11 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
             2. Use the provided Recipe for more details related to the actions.
             3. Only use the "send_message_to_roles" tool when contacting personas other than {role}_assistant,Executor,multi_role_agent.
             4. Tools you have [txt2img,img2txt,user_camera_inp,get_chat_history,create_scheduled_jobs] if you have any task which is not doable by these tool check recipe first else create python code to do so
+            5. Keep track of action and only go to text action when the current action is completed successfully
+            6. Always use code from recipe given below
+            7. If there is any action which is like to perform a task continously you should not do it.
+            8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
+            
             Actions: <actionsStart>{recipes[prompt_id]['steps']}<actionEnd>
             Recipe: <recipeStart>{recipes[prompt_id]['recipe']}<recipeEnd>
             generalized_functions: <generalized_functionsStart>{recipes[prompt_id]['generalized_functions']}<generalized_functionsEnd>
@@ -430,8 +436,13 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
             Your responsibilities:
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
-            3. Only use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
-        
+            3. Only use the "send_message_to_roles" tool when contacting personas other than {role}_assistant,Executor,multi_role_agent.
+            4. Tools you have [txt2img,img2txt,user_camera_inp,get_chat_history,create_scheduled_jobs] if you have any task which is not doable by these tool check recipe first else create python code to do so
+            5. Keep track of action and only go to text action when the current action is completed successfully
+            6. Always use code from recipe given below
+            7. If there is any action which is like to perform a task continously you should not do it.
+            8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
+            
             Actions: <actionsStart>{recipes[prompt_id]['steps']}<actionEnd>
             Recipe: <recipeStart>{recipes[prompt_id]['recipe']}<recipeEnd>
             generalized_functions: <generalized_functionsStart>{recipes[prompt_id]['generalized_functions']}<generalized_functionsEnd>
@@ -609,6 +620,8 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     
     def connect_time_main(message: Annotated[str, "The message time agent want to send to main agent"]) -> str:
         message = f"Role: Time Agent\n Message: {message}"
+        print(f'user_id {user_id}')
+        assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user = user_agents[user_id]
         response = multi_role_agent.initiate_chat(manager, message=message,speaker_selection={"speaker": "assistant"}, clear_history=False)
         last_message = group_chat.messages[-1]
         if last_message['content'] == 'TERMINATE':
@@ -617,7 +630,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         send_message_to_user(user_id,last_message,'')
         
         text = f'The Response from main Agent: {last_message}'
-        time_user.initiate_chat(time,message=text)
+        time_user.initiate_chat(time_agent,message=text)
         key = list(time_user.chat_messages.keys())[0]
         last_message = user_proxy.chat_messages[key][-1]['content'].replace('TERMINATE','')
         send_message_to_user(user_id,last_message,'')
@@ -638,7 +651,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     
     def state_transition(last_speaker, groupchat):
         messages = groupchat.messages
-        current_app.logger.info(f'Inside state_transition with message {messages[-1]["content"]} & last_speaker {last_speaker}')
+        current_app.logger.info(f'Inside state_transition with message :10 {messages[-1]["content"][:10]} & last_speaker {last_speaker.name}')
         if last_speaker == user_proxy or last_speaker == multi_role_agent or last_speaker == helper:
             return assistant
         if 'exitcode:' in messages[-1]["content"]:
