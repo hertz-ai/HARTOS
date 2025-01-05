@@ -1,28 +1,70 @@
 {
   "status": "completed",
-  "name": "Pitch Deck Review",
-  "goal": "Update the pitch deck file as per rules",
-  "broadcast_agent": false,
-  "number_of_persona": [
+  "steps": [
     {
-      "name": "Entrepreneur",
-      "description": "The user who wants to update their pitch deck file"
+      "action": "Initiate conversation by getting user's interest and location if not already available, and save it for later retrieval.",
+      "action_id": 1,
+      "persona": "Assistant"
+    },
+    {
+      "action": "Get one news item from NewsAPI using this key 'cce4e375a594418d97c47bdee357799a' and the details saved from the user (interest/location).",
+      "action_id": 2,
+      "persona": "Assistant"
+    },
+    {
+      "action": "Format the response in a way that you are speaking the news as an anchor. The content of the news should be at least 50 words.",
+      "action_id": 3,
+      "persona": "Assistant"
+    },
+    {
+      "action": "Every 2 minutes, provide a new news item to the user.",
+      "action_id": 4,
+      "persona": "Assistant"
     }
   ],
-  "flows": [
+  "recipe": "1. Initiate a conversation to get user's interest and location, and save it for later retrieval.\n2. Fetch one news item from NewsAPI using the saved details.\n3. Format the news item as if speaking it as a news anchor, ensuring the content is at least 50 words.\n4. Set up a scheduled task to fetch and provide a new news item Every 2 minutes.",
+  "scheduled_tasks": [
     {
-      "flow_name": "Pitch Deck Updation Process",
-      "sub_goal": "To update the pitch deck file effectively",
-      "actions": [
-        "Initiate conversation by asking user to upload a file",
-        "after getting file_id this this API'https://mailer.hertzai.com/get_file_by_id/{file_id}' to check if files is processed properly or not by doing a GET request",
-        "Upon receiving the response from the previous API, do a GET request to another API to get the page details 'http://azure_pipeline.hertzai.com:5454/image/output1/{file_name}/page_{page_number}/_segformer/segformer_overall_Final_Image.jpg'. Use the file_name (without extension) from the previous API response and start the page_number from 0",
-        "After getting the page image, get all the details from that page and check if it follows the pitch deck standards",
-        "Repeat this for all the pages in the file",
-        "Once all the pages are completed, create an updated PDF and provide the file URL to the user"
-      ]
+      "cron_expression": "*/2 * * * *",
+      "job_description": "Fetch and provide a new news item Every 2 minutes"
     }
   ],
-  "prompt_id": "67",
-  "creator_user_id": 10086
+  "generalized_functions": [
+    {
+      "function_name": "fetch_news",
+      "description": "Fetches news items from NewsAPI using a provided API key and query.",
+      "parameters": [
+        "api_key (str): Your NewsAPI key.",
+        "query (str): The search query to fetch news items."
+      ],
+      "returns": [
+        "dict: The first news article if found, otherwise a message indicating no articles were found."
+      ],
+      "docstring": "Fetch news items from NewsAPI\n\n:param api_key: Your NewsAPI key.\n:param query: The search query to fetch news items.\n:return: The first news article if found, otherwise a message indicating no articles were found."
+    },
+    {
+      "function_name": "format_news_as_anchor",
+      "description": "Formats a news item as if speaking it as a news anchor.",
+      "parameters": [
+        "news_item (dict): The news item to be formatted."
+      ],
+      "returns": [
+        "str: The formatted news item as an anchor presentation."
+      ],
+      "docstring": "Format news item as a news anchor presentation\n\n:param news_item: The news item to be formatted.\n:return: The formatted news item as an anchor presentation."
+    },
+    {
+      "function_name": "schedule_news_fetch",
+      "description": "Schedules a job to fetch and provide a news item at a specified interval.",
+      "parameters": [
+        "schedule_interval (int): The interval in seconds to fetch a news item.",
+        "api_key (str): Your NewsAPI key.",
+        "query (str): The search query to fetch news items."
+      ],
+      "returns": [
+        "None"
+      ],
+      "docstring": "Schedule a job to fetch and provide a news item at a specified interval\n\n:param schedule_interval: The interval in seconds to fetch a news item.\n:param api_key: Your NewsAPI key.\n:param query: The search query to fetch news items.\n:return: None"
+    }
+  ]
 }
