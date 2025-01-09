@@ -2070,7 +2070,7 @@ def chat():
                 if new_res['status'] == 'pending':
                     app.logger.info('PENDING STATUS')
                     ans = new_res['question'] if 'question' in new_res else new_res['review_details']
-                    return jsonify({'response': ans, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
+                    return jsonify({'response': ans, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'creating'})
                 else:
                     app.logger.info('COMPLETED STATUS')
                     new_res['prompt_id'] = prompt_id
@@ -2083,19 +2083,20 @@ def chat():
                         json.dump(new_res, json_file)
                     app.logger.info(f"Dictionary saved to {name}")
                     review_agents[user_id] = True
-                    # return jsonify({'response': 'Review Agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
+                    return jsonify({'response': 'Got Agent details successfully lets move on to review them one at a time', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'review'})
             except Exception as e:
                 app.logger.error('GOT some error while eval and returning the response')
                 app.logger.error(e)
-                return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
+                return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'creating'})
         if review_agents[user_id] and not conversation_agent[user_id]:
             response = recipe(user_id,prompt,prompt_id,file_id)
             if response =='Agent Created Successfully':
                 conversation_agent[user_id] = True
-            return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
+                return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'completed'})
+            return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'review'})
         if review_agents[user_id] and conversation_agent[user_id]:
             response = chat_agent(user_id,prompt,prompt_id,file_id)
-            return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
+            return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'evaluation'})
 
     if prompt_id and os.path.exists(f'prompts/{prompt_id}.json'):
         
@@ -2109,7 +2110,7 @@ def chat():
         #     return jsonify({'response': 'Need user_id and text to use agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
         # last_response = ''
         #create and user use_recipe.py
-        return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
+        return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'reuse'})
 
     if prompt_id:
         try:

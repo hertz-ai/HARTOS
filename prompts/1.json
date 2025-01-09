@@ -2,69 +2,116 @@
   "status": "completed",
   "steps": [
     {
-      "action": "Initiate conversation by getting user's interest and location if not already available, and save it for later retrieval.",
+      "action": "Initiate a conversation with the creator by asking about the genre of the story.",
       "action_id": 1,
-      "persona": "Assistant"
+      "persona": "user",
+      "fallback_action": "Select any random genre",
+      "Agent": "assistant"
     },
     {
-      "action": "Get one news item from NewsAPI using this key 'cce4e375a594418d97c47bdee357799a' and the details saved from the user (interest/location).",
+      "action": "Create a 200-word story with multiple characters in the format: {character1} dialogue of character1... {character2} dialogue of character2, narrated like an audiobook. and save it internally.",
       "action_id": 2,
-      "persona": "Assistant"
+      "persona": "user",
+      "fallback_action": "Create a 100-word story",
+      "Agent": "assistant"
     },
     {
-      "action": "Format the response in a way that you are speaking the news as an anchor. The content of the news should be at least 50 words.",
+      "action": "Retrieve the list of avatar IDs by using the API: https://mailer.hertzai.com/all_teacher_avatars_user_id?user_id={user_id}.",
       "action_id": 3,
-      "persona": "Assistant"
+      "persona": "user",
+      "fallback_action": "Hit API with user_id 1",
+      "Agent": "Executor"
     },
     {
-      "action": "Every 2 minutes, provide a new news item to the user.",
+      "action": "Associate the avatar ID based on the teacher's name to a character created earlier and save it internally along with the character name and teacher avatar ID.",
       "action_id": 4,
-      "persona": "Assistant"
-    }
-  ],
-  "recipe": "1. Initiate a conversation to get user's interest and location, and save it for later retrieval.\n2. Fetch one news item from NewsAPI using the saved details.\n3. Format the news item as if speaking it as a news anchor, ensuring the content is at least 50 words.\n4. Set up a scheduled task to fetch and provide a new news item Every 2 minutes.",
-  "scheduled_tasks": [
+      "persona": "user",
+      "fallback_action": "Try again after some time",
+      "Agent": "assistant"
+    },
     {
-      "cron_expression": "*/2 * * * *",
-      "job_description": "Fetch and provide a new news"
+      "action": "Give one character dialogue at a time to the creator, create the video, and save it in the database for later use. Continue until all the dialogues from the story are complete.",
+      "action_id": 5,
+      "persona": "user",
+      "fallback_action": "Inform the creator and move to next action",
+      "Agent": "assistant"
+    },
+    {
+      "action": "Check the status of video completion in a dynamic interval based on the number of words in the dialogue. If not completed, check regularly at an interval until success for the dialogue. After success, repeat this for each dialogue till the end of the story.",
+      "action_id": 6,
+      "persona": "user",
+      "fallback_action": "Proceed to next action",
+      "Agent": "Executor"
+    },
+    {
+      "action": "Create a scheduled activity to perform all the above actions until a story is created and repeat this periodically based on the previous story's creation status.",
+      "action_id": 7,
+      "persona": "user",
+      "fallback_action": "Inform the creator and move to next action",
+      "Agent": "Helper"
+    },
+    {
+      "action": "Have a monitoring task to check if the previous story is successfully created and start creating new stories after the previous story is completed without any human intervention.",
+      "action_id": 8,
+      "persona": "user",
+      "fallback_action": "Inform the creator and move to next action",
+      "Agent": "Helper"
+    },
+    {
+      "action": "Keep publishing the generated stories so that the user agent can keep broadcasting them like a story TV channel.",
+      "action_id": 9,
+      "persona": "user",
+      "fallback_action": "Ignore the failure",
+      "Agent": "assistant"
+    },
+    {
+      "action": "Retrieve the successfully created stories from the internal memory and deliver them to the user with the same exact teacher_avatar_id and text without altering a single letter.",
+      "action_id": 10,
+      "persona": "user",
+      "fallback_action": "Try again after some time",
+      "Agent": "assistant"
+    },
+    {
+      "action": "Return one dialogue at a time in the same order the story was created, with an interval based on the number of words (assuming 3 words will contribute to 1 second of video). Repeat until the story is fully given to the user.",
+      "action_id": 11,
+      "persona": "user",
+      "fallback_action": "Try again after some time",
+      "Agent": "Executor"
+    },
+    {
+      "action": "Track the stories given to the user in internal data and provide a new story only after the previous story is fully delivered.",
+      "action_id": 12,
+      "persona": "user",
+      "fallback_action": "Try again after some time",
+      "Agent": "Helper"
+    },
+    {
+      "action": "User persona will only reuse stories created by the creator and will not create new stories.",
+      "action_id": 13,
+      "persona": "user",
+      "fallback_action": "n/a",
+      "Agent": "assistant"
     }
   ],
+  "recipe": "Create story and videos from dialogues",
   "generalized_functions": [
     {
-      "function_name": "fetch_news",
-      "description": "Fetches news items from NewsAPI using a provided API key and query.",
-      "parameters": [
-        "api_key (str): Your NewsAPI key.",
-        "query (str): The search query to fetch news items."
-      ],
-      "returns": [
-        "dict: The first news article if found, otherwise a message indicating no articles were found."
-      ],
-      "docstring": "Fetch news items from NewsAPI\n\n:param api_key: Your NewsAPI key.\n:param query: The search query to fetch news items.\n:return: The first news article if found, otherwise a message indicating no articles were found."
+      "function_name": "check_video_status",
+      "code": "def check_video_status(dialogue, character):\n    \"\"\"Check the status of video completion for a given dialogue and character.\"\"\"\n    words_count = len(dialogue.split())\n    interval = (words_count / 3) * 5\n    video_completed = False\n    while not video_completed:\n        print(f\"Checking video status for {character} at interval {interval}s...\")\n        # Replace with actual video status check logic\n        video_completed = True\n        if not video_completed:\n            time.sleep(interval)\n    return f\"Video for {character} completed successfully.\""
     },
     {
-      "function_name": "format_news_as_anchor",
-      "description": "Formats a news item as if speaking it as a news anchor.",
-      "parameters": [
-        "news_item (dict): The news item to be formatted."
-      ],
-      "returns": [
-        "str: The formatted news item as an anchor presentation."
-      ],
-      "docstring": "Format news item as a news anchor presentation\n\n:param news_item: The news item to be formatted.\n:return: The formatted news item as an anchor presentation."
+      "function_name": "return_dialogues",
+      "code": "def return_dialogues(dialogues, user):\n    \"\"\"Return dialogues one by one with an interval based on the number of words.\"\"\"\n    for dialogue in dialogues:\n        character, text = dialogue\n        words_count = len(text.split())\n        interval = (words_count / 3)\n        print(f\"Returning dialogue for {character}: \\\"{text}\\\"\")\n        print(f\"Waiting for {interval} seconds before next dialogue...\")\n        time.sleep(interval)"
+    }
+  ],
+  "scheduled_tasks": [
+    {
+      "cron_expression": "0 1-23/1 * * *",
+      "job_description": "Perform all actions to create a story and repeat 20 times a day"
     },
     {
-      "function_name": "schedule_news_fetch",
-      "description": "Schedules a job to fetch and provide a news item at a specified interval.",
-      "parameters": [
-        "schedule_interval (int): The interval in seconds to fetch a news item.",
-        "api_key (str): Your NewsAPI key.",
-        "query (str): The search query to fetch news items."
-      ],
-      "returns": [
-        "None"
-      ],
-      "docstring": "Schedule a job to fetch and provide a news item at a specified interval\n\n:param schedule_interval: The interval in seconds to fetch a news item.\n:param api_key: Your NewsAPI key.\n:param query: The search query to fetch news items.\n:return: None"
+      "cron_expression": "0 0-23/2 * * *",
+      "job_description": "Check if the previous story is successfully created and start creating new stories after the previous story is completed 10 times a day"
     }
   ]
 }
