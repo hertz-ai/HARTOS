@@ -18,7 +18,7 @@ def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autoge
     # Create a basic function calling config
     llm_config = {
         "config_list": config_list,
-        "seed": 42
+        "cache_seed": None
     }
 
     # Create the assistant agent with context awareness
@@ -37,7 +37,8 @@ def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autoge
         "goal": "The ultimate goal of the agent",
         "broadcast_agent":'yes/no', // ask yes or no
         "number_of_persona":[{"name":"the role of the person comes here","description":" description on what the person can do here"}] //if broadcast_agent is true then by deafult it should be blank [] else ask of number of persona/people involved in this agent
-        "flows": [{"flow_name":"","actions":['string array with actions(with tool usage) to perform to reach the sub goal for this flow'],"sub_goal":"the goal for this flow"}]
+        "flows": [{"flow_name":"","actions":['string array with actions(with tool usage) to perform to reach the sub goal for this flow'],"sub_goal":"the goal for this flow"}],
+        "extra_information":"Some extra information/note here"
         }
         Guidelines for Responses:
 

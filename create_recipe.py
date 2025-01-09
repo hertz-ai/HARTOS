@@ -1,7 +1,7 @@
 import autogen
 from typing import Dict, Tuple
 import os
-from typing import Annotated
+from typing import Annotated, Optional
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 import requests
@@ -31,30 +31,8 @@ config_list = [{
         "api_version": "2024-02-15-preview"
     }]
 
+agent_data = {}
 
-
-executor_config = {
-    "llm_config": {
-        "config_list": config_list,
-        "temperature": 0.4,
-    },
-    "system_message": """You are a executor agent. focused solely on creating, running & debugging code.
-    Your responsibilities:
-    1. Execute code provided by the assistant agent
-    2. Report execution results, errors, or output
-    3. If there are errors:
-       - Identify the issue
-       - Propose & implement fixes
-       - Report back to the assistant
-    
-    Note: Your Working Directory is "/home/hertzai2019/newauto/coding" use this if you need,
-    Do not engage in general conversation - that's the assistant's role.
-    IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code. Instead, utilize the create_scheduled_jobs tool to execute code at specific intervals. If the assistant agent requests code execution with time.sleep or any similar sleep function, respond that such code cannot be executed and instruct the helper agent to use the create_scheduled_jobs tool instead.
-    Add proper error handling, logging.
-    When writing code, always print the final response just before returning it.
-    Always provide clear execution results or error messages to the assistant.
-    if you get any conversation which is not related to coding ask the manager to route this conversation to user"""
-}
 
 
 def send_message_to_user(user_id,response,inp):
@@ -102,7 +80,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     """Create new assistant & user agents for a given user_id"""
     
     llm_config = {
-        "temperature": 0.7,
+        "cache_seed": None,
         "config_list": [{
         "model": 'hertzai-4o',
         "api_type": "azure",
@@ -145,7 +123,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             i.{"status": "updated","action": "current action","updated_action": "updated action","action_id": 1,"message": "message here","persona_name":"persona name this action belongs to","fallback_action": "","entire_actions":[return all actions ask assistant to give array of all actions]} // If no fallback_action is provided, ask user "What measures should be taken if this action fails in the future?" & include their response here}/n
     
         Capabilites you have: You can see user via user camera, if visual camera feed not available then request user to turn on camera to perform an action which requires camera input, All your responses to user are played as if you are talking in video call(with talking head animation & audio via TTS).
-        Tools Helper Agent can use: text_2_image(will create image from text), get_recent_files(get you file_id of user uploaded files), create_scheduled_jobs(will create time based schedled jobs), get_text_from_image(will get text from image/describe the image/answer question from image)
+        ask Helper agent to use get_set_internal_memory tool if you want to store something or if you want to get some information regarding user.
+        Tools Helper Agent can use: text_2_image(will create image from text), get_recent_files(get you file_id of user uploaded files), create_scheduled_jobs(will create time based schedled jobs), get_text_from_image(will get text from image/describe the image/answer question from image),Generate_video(Can generate video for the text),get_set_internal_memory(it store and retrieve data in database/it has user details)
         For anything involving delayed/timer/scheduled tasks or scheduled jobs/continous monitoring call the create_scheduled_jobs tool it will create a scheduled job.
         Remember: Maintain clear communication, prioritize accuracy over speed, & ensure proper handoff when delegating tasks.
         Note: Your Working Directory is "/home/hertzai2019/newauto/coding/" use this if you need it.
@@ -162,6 +141,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         code_execution_config={"last_n_messages":2,"work_dir": "coding", "use_docker": False},
         system_message="""You are Helper Agent, Help the assistant agent to complete the actions do not coordinate with other agents, after your response always pass the conversation to assistant
         IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code. Instead, utilize the create_scheduled_jobs tool to execute code at specific intervals. If the assistant agent requests code execution with time.sleep or any similar sleep function, respond that such code cannot be executed and use the create_scheduled_jobs tool instead.
+        Use get_set_internal_memory tool if you want to store something or if you want to get some information regarding user.
         When writing code, always print the final response just before returning it.""",
         is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
     )
@@ -202,7 +182,24 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     executor = autogen.AssistantAgent(
         name="Executor",
         code_execution_config={"last_n_messages":2,"work_dir": "coding", "use_docker": False},
-        **executor_config
+        llm_config=llm_config,
+        system_message="""You are a executor agent. focused solely on creating, running & debugging code.
+        Your responsibilities:
+        1. Execute code provided by the assistant agent
+        2. Report execution results, errors, or output
+        3. If there are errors:
+        - Identify the issue
+        - Propose & implement fixes
+        - Report back to the assistant
+        
+        Note: Your Working Directory is "/home/hertzai2019/newauto/coding" use this if you need,
+        Ask helper Agent to use get_set_internal_memory tool if you want to store something or if you want to get some information regarding user.
+        Do not engage in general conversation - that's the assistant's role.
+        IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code. Instead, utilize the create_scheduled_jobs tool to execute code at specific intervals. If the assistant agent requests code execution with time.sleep or any similar sleep function, respond that such code cannot be executed and instruct the helper agent to use the create_scheduled_jobs tool instead.
+        Add proper error handling, logging.
+        When writing code, always print the final response just before returning it.
+        Always provide clear execution results or error messages to the assistant.
+        if you get any conversation which is not related to coding ask the manager to route this conversation to user"""
     )
     
     chat_instructor = autogen.UserProxyAgent(
@@ -249,6 +246,121 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     helper.register_for_llm(name="text_2_image", description="Text to image Creator")(txt2img)
     executor.register_for_execution(name="text_2_image")(txt2img)
     
+    def get_set_internal_memory(key: Annotated[str, "Key for storing/retrieving data"],
+                    data: Annotated[Optional[str], "Data to store (required for SET, ignored for GET)"] = None,
+                    method: Annotated[Literal["GET", "SET"], "Operation type (GET or SET)"] = 'GET') -> str:
+        current_app.logger.info('INSIDE get_set_internal_memory')
+        if prompt_id not in agent_data:
+            agent_data[prompt_id] = {}
+        if method == 'GET':
+            return agent_data[prompt_id].get(key,f'No data available with key {key}')
+        elif method == 'SET':
+            agent_data[prompt_id][key] = data
+            return f'Data Stored Successfully with key {key}'
+        else:
+            return 'Invalid Method it can be either GET or SET'
+
+    
+    helper.register_for_llm(name="get_set_internal_memory", description="Use this to Store and retrieve data using key-value storage system")(get_set_internal_memory)
+    executor.register_for_execution(name="get_set_internal_memory")(get_set_internal_memory)
+    
+    def get_all_data() -> str:
+        current_app.logger.info('INSIDE get_all_data')
+        return f'{agent_data[prompt_id]}'
+
+    
+    helper.register_for_llm(name="get_all_data", description="Returns all data from the internal Memory")(get_all_data)
+    executor.register_for_execution(name="get_all_data")(get_all_data)
+    
+    def get_user_id() -> str:
+        current_app.logger.info('INSIDE get_user_id')
+        return f'{user_id}'
+
+    
+    helper.register_for_llm(name="get_user_id", description="Returns the unique identifier (user_id) of the current user.")(get_user_id)
+    executor.register_for_execution(name="get_user_id")(get_user_id)
+    
+    def get_prompt_id() -> str:
+        current_app.logger.info('INSIDE get_prompt_id')
+        return f'{prompt_id}'
+
+    
+    helper.register_for_llm(name="get_prompt_id", description="Returns the unique identifier (prompt_id) associated with the current prompt or conversation.")(get_prompt_id)
+    executor.register_for_execution(name="get_prompt_id")(get_prompt_id)
+    
+    
+    def Generate_video(text: Annotated[str, "Text you want to create video"],
+                       avatar_id: Annotated[str, "one avatar_id"]) -> str:
+        current_app.logger.info('INSIDE video_gen')
+        database_url = 'https://mailer.hertzai.com'
+        makeittalk_url = 'http://azurekong.hertzai.com:8000/makeitLoad'
+        final_res = []
+    
+        print(f"avtar_id: {avatar_id}:\n{text[:10]}....\n")
+        
+        headers = {'Content-Type': 'application/json'}
+        data = {}
+        data["text"] = text
+        data['flag_hallo'] = 'false'
+        data['chattts'] = True
+        res = requests.get("https://mailer.hertzai.com/get_image_by_id/{}".format(avatar_id))
+        res = res.json()
+        new_image_url = res["image_url"]
+        data["cartoon_image"] = "True"
+        data["bg_url"] = 'http://stream.mcgroce.com/txt/examples_cartoon/roy_bg.jpg'
+        data['vtoonify'] = "false"
+        data["image_url"] = new_image_url
+        data['im_crop'] = "false"
+        data['remove_bg'] = "false"
+        data['hd_video'] = "false"
+        data['uid'] = 'somethingrandom here'
+        data['gradient'] = "true"
+        data['cus_bg'] = "false"
+        data['solid_color'] = "false"
+        data['inpainting'] = "false"
+        data['prompt'] = ""
+        data['gender'] = 'male'
+        if res['voice_id'] != None:
+            voice_sample = requests.get(
+                "{}/get_voice_sample_id/{}".format(database_url, res['voice_id']))
+            voice_sample = voice_sample.json()
+        else:
+            voice_sample = None
+        if voice_sample is None:
+            current_app.logger.info('voice sample is none using default')
+            voice_sample = requests.get(
+                "{}/get_voice_sample/{}".format(database_url, user_id))
+            voice_sample = voice_sample.json()
+        data["audio_sample_url"] = voice_sample["voice_sample_url"]
+        video_link = requests.post("{}/video-gen/".format(makeittalk_url),
+                                    data=json.dumps(data), headers=headers, timeout=60)
+        current_app.logger.info(" *********   video link  ********* %s", video_link)
+        video_link = json.loads(video_link.content)
+        video_link['image_url'] = new_image_url
+        video_link['text'] = text
+        video_link['avatar_id'] = avatar_id
+        video_link['bg_url'] = 'http://stream.mcgroce.com/txt/examples_cartoon/roy_bg.jpg'
+        final_res.append(video_link)
+        headers = {'Content-Type': 'application/json'}
+        data = {
+            "conv_id": None,
+            "teacher_avatar_id": avatar_id,
+            "voice_id": None,
+            "text": text,
+            "audio_url": voice_sample["voice_sample_url"],
+            "reference_txt": video_link['reference_txt'],
+            "warper_txt": video_link['warper_txt'],
+            "triangulation_txt": video_link['triangulation_txt'],
+            "image_url": new_image_url
+        }
+        res = requests.post("{}/toonify-generated-video".format(database_url),
+                            data=json.dumps(data), headers=headers).json()
+        
+        return f"Video Generation completed and saved Successfully"
+
+    
+    helper.register_for_llm(name="Generate_video", description="Generate video with text and save it in database")(Generate_video)
+    executor.register_for_execution(name="Generate_video")(Generate_video)
     
     def recent_files() -> str:
         current_app.logger.info('INSIDE recent_files')
@@ -312,7 +424,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     def state_transition(last_speaker, groupchat):
         current_app.logger.info('Inside state_transition')
         messages = groupchat.messages
-        current_app.logger.info(f'Inside state_transition with message {messages[-1]["content"]} & last_speaker:{last_speaker.name}')
+        current_app.logger.info(f'Inside state_transition with message {messages[-1]["content"][:10]}.. & last_speaker:{last_speaker.name}')
         crossbar_message = {"text": [messages[-1]["content"]], "priority": 99, "action": 'Agent', "historical_request_id": [], "preffered_language": 'en-US', "options": [], "newoptions": [], "bot_type": 'Agent', "page_image_url": "", "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
         'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0}, 'bottom_left': {'x': 0, 'y': 0}}}
         result = client.publish(
@@ -380,12 +492,16 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         except Exception as e:
             current_app.logger.error(f'Got error when content as blank with error as :{e}')
         #checking if message is routed to user via tag
-        pattern = r"@user"   
+        pattern = r"@user"
+        pattern1 = r"@StatusVerifier"
         try:
             if re.search(pattern, messages[-1]["content"]):
                 current_app.logger.info("String contains @user returnng author")
                 messages[-1]["content"] = messages[-1]["content"].replace('@user','')
                 return author
+            if re.search(pattern1, messages[-1]["content"]):
+                current_app.logger.info("String contains @StatusVerifier returnng StatusVerifier")
+                return verify
         except Exception as e:
             current_app.logger.error(f'Got error when searching for @user in last message :{e}')
 
@@ -417,7 +533,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     
     manager = autogen.GroupChatManager(
         groupchat=group_chat,
-        llm_config={"config_list": config_list}
+        llm_config={"config_list": config_list,"cache_seed": None}
     )
     
     
@@ -475,19 +591,22 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
         current_app.logger.info('inside while')
         if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
             # current_app.logger.info(f"group_chat.messages[-1]['content'] {group_chat.messages[-1]['content']}")
-            current_app.logger.info(f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content']}")
+            current_app.logger.info(f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
             try:
                 json_obj = eval(group_chat.messages[-2]["content"])
                 current_app.logger.info(f'got json object {json_obj}')
             except:
                 try:
-                    json_match = re.search(r'{[\s\S]*}', messages[-2]["content"])
+                    json_match = re.search(r'{[\s\S]*}', group_chat.messages[-2]["content"])
                     if json_match:
                         json_part = json_match.group(0)
                         json_obj = json.loads(json_part)
-                except:
+                    else:
+                        raise 'No json found'
+                except Exception as e:
+                    current_app.logger.error(f'it is not a json object the error is: {e}')
                     current_app.logger.info('it is not a json object You should ask status verifier to give response in proper format & not move ahead to next action')
-                    message = 'Hey StatusVerifier Agent, Please verify the status of the action performed and Respond in the following format {"status": "status here","action": "current action","action_id": 1,"message": "message here","fallback_action": "fallback action here"}'
+                    message = 'Hey @StatusVerifier Agent, Please verify the status of the action performed and Respond in the following format {"status": "status here","action": "current action","action_id": 1,"message": "message here","fallback_action": "fallback action here"}'
                     assistant_agent.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
                     continue
             current_app.logger.info('resuming chat')
@@ -505,7 +624,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                 current_app.logger.info(f'Save this actions as final verified actions {user_tasks[user_id].actions}')
                 message = '''Reflect on the sequence & create a recipe containing all the necessary steps & a name for it.
                 Provide the response in JSON format as:
-                {"status":"completed","steps":[{ "action": "Action here", "action_id": 1, "persona": "the persona this action belongs to" }],"recipe": "Final recipe with steps and generalized function here","generalized_functions":[],"scheduled_tasks":[{"cron_expression":"","job_description":"just mention the job description no time or frequency needed"}]}. 
+                {"status":"completed","steps":[{ "action": "Action here", "action_id": 1, "persona": "the persona this action belongs to","fallback_action":"","Agent":"agent name who completed this task it should be from one of these 'assistant/Executor/Helper'" }],"recipe": "Final recipe with steps and generalized function here","generalized_functions":[],"scheduled_tasks":[{"cron_expression":"","job_description":"just mention the job description no time or frequency needed"}]}. 
                 The recipe should have: 
                     Suggest well-documented, generalized Python function(s) to perform similar tasks for coding steps in the future.
                     Avoid storing information directly from the author in the recipe; instead, create placeholders for such variables & use them.
@@ -557,6 +676,7 @@ def recipe(user_id, text,prompt_id,file_id):
         with open(f"prompts/{prompt_id}.json", 'r') as f:
             config = json.load(f)
         user_tasks[user_id] = Action(config['flows'][0]['actions'])
+        agent_data[prompt_id] = {'user_id':user_id}
     try:
         
         last_response = get_response_group(user_id,text,prompt_id)
@@ -569,6 +689,9 @@ def recipe(user_id, text,prompt_id,file_id):
         json_response = eval(last_response)
         if 'status' in json_response.keys(): 
             if 'recipe' in json_response.keys():
+                url = f'https://mailer.hertzai.com/update_agent_prompt?prompt_id={prompt_id}'
+                headers = {'Content-Type': 'application/json'}
+                res = requests.patch(url,headers=headers)
                 return 'Agent Created Successfully'
             else:
                 return json_response['message']
