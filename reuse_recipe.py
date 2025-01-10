@@ -64,9 +64,18 @@ def send_message_to_user(user_id,response,inp):
     res = requests.post(url,data=body,headers=headers)
 
 def execute_python_file(task_description:str,user_id: int):
-    print('inside calling user agent at time')
+    import requests
+    import json
+    headers = {'Content-Type': 'application/json'}
+    url = 'http://localhost:6777/time_agent'
+    data = json.dumps({'task_description':task_description,'user_id':user_id})
+    res = requests.post(url,data=data,headers=headers)
+    return 'done'
+
+def time_based_execution(task_description:str,user_id: int):
+    current_app.logger.info('INSIDE TIME_BASED_EXECUTION')
     if user_id not in user_agents:
-        print('user_id is not present')
+        current_app.logger.info('user_id is not present')
     else:
         
         assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user = user_agents[user_id]
@@ -77,10 +86,8 @@ def execute_python_file(task_description:str,user_id: int):
         key = list(time_user.chat_messages.keys())[0]
         last_message = time_user.chat_messages[key][-1]['content'].replace('TERMINATE','')
         
-        
         #sending response to receiver agent
         send_message_to_user(user_id,last_message,task_description)
-        
     return 'done'
 
 def get_frame(user_id):
@@ -213,8 +220,8 @@ def create_agents_for_role(user_id: str,prompt_id):
         agent_prompt = f'''You are a Helpful Assistant follow below action's
         initiate the conversation by asking which persona they belong to among the available personas: {temp} // give the persona names & ask to select one
         after you get the persona response from user ask them Would you like to start a new chat, or join an existing one with another user?
-        if new chat then call the update_persona tool to update the records in db & return TERMINATE
-        if they want to join an existing chat then ask the user to give the main user's contact number & then call the update_persona tool to update the records in db & return TERMINATE
+        if user askes to create new chat then call the "update_persona" tool to update the records in db & return TERMINATE
+        if they want to join an existing chat then ask the user to give the main user's contact number & then call the "update_persona" tool to update the records in db & return TERMINATE
         Note: only consider answers from User agent, 
         '''
         assistant = autogen.AssistantAgent(
@@ -362,18 +369,33 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
                     break
     if not role:
         role = ''
+        current_app.logger.info(f'Got role as {role}')
     goal = ''
     with open(f"prompts/{prompt_id}.json", 'r') as f:
             config = json.load(f)
             goal = config['goal']
     current_app.logger.info(f'Got goal as {goal}')
     role_actions = []
+    current_app.logger.info(f'Getting role actions')
     for i in recipes[prompt_id]['steps']:
+        current_app.logger.info(f'this is action persona:{i["persona"]} ')
         if i['persona'].lower() == role.lower():
+            
             role_actions.append(i)
+    current_app.logger.info(f'role_actions: {role_actions}')
     
     if len(role_actions) == 0:
         role_actions = recipes[prompt_id]['steps']
+    individual_recipe = []
+    for i in range(1,(len(recipes[prompt_id]['steps']))):
+        current_app.logger.info(f'checking for prompts/{prompt_id}_{i}.json')
+        try:
+            with open(f"prompts/{prompt_id}_1.json", 'r') as f:
+                config = json.load(f)
+                individual_recipe.append(config)
+        except Exception as e:
+            current_app.logger.error(f'Got error as :{e} while checking for prompts/{prompt_id}_{i}.json')
+    
     agent_prompt = f'''You are a Helpful {role} Assistant. Follow the actions below to assist the user:
         1. Try to complete a task on your own If you are unable to perform a specific task, ask the helper agent for assistance.
         2. Only follow actions where the persona is: {role}.
@@ -383,11 +405,10 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         6. Always use code from recipe given below
         7. If there is any action which is like to perform a task continously you should not do it.
         8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
-        9. Tools Helper Agent can use [txt2img,img2txt,user_camera_inp,get_chat_history,create_scheduled_jobs,,save_retrieve_data,Generate_video] if you have any task which is not doable by these tool check recipe first else create python code to do so
+        9. Tools Helper Agent can use [txt2img, img2txt, save_data_in_memory, get_data_from_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs] if you have any task which is not doable by these tool check recipe first else create python code to do so
         
         Actions: <actionsStart>{role_actions}<actionEnd>
-        Recipe: <recipeStart>{recipes[prompt_id]['recipe']}<recipeEnd>
-        generalized_functions: <generalized_functionsStart>{recipes[prompt_id]['generalized_functions']}<generalized_functionsEnd>
+        Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{individual_recipe}<generalized_functionsEnd><recipeEnd>
         When writing code, always print the final response just before returning it.
         Note: Other agents do not have access to these actions or recipe information. Ensure you provide them with the necessary context and related information to perform the required actions.
     '''
@@ -423,7 +444,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
             3. Only use the "send_message_to_roles" tool when contacting personas other than {role}_assistant,Executor,multi_role_agent.
-            4. Tools you have [txt2img,img2txt,user_camera_inp,get_chat_history,create_scheduled_jobs,,save_retrieve_data,Generate_video] if you have any task which is not doable by these tool check recipe first else create python code to do so
+            4. Tools you have [txt2img, img2txt, save_data_in_memory, get_data_from_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs] if you have any task which is not doable by these tool check recipe first else create python code to do so
             5. Keep track of action and only go to text action when the current action is completed successfully
             6. Always use code from recipe given below
             7. If there is any action which is like to perform a task continously you should not do it.
@@ -446,7 +467,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
             3. Only use the "send_message_to_roles" tool when contacting personas other than {role}_assistant,Executor,multi_role_agent.
-            4. Tools Helper Agent can use [txt2img,img2txt,user_camera_inp,get_chat_history,create_scheduled_jobs,save_retrieve_data,Generate_video] if you have any task which is not doable by these tool check recipe first else create python code to do so
+            4. Tools Helper Agent can use [txt2img, img2txt, save_data_in_memory, get_data_from_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs] if you have any task which is not doable by these tool check recipe first else create python code to do so
             5. Keep track of action and only go to text action when the current action is completed successfully
             6. Always use code from recipe given below
             7. If there is any action which is like to perform a task continously you should not do it.
@@ -472,8 +493,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         system_message="""You will send message from multiple different personas your, job is to ask those question to assistant agent
         if you think some text was intent to give to some other agent but i came to you send the same message to user""",
     )
-
-    # @assistant.register_for_execution()
+    # @executor.register_for_execution()
     # @helper.register_for_llm(api_style="function", description="sends message/ask questions to different roles/personas")
     # def send_message_to_roles(role: Annotated[str, "the role to which the message to send"], 
     #                         message: Annotated[str, "The question to ask or message to send"]) -> str:
@@ -509,11 +529,11 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     #                 current_app.logger.info('Published to chat') 
     #                 return 'Message sent Successfully'
     #         return 'Not able to send Message try again later' 
-    
+    # 
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",description="Text to image Creator")
     def txt2img(text: Annotated[str, "Text to create image"]) -> str:
-        current_app.logger.info('INSIDE TXT2IMG')
+        current_app.logger.info('INSIDE txt2img')
         url = f"http://aws_rasa.hertzai.com:5459/txt2img?prompt={text}"
 
         payload = ""
@@ -521,10 +541,10 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
 
         response = requests.post(url, headers=headers, data=payload)
         return response.json()['img_url']
-        
+       
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",description="Image to Text/Question Answering from image")
-    def img2txt(image_url: Annotated[str, "image url of which you want text"],text: Annotated[str, "the details you want from image"]='Describe the Images and Text data in this image in detail') -> str:
+    def img2txt(image_url: Annotated[str, "image url of which you want text"],text: Annotated[str, "the details you want from image"]='Describe the Images & Text data in this image in detail') -> str:
         current_app.logger.info('INSIDE img2txt')
         url = "http://azure_all_vms.hertzai.com:6066/image_inference"
 
@@ -542,26 +562,121 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         else:
             return 'Not able to get this page details try later'
     
+    
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",description="Store and retrieve data using key-value storage system")
-    def save_retrieve_data(key: Annotated[str, "Key for storing/retrieving data"],
-                    data: Annotated[Optional[str], "Data to store (required for SET, ignored for GET)"] = None,
-                    method: Annotated[Literal["GET", "SET"], "Operation type (GET or SET)"] = 'GET') -> str:
-        current_app.logger.info('INSIDE save_retrieve_data')
-        if prompt_id not in agent_data:
-            agent_data[prompt_id] = {}
-        if method == 'GET':
-            return agent_data[prompt_id].get(key,f'No data available with key {key}')
-        elif method == 'SET':
-            agent_data[prompt_id][key] = data
-            return f'Data Stored Successfully with key {key}'
+    @helper.register_for_llm(api_style="function",description="Use this to Store and retrieve data using key-value storage system")
+    def save_data_in_memory(key: Annotated[str, "Key for storing/retrieving data"],
+                    value: Annotated[Optional[str], "Value you want to store"] = None) -> str:
+        current_app.logger.info('INSIDE save_data_in_memory')
+        current_app.logger.info(f'Data in memory before update {agent_data[prompt_id]}')
+        agent_data[prompt_id][key] = value
+        current_app.logger.info(f'Data in memory after update {agent_data[prompt_id]}')
+        return f'{agent_data[prompt_id]}'
+    
+    
+    @assistant.register_for_execution()
+    @helper.register_for_llm(api_style="function",description="Returns all data from the internal Memory")
+    def get_data_from_memory() -> str:
+        current_app.logger.info('INSIDE get_all_data')
+        return f'{agent_data[prompt_id]}'
+ 
+    @assistant.register_for_execution()
+    @helper.register_for_llm(api_style="function",description="Returns the unique identifier (user_id) of the current user.")
+    def get_user_id() -> str:
+        current_app.logger.info('INSIDE get_user_id')
+        return f'{user_id}'
+    
+    @assistant.register_for_execution()
+    @helper.register_for_llm(api_style="function",description="Returns the unique identifier (prompt_id) associated with the current prompt or conversation.")
+    def get_prompt_id() -> str:
+        current_app.logger.info('INSIDE get_prompt_id')
+        return f'{prompt_id}'
+    
+    @assistant.register_for_execution()
+    @helper.register_for_llm(api_style="function",description="Generate video with text and save it in database")
+    def Generate_video(text: Annotated[str, "Text you want to create video"],
+                       avatar_id: Annotated[str, "one avatar_id"]) -> str:
+        current_app.logger.info('INSIDE video_gen')
+        database_url = 'https://mailer.hertzai.com'
+        makeittalk_url = 'http://azurekong.hertzai.com:8000/makeitLoad'
+        final_res = []
+    
+        print(f"avtar_id: {avatar_id}:\n{text[:10]}....\n")
+        
+        headers = {'Content-Type': 'application/json'}
+        data = {}
+        data["text"] = text
+        data['flag_hallo'] = 'false'
+        data['chattts'] = True
+        res = requests.get("https://mailer.hertzai.com/get_image_by_id/{}".format(avatar_id))
+        res = res.json()
+        new_image_url = res["image_url"]
+        data["cartoon_image"] = "True"
+        data["bg_url"] = 'http://stream.mcgroce.com/txt/examples_cartoon/roy_bg.jpg'
+        data['vtoonify'] = "false"
+        data["image_url"] = new_image_url
+        data['im_crop'] = "false"
+        data['remove_bg'] = "false"
+        data['hd_video'] = "false"
+        data['uid'] = 'somethingrandom here'
+        data['gradient'] = "true"
+        data['cus_bg'] = "false"
+        data['solid_color'] = "false"
+        data['inpainting'] = "false"
+        data['prompt'] = ""
+        data['gender'] = 'male'
+        if res['voice_id'] != None:
+            voice_sample = requests.get(
+                "{}/get_voice_sample_id/{}".format(database_url, res['voice_id']))
+            voice_sample = voice_sample.json()
         else:
-            return 'Invalid Method it can be either GET or SET'
+            voice_sample = None
+        if voice_sample is None:
+            current_app.logger.info('voice sample is none using default')
+            voice_sample = requests.get(
+                "{}/get_voice_sample/{}".format(database_url, user_id))
+            voice_sample = voice_sample.json()
+        data["audio_sample_url"] = voice_sample["voice_sample_url"]
+        video_link = requests.post("{}/video-gen/".format(makeittalk_url),
+                                    data=json.dumps(data), headers=headers, timeout=60)
+        current_app.logger.info(" *********   video link  ********* %s", video_link)
+        video_link = json.loads(video_link.content)
+        video_link['image_url'] = new_image_url
+        video_link['text'] = text
+        video_link['avatar_id'] = avatar_id
+        video_link['bg_url'] = 'http://stream.mcgroce.com/txt/examples_cartoon/roy_bg.jpg'
+        final_res.append(video_link)
+        headers = {'Content-Type': 'application/json'}
+        data = {
+            "conv_id": None,
+            "teacher_avatar_id": avatar_id,
+            "voice_id": None,
+            "text": text,
+            "audio_url": voice_sample["voice_sample_url"],
+            "reference_txt": video_link['reference_txt'],
+            "warper_txt": video_link['warper_txt'],
+            "triangulation_txt": video_link['triangulation_txt'],
+            "image_url": new_image_url
+        }
+        res = requests.post("{}/toonify-generated-video".format(database_url),
+                            data=json.dumps(data), headers=headers).json()
+        
+        return f"Video Generation completed and saved Successfully"
 
     
     @assistant.register_for_execution()
+    @helper.register_for_llm(api_style="function",description="get user's recent uploaded files")
+    def get_user_uploaded_file() -> str:
+        current_app.logger.info('INSIDE get_user_uploaded_file')
+        if recent_file_id[user_id]:
+            return f'Got user uploaded file the file_id is {recent_file_id[user_id]}'
+
+        return 'No file uploaded from user'
+    
+    
+    @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",description="Get user's visual information to process somethings")
-    def user_camera_inp(inp: Annotated[str, "The Question to check from visual context"]) -> str:
+    def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual context"]) -> str:
         request_id = 'Autogent_1234'
         current_app.logger.info('Using Vision to answer question')
         frame = get_frame(str(user_id))
@@ -591,83 +706,18 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
                 return response
             except Exception as e:
                 current_app.logger.info('ERROR: Got error in visal QA')
-
+                return 'failed to get visual context ask user to check if the camera is turned on'
+    
+    
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",description="Get Chat history based on text & start & end date")
     def get_chat_history(text: Annotated[str, "Text related to which you want history"],start: Annotated[str, "start date in format %Y-%m-%dT%H:%M:%S.%fZ"],end: Annotated[str, "end date in format %Y-%m-%dT%H:%M:%S.%fZ"]) -> str:
         current_app.logger.info('INSIDE get_chat_history')
         return get_time_based_history(text, f'user_{user_id}', start, end)
     
-    @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",description="Generate video with text")
-    def Generate_video(text: Annotated[str, "Text you want to create video"],
-                       avatar_id: Annotated[str, "one avatar_id"]) -> str:
-        current_app.logger.info('INSIDE video_gen')
-        segments = text.split("\n\n")
-        database_url = 'https://mailer.hertzai.com'
-        makeittalk_url = 'http://azurekong.hertzai.com:8000/makeitLoad'
-        final_res = []
-        for segment in segments:
-            match = re.match(r"(\d{4}):", segment)
-            if match:
-                number = match.group(1)
-                rest_of_text = segment[len(match.group(0)):].strip()
-            else:
-                # Look for any 4-digit number in the text
-                found_number = re.search(r"\b\d{4}\b", segment)
-                number = found_number.group(0) if found_number else str(avatar_id)
-                rest_of_text = segment.strip()
-        
-            print(f"avtar_id: {number}:\n{rest_of_text[:10]}....\n")
-            
-            headers = {'Content-Type': 'application/json'}
-            data = {}
-            data["text"] = rest_of_text
-            data['flag_hallo'] = 'false'
-            data['chattts'] = False
-            res = requests.get("https://mailer.hertzai.com/get_image_by_id/{}".format(number))
-            res = res.json()
-            new_image_url = res["image_url"]
-            data["cartoon_image"] = "True"
-            data["bg_url"] = 'http://stream.mcgroce.com/txt/examples_cartoon/roy_bg.jpg'
-            data['vtoonify'] = "false"
-            data["image_url"] = new_image_url
-            data['im_crop'] = "false"
-            data['remove_bg'] = "false"
-            data['hd_video'] = "false"
-            data['uid'] = 'somethingrandom here'
-            data['gradient'] = "true"
-            data['cus_bg'] = "false"
-            data['solid_color'] = "false"
-            data['inpainting'] = "false"
-            data['prompt'] = ""
-            data['gender'] = 'male'
-            if res['voice_id'] != None:
-                voice_sample = requests.get(
-                    "{}/get_voice_sample_id/{}".format(database_url, res['voice_id']))
-                voice_sample = voice_sample.json()
-            else:
-                voice_sample = None
-            if voice_sample is None:
-                current_app.logger.info('voice sample is none using default')
-                voice_sample = requests.get(
-                    "{}/get_voice_sample/{}".format(database_url, user_id))
-                voice_sample = voice_sample.json()
-            data["audio_sample_url"] = voice_sample["voice_sample_url"]
-            video_link = requests.post("{}/video-gen/".format(makeittalk_url),
-                                       data=json.dumps(data), headers=headers, timeout=60)
-            current_app.logger.info(" *********   video link  ********* %s", video_link)
-            video_link = json.loads(video_link.content)
-            video_link['image_url'] = new_image_url
-            video_link['text'] = rest_of_text
-            video_link['avatar_id'] = number
-            video_link['bg_url'] = 'http://stream.mcgroce.com/txt/examples_cartoon/roy_bg.jpg'
-            final_res.append(video_link)
-        agent_data[prompt_id]['story'] = final_res
-        return f"{final_res}"
     
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function", description="Creates time-based jobs using APScheduler to schedule jobs")
+    @helper.register_for_llm(api_style="function",description="Creates time-based jobs using APScheduler to schedule jobs")
     def create_scheduled_jobs(cron_expression: Annotated[str, "Cron expression for scheduling"], 
                             job_description: Annotated[str, "Description of the job to be performed"],
                             user_id: Annotated[int, "User ID"] = 5) -> str:
@@ -684,12 +734,16 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         except Exception as e:
             current_app.logger.info(f'Error in create_scheduled_jobs: {str(e)}')
             return f"Error creating scheduled job: {str(e)}"
-
+        
     # Let's first define the assistant agent that suggests tool calls. TODO add recipe here
     time_agent = ConversableAgent(
         name="time",
-        system_message="You are a helpful AI assistant. "
-        "You can help with creating scheduled jobs "
+        system_message="You are an helpful AI assistant. "
+        f"""You can refer below details to perform task:
+            Actions: <actionsStart>{role_actions}<actionEnd>
+            Recipe: <recipeStart>{recipes[prompt_id]['recipe']}<recipeEnd>
+            generalized_functions: <generalized_functionsStart>{recipes[prompt_id]['generalized_functions']}<generalized_functionsEnd>
+        """
         "If you want any information/chat history or you are not able to do any task pass the task to main agent using 'connect_time_main' tool"
         "Return 'TERMINATE' when the task is done.",
         llm_config=llm_config,
@@ -703,12 +757,6 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         is_termination_msg=lambda msg: msg.get("content") is not None and "TERMINATE" in msg["content"],
         human_input_mode="NEVER",
     )
-    
-    # Register the tool signature with the assistant agent.
-    time_agent.register_for_llm(name="Scheduler", description="Creates time-based jobs using APScheduler to schedule jobs")(create_scheduled_jobs)
-
-    # Register the tool function with the user proxy agent.
-    time_user.register_for_execution(name="Scheduler")(create_scheduled_jobs)
     
     def connect_time_main(message: Annotated[str, "The message time agent want to send to main agent"]) -> str:
         message = f"Role: Time Agent\n Message: {message}"
@@ -744,7 +792,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     def state_transition(last_speaker, groupchat):
         messages = groupchat.messages
         current_app.logger.info(f'Inside state_transition with message :10 {messages[-1]["content"][:10]} & last_speaker {last_speaker.name}')
-        if last_speaker == user_proxy or last_speaker == multi_role_agent or last_speaker == helper:
+        if last_speaker.name == f"user_proxy_{user_id}" or last_speaker.name == 'multi_role_agent' or last_speaker.name == 'helper' or last_speaker.name == 'Executor':
             return assistant
         if 'exitcode:' in messages[-1]["content"]:
             current_app.logger.info('Got exitcode in text returning assistant')
@@ -758,7 +806,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     group_chat = autogen.GroupChat(
         agents=[assistant, helper, user_proxy,multi_role_agent,executor],
         messages=[],
-        # messages_per_round=15,
+        messages_per_round=20,
         # speaker_selection_method="auto",  # using an LLM to decide
         speaker_selection_method=state_transition,  # using an LLM to decide
         allow_repeat_speaker=False,  # Prevent same agent speaking twice
