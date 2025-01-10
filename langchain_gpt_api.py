@@ -70,7 +70,7 @@ load_dotenv()
 #autogen requirements
 
 from create_recipe import recipe
-from reuse_recipe import chat_agent, crossbar_multiagent
+from reuse_recipe import chat_agent, crossbar_multiagent, time_based_execution
 from autobahn.twisted.wamp import Application
 from autobahn.twisted.component import Component, run
 from twisted.internet import reactor
@@ -2070,7 +2070,7 @@ def chat():
                 if new_res['status'] == 'pending':
                     app.logger.info('PENDING STATUS')
                     ans = new_res['question'] if 'question' in new_res else new_res['review_details']
-                    return jsonify({'response': ans, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'creating'})
+                    return jsonify({'response': ans, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Creation Mode'})
                 else:
                     app.logger.info('COMPLETED STATUS')
                     new_res['prompt_id'] = prompt_id
@@ -2083,20 +2083,20 @@ def chat():
                         json.dump(new_res, json_file)
                     app.logger.info(f"Dictionary saved to {name}")
                     review_agents[user_id] = True
-                    return jsonify({'response': 'Got Agent details successfully lets move on to review them one at a time', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'review'})
+                    return jsonify({'response': 'Got Agent details successfully lets move on to review them one at a time', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Review Mode'})
             except Exception as e:
                 app.logger.error('GOT some error while eval and returning the response')
                 app.logger.error(e)
-                return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'creating'})
+                return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Creation Mode'})
         if review_agents[user_id] and not conversation_agent[user_id]:
             response = recipe(user_id,prompt,prompt_id,file_id)
             if response =='Agent Created Successfully':
                 conversation_agent[user_id] = True
                 return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'completed'})
-            return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'review'})
+            return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Review Mode'})
         if review_agents[user_id] and conversation_agent[user_id]:
             response = chat_agent(user_id,prompt,prompt_id,file_id)
-            return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'evaluation'})
+            return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Evaluation Mode'})
 
     if prompt_id and os.path.exists(f'prompts/{prompt_id}.json'):
         
@@ -2110,7 +2110,7 @@ def chat():
         #     return jsonify({'response': 'Need user_id and text to use agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
         # last_response = ''
         #create and user use_recipe.py
-        return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'reuse'})
+        return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Reuse Mode'})
 
     if prompt_id:
         try:
@@ -2192,6 +2192,19 @@ def chat():
 
     return jsonify({'response': ans, 'intent': thread_local_data.get_recognize_intents(), 'req_token_count': thread_local_data.get_req_token_count(), 'res_token_count': thread_local_data.get_res_token_count(), 'history_request_id': thread_local_data.get_reqid_list()})
 
+
+@app.route('/time_agent',methods=['POST'])
+def time_agent():
+    app.logger.info('GOT REUEST IN TIME AGENT API')
+    data = request.get_json()
+    task_description = data.get('task_description',None)
+    user_id = data.get('user_id',None)
+    if not task_description or not user_id:
+        return jsonify({'error':'user_id or task_description is missing'}), 404
+    app.logger.info(f'GOT user_id:{user_id} & task_description:{task_description}')
+    res = time_based_execution(str(task_description),int(user_id))
+    return jsonify({'response':f'{res}'}), 200
+    
 
 @app.route('/add_history', methods=['POST'])
 def history():

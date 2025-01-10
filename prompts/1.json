@@ -2,116 +2,90 @@
   "status": "completed",
   "steps": [
     {
-      "action": "Initiate a conversation with the creator by asking about the genre of the story.",
+      "action": "Create a story of 100 words with 2 characters speaking and save it for later use",
       "action_id": 1,
-      "persona": "user",
-      "fallback_action": "Select any random genre",
-      "Agent": "assistant"
+      "persona": "Creator",
+      "fallback_action": "try again with different topic"
     },
     {
-      "action": "Create a 200-word story with multiple characters in the format: {character1} dialogue of character1... {character2} dialogue of character2, narrated like an audiobook. and save it internally.",
+      "action": "Hit this API 'https://mailer.hertzai.com/all_teacher_avatars_user_id?user_id={user_id}' and get avatar_id and assign each character a consistent single avatar_id through out the story",
       "action_id": 2,
-      "persona": "user",
-      "fallback_action": "Create a 100-word story",
-      "Agent": "assistant"
+      "persona": "Creator",
+      "fallback_action": "try again after sometime"
     },
     {
-      "action": "Retrieve the list of avatar IDs by using the API: https://mailer.hertzai.com/all_teacher_avatars_user_id?user_id={user_id}.",
+      "action": "Create a video, one at a time, for each dialogue of the character story we created",
       "action_id": 3,
-      "persona": "user",
-      "fallback_action": "Hit API with user_id 1",
-      "Agent": "Executor"
+      "persona": "Creator",
+      "fallback_action": "try again"
     },
     {
-      "action": "Associate the avatar ID based on the teacher's name to a character created earlier and save it internally along with the character name and teacher avatar ID.",
+      "action": "Inform the Creator that the story creation was successful",
       "action_id": 4,
-      "persona": "user",
-      "fallback_action": "Try again after some time",
-      "Agent": "assistant"
+      "persona": "Creator",
+      "fallback_action": "try again after sometime"
     },
     {
-      "action": "Give one character dialogue at a time to the creator, create the video, and save it in the database for later use. Continue until all the dialogues from the story are complete.",
+      "action": "For the User, check for the available story. If there is any story available, get the entire story and provide one character line to the User at a time, just like an audiobook",
       "action_id": 5,
-      "persona": "user",
-      "fallback_action": "Inform the creator and move to next action",
-      "Agent": "assistant"
-    },
-    {
-      "action": "Check the status of video completion in a dynamic interval based on the number of words in the dialogue. If not completed, check regularly at an interval until success for the dialogue. After success, repeat this for each dialogue till the end of the story.",
-      "action_id": 6,
-      "persona": "user",
-      "fallback_action": "Proceed to next action",
-      "Agent": "Executor"
-    },
-    {
-      "action": "Create a scheduled activity to perform all the above actions until a story is created and repeat this periodically based on the previous story's creation status.",
-      "action_id": 7,
-      "persona": "user",
-      "fallback_action": "Inform the creator and move to next action",
-      "Agent": "Helper"
-    },
-    {
-      "action": "Have a monitoring task to check if the previous story is successfully created and start creating new stories after the previous story is completed without any human intervention.",
-      "action_id": 8,
-      "persona": "user",
-      "fallback_action": "Inform the creator and move to next action",
-      "Agent": "Helper"
-    },
-    {
-      "action": "Keep publishing the generated stories so that the user agent can keep broadcasting them like a story TV channel.",
-      "action_id": 9,
-      "persona": "user",
-      "fallback_action": "Ignore the failure",
-      "Agent": "assistant"
-    },
-    {
-      "action": "Retrieve the successfully created stories from the internal memory and deliver them to the user with the same exact teacher_avatar_id and text without altering a single letter.",
-      "action_id": 10,
-      "persona": "user",
-      "fallback_action": "Try again after some time",
-      "Agent": "assistant"
-    },
-    {
-      "action": "Return one dialogue at a time in the same order the story was created, with an interval based on the number of words (assuming 3 words will contribute to 1 second of video). Repeat until the story is fully given to the user.",
-      "action_id": 11,
-      "persona": "user",
-      "fallback_action": "Try again after some time",
-      "Agent": "Executor"
-    },
-    {
-      "action": "Track the stories given to the user in internal data and provide a new story only after the previous story is fully delivered.",
-      "action_id": 12,
-      "persona": "user",
-      "fallback_action": "Try again after some time",
-      "Agent": "Helper"
-    },
-    {
-      "action": "User persona will only reuse stories created by the creator and will not create new stories.",
-      "action_id": 13,
-      "persona": "user",
-      "fallback_action": "n/a",
-      "Agent": "assistant"
+      "persona": "User",
+      "fallback_action": "try again"
     }
   ],
-  "recipe": "Create story and videos from dialogues",
+  "recipe": "Final recipe involves creating a story with dialogues, fetching avatar IDs, creating videos for each dialogue, informing the creator, and providing the story to the user one line at a time.",
   "generalized_functions": [
     {
-      "function_name": "check_video_status",
-      "code": "def check_video_status(dialogue, character):\n    \"\"\"Check the status of video completion for a given dialogue and character.\"\"\"\n    words_count = len(dialogue.split())\n    interval = (words_count / 3) * 5\n    video_completed = False\n    while not video_completed:\n        print(f\"Checking video status for {character} at interval {interval}s...\")\n        # Replace with actual video status check logic\n        video_completed = True\n        if not video_completed:\n            time.sleep(interval)\n    return f\"Video for {character} completed successfully.\""
+      "function_name": "create_story",
+      "description": "Creates a story with given number of words and dialogues between characters.",
+      "parameters": {
+        "word_count": "Number of words in the story",
+        "dialogues": "List of dialogues between characters"
+      },
+      "returns": "The created story"
     },
     {
-      "function_name": "return_dialogues",
-      "code": "def return_dialogues(dialogues, user):\n    \"\"\"Return dialogues one by one with an interval based on the number of words.\"\"\"\n    for dialogue in dialogues:\n        character, text = dialogue\n        words_count = len(text.split())\n        interval = (words_count / 3)\n        print(f\"Returning dialogue for {character}: \\\"{text}\\\"\")\n        print(f\"Waiting for {interval} seconds before next dialogue...\")\n        time.sleep(interval)"
+      "function_name": "get_avatar_ids",
+      "description": "Fetches avatar IDs for a given user ID.",
+      "parameters": {
+        "user_id": "User ID for whom avatar IDs are to be fetched"
+      },
+      "returns": "List of avatar IDs"
+    },
+    {
+      "function_name": "create_video_for_dialogue",
+      "description": "Creates a video for a given dialogue using specified avatar ID.",
+      "parameters": {
+        "dialogue": "The dialogue for which video is to be created",
+        "avatar_id": "The avatar ID to be used for the video"
+      },
+      "returns": "URL of the created video"
+    },
+    {
+      "function_name": "inform_creator",
+      "description": "Informs the creator about the status of the story creation.",
+      "parameters": {
+        "message": "The message to be sent to the creator"
+      },
+      "returns": "Confirmation of informing the creator"
+    },
+    {
+      "function_name": "provide_story_line",
+      "description": "Provides one line of the story to the user at a time.",
+      "parameters": {
+        "story": "The entire story",
+        "line_number": "The line number to be provided to the user"
+      },
+      "returns": "The specific line from the story"
     }
   ],
   "scheduled_tasks": [
     {
-      "cron_expression": "0 1-23/1 * * *",
-      "job_description": "Perform all actions to create a story and repeat 20 times a day"
+      "cron_expression": "",
+      "job_description": "Fetch avatar IDs for users periodically"
     },
     {
-      "cron_expression": "0 0-23/2 * * *",
-      "job_description": "Check if the previous story is successfully created and start creating new stories after the previous story is completed 10 times a day"
+      "cron_expression": "",
+      "job_description": "Check for new stories and provide to users periodically"
     }
   ]
 }
