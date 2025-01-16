@@ -22,14 +22,18 @@ from autobahn.twisted.component import Component, run
 from twisted.internet import reactor
 from twisted.internet.defer import inlineCallbacks
 import threading
-from autogen import ConversableAgent, register_function
+from autogen import ConversableAgent, register_function, runtime_logging
 import requests
 from flask import current_app
+
+from autogen.agentchat.contrib.capabilities import transform_messages, transforms
+from autogen.cache.in_memory_cache import InMemoryCache
+
 
 client = Client('http://aws_rasa.hertzai.com:8088/publish')
 scheduler = BackgroundScheduler()
 scheduler.start()
-
+# logging_session_id = runtime_logging.start(config={"dbname": "logs.db"})
 # Store user-specific agents & their chat history
 user_agents: Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]] = {}
 role_agents: Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]] = {}
@@ -42,20 +46,25 @@ agents_roles = {}
 
 redis_client = redis.StrictRedis(
     host='azure_all_vms.hertzai.com', port=6369, db=0)
-agent_data = {}
+agent_data = {77:{'horror_story_1': "Narrator 1 (Avatar ID 1983):\n1. It was a dark and stormy night, the wind howling ominously through the trees. Emily and Jack decided to take shelter in the old, abandoned mansion at the edge of town.\n\nNarrator 2 (Avatar ID 1980):\n2. As they stepped inside, the door slammed shut behind them with a loud bang. The temperature dropped instantly, and a chill ran down their spines. Emily's flashlight flickered, casting eerie shadows on the cobweb-covered walls.\n\nNarrator 1 (Avatar ID 1983):\n3. They heard whispers, faint at first but growing louder. Jack's curiosity got the better of him, and he ventured deeper into the mansion, leaving Emily behind.\n\nNarrator 2 (Avatar ID 1980):\n4. Suddenly, a blood-curdling scream pierced the air. Emily ran towards the sound, only to find Jack's flashlight on the floor, flickering. Jack was nowhere to be seen. The whispers grew louder, closing in on Emily, until everything went dark.", 'new_story_1': "Narrator 1 (Avatar ID 1983):\n1. Clara stood at the edge of the cliff, the ocean waves crashing below her. The breeze was cool and salty, whispering secrets of long-forgotten tales.\n\nNarrator 2 (Avatar ID 1980):\n2. She had come here searching for answers, for a sign that everything would be alright. In her hand, she clutched a letter, its contents promising hope and a new beginning.\n\nNarrator 1 (Avatar ID 1983):\n3. As Clara unfolded the letter, her eyes widened. It wasn't just a message of hope; it was a map, leading to a hidden treasure deep within the forest.\n\nNarrator 2 (Avatar ID 1980):\n4. With newfound determination, Clara turned away from the cliffs and began her journey, her heart beating with the promise of adventure and discovery."}}
+# config_list = [{
+#     "model": 'gpt-4o',
+#     "api_type": "azure",
+#     "api_key": '4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf',
+#     "base_url": 'https://hertzai-gpt4.openai.azure.com/',
+#     "api_version": "2024-02-15-preview",
+#     "price": [0.0025, 0.01]
+# }]
+
 config_list = [{
-    "model": 'hertzai-4o',
+    "model": "gpt-4o-mini",
     "api_type": "azure",
-    "api_key": '8f3cd49e1c3346128ba77d09ee9c824c',
-    "base_url": 'https://hertzai-gpt4.openai.azure.com/',
-    "api_version": "2024-02-15-preview"
+    "api_key": "4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf",
+    "base_url": "https://hertzai-gpt4.openai.azure.com/",
+    "api_version": "2024-02-15-preview",
+    "price":[0.00015,0.0006]
 }]
-executor_config = {
-    "llm_config": {
-        "config_list": config_list,
-        "cache_seed": None
-    }
-}
+
 
 def send_message_to_user(user_id,response,inp):
     url = 'http://aws_rasa.hertzai.com:9890/autogen_response'
@@ -191,14 +200,15 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
 
 
 def create_agents_for_role(user_id: str,prompt_id):
-    current_app.logger.info('INSIDE create_agents_for_role')
     config_list = [{
-        "model": 'hertzai-4o',
+        "model": 'gpt-4o',
         "api_type": "azure",
-        "api_key": '8f3cd49e1c3346128ba77d09ee9c824c',
+        "api_key": '4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf',
         "base_url": 'https://hertzai-gpt4.openai.azure.com/',
-        "api_version": "2024-02-15-preview"
+        "api_version": "2024-02-15-preview",
+        "price": [0.0025, 0.01]
     }]
+    current_app.logger.info('INSIDE create_agents_for_role')
 
     # Create a basic function calling config
     llm_config = {
@@ -308,11 +318,27 @@ def create_agents_for_role(user_id: str,prompt_id):
                 return None
             return "auto"
             
+        select_speaker_compression_args = dict(
+            model_name="microsoft/llmlingua-2-xlm-roberta-large-meetingbank", use_llmlingua2=True, device_map="cpu"
+        )
+        select_speaker_transforms = transform_messages.TransformMessages(
+            transforms=[
+                transforms.MessageHistoryLimiter(max_messages=10),
+                transforms.TextMessageCompressor(
+                    min_tokens=1000,
+                    text_compressor=transforms.LLMLingua(select_speaker_compression_args, structured_compression=True),
+                    cache=InMemoryCache(seed=43),
+                    filter_dict={"role": ["system"], "name": ["ceo", "checking_agent"]},
+                    exclude_filter=True,
+                ),
+                transforms.MessageTokenLimiter(max_tokens=3000, max_tokens_per_message=500, min_tokens=300),
+            ]
+        )
         group_chat = autogen.GroupChat(
             agents=[assistant, helper, user_proxy],
             messages=[],
-            # messages_per_round=15,
-            # speaker_selection_method="auto",  # using an LLM to decide
+            max_round=20,
+            select_speaker_transform_messages=select_speaker_transforms,
             speaker_selection_method=state_transition,  # using an LLM to decide
             allow_repeat_speaker=False,  # Prevent same agent speaking twice
             send_introductions=True
@@ -338,13 +364,6 @@ def create_agents_for_role(user_id: str,prompt_id):
 
 def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]:
     """Create new assistant & user proxy agents for a user with basic configuration."""
-    config_list = [{
-        "model": 'hertzai-4o',
-        "api_type": "azure",
-        "api_key": '8f3cd49e1c3346128ba77d09ee9c824c',
-        "base_url": 'https://hertzai-gpt4.openai.azure.com/',
-        "api_version": "2024-02-15-preview"
-    }]
 
     # Create a basic function calling config
     llm_config = {
@@ -395,17 +414,19 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
                 individual_recipe.append(config)
         except Exception as e:
             current_app.logger.error(f'Got error as :{e} while checking for prompts/{prompt_id}_{i}.json')
-    
+    response_format = {'message_2_user': 'Your message here'}
     agent_prompt = f'''You are a Helpful {role} Assistant. Follow the actions below to assist the user:
         1. Try to complete a task on your own If you are unable to perform a specific task, ask the helper agent for assistance.
         2. Only follow actions where the persona is: {role}.
         3. Follow the steps below to achieve the goal: {goal}.
         4. Use the provided Recipe for more details related to the actions.
         5. Keep track of action and only go to text action when the current action is completed successfully
-        6. Always use code from recipe given below
-        7. If there is any action which is like to perform a task continously you should not do it.
+        6. Always use steps/code from recipe given below
+        7. If there is any action which is like to perform a task continously or time based or scheduled activity you should not perform this action is already taken care of.
         8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
         9. Tools Helper Agent can use [txt2img, img2txt, save_data_in_memory, get_data_from_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs] if you have any task which is not doable by these tool check recipe first else create python code to do so
+        10. Do not mention anything related to action or get confirmation from user if not needed.
+        11. IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @{role} {response_format}
         
         Actions: <actionsStart>{role_actions}<actionEnd>
         Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{individual_recipe}<generalized_functionsEnd><recipeEnd>
@@ -449,10 +470,10 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
             6. Always use code from recipe given below
             7. If there is any action which is like to perform a task continously you should not do it.
             8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
+            9. IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @{role} {response_format}
             
             Actions: <actionsStart>{role_actions}<actionEnd>
-            Recipe: <recipeStart>{recipes[prompt_id]['recipe']}<recipeEnd>
-            generalized_functions: <generalized_functionsStart>{recipes[prompt_id]['generalized_functions']}<generalized_functionsEnd>
+            Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{individual_recipe}<generalized_functionsEnd><recipeEnd>            
             
             When writing code, always print the final response just before returning it.
         """,
@@ -472,11 +493,11 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
             6. Always use code from recipe given below
             7. If there is any action which is like to perform a task continously you should not do it.
             8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
+            9. IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @{role} {response_format}
             
             Actions: <actionsStart>{role_actions}<actionEnd>
-            Recipe: <recipeStart>{recipes[prompt_id]['recipe']}<recipeEnd>
-            generalized_functions: <generalized_functionsStart>{recipes[prompt_id]['generalized_functions']}<generalized_functionsEnd>
-            
+            Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{individual_recipe}<generalized_functionsEnd><recipeEnd>
+        
             Note: Your Working Directory is "/home/hertzai2019/newauto/coding" use this if you need,
             Add proper error handling, logging.
             Always provide clear execution results or error messages to the assistant.
@@ -568,16 +589,15 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     def save_data_in_memory(key: Annotated[str, "Key for storing/retrieving data"],
                     value: Annotated[Optional[str], "Value you want to store"] = None) -> str:
         current_app.logger.info('INSIDE save_data_in_memory')
-        current_app.logger.info(f'Data in memory before update {agent_data[prompt_id]}')
         agent_data[prompt_id][key] = value
-        current_app.logger.info(f'Data in memory after update {agent_data[prompt_id]}')
         return f'{agent_data[prompt_id]}'
     
     
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",description="Returns all data from the internal Memory")
     def get_data_from_memory() -> str:
-        current_app.logger.info('INSIDE get_all_data')
+        current_app.logger.info(f'INSIDE get_all_data with prompt_id {prompt_id}')
+        current_app.logger.info(f'data from get_all_data {agent_data[prompt_id]}')
         return f'{agent_data[prompt_id]}'
  
     @assistant.register_for_execution()
@@ -738,13 +758,13 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     # Let's first define the assistant agent that suggests tool calls. TODO add recipe here
     time_agent = ConversableAgent(
         name="time",
-        system_message="You are an helpful AI assistant. "
+        system_message="You are an helpful AI assistant used to perform time based tasks given to you. "
         f"""You can refer below details to perform task:
             Actions: <actionsStart>{role_actions}<actionEnd>
-            Recipe: <recipeStart>{recipes[prompt_id]['recipe']}<recipeEnd>
-            generalized_functions: <generalized_functionsStart>{recipes[prompt_id]['generalized_functions']}<generalized_functionsEnd>
+            Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{individual_recipe}<generalized_functionsEnd><recipeEnd>
+        
         """
-        "If you want any information/chat history or you are not able to do any task pass the task to main agent using 'connect_time_main' tool"
+        f"When you want to communicate with {role} connect main agent using 'connect_time_main' tool."
         "Return 'TERMINATE' when the task is done.",
         llm_config=llm_config,
     )
@@ -752,11 +772,36 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     # The user proxy agent is used for interacting with the assistant agent
     # & executes tool calls.
     time_user = ConversableAgent(
-        name="time_user",
+        name="executor",
         llm_config=False,
         is_termination_msg=lambda msg: msg.get("content") is not None and "TERMINATE" in msg["content"],
+        code_execution_config={"work_dir": "coding", "use_docker": False},
         human_input_mode="NEVER",
     )
+    
+    ##Tools call
+    time_agent.register_for_llm(name="txt2img", description="Text to image Creator")(txt2img)
+    time_user.register_for_execution(name="txt2img")(txt2img)
+    time_agent.register_for_llm(name="img2txt", description="Image to Text/Question Answering from image")(img2txt)
+    time_user.register_for_execution(name="img2txt")(img2txt)  
+    time_agent.register_for_llm(name="save_data_in_memory", description="Use this to Store and retrieve data using key-value storage system")(save_data_in_memory)
+    time_user.register_for_execution(name="save_data_in_memory")(save_data_in_memory)  
+    time_agent.register_for_llm(name="get_data_from_memory", description="Returns all data from the internal Memory")(get_data_from_memory)
+    time_user.register_for_execution(name="get_data_from_memory")(get_data_from_memory)  
+    time_agent.register_for_llm(name="get_user_id", description="Returns the unique identifier (user_id) of the current user.")(get_user_id)
+    time_user.register_for_execution(name="get_user_id")(get_user_id)  
+    time_agent.register_for_llm(name="get_prompt_id", description="Returns the unique identifier (prompt_id) associated with the current prompt or conversation.")(get_prompt_id)
+    time_user.register_for_execution(name="get_prompt_id")(get_prompt_id)  
+    time_agent.register_for_llm(name="Generate_video", description="Generate video with text and save it in database")(Generate_video)
+    time_user.register_for_execution(name="Generate_video")(Generate_video)  
+    time_agent.register_for_llm(name="get_user_uploaded_file", description="get user's recent uploaded files")(get_user_uploaded_file)
+    time_user.register_for_execution(name="get_user_uploaded_file")(get_user_uploaded_file)  
+    time_agent.register_for_llm(name="get_user_camera_inp", description="Get user's visual information to process somethings")(get_user_camera_inp)
+    time_user.register_for_execution(name="get_user_camera_inp")(get_user_camera_inp)  
+    time_agent.register_for_llm(name="create_scheduled_jobs", description="Creates time-based jobs using APScheduler to schedule jobs")(create_scheduled_jobs)
+    time_user.register_for_execution(name="create_scheduled_jobs")(create_scheduled_jobs)  
+    time_agent.register_for_llm(name="get_chat_history", description="Get Chat history based on text & start & end date")(get_chat_history)
+    time_user.register_for_execution(name="get_chat_history")(get_chat_history)  
     
     def connect_time_main(message: Annotated[str, "The message time agent want to send to main agent"]) -> str:
         message = f"Role: Time Agent\n Message: {message}"
@@ -782,11 +827,11 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     # Register the tool function with the user proxy agent.
     time_user.register_for_execution(name="Connect_to_main_agent")(connect_time_main)  
     
-    assistant.description = 'Agent that is designed to do some specific tasks'
-    user_proxy.description = 'Agent will act as user & perform task assigned to user'
-    helper.description = 'helps assistant agent to call functions'
-    multi_role_agent.description = 'Never call this agent it will act as a external agent'
-    executor.description = 'this is an executor agent that Specialized agent for code execution & response handling'
+    assistant.description = 'Designed to handle specific tasks by interacting directly with other agents or the user. It acts as the primary orchestrator for task management and ensures tasks are completed efficiently'
+    user_proxy.description = 'Acts as a user, performing tasks assigned by the Assistant Agent. It simulates user actions and provides results or feedback as required.'
+    helper.description = 'Assists the Assistant Agent by handling function (txt2img, img2txt, save_data_in_memory, get_data_from_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs) calls and supporting backend processes. '
+    multi_role_agent.description = 'Acts as an external agent with multi-functional capabilities. Note: This agent should never be directly invoked.'
+    executor.description = 'A specialized agent responsible for executing code and handling response management. It ensures computational tasks are performed accurately and returns results effectively.'
     
     
     def state_transition(last_speaker, groupchat):
@@ -803,11 +848,27 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
             return None
         return "auto"
         
+    select_speaker_compression_args = dict(
+        model_name="microsoft/llmlingua-2-xlm-roberta-large-meetingbank", use_llmlingua2=True, device_map="cpu"
+    )
+    select_speaker_transforms = transform_messages.TransformMessages(
+        transforms=[
+            transforms.MessageHistoryLimiter(max_messages=10),
+            transforms.TextMessageCompressor(
+                min_tokens=1000,
+                text_compressor=transforms.LLMLingua(select_speaker_compression_args, structured_compression=True),
+                cache=InMemoryCache(seed=43),
+                filter_dict={"role": ["system"], "name": ["ceo", "checking_agent"]},
+                exclude_filter=True,
+            ),
+            transforms.MessageTokenLimiter(max_tokens=3000, max_tokens_per_message=500, min_tokens=300),
+        ]
+    )
     group_chat = autogen.GroupChat(
         agents=[assistant, helper, user_proxy,multi_role_agent,executor],
         messages=[],
-        messages_per_round=20,
-        # speaker_selection_method="auto",  # using an LLM to decide
+        max_round=20,
+        select_speaker_transform_messages=select_speaker_transforms,
         speaker_selection_method=state_transition,  # using an LLM to decide
         allow_repeat_speaker=False,  # Prevent same agent speaking twice
         send_introductions=True
@@ -825,7 +886,22 @@ def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.Us
     """Get a single response from the agent for the given message."""
     try:
 
-        response = user_proxy.initiate_chat(manager, message=message,speaker_selection={"speaker": "assistant"}, clear_history=False)
+        result = user_proxy.initiate_chat(manager, message=message,speaker_selection={"speaker": "assistant"}, clear_history=False)
+        # Print the chat summary
+        current_app.logger.info("\n=== Chat Summary ===")
+        current_app.logger.info(result.summary)
+
+        # Print the cost information
+        current_app.logger.info("\n=== Cost Information ===")
+        current_app.logger.info("Including cached inference: {}".format(result.cost['usage_including_cached_inference']))
+        current_app.logger.info("Excluding cached inference: {}".format(result.cost['usage_excluding_cached_inference']))
+
+        # Print the full chat history
+        current_app.logger.info("\n=== Full Chat History ===")
+        for message in result.chat_history:
+            sender = message.get('name', 'Unknown')
+            content = message.get('content', '')
+            current_app.logger.info(f"{sender}: {content}")
         last_message = group_chat.messages[-1]
         if last_message['content'] == 'TERMINATE':
             last_message = group_chat.messages[-2]
@@ -848,7 +924,8 @@ def chat_agent(user_id,text,prompt_id,file_id):
         # Get or create agents for this user
         if user_id not in user_agents:
             if user_id not in user_journey:
-                agent_data[prompt_id] = {}
+                if prompt_id not in agent_data.keys():
+                    agent_data[prompt_id] = {}
                 role_agents[user_id] = create_agents_for_role(user_id,prompt_id)
                 assistant, user_proxy, group_chat, manager, helper, stop = role_agents[user_id]
                 if stop:
@@ -858,13 +935,29 @@ def chat_agent(user_id,text,prompt_id,file_id):
             if user_journey[user_id] == 'UseBot':
                 with open(f"prompts/{prompt_id}_recipe.json", 'r') as f:
                     config = json.load(f)
+                    recipes[prompt_id] = config
                     try:
                         if 'scheduled_tasks' in config and len(config['scheduled_tasks'])>0:
                             current_app.logger.info('Creating scheduled tasks')
-                            trigger = CronTrigger.from_crontab(config['scheduled_tasks'][0]['cron_expression'])
-                            job_id = f"job_{int(time.time())}"
-                            scheduler.add_job(execute_python_file, trigger=trigger, id=job_id,args=[config['scheduled_tasks'][0]['job_description'],user_id])
-                            current_app.logger.info('Successfully created scheduler job')
+                            creator = True if f'{user_id}_{prompt_id}' in agents_session.keys() else False
+                            role = None
+                            if creator:
+                                for i in agents_session[f'{user_id}_{prompt_id}']:
+                                    if i['user_id'] == user_id:
+                                        role = i['role']
+                                        break
+                            if not role:
+                                if user_id in chat_joinees.keys():
+                                    chat_creator_user_id = f"{chat_joinees[user_id][prompt_id]}_{prompt_id}"
+                                    for i in agents_session[f"{chat_creator_user_id}"]:
+                                        if i['user_id'] == user_id:
+                                            role = i['role']
+                                            break
+                            # if role and config['scheduled_tasks'][0]['persona'].lower() == role.lower():
+                            #     trigger = CronTrigger.from_crontab(config['scheduled_tasks'][0]['cron_expression'])
+                            #     job_id = f"job_{int(time.time())}"
+                            #     scheduler.add_job(execute_python_file, trigger=trigger, id=job_id,args=[config['scheduled_tasks'][0]['job_description'],user_id])
+                            #     current_app.logger.info('Successfully created scheduler job')
                     except Exception as e:
                         current_app.logger.error(f'Some Error in creating scheduled tasks error:{e}')
                     recipes[prompt_id] = config
@@ -872,12 +965,69 @@ def chat_agent(user_id,text,prompt_id,file_id):
                 user_journey[user_id] = 'UseBot'
         if user_journey[user_id] == 'Roles':
             assistant, user_proxy, group_chat, manager, helper, stop = role_agents[user_id]
-            response = user_proxy.initiate_chat(manager, message=user_message,speaker_selection={"speaker": "assistant"}, clear_history=False)
+            result = user_proxy.initiate_chat(manager, message=user_message,speaker_selection={"speaker": "assistant"}, clear_history=False)
+            # Print the chat summary
+            current_app.logger.info("\n=== Chat Summary ===")
+            current_app.logger.info(result.summary)
+
+            # Print the cost information
+            current_app.logger.info("\n=== Cost Information ===")
+            current_app.logger.info("Including cached inference: {}".format(result.cost['usage_including_cached_inference']))
+            current_app.logger.info("Excluding cached inference: {}".format(result.cost['usage_excluding_cached_inference']))
+            current_app.logger.info("\n=== Cost and Token Information ===")
+            current_app.logger.info("Including cached inference:")
+            for model, usage in result.cost['usage_including_cached_inference'].items():
+                if isinstance(usage, dict) and 'prompt_tokens' in usage:
+                    current_app.logger.info(f"\nModel: {model}")
+                    current_app.logger.info(f"Prompt tokens: {usage['prompt_tokens']}")
+                    current_app.logger.info(f"Completion tokens: {usage['completion_tokens']}")
+                    current_app.logger.info(f"Total tokens: {usage['total_tokens']}")
+                    current_app.logger.info(f"Cost: ${usage.get('total_cost', 0):.4f}")
+
+            current_app.logger.info("\nExcluding cached inference:")
+            for model, usage in result.cost['usage_excluding_cached_inference'].items():
+                if isinstance(usage, dict) and 'prompt_tokens' in usage:
+                    current_app.logger.info(f"\nModel: {model}")
+                    current_app.logger.info(f"Prompt tokens: {usage['prompt_tokens']}")
+                    current_app.logger.info(f"Completion tokens: {usage['completion_tokens']}")
+                    current_app.logger.info(f"Total tokens: {usage['total_tokens']}")
+                    current_app.logger.info(f"Cost: ${usage.get('total_cost', 0):.4f}")
+            # Print the full chat history
+            current_app.logger.info("\n=== Full Chat History ===")
+            for message in result.chat_history:
+                sender = message.get('name', 'Unknown')
+                content = message.get('content', '')
+                current_app.logger.info(f"{sender}: {content}")
             last_message = group_chat.messages[-1]
             if 'terminate' in last_message['content'].lower():
-                last_message = group_chat.messages[-2]
+                with open(f"prompts/{prompt_id}_recipe.json", 'r') as f:
+                    config = json.load(f)
+                    recipes[prompt_id] = config
+                user_agents[user_id] = create_agents_for_user(user_id,prompt_id)
+                assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user = user_agents[user_id]
                 user_journey[user_id] = 'UseBot'
-                return 'Role updated Successfully use the bot now'
+                message = "let's perform the actions availabe in sequence\nIMP instruction: If you want to ask something or send something to the user, always use this format: @user {'message_2_user': 'Your message here'}"
+                result = helper.initiate_chat(manager, message=message,speaker_selection={"speaker": "assistant"}, clear_history=False)
+                # Print the chat summary
+                current_app.logger.info("\n=== Chat Summary ===")
+                current_app.logger.info(result.summary)
+
+                # Print the cost information
+                current_app.logger.info("\n=== Cost Information ===")
+                current_app.logger.info("Including cached inference: {}".format(result.cost['usage_including_cached_inference']))
+                current_app.logger.info("Excluding cached inference: {}".format(result.cost['usage_excluding_cached_inference']))
+
+                # Print the full chat history
+                current_app.logger.info("\n=== Full Chat History ===")
+                for message in result.chat_history:
+                    sender = message.get('name', 'Unknown')
+                    content = message.get('content', '')
+                    current_app.logger.info(f"{sender}: {content}")
+                last_message = group_chat.messages[-1]
+                if last_message['content'] == 'TERMINATE':
+                    last_message = group_chat.messages[-2]
+                return last_message
+        
             
             return last_message['content']
         else:

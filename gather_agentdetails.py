@@ -8,9 +8,9 @@ user_agents: Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]] = 
 def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]:
     """Create new assistant & user proxy agents for a user with basic configuration."""
     config_list = [{
-        "model": 'hertzai-4o',
+        "model": 'gpt-4o-mini',
         "api_type": "azure",
-        "api_key": '8f3cd49e1c3346128ba77d09ee9c824c',
+        "api_key": '4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf',
         "base_url": 'https://hertzai-gpt4.openai.azure.com/',
         "api_version": "2024-02-15-preview"
     }]
