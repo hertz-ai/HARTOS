@@ -323,7 +323,7 @@ def create_agents_for_role(user_id: str,prompt_id):
         )
         select_speaker_transforms = transform_messages.TransformMessages(
             transforms=[
-                transforms.MessageHistoryLimiter(max_messages=10),
+                transforms.MessageHistoryLimiter(max_messages=5),
                 transforms.TextMessageCompressor(
                     min_tokens=1000,
                     text_compressor=transforms.LLMLingua(select_speaker_compression_args, structured_compression=True),
@@ -891,17 +891,8 @@ def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.Us
         current_app.logger.info("\n=== Chat Summary ===")
         current_app.logger.info(result.summary)
 
-        # Print the cost information
-        current_app.logger.info("\n=== Cost Information ===")
-        current_app.logger.info("Including cached inference: {}".format(result.cost['usage_including_cached_inference']))
-        current_app.logger.info("Excluding cached inference: {}".format(result.cost['usage_excluding_cached_inference']))
-
-        # Print the full chat history
-        current_app.logger.info("\n=== Full Chat History ===")
-        for message in result.chat_history:
-            sender = message.get('name', 'Unknown')
-            content = message.get('content', '')
-            current_app.logger.info(f"{sender}: {content}")
+        current_app.logger.info("\n=== Full response ===")
+        current_app.logger.info(result)
         last_message = group_chat.messages[-1]
         if last_message['content'] == 'TERMINATE':
             last_message = group_chat.messages[-2]
@@ -970,34 +961,11 @@ def chat_agent(user_id,text,prompt_id,file_id):
             current_app.logger.info("\n=== Chat Summary ===")
             current_app.logger.info(result.summary)
 
-            # Print the cost information
-            current_app.logger.info("\n=== Cost Information ===")
-            current_app.logger.info("Including cached inference: {}".format(result.cost['usage_including_cached_inference']))
-            current_app.logger.info("Excluding cached inference: {}".format(result.cost['usage_excluding_cached_inference']))
-            current_app.logger.info("\n=== Cost and Token Information ===")
-            current_app.logger.info("Including cached inference:")
-            for model, usage in result.cost['usage_including_cached_inference'].items():
-                if isinstance(usage, dict) and 'prompt_tokens' in usage:
-                    current_app.logger.info(f"\nModel: {model}")
-                    current_app.logger.info(f"Prompt tokens: {usage['prompt_tokens']}")
-                    current_app.logger.info(f"Completion tokens: {usage['completion_tokens']}")
-                    current_app.logger.info(f"Total tokens: {usage['total_tokens']}")
-                    current_app.logger.info(f"Cost: ${usage.get('total_cost', 0):.4f}")
-
-            current_app.logger.info("\nExcluding cached inference:")
-            for model, usage in result.cost['usage_excluding_cached_inference'].items():
-                if isinstance(usage, dict) and 'prompt_tokens' in usage:
-                    current_app.logger.info(f"\nModel: {model}")
-                    current_app.logger.info(f"Prompt tokens: {usage['prompt_tokens']}")
-                    current_app.logger.info(f"Completion tokens: {usage['completion_tokens']}")
-                    current_app.logger.info(f"Total tokens: {usage['total_tokens']}")
-                    current_app.logger.info(f"Cost: ${usage.get('total_cost', 0):.4f}")
+            
             # Print the full chat history
-            current_app.logger.info("\n=== Full Chat History ===")
-            for message in result.chat_history:
-                sender = message.get('name', 'Unknown')
-                content = message.get('content', '')
-                current_app.logger.info(f"{sender}: {content}")
+            current_app.logger.info("\n=== Full response ===")
+            current_app.logger.info(result)
+            
             last_message = group_chat.messages[-1]
             if 'terminate' in last_message['content'].lower():
                 with open(f"prompts/{prompt_id}_recipe.json", 'r') as f:
@@ -1012,17 +980,8 @@ def chat_agent(user_id,text,prompt_id,file_id):
                 current_app.logger.info("\n=== Chat Summary ===")
                 current_app.logger.info(result.summary)
 
-                # Print the cost information
-                current_app.logger.info("\n=== Cost Information ===")
-                current_app.logger.info("Including cached inference: {}".format(result.cost['usage_including_cached_inference']))
-                current_app.logger.info("Excluding cached inference: {}".format(result.cost['usage_excluding_cached_inference']))
-
-                # Print the full chat history
-                current_app.logger.info("\n=== Full Chat History ===")
-                for message in result.chat_history:
-                    sender = message.get('name', 'Unknown')
-                    content = message.get('content', '')
-                    current_app.logger.info(f"{sender}: {content}")
+                current_app.logger.info("\n=== Full response ===")
+                current_app.logger.info(result)
                 last_message = group_chat.messages[-1]
                 if last_message['content'] == 'TERMINATE':
                     last_message = group_chat.messages[-2]
