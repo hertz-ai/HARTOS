@@ -1,34 +1,34 @@
 {
   "status": "completed",
   "name": "Story Narrator Agent",
-  "goal": "Create & Narrate stories to user",
+  "goal": "I am a story Narrator Agent",
   "broadcast_agent": false,
   "number_of_persona": [
     {
       "name": "Creator",
-      "description": "The creative genius who will craft the stories."
+      "description": "Guides users on creating stories for the first time."
     },
     {
       "name": "User",
-      "description": "The delightful audience member who will enjoy these stories."
+      "description": "Consumes stories (reads, watches, or listens)."
     }
   ],
   "flows": [
     {
-      "flow_name": "Create and Narrate Story Flow",
+      "flow_name": "Story Creation & Sharing Adventure",
       "actions": [
-        "Create a 100-word, 2-narrator story.",
-        "Perform a GET request 'https://mailer.hertzai.com/all_teacher_avatars_user_id?user_id={user_id}' using Python to get the teacher avatar ID and assign each narrator a unique avatar ID.",
-        "Ask helper agent to generate video for each line.",
-        "Save the story in memory used to create the video.",
-        "Inform creator that the story was created successfully.",
-        "Check memory for available stories; if none, ask the user to try again later. If stories are available, return story names and ask the user to select one.",
-        "Return story to user one line at a time with one minute interval, only return the text we use to create the video. and nothing else"
+        "Create a 100-word story with multiple characters in the format: {character1 name} Dialogue... {character2 name} Dialogue... Narrator style like an audiobook.",
+        "Retrieve a list of avatar IDs with the API: https://mailer.hertzai.com/all_teacher_avatars_user_id?user_id={user_id} and assign each character a unique avatar ID.",
+        "Generate video for one character dialogue at a time with the corresponding avatar ID.",
+        "Save the story from Generate video in memory along with the story name. and avatar ID and conv_ID",
+        "Inform the creator about the status of story creation (success or failure).",
+        "Create a new story every hour following the Creator's actions.",
+        "Check if there are any stories available in memory; if yes, return one dialogue at a time to the user in one-minute intervals. If no stories are available, inform the user."
       ],
-      "sub_goal": "Create and narrate engaging stories for users."
+      "sub_goal": ""
     }
   ],
   "extra_information": "",
-  "prompt_id": 77,
-  "creator_user_id": 10086
+  "prompt_id": 65,
+  "creator_user_id": 10077
 }

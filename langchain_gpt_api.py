@@ -2048,7 +2048,7 @@ def chat():
             if not user_id or not prompt:
                 return jsonify({'response': 'Need user_id and text to create agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
             from gather_agentdetails import gather_info
-            response = gather_info(user_id,prompt)
+            response = gather_info(user_id,prompt,prompt_id)
             new_response = response.replace('true','True').replace("false", "False")
             app.logger.info('AFTER GATHER INFO')
             try:
@@ -2199,10 +2199,11 @@ def time_agent():
     data = request.get_json()
     task_description = data.get('task_description',None)
     user_id = data.get('user_id',None)
-    if not task_description or not user_id:
-        return jsonify({'error':'user_id or task_description is missing'}), 404
-    app.logger.info(f'GOT user_id:{user_id} & task_description:{task_description}')
-    res = time_based_execution(str(task_description),int(user_id))
+    prompt_id = data.get('prompt_id',None)
+    if not task_description or not user_id or not prompt_id:
+        return jsonify({'error':'user_id or task_description or prompt_id is missing'}), 404
+    app.logger.info(f'GOT user_id:{user_id} & prompt_id:{prompt_id} & task_description:{task_description}')
+    res = time_based_execution(str(task_description),int(user_id),int(prompt_id))
     return jsonify({'response':f'{res}'}), 200
     
 
