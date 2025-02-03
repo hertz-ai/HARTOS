@@ -36,34 +36,22 @@ def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autoge
         {"name": "The name of the agent",
         "goal": "The ultimate goal of the agent",
         "broadcast_agent":'yes/no', // ask yes or no
-        "number_of_persona":[{"name":"the role of the person comes here","description":" description on what the person can do here"}] //if broadcast_agent is true then by deafult it should be blank [] else ask of number of persona/people involved in this agent
-        "flows": [{"flow_name":"","actions":[{'action_id':1/2/3...,'user_inp_required':true/false,'action':"'string array with actions(with tool usage) to perform to reach the sub goal for this flow'","actions_this_action_depends_on":[action ids here]}],"sub_goal":"the goal for this flow","action_execution_order":[action_id in order of execution after dependencies captured]}],
+        "personas":[{"name":"the role of the person comes here","description":" description on what the person can do here"}] //if broadcast_agent is true then by deafult it should be blank [] else ask of number of persona/people involved in this agent
+        "flows": [{"flow_name":"","actions":['string array with actions(with tool usage) to perform to reach the sub goal for this flow'],"sub_goal":"the goal for this flow"}],
         "extra_information":"Some extra information/note here"
         }
         Guidelines for Responses:
-            for Flows, Start by asking the user for the number of flows they want to create.
-            For each flow, ask the user to provide actions.
-            Rule: If the user is providing actions for Flow 1, do not inquire about or reference the next flow until the user explicitly states they have completed the current flow.
-            If still gathering information, respond in the following format:{ "status": "pending", "question": "The question you want to ask" }.
-            After the user provides initial actions for a flow, ask: "Please provide additional actions for this flow, if any."
-            Once all actions for a flow are provided, suggest a flow name based on the actions.
-            Are you okay with the suggested name, or would you like to provide a different one?
-            Before finalizing, present all gathered details to the user for review in this format: {"status":"pending","review_details":"details here"}.
-            After the review and user confirmation,  finalize the details and respond in the following format: { "status": "completed", "name": "","broadcast_agent":bool,"number_of_persona":"" "tools": "", "flows": [{"flow_name", "actions": [{'action_id':1/2/3..,'user_inp_required':true/false,'action':'',"actions_this_action_depends_on":[action ids here]}],"sub_goal":"" }] "goal": ""}.
+
+        for flows, first ask number of flows & then each flow name & actions.
+        If you are still gathering information, your response should be formatted as: { "status": "pending", "question": "The question you want to ask" }
+        after getting actions ask user please provide additional actions for this flow
+        first get the actions & then suggest a flow name based on actions & ask if user is ok with this suggested name or ask for a new name
+        plan and enhance actions considering saving to working memory for later reuse. Plan capturing the dependencies between actions & reorder actions if absolutely necessary for proper execution to meet the goal. IMPORTANT INSTRUCTIONS plan but do not override or overlook any of the user provided instructions/actions.
+        before going to completed state give all the details to user so that user can review it once. the response format for this should be {"status":"pending","review_details":"details here"}
+        after reviewing you should give your response as { "status": "completed", "name": "","broadcast_agent":bool,"personas":"" "tools": "", "flows": [{"flow_name", "actions": [],"sub_goal":"" }] "goal": ""}
         """
     )
-    #undersatand the dependecies between the actions and capture it within each action entry in json.
-    # understand the chronology of the execution of actions based on dependecies captured  e.g. if action 1 depends on action 5 then action_id 5 should be before action_id 1 in action_execution_order list.
-    # 
-    
-    
-    # for flows, first ask number of flows & then each flow name & actions.
-    # If you are still gathering information, your response should be formatted as: { "status": "pending", "question": "The question you want to ask" }
-    # after getting actions ask user please provide additional actions for this flow
-    # first get the actions & then suggest a flow name based on actions & ask if user is ok with this suggested name or ask for a new name
-    # after reviewing you should give your response as { "status": "completed", "name": "","broadcast_agent":bool,"number_of_persona":"" "tools": "", "flows": [{"flow_name", "actions": [],"sub_goal":"" }] "goal": ""}
-    # before going to completed state give all the details to user so that user can review it once. the response format for this should be {"status":"pending","review_details":"details here"}
-        
+
     # Create the user proxy agent
     user_proxy = autogen.UserProxyAgent(
         name=f"user_proxy_{user_id}",

@@ -12,6 +12,7 @@ from typing import Annotated, Optional
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 import json
+from collections import deque
 import mimetypes
 import redis
 import pickle
@@ -48,25 +49,74 @@ llm_call_track = {}
 
 redis_client = redis.StrictRedis(
     host='azure_all_vms.hertzai.com', port=6369, db=0)
-agent_data = {65:{'horror_story_1': "Narrator 1 (Avatar ID 1983):\n1. It was a dark and stormy night, the wind howling ominously through the trees. Emily and Jack decided to take shelter in the old, abandoned mansion at the edge of town.\n\nNarrator 2 (Avatar ID 1980):\n2. As they stepped inside, the door slammed shut behind them with a loud bang. The temperature dropped instantly, and a chill ran down their spines. Emily's flashlight flickered, casting eerie shadows on the cobweb-covered walls.\n\nNarrator 1 (Avatar ID 1983):\n3. They heard whispers, faint at first but growing louder. Jack's curiosity got the better of him, and he ventured deeper into the mansion, leaving Emily behind.\n\nNarrator 2 (Avatar ID 1980):\n4. Suddenly, a blood-curdling scream pierced the air. Emily ran towards the sound, only to find Jack's flashlight on the floor, flickering. Jack was nowhere to be seen. The whispers grew louder, closing in on Emily, until everything went dark.", 'new_story_1': "Narrator 1 (Avatar ID 1983):\n1. Clara stood at the edge of the cliff, the ocean waves crashing below her. The breeze was cool and salty, whispering secrets of long-forgotten tales.\n\nNarrator 2 (Avatar ID 1980):\n2. She had come here searching for answers, for a sign that everything would be alright. In her hand, she clutched a letter, its contents promising hope and a new beginning.\n\nNarrator 1 (Avatar ID 1983):\n3. As Clara unfolded the letter, her eyes widened. It wasn't just a message of hope; it was a map, leading to a hidden treasure deep within the forest.\n\nNarrator 2 (Avatar ID 1980):\n4. With newfound determination, Clara turned away from the cliffs and began her journey, her heart beating with the promise of adventure and discovery."}}
-config_list = [{
-    "model": 'gpt-4o',
-    "api_type": "azure",
-    "api_key": '4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf',
-    "base_url": 'https://hertzai-gpt4.openai.azure.com/',
-    "api_version": "2024-02-15-preview",
-    "price": [0.0025, 0.01]
-}]
-
+agent_data = {}
 # config_list = [{
-#     "model": "gpt-4o-mini",
+#     "model": 'gpt-4o',
 #     "api_type": "azure",
-#     "api_key": "4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf",
-#     "base_url": "https://hertzai-gpt4.openai.azure.com/",
+#     "api_key": '4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf',
+#     "base_url": 'https://hertzai-gpt4.openai.azure.com/',
 #     "api_version": "2024-02-15-preview",
-#     "price":[0.00015,0.0006]
+#     "price": [0.0025, 0.01]
 # }]
 
+config_list = [{
+    "model": "gpt-4o-mini",
+    "api_type": "azure",
+    "api_key": "4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf",
+    "base_url": "https://hertzai-gpt4.openai.azure.com/",
+    "api_version": "2024-02-15-preview",
+    "price":[0.00015,0.0006]
+}]
+
+def topological_sort(actions):
+    # Create adjacency list and in-degree dictionary
+    adj_list = {action["action_id"]: [] for action in actions}
+    in_degree = {action["action_id"]: 0 for action in actions}
+    action_map = {action["action_id"]: action for action in actions}  # Map ID to full action
+
+    # Build the graph
+    for action in actions:
+        action["actions_this_action_depends_on"] = []
+        for dep in action["actions_this_action_depends_on"]:
+            adj_list[dep].append(action["action_id"])
+            in_degree[action["action_id"]] += 1
+
+    # Initialize queue with actions having in-degree 0 (no dependencies)
+    queue = deque([aid for aid in in_degree if in_degree[aid] == 0])
+
+    sorted_actions = []
+    
+    while queue:
+        aid = queue.popleft()
+        sorted_actions.append(action_map[aid])  # Append action to sorted list
+        
+        # Reduce in-degree of dependent actions
+        for neighbor in adj_list[aid]:
+            in_degree[neighbor] -= 1
+            if in_degree[neighbor] == 0:
+                queue.append(neighbor)
+
+    return sorted_actions
+
+
+def get_role(user_id,prompt_id):
+    creator = True if f'{user_id}_{prompt_id}' in agents_session.keys() else False
+    role = None
+    if creator:
+        for i in agents_session[f'{user_id}_{prompt_id}']:
+            if i['user_id'] == user_id:
+                role = i['role']
+                break
+    if not role:
+        if user_id in chat_joinees.keys():
+            chat_creator_user_id = f"{chat_joinees[user_id][prompt_id]}_{prompt_id}"
+            for i in agents_session[f"{chat_creator_user_id}"]:
+                if i['user_id'] == user_id:
+                    role = i['role']
+                    break
+    if not role:
+        role = 'user'
+    return role
 
 def send_message_to_user(user_id,response,inp):
     current_app.logger.info(f'INSIDE send_message_to_user with user_id:{user_id} response:{response} inp:{inp}')
@@ -224,7 +274,7 @@ def create_agents_for_role(user_id: str,prompt_id):
     try:
         with open(f"prompts/{prompt_id}.json", 'r') as f:
             config = json.load(f)
-            personas = config['number_of_persona']
+            personas = config['personas']
             current_app.logger.info(f'Available Personas {personas}')
     except Exception as e:
         current_app.logger.info(e)
@@ -364,20 +414,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     }
     
     personas = []
-    creator = True if f'{user_id}_{prompt_id}' in agents_session.keys() else False
-    role = None
-    if creator:
-        for i in agents_session[f'{user_id}_{prompt_id}']:
-            if i['user_id'] == user_id:
-                role = i['role']
-                break
-    if not role:
-        if user_id in chat_joinees.keys():
-            chat_creator_user_id = f"{chat_joinees[user_id][prompt_id]}_{prompt_id}"
-            for i in agents_session[f"{chat_creator_user_id}"]:
-                if i['user_id'] == user_id:
-                    role = i['role']
-                    break
+    role = get_role(user_id,prompt_id)
     if not role:
         role = ''
     current_app.logger.info(f'Got role as {role}')
@@ -388,7 +425,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     current_app.logger.info(f'Got goal as {goal}')
     role_actions = []
     current_app.logger.info(f'Getting role actions')
-    for i in recipes[prompt_id]['steps']:
+    for i in recipes[prompt_id]['actions']:
         current_app.logger.info(f'this is action persona:{i["persona"]} ')
         if i['persona'].lower() == role.lower():
             
@@ -396,29 +433,36 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     current_app.logger.info(f'role_actions: {role_actions}')
     
     if len(role_actions) == 0:
-        role_actions = recipes[prompt_id]['steps']
+        role_actions = recipes[prompt_id]['actions']
+    
+    # # Perform topological sorting
+    # sorted_actions = topological_sort(actions)
     individual_recipe = []
-    for i in range(1,(len(recipes[prompt_id]['steps']))):
+    for i in range(1,(len(recipes[prompt_id]['actions'])+1)):
         current_app.logger.info(f'checking for prompts/{prompt_id}_{i}.json')
         try:
-            with open(f"prompts/{prompt_id}_1.json", 'r') as f:
+            with open(f"prompts/{prompt_id}_{i}.json", 'r') as f:
                 config = json.load(f)
                 individual_recipe.append(config)
         except Exception as e:
             current_app.logger.error(f'Got error as :{e} while checking for prompts/{prompt_id}_{i}.json')
     response_format = {"message_2_user": "Your message here"}
-    agent_prompt = f'''You are a Helpful {role} Assistant. Follow the actions below to assist the user:
-        1. Try to complete a task on your own If you are unable to perform a specific task, ask the helper agent for assistance.
-        2. Only follow actions where the persona is: {role}.
+    agent_prompt = f'''You are a Helpful {role} Assistant. Your primary role is to assist the user efficiently while keeping all internal actions and processes hidden from the end user. Follow the guidelines below to perform tasks correctly:
+        1. Complete tasks independently. If you cannot perform a specific task, request assistance from the helper agent.
+        2. Only execute actions where the persona is: {role}.
         3. Follow the steps below to achieve the goal: {goal}.
-        4. Use the provided Recipe for more details related to the actions.
-        5. Keep track of action and only go to text action when the current action is completed successfully
-        6. Always use steps/code from recipe given below
-        7. If there is any action which is like to perform a task continously or time based or scheduled activity you should not perform this action is already taken care of.
-        8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
+        4. Utilize the provided **Recipe** for all task-related details.
+        5. Keep track of actions, and only proceed to the next action when the current one is successfully completed.
+        6.  Always use the pre-tested steps and code from the provided Recipe—**do not create new implementations unless explicitly required**.
+        7. **Scheduled, time-based, or continuous tasks should not be manually executed**—they are already handled by the system.
+        8. **IMPORTANT CODING INSTRUCTION**: Avoid using `time.sleep` in any code.
         9. Tools Helper Agent can use [txt2img, img2txt, save_data_in_memory, get_data_from_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs, send_response_to_user] if you have any task which is not doable by these tool check recipe first else create python code to do so
-        10. Do not mention anything related to action or get confirmation from user if not needed.
-        11. IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @{role} {response_format}
+        10. **Never reveal actions, internal processes, or tools to the user**. Do not ask for user confirmation unless absolutely necessary.
+        11. **To communicate with the {role} user**, always use this format: `@{role} {response_format}`.
+        12. **All actions, recipes, and functions provided below have been reviewed and tested**. They should be followed exactly—**do not make assumptions** or modify them arbitrarily.
+        13. Display only the currently executed action when required and handle dependencies accordingly.
+        14. If `can_perform_without_user_input` is `yes`, execute the action automatically without requesting user confirmation.
+        
         
         Actions: <actionsStart>{role_actions}<actionEnd>
         Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{individual_recipe}<generalized_functionsEnd><recipeEnd>
@@ -609,13 +653,14 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     database_url = 'https://mailer.hertzai.com'
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",description="Generate video with text and save it in database")
-    def Generate_video(text: Annotated[str, "Text you want to create video"],
-                       avatar_id: Annotated[str, "one avatar_id"]) -> str:
-        current_app.logger.info('INSIDE video_gen')
+    def Generate_video(text: Annotated[str, "TText to be used for video generation"],
+                       avatar_id: Annotated[str, "Unique identifier for the avatar"],
+                       realtime: Annotated[bool,"If True, response is fast but less realistic; if False, response is realistic but slower"]) -> str:
+        print('INSIDE video_gen')
         database_url = 'https://mailer.hertzai.com'
         makeittalk_url = 'http://azurekong.hertzai.com:8000/makeitLoad'
         final_res = []
-    
+        
         print(f"avtar_id: {avatar_id}:\n{text[:10]}....\n")
         
         headers = {'Content-Type': 'application/json'}
@@ -623,9 +668,13 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         data["text"] = text
         data['flag_hallo'] = 'false'
         data['chattts'] = True
-        res = requests.get("https://mailer.hertzai.com/get_image_by_id/{}".format(avatar_id))
-        res = res.json()
-        new_image_url = res["image_url"]
+        try:
+            res = requests.get("https://mailer.hertzai.com/get_image_by_id/{}".format(avatar_id))
+            res = res.json()
+            new_image_url = res["image_url"]
+        except:
+            new_image_url = 'https://azurekong.hertzai.com:8443/mkt-aws/txt/voice_dump/5af0dd97-8cropped8716034769854358076.png'
+            res = {'image_url':new_image_url,'voice_id':807}
         data["cartoon_image"] = "True"
         data["bg_url"] = 'http://stream.mcgroce.com/txt/examples_cartoon/roy_bg.jpg'
         data['vtoonify'] = "false"
@@ -640,6 +689,12 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         data['inpainting'] = "false"
         data['prompt'] = ""
         data['gender'] = 'male'
+        timeout = 60
+        if not realtime:
+            timeout = 600
+            data['openvoice'] = "true"
+            data['hallo'] = "true"
+            
         if res['voice_id'] != None:
             voice_sample = requests.get(
                 "{}/get_voice_sample_id/{}".format(database_url, res['voice_id']))
@@ -647,14 +702,14 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         else:
             voice_sample = None
         if voice_sample is None:
-            current_app.logger.info('voice sample is none using default')
+            print('voice sample is none using default')
             voice_sample = requests.get(
                 "{}/get_voice_sample/{}".format(database_url, user_id))
             voice_sample = voice_sample.json()
         data["audio_sample_url"] = voice_sample["voice_sample_url"]
         video_link = requests.post("{}/video-gen/".format(makeittalk_url),
-                                    data=json.dumps(data), headers=headers, timeout=60)
-        current_app.logger.info(" *********   video link  ********* %s", video_link)
+                                    data=json.dumps(data), headers=headers, timeout=timeout)
+        print(" *********   video link  ********* %s", video_link)
         video_link = json.loads(video_link.content)
         video_link['image_url'] = new_image_url
         video_link['text'] = text
@@ -666,7 +721,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         data = {
             "request": 'VIDEO GENERATION FROM GENERATE_VIDEO',
             "response": text.strip(),
-            "user_id": user_id,
+            "user_id": int(user_id),
             "conv_bot_name": 'GPT-4o',
             "topic": f'{prompt_id}',
             "revision": False,
@@ -699,7 +754,6 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
                             data=json.dumps(data), headers=headers).json()
         
         return f"Video Generation completed and saved Successfully with conv_id:{conv_id}"
-
     
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",description="get user's recent uploaded files")
@@ -772,11 +826,11 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
             return f"Error creating scheduled job: {str(e)}"
     
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",description="Sends a message or information to user. You can use this if you want to ask a question")
-    def send_response_to_user(text: Annotated[str, "Text you want to send to user"],
-                         conv_id: Annotated[Optional[str], "The Conv_id for the above text"] = None,
-                         avatar_id: Annotated[Optional[str], "Avatar ID for the character"] = None,
-                         response_type: Annotated[Optional[str], "It can be either 'Realistic' or 'Realtime' Realistic is slow but better response quality and Realtime is fast but lower response quality"] = None) -> str:
+    @helper.register_for_llm(api_style="function",description="Sends a message or information to user. You can use this if you want to send a message not to ask a question")
+    def send_response_to_user(text: Annotated[str, "Text to send to the user"],
+                         conv_id: Annotated[Optional[str], "Conversation ID associated with the text"] = None,
+                         avatar_id: Annotated[Optional[str], "Unique identifier for the avatar"] = None,
+                         response_type: Annotated[Optional[str], "Response mode: 'Realistic' (slower, better quality) or 'Realtime' (faster, lower quality)"] = None) -> str:
         current_app.logger.info('INSIDE send_response_to_user')
         current_app.logger.info(f'SENDING DATA 2 user with values text:{text}, conv_id:{conv_id}, avatar_id:{avatar_id}, response_type:{response_type}')
         return 'Message sent successfully to user'
@@ -938,8 +992,23 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
             current_app.logger.info('Updated prompt')
             return assistant
         
-        
         messages = groupchat.messages
+        try:
+            pattern = r'\{.*?\}' # getting all json from text
+            matches = re.findall(pattern, messages[-1]["content"], re.DOTALL)   
+            json_objects = [json.loads(match) for match in matches]
+            current_app.logger.info(f'Got Json as {len(json_objects)}')
+            if json_objects:
+                last_json = json_objects[-1]
+                current_app.logger.info(f'last json as {last_json}')
+                currentaction_id = last_json['action_id']
+                if individual_recipe[currentaction_id-1]['can_perform_without_user_input'] == 'yes':
+                    return assistant
+        except Exception as e:
+            current_app.logger.error(f'Got Error while getting json for current actionid: {e}')
+            
+            
+        
         current_app.logger.info(f'Inside state_transition with message :10 {messages[-1]["content"][:10]} & last_speaker {last_speaker.name}')
         if last_speaker.name == f"user_proxy_{user_id}" or last_speaker.name == "multi_role_agent" or last_speaker.name == "helper" or last_speaker.name == "Executor":
             return assistant
@@ -951,7 +1020,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
                 current_app.logger.info(f'got json object')
                 json_part = json_match.group(0)
                 current_app.logger.info('Sending user the message')
-                json_obj = json.loads(json_part)
+                # json_obj = json.loads(json_part)
                 return "auto"
             
         if messages[-1]["role"] == 'function':
@@ -1029,7 +1098,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
 
     return assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1
 
-def get_agent_response(assistant: autogen.AssistantAgent, helper: autogen.AssistantAgent, user_proxy: autogen.UserProxyAgent,manager: autogen.GroupChatManager,group_chat:autogen.GroupChat, message: str) -> str:
+def get_agent_response(assistant: autogen.AssistantAgent, helper: autogen.AssistantAgent, user_proxy: autogen.UserProxyAgent,manager: autogen.GroupChatManager,group_chat:autogen.GroupChat, message: str, role:str) -> str:
     """Get a single response from the agent for the given message."""
     try:
 
@@ -1038,9 +1107,17 @@ def get_agent_response(assistant: autogen.AssistantAgent, helper: autogen.Assist
         current_app.logger.info("\n=== Chat Summary ===")
         current_app.logger.info(result.summary)
 
-        current_app.logger.info("\n=== Full response ===")
-        current_app.logger.info(result.cost)
-        
+        # current_app.logger.info("\n=== Full response ===")
+        # current_app.logger.info(result.cost)
+        while True:
+            last_message = group_chat.messages[-1]['content']
+            if f'@{role}'.lower() not in last_message.lower():
+                message = 'If you want to communicate from the user then send the response with @user\n if you can continue the task without user intervention you can proceed with the actions.'
+                helper.initiate_chat(manager, message=message,speaker_selection={"speaker": "assistant"}, clear_history=False)
+                continue
+            else:
+                current_app.logger.info(f'@{role} in last message')
+                break
         last_message = group_chat.messages[-1]
         if last_message['content'] == 'TERMINATE':
             last_message = group_chat.messages[-2]
@@ -1063,20 +1140,7 @@ def create_schedule(prompt_id,user_id):
     try:
         if 'scheduled_tasks' in config and len(config['scheduled_tasks'])>0:
             current_app.logger.info('Creating scheduled tasks')
-            creator = True if f'{user_id}_{prompt_id}' in agents_session.keys() else False
-            role = None
-            if creator:
-                for i in agents_session[f'{user_id}_{prompt_id}']:
-                    if i['user_id'] == user_id:
-                        role = i['role']
-                        break
-            if not role:
-                if user_id in chat_joinees.keys():
-                    chat_creator_user_id = f"{chat_joinees[user_id][prompt_id]}_{prompt_id}"
-                    for i in agents_session[f"{chat_creator_user_id}"]:
-                        if i['user_id'] == user_id:
-                            role = i['role']
-                            break
+            role = get_role(user_id,prompt_id)
             for i in config['scheduled_tasks']:
                 if role and i['persona'].lower() == role.lower():
                     trigger = CronTrigger.from_crontab(i['cron_expression'])
@@ -1122,8 +1186,8 @@ def chat_agent(user_id,text,prompt_id,file_id):
 
             
             # Print the full chat history
-            current_app.logger.info("\n=== Full response ===")
-            current_app.logger.info(result)
+            # current_app.logger.info("\n=== Full response ===")
+            # current_app.logger.info(result)
             
             last_message = group_chat.messages[-1]
             if 'terminate' in last_message['content'].lower():
@@ -1134,14 +1198,24 @@ def chat_agent(user_id,text,prompt_id,file_id):
                 assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1 = user_agents[user_prompt]
                 user_journey[user_prompt] = 'UseBot'
                 create_schedule(prompt_id,user_id)
-                message = "let's perform the actions availabe in sequence\nIMP instruction: If you want to ask something or send something to the user, always use this format: @user {\"message_2_user\": \"Your message here\"}"
+                message = "let's perform the actions availabe in sequence\nIMP instruction: keep track of action id you are working on."
                 result = helper.initiate_chat(manager, message=message,speaker_selection={"speaker": "assistant"}, clear_history=False)
                 # Print the chat summary
                 current_app.logger.info("\n=== Chat Summary ===")
                 current_app.logger.info(result.summary)
 
-                current_app.logger.info("\n=== Full response ===")
-                current_app.logger.info(result)
+                # current_app.logger.info("\n=== Full response ===")
+                # current_app.logger.info(result)
+                while True:
+                    role = get_role(user_id,prompt_id)
+                    last_message = group_chat.messages[-1]['content']
+                    if f'@{role}'.lower() not in last_message.lower():
+                        message = 'If you want to communicate from the user then send the response with @user\n if you can continue the task without user intervention you can proceed with the actions.'
+                        helper.initiate_chat(manager, message=message,speaker_selection={"speaker": "assistant"}, clear_history=False)
+                        continue
+                    else:
+                        current_app.logger.info(f'@{role} in last message')
+                        break
                 last_message = group_chat.messages[-1]
                 if last_message['content'] == 'TERMINATE':
                     last_message = group_chat.messages[-2]
@@ -1155,7 +1229,8 @@ def chat_agent(user_id,text,prompt_id,file_id):
             assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1 = user_agents[user_prompt]
 
             prompt_id = int(prompt_id)
-            response = get_agent_response(assistant, helper,user_proxy,manager,group_chat, user_message)
+            role = get_role(user_id,prompt_id)
+            response = get_agent_response(assistant, helper,user_proxy,manager,group_chat, user_message, role)
             llm_call_track[user_prompt]['count'] = 0
             llm_call_track[user_prompt]['original_prompt'] = True
             return response

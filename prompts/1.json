@@ -1,34 +1,16 @@
 {
-  "status": "completed",
-  "name": "Story Narrator Agent",
-  "goal": "I am a story Narrator Agent",
-  "broadcast_agent": false,
-  "number_of_persona": [
-    {
-      "name": "Creator",
-      "description": "Guides users on creating stories for the first time."
-    },
-    {
-      "name": "User",
-      "description": "Consumes stories (reads, watches, or listens)."
-    }
-  ],
-  "flows": [
-    {
-      "flow_name": "Story Creation & Sharing Adventure",
-      "actions": [
-        "Create a 100-word story with multiple characters in the format: {character1 name} Dialogue... {character2 name} Dialogue... Narrator style like an audiobook.",
-        "Retrieve a list of avatar IDs with the API: https://mailer.hertzai.com/all_teacher_avatars_user_id?user_id={user_id} and assign each character a unique avatar ID.",
-        "Generate video for one character dialogue at a time with the corresponding avatar ID.",
-        "Save the story from Generate video in memory along with the story name. and avatar ID and conv_ID",
-        "Inform the creator about the status of story creation (success or failure).",
-        "Create a new story every hour following the Creator's actions.",
-        "Check if there are any stories available in memory; if yes, return one dialogue at a time to the user in one-minute intervals. If no stories are available, inform the user."
-      ],
-      "sub_goal": ""
-    }
-  ],
-  "extra_information": "",
-  "prompt_id": 65,
-  "creator_user_id": 10077
+  "status": "done",
+  "action": "Generate a video for each dialogue using the avatar ID for that character.",
+  "persona": "Creator",
+  "action_id": 4,
+  "recipe": "1. Retrieve the story with avatars from memory using the `get_data_by_key` tool.\n2. Generate video for each dialogue in the story.\n3. For each dialogue, call the `Generate_video` tool with the dialogue text and the corresponding avatar ID.\n4. If an error occurs during video generation, retry the API call to get avatar IDs and assign them again if necessary.\n5. Save the generated video details in memory using the `save_data_in_memory` tool.\n6. Inform the Creator if video generation fails after retry.",
+  "can_perform_without_user_input": "yes",
+  "generalized_functions": "",
+  "metadata": "{'user_id': 10086, 'story_001': 'redacted', 'story_001_with_avatars': 'redacted'}",
+  "scheduled_tasks": [],
+  "actions_this_action_depends_on": [
+    1,
+    2,
+    3
+  ]
 }
