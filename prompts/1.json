@@ -1,16 +1,19 @@
 {
   "status": "done",
-  "action": "Generate a video for each dialogue using the avatar ID for that character.",
+  "action": "Generate video for one speaker's dialogue at a time using the associated avatar ID",
   "persona": "Creator",
-  "action_id": 4,
-  "recipe": "1. Retrieve the story with avatars from memory using the `get_data_by_key` tool.\n2. Generate video for each dialogue in the story.\n3. For each dialogue, call the `Generate_video` tool with the dialogue text and the corresponding avatar ID.\n4. If an error occurs during video generation, retry the API call to get avatar IDs and assign them again if necessary.\n5. Save the generated video details in memory using the `save_data_in_memory` tool.\n6. Inform the Creator if video generation fails after retry.",
+  "action_id": 3,
+  "recipe": "1. Retrieve the associated avatar ID for the given speaker from the memory. Call 'get_data_by_key' tool with the key 'avatar_ids'.\n2. Generate the video for the speaker's dialogue using the 'Generate_video' tool, passing the text and the avatar ID.\n3. Save the conv_id and text used for video generation in memory using the 'save_data_in_memory' tool with the key 'video_generation_status'.\n4. Check the video status by querying the API endpoint 'https://mailer.hertzai.com/get-video-conv_id/{conv_id}', replacing {conv_id} with the conv_id retrieved earlier. Use the 'requests' library to make the API call and check the status.\n5. If the video status is 'null', retry the status check after 5 minutes. Use the 'time.sleep(300)' in a loop until the video status is no longer 'null', then proceed to the next action.\n6. If the video status is successful, proceed with generating the video for the next dialogue if available, following steps 1 through 5.\n7. If any step fails, retry the action after 5 minutes as a fallback mechanism.",
   "can_perform_without_user_input": "yes",
-  "generalized_functions": "",
-  "metadata": "{'user_id': 10086, 'story_001': 'redacted', 'story_001_with_avatars': 'redacted'}",
-  "scheduled_tasks": [],
+  "generalized_functions": "import requests\nimport time\n\ndef check_video_status_conv_id(conv_id):\n    '''\n    Check the video status using the given conv_id.\n    Parameters:\n        conv_id (int): The conversation ID of the video generation task.\n    Returns:\n        dict: The status data from the API response.\n    '''\n    url = f\"https://mailer.hertzai.com/get-video-conv_id/{conv_id}\"\n    response = requests.get(url)\n    data = response.json()\n    return data\n\ndef main():\n    '''\n    Main function to continuously check the video status every 5 minutes until it's no longer 'null'.\n    Then, proceed with the next action.\n    '''\n    conv_id = 64019  # Replace with the actual conv_id you want to check\n    while True:\n        status_data = check_video_status_conv_id(conv_id)\n        if status_data.get('status') == 'null':\n            print(\"Video status is null, retrying after 5 minutes...\")\n            time.sleep(300)  # Wait for 5 minutes before retrying\n        else:\n            print(\"Video generation complete. Proceeding with the next action...\")\n            break\n\nif __name__ == \"__main__\":\n    main()",
+  "metadata": "{'user_id': 10086, '100_word_story': 'Once upon a time in a small village, there were two best friends, Jack and Lily.\\n\\nJack: 'Lily, look at the sky! It's filled with shooting stars tonight.'\\n\\nLily: 'It's so beautiful, Jack. I wish we could always have nights like this.'\\n\\nNarrator: The friends spent their nights dreaming under the starry sky. But one day, trouble struck their village.\\n\\nJack: 'Lily, we need to find a way to save our village from the storm!'\\n\\nLily: 'Don't worry, Jack. Together, we can overcome anything.'\\n\\nNarrator: And so, their bond grew stronger as they faced challenges together.', 'avatar_ids': '{\"Jack\": 2822, \"Lily\": 2821, \"Narrator\": 2820}', 'video_generation_status': '{\"conv_id\": 64019, \"text\": \"Lily, look at the sky! It\\'s filled with shooting stars tonight.\"}'}",
+  "scheduled_tasks": [
+    {
+      "cron_expression": "*/5 * * * *",
+      "job_description": "Retry generating the video after 5 minutes if the status is null."
+    }
+  ],
   "actions_this_action_depends_on": [
-    1,
-    2,
-    3
+    2
   ]
 }
