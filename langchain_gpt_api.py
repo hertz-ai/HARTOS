@@ -71,9 +71,7 @@ load_dotenv()
 
 from create_recipe import recipe
 from reuse_recipe import chat_agent, crossbar_multiagent, time_based_execution
-from autobahn.twisted.wamp import Application
 from autobahn.twisted.component import Component, run
-from twisted.internet import reactor
 from twisted.internet.defer import inlineCallbacks
 import threading
 

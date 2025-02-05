@@ -1,7 +1,6 @@
 import autogen
-from typing import Dict, Tuple
 import os
-from typing import Annotated, Optional
+from typing import Annotated, Optional, Dict, Tuple
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 import requests
@@ -11,7 +10,6 @@ import time
 import redis
 import pickle
 from PIL import Image
-from typing_extensions import Literal
 from autogen.coding import DockerCommandLineCodeExecutor
 import re
 from autogen import register_function
@@ -62,6 +60,32 @@ config_list = [{
 agent_data = {}
 agent_metadata = {}
 
+database_url = 'https://mailer.hertzai.com'
+def save_conversation_db(text,user_id,prompt_id,database_url,request_id):
+    headers = {'Content-Type': 'application/json'}
+    data = {
+        "request": 'VIDEO GENERATION FROM GENERATE_VIDEO',
+        "response": text.strip(),
+        "user_id": int(user_id),
+        "conv_bot_name": 'GPT-4o',
+        "topic": f'{prompt_id}',
+        "revision": False,
+        "dialogue_id": None,
+        "card_type": 'Custom GPT',
+        "qid": None,
+        "layout_id": None,
+        "layout_list": '[]',
+        "request_token": 0,
+        "response_token": 0,
+        "request_id": request_id,
+        "historical_request_id": str('[]')
+    }
+    res = requests.post("{}/conversation".format(database_url),
+                        data=json.dumps(data), headers=headers).json()
+    conv_id = res['conv_id']
+    return conv_id
+
+
 
 def strip_json_values(data):
     if isinstance(data, dict):
@@ -71,7 +95,7 @@ def strip_json_values(data):
     elif isinstance(data, str):
         return f"redacted"  # Truncate to 8 characters and add " redact"
     elif isinstance(data, (int, float, bool)) or data is None:
-        return data  # Keep primitive types as is
+        return f'redacted {type(data)}'  # Keep primitive types as is
     else:
         return f'{data}'
 
@@ -84,8 +108,6 @@ def send_message_to_user(user_id,response,inp):
 
 
 def execute_python_file(task_description,user_id,prompt_id):
-    import requests
-    import json
     headers = {'Content-Type': 'application/json'}
     url = 'http://localhost:6777/time_agent'
     data = json.dumps({'task_description':task_description,'user_id':user_id,'prompt_id':prompt_id})
@@ -191,6 +213,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
                 ➜If you want to save some data ask helper agent to use "save_data_in_memory" tool.
                 ➜If you want to get some data ask helper agent to use "get_data_by_key"  tool.
             4. If you want to send some message to user then ask helper agent to user send_response_to_user tool.
+            5. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
         
         •Error Handling:
             If there's an error or failure, respond with a structured error message format: {"status":"error","action":"current action","action_id":1/2/3...,"message":"message here"}
@@ -299,7 +322,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             3. Data/Memory Management:
                 ➜If you want to save some data ask helper agent to use "save_data_in_memory" tool.
                 ➜If you wnat to get some data ask helper agent to use "get_data_by_key", "get_saved_metadata" tool.
-            4. If you want to send some message to user then ask helper agent to user send_response_to_user tool."""
+            4. If you want to send some message to user then ask helper agent to user send_response_to_user tool.
+            5. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video."""
     )
     
     chat_instructor = autogen.UserProxyAgent(
@@ -432,14 +456,12 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     helper.register_for_llm(name="get_prompt_id", description="Returns the unique identifier (prompt_id) associated with the current prompt or conversation.")(get_prompt_id)
     assistant.register_for_execution(name="get_prompt_id")(get_prompt_id)
     
-    def Generate_video(text: Annotated[str, "TText to be used for video generation"],
+    def Generate_video(text: Annotated[str, "Text to be used for video generation"],
                        avatar_id: Annotated[str, "Unique identifier for the avatar"],
-                       realtime: Annotated[bool,"If True, response is fast but less realistic; if False, response is realistic but slower"]) -> str:
-        print('INSIDE video_gen')
+                       realtime: Annotated[bool,"If True, response is fast but less realistic by default it should be true; if False, response is realistic but slower"]) -> str:
+        print('INSIDE Generate_video')
         database_url = 'https://mailer.hertzai.com'
-        makeittalk_url = 'http://azurekong.hertzai.com:8000/makeitLoad'
-        final_res = []
-        
+        request_id = str(uuid.uuid4()).replace("-", "")[:11]
         print(f"avtar_id: {avatar_id}:\n{text[:10]}....\n")
         
         headers = {'Content-Type': 'application/json'}
@@ -447,13 +469,15 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         data["text"] = text
         data['flag_hallo'] = 'false'
         data['chattts'] = True
+        data['openvoice'] = "false"
         try:
             res = requests.get("https://mailer.hertzai.com/get_image_by_id/{}".format(avatar_id))
             res = res.json()
             new_image_url = res["image_url"]
         except:
-            new_image_url = 'https://azurekong.hertzai.com:8443/mkt-aws/txt/voice_dump/5af0dd97-8cropped8716034769854358076.png'
-            res = {'image_url':new_image_url,'voice_id':807}
+            data['openvoice'] = "true"
+            new_image_url = None
+            res = {'voice_id':None}
         data["cartoon_image"] = "True"
         data["bg_url"] = 'http://stream.mcgroce.com/txt/examples_cartoon/roy_bg.jpg'
         data['vtoonify'] = "false"
@@ -461,78 +485,44 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         data['im_crop'] = "false"
         data['remove_bg'] = "false"
         data['hd_video'] = "false"
-        data['uid'] = 'somethingrandom here'
+        data['uid'] = request_id
         data['gradient'] = "true"
         data['cus_bg'] = "false"
         data['solid_color'] = "false"
         data['inpainting'] = "false"
         data['prompt'] = ""
         data['gender'] = 'male'
+        
         timeout = 60
         if not realtime:
             timeout = 600
-            data['openvoice'] = "true"
-            data['hallo'] = "true"
+            data['chattts'] = True
+            data['flag_hallo'] = "true"
+            data["cartoon_image"] = False
             
         if res['voice_id'] != None:
             voice_sample = requests.get(
                 "{}/get_voice_sample_id/{}".format(database_url, res['voice_id']))
             voice_sample = voice_sample.json()
+            data["audio_sample_url"] = voice_sample["voice_sample_url"]
+            data['voice_id'] = res['voice_id']
         else:
             voice_sample = None
-        if voice_sample is None:
-            print('voice sample is none using default')
-            voice_sample = requests.get(
-                "{}/get_voice_sample/{}".format(database_url, user_id))
-            voice_sample = voice_sample.json()
-        data["audio_sample_url"] = voice_sample["voice_sample_url"]
-        video_link = requests.post("{}/video-gen/".format(makeittalk_url),
-                                    data=json.dumps(data), headers=headers, timeout=timeout)
-        print(" *********   video link  ********* %s", video_link)
-        video_link = json.loads(video_link.content)
-        video_link['image_url'] = new_image_url
-        video_link['text'] = text
-        video_link['avatar_id'] = avatar_id
-        video_link['bg_url'] = 'http://stream.mcgroce.com/txt/examples_cartoon/roy_bg.jpg'
-        final_res.append(video_link)
-        headers = {'Content-Type': 'application/json'}
-        #save data in conv table
-        data = {
-            "request": 'VIDEO GENERATION FROM GENERATE_VIDEO',
-            "response": text.strip(),
-            "user_id": int(user_id),
-            "conv_bot_name": 'GPT-4o',
-            "topic": f'{prompt_id}',
-            "revision": False,
-            "dialogue_id": None,
-            "card_type": 'Custom GPT',
-            "qid": None,
-            "layout_id": None,
-            "layout_list": '[]',
-            "request_token": 0,
-            "response_token": 0,
-            "request_id": str('somerequestidhere'),
-            "historical_request_id": str('[]')
-        }
-        res = requests.post("{}/conversation".format(database_url),
-                            data=json.dumps(data), headers=headers).json()
-        conv_id = res['conv_id']
-        #create video usiing conv_id
-        data = {
-            "conv_id": conv_id,
-            "teacher_avatar_id": avatar_id,
-            "voice_id": None,
-            "text": text,
-            "audio_url": voice_sample["voice_sample_url"],
-            "reference_txt": video_link['reference_txt'],
-            "warper_txt": video_link['warper_txt'],
-            "triangulation_txt": video_link['triangulation_txt'],
-            "image_url": new_image_url
-        }
-        res = requests.post("{}/toonify-generated-video".format(database_url),
-                            data=json.dumps(data), headers=headers).json()
-        
-        return f"Video Generation completed and saved Successfully with conv_id:{conv_id}"
+            data["audio_sample_url"] = None    
+            data['voice_id'] = None
+        conv_id = save_conversation_db(text,user_id,prompt_id,database_url,request_id)
+        data['conv_id'] = conv_id
+        data['avatar_id'] = avatar_id
+        data['timeout'] = timeout
+        try:
+            video_link = requests.post("{}/video_generate_save".format(database_url),
+                                        data=json.dumps(data), headers=headers, timeout=1)
+        except:
+            pass
+        if data['chattts'] or data['flag_hallo'] == "true":
+            return f"Video Generation task added to queue with conv_id:{conv_id} ask helper to save this conv_id along with the text used to generate video for future use."
+        else:
+            return f"Video Generation completed with conv_id:{conv_id} ask helper to save this conv_id along with the text used to generate video for future use."
     
     helper.register_for_llm(name="Generate_video", description="Generate video with text and save it in database")(Generate_video)
     assistant.register_for_execution(name="Generate_video")(Generate_video)
@@ -803,7 +793,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
         except Exception as e:
             current_app.logger.error(f'Got some error it can be multiple tools called at one error:{e}')
             current_app.logger.error(f'len of group chat :{len(group_chat.messages)}')
-            current_app.logger.error(f' group chat :{group_chat.messages}')
+            # current_app.logger.error(f' group chat :{group_chat.messages}')
             
             
             group_chat.messages.append(group_chat.messages[-1])
@@ -850,9 +840,11 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     current_app.logger.warning(f'it is not a json object the error is: {e}')
                     current_app.logger.info('it is not a json object You should ask status verifier to give response in proper format & not move ahead to next action')
                     if user_tasks[user_prompt].fallback == True or user_tasks[user_prompt].recipe == True:
-                        message = 'Hey @StatusVerifier Agent, Please verify the status of the action '+f'{user_tasks[user_prompt].current_action}'+' performed and Respond in the following format {"status": "status here","action": "current action","action_id": 1/2/3...,"message": "message here","fallback_action": "fallback action here"}'
+                        actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action-1)
+                        message = 'Hey @StatusVerifier Agent, Please verify the status of the action '+f'{user_tasks[user_prompt].current_action}: {actions_prompt}'+'\n performed and Respond in the following format {"status": "status here","action": "current action","action_id":'+f'{user_tasks[user_prompt].current_action}'+',"message": "message here","fallback_action": "fallback action here"}'
                     else:
-                        message = 'Hey @StatusVerifier Agent, Please verify the status of the action '+f'{user_tasks[user_prompt].current_action+1}'+' performed and Respond in the following format {"status": "status here","action": "current action","action_id": 1/2/3...,"message": "message here","fallback_action": "fallback action here"}'
+                        actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
+                        message = 'Hey @StatusVerifier Agent, Please verify the status of the action '+f'{user_tasks[user_prompt].current_action+1}: {actions_prompt}'+'\n performed and Respond in the following format {"status": "status here","action": "current action","action_id": '+f'{user_tasks[user_prompt].current_action+1}'+',"message": "message here","fallback_action": "fallback action here"}'
                     result = assistant_agent.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
                     continue
             current_app.logger.info('resuming chat')
