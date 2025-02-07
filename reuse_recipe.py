@@ -17,6 +17,7 @@ from PIL import Image
 from langchain.memory import ZepMemory
 from crossbarhttp import Client
 from flask import current_app
+from helper import topological_sort
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
 
 client = Client('http://aws_rasa.hertzai.com:8088/publish')
@@ -69,35 +70,7 @@ class Action:
         except:
             raise IndexError("Custom message: Index is out of range!") 
 
-def topological_sort(actions):
-    # Create adjacency list and in-degree dictionary
-    adj_list = {action["action_id"]: [] for action in actions}
-    in_degree = {action["action_id"]: 0 for action in actions}
-    action_map = {action["action_id"]: action for action in actions}  # Map ID to full action
 
-    # Build the graph
-    for action in actions:
-        action["actions_this_action_depends_on"] = []
-        for dep in action["actions_this_action_depends_on"]:
-            adj_list[dep].append(action["action_id"])
-            in_degree[action["action_id"]] += 1
-
-    # Initialize queue with actions having in-degree 0 (no dependencies)
-    queue = deque([aid for aid in in_degree if in_degree[aid] == 0])
-
-    sorted_actions = []
-    
-    while queue:
-        aid = queue.popleft()
-        sorted_actions.append(action_map[aid])  # Append action to sorted list
-        
-        # Reduce in-degree of dependent actions
-        for neighbor in adj_list[aid]:
-            in_degree[neighbor] -= 1
-            if in_degree[neighbor] == 0:
-                queue.append(neighbor)
-
-    return sorted_actions
 
 database_url = 'https://mailer.hertzai.com'
 
@@ -152,15 +125,15 @@ def send_message_to_user(user_id,response,inp):
     headers = {'Content-Type': 'application/json'}
     res = requests.post(url,data=body,headers=headers)
 
-def execute_python_file(task_description:str,user_id: int,prompt_id:int):
+def execute_python_file(task_description:str,user_id: int,prompt_id:int,action_entry_point:int=0):
     headers = {'Content-Type': 'application/json'}
     url = 'http://localhost:6777/time_agent'
-    data = json.dumps({'task_description':task_description,'user_id':user_id,'prompt_id':prompt_id})
+    data = json.dumps({'task_description':task_description,'user_id':user_id,'prompt_id':prompt_id,'action_entry_point':action_entry_point})
     res = requests.post(url,data=data,headers=headers)
     return 'done'
 
-def time_based_execution(task_description:str,user_id: int,prompt_id:int):
-    current_app.logger.info('INSIDE TIME_BASED_EXECUTION')
+def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_entry_point:int):
+    current_app.logger.info(f'INSIDE TIME_BASED_EXECUTION with action_entry_point"{action_entry_point}')
     user_prompt = f'{user_id}_{prompt_id}'
     if user_prompt not in user_agents:
         current_app.logger.info('user_id is not present')
@@ -277,7 +250,7 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
         return json.dumps({'res': [message.message['content'] for message in messages]})
 
 
-
+#TODO Reset action order after it reaches end.
 def create_agents_for_role(user_id: str,prompt_id):
     config_list = [{
         "model": 'gpt-4o',
@@ -836,7 +809,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",description="Creates time-based jobs using APScheduler to schedule jobs")
-    def create_scheduled_jobs(cron_expression: Annotated[str, "Cron expression for scheduling"], 
+    def create_scheduled_jobs(cron_expression: Annotated[str, "Cron expression for scheduling. Example: '0 9 * * 1-5' (Runs at 9:00 AM, Monday to Friday)."], 
                             job_description: Annotated[str, "Description of the job to be performed"]) -> str:
         current_app.logger.info('INSIDE create_scheduled_jobs')
         if not scheduler.running:
@@ -845,7 +818,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         try:
             trigger = CronTrigger.from_crontab(cron_expression)
             job_id = f"job_{int(time.time())}"
-            scheduler.add_job(execute_python_file, trigger=trigger, id=job_id, args=[job_description, user_id,prompt_id])
+            scheduler.add_job(execute_python_file, trigger=trigger, id=job_id, args=[job_description, user_id,prompt_id,0])
             current_app.logger.info('Successfully created scheduler job')
             return 'Successfully created scheduler job'
         except Exception as e:
@@ -1009,7 +982,8 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     
     def state_transition(last_speaker, groupchat):        
         messages = groupchat.messages
-        
+        if user_tasks[user_prompt].actions[user_tasks[user_prompt].current_action]['can_perform_without_user_input'] == 'yes':
+            current_app.logger.info('GOT can_perform_without_user_input as true')
         pattern3 = r"@statusverifier"
         if re.search(pattern3, messages[-1]["content"].lower()):
             current_app.logger.info("String contains @StatusVerifier returnig StatusVerifier")
@@ -1199,6 +1173,9 @@ def get_agent_response(assistant: autogen.AssistantAgent,chat_instructor: autoge
                         message = 'Hey @StatusVerifier Agent, Please verify the status of the action '+f'{user_tasks[user_prompt].current_action+1}: {actions_prompt}'+'\n performed and Respond in the following format {"status": "status here","action": "current action","action_id": '+f'{user_tasks[user_prompt].current_action+1}'+',"message": "message here"}'
                         assistant.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
                         continue
+            if user_tasks[user_prompt].actions[user_tasks[user_prompt].current_action]['can_perform_without_user_input'] == 'yes':
+                current_app.logger.info('GOT can_perform_without_user_input as true')
+        
             count +=1
             if count == 4:
                 break
@@ -1210,6 +1187,8 @@ def get_agent_response(assistant: autogen.AssistantAgent,chat_instructor: autoge
             else:
                 current_app.logger.info(f'@{role} in last message')
                 break
+        # if individual_recipe[currentaction_id-1]['can_perform_without_user_input'] == 'yes':
+        #     return assistant
         last_message = group_chat.messages[-1]
         if last_message['content'] == 'TERMINATE':
             last_message = group_chat.messages[-2]
@@ -1233,7 +1212,7 @@ def create_schedule(prompt_id,user_id):
                 if role and i['persona'].lower() == role.lower():
                     trigger = CronTrigger.from_crontab(i['cron_expression'])
                     job_id = f"job_{int(time.time())}"
-                    # scheduler.add_job(execute_python_file, trigger=trigger, id=job_id,args=[i['job_description'],user_id,prompt_id])
+                    scheduler.add_job(execute_python_file, trigger=trigger, id=job_id,args=[i['job_description'],user_id,prompt_id,i['action_entry_point']])
                     current_app.logger.info(f'Successfully created scheduler job {i["persona"]}')
     except Exception as e:
         current_app.logger.error(f'Some Error in creating scheduled tasks error:{e}')

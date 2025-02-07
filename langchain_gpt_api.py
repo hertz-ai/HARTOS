@@ -2198,10 +2198,11 @@ def time_agent():
     task_description = data.get('task_description',None)
     user_id = data.get('user_id',None)
     prompt_id = data.get('prompt_id',None)
+    action_entry_point = data.get('prompt_id',0)
     if not task_description or not user_id or not prompt_id:
         return jsonify({'error':'user_id or task_description or prompt_id is missing'}), 404
     app.logger.info(f'GOT user_id:{user_id} & prompt_id:{prompt_id} & task_description:{task_description}')
-    res = time_based_execution(str(task_description),int(user_id),int(prompt_id))
+    res = time_based_execution(str(task_description),int(user_id),int(prompt_id),action_entry_point)
     return jsonify({'response':f'{res}'}), 200
     
 

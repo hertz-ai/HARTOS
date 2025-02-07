@@ -1,19 +1,29 @@
 {
-  "status": "done",
-  "action": "Generate video for one speaker's dialogue at a time using the associated avatar ID",
-  "persona": "Creator",
-  "action_id": 3,
-  "recipe": "1. Retrieve the associated avatar ID for the given speaker from the memory. Call 'get_data_by_key' tool with the key 'avatar_ids'.\n2. Generate the video for the speaker's dialogue using the 'Generate_video' tool, passing the text and the avatar ID.\n3. Save the conv_id and text used for video generation in memory using the 'save_data_in_memory' tool with the key 'video_generation_status'.\n4. Check the video status by querying the API endpoint 'https://mailer.hertzai.com/get-video-conv_id/{conv_id}', replacing {conv_id} with the conv_id retrieved earlier. Use the 'requests' library to make the API call and check the status.\n5. If the video status is 'null', retry the status check after 5 minutes. Use the 'time.sleep(300)' in a loop until the video status is no longer 'null', then proceed to the next action.\n6. If the video status is successful, proceed with generating the video for the next dialogue if available, following steps 1 through 5.\n7. If any step fails, retry the action after 5 minutes as a fallback mechanism.",
-  "can_perform_without_user_input": "yes",
-  "generalized_functions": "import requests\nimport time\n\ndef check_video_status_conv_id(conv_id):\n    '''\n    Check the video status using the given conv_id.\n    Parameters:\n        conv_id (int): The conversation ID of the video generation task.\n    Returns:\n        dict: The status data from the API response.\n    '''\n    url = f\"https://mailer.hertzai.com/get-video-conv_id/{conv_id}\"\n    response = requests.get(url)\n    data = response.json()\n    return data\n\ndef main():\n    '''\n    Main function to continuously check the video status every 5 minutes until it's no longer 'null'.\n    Then, proceed with the next action.\n    '''\n    conv_id = 64019  # Replace with the actual conv_id you want to check\n    while True:\n        status_data = check_video_status_conv_id(conv_id)\n        if status_data.get('status') == 'null':\n            print(\"Video status is null, retrying after 5 minutes...\")\n            time.sleep(300)  # Wait for 5 minutes before retrying\n        else:\n            print(\"Video generation complete. Proceeding with the next action...\")\n            break\n\nif __name__ == \"__main__\":\n    main()",
-  "metadata": "{'user_id': 10086, '100_word_story': 'Once upon a time in a small village, there were two best friends, Jack and Lily.\\n\\nJack: 'Lily, look at the sky! It's filled with shooting stars tonight.'\\n\\nLily: 'It's so beautiful, Jack. I wish we could always have nights like this.'\\n\\nNarrator: The friends spent their nights dreaming under the starry sky. But one day, trouble struck their village.\\n\\nJack: 'Lily, we need to find a way to save our village from the storm!'\\n\\nLily: 'Don't worry, Jack. Together, we can overcome anything.'\\n\\nNarrator: And so, their bond grew stronger as they faced challenges together.', 'avatar_ids': '{\"Jack\": 2822, \"Lily\": 2821, \"Narrator\": 2820}', 'video_generation_status': '{\"conv_id\": 64019, \"text\": \"Lily, look at the sky! It\\'s filled with shooting stars tonight.\"}'}",
-  "scheduled_tasks": [
+  "status": "completed",
+  "name": "Image Generator",
+  "broadcast_agent": false,
+  "personas": [
     {
-      "cron_expression": "*/5 * * * *",
-      "job_description": "Retry generating the video after 5 minutes if the status is null."
+      "name": "Creator",
+      "description": "Responsible for creating stories."
+    },
+    {
+      "name": "User",
+      "description": "The one who will consume those stories."
     }
   ],
-  "actions_this_action_depends_on": [
-    2
-  ]
+  "flows": [
+    {
+      "flow_name": "Story Creation and Delivery Flow",
+      "actions": [
+        "Create a 100-word story with multiple characters in the following format: {character1 name} dialogue of character1... {character2 name} dialogue of character2 narrator like an audiobook, and save it.",
+        "Retrieve avatar IDs using the API: https://mailer.hertzai.com/all_teacher_only_avatars_id_user_id?user_id={user_id} and associate each speaker with a unique avatar ID from the response, saving that info as well.",
+        "Generate video for one speaker's dialogue at a time using the associated avatar ID after generating video hit this API: https://mailer.hertzai.com/get-video-conv_id/{conv_id} to check the video status. If it's null, retry after 5 minutes. Inform the creator if it becomes not null before moving to the next action.",
+        "Create a new story every hour.",
+        "For the User, check if any story is available in memory. If yes, give one speaker's dialogue at a time with a 10-second interval. If not, share a joke and ask them to try again later."
+      ],
+      "sub_goal": "Generate an image based on user input."
+    }
+  ],
+  "goal": "Generate an image based on user input."
 }
