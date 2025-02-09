@@ -434,8 +434,8 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         role_actions = recipes[prompt_id]['actions']
         
     # Perform topological sorting
-    sorted_actions = topological_sort(role_actions)
-    user_tasks[user_prompt] = Action(sorted_actions)
+    # sorted_actions = topological_sort(role_actions)
+    user_tasks[user_prompt] = Action(role_actions)
     individual_recipe = []
     for i in range(1,(len(recipes[prompt_id]['actions'])+1)):
         current_app.logger.info(f'checking for prompts/{prompt_id}_{i}.json')
@@ -982,8 +982,6 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     
     def state_transition(last_speaker, groupchat):        
         messages = groupchat.messages
-        if user_tasks[user_prompt].actions[user_tasks[user_prompt].current_action]['can_perform_without_user_input'] == 'yes':
-            current_app.logger.info('GOT can_perform_without_user_input as true')
         pattern3 = r"@statusverifier"
         if re.search(pattern3, messages[-1]["content"].lower()):
             current_app.logger.info("String contains @StatusVerifier returnig StatusVerifier")
@@ -1175,6 +1173,8 @@ def get_agent_response(assistant: autogen.AssistantAgent,chat_instructor: autoge
                         continue
             if user_tasks[user_prompt].actions[user_tasks[user_prompt].current_action]['can_perform_without_user_input'] == 'yes':
                 current_app.logger.info('GOT can_perform_without_user_input as true')
+                message = 'You should complete this task independently. Feel free to make reasonable assumptions where necessary'
+                helper.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)    
         
             count +=1
             if count == 4:

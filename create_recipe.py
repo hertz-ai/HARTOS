@@ -613,7 +613,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         metadata = get_saved_metadata()
         
         
-        if not messages[-1]["content"].startswith('Reflect on the sequence'):
+        if not messages[-1]["content"].startswith('Reflect on the sequence') and not messages[-1]["content"].startswith('Focus on the current task at hand an'):
             json_obj = retrieve_json(messages[-1]["content"])
             if json_obj:
                 try:   
@@ -776,8 +776,11 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
         current_app.logger.warning(f'CHECK THIS OUT group_chat.messages:{group_chat.messages[-1]}')
         for i in range(len(group_chat.messages)):
             group_chat.messages[i]['role'] = 'user'
-        clear_history = True
-        message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
+        clear_history = False
+        if user_tasks[user_prompt].fallback == True or user_tasks[user_prompt].recipe == True:
+            message = 'Hey @StatusVerifier Agent, Please verify the status of the action '+f'{user_tasks[user_prompt].current_action}: {actions_prompt}'+'\n performed and Respond in the following format {"status": "status here","action": "current action","action_id":'+f'{user_tasks[user_prompt].current_action}'+',"message": "message here","fallback_action": "fallback action here"}'
+        else:
+            message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
         text = f'Action {user_tasks[user_prompt].current_action+1}: {message} '
 
     if len(messages[user_prompt])>0:
@@ -820,7 +823,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
         if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
             current_app.logger.info(f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
             json_obj = retrieve_json(group_chat.messages[-2]["content"])
-            if json_obj and 'status' in json_obj.keys():
+            if json_obj and type(json_obj)==dict and 'status' in json_obj.keys():
                 if json_obj['status'].lower() == 'completed' and 'recipe' not in json_obj.keys():
                     if user_tasks[user_prompt].current_action != int(json_obj['action_id']):
                         user_tasks[user_prompt].fallback = True
