@@ -2193,7 +2193,7 @@ def chat():
 
 @app.route('/time_agent',methods=['POST'])
 def time_agent():
-    app.logger.info('GOT REUEST IN TIME AGENT API')
+    app.logger.info('GOT REQUEST IN TIME AGENT API')
     data = request.get_json()
     task_description = data.get('task_description',None)
     user_id = data.get('user_id',None)
@@ -2205,6 +2205,14 @@ def time_agent():
     res = time_based_execution(str(task_description),int(user_id),int(prompt_id),action_entry_point)
     return jsonify({'response':f'{res}'}), 200
     
+@app.route('/response_ack',methods=['POST'])
+def response_ack():
+    app.logger.info('GOT REQUEST IN response_ack')
+    data = request.get_json()
+    user_id = data.get('user_id',None)
+    request_id = data.get('request_id',None)
+    thread_local_data.set_request_id(request_id=request_id)
+    prompt_id = data.get('prompt_id',None)
 
 @app.route('/add_history', methods=['POST'])
 def history():

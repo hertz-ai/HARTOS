@@ -1,17 +1,32 @@
 {
-  "status": "done",
-  "action": "Check if any story is available in memory for the User and share a joke if not available",
-  "fallback_action": "",
-  "persona": "User",
-  "action_id": 5,
-  "recipe": "1. Retrieve stored stories from memory.\n2. If stories are available, provide each speaker's dialogue to user using send_message_to_user tool with a 10-second interval.\n   - Utilize the saved avatar associations for accurate delivery.\n3. If no stories are available, share a joke with the user and ask them to try again later.\n4. If at any point an error occurs, inform the user and seek further assistance.",
-  "can_perform_without_user_input": "yes",
-  "metadata": {
-    "user_id": "redacted <class 'int'>",
-    "100_word_story_creator_Alice_Bob": "redacted",
-    "avatar_association_user_Alice_Bob_Narrator": "redacted",
-    "conv_id_Alice": "redacted",
-    "conv_id_Bob": "redacted",
-    "conv_id_Narrator": "redacted"
-  }
+  "status": "completed",
+  "name": "Story Narrator Agent",
+  "broadcast_agent": false,
+  "personas": [
+    {
+      "name": "Creator",
+      "description": "Creates stories"
+    },
+    {
+      "name": "User",
+      "description": "Consumes stories"
+    }
+  ],
+  "flows": [
+    {
+      "flow_name": "Story Creation and Narration",
+      "actions": [
+        "Create a 100-word story with multiple characters in the following format: {character1 name} dialogue of character1... {character2 name} dialogue of character2 narrator like an audiobook, and save it.",
+        "Retrieve avatar IDs using the API: https://mailer.hertzai.com/all_teacher_only_avatars_id_user_id?user_id={user_id} and associate each speaker with a unique avatar ID from the response, saving that info as well.",
+        "Generate video for one speaker's dialogue at a time using the associated avatar ID,",
+        "hit this API: https://mailer.hertzai.com/get-video-conv_id/{conv_id} to check the video status. If it's null, retry after 5 minutes and Inform the creator.",
+        "Create a new story every hour.",
+        "For the User, check if any story is available in memory. If yes, give one speaker's dialogue at a time with a 10-second interval. If not, share a joke and ask them to try again later."
+      ],
+      "sub_goal": "Create and narrate stories, delivering engaging content to users."
+    }
+  ],
+  "goal": "I am a Story Narrator Agent",
+  "prompt_id": 65,
+  "creator_user_id": 10086
 }

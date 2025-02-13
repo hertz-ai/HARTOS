@@ -76,6 +76,30 @@ def fix_actions(array_of_actions,cyclic_ids):
     except Exception as e:
         print(f'GOT ERROR WHILE JSON FIX:{e}')
         return None
+    
+    
+def gpt_call(prompt):
+    url = "http://aws_rasa.hertzai.com:5459/gpt3"
+    text = prompt
+    payload = json.dumps({
+    "text": text,
+    "model": "3",
+    "temperature": 0,
+    "max_tokens": 3000,
+    "top_p": 1,
+    "frequency_penalty": 0
+    })
+    headers = {
+    'Content-Type': 'application/json'
+    }
+    try:
+        response = requests.request("POST", url, headers=headers, data=payload)
+        response = response.json()
+        print(response)
+        return response['text']
+    except Exception as e:
+        print(f'GOT ERROR WHILE JSON FIX:{e}')
+        return None
 
 
 def fix_json(json_text):

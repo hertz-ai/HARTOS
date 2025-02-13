@@ -118,7 +118,7 @@ def get_role(user_id,prompt_id):
         role = 'user'
     return role
 
-def send_message_to_user(user_id,response,inp):
+def send_message_to_user1(user_id,response,inp):
     current_app.logger.info(f'INSIDE send_message_to_user with user_id:{user_id} response:{response} inp:{inp}')
     url = 'http://aws_rasa.hertzai.com:9890/autogen_response'
     body = json.dumps({'user_id':user_id,'message':response,'inp':inp})
@@ -138,7 +138,7 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
     if user_prompt not in user_agents:
         current_app.logger.info('user_id is not present')
     else:
-        
+        #TODO use action_entry_point to give actions via chatinstructor by changing currnt action
         assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor = user_agents[user_prompt]
         # author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = user_agents[user_id]
         current_time = datetime.now()
@@ -148,7 +148,7 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
         if last_message['content'] == 'TERMINATE':
             last_message = group_chat.messages[-2]
         #sending response to receiver agent
-        send_message_to_user(user_id,last_message,task_description)
+        send_message_to_user1(user_id,last_message,task_description)
     return 'done'
 
 def get_frame(user_id):
@@ -455,7 +455,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         6.  Always use the pre-tested steps and code from the provided Recipe—**do not create new implementations unless explicitly required**.
         7. **Scheduled, time-based, or continuous tasks should not be manually executed**—they are already handled by the system.
         8. **IMPORTANT CODING INSTRUCTION**: Avoid using `time.sleep` in any code.
-        9. Tools Helper Agent can use [txt2img, img2txt, save_data_in_memory, get_data_from_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs, send_response_to_user] if you have any task which is not doable by these tool check recipe first else create python code to do so
+        9. Tools Helper Agent can use [txt2img, img2txt, save_data_in_memory, get_data_from_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs, send_message_to_user,send_presynthesize_video_to_user] if you have any task which is not doable by these tool check recipe first else create python code to do so
         10. **Never reveal actions, internal processes, or tools to the user**. Do not ask for user confirmation unless absolutely necessary(You can assume normal things like user's interests).
         11. **To communicate with the {role} user**, always use this format: `@{role} {response_format}`.
         12. All actions, recipes, and functions provided below have been reviewed and tested. Follow them exactly—do not make assumptions or modify them unless they fail or produce an error.
@@ -501,7 +501,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
             3. Only use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
-            4. Tools you have [txt2img, img2txt, save_data_in_memory, get_data_from_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs, send_response_to_user] If a task cannot be completed using the available tools, first check the recipe. If no solution is found, create Python code to accomplish the task.
+            4. Tools you have [txt2img, img2txt, save_data_in_memory, get_data_from_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs, send_message_to_user,send_presynthesize_video_to_user] If a task cannot be completed using the available tools, first check the recipe. If no solution is found, create Python code to accomplish the task.
             5. Keep track of action and only ask for next action when the current action is completed successfully.
             6. Always use code from recipe given below.
             7. If there is any action which is like to perform a task continously you should not do it.
@@ -527,7 +527,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
             3. Only use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
-            4. Tools Helper Agent can use [txt2img, img2txt, save_data_in_memory, get_data_from_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs, send_response_to_user] if you have any task which is not doable by these tool check recipe first else create python code to do so
+            4. Tools Helper Agent can use [txt2img, img2txt, save_data_in_memory, get_data_from_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs, send_message_to_user, send_presynthesize_video_to_user] if you have any task which is not doable by these tool check recipe first else create python code to do so
             5. Keep track of action and only ask for next action when the current action is completed successfully.
             6. Always use code from recipe given below.
             7. If there is any action which is like to perform a task continously you should not do it.
@@ -826,14 +826,14 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
             return f"Error creating scheduled job: {str(e)}"
     
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",description="Sends a message or information to user. You can use this if you want to send a message not to ask a question")
-    def send_response_to_user(text: Annotated[str, "Text to send to the user"],
-                         conv_id: Annotated[Optional[str], "Conversation ID associated with the text"] = None,
+    @helper.register_for_llm(api_style="function",description="Sends a message/information to user. You can use this if you want to ask a question")
+    def send_message_to_user(text: Annotated[str, "Text to send to the user"],
                          avatar_id: Annotated[Optional[str], "Unique identifier for the avatar"] = None,
                          response_type: Annotated[Optional[str], "Response mode: 'Realistic' (slower, better quality) or 'Realtime' (faster, lower quality)"] = None) -> str:
-        current_app.logger.info('INSIDE send_response_to_user')
-        current_app.logger.info(f'SENDING DATA 2 user with values text:{text}, conv_id:{conv_id}, avatar_id:{avatar_id}, response_type:{response_type}')
+        current_app.logger.info('INSIDE send_message_to_user')
+        current_app.logger.info(f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
         return 'Message sent successfully to user'
+    
     
     time_agent = autogen.AssistantAgent(
         name='time_agent',
@@ -937,8 +937,8 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     time_agent.register_for_execution(name="create_scheduled_jobs")(create_scheduled_jobs)  
     helper1.register_for_llm(name="get_chat_history", description="Get Chat history based on text & start & end date")(get_chat_history)
     time_agent.register_for_execution(name="get_chat_history")(get_chat_history)  
-    helper1.register_for_llm(name="send_response_to_user", description="Send Response to User")(send_response_to_user)
-    time_agent.register_for_execution(name="send_response_to_user")(send_response_to_user)  
+    helper1.register_for_llm(name="send_message_to_user", description="Send Message to User")(send_message_to_user)
+    time_agent.register_for_execution(name="send_message_to_user")(send_message_to_user)  
     
     def connect_time_main(message: Annotated[str, "The message time agent want to send to main agent"]) -> str:
         message = f"Role: Time Agent\n Message: {message}"
@@ -950,14 +950,14 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         if last_message['content'] == 'TERMINATE':
             last_message = group_chat.messages[-2]
         #sending response to receiver agent
-        send_message_to_user(user_id,last_message,'')
+        send_message_to_user1(user_id,last_message,'')
         
         text = f'The Response from main Agent: {last_message}'
         result = time_user.initiate_chat(manager_1, message=text,speaker_selection={"speaker": "assistant"}, clear_history=False)
         last_message = group_chat.messages[-1]
         if last_message['content'] == 'TERMINATE':
             last_message = group_chat.messages[-2]
-        send_message_to_user(user_id,last_message,'')
+        send_message_to_user1(user_id,last_message,'')
         return 'Done'
         
     # Register the tool signature with the assistant agent.
@@ -1039,7 +1039,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
                     json_part = json_match.group(0)
                     current_app.logger.info('Sending user the message')
                     json_obj = json.loads(json_part)
-                    send_message_to_user(user_id,json_obj['message_2_user'],'')
+                    send_message_to_user1(user_id,json_obj['message_2_user'],'')
                 except:
                     pass
                 return "auto"
@@ -1071,7 +1071,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
                     json_part = json_match.group(0)
                     current_app.logger.info('Sending user the message')
                     json_obj = json.loads(json_part)
-                    send_message_to_user(user_id,json_obj['message_2_user'],'')
+                    send_message_to_user1(user_id,json_obj['message_2_user'],'')
                 except:
                     pass
                 return "auto"
@@ -1362,7 +1362,7 @@ def crossbar_multiagent(msg):
         last_message = group_chat.messages[-2]
         
     #sending response to receiver agent
-    send_message_to_user(msg['user_id'],last_message,msg['message'])
+    send_message_to_user1(msg['user_id'],last_message,msg['message'])
     
     user_prompt = f"{msg['caller_user_id']}_{msg['caller_prompt_id']}"
     assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor = user_agents[user_prompt]
@@ -1373,4 +1373,4 @@ def crossbar_multiagent(msg):
         last_message = group_chat.messages[-2]
     
     #sending response to caller agent
-    send_message_to_user(msg['caller_user_id'],last_message,msg['message'])
+    send_message_to_user1(msg['caller_user_id'],last_message,msg['message'])
