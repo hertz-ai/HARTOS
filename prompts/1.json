@@ -1,32 +1,32 @@
 {
-  "status": "completed",
-  "name": "Story Narrator Agent",
-  "broadcast_agent": false,
-  "personas": [
+  "status": "done",
+  "action": "Retrieve avatar IDs using the API: https://mailer.hertzai.com/all_teacher_only_avatars_id_user_id?user_id={user_id} and associate each speaker with a unique avatar ID from the response, saving that info as well.",
+  "fallback_action": "",
+  "persona": "Creator",
+  "action_id": 2,
+  "recipe": [
     {
-      "name": "Creator",
-      "description": "Creates stories"
+      "steps": "Retrieve the user ID from memory using 'get_data_by_key'.",
+      "tool_name": "get_data_by_key"
     },
     {
-      "name": "User",
-      "description": "Consumes stories"
-    }
-  ],
-  "flows": [
+      "steps": "Execute the API call to retrieve avatar IDs using the user ID.",
+      "tool_name": "",
+      "generalized_functions": "import requests\n\ndef fetch_avatar_ids(user_id):\n    url = f\"https://mailer.hertzai.com/all_teacher_only_avatars_id_user_id?user_id={user_id}\"\n    response = requests.get(url)\n    response.raise_for_status()\n    print(response.json())\n    return response.json()\n\nuser_id = 10086\navatar_ids = fetch_avatar_ids(user_id)\nprint(avatar_ids)"
+    },
     {
-      "flow_name": "Story Creation and Narration",
-      "actions": [
-        "Create a 100-word story with multiple characters in the following format: {character1 name} dialogue of character1... {character2 name} dialogue of character2 narrator like an audiobook, and save it.",
-        "Retrieve avatar IDs using the API: https://mailer.hertzai.com/all_teacher_only_avatars_id_user_id?user_id={user_id} and associate each speaker with a unique avatar ID from the response, saving that info as well.",
-        "Generate video for one speaker's dialogue at a time using the associated avatar ID,",
-        "hit this API: https://mailer.hertzai.com/get-video-conv_id/{conv_id} to check the video status. If it's null, retry after 5 minutes and Inform the creator.",
-        "Create a new story every hour.",
-        "For the User, check if any story is available in memory. If yes, give one speaker's dialogue at a time with a 10-second interval. If not, share a joke and ask them to try again later."
-      ],
-      "sub_goal": "Create and narrate stories, delivering engaging content to users."
+      "steps": "Save the retrieved avatar IDs in memory for future use.",
+      "tool_name": "save_data_in_memory"
     }
   ],
-  "goal": "I am a Story Narrator Agent",
-  "prompt_id": 65,
-  "creator_user_id": 10086
+  "can_perform_without_user_input": "yes",
+  "scheduled_tasks": [],
+  "metadata": {
+    "user_id": "redacted <class 'int'>",
+    "avatar_ids": "redacted <class 'str'>"
+  },
+  "time_took_to_complete": 19.11701798439026,
+  "actions_this_action_depends_on": [
+    1
+  ]
 }

@@ -168,6 +168,60 @@ class Action:
     def get_action(self,current_action):
         return self.actions[current_action]
 
+from typing import List
+
+class ToolMessageHandler():
+    """Handles tool messages in the conversation history.
+    
+    This transformation checks the first message (index 0) in the conversation history.
+    If the message role is 'tool', it removes that message and returns the remaining messages.
+    Otherwise, it returns the conversation history unchanged.
+    """
+    
+    def __init__(self):
+        """
+        Initialize the ToolMessageHandler.
+        No configuration parameters are needed for this simple transformation.
+        """
+        pass
+        
+    def apply_transform(self, messages: List[Dict]) -> List[Dict]:
+        """Applies the tool message handling transformation to the conversation history.
+        
+        Args:
+            messages (List[Dict]): The list of messages representing the conversation history.
+            
+        Returns:
+            List[Dict]: A new list containing the messages, with the first tool message removed if present.
+        """
+        if not messages:
+            return messages
+            
+        # Make a copy to avoid modifying the original list
+        processed_messages = messages.copy()
+        
+        # Check if the first message has a role of 'tool'
+        if processed_messages and processed_messages[0].get('role') == 'tool':
+            current_app.logger.info('GOT TOOL AS FIRST MESSAGE POPPING IT')
+            processed_messages.pop(0)
+            
+        return processed_messages
+        
+    def get_logs(self, pre_transform_messages: List[Dict], post_transform_messages: List[Dict]) -> Tuple[str, bool]:
+        """Generates logs about the transformation.
+        
+        Args:
+            pre_transform_messages (List[Dict]): Messages before transformation
+            post_transform_messages (List[Dict]): Messages after transformation
+            
+        Returns:
+            Tuple[str, bool]: A tuple containing the log message and whether a transformation occurred
+        """
+        if len(pre_transform_messages) > len(post_transform_messages):
+            return "Removed tool message from the beginning of conversation.", True
+        return "No tool message was removed.", False
+    
+
 def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent, autogen.ConversableAgent]:
     """Create new assistant & user agents for a given user_id"""
     user_prompt = f'{user_id}_{prompt_id}'
@@ -354,6 +408,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=30,keep_first_message=True),
             transforms.MessageTokenLimiter(max_tokens=3000, max_tokens_per_message=700, min_tokens=0),
+            ToolMessageHandler(),
         ]
     )
     context_handling.add_to_agent(assistant)
@@ -483,7 +538,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         data = {}
         data["text"] = text
         data['flag_hallo'] = 'false'
-        data['chattts'] = True
+        data['chattts'] = False
         data['openvoice'] = "false"
         try:
             res = requests.get("https://mailer.hertzai.com/get_image_by_id/{}".format(avatar_id))
@@ -574,9 +629,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     helper.register_for_llm(name="get_text_from_image", description="Image to Text")(img2txt)
     assistant.register_for_execution(name="get_text_from_image")(img2txt)
     
-    def create_scheduled_jobs(cron_expression: Annotated[str, "Cron expression for scheduling. Example: '0 9 * * 1-5' (Runs at 9:00 AM, Monday to Friday). If the interval is greater than 60 seconds or it needs to be executed at a dynamic cron time this argument is Mandatory else None"],
-                              interval_sec: Annotated[str, "time between two Interval in seconds."], 
-                            job_description: Annotated[str, "Description of the job to be performed"]) -> str:
+    def create_scheduled_jobs(interval_sec: Annotated[int, "time between two Interval in seconds."], 
+                            job_description: Annotated[str, "Description of the job to be performed"],
+                            cron_expression: Annotated[Optional[str], "Cron expression for scheduling. Example: '0 9 * * 1-5' (Runs at 9:00 AM, Monday to Friday). If the interval is greater than 60 seconds or it needs to be executed at a dynamic cron time this argument is Mandatory else None"]=None) -> str:
         current_app.logger.info('INSIDE create_scheduled_jobs')
         #TODO check if cron or interval is less than time in session
         if interval_sec < sum(task_time[prompt_id]['times']):
@@ -611,7 +666,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         current_app.logger.info('INSIDE send_message_to_user')
         current_app.logger.info(f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
-        return f'Message sent successfully to user with request_id: {request_id}'
+        return f'Message sent successfully to user with request_id: {request_id_list[user_prompt]}-intermediate'
     
     helper.register_for_llm(name="send_message_to_user", description="Sends a message/information to user. You can use this if you want to ask a question")(send_message_to_user)
     assistant.register_for_execution(name="send_message_to_user")(send_message_to_user)
@@ -624,18 +679,18 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     helper.register_for_llm(name="send_presynthesize_video_to_user", description="Sends a presynthesized message/video/dialogue to user using conv_id.")(send_presynthesize_video_to_user)
     assistant.register_for_execution(name="send_presynthesize_video_to_user")(send_presynthesize_video_to_user)
     
-    def task_less_60se(task: Annotated[str, "task to perform under 60 seconds"],
+    def task_less_60sec(task: Annotated[str, "task to perform under 60 seconds"],
                        perform_in: Annotated[str, "time to wait before performing this task"],) -> str:
-        current_app.logger.info('INSIDE task_less_60se')
+        current_app.logger.info('INSIDE task_less_60sec')
         current_app.logger.info(f'with task task:{task}. and waiting time: {perform_in}')
         return 'Message sent successfully to user'
     
-    helper.register_for_llm(name="task_less_60se", description="Sends a presynthesized message/video/dialogue to user using conv_id.")(task_less_60se)
-    assistant.register_for_execution(name="task_less_60se")(task_less_60se)
+    helper.register_for_llm(name="task_less_60sec", description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")(task_less_60sec)
+    assistant.register_for_execution(name="task_less_60sec")(task_less_60sec)
     
     assistant.description = 'this is an assistant agent that coordinates & executes requested tasks & actions'
     executor.description = 'this is an executor agent that Specialized agent for code execution & response handling'
-    author.description = 'this is an author/user agent that focused on user support, error resolution, contextual information. Contact this agent when you need any user based information or if you want to say something to user'
+    author.description = 'this is an author/user agent that focused on user support, error resolution, contextual information. Contact this agent when you need any user based information or persona based information or if you want to say something to user'
     chat_instructor.description = 'this is a ChatInstructor agent that provides step-by-step action plans for task execution'
     helper.description = 'this is a helper agent that facilitates task completion & assists other agents'
     verify.description = 'this is a verify status agent. which will verify the status of current action that will be called after ChatInstructor gives instruction to complete an action & assistant completes it, this agent will provide updates in a structured JSON format & then call user agent'
@@ -644,80 +699,93 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         current_app.logger.info(f'Inside state_transition with actions {user_tasks[user_prompt].current_action}')
         messages = groupchat.messages
         current_app.logger.info(f'Inside state_transition with message {messages[-1]["content"][:10]}.. & last_speaker:{last_speaker.name}')
-        crossbar_message = {"text": [messages[-1]["content"]], "priority": 49, "action": 'Thinking', "historical_request_id": [], "preffered_language": 'en-US', "options": [], "newoptions": [], "bot_type": 'Agent', "page_image_url": "", "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
-        'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0}, 'bottom_left': {'x': 0, 'y': 0}}}
-        result = client.publish(
-            f"com.hertzai.hevolve.chat.{user_id}", f'{crossbar_message}')
+        # crossbar_message = {"text": ["Working on "+messages[-1]['content']+".\n please evaluate the response i am giving to check if it meets the current action"], "priority": 49, "action": 'Thinking', "historical_request_id": [], "preffered_language": 'en-US', "options": [], "newoptions": [], "bot_type": 'Agent', "page_image_url": "", "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
+        # 'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0}, 'bottom_left': {'x': 0, 'y': 0}}}
+        # result = client.publish(
+        #     f"com.hertzai.hevolve.chat.{user_id}", f'{crossbar_message}')
         
         metadata = get_saved_metadata()
+        current_app.logger.info(messages[-1])
+        if messages[-1]['role'] == 'tool':
+            current_app.logger.info('role is tool returning assistant')
+            return assistant
         
         
         if not messages[-1]["content"].startswith('Reflect on the sequence') and not messages[-1]["content"].startswith('Focus on the current task at hand an'):
             json_obj = retrieve_json(messages[-1]["content"])
             if json_obj:
-                try:   
-                    current_app.logger.info(f'got status as:{json_obj["status"]} ')
-                    if json_obj['status'].lower() == 'error':
-                        return author
-                    elif json_obj['status'].lower() == 'completed' or json_obj['status'].lower() == 'success':
-                        if 'recipe' in json_obj.keys():
-                            current_app.logger.info('Recipe created successfully')
-                            merged_dict = {**final_recipe[prompt_id], **json_obj}
-                            name = f'prompts/{prompt_id}_recipe.json'
-                            with open(name, "w") as json_file:
-                                json.dump(merged_dict, json_file)
-                            current_app.logger.info(f"Dictionary saved to {name}")
-                        if 'action_id' in json_obj.keys():
-                            if user_tasks[user_prompt].fallback == False and user_tasks[user_prompt].recipe == False:
-                                current_app.logger.info('UPDATED TIMER for this action')
-                                end = time.time()
-                                task_time[prompt_id]['times'].append(end-task_time[prompt_id]['timer'])
-                            user_tasks[user_prompt].actions[int(json_obj['action_id'])-1] = json_obj['action']
-                            user_tasks[user_prompt].new_json.append(json_obj)
-                            current_app.logger.info(f'CHECKING FOR FALLBACK user_tasks[user_prompt].current_action={user_tasks[user_prompt].current_action} json_obj["action_id"]={json_obj["action_id"]}')
-                            if user_tasks[user_prompt].current_action != int(json_obj['action_id']):
-                                user_tasks[user_prompt].fallback = True
-                            
-                            current_app.logger.info(f'UPDATIN CURRENT ACTION AS :{int(json_obj["action_id"])}')
-                            user_tasks[user_prompt].current_action = int(json_obj['action_id'])
-                        return chat_instructor
-                    elif json_obj['status'].lower() == 'updated':
-                        if 'entire_actions' in json_obj.keys() and type(json_obj['entire_actions'])==list:
-                            current_app.logger.info('GOT UPDATED WITH entire actions')
-                            try:
-                                current_app.logger.info(f"user_tasks[user_prompt].actions:{len(user_tasks[user_prompt].actions)}, len(json_obj['entire_actions']:{len(json_obj['entire_actions'])}")
-                                current_app.logger.info(f"user_tasks[user_prompt].actions:{user_tasks[user_prompt].actions}, len(json_obj['entire_actions']:{json_obj['entire_actions']}")
+                try:
+                    if 'status' in json_obj:
+                        current_app.logger.info(f'got status as:{json_obj["status"]} ')
+                        if json_obj['status'].lower() == 'error':
+                            return author
+                        elif json_obj['status'].lower() == 'completed' or json_obj['status'].lower() == 'success':
+                            if 'recipe' in json_obj.keys():
+                                current_app.logger.info('Recipe created successfully')
+                                merged_dict = {**final_recipe[prompt_id], **json_obj}
+                                name = f'prompts/{prompt_id}_recipe.json'
+                                with open(name, "w") as json_file:
+                                    json.dump(merged_dict, json_file)
+                                current_app.logger.info(f"Dictionary saved to {name}")
+                            if 'action_id' in json_obj.keys():
+                                if user_tasks[user_prompt].fallback == False and user_tasks[user_prompt].recipe == False:
+                                    current_app.logger.info('UPDATED TIMER for this action')
+                                    end = time.time()
+                                    task_time[prompt_id]['times'].append(end-task_time[prompt_id]['timer'])
+                                user_tasks[user_prompt].actions[int(json_obj['action_id'])-1] = json_obj['action']
+                                user_tasks[user_prompt].new_json.append(json_obj)
+                                current_app.logger.info(f'CHECKING FOR FALLBACK user_tasks[user_prompt].current_action={user_tasks[user_prompt].current_action} json_obj["action_id"]={json_obj["action_id"]}')
+                                if user_tasks[user_prompt].current_action != int(json_obj['action_id']):
+                                    user_tasks[user_prompt].fallback = True
                                 
-                                current_app.logger.info('')
-                                entire_actions = json_obj['entire_actions']
-                                user_tasks[user_prompt].actions = entire_actions
-                                user_tasks[user_prompt].current_action = 0
-                                user_tasks[user_prompt].fallback = False
-                                user_tasks[user_prompt].recipe = False
-                            except Exception as e:
-                                current_app.logger.info(f'error is here:{e}')
+                                current_app.logger.info(f'UPDATIN CURRENT ACTION AS :{int(json_obj["action_id"])}')
+                                user_tasks[user_prompt].current_action = int(json_obj['action_id'])
+                            return chat_instructor
+                        elif json_obj['status'].lower() == 'updated':
+                            if 'entire_actions' in json_obj.keys() and type(json_obj['entire_actions'])==list:
+                                current_app.logger.info('GOT UPDATED WITH entire actions')
+                                try:
+                                    current_app.logger.info(f"user_tasks[user_prompt].actions:{len(user_tasks[user_prompt].actions)}, len(json_obj['entire_actions']:{len(json_obj['entire_actions'])}")
+                                    current_app.logger.info(f"user_tasks[user_prompt].actions:{user_tasks[user_prompt].actions}, len(json_obj['entire_actions']:{json_obj['entire_actions']}")
+                                    
+                                    current_app.logger.info('')
+                                    entire_actions = json_obj['entire_actions']
+                                    user_tasks[user_prompt].actions = entire_actions
+                                    user_tasks[user_prompt].current_action = 0
+                                    user_tasks[user_prompt].fallback = False
+                                    user_tasks[user_prompt].recipe = False
+                                except Exception as e:
+                                    current_app.logger.info(f'error is here:{e}')
+                                    user_tasks[user_prompt].actions[int(json_obj['action_id'])-1] = json_obj['updated_action']
+                                    user_tasks[user_prompt].new_json.append(json_obj)
+                                    user_tasks[user_prompt].fallback = True
+                            elif 'action_id' in json_obj.keys():
                                 user_tasks[user_prompt].actions[int(json_obj['action_id'])-1] = json_obj['updated_action']
                                 user_tasks[user_prompt].new_json.append(json_obj)
                                 user_tasks[user_prompt].fallback = True
-                        elif 'action_id' in json_obj.keys():
-                            user_tasks[user_prompt].actions[int(json_obj['action_id'])-1] = json_obj['updated_action']
-                            user_tasks[user_prompt].new_json.append(json_obj)
-                            user_tasks[user_prompt].fallback = True
-                    elif json_obj['status'].lower() == 'done':
-                        current_app.logger.info('Got Individual action recipe save it')
-                        name = f'prompts/{prompt_id}_{json_obj["action_id"]}.json'
-                        user_tasks[user_prompt].fallback = False
-                        user_tasks[user_prompt].recipe = False
-                        metadata = strip_json_values(agent_data[prompt_id])
-                        json_obj['metadata'] = metadata
-                        json_obj['time_took_to_complete'] = task_time[prompt_id]['times'][-1]
-                        with open(name, "w") as json_file:
-                            json.dump(json_obj, json_file)
-                        current_app.logger.info(f'Saved Individual recipe at: {name}')
-                        
-                        return chat_instructor   
-                except:
-                    pass
+                        elif json_obj['status'].lower() == 'done':
+                            current_app.logger.info('Got Individual action recipe save it')
+                            name = f'prompts/{prompt_id}_{json_obj["action_id"]}.json'
+                            user_tasks[user_prompt].fallback = False
+                            user_tasks[user_prompt].recipe = False
+                            metadata = strip_json_values(agent_data[prompt_id])
+                            json_obj['metadata'] = metadata
+                            json_obj['time_took_to_complete'] = task_time[prompt_id]['times'][-1]
+                            for i in json_obj['recipe']:
+                                if 'tool_name' in i and i['tool_name'] != "":
+                                    i['agent_to_perform_this_action'] = 'Helper'
+                                elif 'generalized_functions' in i and i['generalized_functions'] != "":
+                                    i['agent_to_perform_this_action'] = 'Executor'
+                                else:
+                                    i['agent_to_perform_this_action'] = 'Assistant'
+                            with open(name, "w") as json_file:
+                                json.dump(json_obj, json_file)
+                            user_tasks[user_prompt].current_action = int(json_obj['action_id'])
+                            current_app.logger.info(f'Saved Individual recipe at: {name}')
+                            
+                            return chat_instructor   
+                except Exception as e:
+                    current_app.logger.error(f'GOT SOME ERROR WHILE JSON: {e}')
             
         pattern = r"@Helper"
         pattern1 = r"@Executor"
@@ -781,6 +849,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=30,keep_first_message=True),
             transforms.MessageTokenLimiter(max_tokens=3000, max_tokens_per_message=500, min_tokens=0),
+            ToolMessageHandler(),
         ]
     )
     
@@ -825,7 +894,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
         clear_history = False
         if user_tasks[user_prompt].fallback == True or user_tasks[user_prompt].recipe == True:
             actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action-1)
-            message = 'Hey @StatusVerifier Agent, Please tell the status of the action '+f'{user_tasks[user_prompt].current_action}: {actions_prompt}'+'\n performed and Respond in the following format {"status": "status here","action": "current action","action_id":'+f'{user_tasks[user_prompt].current_action}'+',"message": "message here","fallback_action": "fallback action here"}'
+            message = 'Lets continue the work we were doing if action is completed then ask status verifier Agent to Please tell the status of the action'
         else:
             message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
         text = f'Action {user_tasks[user_prompt].current_action+1}: {message} '
@@ -853,8 +922,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
         'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0}, 'bottom_left': {'x': 0, 'y': 0}}}
         result = client.publish(
             f"com.hertzai.hevolve.chat.{user_id}", f'{crossbar_message}')
-        task_time[prompt_id]['timer'] = time.time()
-        task_time[prompt_id]['times'] = []
+        task_time[prompt_id] = {'timer':time.time(),'times':[]}
         result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
     
     current_app.logger.info("\n=== Chat Summary ===")
@@ -881,13 +949,16 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             else:
                 current_app.logger.warning(f'it is not a json object the error is:')
                 current_app.logger.info('it is not a json object You should ask status verifier to give response in proper format & not move ahead to next action')
+                if group_chat.messages[-1]['role'] == 'tool':
+                    current_app.logger.info('GOT role is tool')
+                    break
                 if user_tasks[user_prompt].fallback == True or user_tasks[user_prompt].recipe == True:
                     actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action-1)
-                    message = 'Hey @StatusVerifier Agent, Please tell the status of the action '+f'{user_tasks[user_prompt].current_action}: {actions_prompt}'+'\n performed and Respond in the following format {"status": "status here","action": "current action","action_id":'+f'{user_tasks[user_prompt].current_action}'+',"message": "message here","fallback_action": "fallback action here"}'
+                    message = 'Lets continue the work we were doing if action is completed then ask status verifier Agent to Please tell the status of the action'
                 else:
                     actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
-                    message = 'Hey @StatusVerifier Agent, Please tell the status of the action '+f'{user_tasks[user_prompt].current_action+1}: {actions_prompt}'+'\n performed and Respond in the following format {"status": "status here","action": "current action","action_id": '+f'{user_tasks[user_prompt].current_action+1}'+',"message": "message here","fallback_action": "fallback action here"}'
-                result = assistant_agent.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
+                    message = 'Lets continue the work we were doing if action is completed then ask status verifier Agent to Please tell the status of the action'
+                result = agents_object['helper'].initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
                 continue
             current_app.logger.info('resuming chat')
             if user_tasks[user_prompt].current_action>=len(user_tasks[user_prompt].actions):
@@ -896,7 +967,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     user_tasks[user_prompt].fallback = False
                     metadata = strip_json_values(agent_data[prompt_id])
                     message = '''Focus on the current task at hand and create a detailed recipe that includes only the necessary steps for this action, along with a suitable name. Provide the output in the following JSON format:
-                    { "status", "done", "action": "Describe the action performed here","fallback_action":"", "persona":"","action_id": '''+f'{user_tasks[user_prompt].current_action}'+''', "recipe": "Include the recipe with all steps, tools, and generalized functions to perform this action successfully","can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike", "generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job exists; otherwise, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
+                    { "status", "done", "action": "'''+str(user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action-1))+'''","fallback_action":"", "persona":"","action_id": '''+f'{user_tasks[user_prompt].current_action}'+''', "recipe": [{{"steps":"steps here","tool_name":"Only include tool name here if used for this step.","generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely."}}],"can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job exists; otherwise, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
                     Recipe Requirements:
                     1. Generalized Python Functions: Give the code which was created and excuted successfully without any error handling edge cases. leave it blank when there is no code nedded to perform the action
                     2. Avoid directly storing any specific information provided by the author in the recipe. Use placeholders for variables instead.
@@ -928,28 +999,38 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     group_chat.messages[-1]['content'] = f'{individual_recipe}'
                     assistant_agent.update_system_message = 'Check if the current_action depends on any other action, regardless of order—it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.'
                     for num,action in enumerate(user_tasks[user_prompt].actions,1):
-                        message = f'''Check if the current_action depends on any other action, regardless of order—it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.\n current_action: {action}'''
-                        result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
-                        for i in range(1,4):
-                            text = group_chat.messages[-i]['content']
-                            match = re.search(r'\[.*?\]', text)
+                        try:
+                            message = f'''Check if the current_action depends on any other action, regardless of order—it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.\n current_action: {action}'''
+                            result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
+                            for i in range(1,4):
+                                text = group_chat.messages[-i]['content']
+                                match = re.search(r'\[.*?\]', text)
+                                if match:
+                                    break
                             if match:
-                                break
-                        if match:
-                            action_ids = eval(match.group())
-                            file_path = f'prompts/{prompt_id}_{num}.json'
-                            with open(file_path, 'r') as f:
-                                data = json.load(f)
-                            data['actions_this_action_depends_on'] = action_ids
-                            with open(file_path, 'w') as f:
-                                json.dump(data, f, indent=4)
-                        else:
+                                action_ids = eval(match.group())
+                                file_path = f'prompts/{prompt_id}_{num}.json'
+                                with open(file_path, 'r') as f:
+                                    data = json.load(f)
+                                data['actions_this_action_depends_on'] = action_ids
+                                with open(file_path, 'w') as f:
+                                    json.dump(data, f, indent=4)
+                            else:
+                                file_path = f'prompts/{prompt_id}_{num}.json'
+                                with open(file_path, 'r') as f:
+                                    data = json.load(f)
+                                data['actions_this_action_depends_on'] = []
+                                with open(file_path, 'w') as f:
+                                    json.dump(data, f, indent=4)
+                        except Exception as e:
+                            current_app.logger.info(f'GOT ERROR AT EVAL OF LIST :{e}')
                             file_path = f'prompts/{prompt_id}_{num}.json'
                             with open(file_path, 'r') as f:
                                 data = json.load(f)
                             data['actions_this_action_depends_on'] = []
                             with open(file_path, 'w') as f:
                                 json.dump(data, f, indent=4)
+                            continue
                     
                     individual_recipe = []
                     for i in range(1,(user_tasks[user_prompt].current_action)):
@@ -1093,7 +1174,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     user_tasks[user_prompt].fallback = False
                     metadata = strip_json_values(agent_data[prompt_id])
                     message = '''Focus on the current task at hand and create a detailed recipe that includes only the necessary steps for this action, along with a suitable name. Provide the output in the following JSON format:
-                    { "status", "done", "action": "Describe the action performed here","fallback_action":"", "persona":"","action_id": '''+f'{user_tasks[user_prompt].current_action}'+''', "recipe": "Include the recipe with all steps, tools, and generalized functions to perform this action successfully","can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike", "generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely.","metadata":"metadata saved in memory till this action", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job exists; otherwise, do not create it.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job exists; otherwise, do not create it.", "persona":"","action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
+                    { "status", "done", "action": "Describe the action performed here","fallback_action":"", "persona":"","action_id": '''+f'{user_tasks[user_prompt].current_action}'+''', "recipe": [{{"steps":"steps here","tool_name":"Only include tool name here if used for this step.","generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely."}}],"can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job exists; otherwise, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
                     Recipe Requirements:
                     1. Generalized Python Functions: Give the code which was created and excuted successfully without any error handling edge cases. leave it blank when there is no code nedded to perform the action
                     2. Avoid directly storing any specific information provided by the author in the recipe. Use placeholders for variables instead.
@@ -1109,7 +1190,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     # user_tasks[user_prompt].current_action = user_tasks[user_prompt].current_action+1
                     task_time[prompt_id]['timer'] = time.time()
                     message = f'Action {user_tasks[user_prompt].current_action+1}: {message} '
-                    crossbar_message = {"text": ["Working on "+message], "priority": 49, "action": 'Thinking', "historical_request_id": [], "preffered_language": 'en-US', "options": [], "newoptions": [], "bot_type": 'Agent', "page_image_url": "", "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
+                    crossbar_message = {"text": ["Working on "+message+".\n please evaluate the response i am giving to check if it meets the current action"], "priority": 49, "action": 'Thinking', "historical_request_id": [], "preffered_language": 'en-US', "options": [], "newoptions": [], "bot_type": 'Agent', "page_image_url": "", "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
                     'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0}, 'bottom_left': {'x': 0, 'y': 0}}}
                     result = client.publish(
                         f"com.hertzai.hevolve.chat.{user_id}", f'{crossbar_message}')
@@ -1135,9 +1216,11 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
 
 messages = {}
 recent_file_id = {}
+request_id_list = {}
 
-def recipe(user_id, text,prompt_id,file_id):
+def recipe(user_id, text,prompt_id,file_id,request_id):
     user_prompt = f'{user_id}_{prompt_id}'
+    request_id_list[user_prompt] = request_id
     current_app.logger.info('--'*100)
     if file_id:
             recent_file_id[user_id] = file_id

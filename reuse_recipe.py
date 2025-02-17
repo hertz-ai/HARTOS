@@ -834,6 +834,21 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         current_app.logger.info(f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
         return 'Message sent successfully to user'
     
+    @assistant.register_for_execution()
+    @helper.register_for_llm(api_style="function",description="Sends a presynthesized message/video/dialogue to user using conv_id.")
+    def send_presynthesize_video_to_user(conv_id: Annotated[str, "Conversation ID associated with the text from memory"]) -> str:
+        current_app.logger.info('INSIDE send_presynthesize_video_to_user')
+        current_app.logger.info(f'SENDING DATA 2 user with value: conv_id:{conv_id}.')
+        return 'Message sent successfully to user'
+    
+    
+    @assistant.register_for_execution()
+    @helper.register_for_llm(api_style="function",description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")
+    def task_less_60sec(task: Annotated[str, "task to perform under 60 seconds"],
+                       perform_in: Annotated[str, "time to wait before performing this task"],) -> str:
+        current_app.logger.info('INSIDE task_less_60sec')
+        current_app.logger.info(f'with task task:{task}. and waiting time: {perform_in}')
+        return 'Message sent successfully to user'
     
     time_agent = autogen.AssistantAgent(
         name='time_agent',
@@ -939,6 +954,11 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     time_agent.register_for_execution(name="get_chat_history")(get_chat_history)  
     helper1.register_for_llm(name="send_message_to_user", description="Send Message to User")(send_message_to_user)
     time_agent.register_for_execution(name="send_message_to_user")(send_message_to_user)  
+    helper1.register_for_llm(name="send_presynthesize_video_to_user", description="Sends a presynthesized message/video/dialogue to user using conv_id.")(send_presynthesize_video_to_user)
+    time_agent.register_for_execution(name="send_presynthesize_video_to_user")(send_presynthesize_video_to_user)
+    helper1.register_for_llm(name="task_less_60sec", description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")(task_less_60sec)
+    time_agent.register_for_execution(name="task_less_60sec")(task_less_60sec)
+    
     
     def connect_time_main(message: Annotated[str, "The message time agent want to send to main agent"]) -> str:
         message = f"Role: Time Agent\n Message: {message}"
@@ -982,10 +1002,6 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     
     def state_transition(last_speaker, groupchat):        
         messages = groupchat.messages
-        pattern3 = r"@statusverifier"
-        if re.search(pattern3, messages[-1]["content"].lower()):
-            current_app.logger.info("String contains @StatusVerifier returnig StatusVerifier")
-            return verify
         try:
             pattern = r'\{.*?\}' # getting all json from text
             matches = re.findall(pattern, messages[-1]["content"], re.DOTALL)   
@@ -1009,7 +1025,11 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         except Exception as e:
             current_app.logger.error(f'Got Error while getting json for current actionid: {e}')
             
-            
+        pattern3 = r"@statusverifier"
+        if re.search(pattern3, messages[-1]["content"].lower()):
+            current_app.logger.info("String contains @StatusVerifier returnig StatusVerifier")
+            return verify
+        
         llm_call_track[user_prompt]['count'] +=1
         current_app.logger.info(f"llm_call_track[user_prompt]['count']:{llm_call_track[user_prompt]['count']}")
         if llm_call_track[user_prompt]['original_prompt'] == True:
