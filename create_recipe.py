@@ -17,7 +17,7 @@ from autogen import register_function
 import json
 from autogen import ConversableAgent
 from flask import current_app
-from helper import topological_sort, fix_json, retrieve_json, fix_actions, gpt_call
+from helper import topological_sort, fix_json, retrieve_json, fix_actions, gpt_call, ToolMessageHandler
 
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
 
@@ -34,6 +34,7 @@ scheduler = BackgroundScheduler()
 scheduler.start()
 
 user_agents: Dict[str, Tuple[autogen.ConversableAgent, autogen.ConversableAgent]] = {}
+time_agents = {}
 # config_list = [{
 #     "model": "gpt-4o-mini",
 #     "api_type": "azure",
@@ -124,20 +125,19 @@ def execute_python_file(task_description:str,user_id: int,prompt_id:int,action_e
 def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_entry_point:int):
     current_app.logger.info(f'INSIDE TIME_BASED_EXECUTION with action_entry_point"{action_entry_point}')
     user_prompt = f'{user_id}_{prompt_id}'
-    if user_prompt not in user_agents:
-        current_app.logger.info('user_id is not present')
-    else:
-        #TODO use action_entry_point to give actions via chatinstructor by changing currnt action
-        assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor = user_agents[user_prompt]
-        # author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = user_agents[user_id]
-        current_time = datetime.now()
-        text = f'This is the time now {current_time}\n you must perform this task {task_description}'
-        result = time_user.initiate_chat(manager_1, message=text,speaker_selection={"speaker": "assistant"}, clear_history=False)
-        last_message = group_chat.messages[-1]
-        if last_message['content'] == 'TERMINATE':
-            last_message = group_chat.messages[-2]
-        #sending response to receiver agent
-        send_message_to_user1(user_id,last_message,task_description)
+    if user_prompt not in time_agents:
+        time_agents[user_prompt] = create_time_agents(user_id,prompt_id,'creator','')
+    
+    #TODO use action_entry_point to give actions via chatinstructor by changing currnt action
+    # author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = user_agents[user_id]
+    current_time = datetime.now()
+    text = f'This is the time now {current_time}\n you must perform this task {task_description} with Action entry point as {action_entry_point}'
+    result = time_agents[user_prompt]['time_user'].initiate_chat(time_agents[user_prompt]['time_manager'], message=text,speaker_selection={"speaker": "assistant"}, clear_history=False)
+    last_message = time_agents[user_prompt]['time_group_chat'].messages[-1]
+    if last_message['content'] == 'TERMINATE':
+        last_message = time_agents[user_prompt]['time_group_chat'].messages[-2]
+    #sending response to receiver agent
+    send_message_to_user1(user_id,last_message,task_description)
     return 'done'
         
 def get_frame(user_id):
@@ -170,66 +170,17 @@ class Action:
 
 from typing import List
 
-class ToolMessageHandler():
-    """Handles tool messages in the conversation history.
-    
-    This transformation checks the first message (index 0) in the conversation history.
-    If the message role is 'tool', it removes that message and returns the remaining messages.
-    Otherwise, it returns the conversation history unchanged.
-    """
-    
-    def __init__(self):
-        """
-        Initialize the ToolMessageHandler.
-        No configuration parameters are needed for this simple transformation.
-        """
-        pass
-        
-    def apply_transform(self, messages: List[Dict]) -> List[Dict]:
-        """Applies the tool message handling transformation to the conversation history.
-        
-        Args:
-            messages (List[Dict]): The list of messages representing the conversation history.
-            
-        Returns:
-            List[Dict]: A new list containing the messages, with the first tool message removed if present.
-        """
-        if not messages:
-            return messages
-            
-        # Make a copy to avoid modifying the original list
-        processed_messages = messages.copy()
-        
-        # Check if the first message has a role of 'tool'
-        if processed_messages and processed_messages[0].get('role') == 'tool':
-            current_app.logger.info('GOT TOOL AS FIRST MESSAGE POPPING IT')
-            processed_messages.pop(0)
-            
-        return processed_messages
-        
-    def get_logs(self, pre_transform_messages: List[Dict], post_transform_messages: List[Dict]) -> Tuple[str, bool]:
-        """Generates logs about the transformation.
-        
-        Args:
-            pre_transform_messages (List[Dict]): Messages before transformation
-            post_transform_messages (List[Dict]): Messages after transformation
-            
-        Returns:
-            Tuple[str, bool]: A tuple containing the log message and whether a transformation occurred
-        """
-        if len(pre_transform_messages) > len(post_transform_messages):
-            return "Removed tool message from the beginning of conversation.", True
-        return "No tool message was removed.", False
-    
+  
+llm_config = {
+        "cache_seed": None,
+        "config_list": config_list,
+        "max_tokens": 1500
+    }   
 
 def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent, autogen.ConversableAgent]:
     """Create new assistant & user agents for a given user_id"""
     user_prompt = f'{user_id}_{prompt_id}'
-    llm_config = {
-        "cache_seed": None,
-        "config_list": config_list,
-        "max_tokens": 1500
-    }
+    
     
     custom_agents = []
     agents_object = {}
@@ -265,17 +216,18 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
                 ➜If there’s only 1 persona in the list, associate that persona with all actions automatically.
                 ➜If there are multiple personas, ask the @User to select the persona associated with each action.
         
-        •Code Execution: Executor Agent: Executes code as needed.
+        •Code Execution: Executor Agent: Executes code as needed. Ensure the final response is printed in code using print() before sending to Executor.
         
         •Tools Helper Agent can use:
             1. The tools are: send_message_to_user,send_presynthesize_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory.
             2. Create Scheduled Jobs: For tasks involving timers or scheduled jobs, ask Helper agent to use the create_scheduled_jobs tool.
             3. Data/Memory Management:
-                ➜If you want to save some data ask helper agent to use "save_data_in_memory" tool.
+                ➜If you want to save some data,understand the current data from get_saved_metadata & plan the datamodel and ask helper agent to use "save_data_in_memory" tool.
                 ➜If you want to get some data ask helper agent to use "get_data_by_key"  tool.
             4. If you want to send some message to user then ask helper agent to use send_message_to_user tool.
             5. If you want to send some pre synthesized video to user then ask helper agent to use send_presynthesize_video_to_user tool.
-            6. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
+            6. Always ask helper agent to use Generate_video tool when there is a task to generate video.
+            77. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
         
         •Error Handling:
             If there's an error or failure, respond with a structured error message format: {"status":"error","action":"current action","action_id":1/2/3...,"message":"message here"}
@@ -314,7 +266,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             Instead, use the create_scheduled_jobs tool for tasks requiring timed intervals.
             If the Assistant Agent requests code with time.sleep, respond that it cannot be executed and utilize the create_scheduled_jobs tool instead.
             Always include proper error handling and logging.
-            Ensure the final response is printed before returning it.
+            Ensure the final response is printed usin print() before returning it.
             If you want to send data proactively (on your own) to user use @user {"message_2_user": "message here"}. However, if you're responding to the user's request or instruction, use the send_message_to_user tool.
         Data Management:
             Use the get_set_internal_memory tool to store or retrieve user information as needed.""",
@@ -381,7 +333,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             Avoid using time.sleep. Instead, request the Helper Agent to use the create_scheduled_jobs tool for tasks requiring delays or intervals.
             If the Assistant Agent provides code requiring time.sleep, inform them that it cannot be executed and suggest using the create_scheduled_jobs tool.
             Add proper error handling and logging in all code.
-            Ensure the final response is printed before returning it.
+            Ensure the final response is printed using print() before returning it.
         Calling Other Agents:
             When you need to direct a question or route the conversation to a specific agent, use the @ tag followed by the agent's name. Examples include: @Executor or @Helper or @User
         Things You cannot do but Helper Agent can:
@@ -487,11 +439,15 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     helper.register_for_llm(name="get_user_camera_inp", description="Get user's visual information to process somethings")(get_user_camera_inp)
     assistant.register_for_execution(name="get_user_camera_inp")(get_user_camera_inp)  
     
-    ##TODO plan the data model to save data based on agent end goal and also what ever was retrieved as part of existing metadata
-    def save_data_in_memory(key: Annotated[str, "Key for storing data now & retrieving data later. Key should be generic valid keyname"],
-                    value: Annotated[Optional[str], "Value you want to store"] = None) -> str:
+    def save_data_in_memory(key: Annotated[str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
+                            value: Annotated[Optional[str], "Value you want to store"] = None) -> str:
         current_app.logger.info('INSIDE save_data_in_memory')
-        agent_data[prompt_id][key] = value
+        keys = key.split('.')
+        d = agent_data.setdefault(prompt_id, {})
+        
+        for k in keys[:-1]:
+            d = d.setdefault(k, {})
+        d[keys[-1]] = value
         return f'{agent_data[prompt_id]}'
     
     helper.register_for_llm(name="save_data_in_memory", description="Use this to Store and retrieve data using key-value storage system")(save_data_in_memory)
@@ -504,8 +460,17 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     helper.register_for_llm(name="get_saved_metadata", description="Returns all metadata from the internal Memory")(get_saved_metadata)
     assistant.register_for_execution(name="get_saved_metadata")(get_saved_metadata)
     
-    def get_data_by_key(key: Annotated[str, "Key for retrieving data"]) -> str:
-        return f'{agent_data[prompt_id][key]}'
+    def get_data_by_key(key: Annotated[str, "Key path for retrieving data. Use dot notation for nested keys (e.g., 'user.info.name')."]) -> str:
+        keys = key.split('.')
+        d = agent_data.get(prompt_id, {})
+        
+        try:
+            for k in keys:
+                d = d[k]
+            return f'{d}'
+        except KeyError:
+            return "Key not found in stored data."
+
 
     helper.register_for_llm(name="get_data_by_key", description="Returns all data from the internal Memory")(get_data_by_key)
     assistant.register_for_execution(name="get_data_by_key")(get_data_by_key)
@@ -633,29 +598,31 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
                             job_description: Annotated[str, "Description of the job to be performed"],
                             cron_expression: Annotated[Optional[str], "Cron expression for scheduling. Example: '0 9 * * 1-5' (Runs at 9:00 AM, Monday to Friday). If the interval is greater than 60 seconds or it needs to be executed at a dynamic cron time this argument is Mandatory else None"]=None) -> str:
         current_app.logger.info('INSIDE create_scheduled_jobs')
-        #TODO check if cron or interval is less than time in session
-        if interval_sec < sum(task_time[prompt_id]['times']):
-            return f"Cannot Create Scheduled jobs for this interval as time taken for execution {sum(task_time[prompt_id]['times'])} is greater than interval between the jobs {interval_sec}"
         
-        if not scheduler.running:
-            scheduler.start()
+        # actual_execution_time = sum(task_time[prompt_id]['times'][-1])
+        # if interval_sec < actual_execution_time:
+        #     return f"Unable to create scheduled job for the specified interval because the actual execution time ({actual_execution_time} seconds) exceeds the interval between jobs ({interval_sec} seconds). Please use an interval longer than {actual_execution_time} seconds. Would you like to create a scheduled job with this updated interval?"
         
-        try:
-            if not interval_sec or int(interval_sec) >60:
-                trigger = CronTrigger.from_crontab(cron_expression)
-                job_id = f"job_{int(time.time())}"
-                scheduler.add_job(execute_python_file, trigger=trigger, id=job_id, args=[job_description, int(user_id),int(prompt_id)])
-                current_app.logger.info('Successfully created scheduler job')
-                return 'Successfully created scheduler job'
-            else:
-                trigger = IntervalTrigger(seconds=int(interval_sec))
-                job_id = f"job_{int(time.time())}"
-                scheduler.add_job(execute_python_file, trigger=trigger, id=job_id, args=[job_description, int(user_id),int(prompt_id)])
-                current_app.logger.info('Successfully created scheduler job')
-                return 'Successfully created scheduler job'
-        except Exception as e:
-            current_app.logger.error(f'Error in create_scheduled_jobs: {str(e)}')
-            return f"Error creating scheduled job: {str(e)}"
+        # if not scheduler.running:
+        #     scheduler.start()
+        
+        # try:
+        #     if not interval_sec or int(interval_sec) >60:
+        #         trigger = CronTrigger.from_crontab(cron_expression)
+        #         job_id = f"job_{int(time.time())}"
+        #         scheduler.add_job(execute_python_file, trigger=trigger, id=job_id, args=[job_description, int(user_id),int(prompt_id)])
+        #         current_app.logger.info('Successfully created scheduler job')
+        #         return 'Successfully created scheduler job'
+        #     else:
+        #         trigger = IntervalTrigger(seconds=int(interval_sec))
+        #         job_id = f"job_{int(time.time())}"
+        #         scheduler.add_job(execute_python_file, trigger=trigger, id=job_id, args=[job_description, int(user_id),int(prompt_id)])
+        #         current_app.logger.info('Successfully created scheduler job')
+        #         return 'Successfully created scheduler job'
+        # except Exception as e:
+        #     current_app.logger.error(f'Error in create_scheduled_jobs: {str(e)}')
+        #     return f"Error creating scheduled job: {str(e)}"
+        return 'Added this schedule job in creation process will do it at the end. you can go ahead and mark this action as completed.'
         
     helper.register_for_llm(name="create_scheduled_jobs", description="Creates time-based jobs using APScheduler to schedule jobs")(create_scheduled_jobs)
     assistant.register_for_execution(name="create_scheduled_jobs")(create_scheduled_jobs)
@@ -727,6 +694,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
                                 with open(name, "w") as json_file:
                                     json.dump(merged_dict, json_file)
                                 current_app.logger.info(f"Dictionary saved to {name}")
+                                return None
                             if 'action_id' in json_obj.keys():
                                 if user_tasks[user_prompt].fallback == False and user_tasks[user_prompt].recipe == False:
                                     current_app.logger.info('UPDATED TIMER for this action')
@@ -843,6 +811,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             return 'auto'
     
     
+    
     all_agents = [assistant, executor, author, chat_instructor,helper,verify]
     all_agents.extend(custom_agents)
     select_speaker_transforms = transform_messages.TransformMessages(
@@ -873,7 +842,250 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     
     
     
+    
     return author, assistant, executor, group_chat, manager, chat_instructor, agents_object
+
+def create_time_agents(user_id, prompt_id,role,goal):
+    user_prompt = f'{user_id}_{prompt_id}'
+    
+    
+    time_agent = autogen.AssistantAgent(
+        name='time_agent',
+        llm_config=llm_config,
+        max_consecutive_auto_reply=10,
+        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        code_execution_config={"work_dir": "coding", "use_docker": False},
+        system_message="You are an helpful AI assistant used to perform time based tasks given to you. "
+        f"""You can refer below details to perform task:
+            Actions: <actionsStart>{user_tasks[user_prompt].actions}<actionEnd>
+            Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{final_recipe[prompt_id]}<generalized_functionsEnd><recipeEnd>
+        
+        """
+        f"When you want to communicate with {role} connect main agent using 'connect_time_main' tool."
+        "Tools Helper Agent can use [txt2img, img2txt, save_data_in_memory, get_data_from_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs,Connect_to_main_agent]"
+        "if you have any task which is not doable by these tool check recipe first else create python code to do so"
+        "the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video."
+        f'IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @user {{"message_2_user": "Your message here"}}'
+        "Return 'TERMINATE' when the task is done."
+    )
+    
+    time_user = autogen.UserProxyAgent(
+        name=f"user_proxy_{user_id}",
+        human_input_mode="NEVER",
+        llm_config=False,
+        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        max_consecutive_auto_reply=0,
+        code_execution_config=False,
+    )
+    helper1 = autogen.AssistantAgent(
+        name="helper",
+        llm_config=llm_config,
+        code_execution_config={"work_dir": "coding", "use_docker": False},
+        system_message=f"""You are Helper Agent. Help the {role} agent to complete the task:
+            1. Follow the steps below to achieve the goal: {goal}.
+            2. Use the provided Recipe for more details related to the actions.
+            3. Only use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
+            4. Tools you have [txt2img, img2txt, save_data_in_memory, get_data_from_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs] if you have any task which is not doable by these tool check recipe first else create python code to do so
+            5. Keep track of action and only go to next action when the current action is completed successfully
+            6. Always use code from recipe given below
+            7. If there is any action which is like to perform a task continously you should not do it.
+            8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
+            9. IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @{role} {{"message_2_user": "Your message here"}}
+            10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
+            Actions: <actionsStart>{user_tasks[user_prompt].actions}<actionEnd>
+            Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{final_recipe[prompt_id]}<generalized_functionsEnd><recipeEnd>            
+            
+            When writing code, always print the final response just before returning it.
+        """,
+        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+    )
+    executor1 = autogen.AssistantAgent(
+        name="Executor",
+        llm_config=llm_config,
+        code_execution_config={"last_n_messages":2,"work_dir": "coding", "use_docker": False},
+        system_message=f'''You are a executor agent. focused solely on creating, running & debugging code.
+            Your responsibilities:
+            1. Follow the steps below to achieve the goal: {goal}.
+            2. Use the provided Recipe for more details related to the actions.
+            3. Only use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
+            4. Tools Helper Agent can use [txt2img, img2txt, save_data_in_memory, get_data_from_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs] if you have any task which is not doable by these tool check recipe first else create python code to do so
+            5. Keep track of action and only go to next action when the current action is completed successfully
+            6. Always use code from recipe given below
+            7. If there is any action which is like to perform a task continously you should not do it.
+            8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
+            9. IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @{role} {{"message_2_user": "Your message here"}}
+            10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
+            Actions: <actionsStart>{user_tasks[user_prompt].actions}<actionEnd>
+            Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{final_recipe[prompt_id]}<generalized_functionsEnd><recipeEnd>
+        
+            Note: Your Working Directory is "/home/hertzai2019/newauto/coding" use this if you need,
+            Add proper error handling, logging.
+            Always provide clear execution results or error messages to the assistant.
+            if you get any conversation which is not related to coding ask the manager to route this conversation to user
+            When writing code, always print the final response just before returning it.
+        ''',
+        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+    )
+    multi_role_agent1 = autogen.AssistantAgent(
+        name="multi_role_agent",
+        llm_config=llm_config,
+        code_execution_config=False,
+        system_message="""You will send message from multiple different personas your, job is to ask those question to assistant agent
+        if you think some text was intent to give to some other agent but i came to you send the same message to user""",
+    )
+    verify1 = autogen.AssistantAgent(
+        name="StatusVerifier",
+        llm_config=llm_config,
+        code_execution_config=False,
+        system_message=""""You are an Status verification agent.
+        Role: Track and verify the status of actions. Provide updates strictly in JSON format only when status is completed.
+        Response formats:
+            1. Action Completed Successfully: {"status": "completed","action": "current action","action_id": 1/2/3...,"message": "message here"}
+            2. Action Error: {"status": "error","action": "current action","action_id": 1/2/3...,"message": "message here"}
+            2. Action Pending: {"status": "pending","action": "current action","action_id": 1/2/3...,"message": "pending actions here"}
+        Important Instructions:
+            Only mark an action as "Completed" if the Assistant Agent confirms successful completion.
+            For pending tasks or ongoing actions, respond to helper to complete the task.
+            Verify the action performed by assistant and make sure the action is performed correctly as per instructions. if action performed was not as per instructions give the pending actions to the helper agent.
+            Report status only—do not perform actions yourself.
+            
+        """,
+        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+    )
+    
+    chat_instructor1 = autogen.UserProxyAgent(
+        name="ChatInstructor",
+        human_input_mode="NEVER",
+        max_consecutive_auto_reply=10,
+        default_auto_reply="TERMINATE",
+        code_execution_config=False,
+        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+    )
+    
+    context_handling = transform_messages.TransformMessages(
+        transforms=[
+            transforms.MessageHistoryLimiter(max_messages=30,keep_first_message=True),
+            transforms.MessageTokenLimiter(max_tokens=3000, max_tokens_per_message=700, min_tokens=0),
+            ToolMessageHandler(),
+        ]
+    )
+    context_handling.add_to_agent(time_agent)
+    context_handling.add_to_agent(time_user)
+    context_handling.add_to_agent(helper1)
+    context_handling.add_to_agent(executor1)
+    context_handling.add_to_agent(multi_role_agent1)
+    context_handling.add_to_agent(verify1)
+    context_handling.add_to_agent(chat_instructor1)
+    time_agent_object = {}
+    time_agent_object['time_agent'] = time_agent
+    time_agent_object['time_user'] = time_user
+    time_agent_object['helper1'] = helper1
+    time_agent_object['executor1'] = executor1
+    time_agent_object['multi_role_agent1'] = multi_role_agent1
+    time_agent_object['verify1'] = verify1
+    time_agent_object['chat_instructor1'] = chat_instructor1
+    
+    time_agent.description = 'Designed to handle specific tasks by interacting directly with other agents or the user. It acts as the primary orchestrator for task management and ensures tasks are completed efficiently'
+    time_user.description = 'Acts as a user, performing tasks assigned by the Assistant Agent. It simulates user actions and provides results or feedback as required.'
+    helper1.description = 'Assists the Assistant Agent by handling function (txt2img, img2txt, save_data_in_memory, get_data_from_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs) calls and supporting backend processes. '
+    executor1.description = 'A specialized agent responsible for executing code and handling response management. It ensures computational tasks are performed accurately and returns results effectively.'
+    multi_role_agent1.description = 'Acts as an external agent with multi-functional capabilities. Note: This agent should never be directly invoked.'
+    verify1.description = 'this is a verify status agent. which will verify the status of current action.'
+    
+    def state_transition1(last_speaker, groupchat):        
+        messages = groupchat.messages
+        try:
+            pattern = r'\{.*?\}' # getting all json from text
+            matches = re.findall(pattern, messages[-1]["content"], re.DOTALL)   
+            json_objects = [json.loads(match) for match in matches]
+            current_app.logger.info(f'Got Json as {len(json_objects)}')
+            if json_objects:
+                last_json = json_objects[-1]
+                current_app.logger.info(f'last json as {last_json}')
+                if 'status' in last_json.keys() and last_json['status'].lower() == 'completed':
+                    current_app.logger.info('GOT COMPLETED FOR ACTION')
+                    try:
+                        user_tasks[user_prompt].current_action = json_objects['action_id']
+                    except:
+                        current_app.logger.error('GOT ERROR WHILE UPDATING CURRENT ACTION')
+                        user_tasks[user_prompt].current_action += 1
+                    return chat_instructor1
+                    
+                currentaction_id = last_json['action_id']
+                if final_recipe[prompt_id][currentaction_id-1]['can_perform_without_user_input'] == 'yes':
+                    return time_agent
+        except Exception as e:
+            current_app.logger.error(f'Got Error while getting json for current actionid: {e}')
+            
+        pattern3 = r"@statusverifier"
+        if re.search(pattern3, messages[-1]["content"].lower()):
+            current_app.logger.info("String contains @StatusVerifier returnig StatusVerifier")
+            return verify1
+    
+        current_app.logger.info(f'Inside state_transition with message :10 {messages[-1]["content"][:10]} & last_speaker {last_speaker.name}')
+        if last_speaker.name == f"user_proxy_{user_id}" or last_speaker.name == "multi_role_agent" or last_speaker.name == "helper" or last_speaker.name == "Executor":
+            return time_agent
+        current_app.logger.info(f'Checking for @user or @{role} in message')
+        if '@user' in messages[-1]["content"].lower() or f'@{role}'.lower() in messages[-1]["content"].lower():
+            current_app.logger.info('GOT @USER in message')
+            temp_message = messages[-1]["content"]
+            temp_message = temp_message.replace("'",'"')
+            json_match = re.search(r'{[\s\S]*}', temp_message)
+            if json_match:
+                try:
+                    current_app.logger.info('GOT Json')
+                    current_app.logger.info(f'got json object')
+                    json_part = json_match.group(0)
+                    current_app.logger.info('Sending user the message')
+                    json_obj = json.loads(json_part)
+                    send_message_to_user1(user_id,json_obj['message_2_user'],'')
+                except:
+                    pass
+                return "auto"
+            
+        if messages[-1]["role"] == 'function':
+            current_app.logger.info('The last speaker was function returning assistant') 
+            return time_agent
+        if 'exitcode:' in messages[-1]["content"]:
+            current_app.logger.info('Got exitcode in text returning assistant')
+            return time_agent
+        if 'TERMINATE' in messages[-1]["content"].upper():
+            current_app.logger.info('TERMINATING BECAUSE OF TERMINATE')
+            # retrieve: action 1 -> action 2
+            return None
+        return "auto"
+    
+    select_speaker_transforms = transform_messages.TransformMessages(
+        transforms=[
+            transforms.MessageHistoryLimiter(max_messages=30,keep_first_message=True),
+            transforms.MessageTokenLimiter(max_tokens=3000, max_tokens_per_message=500, min_tokens=0),
+            ToolMessageHandler(),
+        ]
+    )
+    time_group_chat = autogen.GroupChat(
+        agents=[time_agent, helper1, time_user,multi_role_agent1,executor1,chat_instructor1,verify1],
+        messages=[],
+        max_round=10,
+        select_speaker_transform_messages=select_speaker_transforms,
+        speaker_selection_method=state_transition1,  # using an LLM to decide
+        allow_repeat_speaker=False,  # Prevent same agent speaking twice
+        send_introductions=False
+    )
+    
+    time_manager = autogen.GroupChatManager(
+        groupchat=time_group_chat,
+        llm_config={"cache_seed": None,"config_list": config_list}
+    )
+    
+    time_agent_object['time_group_chat'] = time_group_chat
+    time_agent_object['time_manager'] = time_manager
+    return time_agent_object
+    
+    
+    
+    
+    
+    
 
 user_tasks = {}
 
@@ -967,7 +1179,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     user_tasks[user_prompt].fallback = False
                     metadata = strip_json_values(agent_data[prompt_id])
                     message = '''Focus on the current task at hand and create a detailed recipe that includes only the necessary steps for this action, along with a suitable name. Provide the output in the following JSON format:
-                    { "status", "done", "action": "'''+str(user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action-1))+'''","fallback_action":"", "persona":"","action_id": '''+f'{user_tasks[user_prompt].current_action}'+''', "recipe": [{{"steps":"steps here","tool_name":"Only include tool name here if used for this step.","generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely."}}],"can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job exists; otherwise, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
+                    { "status", "done", "action": "'''+str(user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action-1))+'''","fallback_action":"", "persona":"","action_id": '''+f'{user_tasks[user_prompt].current_action}'+''', "recipe": [{{"steps":"steps here","tool_name":"Only include tool name here if used for this step.","generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely."}}],"can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
                     Recipe Requirements:
                     1. Generalized Python Functions: Give the code which was created and excuted successfully without any error handling edge cases. leave it blank when there is no code nedded to perform the action
                     2. Avoid directly storing any specific information provided by the author in the recipe. Use placeholders for variables instead.
@@ -997,10 +1209,11 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                             current_app.logger.error(f'Got error as :{e} while checking for prompts/{prompt_id}_{i}.json')
                             
                     group_chat.messages[-1]['content'] = f'{individual_recipe}'
-                    assistant_agent.update_system_message = 'Check if the current_action depends on any other action, regardless of order—it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.'
+                    assistant_agent.update_system_message = 'Check if the current_action depends on any other action, regardless of order it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.'
                     for num,action in enumerate(user_tasks[user_prompt].actions,1):
                         try:
-                            message = f'''Check if the current_action depends on any other action, regardless of order—it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.\n current_action: {action}'''
+                            group_chat.messages[-1]['content'] = f'{individual_recipe}'
+                            message = f'''Check if the current_action depends on any other action, regardless of order it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.\n current_action: {action}'''
                             result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
                             for i in range(1,4):
                                 text = group_chat.messages[-i]['content']
@@ -1056,20 +1269,24 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     with open(file_path, 'r') as f:
                         data = json.load(f)
                         role = [x['name'] for x in data['personas']]
+                    message = '''Reflect on the sequence of tasks and create scheduled_tasks with proper persona name and action_entry_point. Provide the output in the following JSON format:
+                        { "status", "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer `action_id` from the list of existing `action_ids` is required as the starting point to perform this job.","action_exit_point":"An integer `action_id` up to which the job should be performed to complete the task. It can be greater than or equal to the entry point.","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }'''
+
                     final_recipe[prompt_id] = {"status":"completed","actions":updated_actions}
                     assistant_agent.update_system_message = '''Reflect on the sequence of tasks and create scheduled_tasks with proper persona name and action_entry_point. Provide the output in the following JSON format:
-                    { "status", "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job exists; otherwise, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }'''
+                    { "status", "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer `action_id` from the list of existing `action_ids` is required as the starting point to perform this job.","action_exit_point":"An integer `action_id` up to which the job should be performed to complete the task. It can be greater than or equal to the entry point.","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }'''
                     current_app.logger.info(f'user_tasks[user_prompt].current_action:{user_tasks[user_prompt].current_action} == len(user_tasks[user_prompt].actions)')
-                    message = '''Reflect on the sequence of tasks and create scheduled_tasks with proper persona name and action_entry_point. Provide the output in the following JSON format:
-                    { "status", "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job exists; otherwise, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
-                    Recipe Requirements:
-                        '''+f"1. The persona must be one of the following: {role}. No other personas are allowed."
                     chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=True,silent=False)
                     last_message = group_chat.messages[-1]
                     json_response = retrieve_json(last_message['content'])
                     if json_response and 'status' in json_response.keys(): 
                         merged_dict = {**final_recipe[prompt_id], **json_response}
                         current_app.logger.info('Recipe created successfully')
+                        time_agents[user_prompt] = create_time_agents(user_id,prompt_id,'creator','')
+                        #TODO create time based scheduler here as you should get the actual entry point first using llm call and then create a scheduled job.
+                        for jobs in merged_dict['scheduled_tasks']:
+                            time_based_execution(jobs['job_description'],user_id,prompt_id,jobs['action_entry_point'])
+                        
                         name = f'prompts/{prompt_id}_recipe.json'
                         with open(name, "w") as json_file:
                             json.dump(merged_dict, json_file)
@@ -1097,9 +1314,9 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         except Exception as e:
                             current_app.logger.error(f'Got error as :{e} while checking for prompts/{prompt_id}_{i}.json')
                     group_chat.messages[-1]['content'] = f'{individual_recipe}'
-                    assistant_agent.update_system_message = 'Check if the current_action depends on any other action, regardless of order—it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.'
+                    assistant_agent.update_system_message = 'Check if the current_action depends on any other action, regardless of order it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.'
                     for num,action in enumerate(user_tasks[user_prompt].actions,1):
-                        message = f'''Check if the current_action depends on any other action, regardless of order—it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.\n current_action: {action}'''
+                        message = f'''Check if the current_action depends on any other action, regardless of order it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.\n current_action: {action}'''
                         result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
                         for i in range(1,4):
                             text = group_chat.messages[-i]['content']
@@ -1148,11 +1365,9 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         role = [x['name'] for x in data['personas']]
                     final_recipe[prompt_id] = {"status":"completed","actions":updated_actions}
                     assistant_agent.update_system_message = '''Reflect on the sequence of tasks and create scheduled_tasks with proper persona name and action_entry_point. Provide the output in the following JSON format:
-                    { "status", "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job exists; otherwise, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }'''
+                    { "status", "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer `action_id` from the list of existing `action_ids` is required as the starting point to perform this job.","action_exit_point":"An integer `action_id` up to which the job should be performed to complete the task. It can be greater than or equal to the entry point.","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }'''
                     message = '''Reflect on the sequence of tasks and create scheduled_tasks with proper persona name and action_entry_point. Provide the output in the following JSON format:
-                    { "status", "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job exists; otherwise, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
-                    Recipe Requirements:
-                        '''+f"1. The persona must be one of the following: {role}. No other personas are allowed."
+                    { "status", "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer `action_id` from the list of existing `action_ids` is required as the starting point to perform this job.","action_exit_point":"An integer `action_id` up to which the job should be performed to complete the task. It can be greater than or equal to the entry point.","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }'''
                     chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
                     last_message = group_chat.messages[-1]
                     json_response = retrieve_json(last_message['content'])
@@ -1174,7 +1389,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     user_tasks[user_prompt].fallback = False
                     metadata = strip_json_values(agent_data[prompt_id])
                     message = '''Focus on the current task at hand and create a detailed recipe that includes only the necessary steps for this action, along with a suitable name. Provide the output in the following JSON format:
-                    { "status", "done", "action": "Describe the action performed here","fallback_action":"", "persona":"","action_id": '''+f'{user_tasks[user_prompt].current_action}'+''', "recipe": [{{"steps":"steps here","tool_name":"Only include tool name here if used for this step.","generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely."}}],"can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job exists; otherwise, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
+                    { "status", "done", "action": "Describe the action performed here","fallback_action":"", "persona":"","action_id": '''+f'{user_tasks[user_prompt].current_action}'+''', "recipe": [{{"steps":"steps here","tool_name":"Only include tool name here if used for this step.","generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely."}}],"can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
                     Recipe Requirements:
                     1. Generalized Python Functions: Give the code which was created and excuted successfully without any error handling edge cases. leave it blank when there is no code nedded to perform the action
                     2. Avoid directly storing any specific information provided by the author in the recipe. Use placeholders for variables instead.

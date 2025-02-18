@@ -3,6 +3,7 @@ import requests
 import re
 import json
 from flask import current_app
+from typing import List, Dict, Tuple
 
 def topological_sort(actions):
     # Create adjacency list and in-degree dictionary
@@ -100,6 +101,21 @@ def gpt_call(prompt):
     except Exception as e:
         print(f'GOT ERROR WHILE JSON FIX:{e}')
         return None
+    
+def gpt_mini(prompt,request_id,history):
+    url = "http://aws_rasa.hertzai.com:5459/gpt-json"
+    prompt = f'{prompt} conside below as history {history}'
+    response = requests.post(
+        url,
+        json={
+            "model": "gpt-4o",
+            "data": [{"role": "user", "content": prompt}],
+            "max_token": 1000,
+            "request_id": request_id
+        })
+    print(f"gpt 4o-mini response is {response}")
+    print(f"gpt 4o-mini response is {response.json()}")
+    return response.json()["text"]
 
 
 def fix_json(json_text):
@@ -168,3 +184,56 @@ def retrieve_json(json_message):
     except:
         json_obj = fix_json(json_message)
         return json_obj
+    
+    
+class ToolMessageHandler():
+    """Handles tool messages in the conversation history.
+    
+    This transformation checks the first message (index 0) in the conversation history.
+    If the message role is 'tool', it removes that message and returns the remaining messages.
+    Otherwise, it returns the conversation history unchanged.
+    """
+    
+    def __init__(self):
+        """
+        Initialize the ToolMessageHandler.
+        No configuration parameters are needed for this simple transformation.
+        """
+        pass
+        
+    def apply_transform(self, messages: List[Dict]) -> List[Dict]:
+        """Applies the tool message handling transformation to the conversation history.
+        
+        Args:
+            messages (List[Dict]): The list of messages representing the conversation history.
+            
+        Returns:
+            List[Dict]: A new list containing the messages, with the first tool message removed if present.
+        """
+        if not messages:
+            return messages
+            
+        # Make a copy to avoid modifying the original list
+        processed_messages = messages.copy()
+        
+        # Check if the first message has a role of 'tool'
+        if processed_messages and processed_messages[0].get('role') == 'tool':
+            current_app.logger.info('GOT TOOL AS FIRST MESSAGE POPPING IT')
+            processed_messages.pop(0)
+            
+        return processed_messages
+        
+    def get_logs(self, pre_transform_messages: List[Dict], post_transform_messages: List[Dict]) -> Tuple[str, bool]:
+        """Generates logs about the transformation.
+        
+        Args:
+            pre_transform_messages (List[Dict]): Messages before transformation
+            post_transform_messages (List[Dict]): Messages after transformation
+            
+        Returns:
+            Tuple[str, bool]: A tuple containing the log message and whether a transformation occurred
+        """
+        if len(pre_transform_messages) > len(post_transform_messages):
+            return "Removed tool message from the beginning of conversation.", True
+        return "No tool message was removed.", False
+  

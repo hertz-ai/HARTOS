@@ -17,7 +17,7 @@ from PIL import Image
 from langchain.memory import ZepMemory
 from crossbarhttp import Client
 from flask import current_app
-from helper import topological_sort
+from helper import topological_sort, ToolMessageHandler
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
 
 client = Client('http://aws_rasa.hertzai.com:8088/publish')
@@ -835,7 +835,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         return 'Message sent successfully to user'
     
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",description="Sends a presynthesized message/video/dialogue to user using conv_id.")
+    @helper.register_for_llm(api_style="function",description="Sends a presynthesized message/video/dialogue to user using conv_id from memory.")
     def send_presynthesize_video_to_user(conv_id: Annotated[str, "Conversation ID associated with the text from memory"]) -> str:
         current_app.logger.info('INSIDE send_presynthesize_video_to_user')
         current_app.logger.info(f'SENDING DATA 2 user with value: conv_id:{conv_id}.')
@@ -1106,15 +1106,16 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         
     select_speaker_transforms = transform_messages.TransformMessages(
         transforms=[
-            transforms.MessageHistoryLimiter(max_messages=5),
-            transforms.MessageTokenLimiter(max_tokens=3000, max_tokens_per_message=500, min_tokens=300),
+            transforms.MessageHistoryLimiter(max_messages=30,keep_first_message=True),
+            transforms.MessageTokenLimiter(max_tokens=3000, max_tokens_per_message=500, min_tokens=0),
+            ToolMessageHandler(),
         ]
     )
     group_chat = autogen.GroupChat(
         agents=[assistant, helper, user_proxy,multi_role_agent,executor,chat_instructor,verify],
         messages=[],
         max_round=10,
-        # select_speaker_transform_messages=select_speaker_transforms,
+        select_speaker_transform_messages=select_speaker_transforms,
         speaker_selection_method=state_transition,  # using an LLM to decide
         allow_repeat_speaker=False,  # Prevent same agent speaking twice
         send_introductions=False
