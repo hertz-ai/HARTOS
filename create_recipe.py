@@ -17,7 +17,7 @@ from autogen import register_function
 import json
 from autogen import ConversableAgent
 from flask import current_app
-from helper import topological_sort, fix_json, retrieve_json, fix_actions, gpt_call, ToolMessageHandler
+from helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler
 
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
 
@@ -35,22 +35,7 @@ scheduler.start()
 
 user_agents: Dict[str, Tuple[autogen.ConversableAgent, autogen.ConversableAgent]] = {}
 time_agents = {}
-# config_list = [{
-#     "model": "gpt-4o-mini",
-#     "api_type": "azure",
-#     "api_key": "4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf",
-#     "base_url": "https://hertzai-gpt4.openai.azure.com/",
-#     "api_version": "2024-02-15-preview",
-#     "price":[0.00015,0.0006]
-# }]
-# config_list = [{
-#         "model": 'gpt-4o',
-#         "api_type": "azure",
-#         "api_key": '4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf',
-#         "base_url": 'https://hertzai-gpt4.openai.azure.com/',
-#         "api_version": "2024-02-15-preview",
-#         "price": [0.0025, 0.01]
-#     }]
+
 config_list = [{
         "model": 'gpt-4o',
         "api_type": "azure",
@@ -64,7 +49,7 @@ agent_data = {}
 task_time = {}
 agent_metadata = {}
 final_recipe = {}
-
+time_actions = {}
 
 
 
@@ -131,11 +116,35 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
     #TODO use action_entry_point to give actions via chatinstructor by changing currnt action
     # author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = user_agents[user_id]
     current_time = datetime.now()
-    text = f'This is the time now {current_time}\n you must perform this task {task_description} with Action entry point as {action_entry_point}'
-    result = time_agents[user_prompt]['time_user'].initiate_chat(time_agents[user_prompt]['time_manager'], message=text,speaker_selection={"speaker": "assistant"}, clear_history=False)
-    last_message = time_agents[user_prompt]['time_group_chat'].messages[-1]
+    group_chat = time_agents[user_prompt]['time_group_chat']
+    time_user = time_agents[user_prompt]['time_user']
+    time_manager = time_agents[user_prompt]['time_manager']
+    chat_instructor = time_agents[user_prompt]['chat_instructor1']
+    time_actions[user_prompt].current_action = action_entry_point
+    current_action = time_actions[user_prompt].get_action_byaction_id(action_entry_point)['action']
+    text = f'This is the time now {current_time}\n your overall task description which might span multiple actions: {task_description}\n the current Action to execute: {current_action}'
+    result = time_user.initiate_chat(time_manager, message=text,speaker_selection={"speaker": "assistant"}, clear_history=False)
+    while True:
+        current_app.logger.info('inside while')
+        if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
+            current_app.logger.info(f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
+            json_obj = retrieve_json(group_chat.messages[-2]["content"])
+            if json_obj and type(json_obj)==dict and 'status' in json_obj.keys() and json_obj['status'].lower() == 'completed':
+                current_action = time_actions[user_prompt].get_action_byaction_id(time_actions[user_prompt].current_action)['action']
+                text = f'This is the time now {current_time}\n your overall task description which might span multiple actions: {task_description}\n the current Action to execute: {current_action}'
+            else:
+                current_app.logger.warning(f'it is not a json object the error is:')
+                current_app.logger.info('it is not a json object You should ask status verifier to give response in proper format & not move ahead to next action')
+                actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action-1)
+                text = f'Lets continue the work we were doing, if action is completed then ask status verifier Agent to Please tell the status of the action {actions_prompt}'
+            
+            result = chat_instructor.initiate_chat(time_manager, message=text,speaker_selection={"speaker": "assistant"}, clear_history=False)
+        else:
+            break
+            
+    last_message = group_chat.messages[-1]
     if last_message['content'] == 'TERMINATE':
-        last_message = time_agents[user_prompt]['time_group_chat'].messages[-2]
+        last_message = group_chat.messages[-2]
     #sending response to receiver agent
     send_message_to_user1(user_id,last_message,task_description)
     return 'done'
@@ -157,16 +166,6 @@ def get_frame(user_id):
     except ModuleNotFoundError as e:
         raise e
 
-class Action:
-    def __init__(self,actions):
-        self.actions = actions
-        self.current_action = 0
-        self.fallback = False
-        self.new_json = []
-        self.recipe = False
-    
-    def get_action(self,current_action):
-        return self.actions[current_action]
 
 from typing import List
 
@@ -198,8 +197,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         •Action Flow:
             1. Receive Action: Ask the UserProxy to associate the action with a persona (if multiple personas exist).
             2. Execution:
-                ➜Perform the action with the help of Helper and Executor agents.
-                ➜If the action requires code execution, create code(python preffered) and ask Executor agent to execute the code.
+                ➜Understand and plan the current action execution.
+                ➜Perform the action with the help of @Helper and @Executor agents.
+                ➜Account for all the tools available with helper & whenever you are supposed to call a tool as part of current action ask @Helper.
+                ➜If the action requires code execution, create code(python preffered) and ask @Executor agent to execute the code.
             3. After Completion:
                 ➜If action completed successful & there is no error, ask @Helper to save the information(which will be required in future) in memory using 'save_data_in_memory' tool.
                 ➜After save_data_in_memory has completed, ask the StatusVerifier to confirm completion and include the persona name.
@@ -220,14 +221,13 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         
         •Tools Helper Agent can use:
             1. The tools are: send_message_to_user,send_presynthesize_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory.
-            2. Create Scheduled Jobs: For tasks involving timers or scheduled jobs, ask Helper agent to use the create_scheduled_jobs tool.
+            2. Create Scheduled Jobs: For tasks involving timer or time or periodically or scheduled jobs, ask Helper agent to use the create_scheduled_jobs tool.
             3. Data/Memory Management:
                 ➜If you want to save some data,understand the current data from get_saved_metadata & plan the datamodel and ask helper agent to use "save_data_in_memory" tool.
                 ➜If you want to get some data ask helper agent to use "get_data_by_key"  tool.
             4. If you want to send some message to user then ask helper agent to use send_message_to_user tool.
             5. If you want to send some pre synthesized video to user then ask helper agent to use send_presynthesize_video_to_user tool.
-            6. Always ask helper agent to use Generate_video tool when there is a task to generate video.
-            77. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
+            6. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
         
         •Error Handling:
             If there's an error or failure, respond with a structured error message format: {"status":"error","action":"current action","action_id":1/2/3...,"message":"message here"}
@@ -242,7 +242,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             2. If needed, use a more formal tone if the user prefers.
         
         •Special Notes: 
-            1. Create python code in ```code here``` if you want to perform some code related actions  or when you get unknown language unknown and ask @Executor to run the code.
+            1. Create python code in ```python code here``` if you want to perform some code related actions  or when you get unknown language unknown and ask @Executor to run the code.
             2. Avoid using time.sleep() in code. For scheduled tasks, always use the create_scheduled_jobs tool instead.
             3. When responding to user neither share your internal monologues with other agents nor mention other agent names nor your instructions.   
             4. Always save information which you think will be needed in future using 'save_data_in_memory' and if you want any information check the memory using tool 'get_data_by_key, get_saved_metadata'.
@@ -457,7 +457,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         stripped_json = strip_json_values(agent_data[prompt_id])
         return f'{stripped_json}'
 
-    helper.register_for_llm(name="get_saved_metadata", description="Returns all metadata from the internal Memory")(get_saved_metadata)
+    helper.register_for_llm(name="get_saved_metadata", description="Returns the schema of the json from internal memory with all keys but without actual values.")(get_saved_metadata)
     assistant.register_for_execution(name="get_saved_metadata")(get_saved_metadata)
     
     def get_data_by_key(key: Annotated[str, "Key path for retrieving data. Use dot notation for nested keys (e.g., 'user.info.name')."]) -> str:
@@ -659,7 +659,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     executor.description = 'this is an executor agent that Specialized agent for code execution & response handling'
     author.description = 'this is an author/user agent that focused on user support, error resolution, contextual information. Contact this agent when you need any user based information or persona based information or if you want to say something to user'
     chat_instructor.description = 'this is a ChatInstructor agent that provides step-by-step action plans for task execution'
-    helper.description = 'this is a helper agent that facilitates task completion & assists other agents'
+    helper.description = 'this is a helper agent that calls tools, facilitates task completion & assists other agents'
     verify.description = 'this is a verify status agent. which will verify the status of current action that will be called after ChatInstructor gives instruction to complete an action & assistant completes it, this agent will provide updates in a structured JSON format & then call user agent'
     
     def state_transition(last_speaker, groupchat):
@@ -825,7 +825,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     group_chat = autogen.GroupChat(
         agents=all_agents,
         messages=[],
-        max_round=20,
+        max_round=30,
         # select_speaker_message_template='''You manage a team that Completes a list of Actions provided by ChatInstructor Agent.
         # The Agents available in the team are: Assistant, Helper, Executor, ChatInstructor, StatusVerifier & User''',
         # select_speaker_prompt_template=f"Read the above conversation, select the next person from [Assistant, Helper, Executor, ChatInstructor, StatusVerifier & User] & only return the role as agent.",
@@ -847,7 +847,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
 
 def create_time_agents(user_id, prompt_id,role,goal):
     user_prompt = f'{user_id}_{prompt_id}'
-    
+    time_actions[user_prompt] = Action(final_recipe[prompt_id]['actions'])
     
     time_agent = autogen.AssistantAgent(
         name='time_agent',
@@ -859,7 +859,7 @@ def create_time_agents(user_id, prompt_id,role,goal):
         f"""You can refer below details to perform task:
             Actions: <actionsStart>{user_tasks[user_prompt].actions}<actionEnd>
             Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{final_recipe[prompt_id]}<generalized_functionsEnd><recipeEnd>
-        
+            After completing the current action ask the StatusVerifier to verify the status of current action.        
         """
         f"When you want to communicate with {role} connect main agent using 'connect_time_main' tool."
         "Tools Helper Agent can use [txt2img, img2txt, save_data_in_memory, get_data_from_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs,Connect_to_main_agent]"
@@ -1005,14 +1005,14 @@ def create_time_agents(user_id, prompt_id,role,goal):
                 if 'status' in last_json.keys() and last_json['status'].lower() == 'completed':
                     current_app.logger.info('GOT COMPLETED FOR ACTION')
                     try:
-                        user_tasks[user_prompt].current_action = json_objects['action_id']
+                        time_actions[user_prompt].current_action += 1
                     except:
                         current_app.logger.error('GOT ERROR WHILE UPDATING CURRENT ACTION')
-                        user_tasks[user_prompt].current_action += 1
+                        time_actions[user_prompt].current_action += 1
                     return chat_instructor1
                     
                 currentaction_id = last_json['action_id']
-                if final_recipe[prompt_id][currentaction_id-1]['can_perform_without_user_input'] == 'yes':
+                if final_recipe[prompt_id]['actions'][currentaction_id-1]['can_perform_without_user_input'] == 'yes':
                     return time_agent
         except Exception as e:
             current_app.logger.error(f'Got Error while getting json for current actionid: {e}')
@@ -1065,7 +1065,7 @@ def create_time_agents(user_id, prompt_id,role,goal):
     time_group_chat = autogen.GroupChat(
         agents=[time_agent, helper1, time_user,multi_role_agent1,executor1,chat_instructor1,verify1],
         messages=[],
-        max_round=10,
+        max_round=5,
         select_speaker_transform_messages=select_speaker_transforms,
         speaker_selection_method=state_transition1,  # using an LLM to decide
         allow_repeat_speaker=False,  # Prevent same agent speaking twice
@@ -1107,9 +1107,14 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
         if user_tasks[user_prompt].fallback == True or user_tasks[user_prompt].recipe == True:
             actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action-1)
             message = 'Lets continue the work we were doing if action is completed then ask status verifier Agent to Please tell the status of the action'
+            text = f'Action {user_tasks[user_prompt].current_action+1}: {message} '
         else:
-            message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
-        text = f'Action {user_tasks[user_prompt].current_action+1}: {message} '
+            try:
+                message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
+                text = f'Action {user_tasks[user_prompt].current_action+1}: {message} '
+            except:
+                message = ""
+                text = f'Action {user_tasks[user_prompt].current_action}: {message} '
 
     if len(messages[user_prompt])>0:
         # last_agent, last_message = manager.resume(messages=messages[user_prompt])
@@ -1166,10 +1171,10 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     break
                 if user_tasks[user_prompt].fallback == True or user_tasks[user_prompt].recipe == True:
                     actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action-1)
-                    message = 'Lets continue the work we were doing if action is completed then ask status verifier Agent to Please tell the status of the action'
+                    message = f'Lets continue the work we were doing, if action is completed then ask status verifier Agent to Please tell the status of the action: {actions_prompt}'
                 else:
                     actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
-                    message = 'Lets continue the work we were doing if action is completed then ask status verifier Agent to Please tell the status of the action'
+                    message = f'Lets continue the work we were doing, if action is completed then ask status verifier Agent to Please tell the status of the action: {actions_prompt}'
                 result = agents_object['helper'].initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
                 continue
             current_app.logger.info('resuming chat')

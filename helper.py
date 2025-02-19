@@ -236,4 +236,20 @@ class ToolMessageHandler():
         if len(pre_transform_messages) > len(post_transform_messages):
             return "Removed tool message from the beginning of conversation.", True
         return "No tool message was removed.", False
-  
+
+class Action:
+    def __init__(self,actions):
+        self.actions = actions
+        self.current_action = 0
+        self.fallback = False
+        self.new_json = []
+        self.recipe = False
+    
+    def get_action(self,current_action):
+        return self.actions[current_action]
+    
+    def get_action_byaction_id(self,action_id):
+        for i in self.actions:
+            if i['action_id'] == action_id:
+                return i
+        return None
