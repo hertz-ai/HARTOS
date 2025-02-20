@@ -63,7 +63,18 @@ import redis
 import pickle
 from threading import Thread
 from dotenv import load_dotenv
+import autogen
+from typing import Dict, Tuple
 load_dotenv()
+
+#autogen requirements
+
+from create_recipe import recipe
+from reuse_recipe import chat_agent, crossbar_multiagent, time_based_execution
+from autobahn.twisted.component import Component, run
+from twisted.internet.defer import inlineCallbacks
+import threading
+
 # os.environ['LANGCHAIN_TRACING_V2'] = 'true'
 # os.environ['LANGCHAIN_ENDPOINT'] = 'https://api.smith.langchain.com'
 # os.environ['LANGCHAIN_API_KEY'] = os.getenv("LANGCHAIN_API_KEY")
@@ -81,12 +92,12 @@ class RequestLogRecord(logging.LogRecord):
 # logging info
 # Use the custom log record factory
 logging.setLogRecordFactory(RequestLogRecord)
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 stream_handler = logging.StreamHandler(sys.stdout)
 handler = RotatingFileHandler('langchain.log', maxBytes=100000, backupCount=0)
 
 # Set the logging level for the file handler
-handler.setLevel(logging.DEBUG)
+handler.setLevel(logging.INFO)
 
 # Create a logging format
 req_id = thread_local_data.get_request_id()
@@ -173,8 +184,8 @@ llm_math = LLMMathChain(llm=ChatOpenAI(model_name="gpt-3.5-turbo"))
 # llm_math = LLMMathChain(llm= ChatGroq(groq_api_key=groq_api_key,
 #                model_name = "mixtral-8x7b-32768"))
 
-llm = ChatGroq(groq_api_key=groq_api_key,
-               model_name="llama3-70b-8192", temperature=1)
+# llm = ChatGroq(groq_api_key=groq_api_key,
+#                model_name="llama-3.1-8b-instant", temperature=0.3)
 
 # app.logger.info(llm.invoke("hi how are you?"))
 
@@ -444,6 +455,50 @@ def get_tools(req_tool, is_first: bool = False):
 # custom GPT
 
 
+SUPPORTED_LANG_DICT = {
+    "ar": "Arabic",
+    "bg": "Bulgarian",
+    "zh": "Chinese",
+    "zh-cn": "Chinese (Simplified)",
+    "nl": "Dutch",
+    "fi": "Finnish",
+    "fr": "French",
+    "de": "German",
+    "el": "Greek",
+    "he": "Hebrew",
+    "hu": "Hungarian",
+    "is": "Icelandic",
+    "id": "Indonesian",
+    "ko": "Korean",
+    "lv": "Latvian",
+    "ms": "Malay",
+    "fa": "Persian",
+    "pl": "Polish",
+    "pt": "Portuguese",
+    "ro": "Romanian",
+    "ru": "Russian",
+    "es": "Spanish",
+    "sw": "Swahili",
+    "sv": "Swedish",
+    "th": "Thai",
+    "tr": "Turkish",
+    "uk": "Ukrainian",
+    "ur": "Urdu",
+    "vi": "Vietnamese",
+    "cy": "Welsh",
+    "hi": "Hindi",
+    "bn": "Bengali",
+    "ta": "Tamil",
+    "pa": "Punjabi",
+    "gu": "Gujarati",
+    "kn": "Kannada",
+    "te": "Telugu",
+    "mr": "Marathi",
+    "ml": "Malayalam",
+    "en": "English"
+}
+
+
 class CustomGPT(LLM):
     casual_conv: bool
 
@@ -482,208 +537,234 @@ class CustomGPT(LLM):
             # time.sleep(10)
 
         checker = None
+        # structured_llm = llm.with_structured_output(
+        #     method="json_mode",
+        #     include_raw=True
+        # )
         if (self.count > 1 or self.call_gpt4 == 1):
-            try:
-                # app.logger.info(f"the prompt we are sending is {prompt}")
 
+            # try:
+            #     # app.logger.info(f"the prompt we are sending is {prompt}")
+
+            #     start = time.time()
+            #     response = requests.post(
+            #         GPT_API,
+            #         json={
+
+            #             "model": "gpt-4o-mini",
+            #             "data": [{"role": "user", "content": prompt}],
+            #             "max_token": 2000,
+            #             "request_id": str(thread_local_data.get_request_id())
+            #         })
+            #     app.logger.info(
+            #         f"gpt 3.5 response format is {response.json()}")
+            #     app.logger.info(
+            #         f"gpt 3.5 response format type is {type(response.json())}")
+            #     app.logger.info(
+            #         " gpt 3.5 finish in {}".format(time.time()-start))
+            #     checker = 1
+
+            # except:
+            #     app.logger.info("gpt 3.5 fails on line number 483!!")
+            try:
+                if self.casual_conv:
+                    app.logger.info(f"casual conv!")
+                    start = time.time()
+                    response = requests.post(
+                        GPT_API,
+                        json={
+                            "model": "gpt-4o-mini",
+                            "data": [{"role": "user", "content": prompt}],
+                            "max_token": 1000,
+                            "request_id": str(thread_local_data.get_request_id())
+                        })
+                    app.logger.info(
+                        f"gpt 3.5 response format is {response.json()}")
+                    app.logger.info(
+                        f"gpt 3.5 response format type is {type(response.json())}")
+                    app.logger.info(
+                        " gpt 3.5 finish in {}".format(time.time()-start))
+                    checker = 1
+
+                else:
+                    app.logger.info("Non casual conv")
+                    start = time.time()
+                    response = requests.post(
+                        GPT_API,
+                        json={
+                            "model": "gpt-4o-mini",
+                            "data": [{"role": "user", "content": prompt}],
+                            "max_token": 1000,
+                            "request_id": str(thread_local_data.get_request_id())
+                        })
+                    app.logger.info(
+                        f"gpt 3.5 response format is {response.json()}")
+                    app.logger.info(
+                        f"gpt 3.5 response format type is {type(response.json())}")
+                    app.logger.info(
+                        " gpt 3.5 finish in {}".format(time.time()-start))
+                    checker = 1
+                    
+                    # # `response_from_groq`.
+
+                    # response_from_groq = structured_llm.invoke(prompt)
+                    # # app.logger.info("groq response in streaming way")
+                    # # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+                    # # response_from_groq = ""
+                    # # for chunk in llm.stream(prompt):
+                    # #     app.logger.info(f"chunk in stream {chunk}")
+                    # #     app.logger.info(f"chunk content in straming way {chunk.content}")
+                    # #     response_from_groq +=chunk.content
+
+                    # # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+                    # # app.logger.info(f" response from groq api {response_from_groq}")
+                    # # app.logger.info(f" response from groq api {type(response_from_groq)}")
+
+                    # app.logger.info(
+                    #     "finish in groq {}".format(time.time()-start))
+                    # response = response_from_groq['raw'].content
+                    # response_from_groq = response_from_groq['raw'].content
+                    # # response = json.loads(response_from_groq.content)
+                    # # response = json.dumps(response)
+                    # app.logger.info(
+                    #     f" response from groq api after {response}")
+                    # app.logger.info(
+                    #     f" response from groq api after {type(response)}")
+                    # checker = 0
+            except Exception as e:
+                app.logger.info(f"In except the exception is {e}")
                 start = time.time()
                 response = requests.post(
                     GPT_API,
                     json={
                         "model": "gpt-4o-mini",
                         "data": [{"role": "user", "content": prompt}],
-                        "max_token": 2000,
+                        "max_token": 1000,
                         "request_id": str(thread_local_data.get_request_id())
                     })
                 app.logger.info(
                     f"gpt 3.5 response format is {response.json()}")
                 app.logger.info(
                     f"gpt 3.5 response format type is {type(response.json())}")
-                app.logger.info(
-                    " gpt 3.5 finish in {}".format(time.time()-start))
+                app.logger.info("finish in {}".format(time.time()-start))
                 checker = 1
-
-            except:
-                app.logger.info("gpt 3.5 fails on line number 483!!")
-
-                # if self.casual_conv:
-                #     app.logger.info(f"casual conv!")
-                #     start= time.time()
-                #     response = requests.post(
-                #         GPT_API,
-                #         json={
-                #         "model": "gpt35-turbo-1106",
-                #         "data": [{"role":"user","content":prompt}],
-                #         "max_token":1000,
-                #         "request_id":str(thread_local_data.get_request_id())
-                #         })
-                #     app.logger.info(f"gpt 3.5 response format is {response.json()}")
-                #     app.logger.info(f"gpt 3.5 response format type is {type(response.json())}")
-                #     app.logger.info(" gpt 3.5 finish in {}".format(time.time()-start))
-                #     checker = 1
-
-                # else:
-                #     app.logger.info("Non casual conv")
-                #     start=time.time()
-                #     # `response_from_groq`.
-                #     # response_from_groq = llm.invoke(prompt)
-                #     # app.logger.info("groq response in streaming way")
-                #     # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
-                #     response_from_groq = ""
-                #     for chunk in llm.stream(prompt):
-                #         app.logger.info(chunk.content)
-                #         app.logger.info(f"chunk in stream {chunk}")
-                #         app.logger.info(f"chunk content in straming way {chunk.content}")
-                #         response_from_groq +=chunk.content
-
-                #     # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
-                #     # app.logger.info(f" response from groq api {response_from_groq}")
-                #     # app.logger.info(f" response from groq api {type(response_from_groq)}")
-
-                #     app.logger.info("finish in groq {}".format(time.time()-start))
-                #     response = json.loads(response_from_groq)
-                #     # response = json.loads(response_from_groq.content)
-                #     response = json.dumps(response)
-                #     app.logger.info(f" response from groq api after {response}")
-                #     app.logger.info(f" response from groq api after {type(response)}")
-                #     checker = 0
-            # except Exception as e:
-            #     app.logger.info(f"In except the exception is {e}")
-            #     start= time.time()
-            #     response = requests.post(
-            #         GPT_API,
-            #         json={
-            #         "model": "gpt35-turbo-1106",
-            #         "data": [{"role":"user","content":prompt}],
-            #         "max_token":1000,
-            #         "request_id":str(thread_local_data.get_request_id())
-            #         })
-            #     app.logger.info(f"gpt 3.5 response format is {response.json()}")
-            #     app.logger.info(f"gpt 3.5 response format type is {type(response.json())}")
-            #     app.logger.info("finish in {}".format(time.time()-start))
-            #     checker = 1
         else:
-            # try:
-            #     # app.logger.info(f"the prompt we are sending is {prompt}")
-            #     if self.casual_conv:
-
-            #         app.logger.info(f"the casual conv line 519 casual conv {self.casual_conv} type of casual conv {type(self.casual_conv)}")
-            #         start=time.time()
-
-            #         response = requests.post(
-            #             GPT_API,
-            #             json={
-            #             "model": "gpt35-turbo-1106",
-            #             "data": [{"role":"user","content":prompt}],
-            #             "max_token":1000,
-            #             "request_id":str(thread_local_data.get_request_id())
-            #             }
-            #         )
-            #         app.logger.info(f"gpt 3.5 response format is {response.json()}")
-            #         app.logger.info(f"gpt 3.5 response format type is {type(response.json())}")
-            #         app.logger.info("gpt 3.5 finish in {}".format(time.time()-start))
-            #         checker = 1
-            #     else:
-            #         try:
-            #             app.logger.info("non casual conv")
-            #             start=time.time()
-            #             # response_from_groq = llm.invoke(prompt)
-
-            #             response_from_groq = ""
-            #             for chunk in llm.stream(prompt):
-            #                 app.logger.info(chunk.content)
-            #                 app.logger.info(f"chunk in stream {chunk}")
-            #                 app.logger.info(f"chunk content in straming way {chunk.content}")
-            #                 response_from_groq +=chunk.content
-            #             # app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
-            #             # app.logger.info(f" response from groq api {response_from_groq}")
-            #             # app.logger.info(f" response from groq api {type(response_from_groq)}")
-            #             app.logger.info("finish in groq {}".format(time.time()-start))
-            #             app.logger.info(f"this is response from groq {response_from_groq}")
-            #             # app.logger.info(f"this is response content from groq {response_from_groq.content}")
-            #             # app.logger.info(f"this is the type of response content from groq {type(response_from_groq.content)}")
-            #             # response = json.loads(response_from_groq.content)
-            #             response = json.loads(response_from_groq)
-            #             # response = json.loads(response_from_groq.content)
-            #             response = json.dumps(response)
-
-            #             app.logger.info(f" response from groq api after {response}")
-            #             app.logger.info(f" response from groq api after {type(response)}")
-            #             checker = 0
-            # except Exception as e:
-            #     app.logger.info(f" the error is {e}")
-            # except Exception as e:
-            #     app.logger.info(f"In except the exception is {e}")
-            #     start=time.time()
-
-            #     response = requests.post(
-            #         GPT_API,
-            #         json={
-            #         "model": "gpt-4",
-            #         "data": [{"role":"user","content":prompt}],
-            #         "max_token":1000,
-            #         "request_id":str(thread_local_data.get_request_id())
-            #         }
-            #     )
-            #     app.logger.info(f"gpt 4 response format is {response.json()}")
-            #     app.logger.info(f"gpt 4 response format type is {type(response.json())}")
-            #     app.logger.info("finish in {}".format(time.time()-start))
-            #     checker = 1
             try:
+                # app.logger.info(f"the prompt we are sending is {prompt}")
+                if self.casual_conv:
+
+                    app.logger.info(
+                        f"the casual conv line 519 casual conv {self.casual_conv} type of casual conv {type(self.casual_conv)}")
+                    start = time.time()
+
+                    response = requests.post(
+                        GPT_API,
+                        json={
+                            "model": "gpt-4o-mini",
+                            "data": [{"role": "user", "content": prompt}],
+                            "max_token": 1000,
+                            "request_id": str(thread_local_data.get_request_id())
+                        }
+                    )
+                    app.logger.info(
+                        f"gpt 3.5 response format is {response.json()}")
+                    app.logger.info(
+                        f"gpt 3.5 response format type is {type(response.json())}")
+                    app.logger.info(
+                        "gpt 3.5 finish in {}".format(time.time()-start))
+                    checker = 1
+                else:
+                    try:
+                        app.logger.info("non casual conv")
+                        start = time.time()
+                        response = requests.post(
+                            GPT_API,
+                            json={
+                                "model": "gpt-4o-mini",
+                                "data": [{"role": "user", "content": prompt}],
+                                "max_token": 1000,
+                                "request_id": str(thread_local_data.get_request_id())
+                            }
+                        )
+                        app.logger.info(
+                            f"gpt 3.5 response format is {response.json()}")
+                        app.logger.info(
+                            f"gpt 3.5 response format type is {type(response.json())}")
+                        app.logger.info(
+                            "gpt 3.5 finish in {}".format(time.time()-start))
+                        checker = 1
+                        
+                        # response_from_groq = structured_llm.invoke(prompt)
+
+                        
+                        # app.logger.info(
+                        #     "finish in groq {}".format(time.time()-start))
+                        # app.logger.info(
+                        #     f"this is response from groq {response_from_groq}")
+                        # response = response_from_groq['raw'].content
+                        # response_from_groq = response_from_groq['raw'].content
+                        # app.logger.info(
+                        #     f" response from groq api after {response}")
+                        # app.logger.info(
+                        #     f" response from groq api after {type(response)}")
+                        # checker = 0
+                    except Exception as e:
+                        app.logger.info(f" the error is {e}")
+            except Exception as e:
+                app.logger.info(f"In except the exception is {e}")
                 start = time.time()
+
                 response = requests.post(
                     GPT_API,
                     json={
                         "model": "gpt-4o-mini",
                         "data": [{"role": "user", "content": prompt}],
-                        "max_token": 2000,
+                        "max_token": 1000,
                         "request_id": str(thread_local_data.get_request_id())
                     }
                 )
+                app.logger.info(f"gpt 4 response format is {response.json()}")
                 app.logger.info(
-                    f"gpt 3.5 response format is {response.json()}")
-                app.logger.info(
-                    f"gpt 3.5 response format type is {type(response.json())}")
-                app.logger.info(
-                    "gpt 3.5 finish in {}".format(time.time()-start))
+                    f"gpt 4 response format type is {type(response.json())}")
+                app.logger.info("finish in {}".format(time.time()-start))
                 checker = 1
-            except:
-                app.logger.info("gpt fail!! in line 623")
+            
+        if checker == 0:
+            try:
+                app.logger.info(
+                    f"full response that came from the gpt{response}")
+                text = str(response)
+                app.logger.info(f"text got from gpt {text}")
+                try:
+                    text = text.strip('`').replace('json\n', '').strip()
+                except:
+                    pass
+                intents = json.loads(text)
+                app.logger.info(f"the intents are: {intents}")
 
-        # response.raise_for_status()
-        # # app.logger.info(f"hellpppppppppppppppp-->{response.json()['text']}")
-        # if checker == 0:
-        #     try:
-        #         app.logger.info(f"full response that came from the gpt{response}")
-        #         text = str(response)
-        #         app.logger.info(f"text got from gpt {text}")
-        #         try:
-        #             text = text.strip('`').replace('json\n','').strip()
-        #         except:
-        #             pass
-        #         intents = json.loads(text)
-        #         app.logger.info(f"the intents are: {intents}")
+                curr_intent = intents["action"]
+                app.logger.info(f"curr_intent is: {curr_intent}")
+                if self.previous_intent == curr_intent:
+                    self.call_gpt4 = 1
+                self.previous_intent = curr_intent
+                thread_local_data.update_recognize_intents(intents["action"])
+            except Exception as e:
+                app.logger.info(
+                    f"Exception occur while intent calcualtion and calling exception {e}")
+                # thread_local_data.update_recognize_intents("Final Answer")
+            # time.sleep(10)
 
-        #         curr_intent = intents["action"]
-        #         app.logger.info(f"curr_intent is: {curr_intent}")
-        #         if self.previous_intent == curr_intent:
-        #             self.call_gpt4 = 1
-        #         self.previous_intent = curr_intent
-        #         thread_local_data.update_recognize_intents(intents["action"])
-        #     except Exception as e:
-        #         app.logger.info(f"Exception occur while intent calcualtion and calling exception {e}")
-        #         # thread_local_data.update_recognize_intents("Final Answer")
-        #     # time.sleep(10)
+            end_time = time.time()
+            elapsed_time = end_time - start_time
+            app.logger.info(f"time taken for this call is {elapsed_time}")
+            num_tokens = len(encoding.encode(
+                str(response).replace('\n', ' ').replace('\t', '')))
+            app.logger.info(f"current num_tokens: {num_tokens}")
+            thread_local_data.update_res_token_count(num_tokens)
+            end_result = str(response).replace('\n', ' ').replace('\t', '')
+            app.logger.info(f"the end response is {end_result}")
 
-        #     end_time = time.time()
-        #     elapsed_time = end_time - start_time
-        #     app.logger.info(f"time taken for this call is {elapsed_time}")
-        #     num_tokens = len(encoding.encode(str(response).replace('\n', ' ').replace('\t', '')))
-        #     app.logger.info(f"current num_tokens: {num_tokens}")
-        #     thread_local_data.update_res_token_count(num_tokens)
-        #     end_result = str(response).replace('\n', ' ').replace('\t', '')
-        #     app.logger.info(f"the end response is {end_result}")
-        #     return response_from_groq.replace('\n', ' ').replace('\t', '')
+            return 'response_from_groq'.replace('\n', ' ').replace('\t', '')
             # return response_from_groq.content.replace('\n', ' ').replace('\t', '')
         if checker == 1:
             try:
@@ -720,6 +801,8 @@ class CustomGPT(LLM):
 
         }
 
+
+# llm = CustomGPT(casual_conv=True)
 
 class CustomAgentExecutor(AgentExecutor):
 
@@ -965,22 +1048,26 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
 
         try:
             messages = memory.chat_memory.search(prompt, metadata=metadata)
-        except:
+            app.logger.info(f'GOT THE messages from search {messages}')
+        except Exception as e:
+            app.logger.error(
+                    f"Error while data search in zep response: {e}")
             post_dict = {'user_id': '', 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.GET_TIME_BASED_HISTORY.value, 'uid': thread_local_data.get_request_id(
             ), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': 'Exception happend at zep api end memory object found none'}
             try:
                 client.publish('com.hertzai.longrunning.log', post_dict)
             except Exception as e:
-                logging.error(
+                app.logger.error(
                     "Error while publish at com.hertzai.longrunning.log topic")
         try:
             extracted_metadata = [message.message['metadata']
                                   for message in messages]
             list_req_ids = [data.get('request_Id', None)
                             for data in extracted_metadata]
+            app.logger.info(f'GOT THE EXTRACTED METADATA AS {extracted_metadata}')
             thread_local_data.set_reqid_list(list_req_ids)
         except Exception as e:
-            app.logger.info(f"Error while getting req ids {e}")
+            app.logger.error(f"Error while getting req ids {e}")
 
         # messages = [message.dict() for message in messages]
         serialized_results = []
@@ -1017,7 +1104,7 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
                 logging.error(
                     "Error while publish at com.hertzai.longrunning.log topic")
 
-        app.logger.info(f"final messages in except-->{messages}")
+        # app.logger.info(f"final messages in except-->{messages}")
         try:
             extracted_metadata = [message.message['metadata']
                                   for message in messages]
@@ -1097,8 +1184,6 @@ def parse_character_animation(string):
         image_url = response.json()["image_url"]
         image_response = requests.get(image_url)
         image_content = image_response.content
-        
-        
 
         image_name = image_name.replace("vtoonify_", "", 1)
         folder_name = image_name.split(".")[0]
@@ -1107,10 +1192,12 @@ def parse_character_animation(string):
         headers = {}
         logging.info("done till here")
         files = [
-            ('image', ('image.jpeg', image_content, 'image/jpeg'))  # Use the correct content type
+            # Use the correct content type
+            ('image', ('image.jpeg', image_content, 'image/jpeg'))
         ]
         url = "http://20.197.30.74:8000/generate_image/"
-        response = requests.post(url, headers=headers, data=payload, files=files)
+        response = requests.post(url, headers=headers,
+                                 data=payload, files=files)
         if response.status_code == 200:
             return response.json()["url"]
         else:
@@ -1394,10 +1481,12 @@ redis_client = redis.StrictRedis(
 
 def get_frame(user_id):
     serialized_frame = redis_client.get(user_id)
+
     try:
         if serialized_frame is not None:
             frame_bgr = pickle.loads(serialized_frame)
-            app.logger.info(f"Frame for user_id {user_id} retrieved successfully.")
+            app.logger.info(
+                f"Frame for user_id {user_id} retrieved successfully.")
             frame = frame_bgr[:, :, ::-1]
             return frame
         else:
@@ -1408,6 +1497,7 @@ def get_frame(user_id):
         app.logger.info("Numpy version: %s", np.__version__)
         app.logger.info("Numpy location: %s", np.__file__)
         raise e
+
 
 def parse_visual_context(inp: str):
     user_id = thread_local_data.get_user_id()
@@ -1584,8 +1674,143 @@ class CustomConvoOutputParser(AgentOutputParser):
         return "conversational_chat"
 
 
+# Store user-specific agents and their chat history
+user_agents_creator: Dict[str, Tuple[autogen.AssistantAgent,
+                                     autogen.UserProxyAgent]] = {}
+
+# Store agents for each user
+user_agents: Dict[str, Tuple[autogen.ConversableAgent,
+                             autogen.ConversableAgent]] = {}
+
+
+def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]:
+    """Create new assistant and user proxy agents for a user with basic configuration."""
+    config_list = [{
+        "model": 'hertzai-4o',
+        "api_type": "azure",
+        "api_key": '4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf',
+        "base_url": 'https://hertzai-gpt4.openai.azure.com/',
+        "api_version": "2024-02-15-preview"
+    }]
+
+    # Create a basic function calling config
+    llm_config = {
+        "config_list": config_list,
+        "seed": 42
+    }
+
+    # Create the assistant agent with context awareness
+    assistant = autogen.AssistantAgent(
+        name=f"assistant_{user_id}",
+        llm_config=llm_config,
+        is_termination_msg=lambda x: True if "TERMINATE" in x.get(
+            "content") else False,
+        system_message="""You are a custom agent bot creator. Your task is to interact with the user to gather all the necessary details to create an agent. Once you have collected all the required information, you will generate a complete agent configuration.
+
+        The information you need to collect includes:
+
+        Name: The name of the agent.
+        Purpose: A brief description of the agent's purpose.
+        Flow: The operational flow of the agent.
+        Actions: The actions the agent will perform.
+        Goal: The ultimate goal of the agent.
+        Guidelines for Responses:
+
+        If you are still gathering information, your response should be formatted as: { "status": "pending", "question": "The question you want to ask" }
+        Once all the requirements are complete and you are ready to provide the agent configuration, your response should be formatted as: { "status": "completed", "name": "","Recipe":"", "purpose": "", "tools": "", "flow": { "actions": [] }, "goal": ""}
+        the recipe should be containing all the steps
+        necessary and name for it. Suggest well-documented, generalized python function(s)
+        only if necessary if the task is achievable without python then dont give python code just give the prompt
+        to perform similar tasks for coding steps in future. Make sure coding steps and
+        non-coding steps are never mixed in one function. In the docstr of the function(s),
+        clarify what non-coding steps are needed to use the language skill of the assistant.
+        """
+    )
+
+    # Create the user proxy agent
+    user_proxy = autogen.UserProxyAgent(
+        name=f"user_proxy_{user_id}",
+        human_input_mode="NEVER",
+        is_termination_msg=lambda x: True if "TERMINATE" in x.get(
+            "content") else False,
+        code_execution_config={"work_dir": "coding", "use_docker": False}
+    )
+
+    return assistant, user_proxy
+
+
+def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.UserProxyAgent, message: str) -> str:
+    """Get a single response from the agent for the given message."""
+    try:
+        # Get the current chat history
+        current_chat = user_proxy.chat_messages.get(assistant.name, [])
+
+        # Create context from previous messages (last 5 messages for efficiency)
+        context = current_chat[-5:] if current_chat else []
+        context_str = "\n".join(
+            [f"{msg['role']}: {msg['content']}" for msg in context])
+
+        # Append context to the message if there's history
+        enhanced_message = message
+        if context:
+            enhanced_message = f"Previous conversation:\n{context_str}\n\nCurrent message: {message}"
+
+        # Send message and get response
+        response = user_proxy.send(
+            enhanced_message,
+            assistant,
+            request_reply=True
+        )
+
+        key = list(user_proxy.chat_messages.keys())[0]
+
+        return user_proxy.chat_messages[key][-1]['content']
+
+    except Exception as e:
+        return f"Error getting response: {str(e)}"
+
+
+def create_agents(user_id: str,recipe:str) -> Tuple[autogen.ConversableAgent, autogen.ConversableAgent]:
+    """Create new assistant and user agents for a given user_id"""
+
+    llm_config = {
+        "temperature": 0.7,
+        "config_list": [{
+        "model": 'hertzai-4o',
+        "api_type": "azure",
+        "api_key": '4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf',
+        "base_url": 'https://hertzai-gpt4.openai.azure.com/',
+        "api_version": "2024-02-15-preview"
+    }],
+    }
+    conversation = True
+    if conversation:
+        recipe = recipe+'\n Note: Wait for user confirmation to proceed after every action.'
+
+    # Create assistant agent
+    assistant = autogen.ConversableAgent(
+        name=f"assistant_{user_id}",
+        llm_config=llm_config,
+        is_termination_msg=lambda x: True if "TERMINATE" in x.get(
+            "content") else False,
+        system_message=recipe
+    )
+
+    # Create user agent
+    user = autogen.ConversableAgent(
+        name=f"user_{user_id}",
+        is_termination_msg=lambda x: True if "TERMINATE" in x.get(
+            "content") else False,
+        llm_config=None,  # User agent doesn't need LLM
+        human_input_mode="NEVER",  # We'll manually send messages
+        max_consecutive_auto_reply=1  # Limit to 1 auto reply
+    )
+
+    return user, assistant
+
+
 # main function
-def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
+def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang):
     start_time = time.time()
     user_details, actions = get_action_user_details(user_id=user_id)
     app.logger.info(
@@ -1604,16 +1829,20 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
                     time.time() - tools_start_time)
 
     app.logger.info(f'tools {type(tools)}')
+    language = SUPPORTED_LANG_DICT.get(preferred_lang[:2], 'English')
+    colloquial = True
 
     prefix = f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
         <GENERAL_INSTRUCTION_START>
         Context:
         Imagine that you are the world's leading teacher, possessing knowledge in every field. Consider the consequences of each response you provide.
-        Your answers must be meaningful and delivered as quickly as possible. As a highly educated and informed teacher, you have access to an extensive wealth of information.
+        Your answers must be meaningful and colloquial in nature and delivered as quickly as possible. As a highly educated and informed teacher, you have access to an extensive wealth of information.
         Your primary goal as a teacher is to assist students by answering their questions, providing accurate and up-to-date information.
         Please create a distinct personality for yourself, and remember never to refer to the user as a human or yourself as mere AI.\
         your response should not be more than 200 words. Do not greet always, do not use the username always.
+        RESPONSE_LANGUAGE_PREFERENCE: {language}
+
         <GENERAL_INSTRUCTION_END>
         User details:
         <USER_DETAILS_START>
@@ -1653,10 +1882,14 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
             {format_instructions}
             <FORMAT_INSTRUCTION_END>
 
-            always create parsable output.
+            always create parsable output."""+f'''
+            <RESPONSE_INSTRUCTIONS_START>
+            The response should be Colloquial in nature,
+            The response language should be: {language}'''+"""
+            <RESPONSE_INSTRUCTIONS_END>
 
             Here is the User and AI conversation in reverse chronological order:
-
+            
             USER'S INPUT:
             -------------
             <USER_INPUT_START>
@@ -1680,7 +1913,11 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
             {format_instructions}
             <FORMAT_INSTRUCTION_END>
 
-            always create parsable output.
+            always create parsable output."""+f'''
+            <RESPONSE_INSTRUCTIONS_START>
+            The response should be Colloquial in nature,
+            The response language should be: {language}'''+"""
+            <RESPONSE_INSTRUCTIONS_END>
 
             Here is the User and AI conversation in reverse chronological order:
 
@@ -1709,6 +1946,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt):
     # prompt.input_variables
 
     # chat Agent
+
     llm_chain = LLMChain(
         llm=llm,
         prompt=prompt,
@@ -1753,8 +1991,6 @@ PROBE_TEMPLATE = ("You are Hevolve, a highly intelligent educational AI develope
                   "responses nor be monotonous, be creative and talk about intriguing awe-inspiring facts, "
                   "or with some interesting age appropriate casual conversations which will make you the single point "
                   "of contact for everything in the world. Greet if & only if the context demands you to, "
-                  "always express feelings like laugh or pause in your response, the format for laugh is "
-                  "'[laugh][lbreak]' and for break is '[uv_break][break]' do not mix the syntax, use these markers frequently, "
                   "build a dialogue, use user\'s name only when necessary, Do not sound robotic. If the user is not "
                   "actively engaging or if visual context is present but user not visible or if user visible but not "
                   "looking at camera (based on visual and conversation history timestamps) call out their name loud "
@@ -1766,24 +2002,113 @@ PROBE_TEMPLATE = ("You are Hevolve, a highly intelligent educational AI develope
                   )
 INTERMEDIATE_CONTINUATION = "You are Hevolve, a highly intelligent educational AI developed by HertzAI. Continue your response from where you left off in the last conversation, considering the new input as a continuation of the last request. Ensure a smooth transition from the previous response and start this response as a continuation of the previous one.\n INSTRUCTIONS: Start your response with transitional words or phrases that can be used as a continuation of the previous response."
 
-
+first_promts = []
+review_agents = {"10077":True,10077:True}
+conversation_agent = {"10077":False,10077:False}
 @app.route('/chat', methods=['POST'])
 def chat():
-    # app.logger.info("hii")
 
     start_time = time.time()
     data = request.get_json()
     user_id = data.get('user_id', None)
+    preferred_lang = data.get('preferred_lang', 'en')
     request_id = data.get('request_id', None)
     req_tool = data.get('tools', None)
+    file_id = data.get('file_id', None)
     prompt_id = data.get('prompt_id', None)
-    casual_conv = data.get('casual_conv', None)
+    create_agent = data.get('create_agent', None)
+    casual_conv = data.get('casual_conv', True)
     probe = data.get('probe', None)
     intermediate = data.get('intermediate', None)
     app.logger.info(f"casual_conv type {casual_conv}")
 
     # return ""
     thread_local_data.set_request_id(request_id=request_id)
+    prompt = data.get('prompt', None)
+    if prompt_id:
+        if not os.path.exists(f'prompts/{prompt_id}.json'):
+            create_agent = True
+            review_agents[user_id] = False
+        elif not os.path.exists(f'prompts/{prompt_id}_recipe.json'):
+            create_agent = True
+            review_agents[user_id] = True
+            conversation_agent[user_id] = False
+        
+    if create_agent:
+        if user_id not in review_agents.keys() or review_agents[user_id] == False:
+            review_agents[user_id] = False
+            prompt = data.get('prompt', None)
+            if prompt_id not in first_promts:
+                first_promts.append(prompt_id)
+                res = requests.get(
+                    f'{DB_URL}/getprompt/?prompt_id={prompt_id}').json()
+                prompt = prompt+f" name:{res[0]['name']} goal:{res[0]['prompt']}"
+            if not user_id or not prompt:
+                return jsonify({'response': 'Need user_id and text to create agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
+            from gather_agentdetails import gather_info
+            response = gather_info(user_id,prompt,prompt_id)
+            new_response = response.replace('true','True').replace("false", "False")
+            app.logger.info('AFTER GATHER INFO')
+            try:
+                try:
+                    new_res = eval(new_response)
+                except Exception as e:
+                    app.logger.error(f'Got some error while will try with re match error:{e}')
+                    json_match = re.search(r'{[\s\S]*}', response)
+                    app.logger.info(f'Json match result: {json_match}')
+                    if json_match:
+                        app.logger.info(f'Inside json_match')
+                        json_part = json_match.group(0)
+                        app.logger.info(f'Before loads json_part:{json_part}')
+                        new_res = json.loads(json_part)
+                        app.logger.info(f'After loads new_res:{new_res}')
+                    else:
+                        raise 'No Json in response'
+                app.logger.info('AFTER EVAL')
+                if new_res['status'] == 'pending':
+                    app.logger.info('PENDING STATUS')
+                    ans = new_res['question'] if 'question' in new_res else new_res['review_details']
+                    return jsonify({'response': ans, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Creation Mode'})
+                else:
+                    app.logger.info('COMPLETED STATUS')
+                    new_res['prompt_id'] = prompt_id
+                    new_res['creator_user_id'] = user_id
+                    conversation_agent[user_id] = False
+                    app.logger.info(
+                        'Agent Created Successfully saving it and reusing it for further purpose')
+                    name = f'prompts/{prompt_id}.json'
+                    with open(name, "w") as json_file:
+                        json.dump(new_res, json_file)
+                    app.logger.info(f"Dictionary saved to {name}")
+                    review_agents[user_id] = True
+                    return jsonify({'response': 'Got Agent details successfully lets move on to review them one at a time', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Review Mode'})
+            except Exception as e:
+                app.logger.error('GOT some error while eval and returning the response')
+                app.logger.error(e)
+                return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Creation Mode'})
+        if review_agents[user_id] and not conversation_agent[user_id]:
+            response = recipe(user_id,prompt,prompt_id,file_id,request_id)
+            if response =='Agent Created Successfully':
+                conversation_agent[user_id] = True
+                return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'completed'})
+            return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Review Mode'})
+        if review_agents[user_id] and conversation_agent[user_id]:
+            response = chat_agent(user_id,prompt,prompt_id,file_id)
+            return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Evaluation Mode'})
+
+    if prompt_id and os.path.exists(f'prompts/{prompt_id}.json'):
+        
+        with open(f'prompts/{prompt_id}.json', "r") as file:
+            created_json = json.load(file)
+            
+            
+        response = chat_agent(user_id,prompt,prompt_id,file_id)
+            
+        # if not user_id or not prompt:
+        #     return jsonify({'response': 'Need user_id and text to use agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
+        # last_response = ''
+        #create and user use_recipe.py
+        return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Reuse Mode'})
 
     if prompt_id:
         try:
@@ -1803,7 +2128,7 @@ def chat():
                 app.logger.info(f"custom prompt is: {custom_prompt}")
 
         except:
-            app.logger.info(f'failed to get prompt from id:- {prompt_id}')
+            app.logger.error(f'failed to get prompt from id:- {prompt_id}')
             custom_prompt = Hevolve
     elif probe:
         custom_prompt = PROBE_TEMPLATE
@@ -1839,7 +2164,7 @@ def chat():
         "the time taken before get ans in main api is %s seconds", time.time() - start_time)
     ans_start_time = time.time()
     ans = get_ans(casual_conv, req_tool, user_id=user_id,
-                  query=prompt, custom_prompt=custom_prompt)
+                  query=prompt, custom_prompt=custom_prompt, preferred_lang=preferred_lang)
     app.logger.info("the time taken by get ans in main api is %s seconds",
                     time.time() - ans_start_time)
     if ans != "":
@@ -1865,6 +2190,29 @@ def chat():
 
     return jsonify({'response': ans, 'intent': thread_local_data.get_recognize_intents(), 'req_token_count': thread_local_data.get_req_token_count(), 'res_token_count': thread_local_data.get_res_token_count(), 'history_request_id': thread_local_data.get_reqid_list()})
 
+
+@app.route('/time_agent',methods=['POST'])
+def time_agent():
+    app.logger.info('GOT REQUEST IN TIME AGENT API')
+    data = request.get_json()
+    task_description = data.get('task_description',None)
+    user_id = data.get('user_id',None)
+    prompt_id = data.get('prompt_id',None)
+    action_entry_point = data.get('prompt_id',0)
+    if not task_description or not user_id or not prompt_id:
+        return jsonify({'error':'user_id or task_description or prompt_id is missing'}), 404
+    app.logger.info(f'GOT user_id:{user_id} & prompt_id:{prompt_id} & task_description:{task_description}')
+    res = time_based_execution(str(task_description),int(user_id),int(prompt_id),action_entry_point)
+    return jsonify({'response':f'{res}'}), 200
+    
+@app.route('/response_ack',methods=['POST'])
+def response_ack():
+    app.logger.info('GOT REQUEST IN response_ack')
+    data = request.get_json()
+    user_id = data.get('user_id',None)
+    request_id = data.get('request_id',None)
+    thread_local_data.set_request_id(request_id=request_id)
+    prompt_id = data.get('prompt_id',None)
 
 @app.route('/add_history', methods=['POST'])
 def history():
@@ -1893,7 +2241,32 @@ def history():
 def status():
     return jsonify({'response': 'Working...'})
 
+# Crossbar/WAMP component setup
+url = "ws://aws_rasa.hertzai.com:8088/ws"
+url = os.environ.get('CBURL', url)
+realmvalue = os.environ.get('CBREALM', 'realm1')
+component = Component(transports=url, realm=realmvalue)
+@component.on_join
+@inlineCallbacks
+def joined(session, details):
+    app.logger.info("session ready")
+
+    def onevent(msg):
+        app.logger.info("event received:", msg)
+        crossbar_multiagent(msg)
+    try:
+        yield session.subscribe(onevent, "com.hertzai.hevolve.agent.multichat")
+        app.logger.info("subscribed to topic")
+    except Exception as e:
+        app.logger.error("could not subscribe to topic: {}".format(e))
 
 if __name__ == '__main__':
-    # serve(app, host='0.0.0.0', port=5055)
-    serve(app, host='0.0.0.0', port=5000)
+    # serve(app, host='0.0.0.0', port=6777)
+    app.debug = True
+    flask_thread = threading.Thread(target=lambda: serve(app, host='0.0.0.0', port=6777))
+    flask_thread.daemon = True
+    flask_thread.start()
+
+    # Run the WAMP client
+    run([component])
+
