@@ -70,10 +70,8 @@ load_dotenv()
 #autogen requirements
 
 from create_recipe import recipe
-from reuse_recipe import chat_agent, crossbar_multiagent
-from autobahn.twisted.wamp import Application
+from reuse_recipe import chat_agent, crossbar_multiagent, time_based_execution
 from autobahn.twisted.component import Component, run
-from twisted.internet import reactor
 from twisted.internet.defer import inlineCallbacks
 import threading
 
@@ -1690,7 +1688,7 @@ def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autoge
     config_list = [{
         "model": 'hertzai-4o',
         "api_type": "azure",
-        "api_key": '8f3cd49e1c3346128ba77d09ee9c824c',
+        "api_key": '4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf',
         "base_url": 'https://hertzai-gpt4.openai.azure.com/',
         "api_version": "2024-02-15-preview"
     }]
@@ -1780,7 +1778,7 @@ def create_agents(user_id: str,recipe:str) -> Tuple[autogen.ConversableAgent, au
         "config_list": [{
         "model": 'hertzai-4o',
         "api_type": "azure",
-        "api_key": '8f3cd49e1c3346128ba77d09ee9c824c',
+        "api_key": '4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf',
         "base_url": 'https://hertzai-gpt4.openai.azure.com/',
         "api_version": "2024-02-15-preview"
     }],
@@ -2027,6 +2025,15 @@ def chat():
     # return ""
     thread_local_data.set_request_id(request_id=request_id)
     prompt = data.get('prompt', None)
+    if prompt_id:
+        if not os.path.exists(f'prompts/{prompt_id}.json'):
+            create_agent = True
+            review_agents[user_id] = False
+        elif not os.path.exists(f'prompts/{prompt_id}_recipe.json'):
+            create_agent = True
+            review_agents[user_id] = True
+            conversation_agent[user_id] = False
+        
     if create_agent:
         if user_id not in review_agents.keys() or review_agents[user_id] == False:
             review_agents[user_id] = False
@@ -2039,7 +2046,7 @@ def chat():
             if not user_id or not prompt:
                 return jsonify({'response': 'Need user_id and text to create agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
             from gather_agentdetails import gather_info
-            response = gather_info(user_id,prompt)
+            response = gather_info(user_id,prompt,prompt_id)
             new_response = response.replace('true','True').replace("false", "False")
             app.logger.info('AFTER GATHER INFO')
             try:
@@ -2061,7 +2068,7 @@ def chat():
                 if new_res['status'] == 'pending':
                     app.logger.info('PENDING STATUS')
                     ans = new_res['question'] if 'question' in new_res else new_res['review_details']
-                    return jsonify({'response': ans, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
+                    return jsonify({'response': ans, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Creation Mode'})
                 else:
                     app.logger.info('COMPLETED STATUS')
                     new_res['prompt_id'] = prompt_id
@@ -2074,19 +2081,20 @@ def chat():
                         json.dump(new_res, json_file)
                     app.logger.info(f"Dictionary saved to {name}")
                     review_agents[user_id] = True
-                    # return jsonify({'response': 'Review Agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
+                    return jsonify({'response': 'Got Agent details successfully lets move on to review them one at a time', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Review Mode'})
             except Exception as e:
                 app.logger.error('GOT some error while eval and returning the response')
                 app.logger.error(e)
-                return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
+                return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Creation Mode'})
         if review_agents[user_id] and not conversation_agent[user_id]:
-            response = recipe(user_id,prompt,prompt_id,file_id)
+            response = recipe(user_id,prompt,prompt_id,file_id,request_id)
             if response =='Agent Created Successfully':
                 conversation_agent[user_id] = True
-            return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
+                return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'completed'})
+            return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Review Mode'})
         if review_agents[user_id] and conversation_agent[user_id]:
             response = chat_agent(user_id,prompt,prompt_id,file_id)
-            return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
+            return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Evaluation Mode'})
 
     if prompt_id and os.path.exists(f'prompts/{prompt_id}.json'):
         
@@ -2100,7 +2108,7 @@ def chat():
         #     return jsonify({'response': 'Need user_id and text to use agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
         # last_response = ''
         #create and user use_recipe.py
-        return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
+        return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Reuse Mode'})
 
     if prompt_id:
         try:
@@ -2183,6 +2191,29 @@ def chat():
     return jsonify({'response': ans, 'intent': thread_local_data.get_recognize_intents(), 'req_token_count': thread_local_data.get_req_token_count(), 'res_token_count': thread_local_data.get_res_token_count(), 'history_request_id': thread_local_data.get_reqid_list()})
 
 
+@app.route('/time_agent',methods=['POST'])
+def time_agent():
+    app.logger.info('GOT REQUEST IN TIME AGENT API')
+    data = request.get_json()
+    task_description = data.get('task_description',None)
+    user_id = data.get('user_id',None)
+    prompt_id = data.get('prompt_id',None)
+    action_entry_point = data.get('prompt_id',0)
+    if not task_description or not user_id or not prompt_id:
+        return jsonify({'error':'user_id or task_description or prompt_id is missing'}), 404
+    app.logger.info(f'GOT user_id:{user_id} & prompt_id:{prompt_id} & task_description:{task_description}')
+    res = time_based_execution(str(task_description),int(user_id),int(prompt_id),action_entry_point)
+    return jsonify({'response':f'{res}'}), 200
+    
+@app.route('/response_ack',methods=['POST'])
+def response_ack():
+    app.logger.info('GOT REQUEST IN response_ack')
+    data = request.get_json()
+    user_id = data.get('user_id',None)
+    request_id = data.get('request_id',None)
+    thread_local_data.set_request_id(request_id=request_id)
+    prompt_id = data.get('prompt_id',None)
+
 @app.route('/add_history', methods=['POST'])
 def history():
     data = request.get_json()
@@ -2231,6 +2262,7 @@ def joined(session, details):
 
 if __name__ == '__main__':
     # serve(app, host='0.0.0.0', port=6777)
+    app.debug = True
     flask_thread = threading.Thread(target=lambda: serve(app, host='0.0.0.0', port=6777))
     flask_thread.daemon = True
     flask_thread.start()

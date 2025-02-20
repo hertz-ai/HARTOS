@@ -1,50 +1,32 @@
 {
-  "10077_89": [
+  "status": "completed",
+  "name": "Story Narrator Agent",
+  "broadcast_agent": false,
+  "personas": [
     {
-      "agentInstanceID": "com.hertzai.hevolve.chat.89.10077",
-      "user_id": 10077,
-      "role": "Parent",
-      "deviceID": "somestring"
+      "name": "Creator",
+      "description": "Creates stories"
     },
     {
-      "agentInstanceID": "com.hertzai.hevolve.chat.89.10077",
-      "user_id": 10077,
-      "role": "user",
-      "deviceID": "somenewsting" //if user is same and device id and user role is different then only create this entry
-    },
-    {
-      "agentInstanceID": "com.hertzai.hevolve.chat.89.10077",
-      "user_id": 10077,
-      "role": "Parent",
-      "deviceID": "1somestring" // if user and role are same but device id is unique crete new record
+      "name": "User",
+      "description": "Consumes stories"
     }
   ],
-  "10086_80": [
+  "flows": [
     {
-      "agentInstanceID": "com.hertzai.hevolve.chat.80.1078687",
-      "user_id": 1078687,
-      "role": "Parent",
-      "deviceID": "somestring"
-    },
-    {
-      "agentInstanceID": "com.hertzai.hevolve.chat.80.10086",
-      "user_id": 10086,
-      "role": "user",
-      "deviceID": "somenewsting" //if user is same and device id and user role is different then only create this entry
+      "flow_name": "Story Creation and Narration",
+      "actions": [
+        "Create a 100-word story with multiple characters in the following format: (character1 name) dialogue of character1... (character2 name) dialogue of character2, (narrator) like an audiobook, and save it.",
+        "Retrieve avatar IDs using the API: https://mailer.hertzai.com/all_teacher_only_avatars_id_user_id?user_id={user_id} and associate each character with a unique avatar ID from the response, saving that info as well.",
+        "Generate realistic video for one character's dialogue at a time using the associated avatar ID,",
+        "hit this API: https://mailer.hertzai.com/get-video-conv_id/{conv_id} to check the video status. If it's null, retry after 5 minutes and Inform the creator.",
+        "Perform above steps every hour to create a new story.",
+        "For the User, check if any story is available in memory. If yes, give one character's dialogue at a time using conv_id with a 10-second interval between successive dialogue sent to user till the story ends once story ends check for new story and repeat the process. If not, share a joke and ask them to try again later."
+      ],
+      "sub_goal": "Create and narrate stories, delivering engaging content to users."
     }
   ],
-  "10725_80": [
-    {
-      "agentInstanceID": "com.hertzai.hevolve.chat.80.10725",
-      "user_id": 10725,
-      "role": "user",
-      "deviceID": "somenewsting" //if user is same and device id and user role is different then only create this entry
-    },
-    {
-      "agentInstanceID": "com.hertzai.hevolve.chat.80.10086",
-      "user_id": 10086,
-      "role": "Parent",
-      "deviceID": "somestring"
-    }
-  ]
+  "goal": "I am a Story Narrator Agent",
+  "prompt_id": 65,
+  "creator_user_id": 10086
 }
