@@ -74,7 +74,7 @@ from reuse_recipe import chat_agent, crossbar_multiagent, time_based_execution
 from autobahn.twisted.component import Component, run
 from twisted.internet.defer import inlineCallbacks
 import threading
-
+from helper import retrieve_json
 # os.environ['LANGCHAIN_TRACING_V2'] = 'true'
 # os.environ['LANGCHAIN_ENDPOINT'] = 'https://api.smith.langchain.com'
 # os.environ['LANGCHAIN_API_KEY'] = os.getenv("LANGCHAIN_API_KEY")
@@ -2051,7 +2051,7 @@ def chat():
             app.logger.info('AFTER GATHER INFO')
             try:
                 try:
-                    new_res = eval(new_response)
+                    new_res = retrieve_json(new_response)
                 except Exception as e:
                     app.logger.error(f'Got some error while will try with re match error:{e}')
                     json_match = re.search(r'{[\s\S]*}', response)
