@@ -238,6 +238,10 @@ class ToolMessageHandler():
         # Make a copy to avoid modifying the original list
         processed_messages = messages.copy()
         
+        # Only process up to second-to-last message
+        if not messages or len(messages) < 2:
+            return messages
+        
         # current_app.logger.info(f'FIRST MESSAGE:-> {processed_messages[0]}')
         # Check if the first message has a role of 'tool'
         if processed_messages and processed_messages[0].get('role') == 'tool':
@@ -246,11 +250,8 @@ class ToolMessageHandler():
             processed_messages[0]['role'] = 'user'
             del processed_messages[0]['tool_responses']
         
-        # Only process up to second-to-last message
-        if not messages or len(messages) < 2:
-            return messages
         
-        for i in range(len(processed_messages) - 2):
+        for i in range(len(processed_messages) - 1):
             current_msg = processed_messages[i]
             next_msg = processed_messages[i + 1]
             
@@ -271,7 +272,7 @@ class ToolMessageHandler():
             # Case 3: Current message has tool_calls but next message isn't a tool
             elif current_msg.get('role') == 'tool' and next_msg.get('role') == 'tool':
                 # Fix next message to be a tool message
-                next_msg['role'] = 'user'
+                current_msg['role'] = 'user'
         
             
         return processed_messages

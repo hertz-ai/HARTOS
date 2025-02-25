@@ -1,0 +1,32 @@
+{
+    "status": "completed",
+    "name": "Story Narrator Agent",
+    "broadcast_agent": false,
+    "personas": [
+        {
+            "name": "Creator",
+            "description": "Responsible for creating stories."
+        },
+        {
+            "name": "User",
+            "description": "Will consume stories."
+        }
+    ],
+    "flows": [
+        {
+            "flow_name": "Stories Flow",
+            "actions": [
+                "Create a 100-word story with multiple characters in the format: (character1 name) dialogue of character1... (character2 name) dialogue of character2, (narrator) like an audiobook, and save it.",
+                "Retrieve avatar IDs using the API: https://mailer.hertzai.com/all_teacher_only_avatars_id_user_id?user_id={user_id} and associate each character with a unique avatar ID from the response, saving that info as well.",
+                "Generate realistic video for all dialogues at a time using the associated avatar ID.",
+                "Check the status of generated dialogue videos using the status api https://mailer.hertzai.com/get-video-conv_id/{{conv_id}} for all conv_ids which does not have staus as success, on response from api if successfully retrieved the mp4 url then update the internal memory to status success for corresponding conv_id and repeat this entire step or action every 1 minute.",
+                "Perform steps every hour to create a new story.",
+                "Check if any story is available in memory for which all the dialogue status is success, give dialoogues from the selected story with a 10-second interval for the user till the story is completed. once the previous story is completed give the next story using the same process described in this action."
+            ],
+            "sub_goal": "To narrate and deliver stories dynamically."
+        }
+    ],
+    "goal": "I am a Story Narrator Agent",
+    "prompt_id": 65,
+    "creator_user_id": 10086
+}

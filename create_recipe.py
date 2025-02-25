@@ -427,7 +427,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     assistant.register_for_execution(name="get_prompt_id")(get_prompt_id)
     
     def Generate_video(text: Annotated[str, "Text to be used for video generation"],
-                       avatar_id: Annotated[str, "Unique identifier for the avatar"],
+                       avatar_id: Annotated[int, "Unique identifier for the avatar"],
                        realtime: Annotated[bool,"If True, response is fast but less realistic by default it should be true; if False, response is realistic but slower"]) -> str:
         print('INSIDE Generate_video')
         database_url = 'https://mailer.hertzai.com'
@@ -487,7 +487,6 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         try:
             video_link = requests.post("{}/video_generate_save".format(database_url),
                                         data=json.dumps(data), headers=headers, timeout=1)
-            #TODO handle crossbar mp4 videos by saving data to db from makeittalk
         except:
             pass
         if data['chattts'] or data['flag_hallo'] == "true":
@@ -728,7 +727,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             
         
             
-        if last_speaker.name == 'Executor' or last_speaker.name == 'UserProxy' or last_speaker.name == 'UserProxy' or last_speaker.name == 'ChatInstructor':
+        if last_speaker.name == 'Executor' or last_speaker.name == 'Helper' or last_speaker.name == 'UserProxy' or last_speaker.name == 'UserProxy' or last_speaker.name == 'ChatInstructor':
             
             group_chat.messages[-1]['content'] = f"{group_chat.messages[-1]['content']}\n Metadata/skeleton of all keys for retrieving data from memory:{metadata}"
             current_app.logger.info('Got last speaker as executor or helper or author or chat_instructor & reutrning next speaker as assistant')
