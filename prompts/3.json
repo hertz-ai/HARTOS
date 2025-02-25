@@ -1,0 +1,48 @@
+{
+    "status": "done",
+    "action": "Generate realistic video for one character's dialogue at a time using the associated avatar ID",
+    "fallback_action": "If generating a realistic video for one character's dialogue using the associated avatar ID fails in the future, inform the creator.",
+    "persona": "Creator",
+    "action_id": 3,
+    "recipe": [
+        {
+            "steps": "Retrieve the stored character data and dialogue from memory.",
+            "tool_name": "get_data_by_key",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Initiate the video generation for all the retrieved dialogues using the associated avatar ID.",
+            "tool_name": "Generate_video",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Save the generated conversation ID and dialogue into memory for future reference.",
+            "tool_name": "save_data_in_memory",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [],
+    "metadata": {
+        "user_id": "redacted <class 'int'>",
+        "creator": {
+            "stories": {
+                "100_word_story": "redacted <class 'str'>",
+                "mia_video": "redacted <class 'str'>",
+                "jake_video": "redacted <class 'str'>"
+            },
+            "characters": {
+                "Mia": "redacted <class 'str'>",
+                "Jake": "redacted <class 'str'>",
+                "Narrator": "redacted <class 'str'>",
+                "Mia_data": "redacted <class 'str'>"
+            }
+        },
+        "saved_story": "redacted <class 'str'>",
+        "john_video": "redacted <class 'str'>"
+    },
+    "time_took_to_complete": 90.88840293884277,
+    "actions_this_action_depends_on": [
+        2
+    ]
+}

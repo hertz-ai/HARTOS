@@ -2093,7 +2093,7 @@ def chat():
                 return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'completed'})
             return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Review Mode'})
         if review_agents[user_id] and conversation_agent[user_id]:
-            response = chat_agent(user_id,prompt,prompt_id,file_id)
+            response = chat_agent(user_id,prompt,prompt_id,file_id,request_id)
             return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Evaluation Mode'})
 
     if prompt_id and os.path.exists(f'prompts/{prompt_id}.json'):
@@ -2102,7 +2102,7 @@ def chat():
             created_json = json.load(file)
             
             
-        response = chat_agent(user_id,prompt,prompt_id,file_id)
+        response = chat_agent(user_id,prompt,prompt_id,file_id,request_id)
             
         # if not user_id or not prompt:
         #     return jsonify({'response': 'Need user_id and text to use agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})

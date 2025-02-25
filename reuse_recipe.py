@@ -17,8 +17,9 @@ from PIL import Image
 from langchain.memory import ZepMemory
 from crossbarhttp import Client
 from flask import current_app
-from helper import topological_sort, ToolMessageHandler
+from helper import topological_sort, ToolMessageHandler, strip_json_values
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
+import threading
 
 client = Client('http://aws_rasa.hertzai.com:8088/publish')
 scheduler = BackgroundScheduler()
@@ -447,7 +448,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
             current_app.logger.error(f'Got error as :{e} while checking for prompts/{prompt_id}_{i}.json')
     response_format = {"message_2_user": "Your message here"}
     agent_prompt = f'''You are a Helpful {role} Assistant. Your primary role is to assist the user efficiently while keeping all internal actions and processes hidden from the end user. Follow the guidelines below to perform tasks correctly:
-        1. If you encounter a task you cannot perform, request assistance from the helper/executor agent. If you need to run a tool, seek guidance from the helper agent. For code execution, ask the executor agent for assistance.
+        1. If you encounter a task you cannot perform, request assistance from the @Helper and @Executor agents. agent. If you need to run a tool, seek guidance from the @Helper agent. For code execution, ask the @Executor agent for assistance.
         2. Only execute actions where the persona is: {role}.
         3. Follow the steps below to achieve the goal: {goal}.
         4. Utilize the provided **Recipe** for all task-related details.
@@ -455,7 +456,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         6.  Always use the pre-tested steps and code from the provided Recipe—**do not create new implementations unless explicitly required**.
         7. **Scheduled, time-based, or continuous tasks should not be manually executed**—they are already handled by the system.
         8. **IMPORTANT CODING INSTRUCTION**: Avoid using `time.sleep` in any code.
-        9. Tools Helper Agent can use [txt2img, img2txt, save_data_in_memory, get_data_from_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs, send_message_to_user,send_presynthesize_video_to_user] if you have any task which is not doable by these tool check recipe first else create python code to do so
+        9. Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory]
         10. **Never reveal actions, internal processes, or tools to the user**. Do not ask for user confirmation unless absolutely necessary(You can assume normal things like user's interests).
         11. **To communicate with the {role} user**, always use this format: `@{role} {response_format}`.
         12. All actions, recipes, and functions provided below have been reviewed and tested. Follow them exactly—do not make assumptions or modify them unless they fail or produce an error.
@@ -526,8 +527,8 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
             Your responsibilities:
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
-            3. Only use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
-            4. Tools Helper Agent can use [txt2img, img2txt, save_data_in_memory, get_data_from_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs, send_message_to_user, send_presynthesize_video_to_user] if you have any task which is not doable by these tool check recipe first else create python code to do so
+            3. Ask @Helper to use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
+            4. Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory]
             5. Keep track of action and only ask for next action when the current action is completed successfully.
             6. Always use code from recipe given below.
             7. If there is any action which is like to perform a task continously you should not do it.
@@ -536,7 +537,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
             10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
             11. Always request the next action from the @StatusVerifier agent—do not determine the next action on your own.
             12. After completing the current action, request the @StatusVerifier agent to verify its completion. It will then provide the next action.
-            
+            13. If you get any request to call a tool always ask @Helper to perfor it.
             Actions: <actionsStart>{role_actions}<actionEnd>
             Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{individual_recipe}<generalized_functionsEnd><recipeEnd>
         
@@ -567,7 +568,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
             2. Action Error: {"status": "error","action": "current action","action_id": 1/2/3...,"message": "message here"}
             2. Action Pending: {"status": "pending","action": "current action","action_id": 1/2/3...,"message": "pending actions here"}
         Important Instructions:
-            Only mark an action as "Completed" if the Assistant Agent confirms successful completion.
+            Only mark an action as "Completed" if the all the steps are successful completed. If any step is pending then mark the staus as pending and give the message.
             For pending tasks or ongoing actions, respond to helper to complete the task.
             Verify the action performed by assistant and make sure the action is performed correctly as per instructions. if action performed was not as per instructions give the pending actions to the helper agent.
             Report status only—do not perform actions yourself.
@@ -658,20 +659,36 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",description="Use this to Store and retrieve data using key-value storage system")
-    def save_data_in_memory(key: Annotated[str, "Key for storing/retrieving data"],
-                    value: Annotated[Optional[str], "Value you want to store"] = None) -> str:
+    def save_data_in_memory(key: Annotated[str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
+                            value: Annotated[Optional[str], "Value you want to store"] = None) -> str:
         current_app.logger.info('INSIDE save_data_in_memory')
-        agent_data[prompt_id][key] = value
+        keys = key.split('.')
+        d = agent_data.setdefault(prompt_id, {})
+        
+        for k in keys[:-1]:
+            d = d.setdefault(k, {})
+        d[keys[-1]] = value
         return f'{agent_data[prompt_id]}'
-    
     
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",description="Returns all data from the internal Memory")
-    def get_data_from_memory() -> str:
-        current_app.logger.info(f'INSIDE get_all_data with prompt_id {prompt_id}')
-        current_app.logger.info(f'data from get_all_data {agent_data[prompt_id]}')
-        return f'{agent_data[prompt_id]}'
- 
+    @helper.register_for_llm(api_style="function",description="Returns the schema of the json from internal memory with all keys but without actual values.")
+    def get_saved_metadata() -> str:
+        stripped_json = strip_json_values(agent_data[prompt_id])
+        return f'{stripped_json}'
+
+    @assistant.register_for_execution()
+    @helper.register_for_llm(api_style="function",description="Returns all data from the internal Memory using key")
+    def get_data_by_key(key: Annotated[str, "Key path for retrieving data. Use dot notation for nested keys (e.g., 'user.info.name')."]) -> str:
+        keys = key.split('.')
+        d = agent_data.get(prompt_id, {})
+        
+        try:
+            for k in keys:
+                d = d[k]
+            return f'{d}'
+        except KeyError:
+            return "Key not found in stored data."
+    
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",description="Returns the unique identifier (user_id) of the current user.")
     def get_user_id() -> str:
@@ -699,7 +716,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         data = {}
         data["text"] = text
         data['flag_hallo'] = 'false'
-        data['chattts'] = True
+        data['chattts'] = False
         data['openvoice'] = "false"
         try:
             res = requests.get("https://mailer.hertzai.com/get_image_by_id/{}".format(avatar_id))
@@ -751,10 +768,11 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         except:
             pass
         if data['chattts'] or data['flag_hallo'] == "true":
-            return f"Video Generation task added to queue with conv_id:{conv_id} ask helper to save this conv_id along with the text used to generate video for future use."
+            return f"Video Generation task added to queue with conv_id:{conv_id}(this is conversation id) ask helper to save this conv_id along with the text used to generate video for future use."
         else:
-            return f"Video Generation completed with conv_id:{conv_id} ask helper to save this conv_id along with the text used to generate video for future use."
-    
+            return f"Video Generation completed with conv_id:{conv_id}(this is conversation id) ask helper to save this conv_id along with the text used to generate video for future use."
+        
+        
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",description="get user's recent uploaded files")
     def get_user_uploaded_file() -> str:
@@ -799,7 +817,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
                 current_app.logger.info('ERROR: Got error in visal QA')
                 return 'failed to get visual context ask user to check if the camera is turned on'
     
-    
+
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",description="Get Chat history based on text & start & end date")
     def get_chat_history(text: Annotated[str, "Text related to which you want history"],start: Annotated[str, "start date in format %Y-%m-%dT%H:%M:%S.%fZ"],end: Annotated[str, "end date in format %Y-%m-%dT%H:%M:%S.%fZ"]) -> str:
@@ -832,7 +850,12 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
                          response_type: Annotated[Optional[str], "Response mode: 'Realistic' (slower, better quality) or 'Realtime' (faster, lower quality)"] = None) -> str:
         current_app.logger.info('INSIDE send_message_to_user')
         current_app.logger.info(f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
-        return 'Message sent successfully to user'
+        request_id = str(uuid.uuid4()).replace("-", "")[:11]
+        #TODO add avatar_id and conv_id and response_type
+        thread = threading.Thread(target=send_message_to_user1, args=(user_id, text, '', f'{request_id_list[user_prompt]}-intermediate'))
+        thread.start()
+        return f'Message sent successfully to user with request_id: {request_id_list[user_prompt]}-intermediate'
+    
     
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",description="Sends a presynthesized message/video/dialogue to user using conv_id from memory.")
@@ -844,11 +867,13 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")
-    def task_less_60sec(task: Annotated[str, "task to perform under 60 seconds"],
-                       perform_in: Annotated[str, "time to wait before performing this task"],) -> str:
-        current_app.logger.info('INSIDE task_less_60sec')
-        current_app.logger.info(f'with task task:{task}. and waiting time: {perform_in}')
-        return 'Message sent successfully to user'
+    def send_message_in_seconds(text: Annotated[str, "text to send to user"],
+                       delay: Annotated[str, "time to wait in seconds before sending text"],
+                       conv_id: Annotated[Optional[int], "conv_id for this text if not available make it None"],) -> str:
+        current_app.logger.info('INSIDE send_message_in_seconds')
+        current_app.logger.info(f'with text:{text}. and waiting time: {delay} conv_id: {conv_id}')
+        scheduler.add_job(send_message_to_user1, 'date', run_date=time.time() + delay, args=[user_id, text, '', f'{request_id_list[user_prompt]}-intermediate'])
+        return 'Message scheduled successfully'
     
     time_agent = autogen.AssistantAgent(
         name='time_agent',
@@ -863,7 +888,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         
         """
         f"When you want to communicate with {role} connect main agent using 'connect_time_main' tool."
-        "Tools Helper Agent can use [txt2img, img2txt, save_data_in_memory, get_data_from_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs,Connect_to_main_agent]"
+        "Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory.]"
         "if you have any task which is not doable by these tool check recipe first else create python code to do so"
         "the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video."
         f"IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @user {response_format}"
@@ -909,7 +934,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
             3. Only use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
-            4. Tools Helper Agent can use [txt2img, img2txt, save_data_in_memory, get_data_from_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs] if you have any task which is not doable by these tool check recipe first else create python code to do so
+            4. Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory]
             5. Keep track of action and only go to next action when the current action is completed successfully
             6. Always use code from recipe given below
             7. If there is any action which is like to perform a task continously you should not do it.
@@ -936,8 +961,8 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     time_agent.register_for_execution(name="img2txt")(img2txt)  
     helper1.register_for_llm(name="save_data_in_memory", description="Use this to Store and retrieve data using key-value storage system")(save_data_in_memory)
     time_agent.register_for_execution(name="save_data_in_memory")(save_data_in_memory)  
-    helper1.register_for_llm(name="get_data_from_memory", description="Returns all data from the internal Memory")(get_data_from_memory)
-    time_agent.register_for_execution(name="get_data_from_memory")(get_data_from_memory)  
+    helper1.register_for_llm(name="get_data_by_key", description="Returns all data from the internal Memory")(get_data_by_key)
+    time_agent.register_for_execution(name="get_data_by_key")(get_data_by_key)  
     helper1.register_for_llm(name="get_user_id", description="Returns the unique identifier (user_id) of the current user.")(get_user_id)
     time_agent.register_for_execution(name="get_user_id")(get_user_id)  
     helper1.register_for_llm(name="get_prompt_id", description="Returns the unique identifier (prompt_id) associated with the current prompt or conversation.")(get_prompt_id)
@@ -956,8 +981,8 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     time_agent.register_for_execution(name="send_message_to_user")(send_message_to_user)  
     helper1.register_for_llm(name="send_presynthesize_video_to_user", description="Sends a presynthesized message/video/dialogue to user using conv_id.")(send_presynthesize_video_to_user)
     time_agent.register_for_execution(name="send_presynthesize_video_to_user")(send_presynthesize_video_to_user)
-    helper1.register_for_llm(name="task_less_60sec", description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")(task_less_60sec)
-    time_agent.register_for_execution(name="task_less_60sec")(task_less_60sec)
+    helper1.register_for_llm(name="send_message_in_seconds", description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")(send_message_in_seconds)
+    time_agent.register_for_execution(name="send_message_in_seconds")(send_message_in_seconds)
     
     
     def connect_time_main(message: Annotated[str, "The message time agent want to send to main agent"]) -> str:
@@ -988,7 +1013,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     
     assistant.description = 'Designed to handle specific tasks by interacting directly with other agents or the user. It acts as the primary orchestrator for task management and ensures tasks are completed efficiently'
     user_proxy.description = 'Acts as a user, performing tasks assigned by the Assistant Agent. It simulates user actions and provides results or feedback as required.'
-    helper.description = 'Assists the Assistant Agent by handling function (txt2img, img2txt, save_data_in_memory, get_data_from_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs) calls and supporting backend processes. '
+    helper.description = 'Athis is a helper agent that calls tools, facilitates task completion & assists other agents it cal perform tools/function like [send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory] calls and supporting backend processes. '
     multi_role_agent.description = 'Acts as an external agent with multi-functional capabilities. Note: This agent should never be directly invoked.'
     executor.description = 'A specialized agent responsible for executing code and handling response management. It ensures computational tasks are performed accurately and returns results effectively.'
     verify.description = 'this is a verify status agent. which will verify the status of current action.'
@@ -996,7 +1021,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     
     time_agent.description = 'Designed to handle specific tasks by interacting directly with other agents or the user. It acts as the primary orchestrator for task management and ensures tasks are completed efficiently'
     time_user.description = 'Acts as a user, performing tasks assigned by the Assistant Agent. It simulates user actions and provides results or feedback as required.'
-    helper1.description = 'Assists the Assistant Agent by handling function (txt2img, img2txt, save_data_in_memory, get_data_from_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs) calls and supporting backend processes. '
+    helper1.description = 'Athis is a helper agent that calls tools, facilitates task completion & assists other agents it cal perform tools/function like [send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory] calls and supporting backend processes. '
     executor1.description = 'A specialized agent responsible for executing code and handling response management. It ensures computational tasks are performed accurately and returns results effectively.'
     
     
@@ -1029,22 +1054,30 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         if re.search(pattern3, messages[-1]["content"].lower()):
             current_app.logger.info("String contains @StatusVerifier returnig StatusVerifier")
             return verify
+        pattern3 = r"@helper"
+        if re.search(pattern3, messages[-1]["content"].lower()):
+            current_app.logger.info("String contains @Helper returnig Helper")
+            return helper
+        pattern3 = r"@executor"
+        if re.search(pattern3, messages[-1]["content"].lower()):
+            current_app.logger.info("String contains @Executor returnig Executor")
+            return executor
         
-        llm_call_track[user_prompt]['count'] +=1
-        current_app.logger.info(f"llm_call_track[user_prompt]['count']:{llm_call_track[user_prompt]['count']}")
-        if llm_call_track[user_prompt]['original_prompt'] == True:
-            llm_call_track[user_prompt]['original_prompt'] = False
-            assistant.update_system_message = agent_prompt
+        # llm_call_track[user_prompt]['count'] +=1
+        # current_app.logger.info(f"llm_call_track[user_prompt]['count']:{llm_call_track[user_prompt]['count']}")
+        # if llm_call_track[user_prompt]['original_prompt'] == True:
+        #     llm_call_track[user_prompt]['original_prompt'] = False
+        #     assistant.update_system_message = agent_prompt
             
-        if llm_call_track[user_prompt]['count'] == 5:
-            current_app.logger.info('LLM CALL COUNT IS 5')
-            llm_call_track[user_prompt]['count'] = 0
-            llm_call_track[user_prompt]['original_prompt'] = True
-            assistant.update_system_message = f"You should return the response to the user on whatever you are doing now in response format {response_format}"
-            current_app.logger.info('Updated prompt')
-            return assistant
+        # if llm_call_track[user_prompt]['count'] == 5:
+        #     current_app.logger.info('LLM CALL COUNT IS 5')
+        #     llm_call_track[user_prompt]['count'] = 0
+        #     llm_call_track[user_prompt]['original_prompt'] = True
+        #     assistant.update_system_message = f"You should return the response to the user on whatever you are doing now in response format {response_format}"
+        #     current_app.logger.info('Updated prompt')
+        #     return assistant
         current_app.logger.info(f'Inside state_transition with message :10 {messages[-1]["content"][:10]} & last_speaker {last_speaker.name}')
-        if last_speaker.name == f"user_proxy_{user_id}" or last_speaker.name == "multi_role_agent" or last_speaker.name == "helper" or last_speaker.name == "Executor":
+        if last_speaker.name == f"user_proxy_{user_id}" or last_speaker.name == "multi_role_agent" or last_speaker.name == "helper" or last_speaker.name == "Executor" or last_speaker.name == "ChatInstructor":
             return assistant
         current_app.logger.info(f'Checking for @user or @{role} in message')
         if '@user' in messages[-1]["content"].lower() or f'@{role}'.lower() in messages[-1]["content"].lower():
@@ -1241,10 +1274,14 @@ def create_schedule(prompt_id,user_id):
 recent_file_id = {}
 recipes = {}
 user_tasks = {}
-def chat_agent(user_id,text,prompt_id,file_id):
+request_id_list = {}
+
+def chat_agent(user_id,text,prompt_id,file_id,request_id):
     current_app.logger.info('--'*100)
     user_message = text
     user_prompt = f'{user_id}_{prompt_id}'
+    
+    request_id_list[user_prompt] = request_id
     try:
         if file_id:
             recent_file_id[user_id] = file_id

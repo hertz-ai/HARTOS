@@ -1,0 +1,58 @@
+{
+    "status": "done",
+    "action": "Retrieve avatar IDs using the API: https://mailer.hertzai.com/all_teacher_only_avatars_id_user_id?user_id={user_id} and associate each character with a unique avatar ID from the response, saving that info as well.",
+    "fallback_action": "",
+    "persona": "Creator",
+    "action_id": 2,
+    "recipe": [
+        {
+            "steps": "Fetch the user_id from the saved metadata.",
+            "tool_name": "get_user_id",
+            "generalized_functions": "",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Make the API call to retrieve the avatar IDs using the fetched user_id.",
+            "tool_name": "",
+            "generalized_functions": "import requests\n\n# Define the user_id\nuser_id = 10086\n\n# Define the API URL\napi_url = f\"https://mailer.hertzai.com/all_teacher_only_avatars_id_user_id?user_id={{user_id}}\"\n\n# Make the API call to retrieve the avatar IDs\nresponse = requests.get(api_url)\n\n# Check if the response is successful\nif response.status_code == 200:\n    avatar_ids = response.json()\nelse:\n    avatar_ids = None\n\nprint(avatar_ids)",
+            "agent_to_perform_this_action": "Executor"
+        },
+        {
+            "steps": "Associate each character from the previously created story with a unique avatar ID.",
+            "tool_name": "",
+            "generalized_functions": "",
+            "agent_to_perform_this_action": "Assistant"
+        },
+        {
+            "steps": "Save the associated character and avatar ID information in memory.",
+            "tool_name": "save_data_in_memory",
+            "generalized_functions": "",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Request the status verifier agent to confirm the completion for the 'Creator' persona.",
+            "tool_name": "",
+            "generalized_functions": "",
+            "agent_to_perform_this_action": "Assistant"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [],
+    "metadata": {
+        "user_id": "redacted <class 'int'>",
+        "creator": {
+            "story": {
+                "100_word": "redacted <class 'str'>"
+            },
+            "characters": {
+                "Lisa": "redacted <class 'str'>",
+                "Mark": "redacted <class 'str'>",
+                "Sam": "redacted <class 'str'>"
+            }
+        }
+    },
+    "time_took_to_complete": 20.633525848388672,
+    "actions_this_action_depends_on": [
+        1
+    ]
+}

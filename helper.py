@@ -3,7 +3,17 @@ import requests
 import re
 import json
 from flask import current_app
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Annotated
+import pickle
+from PIL import Image
+import uuid
+from datetime import datetime
+import time
+import redis
+
+redis_client = redis.StrictRedis(
+    host='azure_all_vms.hertzai.com', port=6369, db=0)
+
 
 def topological_sort(actions):
     # Create adjacency list and in-degree dictionary
@@ -118,6 +128,18 @@ def gpt_mini(prompt,request_id,history):
     return response.json()["text"]
 
 
+def strip_json_values(data):
+    if isinstance(data, dict):
+        return {key: strip_json_values(value) for key, value in data.items()}
+    elif isinstance(data, list):
+        return [strip_json_values(item) for item in data]
+    elif isinstance(data, str):
+        return f"redacted {type(data)}"  # Truncate to 8 characters and add " redact"
+    elif isinstance(data, (int, float, bool)) or data is None:
+        return f'redacted {type(data)}'  # Keep primitive types as is
+    else:
+        return f"redacted {type(data)}"
+
 def fix_json(json_text):
     url = "http://aws_rasa.hertzai.com:5459/gpt3"
     text = """You are an expert JSON fixer. Your task is to correct a given JSON string, ensuring it is compatible with Python’s `eval()`.  
@@ -212,14 +234,45 @@ class ToolMessageHandler():
         """
         if not messages:
             return messages
-            
+        
         # Make a copy to avoid modifying the original list
         processed_messages = messages.copy()
         
+        # current_app.logger.info(f'FIRST MESSAGE:-> {processed_messages[0]}')
         # Check if the first message has a role of 'tool'
         if processed_messages and processed_messages[0].get('role') == 'tool':
             current_app.logger.info('GOT TOOL AS FIRST MESSAGE POPPING IT')
-            processed_messages.pop(0)
+            # processed_messages.pop(0)
+            processed_messages[0]['role'] = 'user'
+            del processed_messages[0]['tool_responses']
+        
+        # Only process up to second-to-last message
+        if not messages or len(messages) < 2:
+            return messages
+        
+        for i in range(len(processed_messages) - 2):
+            current_msg = processed_messages[i]
+            next_msg = processed_messages[i + 1]
+            
+            # Case 1: Current message has tool_calls but next message isn't a tool
+            if current_msg.get('tool_calls') and next_msg.get('role') != 'tool':
+                # Fix next message to be a tool message
+                # next_msg['role'] = 'tool'
+                del current_msg['tool_calls']
+                current_msg['role'] = 'user'
+                
+            # Case 2: Current message doesn't have tool_calls but next is a tool
+            elif not current_msg.get('tool_calls') and next_msg.get('role') == 'tool':
+                # Convert next message to user and remove tool_calls
+                next_msg['role'] = 'user'
+                if 'tool_calls' in next_msg:
+                    del next_msg['tool_calls']
+            
+            # Case 3: Current message has tool_calls but next message isn't a tool
+            elif current_msg.get('role') == 'tool' and next_msg.get('role') == 'tool':
+                # Fix next message to be a tool message
+                next_msg['role'] = 'user'
+        
             
         return processed_messages
         
@@ -253,3 +306,65 @@ class Action:
             if i['action_id'] == action_id:
                 return i
         return None
+
+def txt2img(text: Annotated[str, "Text to create image"]) -> str:
+    current_app.logger.info('INSIDE txt2img')
+    url = f"http://aws_rasa.hertzai.com:5459/txt2img?prompt={text}"
+
+    payload = ""
+    headers = {}
+
+    response = requests.post(url, headers=headers, data=payload)
+    return response.json()['img_url']
+
+import os
+
+def get_frame(user_id):
+    current_app.logger.info('inside get_frame')
+    serialized_frame = redis_client.get(user_id)
+    current_app.logger.info('after redis client')
+    try:
+        if serialized_frame is not None:
+            frame_bgr = pickle.loads(serialized_frame)
+            current_app.logger.info(
+                f"Frame for user_id {user_id} retrieved successfully.")
+            frame = frame_bgr[:, :, ::-1]
+            return frame
+        else:
+            current_app.logger.info(f"No frame found for user_id {user_id}.")
+            return None
+    except ModuleNotFoundError as e:
+        raise e
+
+def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual context"],user_id:int) -> str:
+    request_id = 'Autogent_1234'
+    current_app.logger.info('Using Vision to answer question')
+    frame = get_frame(str(user_id))
+    if frame is not None:
+        image_path = f"output_images/{user_id}_{request_id}_call.jpg"
+        # Ensure the directory exists
+        directory = os.path.dirname(image_path)
+        if not os.path.exists(directory):
+            os.makedirs(directory)
+        # Convert the frame (which is a NumPy array) to a PIL image
+        image = Image.fromarray(frame)
+        # Save the image
+        image.save(image_path)
+        url = "http://azurekong.hertzai.com:8000/minicpm/upload"
+        payload = {
+            'prompt': f'Instruction: Respond in second person point of view\ninput:-{inp}'}
+        files = [
+            ('file', ('call.jpg', open(image_path, 'rb'), 'image/jpeg'))
+        ]
+        headers = {}
+        try:
+            response = requests.post(
+                url, headers=headers, data=payload, files=files)
+            current_app.logger.info(response.text)
+            response = response.text
+
+            return response
+        except Exception as e:
+            current_app.logger.info('ERROR: Got error in visal QA')
+            return 'failed to get visual context ask user to check if the camera is turned on'
+        
