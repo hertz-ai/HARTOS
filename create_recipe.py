@@ -1647,8 +1647,9 @@ def recipe(user_id, text,prompt_id,file_id,request_id):
         current_app.logger.info('Recipe created successfully')
         time_agents[user_prompt] = create_time_agents(user_id,prompt_id,'creator','')
         #TODO REMOVE FOR LOOP USE SCHEDULER ALL AT ONCE WITH 1 SEC INTERVAL
-        for jobs in merged_dict['scheduled_tasks']:
-            time_based_execution(jobs['job_description'],user_id,prompt_id,jobs['action_entry_point'])
+        if "scheduled_tasks" in merged_dict:
+            for jobs in merged_dict['scheduled_tasks']:
+                time_based_execution(jobs['job_description'],user_id,prompt_id,jobs['action_entry_point'])
         
         name = f'prompts/{prompt_id}_recipe.json'
         with open(name, "w") as json_file:

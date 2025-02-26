@@ -51,7 +51,7 @@ def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autoge
         plan and enhance actions considering saving to working memory for later reuse. Plan capturing the dependencies between actions & reorder actions if absolutely necessary for proper execution to meet the goal. IMPORTANT INSTRUCTIONS plan but do not override or overlook any of the user provided instructions/actions.
         before going to completed state give all the details to user so that user can review it once. the response format for this should be {"status":"pending","review_details":"details here"}
         after reviewing you should give your response as { "status": "completed", "name": "","broadcast_agent":bool,"personas":"" "tools": "", "flows": [{"flow_name", "actions": [],"sub_goal":"" }] "goal": ""}
-        IMPORTANT INSTRUCTION: never skip any user given details like api url, or some information or data always have that in all of your responses.
+        IMPORTANT INSTRUCTION: never skip any user given information or details like api url, or some information you can only rephrase it but you should never gulp any information.
         """
     )
 

@@ -257,24 +257,39 @@ class ToolMessageHandler():
             
             # Case 1: Current message has tool_calls but next message isn't a tool
             if current_msg.get('tool_calls') and next_msg.get('role') != 'tool':
-                # Fix next message to be a tool message
-                # next_msg['role'] = 'tool'
+                current_app.logger.warning(f'CHANGE IN {i}')
+                current_app.logger.warning(f'CURRENT MSG HAS TOOL_CALLS AND NEXT IS NOT TOOL RESPONSE')
+                current_app.logger.warning(f'CURRENT MSG {current_msg}')
                 del current_msg['tool_calls']
                 current_msg['role'] = 'user'
+                current_msg['content'] = ' '
+                current_msg['name'] = 'Helper'
+                current_app.logger.warning(f'CURRENT MSG AFTER DELETE {current_msg}')
                 
             # Case 2: Current message doesn't have tool_calls but next is a tool
             elif not current_msg.get('tool_calls') and next_msg.get('role') == 'tool':
+                current_app.logger.warning(f'CHANGE IN {i}')
+                current_app.logger.warning(f'CHANGE IN NEXT MESSAFE TO USER')
+                current_app.logger.warning(f'Next MESSAGE BEFORE CHANGE {next_msg}')
+                
                 # Convert next message to user and remove tool_calls
                 next_msg['role'] = 'user'
                 if 'tool_calls' in next_msg:
                     del next_msg['tool_calls']
+                    next_msg['role'] = 'user'
+                    next_msg['content'] = ' '
+                    next_msg['name'] = 'Helper'
+                current_app.logger.warning(f'Next MESSAGE AFTER CHANGE {next_msg}')
             
             # Case 3: Current message has tool_calls but next message isn't a tool
             elif current_msg.get('role') == 'tool' and next_msg.get('role') == 'tool':
+                current_app.logger.warning(f'CHANGE IN {i}')
+                current_app.logger.warning(f'CURRENT ROLE TO USER')
                 # Fix next message to be a tool message
                 current_msg['role'] = 'user'
         
-            
+        current_app.logger.debug("processed_messages")
+        current_app.logger.debug(processed_messages)
         return processed_messages
         
     def get_logs(self, pre_transform_messages: List[Dict], post_transform_messages: List[Dict]) -> Tuple[str, bool]:
