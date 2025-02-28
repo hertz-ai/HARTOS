@@ -412,10 +412,12 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     }
     
     personas = []
-    role = get_role(user_id,prompt_id)
-    if not role:
-        role = ''
-    current_app.logger.info(f'Got role as {role}')
+    # role = get_role(user_id,prompt_id)
+    role_number,role = get_flow_number(user_id,prompt_id)
+    
+    with open(f"prompts/{prompt_id}_{role_number}_recipe.json", 'r') as f:
+        config = json.load(f)
+        recipes[user_prompt] = config
     goal = ''
     with open(f"prompts/{prompt_id}.json", 'r') as f:
             config = json.load(f)
@@ -424,7 +426,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     current_app.logger.info(f'Got goal as {goal}')
     role_actions = []
     current_app.logger.info(f'Getting role actions')
-    for i in recipes[prompt_id]['actions']:
+    for i in recipes[user_prompt]['actions']:
         current_app.logger.info(f'this is action persona:{i["persona"]} ')
         if i['persona'].lower() == role.lower():
             
@@ -432,20 +434,20 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     current_app.logger.info(f'role_actions: {role_actions}')
     
     if len(role_actions) == 0:
-        role_actions = recipes[prompt_id]['actions']
+        role_actions = recipes[user_prompt]['actions']
         
     # Perform topological sorting
     # sorted_actions = topological_sort(role_actions)
     user_tasks[user_prompt] = Action(role_actions)
     individual_recipe = []
-    for i in range(1,(len(recipes[prompt_id]['actions'])+1)):
-        current_app.logger.info(f'checking for prompts/{prompt_id}_{i}.json')
+    for i in range(1,(len(recipes[user_prompt]['actions'])+1)):
+        current_app.logger.info(f'checking for prompts/{prompt_id}_{role_number}_{i}.json')
         try:
-            with open(f"prompts/{prompt_id}_{i}.json", 'r') as f:
+            with open(f"prompts/{prompt_id}_{role_number}_{i}.json", 'r') as f:
                 config = json.load(f)
                 individual_recipe.append(config)
         except Exception as e:
-            current_app.logger.error(f'Got error as :{e} while checking for prompts/{prompt_id}_{i}.json')
+            current_app.logger.error(f'Got error as :{e} while checking for prompts/{prompt_id}_{role_number}_{i}.json')
     response_format = {"message_2_user": "Your message here"}
     agent_prompt = f'''You are a Helpful {role} Assistant. Your primary role is to assist the user efficiently while keeping all internal actions and processes hidden from the end user. Follow the guidelines below to perform tasks correctly:
         1. If you encounter a task you cannot perform, request assistance from the @Helper and @Executor agents. agent. If you need to run a tool, seek guidance from the @Helper agent. For code execution, ask the @Executor agent for assistance.
@@ -1254,14 +1256,35 @@ def get_agent_response(assistant: autogen.AssistantAgent,chat_instructor: autoge
         return f"Error getting response: {str(e)}"
 
 
+def get_flow_number(user_id,prompt_id):
+    role = get_role(user_id,prompt_id)
+    if not role:
+        role = None
+    current_app.logger.info(f'Got role as {role}')
+    file_path = f'prompts/{prompt_id}.json'
+    with open(file_path, 'r') as f:
+        data = json.load(f)
+        available_roles = [x['name'] for x in data['personas']]
+        available_flows = data['flows']
+    current_app.logger.info(f'Got available_roles as {available_roles}')
+    if not role:
+        role = available_roles[0]
+    role_number = 0
+    for num,i in enumerate(available_flows):
+        if i['persona'].lower() == role.lower():
+            role_number = num
+            current_app.logger.info(f'GOT role index as {role_number}')
+    return role_number, role
+
 def create_schedule(prompt_id,user_id):
-    with open(f"prompts/{prompt_id}_recipe.json", 'r') as f:
+    user_prompt = f'{user_id}_{prompt_id}'
+    role_number,role = get_flow_number(user_id,prompt_id)
+    with open(f"prompts/{prompt_id}_{role_number}_recipe.json", 'r') as f:
         config = json.load(f)
-        recipes[prompt_id] = config
+        recipes[user_prompt] = config
     try:
         if 'scheduled_tasks' in config and len(config['scheduled_tasks'])>0:
             current_app.logger.info('Creating scheduled tasks')
-            role = get_role(user_id,prompt_id)
             for i in config['scheduled_tasks']:
                 if role and i['persona'].lower() == role.lower():
                     trigger = CronTrigger.from_crontab(i['cron_expression'])
@@ -1318,9 +1341,9 @@ def chat_agent(user_id,text,prompt_id,file_id,request_id):
             
             last_message = group_chat.messages[-1]
             if 'terminate' in last_message['content'].lower():
-                with open(f"prompts/{prompt_id}_recipe.json", 'r') as f:
-                    config = json.load(f)
-                    recipes[prompt_id] = config
+                # with open(f"prompts/{prompt_id}_recipe.json", 'r') as f:
+                #     config = json.load(f)
+                #     recipes[user_prompt] = config
                 user_agents[user_prompt] = create_agents_for_user(user_id,prompt_id)
                 assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor = user_agents[user_prompt]
                 user_journey[user_prompt] = 'UseBot'

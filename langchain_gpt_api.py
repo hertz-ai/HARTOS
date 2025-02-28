@@ -2026,12 +2026,18 @@ def chat():
     thread_local_data.set_request_id(request_id=request_id)
     prompt = data.get('prompt', None)
     if prompt_id:
-        if not os.path.exists(f'prompts/{prompt_id}.json'):
+        if os.path.exists(f'prompts/{prompt_id}_0_recipe.json'):
+            file_path = f'prompts/{prompt_id}.json'
+            with open(file_path, 'r') as f:
+                data = json.load(f)
+                no_of_persona = len(data['personas'])-1
+            if not os.path.exists(f'prompts/{prompt_id}_{no_of_persona}_recipe.json'):
+                create_agent = True
+                review_agents[user_id] = True
+                conversation_agent[user_id] = True
+        elif not os.path.exists(f'prompts/{prompt_id}.json'):
             create_agent = True
             review_agents[user_id] = False
-        elif not os.path.exists(f'prompts/{prompt_id}_recipe.json'):
-            create_agent = True
-            review_agents[user_id] = True
             conversation_agent[user_id] = False
         
     if create_agent:

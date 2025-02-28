@@ -44,6 +44,7 @@ agent_data = {}
 task_time = {}
 agent_metadata = {}
 final_recipe = {}
+individual_json = {}
 time_actions = {}
 scheduler_check = {}
 
@@ -153,14 +154,14 @@ llm_config = {
 def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent, autogen.ConversableAgent]:
     """Create new assistant & user agents for a given user_id"""
     user_prompt = f'{user_id}_{prompt_id}'
-    
+    individual_json[user_prompt] = None
     
     custom_agents = []
     agents_object = {}
     with open(f"prompts/{prompt_id}.json", 'r') as f:
             config = json.load(f)
-            list_of_persona = [x['name'] for x in config['personas']]
-            current_app.logger.info(f'Got list of persona as {list_of_persona}')
+            list_of_persona = config['flows'][recipe_for_persona[user_prompt]]['persona']
+            current_app.logger.info(f'WORKING persona as {list_of_persona}')
     # Create assistant agent
     # Create assistant agent
     assistant = autogen.AssistantAgent(
@@ -611,7 +612,6 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         # 'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0}, 'bottom_left': {'x': 0, 'y': 0}}}
         # result = client.publish(
         #     f"com.hertzai.hevolve.chat.{user_id}", f'{crossbar_message}')
-        
         metadata = get_saved_metadata()
         # current_app.logger.info(messages[-1])
         if messages[-1]['role'] == 'tool':
@@ -631,10 +631,13 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
                             if 'recipe' in json_obj.keys():
                                 current_app.logger.info('Recipe created successfully')
                                 merged_dict = {**final_recipe[prompt_id], **json_obj}
-                                name = f'prompts/{prompt_id}_recipe.json'
+                                flow = recipe_for_persona[user_prompt]
+                                name = f'prompts/{prompt_id}_{flow}_recipe.json'
                                 with open(name, "w") as json_file:
                                     json.dump(merged_dict, json_file)
                                 current_app.logger.info(f"Dictionary saved to {name}")
+                                recipe_for_persona[user_prompt] += 1
+                                user_tasks[user_prompt] = Action(config['flows'][recipe_for_persona[user_prompt]]['actions'])
                                 final_recipe[prompt_id] = merged_dict
                                 return None
                             if 'action_id' in json_obj.keys():
@@ -675,7 +678,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
                                 user_tasks[user_prompt].fallback = True
                         elif json_obj['status'].lower() == 'done':
                             current_app.logger.info('Got Individual action recipe save it')
-                            name = f'prompts/{prompt_id}_{json_obj["action_id"]}.json'
+                            flow = recipe_for_persona[user_prompt]
+                            name = f'prompts/{prompt_id}_{flow}_{json_obj["action_id"]}.json'
                             user_tasks[user_prompt].fallback = False
                             user_tasks[user_prompt].recipe = False
                             metadata = strip_json_values(agent_data[prompt_id])
@@ -691,6 +695,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
                             with open(name, "w") as json_file:
                                 json.dump(json_obj, json_file)
                             user_tasks[user_prompt].current_action = int(json_obj['action_id'])
+                            individual_json[user_prompt] = json_obj
                             current_app.logger.info(f'Saved Individual recipe at: {name}')
                             
                             return chat_instructor   
@@ -913,7 +918,7 @@ def create_time_agents(user_id, prompt_id,role,goal):
     time_agent.register_for_execution(name="text_2_image")(helper_fun.txt2img)
     
     
-    def camera_inp(inp: Annotated[str, "The Question to check from visual context"]):
+    def camera_inp(inp: Annotated[str, "The Question to check from visual context"])->str:
         return helper_fun.get_user_camera_inp(inp,user_id)        
     helper1.register_for_llm(name="get_user_camera_inp", description="Get user's visual information to process somethings")(camera_inp)
     time_agent.register_for_execution(name="get_user_camera_inp")(camera_inp)  
@@ -1332,11 +1337,13 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
         file_path = f'prompts/{prompt_id}.json'
         with open(file_path, 'r') as f:
             data = json.load(f)
-            role = [x['name'] for x in data['personas']]
+            role = data['flows'][recipe_for_persona[user_prompt]]['persona']
         current_app.logger.info('inside while')
         if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
             current_app.logger.info(f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
             json_obj = retrieve_json(group_chat.messages[-2]["content"])
+            if not json_obj:
+                json_obj = individual_json[user_prompt]
             if json_obj and type(json_obj)==dict and 'status' in json_obj.keys():
                 if json_obj['status'].lower() == 'completed' and 'recipe' not in json_obj.keys():
                     if user_tasks[user_prompt].current_action != int(json_obj['action_id']):
@@ -1377,24 +1384,28 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     user_tasks[user_prompt].fallback = False
                     message = f" Action {user_tasks[user_prompt].current_action} fallback:ask user what actions should be taken if current actions fail in the future after you get the response from user give the conversaation to StatusVerifier agent"      
                 else:
+                    # if recipe_for_persona[user_prompt]  < total_persona_actions[user_prompt]:
+                    #     recipe_for_persona[user_prompt] += 1
                     user_tasks[user_prompt].new_json.append(json_obj)
                     user_tasks[user_prompt].current_action += 1
-                    name = f'prompts/{prompt_id}_new.json'
-                    with open(name, "w") as json_file:
-                        json.dump(user_tasks[user_prompt].new_json, json_file)
+                    # name = f'prompts/{prompt_id}_new.json'
+                    # with open(name, "w") as json_file:
+                    #     json.dump(user_tasks[user_prompt].new_json, json_file)
                     current_app.logger.info('updating updated action in .json')
                     individual_recipe = []
+                    flow = recipe_for_persona[user_prompt]
                     for i in range(1,(user_tasks[user_prompt].current_action)):
-                        current_app.logger.info(f'checking for prompts/{prompt_id}_{i}.json')
+                        current_app.logger.info(f'checking for prompts/{prompt_id}_{flow}_{i}.json')
                         try:
-                            with open(f"prompts/{prompt_id}_{i}.json", 'r') as f:
+                            with open(f"prompts/{prompt_id}_{flow}_{i}.json", 'r') as f:
                                 config = json.load(f)
                                 individual_recipe.append(config)
                         except Exception as e:
-                            current_app.logger.error(f'Got error as :{e} while checking for prompts/{prompt_id}_{i}.json')
+                            current_app.logger.error(f'Got error as :{e} while checking for prompts/{prompt_id}_{flow}_{i}.json')
                             
                     group_chat.messages[-1]['content'] = f'{individual_recipe}'
                     assistant_agent.update_system_message = 'Check if the current_action depends on any other action, regardless of order it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.'
+                    flow = recipe_for_persona[user_prompt]
                     for num,action in enumerate(user_tasks[user_prompt].actions,1):
                         try:
                             group_chat.messages[-1]['content'] = f'{individual_recipe}'
@@ -1407,14 +1418,15 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                                     break
                             if match:
                                 action_ids = eval(match.group())
-                                file_path = f'prompts/{prompt_id}_{num}.json'
+                                
+                                file_path = f'prompts/{prompt_id}_{flow}_{num}.json'
                                 with open(file_path, 'r') as f:
                                     data = json.load(f)
                                 data['actions_this_action_depends_on'] = action_ids
                                 with open(file_path, 'w') as f:
                                     json.dump(data, f, indent=4)
                             else:
-                                file_path = f'prompts/{prompt_id}_{num}.json'
+                                file_path = f'prompts/{prompt_id}_{flow}_{num}.json'
                                 with open(file_path, 'r') as f:
                                     data = json.load(f)
                                 data['actions_this_action_depends_on'] = []
@@ -1422,7 +1434,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                                     json.dump(data, f, indent=4)
                         except Exception as e:
                             current_app.logger.info(f'GOT ERROR AT EVAL OF LIST :{e}')
-                            file_path = f'prompts/{prompt_id}_{num}.json'
+                            file_path = f'prompts/{prompt_id}_{flow}_{num}.json'
                             with open(file_path, 'r') as f:
                                 data = json.load(f)
                             data['actions_this_action_depends_on'] = []
@@ -1432,13 +1444,13 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     
                     individual_recipe = []
                     for i in range(1,(user_tasks[user_prompt].current_action)):
-                        current_app.logger.info(f'checking for prompts/{prompt_id}_{i}.json')
+                        current_app.logger.info(f'checking for prompts/{prompt_id}_{flow}_{i}.json')
                         try:
-                            with open(f"prompts/{prompt_id}_{i}.json", 'r') as f:
+                            with open(f"prompts/{prompt_id}_{flow}_{i}.json", 'r') as f:
                                 config = json.load(f)
                                 individual_recipe.append(config)
                         except Exception as e:
-                            current_app.logger.error(f'Got error as :{e} while checking for prompts/{prompt_id}_{i}.json')
+                            current_app.logger.error(f'Got error as :{e} while checking for prompts/{prompt_id}_{flow}_{i}.json')
                     #TOPOLOGICAL SORT & CHECK FOR CYCLIC DEPENDENCY
                     status,updated_actions, cyc = topological_sort(individual_recipe)
                     if not status:
@@ -1453,7 +1465,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     file_path = f'prompts/{prompt_id}.json'
                     with open(file_path, 'r') as f:
                         data = json.load(f)
-                        role = [x['name'] for x in data['personas']]
+                        role = data['flows'][recipe_for_persona[user_prompt]]['persona']
                     message = '''Reflect on the sequence of tasks and create scheduled_tasks with proper persona name and action_entry_point. Provide the output in the following JSON format:
                         { "status", "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer `action_id` from the list of existing `action_ids` is required as the starting point to perform this job.","action_exit_point":"An integer `action_id` up to which the job should be performed to complete the task. It can be greater than or equal to the entry point.","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }'''
 
@@ -1463,7 +1475,14 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     current_app.logger.info(f'user_tasks[user_prompt].current_action:{user_tasks[user_prompt].current_action} == len(user_tasks[user_prompt].actions)')
                     chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
                     last_message = group_chat.messages[-1]
-                    current_app.logger.info(f'HI I AM HERE AFTER FINAL SCHEDULED JSON NOW I WILL DO TIMER TASK')
+                    current_app.logger.info(f'HI I AM HERE AFTER FINAL SCHEDULED JSON NOW I WILL next actions')
+                    current_app.logger.info(f'recipe_for_persona[user_prompt]:{recipe_for_persona[user_prompt]} total_persona_actions[user_prompt]:{total_persona_actions[user_prompt]}')
+                    if recipe_for_persona[user_prompt]  < total_persona_actions[user_prompt]:
+                        current_app.logger.info(f'Completed ONE FLOW NOW WE SHOULD WORK ON NEXT FLOW')
+                        current_app.logger.info(f'DELETED CURRENT AGENTS AND CREATE NEW')
+                        del user_agents[user_prompt]
+                        x = get_response_group(user_id,text,prompt_id)
+                        continue
                     scheduler_check[user_prompt] = True
                     json_response = final_recipe[prompt_id]
                     # if json_response and 'status' in json_response.keys(): 
@@ -1473,8 +1492,8 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     #     #TODO REMOVE FOR LOOP USE SCHEDULER ALL AT ONCE WITH 1 SEC INTERVAL
                     #     for jobs in merged_dict['scheduled_tasks']:
                     #         time_based_execution(jobs['job_description'],user_id,prompt_id,jobs['action_entry_point'])
-                        
-                    #     name = f'prompts/{prompt_id}_recipe.json'
+                    #     flow = recipe_for_persona[user_prompt]
+                    #     name = f'prompts/{prompt_id}_{flow}_recipe.json'
                     #     with open(name, "w") as json_file:
                     #         json.dump(merged_dict, json_file)
                     #     url = f'https://mailer.hertzai.com/update_agent_prompt?prompt_id={prompt_id}'
@@ -1491,15 +1510,16 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                 try:
                     message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
                 except:
+                    flow = recipe_for_persona[user_prompt]
                     individual_recipe = []
                     for i in range(1,(user_tasks[user_prompt].current_action)):
-                        current_app.logger.info(f'checking for prompts/{prompt_id}_{i}.json')
+                        current_app.logger.info(f'checking for prompts/{prompt_id}_{flow}_{i}.json')
                         try:
-                            with open(f"prompts/{prompt_id}_{i}.json", 'r') as f:
+                            with open(f"prompts/{prompt_id}_{flow}_{i}.json", 'r') as f:
                                 config = json.load(f)
                                 individual_recipe.append(config)
                         except Exception as e:
-                            current_app.logger.error(f'Got error as :{e} while checking for prompts/{prompt_id}_{i}.json')
+                            current_app.logger.error(f'Got error as :{e} while checking for prompts/{prompt_id}_{flow}_{i}.json')
                     group_chat.messages[-1]['content'] = f'{individual_recipe}'
                     assistant_agent.update_system_message = 'Check if the current_action depends on any other action, regardless of order it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.'
                     for num,action in enumerate(user_tasks[user_prompt].actions,1):
@@ -1512,14 +1532,14 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                                 break
                         if match:
                             action_ids = eval(match.group())
-                            file_path = f'prompts/{prompt_id}_{num}.json'
+                            file_path = f'prompts/{prompt_id}_{flow}_{num}.json'
                             with open(file_path, 'r') as f:
                                 data = json.load(f)
                             data['actions_this_action_depends_on'] = action_ids
                             with open(file_path, 'w') as f:
                                 json.dump(data, f, indent=4)
                         else:
-                            file_path = f'prompts/{prompt_id}_{num}.json'
+                            file_path = f'prompts/{prompt_id}_{flow}_{num}.json'
                             with open(file_path, 'r') as f:
                                 data = json.load(f)
                             data['actions_this_action_depends_on'] = []
@@ -1528,13 +1548,13 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     
                     individual_recipe = []
                     for i in range(1,(user_tasks[user_prompt].current_action)):
-                        current_app.logger.info(f'checking for prompts/{prompt_id}_{i}.json')
+                        current_app.logger.info(f'checking for prompts/{prompt_id}_{flow}_{i}.json')
                         try:
-                            with open(f"prompts/{prompt_id}_{i}.json", 'r') as f:
+                            with open(f"prompts/{prompt_id}_{flow}_{i}.json", 'r') as f:
                                 config = json.load(f)
                                 individual_recipe.append(config)
                         except Exception as e:
-                            current_app.logger.error(f'Got error as :{e} while checking for prompts/{prompt_id}_{i}.json')
+                            current_app.logger.error(f'Got error as :{e} while checking for prompts/{prompt_id}_{flow}_{i}.json')
                     status,updated_actions, cyc = topological_sort(individual_recipe)
                     if not status:
                         res = fix_actions(individual_recipe,cyc)
@@ -1549,7 +1569,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     file_path = f'prompts/{prompt_id}.json'
                     with open(file_path, 'r') as f:
                         data = json.load(f)
-                        role = [x['name'] for x in data['personas']]
+                        role = data['flows'][recipe_for_persona[user_prompt]]['persona']
                     final_recipe[prompt_id] = {"status":"completed","actions":updated_actions}
                     assistant_agent.update_system_message = '''Reflect on the sequence of tasks and create scheduled_tasks with proper persona name and action_entry_point. Provide the output in the following JSON format:
                     { "status", "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer `action_id` from the list of existing `action_ids` is required as the starting point to perform this job.","action_exit_point":"An integer `action_id` up to which the job should be performed to complete the task. It can be greater than or equal to the entry point.","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }'''
@@ -1561,7 +1581,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     if json_response and 'status' in json_response.keys(): 
                         merged_dict = {**final_recipe[prompt_id], **json_response}
                         current_app.logger.info('Recipe created successfully')
-                        name = f'prompts/{prompt_id}_recipe.json'
+                        name = f'prompts/{prompt_id}_{flow}_recipe.json'
                         with open(name, "w") as json_file:
                             json.dump(merged_dict, json_file)
                         url = f'https://mailer.hertzai.com/update_agent_prompt?prompt_id={prompt_id}'
@@ -1619,6 +1639,8 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
 messages = {}
 recent_file_id = {}
 request_id_list = {}
+recipe_for_persona = {}
+total_persona_actions = {}
 
 def recipe(user_id, text,prompt_id,file_id,request_id):
     user_prompt = f'{user_id}_{prompt_id}'
@@ -1632,6 +1654,8 @@ def recipe(user_id, text,prompt_id,file_id,request_id):
         with open(f"prompts/{prompt_id}.json", 'r') as f:
             config = json.load(f)
         user_tasks[user_prompt] = Action(config['flows'][0]['actions'])
+        recipe_for_persona[user_prompt] = 0
+        total_persona_actions[user_prompt] = len(config['flows'])
         agent_data[prompt_id] = {'user_id':user_id}
     try:
         
@@ -1650,8 +1674,8 @@ def recipe(user_id, text,prompt_id,file_id,request_id):
         if "scheduled_tasks" in merged_dict:
             for jobs in merged_dict['scheduled_tasks']:
                 time_based_execution(jobs['job_description'],user_id,prompt_id,jobs['action_entry_point'])
-        
-        name = f'prompts/{prompt_id}_recipe.json'
+        flow = recipe_for_persona[user_prompt]
+        name = f'prompts/{prompt_id}_{flow}_recipe.json'
         with open(name, "w") as json_file:
             json.dump(merged_dict, json_file)
         url = f'https://mailer.hertzai.com/update_agent_prompt?prompt_id={prompt_id}'

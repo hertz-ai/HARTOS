@@ -3,383 +3,47 @@
     "actions": [
         {
             "status": "done",
-            "action": "Create a 100-word story with multiple characters in the following format: (character1 name) dialogue of character1... (character2 name) dialogue of character2, (narrator) like an audiobook, and save it.",
-            "fallback_action": "If creating and saving a 100-word story fails, create a 50-word story with only one character instead.",
-            "persona": "Creator",
+            "action": "Check if any story is available in memory for which all the dialogue statuses are success, and present the dialogues from the selected story with a 10-second interval until the story is completed. Once that story is done, proceed to give the next story using the same process.",
+            "fallback_action": "If fails then give some joke to use and ask to try later.",
+            "persona": "User",
             "action_id": 1,
             "recipe": [
                 {
-                    "steps": "Create a 100-word story with multiple characters in the specified format. This includes the dialogues of the different characters and a brief narration.",
-                    "tool_name": "",
-                    "agent_to_perform_this_action": "Assistant"
-                },
-                {
-                    "steps": "Save the created story in memory using the 'save_data_in_memory' tool.",
-                    "tool_name": "save_data_in_memory",
+                    "steps": "Retrieve the user ID from memory.",
+                    "tool_name": "get_saved_metadata",
                     "agent_to_perform_this_action": "Helper"
                 },
                 {
-                    "steps": "Ask the StatusVerifier agent to confirm the completion of the action.",
-                    "tool_name": "",
-                    "agent_to_perform_this_action": "Assistant"
-                }
-            ],
-            "can_perform_without_user_input": "yes",
-            "scheduled_tasks": [],
-            "metadata": {
-                "user_id": "redacted <class 'int'>",
-                "creator": {
-                    "story": {
-                        "100_word": "redacted <class 'str'>"
-                    }
-                }
-            },
-            "time_took_to_complete": 20.633525848388672,
-            "actions_this_action_depends_on": []
-        },
-        {
-            "status": "done",
-            "action": "Retrieve avatar IDs using the API: https://mailer.hertzai.com/all_teacher_only_avatars_id_user_id?user_id={user_id} and associate each character with a unique avatar ID from the response, saving that info as well.",
-            "fallback_action": "",
-            "persona": "Creator",
-            "action_id": 2,
-            "recipe": [
-                {
-                    "steps": "Fetch the user_id from the saved metadata.",
-                    "tool_name": "get_user_id",
-                    "generalized_functions": "",
-                    "agent_to_perform_this_action": "Helper"
-                },
-                {
-                    "steps": "Make the API call to retrieve the avatar IDs using the fetched user_id.",
-                    "tool_name": "",
-                    "generalized_functions": "import requests\n\n# Define the user_id\nuser_id = 10086\n\n# Define the API URL\napi_url = f\"https://mailer.hertzai.com/all_teacher_only_avatars_id_user_id?user_id={{user_id}}\"\n\n# Make the API call to retrieve the avatar IDs\nresponse = requests.get(api_url)\n\n# Check if the response is successful\nif response.status_code == 200:\n    avatar_ids = response.json()\nelse:\n    avatar_ids = None\n\nprint(avatar_ids)",
-                    "agent_to_perform_this_action": "Executor"
-                },
-                {
-                    "steps": "Associate each character from the previously created story with a unique avatar ID.",
-                    "tool_name": "",
-                    "generalized_functions": "",
-                    "agent_to_perform_this_action": "Assistant"
-                },
-                {
-                    "steps": "Save the associated character and avatar ID information in memory.",
-                    "tool_name": "save_data_in_memory",
-                    "generalized_functions": "",
-                    "agent_to_perform_this_action": "Helper"
-                },
-                {
-                    "steps": "Request the status verifier agent to confirm the completion for the 'Creator' persona.",
-                    "tool_name": "",
-                    "generalized_functions": "",
-                    "agent_to_perform_this_action": "Assistant"
-                }
-            ],
-            "can_perform_without_user_input": "yes",
-            "scheduled_tasks": [],
-            "metadata": {
-                "user_id": "redacted <class 'int'>",
-                "creator": {
-                    "story": {
-                        "100_word": "redacted <class 'str'>"
-                    },
-                    "characters": {
-                        "Lisa": "redacted <class 'str'>",
-                        "Mark": "redacted <class 'str'>",
-                        "Sam": "redacted <class 'str'>"
-                    }
-                }
-            },
-            "time_took_to_complete": 20.633525848388672,
-            "actions_this_action_depends_on": [
-                1
-            ]
-        },
-        {
-            "status": "done",
-            "action": "Generate realistic video for one character's dialogue at a time using the associated avatar ID.",
-            "fallback_action": "",
-            "persona": "Creator",
-            "action_id": 3,
-            "recipe": [
-                {
-                    "steps": "Retrieve the stored character data and dialogue from memory.",
+                    "steps": "Fetch the stories and their statuses for the retrieved user ID.",
                     "tool_name": "get_data_by_key",
                     "agent_to_perform_this_action": "Helper"
                 },
                 {
-                    "steps": "Initiate the video generation for all the retrieved dialogues using the associated avatar ID.",
-                    "tool_name": "Generate_video",
-                    "agent_to_perform_this_action": "Helper"
+                    "steps": "If stories are found, present dialogues from the selected story with a 10-second interval until the story is completed. Once one story is done, proceed to the next available story in the same manner.",
+                    "tool_name": "",
+                    "agent_to_perform_this_action": "Assistant"
                 },
                 {
-                    "steps": "Save the generated conversation ID and dialogue into memory for future reference.",
-                    "tool_name": "save_data_in_memory",
-                    "agent_to_perform_this_action": "Helper"
+                    "steps": "If no stories are found, provide a joke to the user and ask them to try again later.",
+                    "tool_name": "",
+                    "agent_to_perform_this_action": "Assistant"
                 }
             ],
             "can_perform_without_user_input": "yes",
             "scheduled_tasks": [],
             "metadata": {
-                "user_id": "redacted <class 'int'>",
-                "creator": {
-                    "story": {
-                        "100_word": "redacted <class 'str'>"
-                    },
-                    "characters": {
-                        "Lisa": "redacted <class 'str'>",
-                        "Mark": "redacted <class 'str'>",
-                        "Sam": "redacted <class 'str'>"
-                    },
-                    "videos": {
-                        "Lisa": {
-                            "text": "redacted <class 'str'>",
-                            "conv_id": "redacted <class 'str'>"
-                        }
-                    }
-                }
+                "user_id": "redacted <class 'int'>"
             },
-            "time_took_to_complete": 20.633525848388672,
-            "actions_this_action_depends_on": [
-                1,
-                2
-            ]
-        },
-        {
-            "status": "done",
-            "action": "Check video status with the API: 'https://mailer.hertzai.com/get-video-conv_id/{conv_id}' for conversation ID 65514, and retry every 5 minutes if the status is null. Inform the creator if the action fails.",
-            "fallback_action": "Inform the creator if the checking video status action fails.",
-            "persona": "Creator",
-            "action_id": 4,
-            "recipe": [
-                {
-                    "steps": "Hit the API to check the video status using the conversation ID.",
-                    "tool_name": "",
-                    "generalized_functions": "import requests\n\n# Define the user_id\nconv_id = 64567\n\n# Define the API URL\napi_url = f\"https://mailer.hertzai.com/get-video-conv_id/{{conv_id}}\"\n\n# Make the API call to retrieve the avatar IDs\nresponse = requests.get(api_url)\n\n# Check if the response is successful\nif response.status_code == 200:\n    response = response.json()\nelse:\n    response = None\n\nprint(response)",
-                    "agent_to_perform_this_action": "Executor"
-                },
-                {
-                    "steps": "If the video status is null, schedule a retry after 5 minutes.",
-                    "tool_name": "create_scheduled_jobs",
-                    "agent_to_perform_this_action": "Helper"
-                },
-                {
-                    "steps": "Ask the StatusVerifier agent to confirm the completion of the action.",
-                    "tool_name": "",
-                    "agent_to_perform_this_action": "Assistant"
-                }
-            ],
-            "can_perform_without_user_input": "yes",
-            "scheduled_tasks": [
-                {
-                    "cron_expression": "*/5 * * * *",
-                    "persona": "Creator",
-                    "action_entry_point": 4,
-                    "job_description": "Check the video status every 5 minutes until retrieved successfully"
-                }
-            ],
-            "metadata": {
-                "user_id": "redacted <class 'int'>",
-                "creator": {
-                    "story": {
-                        "100_word": "redacted <class 'str'>"
-                    },
-                    "characters": {
-                        "Lisa": "redacted <class 'str'>",
-                        "Mark": "redacted <class 'str'>",
-                        "Sam": "redacted <class 'str'>"
-                    },
-                    "videos": {
-                        "Lisa": {
-                            "text": "redacted <class 'str'>",
-                            "conv_id": "redacted <class 'str'>"
-                        }
-                    }
-                }
-            },
-            "time_took_to_complete": 57.05520677566528,
-            "actions_this_action_depends_on": [
-                3
-            ]
-        },
-        {
-            "status": "done",
-            "action": "Perform steps every hour to create a new story.",
-            "fallback_action": "Inform the user if performing these steps every hour fails.",
-            "persona": "Creator",
-            "action_id": 5,
-            "recipe": [
-                {
-                    "steps": "Create a 100-word story with multiple characters.",
-                    "tool_name": "",
-                    "generalized_functions": "",
-                    "agent_to_perform_this_action": "Assistant"
-                },
-                {
-                    "steps": "Retrieve avatar IDs using the specified API and associate each character with a unique avatar ID.",
-                    "tool_name": "",
-                    "generalized_functions": "",
-                    "agent_to_perform_this_action": "Assistant"
-                },
-                {
-                    "steps": "Generate realistic video for one character's dialogue at a time using the associated avatar ID.",
-                    "tool_name": "",
-                    "generalized_functions": "",
-                    "agent_to_perform_this_action": "Assistant"
-                },
-                {
-                    "steps": "Hit the API to check the video status and retry if necessary.",
-                    "tool_name": "",
-                    "generalized_functions": "",
-                    "agent_to_perform_this_action": "Assistant"
-                }
-            ],
-            "can_perform_without_user_input": "yes",
-            "scheduled_tasks": [
-                {
-                    "cron_expression": "0 * * * *",
-                    "persona": "Creator",
-                    "action_entry_point": 5,
-                    "job_description": "Performs steps every hour to create a new story."
-                }
-            ],
-            "metadata": {
-                "user_id": "redacted <class 'int'>",
-                "creator": {
-                    "story": {
-                        "100_word": "redacted <class 'str'>"
-                    },
-                    "characters": {
-                        "Lisa": "redacted <class 'str'>",
-                        "Mark": "redacted <class 'str'>",
-                        "Sam": "redacted <class 'str'>"
-                    },
-                    "videos": {
-                        "Lisa": {
-                            "text": "redacted <class 'str'>",
-                            "conv_id": "redacted <class 'str'>"
-                        }
-                    }
-                }
-            },
-            "time_took_to_complete": 10.907878160476685,
-            "actions_this_action_depends_on": [
-                1,
-                2,
-                3,
-                4
-            ]
-        },
-        {
-            "status": "done",
-            "action": "Check if any story is available in memory for the User and send character dialogues with a 10-second interval.",
-            "fallback_action": "Share a joke and ask the user to try again later if no story is available.",
-            "persona": "User",
-            "action_id": 6,
-            "recipe": [
-                {
-                    "steps": "Check if any story is available in memory for the User.",
-                    "tool_name": "get_saved_metadata",
-                    "generalized_functions": "",
-                    "agent_to_perform_this_action": "Helper"
-                },
-                {
-                    "steps": "If a story is available, send all character's dialogue at a time using the stored conv_id with a 10-second interval between successive dialogues until the story ends.",
-                    "tool_name": "send_message_in_seconds",
-                    "generalized_functions": "",
-                    "agent_to_perform_this_action": "Helper"
-                },
-                {
-                    "steps": "Once the story ends, check for a new one and repeat the process.",
-                    "tool_name": "",
-                    "generalized_functions": "",
-                    "agent_to_perform_this_action": "Assistant"
-                },
-                {
-                    "steps": "If no story is available, share a joke and ask the user to try again later.",
-                    "tool_name": "",
-                    "generalized_functions": "",
-                    "agent_to_perform_this_action": "Assistant"
-                }
-            ],
-            "can_perform_without_user_input": "yes",
-            "scheduled_tasks": [
-                {
-                    "cron_expression": "",
-                    "persona": "User",
-                    "action_entry_point": 6,
-                    "job_description": "Check if any story is available for the User and send character dialogues with a 10-second interval."
-                }
-            ],
-            "metadata": {
-                "user_id": "redacted <class 'int'>",
-                "creator": {
-                    "story": {
-                        "100_word": "redacted <class 'str'>"
-                    },
-                    "characters": {
-                        "Lisa": "redacted <class 'str'>",
-                        "Mark": "redacted <class 'str'>",
-                        "Sam": "redacted <class 'str'>"
-                    },
-                    "videos": {
-                        "Lisa": {
-                            "text": "redacted <class 'str'>",
-                            "conv_id": "redacted <class 'str'>"
-                        }
-                    }
-                }
-            },
-            "time_took_to_complete": 10.907878160476685,
-            "actions_this_action_depends_on": [
-                5
-            ]
+            "time_took_to_complete": 41.6982946395874,
+            "actions_this_action_depends_on": []
         }
     ],
     "dependency": [
         {
             "action_id": 1,
             "actions_this_action_depends_on": []
-        },
-        {
-            "action_id": 2,
-            "actions_this_action_depends_on": []
-        },
-        {
-            "action_id": 3,
-            "actions_this_action_depends_on": [
-                1,
-                2
-            ]
-        },
-        {
-            "action_id": 4,
-            "actions_this_action_depends_on": [
-                3
-            ]
-        },
-        {
-            "action_id": 5,
-            "actions_this_action_depends_on": [
-                1,
-                2,
-                3,
-                4
-            ]
-        },
-        {
-            "action_id": 6,
-            "actions_this_action_depends_on": []
         }
     ],
     "recipe": "",
-    "scheduled_tasks": [
-        {
-            "cron_expression": "* * * * *",
-            "persona": "Creator",
-            "action_entry_point": 1,
-            "action_exit_point": 4,
-            "job_description": "Performs steps every hour to create a new story."
-        }
-    ]
+    "scheduled_tasks": []
 }
