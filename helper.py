@@ -274,10 +274,9 @@ class ToolMessageHandler():
                 
                 # Convert next message to user and remove tool_calls
                 next_msg['role'] = 'user'
-                if 'tool_calls' in next_msg:
-                    del next_msg['tool_calls']
+                if 'tool_responses' in next_msg:
+                    del next_msg['tool_responses']
                     next_msg['role'] = 'user'
-                    next_msg['content'] = ' '
                     next_msg['name'] = 'Helper'
                 current_app.logger.warning(f'Next MESSAGE AFTER CHANGE {next_msg}')
             

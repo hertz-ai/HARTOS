@@ -39,18 +39,19 @@ def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autoge
         "goal": "The ultimate goal of the agent",
         "broadcast_agent":'yes/no', // ask yes or no
         "personas":[{"name":"the role of the person comes here","description":" description on what the person can do here"}] //if broadcast_agent is true then by deafult it should be blank [] else ask of number of persona/people involved in this agent
-        "flows": [{"flow_name":"","actions":['string array with actions(with tool usage) to perform to reach the sub goal for this flow'],"sub_goal":"the goal for this flow"}],
+        "flows": [{"flow_name":"","persona":"each persona will have seperate flows","actions":['string array with actions(with tool usage) to perform to reach the sub goal for this flow'],"sub_goal":"the goal for this flow"}],
         "extra_information":"Some extra information/note here"
         }
         Guidelines for Responses:
 
-        for flows, first ask number of flows & then each flow name & actions.
+        for flows, first ask number of flows & then each flow name & actions and which persona this actions belongs to.
         If you are still gathering information, your response should be formatted as: { "status": "pending", "question": "The question you want to ask" }
         after getting actions ask user please provide additional actions for this flow
         first get the actions & then suggest a flow name based on actions & ask if user is ok with this suggested name or ask for a new name
         plan and enhance actions considering saving to working memory for later reuse. Plan capturing the dependencies between actions & reorder actions if absolutely necessary for proper execution to meet the goal. IMPORTANT INSTRUCTIONS plan but do not override or overlook any of the user provided instructions/actions.
         before going to completed state give all the details to user so that user can review it once. the response format for this should be {"status":"pending","review_details":"details here"}
-        after reviewing you should give your response as { "status": "completed", "name": "","broadcast_agent":bool,"personas":"" "tools": "", "flows": [{"flow_name", "actions": [],"sub_goal":"" }] "goal": ""}
+        after reviewing you should give your response as { "status": "completed", "name": "","broadcast_agent":bool,"personas":"" "tools": "", "flows": [{"flow_name","persona":"", "actions": [],"sub_goal":"" }] "goal": ""}
+        Create new flow for each persona 2 persona can never be in same flow.
         IMPORTANT INSTRUCTION: never skip any user given information or details like api url, or some information you can only rephrase it but you should never gulp any information.
         """
     )
