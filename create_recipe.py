@@ -76,7 +76,9 @@ def save_conversation_db(text,user_id,prompt_id,database_url,request_id):
     return conv_id
 
 
-def send_message_to_user1(user_id,response,inp,request_id='AUTOGEN-intermediate'):
+def send_message_to_user1(user_id,response,inp,prompt_id):
+    user_prompt = f'{user_id}_{prompt_id}'
+    request_id = f'{request_id_list[user_prompt]}-intermediate'
     url = 'http://aws_rasa.hertzai.com:9890/autogen_response'
     body = json.dumps({'user_id':user_id,'message':response,'inp':inp,'request_id':request_id})
     headers = {'Content-Type': 'application/json'}
@@ -139,7 +141,7 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
     if last_message['content'] == 'TERMINATE':
         last_message = group_chat.messages[-2]
     #sending response to receiver agent
-    send_message_to_user1(user_id,last_message,task_description)
+    send_message_to_user1(user_id,last_message,task_description,prompt_id)
     return 'done'
 
 from typing import List
@@ -570,7 +572,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         current_app.logger.info(f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
         #TODO add avatar_id and conv_id and response_type
-        thread = threading.Thread(target=send_message_to_user1, args=(user_id, text, '', f'{request_id_list[user_prompt]}-intermediate'))
+        thread = threading.Thread(target=send_message_to_user1, args=(user_id, text, '',prompt_id))
         thread.start()
         return f'Message sent successfully to user with request_id: {request_id_list[user_prompt]}-intermediate'
     
@@ -590,7 +592,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
                        conv_id: Annotated[Optional[int], "conv_id for this text if not available make it None"],) -> str:
         current_app.logger.info('INSIDE send_message_in_seconds')
         current_app.logger.info(f'with text:{text}. and waiting time: {delay} conv_id: {conv_id}')
-        scheduler.add_job(send_message_to_user1, 'date', run_date=time.time() + delay, args=[user_id, text, '', f'{request_id_list[user_prompt]}-intermediate'])
+        scheduler.add_job(send_message_to_user1, 'date', run_date=time.time() + delay, args=[user_id, text, '',prompt_id])
         return 'Message scheduled successfully'
     
     helper.register_for_llm(name="send_message_in_seconds", description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")(send_message_in_seconds)
@@ -1135,7 +1137,7 @@ def create_time_agents(user_id, prompt_id,role,goal):
         current_app.logger.info('INSIDE send_message_to_user')
         current_app.logger.info(f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
-        thread = threading.Thread(target=send_message_to_user1, args=(user_id, text, '', f'{request_id_list[user_prompt]}-intermediate'))
+        thread = threading.Thread(target=send_message_to_user1, args=(user_id, text, '',prompt_id))
         thread.start()
         return f'Message sent successfully to user with request_id: {request_id_list[user_prompt]}-intermediate'
     
@@ -1155,7 +1157,7 @@ def create_time_agents(user_id, prompt_id,role,goal):
                        conv_id: Annotated[Optional[int], "conv_id for this text if not available make it None"],) -> str:
         current_app.logger.info('INSIDE send_message_in_seconds')
         current_app.logger.info(f'with text:{text}. and waiting time: {delay} conv_id: {conv_id}')
-        scheduler.add_job(send_message_to_user1, 'date', run_date=time.time() + delay, args=[user_id, text, '', f'{request_id_list[user_prompt]}-intermediate'])
+        scheduler.add_job(send_message_to_user1, 'date', run_date=time.time() + delay, args=[user_id, text, '',prompt_id])
         return 'Message scheduled successfully'
     
     helper1.register_for_llm(name="send_message_in_seconds", description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")(send_message_in_seconds)
@@ -1240,7 +1242,7 @@ def create_time_agents(user_id, prompt_id,role,goal):
                     json_part = json_match.group(0)
                     current_app.logger.info('Sending user the message')
                     json_obj = json.loads(json_part)
-                    send_message_to_user1(user_id,json_obj['message_2_user'],'')
+                    send_message_to_user1(user_id,json_obj['message_2_user'],'',prompt_id)
                 except:
                     pass
                 return "auto"
