@@ -1,40 +1,38 @@
 {
     "status": "completed",
-    "name": "Story Narrator Agent",
+    "name": "story teller",
     "broadcast_agent": false,
     "personas": [
         {
-            "name": "Creator",
-            "description": "Helps in creating stories"
+            "name": "creator",
+            "description": "who will help to create stories"
         },
         {
-            "name": "User",
-            "description": "Consumes stories"
+            "name": "user",
+            "description": "who will consume stories"
         }
     ],
     "flows": [
         {
-            "flow_name": "Experience Storytime",
-            "persona": "User",
-            "actions": [
-                "Check if any story is available in memory for which all the dialogue statuses are success, and present the dialogues from the selected story with a 10-second interval until the story is completed. Once that story is done, proceed to give the next story using the same process."
-            ],
-            "sub_goal": "To consume and enjoy narrated stories."
-        },
-        {
-            "flow_name": "Create & Generate Stories",
-            "persona": "Creator",
+            "flow_name": "story creator",
+            "persona": "creator",
             "actions": [
                 "Create a 100-word story with multiple characters in the format: (character1 name) dialogue of character1... (character2 name) dialogue of character2, (narrator) like an audiobook, and save it.",
                 "Retrieve avatar IDs using the API: https://mailer.hertzai.com/all_teacher_only_avatars_id_user_id?user_id={user_id} and associate each character with a unique avatar ID from the response, saving that info as well.",
                 "Generate realistic video for all dialogues at a time using the associated avatar ID.",
-                "Check the status of generated dialogue videos using the status API https://mailer.hertzai.com/get-video-conv_id/{{conv_id}} for all conv_ids which do not have status as success. On response from the API, if successfully retrieved the mp4 URL then update the internal memory to status success for the corresponding conv_id; repeat this entire step or action every 5 minutes.",
+                "Check the status of generated dialogue videos using the status API https://mailer.hertzai.com/get-video-conv_id/{{conv_id}} for all conv_ids which do not have status as success.",
                 "Perform steps every hour to create a new story."
             ],
-            "sub_goal": "To create engaging stories with video accompaniment."
+            "sub_goal": "create engaging stories"
+        },
+        {
+            "flow_name": "story consumption",
+            "persona": "user",
+            "actions": [
+                "Check if any story is available in memory for which all the dialogue statuses are success, and present the dialogues from the selected story with a 10-second interval until the story is completed. Once that story is done, proceed to give the next story using the same process."
+            ],
+            "sub_goal": "give stories to user"
         }
     ],
-    "goal": "I am a Story Narrator Agent",
-    "prompt_id": 65,
-    "creator_user_id": 10086
+    "goal": "give stories to user"
 }

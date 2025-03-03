@@ -1122,7 +1122,7 @@ def get_agent_response(assistant: autogen.AssistantAgent,chat_instructor: autoge
                         continue
                 except IndexError as e:
                     current_app.logger.info(f"COmpleted ALL ACTIONS:") 
-                    break
+                    return 'All set! Your tasks are fully completed. Is there anything else you\'d like me to'
                 except:
                     try:
                         json_match = re.search(r'{[\s\S]*}', group_chat.messages[-2]["content"])
@@ -1307,7 +1307,7 @@ def chat_agent(user_id,text,prompt_id,file_id,request_id):
                                     raise 'No json found'
                             except IndexError as e:
                                 current_app.logger.info(f"COmpleted ALL ACTIONS:") 
-                                break
+                                return 'All set! Your tasks are fully completed. Is there anything else you\'d like me to'
                             except Exception as e:
                                 current_app.logger.warning(f'it is not a json object the error is: {e}')
                                 current_app.logger.info('it is not a json object You should ask status verifier to give response in proper format & not move ahead to next action')
