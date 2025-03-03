@@ -2026,19 +2026,36 @@ def chat():
     thread_local_data.set_request_id(request_id=request_id)
     prompt = data.get('prompt', None)
     if prompt_id:
-        if os.path.exists(f'prompts/{prompt_id}_0_recipe.json'):
-            file_path = f'prompts/{prompt_id}.json'
-            with open(file_path, 'r') as f:
-                data = json.load(f)
-                no_of_persona = len(data['personas'])-1
-            if not os.path.exists(f'prompts/{prompt_id}_{no_of_persona}_recipe.json'):
+        if os.path.exists(f'prompts/{prompt_id}.json'):
+            app.logger.info('GATHER JSON EXISTS')
+            if os.path.exists(f'prompts/{prompt_id}_0_recipe.json'):
+                app.logger.info('0 Recipe JSON EXISTS')
+                file_path = f'prompts/{prompt_id}.json'
+                with open(file_path, 'r') as f:
+                    data = json.load(f)
+                    no_of_flow = len(data['flows'])-1
+                    app.logger.info(f'GOT LEN OF FLOW AS {no_of_flow}')
+                if os.path.exists(f'prompts/{prompt_id}_{no_of_flow}_recipe.json'):
+                    app.logger.info(f'{no_of_flow} Recipe Json exist Goinf to reuse')
+                    create_agent = False
+                    review_agents[user_id] = True
+                    conversation_agent[user_id] = False
+                else:
+                    app.logger.info(f'{no_of_flow} Recipe JSON doesnot EXISTS')  
+                    create_agent = True
+                    review_agents[user_id] = True
+                    conversation_agent[user_id] = False
+            else:
+                app.logger.info('0 Recipe JSON doesnot EXISTS')  
                 create_agent = True
                 review_agents[user_id] = True
-                conversation_agent[user_id] = True
-        elif not os.path.exists(f'prompts/{prompt_id}.json'):
+                conversation_agent[user_id] = False
+                       
+        else:
+            app.logger.info('GATHER JSON doesnot EXISTS')
             create_agent = True
             review_agents[user_id] = False
-            conversation_agent[user_id] = False
+            conversation_agent[user_id] = True
         
     if create_agent:
         if user_id not in review_agents.keys() or review_agents[user_id] == False:
@@ -2046,9 +2063,12 @@ def chat():
             prompt = data.get('prompt', None)
             if prompt_id not in first_promts:
                 first_promts.append(prompt_id)
-                res = requests.get(
-                    f'{DB_URL}/getprompt/?prompt_id={prompt_id}').json()
-                prompt = prompt+f" name:{res[0]['name']} goal:{res[0]['prompt']}"
+                try:
+                    res = requests.get(
+                        f'{DB_URL}/getprompt/?prompt_id={prompt_id}').json()
+                    prompt = prompt+f" name:{res[0]['name']} goal:{res[0]['prompt']}"
+                except:
+                    app.logger.error(f'GOT DB ERROR FOR PROMPTID:{prompt_id}')
             if not user_id or not prompt:
                 return jsonify({'response': 'Need user_id and text to create agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
             from gather_agentdetails import gather_info

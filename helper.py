@@ -10,10 +10,83 @@ import uuid
 from datetime import datetime
 import time
 import redis
+from langchain.utilities import GoogleSearchAPIWrapper
+import aiohttp
+import asyncio
+import os
+from bs4 import BeautifulSoup
+from langchain.memory import ZepMemory
+with open("config.json", 'r') as f:
+    config = json.load(f)
 
+
+os.environ["OPENAI_API_KEY"] = config['OPENAI_API_KEY']
+os.environ["GOOGLE_CSE_ID"] = config['GOOGLE_CSE_ID']
+os.environ["GOOGLE_API_KEY"] = config['GOOGLE_API_KEY']
+os.environ["NEWS_API_KEY"] = config['NEWS_API_KEY']
+os.environ["SERPAPI_API_KEY"] = config['SERPAPI_API_KEY']
+
+search = GoogleSearchAPIWrapper(k=4)
 redis_client = redis.StrictRedis(
     host='azure_all_vms.hertzai.com', port=6369, db=0)
 
+async def fetch(session, url):
+    try:
+        async with session.get(url) as response:
+            start_time = time.time()
+            html = await response.text()
+            soup = BeautifulSoup(html, 'html.parser')
+            end_time = time.time()
+            elapsed_time = end_time - start_time
+            print(f"time taken to crawl {url} is {elapsed_time}")
+            return soup.get_text()
+    except Exception as e:
+        print(f"An error occurred while fetching {url}: {e}")
+        return ""
+
+async def async_main(urls):
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch(session, url) for url in urls]
+        return await asyncio.gather(*tasks)
+    
+def top5_results(query):
+    final_res = []
+    top_2_search_res = search.results(query, 2)
+    top_2_search_res_link = [res['link'] for res in top_2_search_res]
+    try:
+        text = asyncio.run(async_main(top_2_search_res_link))
+        # Removing punctuation and extra characters
+        print(text)
+        cleaned_text = re.sub(r'[^\w\s]', '', text[0] +
+                              " "+text[1])  # Remove punctuation
+        # Remove extra newlines and leading/trailing whitespaces
+        cleaned_text = re.sub(r'\n+', '\n', cleaned_text).strip()
+    except RuntimeError as e:
+        print(f"Runtime error occurred: {e}")
+
+    final_res.append({'text': cleaned_text, 'source': top_2_search_res_link})
+    print(f"res:-->{final_res}")
+
+    if len(final_res) == 0:
+        return search.results(query, 4)
+
+    return final_res
+
+
+
+def parse_user_id(user_id:int):
+    url = 'http://azurekong.hertzai.com:8000/db/getstudent_by_user_id'
+
+    headers = {
+        'Content-Type': 'application/json'
+    }
+
+    payload = json.dumps({
+        "user_id": user_id
+    })
+
+    response = requests.request("POST", url, headers=headers, data=payload)
+    return response.text
 
 def topological_sort(actions):
     # Create adjacency list and in-degree dictionary
@@ -332,7 +405,6 @@ def txt2img(text: Annotated[str, "Text to create image"]) -> str:
     response = requests.post(url, headers=headers, data=payload)
     return response.json()['img_url']
 
-import os
 
 def get_frame(user_id):
     current_app.logger.info('inside get_frame')
@@ -383,3 +455,86 @@ def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual c
             current_app.logger.info('ERROR: Got error in visal QA')
             return 'failed to get visual context ask user to check if the camera is turned on'
         
+
+
+def get_time_based_history(prompt: str, session_id: str, start_date: str, end_date: str):
+    '''
+        This function help to extract messages till specified time
+        inputs:
+            prompt: text from user from which we need to extract similar messages
+            session_id: user_{user_id}
+            start_date: time of search start
+            end_date: time till search
+    '''
+
+    start_time = time.time()
+    memory = ZepMemory(
+        session_id=session_id,
+        url='http://azure_all_vms.hertzai.com:8000',
+        api_key='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.J8GYPZN-tVnkiTnS5tyjpQ9FdohZKZo_s5CgasXOqSU',
+        memory_key="chat_history",
+    )
+
+    try:
+
+        metadata = {
+            "start_date": start_date,
+            "end_date":  end_date
+        }
+
+        try:
+            messages = memory.chat_memory.search(prompt, metadata=metadata)
+            current_app.logger.info(f'GOT THE messages from search {messages}')
+        except Exception as e:
+            current_app.logger.info(f'Error: {e}')
+        try:
+            extracted_metadata = [message.message['metadata']
+                                  for message in messages]
+            list_req_ids = [data.get('request_Id', None)
+                            for data in extracted_metadata]
+            current_app.logger.info(f'GOT THE EXTRACTED METADATA AS {extracted_metadata}')
+        except Exception as e:
+            current_app.logger.info(f"Error while getting req ids {e}")
+
+        # messages = [message.dict() for message in messages]
+        serialized_results = []
+        for result in messages:
+            serialized_result = result.dict(exclude_unset=True)
+            # Process the 'message' field to include only specific subfields
+            if 'message' in serialized_result and isinstance(serialized_result['message'], dict):
+                message = serialized_result['message']
+                filtered_message = {
+                    'content': message.get('content'),
+                    'role': message.get('role'),
+                    'created_at': message.get('created_at'),
+                    'request_id': message.get('metadata', {}).get('request_id') if 'metadata' in message else None
+                }
+                # Replace the original message with the filtered message
+                serialized_result['message'] = filtered_message
+            serialized_results.append(serialized_result)
+        messages = serialized_results
+        final_res = {'res_in_filter': messages}
+        current_app.logger.info(f"final-->{final_res}")
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        return json.dumps(final_res)
+    except Exception as e:
+        current_app.logger.info(f"Exception {e}")
+        try:
+            messages = memory.chat_memory.search(prompt)
+        except:
+           current_app.logger.info(f'Error: {e}')
+
+        # current_app.logger.info(f"final messages in except-->{messages}")
+        try:
+            extracted_metadata = [message.message['metadata']
+                                  for message in messages]
+            list_req_ids = [data.get('request_Id', None)
+                            for data in extracted_metadata]
+        except Exception as e:
+            current_app.logger.info(f"Error while getting req ids {e}")
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        current_app.logger.info("time taken for zep is {elapsed_time}")
+        return json.dumps({'res': [message.message['content'] for message in messages]})
+

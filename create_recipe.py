@@ -511,7 +511,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
 
     def img2txt(image_url: Annotated[str, "image url of which you want text"],text: Annotated[str, "the details you want from image"]='Describe the Images & Text data in this image in detail') -> str:
         current_app.logger.info('INSIDE img2txt')
-        url = "http://azure_all_vms.hertzai.com:6066/image_inference"
+        url = "http://azurekong.hertzai.com:8000/llava/image_inference"
 
         payload = {
             'url': image_url,
@@ -595,6 +595,24 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     
     helper.register_for_llm(name="send_message_in_seconds", description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")(send_message_in_seconds)
     assistant.register_for_execution(name="send_message_in_seconds")(send_message_in_seconds)
+    
+    def get_chat_history(text: Annotated[str, "Text related to which you want history"],start: Annotated[str, "start date in format %Y-%m-%dT%H:%M:%S.%fZ"],end: Annotated[str, "end date in format %Y-%m-%dT%H:%M:%S.%fZ"]) -> str:
+        current_app.logger.info('INSIDE get_chat_history')
+        return helper_fun.get_time_based_history(text, f'user_{user_id}', start, end)
+    helper.register_for_llm(name="get_chat_history", description="Get Chat history based on text & start & end date")(get_chat_history)
+    assistant.register_for_execution(name="get_chat_history")(get_chat_history)
+    
+    def google_search(text: Annotated[str, "Text which you want to search"]) -> str:
+        current_app.logger.info('INSIDE google search')
+        return helper_fun.top5_results(text)
+    helper.register_for_llm(name="google_search", description="Get google ssearch response")(google_search)
+    assistant.register_for_execution(name="google_search")(google_search)
+    
+    def get_user_details()->str:
+        current_app.logger.info('INSIDE get user details')
+        return helper_fun.parse_user_id(user_id)
+    helper.register_for_llm(name="get_user_details", description="Get User details like name, dob, gender")(get_user_details)
+    assistant.register_for_execution(name="get_user_details")(get_user_details)
     
     assistant.description = 'this is an assistant agent that coordinates & executes requested tasks & actions'
     executor.description = 'this is an executor agent that Specialized agent for code execution & response handling'
@@ -1059,7 +1077,7 @@ def create_time_agents(user_id, prompt_id,role,goal):
 
     def img2txt(image_url: Annotated[str, "image url of which you want text"],text: Annotated[str, "the details you want from image"]='Describe the Images & Text data in this image in detail') -> str:
         current_app.logger.info('INSIDE img2txt')
-        url = "http://azure_all_vms.hertzai.com:6066/image_inference"
+        url = "http://azurekong.hertzai.com:8000/llava/image_inference"
 
         payload = {
             'url': image_url,

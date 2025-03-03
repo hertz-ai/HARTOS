@@ -17,7 +17,7 @@ from PIL import Image
 from langchain.memory import ZepMemory
 from crossbarhttp import Client
 from flask import current_app
-from helper import topological_sort, ToolMessageHandler, strip_json_values
+from helper import topological_sort, ToolMessageHandler, strip_json_values, get_time_based_history
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
 import threading
 
@@ -119,10 +119,11 @@ def get_role(user_id,prompt_id):
         role = 'user'
     return role
 
-def send_message_to_user1(user_id,response,inp):
+def send_message_to_user1(user_id,response,inp,prompt_id):
+    user_prompt = f'{user_id}_{prompt_id}'
     current_app.logger.info(f'INSIDE send_message_to_user with user_id:{user_id} response:{response} inp:{inp}')
     url = 'http://aws_rasa.hertzai.com:9890/autogen_response'
-    body = json.dumps({'user_id':user_id,'message':response,'inp':inp})
+    body = json.dumps({'user_id':user_id,'message':response,'inp':inp,'request_id':f'{request_id_list[user_prompt]}-intermediate'})
     headers = {'Content-Type': 'application/json'}
     res = requests.post(url,data=body,headers=headers)
 
@@ -149,7 +150,7 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
         if last_message['content'] == 'TERMINATE':
             last_message = group_chat.messages[-2]
         #sending response to receiver agent
-        send_message_to_user1(user_id,last_message,task_description)
+        send_message_to_user1(user_id,last_message,task_description,prompt_id)
     return 'done'
 
 def get_frame(user_id):
@@ -168,88 +169,6 @@ def get_frame(user_id):
     except ModuleNotFoundError as e:
         raise e
     
-
-def get_time_based_history(prompt: str, session_id: str, start_date: str, end_date: str):
-    '''
-        This function help to extract messages till specified time
-        inputs:
-            prompt: text from user from which we need to extract similar messages
-            session_id: user_{user_id}
-            start_date: time of search start
-            end_date: time till search
-    '''
-
-    start_time = time.time()
-    memory = ZepMemory(
-        session_id=session_id,
-        url='http://azure_all_vms.hertzai.com:8000',
-        api_key='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.J8GYPZN-tVnkiTnS5tyjpQ9FdohZKZo_s5CgasXOqSU',
-        memory_key="chat_history",
-    )
-
-    try:
-
-        metadata = {
-            "start_date": start_date,
-            "end_date":  end_date
-        }
-
-        try:
-            messages = memory.chat_memory.search(prompt, metadata=metadata)
-            current_app.logger.info(f'GOT THE messages from search {messages}')
-        except Exception as e:
-            current_app.logger.info(f'Error: {e}')
-        try:
-            extracted_metadata = [message.message['metadata']
-                                  for message in messages]
-            list_req_ids = [data.get('request_Id', None)
-                            for data in extracted_metadata]
-            current_app.logger.info(f'GOT THE EXTRACTED METADATA AS {extracted_metadata}')
-        except Exception as e:
-            current_app.logger.info(f"Error while getting req ids {e}")
-
-        # messages = [message.dict() for message in messages]
-        serialized_results = []
-        for result in messages:
-            serialized_result = result.dict(exclude_unset=True)
-            # Process the 'message' field to include only specific subfields
-            if 'message' in serialized_result and isinstance(serialized_result['message'], dict):
-                message = serialized_result['message']
-                filtered_message = {
-                    'content': message.get('content'),
-                    'role': message.get('role'),
-                    'created_at': message.get('created_at'),
-                    'request_id': message.get('metadata', {}).get('request_id') if 'metadata' in message else None
-                }
-                # Replace the original message with the filtered message
-                serialized_result['message'] = filtered_message
-            serialized_results.append(serialized_result)
-        messages = serialized_results
-        final_res = {'res_in_filter': messages}
-        current_app.logger.info(f"final-->{final_res}")
-        end_time = time.time()
-        elapsed_time = end_time - start_time
-        return json.dumps(final_res)
-    except Exception as e:
-        current_app.logger.info(f"Exception {e}")
-        try:
-            messages = memory.chat_memory.search(prompt)
-        except:
-           current_app.logger.info(f'Error: {e}')
-
-        # current_app.logger.info(f"final messages in except-->{messages}")
-        try:
-            extracted_metadata = [message.message['metadata']
-                                  for message in messages]
-            list_req_ids = [data.get('request_Id', None)
-                            for data in extracted_metadata]
-        except Exception as e:
-            current_app.logger.info(f"Error while getting req ids {e}")
-        end_time = time.time()
-        elapsed_time = end_time - start_time
-        current_app.logger.info("time taken for zep is {elapsed_time}")
-        return json.dumps({'res': [message.message['content'] for message in messages]})
-
 
 #TODO Reset action order after it reaches end.
 def create_agents_for_role(user_id: str,prompt_id):
@@ -642,7 +561,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     @helper.register_for_llm(api_style="function",description="Image to Text/Question Answering from image")
     def img2txt(image_url: Annotated[str, "image url of which you want text"],text: Annotated[str, "the details you want from image"]='Describe the Images & Text data in this image in detail') -> str:
         current_app.logger.info('INSIDE img2txt')
-        url = "http://azure_all_vms.hertzai.com:6066/image_inference"
+        url = "http://azurekong.hertzai.com:8000/llava/image_inference"
 
         payload = {
             'url': image_url,
@@ -997,14 +916,14 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         if last_message['content'] == 'TERMINATE':
             last_message = group_chat.messages[-2]
         #sending response to receiver agent
-        send_message_to_user1(user_id,last_message,'')
+        send_message_to_user1(user_id,last_message,'',prompt_id)
         
         text = f'The Response from main Agent: {last_message}'
         result = time_user.initiate_chat(manager_1, message=text,speaker_selection={"speaker": "assistant"}, clear_history=False)
         last_message = group_chat.messages[-1]
         if last_message['content'] == 'TERMINATE':
             last_message = group_chat.messages[-2]
-        send_message_to_user1(user_id,last_message,'')
+        send_message_to_user1(user_id,last_message,'',prompt_id)
         return 'Done'
         
     # Register the tool signature with the assistant agent.
@@ -1094,7 +1013,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
                     json_part = json_match.group(0)
                     current_app.logger.info('Sending user the message')
                     json_obj = json.loads(json_part)
-                    send_message_to_user1(user_id,json_obj['message_2_user'],'')
+                    send_message_to_user1(user_id,json_obj['message_2_user'],'',prompt_id)
                 except:
                     pass
                 return "auto"
@@ -1126,7 +1045,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
                     json_part = json_match.group(0)
                     current_app.logger.info('Sending user the message')
                     json_obj = json.loads(json_part)
-                    send_message_to_user1(user_id,json_obj['message_2_user'],'')
+                    send_message_to_user1(user_id,json_obj['message_2_user'],'',prompt_id)
                 except:
                     pass
                 return "auto"
@@ -1319,8 +1238,8 @@ def chat_agent(user_id,text,prompt_id,file_id,request_id):
                 assistant, user_proxy, group_chat, manager, helper, stop = role_agents[user_prompt]
                 if stop:
                     user_journey[user_prompt] = 'UseBot'
-                    action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)['action']
-                    user_message = f"Action {user_tasks[user_prompt].current_action+1}:{action_message}"
+                    # action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)['action']
+                    # user_message = f"Action {user_tasks[user_prompt].current_action+1}:{action_message}"
                 else:
                     user_journey[user_prompt] = 'Roles'
             if user_journey[user_prompt] == 'UseBot':
@@ -1443,7 +1362,7 @@ def crossbar_multiagent(msg):
         last_message = group_chat.messages[-2]
         
     #sending response to receiver agent
-    send_message_to_user1(msg['user_id'],last_message,msg['message'])
+    send_message_to_user1(msg['user_id'],last_message,msg['message'],msg['caller_prompt_id'])
     
     user_prompt = f"{msg['caller_user_id']}_{msg['caller_prompt_id']}"
     assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor = user_agents[user_prompt]
@@ -1454,4 +1373,4 @@ def crossbar_multiagent(msg):
         last_message = group_chat.messages[-2]
     
     #sending response to caller agent
-    send_message_to_user1(msg['caller_user_id'],last_message,msg['message'])
+    send_message_to_user1(msg['caller_user_id'],last_message,msg['message'],msg['caller_prompt_id'])
