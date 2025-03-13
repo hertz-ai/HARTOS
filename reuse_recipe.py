@@ -689,9 +689,9 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         except:
             pass
         if data['chattts'] or data['flag_hallo'] == "true":
-            return f"Video Generation task added to queue with conv_id:{conv_id}(this is conversation id) ask helper to save this conv_id along with the text used to generate video for future use."
+            return f"Video Generation task added to queue with conv_id:{conv_id}(this is conversation id) ask helper to save this conv_id in the collection from where it got text used to generate video for future use."
         else:
-            return f"Video Generation completed with conv_id:{conv_id}(this is conversation id) ask helper to save this conv_id along with the text used to generate video for future use."
+            return f"Video Generation completed with conv_id:{conv_id}(this is conversation id) ask helper to save this conv_id in the collection from where it got text used to generate video for future use."
         
         
     @assistant.register_for_execution()
