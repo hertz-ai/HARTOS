@@ -7,9 +7,11 @@ from typing import List, Dict, Tuple, Annotated
 import pickle
 from PIL import Image
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 import redis
+from langchain.schema import AgentAction, AgentFinish, OutputParserException, HumanMessage, AIMessage, SystemMessage
+import pytz
 from langchain.utilities import GoogleSearchAPIWrapper
 import aiohttp
 import asyncio
@@ -25,6 +27,10 @@ os.environ["GOOGLE_CSE_ID"] = config['GOOGLE_CSE_ID']
 os.environ["GOOGLE_API_KEY"] = config['GOOGLE_API_KEY']
 os.environ["NEWS_API_KEY"] = config['NEWS_API_KEY']
 os.environ["SERPAPI_API_KEY"] = config['SERPAPI_API_KEY']
+ACTION_API = config['ACTION_API']
+STUDENT_API = config['STUDENT_API']
+ZEP_API_URL = config['ZEP_API_URL']
+ZEP_API_KEY = config['ZEP_API_KEY']
 
 search = GoogleSearchAPIWrapper(k=4)
 redis_client = redis.StrictRedis(
@@ -332,18 +338,18 @@ class ToolMessageHandler():
             if current_msg.get('tool_calls') and next_msg.get('role') != 'tool':
                 current_app.logger.warning(f'CHANGE IN {i}')
                 current_app.logger.warning(f'CURRENT MSG HAS TOOL_CALLS AND NEXT IS NOT TOOL RESPONSE')
-                current_app.logger.warning(f'CURRENT MSG {current_msg}')
+                # current_app.logger.warning(f'CURRENT MSG {current_msg}')
                 del current_msg['tool_calls']
                 current_msg['role'] = 'user'
                 current_msg['content'] = ' '
                 current_msg['name'] = 'Helper'
-                current_app.logger.warning(f'CURRENT MSG AFTER DELETE {current_msg}')
+                # current_app.logger.warning(f'CURRENT MSG AFTER DELETE {current_msg}')
                 
             # Case 2: Current message doesn't have tool_calls but next is a tool
             elif not current_msg.get('tool_calls') and next_msg.get('role') == 'tool':
                 current_app.logger.warning(f'CHANGE IN {i}')
                 current_app.logger.warning(f'CHANGE IN NEXT MESSAFE TO USER')
-                current_app.logger.warning(f'Next MESSAGE BEFORE CHANGE {next_msg}')
+                # current_app.logger.warning(f'Next MESSAGE BEFORE CHANGE {next_msg}')
                 
                 # Convert next message to user and remove tool_calls
                 next_msg['role'] = 'user'
@@ -351,7 +357,7 @@ class ToolMessageHandler():
                     del next_msg['tool_responses']
                     next_msg['role'] = 'user'
                     next_msg['name'] = 'Helper'
-                current_app.logger.warning(f'Next MESSAGE AFTER CHANGE {next_msg}')
+                # current_app.logger.warning(f'Next MESSAGE AFTER CHANGE {next_msg}')
             
             # Case 3: Current message has tool_calls but next message isn't a tool
             elif current_msg.get('role') == 'tool' and next_msg.get('role') == 'tool':
@@ -361,7 +367,7 @@ class ToolMessageHandler():
                 current_msg['role'] = 'user'
         
         current_app.logger.debug("processed_messages")
-        current_app.logger.debug(processed_messages)
+        # current_app.logger.debug(processed_messages)
         return processed_messages
         
     def get_logs(self, pre_transform_messages: List[Dict], post_transform_messages: List[Dict]) -> Tuple[str, bool]:
@@ -476,11 +482,11 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
     )
 
     try:
-
-        metadata = {
-            "start_date": start_date,
-            "end_date":  end_date
-        }
+        metadata = {}
+        if start_date:
+            metadata['start_date'] = start_date
+        if end_date:
+            metadata['end_date'] = end_date
 
         try:
             messages = memory.chat_memory.search(prompt, metadata=metadata)
@@ -538,3 +544,107 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
         current_app.logger.info("time taken for zep is {elapsed_time}")
         return json.dumps({'res': [message.message['content'] for message in messages]})
 
+def parse_date(date_str):
+    return datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%S")
+
+def get_visual_context(user_id):
+    '''
+        This function help to extract action that user have perfomed till time
+    '''
+    action_url = f"{ACTION_API}?user_id={user_id}"
+
+    # Todo: get, and populate timezone from client
+    time_zone = "Asia/Kolkata"
+
+    india_tz = pytz.timezone(time_zone)
+
+    payload = {}
+    headers = {}
+
+    response = requests.request(
+        "GET", action_url, headers=headers, data=payload)
+
+    if response.status_code == 200:
+
+        data = response.json()
+
+
+        filtered_data_video = [
+            obj for obj in data if obj["zeroshot_label"] == 'Video Reasoning']
+
+        # Process video data
+        video_context_texts = []
+        for obj in filtered_data_video:
+            action = obj["action"]
+            date = parse_date(obj["created_date"])
+            gpt3_label = obj["gpt3_label"]
+
+            if gpt3_label == 'Visual Context':
+                now = datetime.now()
+                # Check if the action is older than 5 minutes
+                if (now - date) > timedelta(minutes=5):
+                    continue
+            first_action_text = f"{action} on {date.astimezone(india_tz).strftime('%Y-%m-%dT%H:%M:%S')}"
+
+            video_context_texts.append(first_action_text)
+        action_texts = []
+        if video_context_texts:
+            action_texts.append('<Last_5_Minutes_Visual_Context_Start>')
+            action_texts.extend(video_context_texts)
+            action_texts.append('<Last_5_Minutes_Visual_Context_End>')
+            action_texts.append(
+                'If a person is identified in Visual_Context section that\'s most probably the user (me) & most likely not taking any selfie.')
+
+        if len(action_texts) == 0:
+            action_texts = ['user has not performed any actions yet.']
+            return None
+
+        actions = ", ".join(action_texts)
+        # Get the current time
+
+        # Format the time in the desired format
+        formatted_time = datetime.now(pytz.utc).astimezone(
+            india_tz).strftime('%Y-%m-%d %H:%M:%S')
+
+        actions = actions + ". List of actions ends. <PREVIOUS_USER_ACTION_END> \n " + "Today's datetime in "+time_zone + "is: " + formatted_time + \
+            " in this format:'%Y-%m-%dT%H:%M:%S' \n Whenever user is asking about current date or current time at particular location then use this datetime format by asking what user's location is. Use the previous sentence datetime info to answer current time based questions coupled with google_search for current time or full_history for historical conversation based answers. Take a deep breath and think step by step.\n"
+        # user detail api
+
+        return actions
+    else:
+        return None
+
+def get_memory(user_id: int):
+    '''
+        Get memory object from zep
+    '''
+    session_id = "user_"+str(user_id)
+    memory = ZepMemory(
+        session_id=session_id,
+        url=ZEP_API_URL,
+        memory_key="chat_history",
+        api_key=ZEP_API_KEY,
+        return_messages=True,
+        input_key="input"
+    )
+    return memory
+
+def history(user_id,prompt_id,role,message):
+    try:
+        memory = get_memory(user_id=int(user_id))
+    except:
+        return "Invalid user ID"
+    if memory:
+        if role == 'user':
+            memory.chat_memory.add_message(
+                HumanMessage(content=message),
+                metadata={'prompt_id': prompt_id}
+            )
+        else:
+            memory.chat_memory.add_message(
+                AIMessage(content=message),
+                metadata={'prompt_id': prompt_id}
+            )
+        return "Messages are saved!!!"
+    else:
+        return "Memory object not found"

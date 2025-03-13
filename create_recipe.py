@@ -493,9 +493,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         except:
             pass
         if data['chattts'] or data['flag_hallo'] == "true":
-            return f"Video Generation task added to queue with conv_id:{conv_id}(this is conversation id) ask helper to save this conv_id along with the text used to generate video for future use."
+            return f"Video Generation task added to queue with conv_id:{conv_id}(this is conversation id) ask helper to save this conv_id in the collection from where it got text used to generate video for future use."
         else:
-            return f"Video Generation completed with conv_id:{conv_id}(this is conversation id) ask helper to save this conv_id along with the text used to generate video for future use."
+            return f"Video Generation completed with conv_id:{conv_id}(this is conversation id) ask helper to save this conv_id in the collection from where it got text used to generate video for future use."
     
     helper.register_for_llm(name="Generate_video", description="Generate/presynthesize video with text and save it in database")(Generate_video)
     assistant.register_for_execution(name="Generate_video")(Generate_video)
@@ -598,7 +598,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     helper.register_for_llm(name="send_message_in_seconds", description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")(send_message_in_seconds)
     assistant.register_for_execution(name="send_message_in_seconds")(send_message_in_seconds)
     
-    def get_chat_history(text: Annotated[str, "Text related to which you want history"],start: Annotated[str, "start date in format %Y-%m-%dT%H:%M:%S.%fZ"],end: Annotated[str, "end date in format %Y-%m-%dT%H:%M:%S.%fZ"]) -> str:
+    def get_chat_history(text: Annotated[str, "Text related to which you want history"],
+                         start: Annotated[Optional[str], "start date in format %Y-%m-%dT%H:%M:%S.%fZ"] = None,
+                         end: Annotated[Optional[str], "end date in format %Y-%m-%dT%H:%M:%S.%fZ"] = None) -> str:
         current_app.logger.info('INSIDE get_chat_history')
         return helper_fun.get_time_based_history(text, f'user_{user_id}', start, end)
     helper.register_for_llm(name="get_chat_history", description="Get Chat history based on text & start & end date")(get_chat_history)
@@ -626,6 +628,16 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     def state_transition(last_speaker, groupchat):
         current_app.logger.info(f'Inside state_transition with actions {user_tasks[user_prompt].current_action}')
         messages = groupchat.messages
+        new_role = 'user'
+        if messages[-1]['name'] != 'UserProxy':
+            new_role = 'AI'
+        helper_fun.history(user_id,prompt_id,new_role,messages[-1]['content'])
+        # if len(messages) % 10 == 0 or messages[-1]['name'] == 'UserProxy':
+        #     current_app.logger.info('CHECKING FOR VIDEO FOR PAST 5MINS')
+        #     visual_context = helper_fun.get_visual_context(user_id)
+        #     current_app.logger.info(f'GOT RESPONSE AS {visual_context}')
+        #     if visual_context:
+        #         groupchat.messages.insert(-2,{'content':visual_context,'role':'user','name':'helper'})
         # current_app.logger.info(f'{messages[-1]}')
         current_app.logger.info(f'Inside state_transition with message {messages[-1]["content"][:10]}.. & last_speaker:{last_speaker.name}')
         # crossbar_message = {"text": ["Working on "+messages[-1]['content']+".\n please evaluate the response i am giving to check if it meets the current action"], "priority": 49, "action": 'Thinking', "historical_request_id": [], "preffered_language": 'en-US', "options": [], "newoptions": [], "bot_type": 'Agent', "page_image_url": "", "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
@@ -1059,9 +1071,9 @@ def create_time_agents(user_id, prompt_id,role,goal):
         except:
             pass
         if data['chattts'] or data['flag_hallo'] == "true":
-            return f"Video Generation task added to queue with conv_id:{conv_id}(this is conversation id) ask helper to save this conv_id along with the text used to generate video for future use."
+            return f"Video Generation task added to queue with conv_id:{conv_id}(this is conversation id) ask helper to save this conv_id in the collection from where it got text used to generate video for future use."
         else:
-            return f"Video Generation completed with conv_id:{conv_id}(this is conversation id) ask helper to save this conv_id along with the text used to generate video for future use."
+            return f"Video Generation completed with conv_id:{conv_id}(this is conversation id) ask helper to save this conv_id in the collection from where it got text used to generate video for future use."
     
     helper1.register_for_llm(name="Generate_video", description="Generate/presynthesize video with text and save it in database")(Generate_video)
     time_agent.register_for_execution(name="Generate_video")(Generate_video)
@@ -1198,6 +1210,9 @@ def create_time_agents(user_id, prompt_id,role,goal):
     def state_transition1(last_speaker, groupchat):
         current_app.logger.info('INSIDE TIMER STATE TRANSITION')      
         messages = groupchat.messages
+        # visual_context = helper_fun.get_visual_context(user_id)
+        # if visual_context:
+        #     groupchat.messages.insert(-1,{'content':visual_context,'role':'user','name':'helper'})
         try:
             pattern = r'\{.*?\}' # getting all json from text
             matches = re.findall(pattern, messages[-1]["content"], re.DOTALL)   
@@ -1500,6 +1515,10 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     if recipe_for_persona[user_prompt]  < total_persona_actions[user_prompt]:
                         current_app.logger.info(f'Completed ONE FLOW NOW WE SHOULD WORK ON NEXT FLOW')
                         current_app.logger.info(f'DELETED CURRENT AGENTS AND CREATE NEW')
+                        with open(f"prompts/{prompt_id}.json", 'r') as f:
+                            config = json.load(f)
+                        # recipe_for_persona[user_prompt] += 1
+                        user_tasks[user_prompt] = Action(config['flows'][recipe_for_persona[user_prompt]]['actions'])
                         del user_agents[user_prompt]
                         x = get_response_group(user_id,text,prompt_id)
                         continue
