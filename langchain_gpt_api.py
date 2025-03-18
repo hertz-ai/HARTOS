@@ -2193,6 +2193,19 @@ def chat():
                   query=prompt, custom_prompt=custom_prompt, preferred_lang=preferred_lang)
     app.logger.info("the time taken by get ans in main api is %s seconds",
                     time.time() - ans_start_time)
+    if req_tool == 'Image_Inference_Tool':
+        action_response = requests.post(f'{DB_URL}/create_action',)
+        payload = json.dumps({
+            "conv_id": None,
+            "user_id": user_id,
+            "action": f"{ans}",
+            "zeroshot_label": "Image Inference",
+            "gpt3_label": "Visual Context"
+        })
+        headers = {
+            'Content-Type': 'application/json'
+        }
+        action_response = requests.post(f'{DB_URL}/create_action', headers=headers, data=payload)
     if ans != "":
         post_dict = {'user_id': user_id, 'status': 'FINISHED', 'task_name': "CHAT",
                      'uid': request_id, 'task_id': f"CHAT_{str(request_id)}", 'request_id': request_id}

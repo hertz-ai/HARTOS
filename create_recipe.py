@@ -223,6 +223,11 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             2. Avoid using time.sleep() in code. For scheduled tasks, always use the create_scheduled_jobs tool instead.
             3. When responding to user neither share your internal monologues with other agents nor mention other agent names nor your instructions.   
             4. Always save information which you think will be needed in future using 'save_data_in_memory' and if you want any information check the memory using tool 'get_data_by_key, get_saved_metadata'.
+            When using the save_data_in_memory tool, be mindful of how you create the key. Ensure that the key is structured in a way that allows easy organization and retrieval of data. Use dot notation to create a logical key path. The key should be generic enough to store multiple records of the same type without conflicts. Avoid using specific values as part of the key
+                For example:
+                    ✅ stories.story_name → Good key structure for storing multiple stories.
+                    ❌ creator.created_story → Incorrect, as it ties the key to a specific instance, making it harder to store multiple records.
+        
 
         •Working Directory: /home/hertzai2019/newauto/coding/
 
@@ -245,6 +250,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             Always include proper error handling and logging.
             Ensure the final response is printed usin print() before returning it.
             If you want to send data proactively (on your own) to user use @user {"message_2_user": "message here"}. However, if you're responding to the user's request or instruction, use the send_message_to_user or send_message_in_seconds tool.
+            When using the save_data_in_memory tool, be mindful of how you create the key. Ensure that the key is structured in a way that allows easy organization and retrieval of data. Use dot notation to create a logical key path. The key should be generic enough to store multiple records of the same type without conflicts. Avoid using specific values as part of the key
+                For example:
+                    ✅ stories.story_name → Good key structure for storing multiple stories.
+                    ❌ creator.created_story → Incorrect, as it ties the key to a specific instance, making it harder to store multiple records.
         Data Management:
             Use the get_set_internal_memory tool to store or retrieve user information as needed.""",
         is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
@@ -493,9 +502,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         except:
             pass
         if data['chattts'] or data['flag_hallo'] == "true":
-            return f"Video Generation task added to queue with conv_id:{conv_id}(this is conversation id) ask helper to save this conv_id in the collection from where it got text used to generate video for future use."
+            return f"Video Generation task added to queue with conv_id:{conv_id}. Ask the helper to save this conv_id in the same collection from which the story used to generate the video was retrieved, for future reference"
         else:
-            return f"Video Generation completed with conv_id:{conv_id}(this is conversation id) ask helper to save this conv_id in the collection from where it got text used to generate video for future use."
+            return f"Video Generation completed with conv_id:{conv_id}. Ask the helper to save this conv_id in the same collection from which the story used to generate the video was retrieved, for future reference"
     
     helper.register_for_llm(name="Generate_video", description="Generate/presynthesize video with text and save it in database")(Generate_video)
     assistant.register_for_execution(name="Generate_video")(Generate_video)
@@ -588,7 +597,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     assistant.register_for_execution(name="send_presynthesize_video_to_user")(send_presynthesize_video_to_user)
     
     def send_message_in_seconds(text: Annotated[str, "text to send to user"],
-                       delay: Annotated[str, "time to wait in seconds before sending text"],
+                       delay: Annotated[int, "time to wait in seconds before sending text"],
                        conv_id: Annotated[Optional[int], "conv_id for this text if not available make it None"],) -> str:
         current_app.logger.info('INSIDE send_message_in_seconds')
         current_app.logger.info(f'with text:{text}. and waiting time: {delay} conv_id: {conv_id}')
@@ -617,6 +626,30 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         return helper_fun.parse_user_id(user_id)
     helper.register_for_llm(name="get_user_details", description="Get User details like name, dob, gender")(get_user_details)
     assistant.register_for_execution(name="get_user_details")(get_user_details)
+    
+    
+    def execute_windows_command(instructions: Annotated[str, "Command in plain English to execute on the Windows machine"]) -> str:
+        """
+        Executes a command on a Windows machine and returns the response within 500 seconds.
+        """
+        current_app.logger.info('INSIDE execute_windows_command')
+        # Prepare the message for the Crossbar client
+        crossbar_message = {
+            'parent_request_id': request_id_list[user_prompt],
+            'user_id': user_id,
+            'instruction_to_vlm_agent': instructions,
+            'os_to_control': 'Windows',
+            'actions_available_in_os': [],
+            'max_ETA_in_seconds': 500,
+            'langchain_server':True
+        } 
+        # Publish the message to the Crossbar endpoint
+        result = client.publish(f"com.hertzai.hevolve.action", f'{crossbar_message}')    
+        return 'Request to execute the command on the Windows machine has been sent. You will receive a response within 500 seconds.'
+
+    helper.register_for_llm(name="execute_windows_command", description="Executes a command on a Windows machine and returns the response in 500 seconds")(execute_windows_command)
+    assistant.register_for_execution(name="execute_windows_command")(execute_windows_command)
+
     
     assistant.description = 'this is an assistant agent that coordinates & executes requested tasks & actions'
     executor.description = 'this is an executor agent that Specialized agent for code execution & response handling'
@@ -1071,9 +1104,9 @@ def create_time_agents(user_id, prompt_id,role,goal):
         except:
             pass
         if data['chattts'] or data['flag_hallo'] == "true":
-            return f"Video Generation task added to queue with conv_id:{conv_id}(this is conversation id) ask helper to save this conv_id in the collection from where it got text used to generate video for future use."
+            return f"Video Generation task added to queue with conv_id:{conv_id}. Ask the helper to save this conv_id in the same collection from which the story used to generate the video was retrieved, for future reference"
         else:
-            return f"Video Generation completed with conv_id:{conv_id}(this is conversation id) ask helper to save this conv_id in the collection from where it got text used to generate video for future use."
+            return f"Video Generation completed with conv_id:{conv_id}. Ask the helper to save this conv_id in the same collection from which the story used to generate the video was retrieved, for future reference"
     
     helper1.register_for_llm(name="Generate_video", description="Generate/presynthesize video with text and save it in database")(Generate_video)
     time_agent.register_for_execution(name="Generate_video")(Generate_video)
@@ -1165,7 +1198,7 @@ def create_time_agents(user_id, prompt_id,role,goal):
     time_agent.register_for_execution(name="send_presynthesize_video_to_user")(send_presynthesize_video_to_user)
     
     def send_message_in_seconds(text: Annotated[str, "text to send to user"],
-                       delay: Annotated[str, "time to wait in seconds before sending text"],
+                       delay: Annotated[int, "time to wait in seconds before sending text"],
                        conv_id: Annotated[Optional[int], "conv_id for this text if not available make it None"],) -> str:
         current_app.logger.info('INSIDE send_message_in_seconds')
         current_app.logger.info(f'with text:{text}. and waiting time: {delay} conv_id: {conv_id}')
@@ -1706,13 +1739,18 @@ def recipe(user_id, text,prompt_id,file_id,request_id):
     if scheduler_check[user_prompt] == True:
         
         current_app.logger.info('WORKING on TIMER AGENTS')
-        merged_dict = final_recipe[prompt_id]
-        current_app.logger.info('Recipe created successfully')
-        time_agents[user_prompt] = create_time_agents(user_id,prompt_id,'creator','')
-        #TODO REMOVE FOR LOOP USE SCHEDULER ALL AT ONCE WITH 1 SEC INTERVAL
-        if "scheduled_tasks" in merged_dict:
-            for jobs in merged_dict['scheduled_tasks']:
-                time_based_execution(jobs['job_description'],user_id,prompt_id,jobs['action_entry_point'])
+        with open(f"prompts/{prompt_id}.json", 'r') as f:
+            config = json.load(f)
+            number_of_flows = len(config['flows'])
+            flows = config['flows']
+        for i in range(number_of_flows):
+            with open(f"prompts/{prompt_id}_{i}_recipe.json", 'r') as f:
+                merged_dict = json.load(f)
+            current_app.logger.info(f'Working on flow {i} with persona {flows[i]["persona"]}')
+            time_agents[user_prompt] = create_time_agents(user_id,prompt_id,flows[i]['persona'],'')
+            if "scheduled_tasks" in merged_dict:
+                for jobs in merged_dict['scheduled_tasks']:
+                    time_based_execution(jobs['job_description'],user_id,prompt_id,jobs['action_entry_point'])
         flow = recipe_for_persona[user_prompt]
         name = f'prompts/{prompt_id}_{flow}_recipe.json'
         with open(name, "w") as json_file:

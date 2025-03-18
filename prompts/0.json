@@ -14,27 +14,25 @@
     ],
     "flows": [
         {
-            "flow_name": "create_story",
+            "flow_name": "story creation",
             "persona": "creator",
             "actions": [
-                "Create a 100-word story in the following format: (character 1 name) character 1 dialogue. (character 2 name) their dialogue and repeat this format till the end of the story\u2026 making the story engaging, profound, and pushing the limits of human psychology to keep the listener wanting more.",
+                "Create a 100-word story in the following format: (character 1 name) character 1 dialogue. (character 2 name) their dialogue and repeat this format till the end of the story making the story engaging, profound, and pushing the limits of human psychology to keep the listener wanting more.",
                 "Retrieve avatar IDs using the API: https://mailer.hertzai.com/all_teacher_only_avatars_id_user_id?user_id={user_id} and associate each character with a unique avatar ID from the response, saving that info as well.",
                 "Create videos for all dialogues at a time using the associated avatar ID.",
                 "Check the status of generated dialogue videos using the status API: https://mailer.hertzai.com/get-video-conv_id/{{conv_id}} for all conv_ids which do not have a status of success.",
-                "Perform steps every hour to create a new story."
+                "Create a new story every hour."
             ],
-            "sub_goal": "create engaging stories"
+            "sub_goal": "To generate and present a new engaging story with accompanying avatar dialogues every hour."
         },
         {
-            "flow_name": "story_consumption",
+            "flow_name": "story consumption",
             "persona": "user",
             "actions": [
-                "Check if any story is available in memory Present the dialogues from the selected story with a 10-second interval until the story is completed. Once that story is done, proceed to give the next story using the same process."
+                "Check if any story is available in memory. Present the dialogues from the selected story with a 10-second interval until the story is completed. Once that story is done, proceed to give the next story using the same process."
             ],
-            "sub_goal": "consume stories"
+            "sub_goal": "To give stories to the user."
         }
     ],
-    "goal": "You should perform tasks given by the user.",
-    "prompt_id": 65,
-    "creator_user_id": 10086
+    "goal": "You should perform task given by user."
 }

@@ -689,9 +689,9 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         except:
             pass
         if data['chattts'] or data['flag_hallo'] == "true":
-            return f"Video Generation task added to queue with conv_id:{conv_id}(this is conversation id) ask helper to save this conv_id in the collection from where it got text used to generate video for future use."
+            return f"Video Generation task added to queue with conv_id:{conv_id}. Ask the helper to save this conv_id in the same collection from which the story used to generate the video was retrieved, for future reference"
         else:
-            return f"Video Generation completed with conv_id:{conv_id}(this is conversation id) ask helper to save this conv_id in the collection from where it got text used to generate video for future use."
+            return f"Video Generation completed with conv_id:{conv_id}. Ask the helper to save this conv_id in the same collection from which the story used to generate the video was retrieved, for future reference"
         
         
     @assistant.register_for_execution()
@@ -789,7 +789,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")
     def send_message_in_seconds(text: Annotated[str, "text to send to user"],
-                       delay: Annotated[str, "time to wait in seconds before sending text"],
+                       delay: Annotated[int, "time to wait in seconds before sending text"],
                        conv_id: Annotated[Optional[int], "conv_id for this text if not available make it None"],) -> str:
         current_app.logger.info('INSIDE send_message_in_seconds')
         current_app.logger.info(f'with text:{text}. and waiting time: {delay} conv_id: {conv_id}')
