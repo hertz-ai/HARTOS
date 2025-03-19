@@ -97,7 +97,7 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
     current_app.logger.info(f'INSIDE TIME_BASED_EXECUTION with action_entry_point"{action_entry_point}')
     user_prompt = f'{user_id}_{prompt_id}'
     if user_prompt not in time_agents:
-        time_agents[user_prompt] = create_time_agents(user_id,prompt_id,'creator','')
+        time_agents[user_prompt] = create_time_agents(user_id,prompt_id,'creator','',[]) #TODO Replace [] with actions
     
     # author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = user_agents[user_id]
     current_time = datetime.now()
@@ -863,9 +863,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     
     return author, assistant, executor, group_chat, manager, chat_instructor, agents_object
 
-def create_time_agents(user_id, prompt_id,role,goal):
+def create_time_agents(user_id, prompt_id,role,goal,actions):
     user_prompt = f'{user_id}_{prompt_id}'
-    time_actions[user_prompt] = Action(final_recipe[prompt_id]['actions'])
+    time_actions[user_prompt] = Action(actions)
     
     time_agent = autogen.AssistantAgent(
         name='time_agent',
@@ -1562,7 +1562,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     # if json_response and 'status' in json_response.keys(): 
                     #     merged_dict = {**final_recipe[prompt_id], **json_response}
                     #     current_app.logger.info('Recipe created successfully')
-                    #     time_agents[user_prompt] = create_time_agents(user_id,prompt_id,'creator','')
+                    #     time_agents[user_prompt] = create_time_agents(user_id,prompt_id,'creator','',[]) #TODO Replace [] with actions
                     #     #TODO REMOVE FOR LOOP USE SCHEDULER ALL AT ONCE WITH 1 SEC INTERVAL
                     #     for jobs in merged_dict['scheduled_tasks']:
                     #         time_based_execution(jobs['job_description'],user_id,prompt_id,jobs['action_entry_point'])
@@ -1748,8 +1748,10 @@ def recipe(user_id, text,prompt_id,file_id,request_id):
         for i in range(number_of_flows):
             with open(f"prompts/{prompt_id}_{i}_recipe.json", 'r') as f:
                 merged_dict = json.load(f)
+                final_recipe[prompt_id] = merged_dict
+                current_app.logger.info(f'updating the final recipe with prompts/{prompt_id}_{i}_recipe.json')
             current_app.logger.info(f'Working on flow {i} with persona {flows[i]["persona"]}')
-            time_agents[user_prompt] = create_time_agents(user_id,prompt_id,flows[i]['persona'],'')
+            time_agents[user_prompt] = create_time_agents(user_id,prompt_id,flows[i]['persona'],'',flows[i]["actions"])
             if "scheduled_tasks" in merged_dict:
                 for jobs in merged_dict['scheduled_tasks']:
                     time_based_execution(jobs['job_description'],user_id,prompt_id,jobs['action_entry_point'])

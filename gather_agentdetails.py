@@ -3,7 +3,7 @@ import autogen
 import os
 from flask import current_app
 
-from helper import retrieve_json
+from helper import retrieve_json, retrieve_json
 # Store user-specific agents & their chat history
 user_agents: Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]] = {}
 
@@ -97,9 +97,22 @@ def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.Us
         )
         
         key = list(user_proxy.chat_messages.keys())[0]
-    
+        response = user_proxy.chat_messages[key][-1]['content']
+        try:
+            new_res = retrieve_json(response)
+            if new_res['status'].lower() == 'completed':
+                if 'flows' not in new_res:
+                    response = user_proxy.send(
+                        'please give the response in proper format: { "status": "completed", "name": "", "broadcast_agent": bool, "personas": "", "tools": "", "flows": [ { "flow_name": "", "persona": "", "actions": [], "sub_goal": "" } ], "goal": "" } where flows should be outer key',
+                        assistant,
+                        request_reply=True
+                    )
+                    key = list(user_proxy.chat_messages.keys())[0]
+                    response = user_proxy.chat_messages[key][-1]['content']
+        except:
+            pass
         
-        return user_proxy.chat_messages[key][-1]['content']
+        return response
 
     except Exception as e:
         return f"Error getting response: {str(e)}"

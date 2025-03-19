@@ -2095,7 +2095,7 @@ def chat():
                     app.logger.info('PENDING STATUS')
                     ans = new_res['question'] if 'question' in new_res else new_res['review_details']
                     return jsonify({'response': ans, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Creation Mode'})
-                else:
+                else:                        
                     app.logger.info('COMPLETED STATUS')
                     new_res['prompt_id'] = prompt_id
                     new_res['creator_user_id'] = user_id
