@@ -601,7 +601,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
                        conv_id: Annotated[Optional[int], "conv_id for this text if not available make it None"],) -> str:
         current_app.logger.info('INSIDE send_message_in_seconds')
         current_app.logger.info(f'with text:{text}. and waiting time: {delay} conv_id: {conv_id}')
-        scheduler.add_job(send_message_to_user1, 'date', run_date=time.time() + delay, args=[user_id, text, '',prompt_id])
+        run_time = datetime.fromtimestamp(time.time() + delay)
+        scheduler.add_job(send_message_to_user1, 'date', run_date=run_time, args=[user_id, text, '',prompt_id])
         return 'Message scheduled successfully'
     
     helper.register_for_llm(name="send_message_in_seconds", description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")(send_message_in_seconds)
@@ -1202,7 +1203,8 @@ def create_time_agents(user_id, prompt_id,role,goal):
                        conv_id: Annotated[Optional[int], "conv_id for this text if not available make it None"],) -> str:
         current_app.logger.info('INSIDE send_message_in_seconds')
         current_app.logger.info(f'with text:{text}. and waiting time: {delay} conv_id: {conv_id}')
-        scheduler.add_job(send_message_to_user1, 'date', run_date=time.time() + delay, args=[user_id, text, '',prompt_id])
+        run_time = datetime.fromtimestamp(time.time() + delay)
+        scheduler.add_job(send_message_to_user1, 'date', run_date=run_time, args=[user_id, text, '',prompt_id])
         return 'Message scheduled successfully'
     
     helper1.register_for_llm(name="send_message_in_seconds", description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")(send_message_in_seconds)
@@ -1374,7 +1376,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             result = agents_object['user'].initiate_chat(recipient=manager, message=text, clear_history=clear_history,silent=False)
         except Exception as e:
             current_app.logger.error(f'Got some error it can be multiple tools called at one error:{e}')
-            current_app.logger.error(f'len of group chat :{group_chat.messages}')
+            # current_app.logger.error(f'len of group chat :{group_chat.messages}')
             return None
             # current_app.logger.error(f' group chat :{group_chat.messages}')
             

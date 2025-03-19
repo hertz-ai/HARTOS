@@ -793,7 +793,8 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
                        conv_id: Annotated[Optional[int], "conv_id for this text if not available make it None"],) -> str:
         current_app.logger.info('INSIDE send_message_in_seconds')
         current_app.logger.info(f'with text:{text}. and waiting time: {delay} conv_id: {conv_id}')
-        scheduler.add_job(send_message_to_user1, 'date', run_date=time.time() + delay, args=[user_id, text, '', f'{request_id_list[user_prompt]}-intermediate'])
+        run_time = datetime.fromtimestamp(time.time() + delay)
+        scheduler.add_job(send_message_to_user1, 'date', run_date=run_time, args=[user_id, text, '',prompt_id])
         return 'Message scheduled successfully'
     
     time_agent = autogen.AssistantAgent(
