@@ -1,38 +1,50 @@
 {
     "status": "completed",
-    "name": "Generic Story",
+    "name": "SynthNews",
+    "goal": "News agent",
     "broadcast_agent": false,
     "personas": [
         {
-            "name": "creator",
-            "description": "Will help in creating stories"
+            "name": "\ud83c\udfdb News Curator",
+            "flows": [
+                {
+                    "flow_name": "Generate News Briefing (Every 3 Hours)",
+                    "actions": [
+                        "Fetch the Latest News from APIs.",
+                        "Assign AI Avatars Per Genre.",
+                        "Store Videos & Assign conv_id for User Retrieval.",
+                        "Verify Video Status Before Publishing."
+                    ],
+                    "sub_goal": "Fetch, structure, generate, and store pre-synthesized AI-powered news briefings for all users."
+                },
+                {
+                    "flow_name": "Refresh News Briefing Every 3 Hours",
+                    "actions": [
+                        "Delete Previous conv_id & Stored Videos.",
+                        "Trigger the News Briefing Generation Flow (Flow 1).",
+                        "Notify System That a New conv_id is Available."
+                    ],
+                    "sub_goal": "Ensure a fresh set of AI-generated news videos replaces the previous ones every 3 hours."
+                }
+            ]
         },
         {
-            "name": "user",
-            "description": "Will consume stories"
+            "name": "\ud83d\udc64 News User (Reactor)",
+            "flows": [
+                {
+                    "flow_name": "User Accessing News Briefing (conv_id Handling Updated)",
+                    "actions": [
+                        "First User Accesses SynthNews.",
+                        "Other Users Access SynthNews.",
+                        "Play AI-Generated News Briefings (Auto-Start).",
+                        "Retrieve News Videos Using conv_id.",
+                        "News Cycle Resets Every 3 Hours."
+                    ],
+                    "sub_goal": "Provide pre-synthesized news briefings by retrieving stored videos using conv_id."
+                }
+            ]
         }
     ],
-    "flows": [
-        {
-            "flow_name": "story creation",
-            "persona": "creator",
-            "actions": [
-                "Create a 100-word story in the following format: (character 1 name) character 1 dialogue. (character 2 name) their dialogue and repeat this format till the end of the story making the story engaging, profound, and pushing the limits of human psychology to keep the listener wanting more.",
-                "Retrieve avatar IDs using the API: https://mailer.hertzai.com/all_teacher_only_avatars_id_user_id?user_id={user_id} and associate each character with a unique avatar ID from the response, saving that info as well.",
-                "Create videos for all dialogues at a time using the associated avatar ID.",
-                "Check the status of generated dialogue videos using the status API: https://mailer.hertzai.com/get-video-conv_id/{{conv_id}} for all conv_ids which do not have a status of success.",
-                "Create a new story every hour."
-            ],
-            "sub_goal": "To generate and present a new engaging story with accompanying avatar dialogues every hour."
-        },
-        {
-            "flow_name": "story consumption",
-            "persona": "user",
-            "actions": [
-                "Check if any story is available in memory. Present the dialogues from the selected story with a 10-second interval until the story is completed. Once that story is done, proceed to give the next story using the same process."
-            ],
-            "sub_goal": "To give stories to the user."
-        }
-    ],
-    "goal": "You should perform task given by user."
+    "prompt_id": "159",
+    "creator_user_id": 16767
 }

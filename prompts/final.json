@@ -3,38 +3,41 @@
     "actions": [
         {
             "status": "done",
-            "action": "Check if any story is available in memory for which all the dialogue statuses are success, and present the dialogues from the selected story with a 10-second interval until the story is completed. Once that story is done, proceed to give the next story using the same process.",
-            "fallback_action": "If fails then give some joke to use and ask to try later.",
-            "persona": "User",
+            "action": "Check if any story is available in memory. Present the dialogues from the selected story with a 10-second interval until the story is completed. Once that story is done, proceed to give the next story using the same process.",
+            "fallback_action": "If the action of checking for stories and presenting them with a 10-second interval fails in the future, send a joke to the user and ask them to try again later for more stories.",
+            "persona": "user",
             "action_id": 1,
             "recipe": [
                 {
-                    "steps": "Retrieve the user ID from memory.",
+                    "steps": "Check if stories are available in memory by querying using the 'get_saved_metadata' tool.",
                     "tool_name": "get_saved_metadata",
                     "agent_to_perform_this_action": "Helper"
                 },
                 {
-                    "steps": "Fetch the stories and their statuses for the retrieved user ID.",
+                    "steps": "Retrieve the content of the current story using the 'get_data_by_key' tool with the key 'stories.current_story'.",
                     "tool_name": "get_data_by_key",
                     "agent_to_perform_this_action": "Helper"
                 },
                 {
-                    "steps": "If stories are found, present dialogues from the selected story with a 10-second interval until the story is completed. Once one story is done, proceed to the next available story in the same manner.",
-                    "tool_name": "",
-                    "agent_to_perform_this_action": "Assistant"
+                    "steps": "Present the dialogues from the fetched story with a 10-second interval using the 'send_message_in_seconds' tool.",
+                    "tool_name": "send_message_in_seconds",
+                    "agent_to_perform_this_action": "Helper"
                 },
                 {
-                    "steps": "If no stories are found, provide a joke to the user and ask them to try again later.",
-                    "tool_name": "",
-                    "agent_to_perform_this_action": "Assistant"
+                    "steps": "Save the story details in memory for future reference using the 'save_data_in_memory' tool with the key 'stories.current_story'.",
+                    "tool_name": "save_data_in_memory",
+                    "agent_to_perform_this_action": "Helper"
                 }
             ],
             "can_perform_without_user_input": "yes",
             "scheduled_tasks": [],
             "metadata": {
-                "user_id": "redacted <class 'int'>"
+                "user_id": "redacted <class 'int'>",
+                "stories": {
+                    "current_story": "redacted <class 'str'>"
+                }
             },
-            "time_took_to_complete": 41.6982946395874,
+            "time_took_to_complete": 34.346285343170166,
             "actions_this_action_depends_on": []
         }
     ],

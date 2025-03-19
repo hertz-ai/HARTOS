@@ -325,14 +325,14 @@ class ToolMessageHandler():
         # Check if the first message has a role of 'tool'
         if processed_messages and processed_messages[0].get('role') == 'tool':
             current_app.logger.info('GOT TOOL AS FIRST MESSAGE CHANGING IT')
-            current_app.logger.info(f'{processed_messages[0]}')
+            # current_app.logger.info(f'{processed_messages[0]}')
             # processed_messages.pop(0)
             processed_messages[0]['role'] = 'user'
-            if 'tool_responses' in processed_messages:
+            if 'tool_responses' in processed_messages[0]:
                 del processed_messages[0]['tool_responses']
-                processed_messages['role'] = 'user'
-                processed_messages['name'] = 'Helper'
-            current_app.logger.info(f'AFTER CHANGE: {processed_messages[0]}')
+                processed_messages[0]['role'] = 'user'
+                processed_messages[0]['name'] = 'Helper'
+            # current_app.logger.info(f'AFTER CHANGE: {processed_messages[0]}')
         
         
         for i in range(len(processed_messages) - 1):
