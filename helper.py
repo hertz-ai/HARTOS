@@ -352,6 +352,7 @@ class ToolMessageHandler():
             # current_app.logger.info(f'{processed_messages[0]}')
             # processed_messages.pop(0)
             processed_messages[0]['role'] = 'user'
+            processed_messages[0]['name'] = 'Helper'
             if 'tool_responses' in processed_messages[0]:
                 del processed_messages[0]['tool_responses']
                 processed_messages[0]['role'] = 'user'
@@ -395,7 +396,7 @@ class ToolMessageHandler():
                 # Fix next message to be a tool message
                 current_msg['role'] = 'user'
         
-        current_app.logger.debug("processed_messages")
+        current_app.logger.info("processed_messages")
         # current_app.logger.debug(processed_messages)
         return processed_messages
         

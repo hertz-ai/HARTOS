@@ -688,7 +688,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             return assistant
         
         
-        if not messages[-1]["content"].startswith('Reflect on the sequence') and not messages[-1]["content"].startswith('Focus on the current task at hand an'):
+        if not messages[-1]["content"].startswith('Reflect on the sequence') and not messages[-1]["content"].startswith('Focus on the current task at hand'):
             json_obj = retrieve_json(messages[-1]["content"])
             if json_obj:
                 try:
@@ -1707,7 +1707,9 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             current_app.logger.info("\n=== Full response ===")
             # current_app.logger.info(result)
             
-                
+        elif group_chat.messages[-1]['content'].startswith('Focus on the current task at hand'):
+            result = agents_object['assistant'].initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
+            continue      
         else:
             break
             
@@ -1777,7 +1779,7 @@ def recipe(user_id, text,prompt_id,file_id,request_id):
         return 'Agent Created Successfully'
     try:
         json_response = retrieve_json(last_response)
-        if 'status' in json_response.keys(): 
+        if 'status' in json_response.keys() and last_response['status'].lower() == 'completed': 
             if 'recipe' in json_response.keys():
                 url = f'https://mailer.hertzai.com/update_agent_prompt?prompt_id={prompt_id}'
                 headers = {'Content-Type': 'application/json'}
