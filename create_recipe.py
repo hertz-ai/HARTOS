@@ -577,7 +577,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     
     def send_message_to_user(text: Annotated[str, "Text to send to the user"],
                          avatar_id: Annotated[Optional[str], "Unique identifier for the avatar"] = None,
-                         response_type: Annotated[Optional[str], "Response mode: 'Realistic' (slower, better quality) or 'Realtime' (faster, lower quality)"] = None) -> str:
+                         response_type: Annotated[Optional[str], "Response mode: 'Realistic' (slower, better quality) or 'Realtime' (faster, lower quality)"] = 'Realtime') -> str:
         current_app.logger.info('INSIDE send_message_to_user')
         current_app.logger.info(f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
@@ -1182,7 +1182,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     
     def send_message_to_user(text: Annotated[str, "Text to send to the user"],
                          avatar_id: Annotated[Optional[str], "Unique identifier for the avatar"] = None,
-                         response_type: Annotated[Optional[str], "Response mode: 'Realistic' (slower, better quality) or 'Realtime' (faster, lower quality)"] = None) -> str:
+                         response_type: Annotated[Optional[str], "Response mode: 'Realistic' (slower, better quality) or 'Realtime' (faster, lower quality)"] = 'Realtime') -> str:
         current_app.logger.info('INSIDE send_message_to_user')
         current_app.logger.info(f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
