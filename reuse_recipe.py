@@ -418,7 +418,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     helper = autogen.AssistantAgent(
         name="helper",
         llm_config=llm_config,
-        code_execution_config={"work_dir": "coding", "use_docker": False},
+        code_execution_config=False,
         system_message=f"""You are Helper Agent. Help the {role} agent to complete the task:
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
@@ -1118,7 +1118,8 @@ def get_agent_response(assistant: autogen.AssistantAgent,chat_instructor: autoge
                         current_app.logger.info(f'UPDATIN CURRENT ACTION AS :{int(json_obj["action_id"])}')
                         user_tasks[user_prompt].current_action = int(json_obj['action_id'])
                         action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)['action']
-                        user_message = f"Action {user_tasks[user_prompt].current_action+1}:{action_message}"
+                        steps = [{x['steps']:{'tool_name':x.get('tool_name',None),'code':x.get('generalized_functions',None)}} for x in recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action]['recipe']]
+                        user_message = f"Action {user_tasks[user_prompt].current_action+1}:{action_message}\n follow these steps: {steps}"
                         chat_instructor.initiate_chat(recipient=manager, message=user_message, clear_history=False,silent=False)
                         continue
                 except IndexError as e:
@@ -1135,7 +1136,8 @@ def get_agent_response(assistant: autogen.AssistantAgent,chat_instructor: autoge
                                 current_app.logger.info(f'UPDATIN CURRENT ACTION AS :{int(json_obj["action_id"])}')
                                 user_tasks[user_prompt].current_action = int(json_obj['action_id'])
                                 action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)['action']
-                                user_message = f"Action {user_tasks[user_prompt].current_action+1}:{action_message}"
+                                steps = [{x['steps']:{'tool_name':x.get('tool_name',None),'code':x.get('generalized_functions',None)}} for x in recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action]['recipe']]
+                                user_message = f"Action {user_tasks[user_prompt].current_action+1}:{action_message}\n follow these steps: {steps}"
                                 chat_instructor.initiate_chat(recipient=manager, message=user_message, clear_history=False,silent=False)
                                 continue
                         else:
@@ -1269,7 +1271,8 @@ def chat_agent(user_id,text,prompt_id,file_id,request_id):
                 user_journey[user_prompt] = 'UseBot'
                 create_schedule(prompt_id,user_id)
                 action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)['action']
-                message = f"Action {user_tasks[user_prompt].current_action+1}:{action_message}"
+                steps = [{x['steps']:{'tool_name':x.get('tool_name',None),'code':x.get('generalized_functions',None)}} for x in recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action]['recipe']]
+                message = f"Action {user_tasks[user_prompt].current_action+1}:{action_message}\n follow these steps: {steps}"
                 # message = "let's perform the actions availabe in sequence\nIMP instruction: keep track of action id you are working on."
                 result = chat_instructor.initiate_chat(manager, message=message,speaker_selection={"speaker": "assistant"}, clear_history=False)
 
@@ -1285,7 +1288,8 @@ def chat_agent(user_id,text,prompt_id,file_id,request_id):
                                 current_app.logger.info(f'UPDATIN CURRENT ACTION AS :{int(json_obj["action_id"])}')
                                 user_tasks[user_prompt].current_action = int(json_obj['action_id'])
                                 action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)['action']
-                                user_message = f"Action {user_tasks[user_prompt].current_action+1}:{action_message}"
+                                steps = [{x['steps']:{'tool_name':x.get('tool_name',None),'code':x.get('generalized_functions',None)}} for x in recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action]['recipe']]
+                                user_message = f"Action {user_tasks[user_prompt].current_action+1}:{action_message}\n follow these steps: {steps}"
                                 chat_instructor.initiate_chat(recipient=manager, message=user_message, clear_history=False,silent=False)
                                 continue
                         except:
@@ -1299,7 +1303,8 @@ def chat_agent(user_id,text,prompt_id,file_id,request_id):
                                         current_app.logger.info(f'UPDATIN CURRENT ACTION AS :{int(json_obj["action_id"])}')
                                         user_tasks[user_prompt].current_action = int(json_obj['action_id'])
                                         action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)['action']
-                                        user_message = f"Action {user_tasks[user_prompt].current_action+1}:{action_message}"
+                                        steps = [{x['steps']:{'tool_name':x.get('tool_name',None),'code':x.get('generalized_functions',None)}} for x in recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action]['recipe']]
+                                        user_message = f"Action {user_tasks[user_prompt].current_action+1}:{action_message}\n follow these steps: {steps}"
                                         chat_instructor.initiate_chat(recipient=manager, message=user_message, clear_history=False,silent=False)
                                         continue
                                         

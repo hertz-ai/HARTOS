@@ -638,6 +638,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         crossbar_message = {
             'parent_request_id': request_id_list[user_prompt],
             'user_id': user_id,
+            'prompt_id': prompt_id,
             'instruction_to_vlm_agent': instructions,
             'os_to_control': 'Windows',
             'actions_available_in_os': [],
