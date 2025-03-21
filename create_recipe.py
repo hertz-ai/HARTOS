@@ -19,9 +19,10 @@ import helper as helper_fun
 import threading
 
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
-
 from autogen.cache.in_memory_cache import InMemoryCache
 
+from autobahn.twisted.wamp import ApplicationSession, ApplicationRunner
+from twisted.internet.defer import inlineCallbacks
 from crossbarhttp import Client
 client = Client('http://aws_rasa.hertzai.com:8088/publish')
 
@@ -645,9 +646,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             'max_ETA_in_seconds': 500,
             'langchain_server':True
         } 
-        # Publish the message to the Crossbar endpoint
-        result = client.publish(f"com.hertzai.hevolve.action", f'{crossbar_message}')    
-        return 'Request to execute the command on the Windows machine has been sent. You will receive a response within 500 seconds.'
+        message_json = json.dumps(crossbar_message)
+        # response = rpc_client.call_rpc("com.hertzai.hevolve.action", [message_json])
+        response = "Executing your request"
+        return response if response else "Failed to execute command on Windows."
 
     helper.register_for_llm(name="execute_windows_command", description="Executes a command on a Windows machine and returns the response in 500 seconds")(execute_windows_command)
     assistant.register_for_execution(name="execute_windows_command")(execute_windows_command)
@@ -1354,8 +1356,16 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
     else:
         author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = user_agents[user_prompt]
     clear_history = False
+    
+    #TOOL CALL AND REPONSE CHECK
+    #current_msg.get('tool_calls') and next_msg.get('role') != 'tool':
+    if len(group_chat.messages)>2 and 'tool_calls' in group_chat.messages[-1]:
+        current_app.logger.warning('GOT INPUT BUT LAST MESSAGE IS tool_calls should wait for tool response')
+        return 'Processing a tool now please try later'
+        
     if Failure:
-        current_app.logger.warning(f'CHECK THIS OUT group_chat.messages:{group_chat.messages[-1]}')
+        current_app.logger.warning(f'CHECK THIS OUT group_chat.messages:{group_chat.messages[-5:]}')
+        current_app.logger.warning(f'CHECK THIS OUT group_chat.messages:{len(group_chat.messages)}')
         for i in range(len(group_chat.messages)):
             group_chat.messages[i]['role'] = 'user'
         clear_history = False
