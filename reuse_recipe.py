@@ -118,12 +118,12 @@ def get_role(user_id,prompt_id):
     if not role:
         role = 'user'
     return role
-
+    
 def send_message_to_user1(user_id,response,inp,prompt_id):
     user_prompt = f'{user_id}_{prompt_id}'
-    current_app.logger.info(f'INSIDE send_message_to_user with user_id:{user_id} response:{response} inp:{inp}')
+    request_id = f'{request_id_list[user_prompt]}-intermediate'
     url = 'http://aws_rasa.hertzai.com:9890/autogen_response'
-    body = json.dumps({'user_id':user_id,'message':response,'inp':inp,'request_id':f'{request_id_list[user_prompt]}-intermediate'})
+    body = json.dumps({'user_id':user_id,'message':response,'inp':inp,'request_id':request_id})
     headers = {'Content-Type': 'application/json'}
     res = requests.post(url,data=body,headers=headers)
 

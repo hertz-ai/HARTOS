@@ -18,6 +18,8 @@ import asyncio
 import os
 from bs4 import BeautifulSoup
 from langchain.memory import ZepMemory
+# from autobahn.twisted.wamp import ApplicationSession, ApplicationRunner
+# from twisted.internet.defer import inlineCallbacks
 with open("config.json", 'r') as f:
     config = json.load(f)
 
@@ -27,6 +29,7 @@ os.environ["GOOGLE_CSE_ID"] = config['GOOGLE_CSE_ID']
 os.environ["GOOGLE_API_KEY"] = config['GOOGLE_API_KEY']
 os.environ["NEWS_API_KEY"] = config['NEWS_API_KEY']
 os.environ["SERPAPI_API_KEY"] = config['SERPAPI_API_KEY']
+
 ACTION_API = config['ACTION_API']
 STUDENT_API = config['STUDENT_API']
 ZEP_API_URL = config['ZEP_API_URL']
@@ -35,6 +38,27 @@ ZEP_API_KEY = config['ZEP_API_KEY']
 search = GoogleSearchAPIWrapper(k=4)
 redis_client = redis.StrictRedis(
     host='azure_all_vms.hertzai.com', port=6369, db=0)
+
+
+# class CrossbarClient(ApplicationSession):
+
+#     @inlineCallbacks
+#     def onJoin(self, details):
+#         print("Connected to Crossbar.io!")
+
+#     @inlineCallbacks
+#     def call_rpc(self, topic, params):
+#         """Calls an RPC function dynamically with the given topic and parameters."""
+#         try:
+#             result = yield self.call(topic, *params)
+#             print(f"RPC Call to {topic} Result:", result)
+#             return result
+#         except Exception as e:
+#             print(f"Error calling RPC {topic}: {e}")
+#             return None
+
+# runner = ApplicationRunner(url="ws://aws_rasa.hertzai.com:8088/", realm="realm1")
+# rpc_client = runner.run(CrossbarClient, start_reactor=False)
 
 async def fetch(session, url):
     try:
