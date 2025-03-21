@@ -768,7 +768,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     @helper.register_for_llm(api_style="function",description="Sends a message/information to user. You can use this if you want to ask a question")
     def send_message_to_user(text: Annotated[str, "Text to send to the user"],
                          avatar_id: Annotated[Optional[str], "Unique identifier for the avatar"] = None,
-                         response_type: Annotated[Optional[str], "Response mode: 'Realistic' (slower, better quality) or 'Realtime' (faster, lower quality)"] = None) -> str:
+                         response_type: Annotated[Optional[str], "Response mode: 'Realistic' (slower, better quality) or 'Realtime' (faster, lower quality)"] = 'Realtime') -> str:
         current_app.logger.info('INSIDE send_message_to_user')
         current_app.logger.info(f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
