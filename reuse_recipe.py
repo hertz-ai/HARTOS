@@ -17,7 +17,7 @@ from PIL import Image
 from langchain.memory import ZepMemory
 from crossbarhttp import Client
 from flask import current_app
-from helper import topological_sort, ToolMessageHandler, strip_json_values, get_time_based_history
+from helper import topological_sort, ToolMessageHandler, strip_json_values, get_time_based_history, retrieve_json
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
 import threading
 
@@ -384,7 +384,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         8. **IMPORTANT CODING INSTRUCTION**: Avoid using `time.sleep` in any code.
         9. Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory]
         10. **Never reveal actions, internal processes, or tools to the user**. Do not ask for user confirmation unless absolutely necessary(You can assume normal things like user's interests).
-        11. **To communicate with the {role} user**, always use this format: `@{role} {response_format}`.
+        11. **To communicate with the {role} user**, always use this format: `@user {response_format}`.
         12. All actions, recipes, and functions provided below have been reviewed and tested. Follow them exactly—do not make assumptions or modify them unless they fail or produce an error.
         13. Always request the next action from the @StatusVerifier agent—do not determine the next action on your own.
         14. If `can_perform_without_user_input` is `yes`, execute the action automatically without requesting user confirmation.
@@ -399,9 +399,9 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     if role == '':
         role = 'Assistant'
     else:
-        role = f'Assistant'
+        role = f'{role}'
     assistant = autogen.AssistantAgent(
-        name=role,
+        name='Assistant',
         llm_config=llm_config,
         max_consecutive_auto_reply=10,
         is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
@@ -433,7 +433,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
             6. Always use code from recipe given below.
             7. If there is any action which is like to perform a task continously you should not do it.
             8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
-            9. IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @{role} {response_format}
+            9. IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @user {response_format}
             10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
             11. Always request the next action from the @StatusVerifier agent—do not determine the next action on your own.
             12. After completing the current action, request the @StatusVerifier agent to verify its completion. It will then provide the next action.
@@ -459,7 +459,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
             6. Always use code from recipe given below.
             7. If there is any action which is like to perform a task continously you should not do it.
             8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
-            9. IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @{role} {response_format}
+            9. IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @user {response_format}
             10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
             11. Always request the next action from the @StatusVerifier agent—do not determine the next action on your own.
             12. After completing the current action, request the @StatusVerifier agent to verify its completion. It will then provide the next action.
@@ -857,7 +857,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
             6. Always use code from recipe given below
             7. If there is any action which is like to perform a task continously you should not do it.
             8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
-            9. IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @{role} {response_format}
+            9. IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @user {response_format}
             10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
             Actions: <actionsStart>{role_actions}<actionEnd>
             Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{individual_recipe}<generalized_functionsEnd><recipeEnd>            
@@ -880,7 +880,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
             6. Always use code from recipe given below
             7. If there is any action which is like to perform a task continously you should not do it.
             8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
-            9. IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @{role} {response_format}
+            9. IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @user {response_format}
             10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
             Actions: <actionsStart>{role_actions}<actionEnd>
             Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{individual_recipe}<generalized_functionsEnd><recipeEnd>
@@ -1067,8 +1067,8 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         current_app.logger.info(f'Inside state_transition with message :10 {messages[-1]["content"][:10]} & last_speaker {last_speaker.name}')
         if last_speaker.name == f"user_proxy_{user_id}" or last_speaker.name == "multi_role_agent" or last_speaker.name == "helper" or last_speaker.name == "Executor" or last_speaker.name == "ChatInstructor":
             return assistant
-        current_app.logger.info(f'Checking for @user or @{role} in message')
-        if '@user' in messages[-1]["content"].lower() or f'@{role}'.lower() in messages[-1]["content"].lower():
+        current_app.logger.info(f'Checking for @user or @user in message')
+        if '@user' in messages[-1]["content"].lower():
             current_app.logger.info('GOT @USER in message')
             temp_message = messages[-1]["content"]
             temp_message = temp_message.replace("'",'"')
@@ -1134,8 +1134,8 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         current_app.logger.info(f'Inside state_transition with message :10 {messages[-1]["content"][:10]} & last_speaker {last_speaker.name}')
         if last_speaker.name == f"user_proxy_{user_id}" or last_speaker.name == "multi_role_agent" or last_speaker.name == "helper" or last_speaker.name == "Executor":
             return time_agent
-        current_app.logger.info(f'Checking for @user or @{role} in message')
-        if '@user' in messages[-1]["content"].lower() or f'@{role}'.lower() in messages[-1]["content"].lower():
+        current_app.logger.info(f'Checking for @user or @user in message')
+        if '@user' in messages[-1]["content"].lower():
             current_app.logger.info('GOT @USER in message')
             temp_message = messages[-1]["content"]
             temp_message = temp_message.replace("'",'"')
@@ -1263,12 +1263,12 @@ def get_agent_response(assistant: autogen.AssistantAgent,chat_instructor: autoge
             if count == 4:
                 break
             last_message = group_chat.messages[-1]['content']
-            if f'@{role}'.lower() not in last_message.lower():
+            if f'@user'.lower() not in last_message.lower():
                 message = 'If you want to communicate from the user then send the response with @user\nIf you current action is completed and you want next action ask @StatusVerifier for next action\n if you can continue the task without user intervention you can proceed with the actions.'
                 helper.initiate_chat(manager, message=message,speaker_selection={"speaker": "assistant"}, clear_history=False)
                 continue
             else:
-                current_app.logger.info(f'@{role} in last message')
+                current_app.logger.info(f'@user in last message')
                 break
         # if individual_recipe[currentaction_id-1]['can_perform_without_user_input'] == 'yes':
         #     return assistant
@@ -1277,14 +1277,9 @@ def get_agent_response(assistant: autogen.AssistantAgent,chat_instructor: autoge
             last_message = group_chat.messages[-2]
         
         if f'message_2_user'.lower() in last_message['content'].lower():
-            json_match = re.search(r'{[\s\S]*}', last_message['content'])
-            if json_match:
+            json_obj = retrieve_json(last_message["content"])
+            if json_obj:
                 try:
-                    current_app.logger.info('GOT Json')
-                    current_app.logger.info(f'got json object')
-                    json_part = json_match.group(0)
-                    current_app.logger.info('Sending user the message')
-                    json_obj = json.loads(json_part)
                     last_message['content'] = json_obj['message_2_user']
                 except:
                     pass
@@ -1445,12 +1440,12 @@ def chat_agent(user_id,text,prompt_id,file_id,request_id):
                         break
                     role = get_role(user_id,prompt_id)
                     last_message = group_chat.messages[-1]['content']
-                    if f'@{role}'.lower() not in last_message.lower():
+                    if f'@user'.lower() not in last_message.lower():
                         message = 'If you want to communicate from the user then send the response with @user\nIf you current action is completed and you want next action ask @StatusVerifier for next action\n if you can continue the task without user intervention you can proceed with the actions.'
                         helper.initiate_chat(manager, message=message,speaker_selection={"speaker": "assistant"}, clear_history=False)
                         continue
                     else:
-                        current_app.logger.info(f'@{role} in last message')
+                        current_app.logger.info(f'@user in last message')
                         break
                 last_message = group_chat.messages[-1]
                 if last_message['content'] == 'TERMINATE':
@@ -1458,14 +1453,9 @@ def chat_agent(user_id,text,prompt_id,file_id,request_id):
                 llm_call_track[user_prompt]['count'] = 0
                 llm_call_track[user_prompt]['original_prompt'] = True
                 if f'message_2_user'.lower() in last_message['content'].lower():
-                    json_match = re.search(r'{[\s\S]*}', last_message['content'])
-                    if json_match:
+                    json_obj = retrieve_json(last_message["content"])
+                    if json_obj:
                         try:
-                            current_app.logger.info('GOT Json')
-                            current_app.logger.info(f'got json object')
-                            json_part = json_match.group(0)
-                            current_app.logger.info('Sending user the message')
-                            json_obj = json.loads(json_part)
                             last_message['content'] = json_obj['message_2_user']
                         except:
                             pass

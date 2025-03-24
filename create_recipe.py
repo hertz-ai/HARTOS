@@ -911,7 +911,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             6. Always use code from recipe given below
             7. If there is any action which is like to perform a task continously you should not do it.
             8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
-            9. IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @{role} {{"message_2_user": "Your message here"}}
+            9. IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @user {{"message_2_user": "Your message here"}}
             10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
             Actions: <actionsStart>{user_tasks[user_prompt].actions}<actionEnd>
             Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{final_recipe[prompt_id]}<generalized_functionsEnd><recipeEnd>            
@@ -1281,8 +1281,8 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         current_app.logger.info(f'Inside state_transition with message :10 {messages[-1]["content"][:10]} & last_speaker {last_speaker.name}')
         if last_speaker.name == f"user_proxy_{user_id}" or last_speaker.name == "multi_role_agent" or last_speaker.name == "helper" or last_speaker.name == "Executor":
             return time_agent
-        current_app.logger.info(f'Checking for @user or @{role} in message')
-        if '@user' in messages[-1]["content"].lower() or f'@{role}'.lower() in messages[-1]["content"].lower():
+        current_app.logger.info(f'Checking for @user or @user in message')
+        if '@user' in messages[-1]["content"].lower():
             current_app.logger.info('GOT @USER in message')
             temp_message = messages[-1]["content"]
             temp_message = temp_message.replace("'",'"')
@@ -1722,14 +1722,9 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
         last_message = group_chat.messages[-2]
     
     if f'message_2_user'.lower() in last_message['content'].lower():
-        json_match = re.search(r'{[\s\S]*}', last_message['content'])
-        if json_match:
+        json_obj = retrieve_json(last_message["content"])
+        if json_obj:
             try:
-                current_app.logger.info('GOT Json')
-                current_app.logger.info(f'got json object')
-                json_part = json_match.group(0)
-                current_app.logger.info('Sending user the message')
-                json_obj = json.loads(json_part)
                 last_message['content'] = json_obj['message_2_user']
             except:
                 pass
