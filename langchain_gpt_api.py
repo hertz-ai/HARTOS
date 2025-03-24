@@ -69,7 +69,7 @@ load_dotenv()
 
 #autogen requirements
 
-from create_recipe import recipe
+from create_recipe import recipe, time_based_execution as time_execution
 from reuse_recipe import chat_agent, crossbar_multiagent, time_based_execution
 from autobahn.twisted.component import Component, run
 from twisted.internet.defer import inlineCallbacks
@@ -2236,12 +2236,16 @@ def time_agent():
     data = request.get_json()
     task_description = data.get('task_description',None)
     user_id = data.get('user_id',None)
+    request_from = data.get('request_from',"Reuse")
     prompt_id = data.get('prompt_id',None)
     action_entry_point = data.get('prompt_id',0)
     if not task_description or not user_id or not prompt_id:
         return jsonify({'error':'user_id or task_description or prompt_id is missing'}), 404
     app.logger.info(f'GOT user_id:{user_id} & prompt_id:{prompt_id} & task_description:{task_description}')
-    res = time_based_execution(str(task_description),int(user_id),int(prompt_id),action_entry_point)
+    if request_from == 'Reuse':
+        res = time_based_execution(str(task_description),int(user_id),int(prompt_id),action_entry_point)
+    else:
+        res = time_execution(str(task_description),int(user_id),int(prompt_id),action_entry_point)
     return jsonify({'response':f'{res}'}), 200
     
 @app.route('/response_ack',methods=['POST'])

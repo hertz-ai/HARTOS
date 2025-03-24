@@ -130,7 +130,7 @@ def send_message_to_user1(user_id,response,inp,prompt_id):
 def execute_python_file(task_description:str,user_id: int,prompt_id:int,action_entry_point:int=0):
     headers = {'Content-Type': 'application/json'}
     url = 'http://localhost:6777/time_agent'
-    data = json.dumps({'task_description':task_description,'user_id':user_id,'prompt_id':prompt_id,'action_entry_point':action_entry_point})
+    data = json.dumps({'task_description':task_description,'user_id':user_id,'prompt_id':prompt_id,'action_entry_point':action_entry_point,'request_from':'Reuse'})
     res = requests.post(url,data=data,headers=headers)
     return 'done'
 
@@ -221,7 +221,7 @@ def create_agents_for_role(user_id: str,prompt_id):
             code_execution_config=False,
         )
         helper = autogen.AssistantAgent(
-            name="helper",
+            name="Helper",
             llm_config=llm_config,
             code_execution_config={"work_dir": "coding", "use_docker": False},
             system_message="""You Help the assistant agent to complete the task, you are helper agent not user/n
@@ -337,6 +337,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     with open(f"prompts/{prompt_id}_{role_number}_recipe.json", 'r') as f:
         config = json.load(f)
         recipes[user_prompt] = config
+        final_recipe[prompt_id] = config
     goal = ''
     with open(f"prompts/{prompt_id}.json", 'r') as f:
             config = json.load(f)
@@ -344,13 +345,17 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     
     current_app.logger.info(f'Got goal as {goal}')
     role_actions = []
+    actions = []
     current_app.logger.info(f'Getting role actions')
     for i in recipes[user_prompt]['actions']:
         current_app.logger.info(f'this is action persona:{i["persona"]} ')
         if i['persona'].lower() == role.lower():
             
             role_actions.append(i)
+            actions.append(i['action'])
     current_app.logger.info(f'role_actions: {role_actions}')
+    current_app.logger.info(f'will create timer agents with: {actions}')
+    time_actions[user_prompt] = Action(actions)
     
     if len(role_actions) == 0:
         role_actions = recipes[user_prompt]['actions']
@@ -394,7 +399,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     if role == '':
         role = 'Assistant'
     else:
-        role = f'{role}'
+        role = f'Assistant'
     assistant = autogen.AssistantAgent(
         name=role,
         llm_config=llm_config,
@@ -408,7 +413,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
 
     # Create the user proxy agent
     user_proxy = autogen.UserProxyAgent(
-        name=f"user_proxy_{user_id}",
+        name=f"User",
         human_input_mode="NEVER",
         llm_config=False,
         is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
@@ -416,7 +421,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         code_execution_config=False,
     )
     helper = autogen.AssistantAgent(
-        name="helper",
+        name="Helper",
         llm_config=llm_config,
         code_execution_config=False,
         system_message=f"""You are Helper Agent. Help the {role} agent to complete the task:
@@ -506,6 +511,20 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         code_execution_config=False,
         is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
     )
+    
+    context_handling = transform_messages.TransformMessages(
+        transforms=[
+            transforms.MessageHistoryLimiter(max_messages=50,keep_first_message=True),
+            transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
+            ToolMessageHandler(),
+        ]
+    )
+    
+    context_handling.add_to_agent(assistant)
+    context_handling.add_to_agent(helper)
+    context_handling.add_to_agent(executor)
+    context_handling.add_to_agent(verify)
+    
     # @executor.register_for_execution()
     # @helper.register_for_llm(api_style="function", description="sends message/ask questions to different roles/personas")
     # def send_message_to_roles(role: Annotated[str, "the role to which the message to send"], 
@@ -826,7 +845,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         code_execution_config=False,
     )
     helper1 = autogen.AssistantAgent(
-        name="helper",
+        name="Helper",
         llm_config=llm_config,
         code_execution_config={"work_dir": "coding", "use_docker": False},
         system_message=f"""You are Helper Agent. Help the {role} agent to complete the task:
@@ -874,7 +893,54 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         ''',
         is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
     )
+    multi_role_agent1 = autogen.AssistantAgent(
+        name="multi_role_agent",
+        llm_config=llm_config,
+        code_execution_config=False,
+        system_message="""You will send message from multiple different personas your, job is to ask those question to assistant agent
+        if you think some text was intent to give to some other agent but i came to you send the same message to user""",
+    )
+    verify1 = autogen.AssistantAgent(
+        name="StatusVerifier",
+        llm_config=llm_config,
+        code_execution_config=False,
+        system_message=""""You are an Status verification agent.
+        Role: Track and verify the status of actions. Provide updates strictly in JSON format only when status is completed.
+        Response formats:
+            1. Action Completed Successfully: {"status": "completed","action": "current action","action_id": 1/2/3...,"message": "message here"}
+            2. Action Error: {"status": "error","action": "current action","action_id": 1/2/3...,"message": "message here"}
+            2. Action Pending: {"status": "pending","action": "current action","action_id": 1/2/3...,"message": "pending actions here"}
+        Important Instructions:
+            Only mark an action as "Completed" if the Assistant Agent confirms successful completion.
+            For pending tasks or ongoing actions, respond to helper to complete the task.
+            Verify the action performed by assistant and make sure the action is performed correctly as per instructions. if action performed was not as per instructions give the pending actions to the helper agent.
+            Report status only—do not perform actions yourself.
+            
+        """,
+        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+    )
     
+    chat_instructor1 = autogen.UserProxyAgent(
+        name="ChatInstructor",
+        human_input_mode="NEVER",
+        max_consecutive_auto_reply=10,
+        default_auto_reply="TERMINATE",
+        code_execution_config=False,
+        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+    )
+    
+    context_handling = transform_messages.TransformMessages(
+        transforms=[
+            transforms.MessageHistoryLimiter(max_messages=50,keep_first_message=True),
+            transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
+            ToolMessageHandler(),
+        ]
+    )
+    context_handling.add_to_agent(time_agent)
+    context_handling.add_to_agent(helper1)
+    context_handling.add_to_agent(executor1)
+    context_handling.add_to_agent(multi_role_agent1)
+    context_handling.add_to_agent(verify1)
     
     ##Tools call
     helper1.register_for_llm(name="txt2img", description="Text to image Creator")(txt2img)
@@ -1032,13 +1098,48 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         return "auto"
     
     def state_transition1(last_speaker, groupchat):
+        current_app.logger.info('INSIDE TIMER STATE TRANSITION')      
         messages = groupchat.messages
-        current_app.logger.info(f'Inside state_transition1 with message :10 {messages[-1]["content"][:10]} & last_speaker {last_speaker.name}')
-        if last_speaker.name == f"user_proxy_{user_id}" or last_speaker.name == "helper" or last_speaker.name == "Executor":
+        # visual_context = helper_fun.get_visual_context(user_id)
+        # if visual_context:
+        #     groupchat.messages.insert(-1,{'content':visual_context,'role':'user','name':'helper'})
+        try:
+            pattern = r'\{.*?\}' # getting all json from text
+            matches = re.findall(pattern, messages[-1]["content"], re.DOTALL)   
+            json_objects = [json.loads(match) for match in matches]
+            current_app.logger.info(f'Got Json as {len(json_objects)}')
+            if json_objects:
+                last_json = json_objects[-1]
+                current_app.logger.info(f'last json as {last_json}')
+                if 'status' in last_json.keys() and last_json['status'].lower() == 'completed':
+                    current_app.logger.info('GOT COMPLETED FOR ACTION')
+                    try:
+                        time_actions[user_prompt].current_action += 1
+                    except:
+                        current_app.logger.error('GOT ERROR WHILE UPDATING CURRENT ACTION')
+                        time_actions[user_prompt].current_action += 1
+                    return chat_instructor1
+                    
+                currentaction_id = last_json['action_id']
+                if final_recipe[prompt_id]['actions'][currentaction_id-1]['can_perform_without_user_input'] == 'yes':
+                    return time_agent
+        except Exception as e:
+            current_app.logger.error(f'Got Error while getting json for current actionid: {e}')
+            
+        pattern3 = r"@statusverifier"
+        if re.search(pattern3, messages[-1]["content"].lower()):
+            current_app.logger.info("String contains @StatusVerifier returnig StatusVerifier")
+            return verify1
+    
+        current_app.logger.info(f'Inside state_transition with message :10 {messages[-1]["content"][:10]} & last_speaker {last_speaker.name}')
+        if last_speaker.name == f"user_proxy_{user_id}" or last_speaker.name == "multi_role_agent" or last_speaker.name == "helper" or last_speaker.name == "Executor":
             return time_agent
+        current_app.logger.info(f'Checking for @user or @{role} in message')
         if '@user' in messages[-1]["content"].lower() or f'@{role}'.lower() in messages[-1]["content"].lower():
-            current_app.logger.info(f'GOT @USER or @{role}in message')
-            json_match = re.search(r'{[\s\S]*}', messages[-1]["content"])
+            current_app.logger.info('GOT @USER in message')
+            temp_message = messages[-1]["content"]
+            temp_message = temp_message.replace("'",'"')
+            json_match = re.search(r'{[\s\S]*}', temp_message)
             if json_match:
                 try:
                     current_app.logger.info('GOT Json')
@@ -1050,6 +1151,10 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
                 except:
                     pass
                 return "auto"
+            
+        if messages[-1]["role"] == 'function':
+            current_app.logger.info('The last speaker was function returning assistant') 
+            return time_agent
         if 'exitcode:' in messages[-1]["content"]:
             current_app.logger.info('Got exitcode in text returning assistant')
             return time_agent
@@ -1058,11 +1163,11 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
             # retrieve: action 1 -> action 2
             return None
         return "auto"
-        
+    
     select_speaker_transforms = transform_messages.TransformMessages(
         transforms=[
-            transforms.MessageHistoryLimiter(max_messages=30,keep_first_message=True),
-            transforms.MessageTokenLimiter(max_tokens=3000, max_tokens_per_message=500, min_tokens=0),
+            transforms.MessageHistoryLimiter(max_messages=50,keep_first_message=True),
+            transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
             ToolMessageHandler(),
         ]
     )
@@ -1082,10 +1187,10 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     )
     
     group_chat_1 = autogen.GroupChat(
-        agents=[time_agent, helper1, time_user,executor1],
+        agents=[time_agent, helper1, time_user,multi_role_agent1,executor1,chat_instructor1,verify1],
         messages=[],
         max_round=10,
-        # select_speaker_transform_messages=select_speaker_transforms,
+        select_speaker_transform_messages=select_speaker_transforms,
         speaker_selection_method=state_transition1,  # using an LLM to decide
         allow_repeat_speaker=False,  # Prevent same agent speaking twice
         send_introductions=False
@@ -1170,7 +1275,19 @@ def get_agent_response(assistant: autogen.AssistantAgent,chat_instructor: autoge
         last_message = group_chat.messages[-1]
         if last_message['content'] == 'TERMINATE':
             last_message = group_chat.messages[-2]
-          
+        
+        if f'message_2_user'.lower() in last_message['content'].lower():
+            json_match = re.search(r'{[\s\S]*}', last_message['content'])
+            if json_match:
+                try:
+                    current_app.logger.info('GOT Json')
+                    current_app.logger.info(f'got json object')
+                    json_part = json_match.group(0)
+                    current_app.logger.info('Sending user the message')
+                    json_obj = json.loads(json_part)
+                    last_message['content'] = json_obj['message_2_user']
+                except:
+                    pass
         return last_message
 
     except Exception as e:
@@ -1220,6 +1337,8 @@ recent_file_id = {}
 recipes = {}
 user_tasks = {}
 request_id_list = {}
+time_actions = {}
+final_recipe = {}
 
 def chat_agent(user_id,text,prompt_id,file_id,request_id):
     current_app.logger.info('--'*100)
@@ -1338,7 +1457,19 @@ def chat_agent(user_id,text,prompt_id,file_id,request_id):
                     last_message = group_chat.messages[-2]
                 llm_call_track[user_prompt]['count'] = 0
                 llm_call_track[user_prompt]['original_prompt'] = True
-                return last_message
+                if f'message_2_user'.lower() in last_message['content'].lower():
+                    json_match = re.search(r'{[\s\S]*}', last_message['content'])
+                    if json_match:
+                        try:
+                            current_app.logger.info('GOT Json')
+                            current_app.logger.info(f'got json object')
+                            json_part = json_match.group(0)
+                            current_app.logger.info('Sending user the message')
+                            json_obj = json.loads(json_part)
+                            last_message['content'] = json_obj['message_2_user']
+                        except:
+                            pass
+                return last_message['content']
         
             
             return last_message['content']

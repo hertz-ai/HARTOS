@@ -90,7 +90,7 @@ def send_message_to_user1(user_id,response,inp,prompt_id):
 def execute_python_file(task_description:str,user_id: int,prompt_id:int,action_entry_point:int=0):
     headers = {'Content-Type': 'application/json'}
     url = 'http://localhost:6777/time_agent'
-    data = json.dumps({'task_description':task_description,'user_id':user_id,'prompt_id':prompt_id,'action_entry_point':action_entry_point})
+    data = json.dumps({'task_description':task_description,'user_id':user_id,'prompt_id':prompt_id,'action_entry_point':action_entry_point,'request_from':'Reuse'})
     res = requests.post(url,data=data,headers=headers)
     return 'done'
 
@@ -899,7 +899,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         code_execution_config=False,
     )
     helper1 = autogen.AssistantAgent(
-        name="helper",
+        name="Helper",
         llm_config=llm_config,
         code_execution_config={"work_dir": "coding", "use_docker": False},
         system_message=f"""You are Helper Agent. Help the {role} agent to complete the task:
@@ -1222,12 +1222,11 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         ]
     )
     context_handling.add_to_agent(time_agent)
-    context_handling.add_to_agent(time_user)
     context_handling.add_to_agent(helper1)
     context_handling.add_to_agent(executor1)
     context_handling.add_to_agent(multi_role_agent1)
     context_handling.add_to_agent(verify1)
-    context_handling.add_to_agent(chat_instructor1)
+    
     time_agent_object = {}
     time_agent_object['time_agent'] = time_agent
     time_agent_object['time_user'] = time_user
@@ -1388,7 +1387,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
         except Exception as e:
             current_app.logger.error(f'Got some error it can be multiple tools called at one error:{e}')
             # current_app.logger.error(f'len of group chat :{group_chat.messages}')
-            return None
+            return 'Our Agent is facing issues in creating this agent please try later'
             # current_app.logger.error(f' group chat :{group_chat.messages}')
             
             
@@ -1721,6 +1720,20 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
     last_message = group_chat.messages[-1]
     if last_message['content'] == 'TERMINATE':
         last_message = group_chat.messages[-2]
+    
+    if f'message_2_user'.lower() in last_message['content'].lower():
+        json_match = re.search(r'{[\s\S]*}', last_message['content'])
+        if json_match:
+            try:
+                current_app.logger.info('GOT Json')
+                current_app.logger.info(f'got json object')
+                json_part = json_match.group(0)
+                current_app.logger.info('Sending user the message')
+                json_obj = json.loads(json_part)
+                last_message['content'] = json_obj['message_2_user']
+            except:
+                pass
+    
     return last_message['content']
 
 messages = {}

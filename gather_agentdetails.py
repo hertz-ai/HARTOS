@@ -41,7 +41,7 @@ def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autoge
         1.Information Gathering Process
             For flows, first ask the user for the number of flows, then collect each flow's details step by step.
             Ask for flow_name, persona, actions, and sub_goal separately to ensure clarity.
-            Always confirm with the user after gathering information to prevent loss of details and do not gulp any information from user.
+            
         2. Actions Planning & Enhancement
             IMPORTANT INSTRUCTION: Never omit, remove, or skip any user-provided detail (e.g., API URLs, custom formats, or specific instructions). You may rephrase them for better clarity, but ensure every single piece of information remains intact.
             Break down complex actions into multiple atomic steps to ensure clear execution while retaining original intent.
@@ -57,7 +57,7 @@ def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autoge
             NEVER overlook, discard, or modify user-provided information without explicit confirmation.
             ALWAYS maintain the exact structure of API URLs, specific phrases, and formats provided by the user.
             Ensure each persona has a separate flow. Two personas should never be combined in the same flow.
-            Always confirm with the user before finalizing any details.
+            
         5. In the review_details and completed responses, ensure that every piece of information provided by the user is included without skipping, omitting, or overlooking any details. The actions should be described thoroughly and clearly, avoiding any vagueness.
         """
     )
