@@ -17,7 +17,7 @@ from flask import current_app
 from helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values
 import helper as helper_fun
 import threading
-
+from twisted.internet import reactor
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
 from autogen.cache.in_memory_cache import InMemoryCache
 
@@ -193,12 +193,12 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             list of persona:- """+f'{list_of_persona}'+"""
             Rules: 
                 ➜If there’s only 1 persona in the list, associate that persona with all actions automatically.
-                ➜If there are multiple personas, ask the @User to select the persona associated with each action.
+                ➜If there are multiple personas, ask the @user to select the persona associated with each action.
         
         •Code Execution: Executor Agent: Executes code as needed. Ensure the final response is printed in code using print() before sending to Executor.
         
         •Tools Helper Agent can use:
-            1. The tools are: send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory.
+            1. The tools are: send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,execute_windows_command,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory.
             2. Create Scheduled Jobs: For tasks involving timer or time or periodically or scheduled jobs, ask Helper agent to use the create_scheduled_jobs tool.
             3. Data/Memory Management:
                 ➜If you want to save some data,understand the current data from get_saved_metadata & plan the datamodel and ask helper agent to use "save_data_in_memory" tool.
@@ -213,7 +213,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         
         •Calling Other Agents:
             1. When you need to direct a question or route the conversation to a specific agent, use the @ tag followed by the agent's name. Examples include: @Executor or @Helper or @User
-            2. If you want to send data proactively (on your own), use @user {"message_2_user": "message here"}. However, if you're responding to the user's request or instruction, use the send_message_to_user or send_message_in_seconds tool.
+            2. If you want to send data proactively (on your own), use `@user {"message_2_user": "message here"}`. However, if you're responding to the user's request or instruction, use the send_message_to_user or send_message_in_seconds tool.
         
         •Communication Style:
             1. Speak casually, with clarity and respect. Maintain accuracy and clear communication.
@@ -250,7 +250,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             If the Assistant Agent requests code with time.sleep, respond that it cannot be executed and utilize the create_scheduled_jobs tool instead.
             Always include proper error handling and logging.
             Ensure the final response is printed usin print() before returning it.
-            If you want to send data proactively (on your own) to user use @user {"message_2_user": "message here"}. However, if you're responding to the user's request or instruction, use the send_message_to_user or send_message_in_seconds tool.
+            If you want to send data proactively (on your own) to user use `@user {"message_2_user": "message here"}`. However, if you're responding to the user's request or instruction, use the send_message_to_user or send_message_in_seconds tool.
             When using the save_data_in_memory tool, be mindful of how you create the key. Ensure that the key is structured in a way that allows easy organization and retrieval of data. Use dot notation to create a logical key path. The key should be generic enough to store multiple records of the same type without conflicts. Avoid using specific values as part of the key
                 For example:
                     ✅ stories.story_name → Good key structure for storing multiple stories.
@@ -324,7 +324,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         Calling Other Agents:
             When you need to direct a question or route the conversation to a specific agent, use the @ tag followed by the agent's name. Examples include: @Executor or @Helper or @User
         Things You cannot do but Helper Agent can:
-            1. Tools Helper Agent can use: Can use tools like send_message_in_seconds, send_message_to_user,send_presynthesize_video_to_user, text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory.
+            1. Tools Helper Agent can use: Can use tools like send_message_in_seconds, send_message_to_user,send_presynthesize_video_to_user, execute_windows_command, text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory.
             2. Create Scheduled Jobs: For tasks involving timers or scheduled jobs, ask Helper agent to use the create_scheduled_jobs tool.
             3. Data/Memory Management:
                 ➜If you want to save some data ask helper agent to use "save_data_in_memory" tool.
@@ -575,7 +575,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     helper.register_for_llm(name="create_scheduled_jobs", description="Creates time-based jobs using APScheduler to schedule jobs")(create_scheduled_jobs)
     assistant.register_for_execution(name="create_scheduled_jobs")(create_scheduled_jobs)
     
-    def send_message_to_user(text: Annotated[str, "Text to send to the user"],
+    def send_message_to_user(text: Annotated[str, "Text you want to send to the user"],
                          avatar_id: Annotated[Optional[str], "Unique identifier for the avatar"] = None,
                          response_type: Annotated[Optional[str], "Response mode: 'Realistic' (slower, better quality) or 'Realtime' (faster, lower quality)"] = 'Realtime') -> str:
         current_app.logger.info('INSIDE send_message_to_user')
@@ -635,6 +635,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         Executes a command on a Windows machine and returns the response within 500 seconds.
         """
         current_app.logger.info('INSIDE execute_windows_command')
+        from crossbar_server import wamp_session, call_rpc
+        if wamp_session is None:
+            current_app.logger.warning('Wamp is none check crossbar')
         # Prepare the message for the Crossbar client
         crossbar_message = {
             'parent_request_id': request_id_list[user_prompt],
@@ -645,11 +648,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             'actions_available_in_os': [],
             'max_ETA_in_seconds': 500,
             'langchain_server':True
-        } 
-        message_json = json.dumps(crossbar_message)
-        # response = rpc_client.call_rpc("com.hertzai.hevolve.action", [message_json])
-        response = "Executing your request"
-        return response if response else "Failed to execute command on Windows."
+        }
+        d = reactor.callFromThread(call_rpc, crossbar_message)
+        return d
 
     helper.register_for_llm(name="execute_windows_command", description="Executes a command on a Windows machine and returns the response in 500 seconds")(execute_windows_command)
     assistant.register_for_execution(name="execute_windows_command")(execute_windows_command)
@@ -886,7 +887,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         "Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory.]"
         "if you have any task which is not doable by these tool check recipe first else create python code to do so"
         "the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video."
-        f'IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @user {{"message_2_user": "Your message here"}}'
+        f'IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: `@user {{"message_2_user": "Your message here"}}`'
         "Return 'TERMINATE' when the task is done."
     )
     
@@ -911,7 +912,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             6. Always use code from recipe given below
             7. If there is any action which is like to perform a task continously you should not do it.
             8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
-            9. IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @user {{"message_2_user": "Your message here"}}
+            9. IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: `@user {{"message_2_user": "Your message here"}}`
             10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
             Actions: <actionsStart>{user_tasks[user_prompt].actions}<actionEnd>
             Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{final_recipe[prompt_id]}<generalized_functionsEnd><recipeEnd>            
@@ -934,7 +935,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             6. Always use code from recipe given below
             7. If there is any action which is like to perform a task continously you should not do it.
             8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
-            9. IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @{role} {{"message_2_user": "Your message here"}}
+            9. IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: `@{role} {{"message_2_user": "Your message here"}}`
             10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
             Actions: <actionsStart>{user_tasks[user_prompt].actions}<actionEnd>
             Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{final_recipe[prompt_id]}<generalized_functionsEnd><recipeEnd>

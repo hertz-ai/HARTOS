@@ -18,8 +18,11 @@ from langchain.memory import ZepMemory
 from crossbarhttp import Client
 from flask import current_app
 from helper import topological_sort, ToolMessageHandler, strip_json_values, get_time_based_history, retrieve_json
+import helper as helper_fun
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
 import threading
+
+from twisted.internet import reactor
 
 client = Client('http://aws_rasa.hertzai.com:8088/publish')
 scheduler = BackgroundScheduler()
@@ -816,6 +819,36 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         scheduler.add_job(send_message_to_user1, 'date', run_date=run_time, args=[user_id, text, '',prompt_id])
         return 'Message scheduled successfully'
     
+    @assistant.register_for_execution()
+    @helper.register_for_llm(api_style="function",description="Executes a command on a Windows machine and returns the response.")
+    def execute_windows_command(instructions: Annotated[str, "Command in plain English to execute on the Windows machine"]) -> str:
+        """
+        Executes a command on a Windows machine and returns the response within 500 seconds.
+        """
+        current_app.logger.info('INSIDE execute_windows_command')
+        from crossbar_server import wamp_session, call_rpc
+        if wamp_session is None:
+            current_app.logger.warning('Wamp is none check crossbar')
+        # Prepare the message for the Crossbar client
+        crossbar_message = {
+            'parent_request_id': request_id_list[user_prompt],
+            'user_id': user_id,
+            'prompt_id': prompt_id,
+            'instruction_to_vlm_agent': instructions,
+            'os_to_control': 'Windows',
+            'actions_available_in_os': [],
+            'max_ETA_in_seconds': 500,
+            'langchain_server':True
+        }
+        d = reactor.callFromThread(call_rpc, crossbar_message)
+        return d
+    
+    @assistant.register_for_execution()
+    @helper.register_for_llm(api_style="function",description="Get google search response")
+    def google_search(text: Annotated[str, "Text which you want to search"]) -> str:
+        current_app.logger.info('INSIDE google search')
+        return helper_fun.top5_results(text)
+    
     time_agent = autogen.AssistantAgent(
         name='time_agent',
         llm_config=llm_config,
@@ -971,6 +1004,12 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     time_agent.register_for_execution(name="send_presynthesize_video_to_user")(send_presynthesize_video_to_user)
     helper1.register_for_llm(name="send_message_in_seconds", description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")(send_message_in_seconds)
     time_agent.register_for_execution(name="send_message_in_seconds")(send_message_in_seconds)
+    
+    helper1.register_for_llm(name="execute_windows_command", description="Executes a command on a Windows machine and returns the response.")(execute_windows_command)
+    time_agent.register_for_execution(name="execute_windows_command")(execute_windows_command)
+    
+    helper1.register_for_llm(name="google_search", description="Get google search response")(google_search)
+    time_agent.register_for_execution(name="google_search")(google_search)
     
     
     def connect_time_main(message: Annotated[str, "The message time agent want to send to main agent"]) -> str:
@@ -1213,7 +1252,7 @@ def get_agent_response(assistant: autogen.AssistantAgent,chat_instructor: autoge
 
         count = 0
         while True:
-            current_app.logger.info('inside while')
+            current_app.logger.info('inside while1')
             if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
                 current_app.logger.info(f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
                 try:
@@ -1254,14 +1293,17 @@ def get_agent_response(assistant: autogen.AssistantAgent,chat_instructor: autoge
                         message = 'Hey @StatusVerifier Agent, Please verify the status of the action '+f'{user_tasks[user_prompt].current_action+1}: {actions_prompt}'+'\n performed and Respond in the following format {"status": "status here","action": "current action","action_id": '+f'{user_tasks[user_prompt].current_action+1}'+',"message": "message here"}'
                         assistant.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
                         continue
-            if user_tasks[user_prompt].actions[user_tasks[user_prompt].current_action]['can_perform_without_user_input'] == 'yes':
-                current_app.logger.info('GOT can_perform_without_user_input as true')
-                message = 'You should complete this task independently. Feel free to make reasonable assumptions where necessary'
-                helper.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)    
-        
-            count +=1
-            if count == 4:
-                break
+            try:
+                if user_tasks[user_prompt].actions[user_tasks[user_prompt].current_action]['can_perform_without_user_input'] == 'yes':
+                    current_app.logger.info('GOT can_perform_without_user_input as true')
+                    message = 'You should complete this task independently. Feel free to make reasonable assumptions where necessary'
+                    helper.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)    
+            
+                count +=1
+                if count == 4:
+                    break
+            except Exception as e:
+                current_app.logger.error(f'WE have some indec error here: {e}')
             last_message = group_chat.messages[-1]['content']
             if f'@user'.lower() not in last_message.lower():
                 message = 'If you want to communicate from the user then send the response with @user\nIf you current action is completed and you want next action ask @StatusVerifier for next action\n if you can continue the task without user intervention you can proceed with the actions.'
@@ -1392,7 +1434,7 @@ def chat_agent(user_id,text,prompt_id,file_id,request_id):
 
                 count = 0
                 while True:
-                    current_app.logger.info('inside while')
+                    current_app.logger.info('inside while2')
                     if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
                         current_app.logger.info(f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
                         try:
@@ -1438,7 +1480,7 @@ def chat_agent(user_id,text,prompt_id,file_id,request_id):
                     count +=1
                     if count == 4:
                         break
-                    role = get_role(user_id,prompt_id)
+                    # role = get_role(user_id,prompt_id)
                     last_message = group_chat.messages[-1]['content']
                     if f'@user'.lower() not in last_message.lower():
                         message = 'If you want to communicate from the user then send the response with @user\nIf you current action is completed and you want next action ask @StatusVerifier for next action\n if you can continue the task without user intervention you can proceed with the actions.'
