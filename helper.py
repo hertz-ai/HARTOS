@@ -490,6 +490,8 @@ def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual c
         except Exception as e:
             current_app.logger.info('ERROR: Got error in visal QA')
             return 'failed to get visual context ask user to check if the camera is turned on'
+    else:
+        return 'failed to get visual context ask user to check if the camera is turned on'
         
 
 

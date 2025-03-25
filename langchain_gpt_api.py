@@ -2284,32 +2284,14 @@ def history():
 def status():
     return jsonify({'response': 'Working...'})
 
-# Crossbar/WAMP component setup
-url = "ws://aws_rasa.hertzai.com:8088/ws"
-url = os.environ.get('CBURL', url)
-realmvalue = os.environ.get('CBREALM', 'realm1')
-component = Component(transports=url, realm=realmvalue)
-@component.on_join
-@inlineCallbacks
-def joined(session, details):
-    app.logger.info("session ready")
-
-    def onevent(msg):
-        app.logger.info("event received:", msg)
-        crossbar_multiagent(msg)
-    try:
-        yield session.subscribe(onevent, "com.hertzai.hevolve.agent.multichat")
-        app.logger.info("subscribed to topic")
-    except Exception as e:
-        app.logger.error("could not subscribe to topic: {}".format(e))
-
 if __name__ == '__main__':
     # serve(app, host='0.0.0.0', port=6777)
     app.debug = True
     flask_thread = threading.Thread(target=lambda: serve(app, host='0.0.0.0', port=6777))
     flask_thread.daemon = True
     flask_thread.start()
-
+    from crossbar_server import component
     # Run the WAMP client
     run([component])
+    
 
