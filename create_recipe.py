@@ -22,7 +22,7 @@ from autogen.agentchat.contrib.capabilities import transform_messages, transform
 from autogen.cache.in_memory_cache import InMemoryCache
 
 from autobahn.twisted.wamp import ApplicationSession, ApplicationRunner
-from twisted.internet.defer import inlineCallbacks
+from twisted.internet.defer import inlineCallbacks, Deferred
 from crossbarhttp import Client
 client = Client('http://aws_rasa.hertzai.com:8088/publish')
 
@@ -630,7 +630,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     assistant.register_for_execution(name="get_user_details")(get_user_details)
     
     @inlineCallbacks
-    def execute_windows_command(instructions: Annotated[str, "Command in plain English to execute on the Windows machine"]) -> str:
+    def execute_windows_command(instructions: Annotated[str, "Command in plain English to execute on the Windows machine"]):
         """
         Executes a command on a Windows machine and returns the response within 500 seconds.
         """
@@ -641,16 +641,24 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         # Prepare the message for the Crossbar client
         crossbar_message = {
             'parent_request_id': request_id_list[user_prompt],
-            'user_id': user_id,
-            'prompt_id': prompt_id,
+            'user_id': '16695',
+            'prompt_id': '54',
             'instruction_to_vlm_agent': instructions,
             'os_to_control': 'Windows',
             'actions_available_in_os': [],
             'max_ETA_in_seconds': 500,
             'langchain_server':True
         }
-        d = yield call_rpc(crossbar_message)
-        return d
+        try:
+            response = yield call_rpc(crossbar_message)  # Wait for the RPC response
+            if isinstance(response, Deferred):  # Extra check for unresolved Deferred
+                response = yield response
+
+            # Ensure response is a JSON string
+            return f'{response}'
+        except Exception as e:
+            current_app.logger.error(f"Error executing command: {e}")
+            return f"error: {e}"
 
     helper.register_for_llm(name="execute_windows_command", description="Executes a command on a Windows machine and returns the response in 500 seconds")(execute_windows_command)
     assistant.register_for_execution(name="execute_windows_command")(execute_windows_command)
