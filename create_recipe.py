@@ -629,7 +629,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     helper.register_for_llm(name="get_user_details", description="Get User details like name, dob, gender")(get_user_details)
     assistant.register_for_execution(name="get_user_details")(get_user_details)
     
-    
+    @inlineCallbacks
     def execute_windows_command(instructions: Annotated[str, "Command in plain English to execute on the Windows machine"]) -> str:
         """
         Executes a command on a Windows machine and returns the response within 500 seconds.
@@ -649,7 +649,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             'max_ETA_in_seconds': 500,
             'langchain_server':True
         }
-        d = reactor.callFromThread(call_rpc, crossbar_message)
+        d = yield call_rpc(crossbar_message)
         return d
 
     helper.register_for_llm(name="execute_windows_command", description="Executes a command on a Windows machine and returns the response in 500 seconds")(execute_windows_command)
