@@ -1,6 +1,9 @@
 from collections import deque
 import requests
 import re
+import autogen
+
+from autogen.agentchat.contrib.capabilities import transform_messages, transforms
 import json
 from flask import current_app
 from typing import List, Dict, Tuple, Annotated
@@ -357,6 +360,7 @@ class ToolMessageHandler():
                 del processed_messages[0]['tool_responses']
                 processed_messages[0]['role'] = 'user'
                 processed_messages[0]['name'] = 'Helper'
+            processed_messages = processed_messages[1:]
             # current_app.logger.info(f'AFTER CHANGE: {processed_messages[0]}')
         
         
@@ -579,12 +583,12 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
 def parse_date(date_str):
     return datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%S")
 
-def get_visual_context(user_id):
+def get_visual_context(user_id,mins=5):
     '''
         This function help to extract action that user have perfomed till time
     '''
-    action_url = f"{ACTION_API}?user_id={user_id}"
-
+    # action_url = f"{ACTION_API}?user_id={user_id}"
+    action_url = f"https://mailer.hertzai.com/get_visual_bymins?user_id={user_id}&mins={mins}"
     # Todo: get, and populate timezone from client
     time_zone = "Asia/Kolkata"
 
@@ -597,20 +601,15 @@ def get_visual_context(user_id):
         "GET", action_url, headers=headers, data=payload)
 
     if response.status_code == 200:
-
         data = response.json()
-
-
         filtered_data_video = [
             obj for obj in data if obj["zeroshot_label"] == 'Video Reasoning']
-
         # Process video data
         video_context_texts = []
         for obj in filtered_data_video:
             action = obj["action"]
             date = parse_date(obj["created_date"])
             gpt3_label = obj["gpt3_label"]
-
             if gpt3_label == 'Visual Context':
                 now = datetime.now()
                 # Check if the action is older than 5 minutes
@@ -619,30 +618,10 @@ def get_visual_context(user_id):
             first_action_text = f"{action} on {date.astimezone(india_tz).strftime('%Y-%m-%dT%H:%M:%S')}"
 
             video_context_texts.append(first_action_text)
-        action_texts = []
         if video_context_texts:
-            action_texts.append('<Last_5_Minutes_Visual_Context_Start>')
-            action_texts.extend(video_context_texts)
-            action_texts.append('<Last_5_Minutes_Visual_Context_End>')
-            action_texts.append(
-                'If a person is identified in Visual_Context section that\'s most probably the user (me) & most likely not taking any selfie.')
-
-        if len(action_texts) == 0:
-            action_texts = ['user has not performed any actions yet.']
+            return video_context_texts[:10]
+        else:
             return None
-
-        actions = ", ".join(action_texts)
-        # Get the current time
-
-        # Format the time in the desired format
-        formatted_time = datetime.now(pytz.utc).astimezone(
-            india_tz).strftime('%Y-%m-%d %H:%M:%S')
-
-        actions = actions + ". List of actions ends. <PREVIOUS_USER_ACTION_END> \n " + "Today's datetime in "+time_zone + "is: " + formatted_time + \
-            " in this format:'%Y-%m-%dT%H:%M:%S' \n Whenever user is asking about current date or current time at particular location then use this datetime format by asking what user's location is. Use the previous sentence datetime info to answer current time based questions coupled with google_search for current time or full_history for historical conversation based answers. Take a deep breath and think step by step.\n"
-        # user detail api
-
-        return actions
     else:
         return None
 
@@ -680,3 +659,129 @@ def history(user_id,prompt_id,role,message):
         return "Messages are saved!!!"
     else:
         return "Memory object not found"
+
+
+config_list = [{
+    "model": "gpt-4o-mini",
+    "api_type": "azure",
+    "api_key": "4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf",
+    "base_url": "https://hertzai-gpt4.openai.azure.com/",
+    "api_version": "2024-02-15-preview",
+    "price":[0.00015,0.0006]
+}]
+
+llm_config = {
+    "config_list": config_list,
+    "cache_seed": None
+}
+def create_visual_agent(user_id,prompt_id):
+    visual_agent = autogen.AssistantAgent(
+        name='visual_agent',
+        llm_config=llm_config,
+        max_consecutive_auto_reply=10,
+        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        code_execution_config={"work_dir": "coding", "use_docker": False},
+        system_message="You are an helpful AI assistant used to perform visual based tasks given to you. "
+    )
+    
+    visual_user = autogen.UserProxyAgent(
+        name=f"UserProxy",
+        human_input_mode="NEVER",
+        llm_config=False,
+        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        max_consecutive_auto_reply=0,
+        code_execution_config=False,
+    )
+    helper2 = autogen.AssistantAgent(
+        name="Helper",
+        llm_config=llm_config,
+        code_execution_config={"work_dir": "coding", "use_docker": False},
+        system_message=f"""You are Helper Agent. Help the visual_agent to complete the task:
+            2. Use the provided Recipe for more details related to the actions.
+            3. Only use the "send_message_to_roles" tool when contacting personas other than ,Executor,multi_role_agent.
+            4. Tools you have [txt2img, img2txt, save_data_in_memory, get_data_from_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs] if you have any task which is not doable by these tool check recipe first else create python code to do so
+            5. Keep track of action and only go to next action when the current action is completed successfully
+            6. Always use code from recipe given below
+            7. If there is any action which is like to perform a task continously you should not do it.
+            8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
+            9. IMPORTANT instruction: If you want to ask something or send something to the, always use this format: @user {{'message_2_user':'message here'}}
+            10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.            
+            When writing code, always print the final response just before returning it.
+        """,
+        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+    )
+    executor2 = autogen.AssistantAgent(
+        name="Executor",
+        llm_config=llm_config,
+        code_execution_config={"last_n_messages":2,"work_dir": "coding", "use_docker": False},
+        system_message=f'''You are a executor agent. focused solely on creating, running & debugging code.
+            Your responsibilities:
+            2. Use the provided Recipe for more details related to the actions.
+            3. Only use the "send_message_to_roles" tool when contacting personas other than,Executor,multi_role_agent.
+            4. Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory]
+            5. Keep track of action and only go to next action when the current action is completed successfully
+            6. Always use code from recipe given below
+            7. If there is any action which is like to perform a task continously you should not do it.
+            8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
+            9. IMPORTANT instruction: If you want to ask something or send something to the user, always use this format: @user {{'message_2_user':'message here'}}
+            10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
+        
+            Note: Your Working Directory is "/home/hertzai2019/newauto/coding" use this if you need,
+            Add proper error handling, logging.
+            Always provide clear execution results or error messages to the assistant.
+            if you get any conversation which is not related to coding ask the manager to route this conversation to user
+            When writing code, always print the final response just before returning it.
+        ''',
+        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+    )
+    multi_role_agent2 = autogen.AssistantAgent(
+        name="multi_role_agent",
+        llm_config=llm_config,
+        code_execution_config=False,
+        system_message="""You will send message from multiple different personas your, job is to ask those question to assistant agent
+        if you think some text was intent to give to some other agent but i came to you send the same message to user""",
+    )
+    verify2 = autogen.AssistantAgent(
+        name="StatusVerifier",
+        llm_config=llm_config,
+        code_execution_config=False,
+        system_message=""""You are an Status verification agent.
+        Role: Track and verify the status of actions. Provide updates strictly in JSON format only when status is completed.
+        Response formats:
+            1. Action Completed Successfully: {"status": "completed","action": "current action","action_id": 1/2/3...,"message": "message here"}
+            2. Action Error: {"status": "error","action": "current action","action_id": 1/2/3...,"message": "message here"}
+            2. Action Pending: {"status": "pending","action": "current action","action_id": 1/2/3...,"message": "pending actions here"}
+        Important Instructions:
+            Only mark an action as "Completed" if the Assistant Agent confirms successful completion.
+            For pending tasks or ongoing actions, respond to helper to complete the task.
+            Verify the action performed by assistant and make sure the action is performed correctly as per instructions. if action performed was not as per instructions give the pending actions to the helper agent.
+            Report status only—do not perform actions yourself.
+            
+        """,
+        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+    )
+    
+    chat_instructor2 = autogen.UserProxyAgent(
+        name="ChatInstructor",
+        human_input_mode="NEVER",
+        max_consecutive_auto_reply=10,
+        default_auto_reply="TERMINATE",
+        code_execution_config=False,
+        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+    )
+    
+    context_handling = transform_messages.TransformMessages(
+        transforms=[
+            transforms.MessageHistoryLimiter(max_messages=50,keep_first_message=True),
+            transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
+            ToolMessageHandler(),
+        ]
+    )
+    context_handling.add_to_agent(visual_agent)
+    context_handling.add_to_agent(helper2)
+    context_handling.add_to_agent(executor2)
+    context_handling.add_to_agent(multi_role_agent2)
+    context_handling.add_to_agent(verify2)
+    
+    return visual_agent, visual_user, helper2, executor2, multi_role_agent2, verify2, chat_instructor2
+    
