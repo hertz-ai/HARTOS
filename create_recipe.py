@@ -5,7 +5,10 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 import requests
+from autobahn.asyncio.component import Component, run
 import uuid
+import asyncio
+import traceback
 from datetime import datetime
 import time
 from autogen.coding import DockerCommandLineCodeExecutor
@@ -17,12 +20,9 @@ from flask import current_app
 from helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values
 import helper as helper_fun
 import threading
-from twisted.internet import reactor
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
 from autogen.cache.in_memory_cache import InMemoryCache
 
-from autobahn.twisted.wamp import ApplicationSession, ApplicationRunner
-from twisted.internet.defer import inlineCallbacks, Deferred
 from crossbarhttp import Client
 client = Client('http://aws_rasa.hertzai.com:8088/publish')
 
@@ -94,11 +94,11 @@ def execute_python_file(task_description:str,user_id: int,prompt_id:int,action_e
     res = requests.post(url,data=data,headers=headers)
     return 'done'
 
-def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_entry_point:int):
+def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_entry_point:int,actions:list=[]):
     current_app.logger.info(f'INSIDE TIME_BASED_EXECUTION with action_entry_point"{action_entry_point}')
     user_prompt = f'{user_id}_{prompt_id}'
     if user_prompt not in time_agents:
-        time_agents[user_prompt] = create_time_agents(user_id,prompt_id,'creator','',[]) #TODO Replace [] with actions
+        time_agents[user_prompt] = create_time_agents(user_id,prompt_id,'creator','',actions)
     
     # author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = user_agents[user_id]
     current_time = datetime.now()
@@ -147,12 +147,45 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
 
 from typing import List
 
-  
+
+class SubscriptionHandler:
+    message = None
+
+    async def on_rpc_response(self, session, msg):
+        current_app.logger.info("Received RPC response: {}".format(msg))
+        SubscriptionHandler.message = msg
+        await component.stop()  # Stop the component after getting the response
+
+async def subscribe_and_return(message,topic,time=8000):
+    global component
+    component = Component(
+        transports="ws://aws_rasa.hertzai.com:8088/ws",
+        realm="realm1",
+    )
+
+    @component.on_join
+    async def join(session, details):
+        current_app.logger.info("Making RPC Call...")
+        try:
+            response = await asyncio.wait_for(session.call(topic,message), timeout=time)
+            await SubscriptionHandler().on_rpc_response(session, response)
+            
+        except Exception as e:
+            current_app.logger.error(f"RPC call failed: {e}")
+            SubscriptionHandler.message = None
+        finally:
+            await component.stop()
+
+    await component.start()
+    return SubscriptionHandler.message
+
 llm_config = {
         "cache_seed": None,
         "config_list": config_list,
         "max_tokens": 1500
-    }   
+    }
+
+
 
 def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent, autogen.ConversableAgent]:
     """Create new assistant & user agents for a given user_id"""
@@ -629,38 +662,42 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     helper.register_for_llm(name="get_user_details", description="Get User details like name, dob, gender")(get_user_details)
     assistant.register_for_execution(name="get_user_details")(get_user_details)
     
-    @inlineCallbacks
-    def execute_windows_command(instructions: Annotated[str, "Command in plain English to execute on the Windows machine"]):
+    async def execute_windows_command(instructions: Annotated[str, "Command in plain English to execute on the Windows machine"])->str:
         """
         Executes a command on a Windows machine and returns the response within 500 seconds.
         """
-        current_app.logger.info('INSIDE execute_windows_command')
-        from crossbar_server import wamp_session, call_rpc
-        if wamp_session is None:
-            current_app.logger.warning('Wamp is none check crossbar')
-        # Prepare the message for the Crossbar client
-        crossbar_message = {
-            'parent_request_id': request_id_list[user_prompt],
-            'user_id': '16695',
-            'prompt_id': '54',
-            'instruction_to_vlm_agent': instructions,
-            'os_to_control': 'Windows',
-            'actions_available_in_os': [],
-            'max_ETA_in_seconds': 500,
-            'langchain_server':True
-        }
         try:
-            response = yield call_rpc(crossbar_message)  # Wait for the RPC response
-            if isinstance(response, Deferred):  # Extra check for unresolved Deferred
-                response = yield response
-
-            # Ensure response is a JSON string
-            return f'{response}'
+            current_app.logger.info('INSIDE execute_windows_command')
+            topic = f'com.hertzai.hevolve.action.{user_id}'
+            current_app.logger.info(f'calling {topic} for 5 second')
+            response = await subscribe_and_return({'prompt_id':prompt_id},topic,5)  # Wait for the RPC response
+            current_app.logger.info(f'Response from call of {topic}: {response}')
+            if not response:
+                return 'Ask user to to go to hertzai.com login and start the windows companion app'
+            crossbar_message = {
+                'parent_request_id': request_id_list[user_prompt],
+                'user_id': f'{user_id}',
+                'prompt_id': '54',
+                'instruction_to_vlm_agent': instructions,
+                'os_to_control': 'Windows',
+                'actions_available_in_os': [],
+                'max_ETA_in_seconds': 500,
+                'langchain_server':True
+            }
+            topic = 'com.hertzai.hevolve.action'
+            current_app.logger.info(f'calling {topic} for 8000 second')
+            response = await subscribe_and_return(crossbar_message,topic)  # Wait for the RPC response
+            current_app.logger.info(f'THIS IS RESPONSE type: {type(response)} value: {response}')
+            if response['status'] == 'success':
+                return 'successfully ran the command in user\' computer.'
+            else:
+                return 'Not able to perform this action now please try later'
         except Exception as e:
-            current_app.logger.error(f"Error executing command: {e}")
-            return f"error: {e}"
+            error_message = traceback.format_exc()  # Capture full traceback
+            current_app.logger.error(f"Error executing command:\n{error_message}")
+            return {"error": e}
 
-    helper.register_for_llm(name="execute_windows_command", description="Executes a command on a Windows machine and returns the response in 500 seconds")(execute_windows_command)
+    helper.register_for_llm(name="execute_windows_command", description="Processes user-defined commands on a personal Windows or Android system.")(execute_windows_command)
     assistant.register_for_execution(name="execute_windows_command")(execute_windows_command)
 
     
@@ -1556,11 +1593,11 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         data = json.load(f)
                         role = data['flows'][recipe_for_persona[user_prompt]]['persona']
                     message = '''Reflect on the sequence of tasks and create scheduled_tasks with proper persona name and action_entry_point. Provide the output in the following JSON format:
-                        { "status", "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer `action_id` from the list of existing `action_ids` is required as the starting point to perform this job.","action_exit_point":"An integer `action_id` up to which the job should be performed to complete the task. It can be greater than or equal to the entry point.","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }'''
+                        { "status", "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer `action_id` from the list of existing `action_ids` is required as the starting point to perform this job.","action_exit_point":"An integer `action_id` up to which the job should be performed to complete the task. It can be greater than or equal to the entry point.","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ], "visual_scheduled_tasks": [ { "cron_expression": "Create this only if a visual time-based job is present; if no visual time-based job exists, do not create it.","persona":"", "job_description": "Provide a description of the visual scheduled job without specifying the time or frequency" } ] }'''
 
                     final_recipe[prompt_id] = {"status":"completed","actions":updated_actions}
                     assistant_agent.update_system_message = '''Reflect on the sequence of tasks and create scheduled_tasks with proper persona name and action_entry_point. Provide the output in the following JSON format:
-                    { "status", "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer `action_id` from the list of existing `action_ids` is required as the starting point to perform this job.","action_exit_point":"An integer `action_id` up to which the job should be performed to complete the task. It can be greater than or equal to the entry point.","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }'''
+                    { "status", "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer `action_id` from the list of existing `action_ids` is required as the starting point to perform this job.","action_exit_point":"An integer `action_id` up to which the job should be performed to complete the task. It can be greater than or equal to the entry point.","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ], "visual_scheduled_tasks": [ { "cron_expression": "Create this only if a visual time-based job is present; if no visual time-based job exists, do not create it.","persona":"", "job_description": "Provide a description of the visual scheduled job without specifying the time or frequency" } ] }'''
                     current_app.logger.info(f'user_tasks[user_prompt].current_action:{user_tasks[user_prompt].current_action} == len(user_tasks[user_prompt].actions)')
                     chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
                     last_message = group_chat.messages[-1]
@@ -1665,9 +1702,9 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         role = data['flows'][recipe_for_persona[user_prompt]]['persona']
                     final_recipe[prompt_id] = {"status":"completed","actions":updated_actions}
                     assistant_agent.update_system_message = '''Reflect on the sequence of tasks and create scheduled_tasks with proper persona name and action_entry_point. Provide the output in the following JSON format:
-                    { "status", "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer `action_id` from the list of existing `action_ids` is required as the starting point to perform this job.","action_exit_point":"An integer `action_id` up to which the job should be performed to complete the task. It can be greater than or equal to the entry point.","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }'''
+                    { "status", "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer `action_id` from the list of existing `action_ids` is required as the starting point to perform this job.","action_exit_point":"An integer `action_id` up to which the job should be performed to complete the task. It can be greater than or equal to the entry point.","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ], "visual_scheduled_tasks": [ { "cron_expression": "Create this only if a visual time-based job is present; if no visual time-based job exists, do not create it.","persona":"", "job_description": "Provide a description of the visual scheduled job without specifying the time or frequency" } ] }'''
                     message = '''Reflect on the sequence of tasks and create scheduled_tasks with proper persona name and action_entry_point. Provide the output in the following JSON format:
-                    { "status", "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer `action_id` from the list of existing `action_ids` is required as the starting point to perform this job.","action_exit_point":"An integer `action_id` up to which the job should be performed to complete the task. It can be greater than or equal to the entry point.","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }'''
+                    { "status", "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer `action_id` from the list of existing `action_ids` is required as the starting point to perform this job.","action_exit_point":"An integer `action_id` up to which the job should be performed to complete the task. It can be greater than or equal to the entry point.","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ], "visual_scheduled_tasks": [ { "cron_expression": "Create this only if a visual time-based job is present; if no visual time-based job exists, do not create it.","persona":"", "job_description": "Provide a description of the visual scheduled job without specifying the time or frequency" } ] }'''
                     chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
                     last_message = group_chat.messages[-1]
                     json_response = retrieve_json(last_message['content'])
@@ -1784,7 +1821,7 @@ def recipe(user_id, text,prompt_id,file_id,request_id):
             time_agents[user_prompt] = create_time_agents(user_id,prompt_id,flows[i]['persona'],'',flows[i]["actions"])
             if "scheduled_tasks" in merged_dict:
                 for jobs in merged_dict['scheduled_tasks']:
-                    time_based_execution(jobs['job_description'],user_id,prompt_id,jobs['action_entry_point'])
+                    time_based_execution(jobs['job_description'],user_id,prompt_id,jobs['action_entry_point'],flows[i]["actions"])
         flow = recipe_for_persona[user_prompt]
         name = f'prompts/{prompt_id}_{flow}_recipe.json'
         with open(name, "w") as json_file:

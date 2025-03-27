@@ -70,9 +70,8 @@ load_dotenv()
 #autogen requirements
 
 from create_recipe import recipe, time_based_execution as time_execution
-from reuse_recipe import chat_agent, crossbar_multiagent, time_based_execution
-from autobahn.twisted.component import Component, run
-from twisted.internet.defer import inlineCallbacks
+from reuse_recipe import chat_agent, crossbar_multiagent, time_based_execution, visual_based_execution
+from autobahn.asyncio.component import Component, run
 import threading
 from helper import retrieve_json
 # os.environ['LANGCHAIN_TRACING_V2'] = 'true'
@@ -2247,6 +2246,22 @@ def time_agent():
     else:
         res = time_execution(str(task_description),int(user_id),int(prompt_id),action_entry_point)
     return jsonify({'response':f'{res}'}), 200
+
+
+@app.route('/visual_agent',methods=['POST'])
+def visual_agent():
+    app.logger.info('GOT REQUEST IN Visual AGENT API')
+    data = request.get_json()
+    task_description = data.get('task_description',None)
+    user_id = data.get('user_id',None)
+    request_from = data.get('request_from',"Reuse")
+    prompt_id = data.get('prompt_id',None)
+    if not task_description or not user_id or not prompt_id:
+        return jsonify({'error':'user_id or task_description or prompt_id is missing'}), 404
+    app.logger.info(f'GOT user_id:{user_id} & prompt_id:{prompt_id} & task_description:{task_description}')
+    if request_from == 'Reuse':
+        res = visual_based_execution(str(task_description),int(user_id),int(prompt_id))
+    return jsonify({'response':f'{res}'}), 200
     
 @app.route('/response_ack',methods=['POST'])
 def response_ack():
@@ -2285,13 +2300,13 @@ def status():
     return jsonify({'response': 'Working...'})
 
 if __name__ == '__main__':
-    # serve(app, host='0.0.0.0', port=6777)
-    app.debug = True
-    flask_thread = threading.Thread(target=lambda: serve(app, host='0.0.0.0', port=6777))
-    flask_thread.daemon = True
-    flask_thread.start()
-    from crossbar_server import component
-    # Run the WAMP client
-    run([component])
+    serve(app, host='0.0.0.0', port=6777, threads=50)
+    # app.debug = True
+    # flask_thread = threading.Thread(target=lambda: serve(app, host='0.0.0.0', port=6777))
+    # flask_thread.daemon = True
+    # flask_thread.start()
+    # from crossbar_server import component
+    # # Run the WAMP client
+    # run([component])
     
 
