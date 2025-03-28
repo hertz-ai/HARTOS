@@ -401,7 +401,7 @@ class ToolMessageHandler():
                 current_msg['role'] = 'user'
         
         current_app.logger.info("processed_messages")
-        # current_app.logger.debug(processed_messages)
+        # current_app.logger.info(processed_messages[0])
         return processed_messages
         
     def get_logs(self, pre_transform_messages: List[Dict], post_transform_messages: List[Dict]) -> Tuple[str, bool]:

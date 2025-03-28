@@ -715,6 +715,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         if messages[-1]['name'] != 'UserProxy':
             new_role = 'AI'
         helper_fun.history(user_id,prompt_id,new_role,messages[-1]['content'])
+        
+        # if len(groupchat.messages) == 5:
+        #     current_app.logger.info('THE LENGTH OF MESSAGES IS 5 APPENDING tool at start')
+        #     groupchat.messages.insert(0,{'role':'tool','name':'Assistant','content':'','tool_responses':''})
         # if len(messages) % 10 == 0 or messages[-1]['name'] == 'UserProxy':
         #     current_app.logger.info('CHECKING FOR VIDEO FOR PAST 5MINS')
         #     visual_context = helper_fun.get_visual_context(user_id)
