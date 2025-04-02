@@ -69,12 +69,11 @@ load_dotenv()
 
 #autogen requirements
 
-from create_recipe import recipe
-from reuse_recipe import chat_agent, crossbar_multiagent, time_based_execution
-from autobahn.twisted.component import Component, run
-from twisted.internet.defer import inlineCallbacks
+from create_recipe import recipe, time_based_execution as time_execution
+from reuse_recipe import chat_agent, crossbar_multiagent, time_based_execution, visual_based_execution
+from autobahn.asyncio.component import Component, run
 import threading
-
+from helper import retrieve_json
 # os.environ['LANGCHAIN_TRACING_V2'] = 'true'
 # os.environ['LANGCHAIN_ENDPOINT'] = 'https://api.smith.langchain.com'
 # os.environ['LANGCHAIN_API_KEY'] = os.getenv("LANGCHAIN_API_KEY")
@@ -604,7 +603,7 @@ class CustomGPT(LLM):
                     app.logger.info(
                         " gpt 3.5 finish in {}".format(time.time()-start))
                     checker = 1
-                    
+
                     # # `response_from_groq`.
 
                     # response_from_groq = structured_llm.invoke(prompt)
@@ -693,10 +692,10 @@ class CustomGPT(LLM):
                         app.logger.info(
                             "gpt 3.5 finish in {}".format(time.time()-start))
                         checker = 1
-                        
+
                         # response_from_groq = structured_llm.invoke(prompt)
 
-                        
+
                         # app.logger.info(
                         #     "finish in groq {}".format(time.time()-start))
                         # app.logger.info(
@@ -728,7 +727,7 @@ class CustomGPT(LLM):
                     f"gpt 4 response format type is {type(response.json())}")
                 app.logger.info("finish in {}".format(time.time()-start))
                 checker = 1
-            
+
         if checker == 0:
             try:
                 app.logger.info(
@@ -1889,7 +1888,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
             <RESPONSE_INSTRUCTIONS_END>
 
             Here is the User and AI conversation in reverse chronological order:
-            
+
             USER'S INPUT:
             -------------
             <USER_INPUT_START>
@@ -2026,23 +2025,49 @@ def chat():
     thread_local_data.set_request_id(request_id=request_id)
     prompt = data.get('prompt', None)
     if prompt_id:
-        if not os.path.exists(f'prompts/{prompt_id}.json'):
+        if os.path.exists(f'prompts/{prompt_id}.json'):
+            app.logger.info('GATHER JSON EXISTS')
+            if os.path.exists(f'prompts/{prompt_id}_0_recipe.json'):
+                app.logger.info('0 Recipe JSON EXISTS')
+                file_path = f'prompts/{prompt_id}.json'
+                with open(file_path, 'r') as f:
+                    data = json.load(f)
+                    no_of_flow = len(data['flows'])-1
+                    app.logger.info(f'GOT LEN OF FLOW AS {no_of_flow}')
+                if os.path.exists(f'prompts/{prompt_id}_{no_of_flow}_recipe.json'):
+                    app.logger.info(f'{no_of_flow} Recipe Json exist Goinf to reuse')
+                    create_agent = False
+                    review_agents[user_id] = True
+                    conversation_agent[user_id] = False
+                else:
+                    app.logger.info(f'{no_of_flow} Recipe JSON doesnot EXISTS')
+                    create_agent = True
+                    review_agents[user_id] = True
+                    conversation_agent[user_id] = False
+            else:
+                app.logger.info('0 Recipe JSON doesnot EXISTS')
+                create_agent = True
+                review_agents[user_id] = True
+                conversation_agent[user_id] = False
+
+        else:
+            app.logger.info('GATHER JSON doesnot EXISTS')
             create_agent = True
             review_agents[user_id] = False
-        elif not os.path.exists(f'prompts/{prompt_id}_recipe.json'):
-            create_agent = True
-            review_agents[user_id] = True
-            conversation_agent[user_id] = False
-        
+            conversation_agent[user_id] = True
+
     if create_agent:
         if user_id not in review_agents.keys() or review_agents[user_id] == False:
             review_agents[user_id] = False
             prompt = data.get('prompt', None)
             if prompt_id not in first_promts:
                 first_promts.append(prompt_id)
-                res = requests.get(
-                    f'{DB_URL}/getprompt/?prompt_id={prompt_id}').json()
-                prompt = prompt+f" name:{res[0]['name']} goal:{res[0]['prompt']}"
+                try:
+                    res = requests.get(
+                        f'{DB_URL}/getprompt/?prompt_id={prompt_id}').json()
+                    prompt = prompt+f" name:{res[0]['name']} goal:{res[0]['prompt']}"
+                except:
+                    app.logger.error(f'GOT DB ERROR FOR PROMPTID:{prompt_id}')
             if not user_id or not prompt:
                 return jsonify({'response': 'Need user_id and text to create agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
             from gather_agentdetails import gather_info
@@ -2051,7 +2076,7 @@ def chat():
             app.logger.info('AFTER GATHER INFO')
             try:
                 try:
-                    new_res = eval(new_response)
+                    new_res = retrieve_json(new_response)
                 except Exception as e:
                     app.logger.error(f'Got some error while will try with re match error:{e}')
                     json_match = re.search(r'{[\s\S]*}', response)
@@ -2093,17 +2118,17 @@ def chat():
                 return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'completed'})
             return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Review Mode'})
         if review_agents[user_id] and conversation_agent[user_id]:
-            response = chat_agent(user_id,prompt,prompt_id,file_id)
+            response = chat_agent(user_id,prompt,prompt_id,file_id,request_id)
             return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Evaluation Mode'})
 
     if prompt_id and os.path.exists(f'prompts/{prompt_id}.json'):
-        
+
         with open(f'prompts/{prompt_id}.json', "r") as file:
             created_json = json.load(file)
-            
-            
-        response = chat_agent(user_id,prompt,prompt_id,file_id)
-            
+
+
+        response = chat_agent(user_id,prompt,prompt_id,file_id,request_id)
+
         # if not user_id or not prompt:
         #     return jsonify({'response': 'Need user_id and text to use agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
         # last_response = ''
@@ -2167,6 +2192,19 @@ def chat():
                   query=prompt, custom_prompt=custom_prompt, preferred_lang=preferred_lang)
     app.logger.info("the time taken by get ans in main api is %s seconds",
                     time.time() - ans_start_time)
+    if req_tool == 'Image_Inference_Tool':
+        action_response = requests.post(f'{DB_URL}/create_action',)
+        payload = json.dumps({
+            "conv_id": None,
+            "user_id": user_id,
+            "action": f"{ans}",
+            "zeroshot_label": "Image Inference",
+            "gpt3_label": "Visual Context"
+        })
+        headers = {
+            'Content-Type': 'application/json'
+        }
+        action_response = requests.post(f'{DB_URL}/create_action', headers=headers, data=payload)
     if ans != "":
         post_dict = {'user_id': user_id, 'status': 'FINISHED', 'task_name': "CHAT",
                      'uid': request_id, 'task_id': f"CHAT_{str(request_id)}", 'request_id': request_id}
@@ -2197,14 +2235,34 @@ def time_agent():
     data = request.get_json()
     task_description = data.get('task_description',None)
     user_id = data.get('user_id',None)
+    request_from = data.get('request_from',"Reuse")
     prompt_id = data.get('prompt_id',None)
     action_entry_point = data.get('prompt_id',0)
     if not task_description or not user_id or not prompt_id:
         return jsonify({'error':'user_id or task_description or prompt_id is missing'}), 404
     app.logger.info(f'GOT user_id:{user_id} & prompt_id:{prompt_id} & task_description:{task_description}')
-    res = time_based_execution(str(task_description),int(user_id),int(prompt_id),action_entry_point)
+    if request_from == 'Reuse':
+        res = time_based_execution(str(task_description),int(user_id),int(prompt_id),action_entry_point)
+    else:
+        res = time_execution(str(task_description),int(user_id),int(prompt_id),action_entry_point)
     return jsonify({'response':f'{res}'}), 200
-    
+
+
+@app.route('/visual_agent',methods=['POST'])
+def visual_agent():
+    app.logger.info('GOT REQUEST IN Visual AGENT API')
+    data = request.get_json()
+    task_description = data.get('task_description',None)
+    user_id = data.get('user_id',None)
+    request_from = data.get('request_from',"Reuse")
+    prompt_id = data.get('prompt_id',None)
+    if not task_description or not user_id or not prompt_id:
+        return jsonify({'error':'user_id or task_description or prompt_id is missing'}), 404
+    app.logger.info(f'GOT user_id:{user_id} & prompt_id:{prompt_id} & task_description:{task_description}')
+    if request_from == 'Reuse':
+        res = visual_based_execution(str(task_description),int(user_id),int(prompt_id))
+    return jsonify({'response':f'{res}'}), 200
+
 @app.route('/response_ack',methods=['POST'])
 def response_ack():
     app.logger.info('GOT REQUEST IN response_ack')
@@ -2241,32 +2299,13 @@ def history():
 def status():
     return jsonify({'response': 'Working...'})
 
-# Crossbar/WAMP component setup
-url = "ws://aws_rasa.hertzai.com:8088/ws"
-url = os.environ.get('CBURL', url)
-realmvalue = os.environ.get('CBREALM', 'realm1')
-component = Component(transports=url, realm=realmvalue)
-@component.on_join
-@inlineCallbacks
-def joined(session, details):
-    app.logger.info("session ready")
-
-    def onevent(msg):
-        app.logger.info("event received:", msg)
-        crossbar_multiagent(msg)
-    try:
-        yield session.subscribe(onevent, "com.hertzai.hevolve.agent.multichat")
-        app.logger.info("subscribed to topic")
-    except Exception as e:
-        app.logger.error("could not subscribe to topic: {}".format(e))
-
 if __name__ == '__main__':
-    # serve(app, host='0.0.0.0', port=6777)
-    app.debug = True
-    flask_thread = threading.Thread(target=lambda: serve(app, host='0.0.0.0', port=6777))
-    flask_thread.daemon = True
-    flask_thread.start()
-
-    # Run the WAMP client
-    run([component])
+    serve(app, host='0.0.0.0', port=6777, threads=50)
+    # app.debug = True
+    # flask_thread = threading.Thread(target=lambda: serve(app, host='0.0.0.0', port=6777))
+    # flask_thread.daemon = True
+    # flask_thread.start()
+    # from crossbar_server import component
+    # # Run the WAMP client
+    # run([component])
 
