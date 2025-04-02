@@ -224,6 +224,7 @@ def get_role(user_id,prompt_id):
 def send_message_to_user1(user_id,response,inp,prompt_id):
     user_prompt = f'{user_id}_{prompt_id}'
     request_id = f'{request_id_list[user_prompt]}-intermediate'
+    request_id_list_sent_intermediate[user_prompt]=request_id_list[user_prompt]
     url = 'http://aws_rasa.hertzai.com:9890/autogen_response'
     body = json.dumps({'user_id':user_id,'message':response,'inp':inp,'request_id':request_id})
     headers = {'Content-Type': 'application/json'}
@@ -1255,6 +1256,9 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     def state_transition(last_speaker, groupchat):
         messages = groupchat.messages
         try:
+            if 'message_2_user' in messages[-1]["content"].lower():
+                return "auto"
+
             pattern = r'\{.*?\}' # getting all json from text
             matches = re.findall(pattern, messages[-1]["content"], re.DOTALL)
             json_objects = [json.loads(match) for match in matches]
@@ -1307,22 +1311,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         if last_speaker.name == f"user_proxy_{user_id}" or last_speaker.name == "multi_role_agent" or last_speaker.name == "helper" or last_speaker.name == "Executor" or last_speaker.name == "ChatInstructor":
             return assistant
         current_app.logger.info(f'Checking for @user or @user in message')
-        if 'message_2_user' in messages[-1]["content"].lower():
-            current_app.logger.info('GOT @USER in message')
-            temp_message = messages[-1]["content"]
-            temp_message = temp_message.replace("'",'"')
-            json_match = re.search(r'{[\s\S]*}', temp_message)
-            if json_match:
-                try:
-                    current_app.logger.info('GOT Json')
-                    current_app.logger.info(f'got json object')
-                    json_part = json_match.group(0)
-                    current_app.logger.info('Sending user the message')
-                    json_obj = json.loads(json_part)
-                    send_message_to_user1(user_id,json_obj['message_2_user'],'',prompt_id)
-                except:
-                    pass
-                return "auto"
+
 
         if messages[-1]["role"] == 'function':
             current_app.logger.info('The last speaker was function returning assistant')
@@ -1520,7 +1509,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
 
     return assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group
 
-def get_agent_response(assistant: autogen.AssistantAgent,chat_instructor: autogen.UserProxyAgent, helper: autogen.AssistantAgent, user_proxy: autogen.UserProxyAgent,manager: autogen.GroupChatManager,group_chat:autogen.GroupChat, message: str, role:str,user_id:int, prompt_id:int) -> str:
+def get_agent_response(assistant: autogen.AssistantAgent,chat_instructor: autogen.UserProxyAgent, helper: autogen.AssistantAgent, user_proxy: autogen.UserProxyAgent,manager: autogen.GroupChatManager,group_chat:autogen.GroupChat, message: str, role:str,user_id:int, prompt_id:int, request_id:str) -> str:
     """Get a single response from the agent for the given message."""
     user_prompt = f'{user_id}_{prompt_id}'
     try:
@@ -1545,7 +1534,7 @@ def get_agent_response(assistant: autogen.AssistantAgent,chat_instructor: autoge
                         continue
                 except IndexError as e:
                     current_app.logger.info(f"COmpleted ALL ACTIONS:")
-                    return 'All set! Your tasks are fully completed. Is there anything else you\'d like me to'
+                    return ''
                 except:
                     try:
                         json_match = re.search(r'{[\s\S]*}', group_chat.messages[-2]["content"])
@@ -1582,9 +1571,17 @@ def get_agent_response(assistant: autogen.AssistantAgent,chat_instructor: autoge
             except Exception as e:
                 current_app.logger.error(f'WE have some indec error here: {e}')
             last_message = group_chat.messages[-1]['content']
-            if f'@user'.lower() not in last_message.lower():
+            # Check if this message has already been sent to the user by state_transition
+            if f'message_2_user'.lower() in last_message.lower()  and request_id == request_id_list_sent_intermediate.get(user_prompt, None):
+                # Message has already been sent to user in state_transition
+                # Return a placeholder or empty response to prevent duplication
+                current_app.logger.info(f'Message with message_2_user detected - already sent by state_transition')
+                # Instead of returning the entire message, return an acknowledgment or empty response
+                return ''
+            elif f'@user'.lower() not in last_message.lower():
                 message = 'If you want to communicate from the user then send the response with @user\nIf you current action is completed and you want next action ask @StatusVerifier for next action\n if you can continue the task without user intervention you can proceed with the actions.'
-                helper.initiate_chat(manager, message=message,speaker_selection={"speaker": "assistant"}, clear_history=False)
+                helper.initiate_chat(manager, message=message, speaker_selection={"speaker": "assistant"},
+                                     clear_history=False)
                 continue
             else:
                 current_app.logger.info(f'@user in last message')
@@ -1595,17 +1592,26 @@ def get_agent_response(assistant: autogen.AssistantAgent,chat_instructor: autoge
         if last_message['content'] == 'TERMINATE':
             last_message = group_chat.messages[-2]
 
+
         if f'message_2_user'.lower() in last_message['content'].lower():
-            json_obj = retrieve_json(last_message["content"])
-            if json_obj:
-                try:
+            try:
+                json_obj = retrieve_json(last_message['content'])
+                if json_obj and 'message_2_user' in json_obj:
                     last_message['content'] = json_obj['message_2_user']
-                except:
-                    pass
-        return last_message
+            except Exception as e:
+                current_app.logger.error(f"Error extracting JSON: {e}")
+                # Fallback to a basic pattern match if retrieve_json fails
+                pattern = r'@user\s*{[\'"]message_2_user[\'"]\s*:\s*[\'"](.+?)[\'"]}'
+                match = re.search(pattern, last_message['content'], re.DOTALL)
+                if match:
+                    last_message['content'] = match.group(1)
+        # At this point, don't process messages with message_2_user as they were already sent
+        return last_message['content']
 
     except Exception as e:
         current_app.logger.info(f'Got some error {e}')
+        error_message = traceback.format_exc()  # Capture full traceback
+        current_app.logger.error(f"Error in get_agent_response:\n{error_message}")
         return f"Error getting response: {str(e)}"
 
 
@@ -1666,6 +1672,8 @@ recent_file_id = {}
 recipes = {}
 user_tasks = {}
 request_id_list = {}
+request_id_list_sent_intermediate = {}
+
 time_actions = {}
 final_recipe = {}
 
@@ -1761,7 +1769,7 @@ def chat_agent(user_id,text,prompt_id,file_id,request_id):
                                     raise 'No json found'
                             except IndexError as e:
                                 current_app.logger.info(f"COmpleted ALL ACTIONS:")
-                                return 'All set! Your tasks are fully completed. Is there anything else you\'d like me to'
+                                return ''
                             except Exception as e:
                                 current_app.logger.warning(f'it is not a json object the error is: {e}')
                                 current_app.logger.info('it is not a json object You should ask status verifier to give response in proper format & not move ahead to next action')
@@ -1802,7 +1810,7 @@ def chat_agent(user_id,text,prompt_id,file_id,request_id):
 
             prompt_id = int(prompt_id)
             role = get_role(user_id,prompt_id)
-            response = get_agent_response(assistant,chat_instructor, helper,user_proxy,manager,group_chat, user_message, role,user_id,prompt_id)
+            response = get_agent_response(assistant,chat_instructor, helper,user_proxy,manager,group_chat, user_message, role,user_id,prompt_id, request_id)
             llm_call_track[user_prompt]['count'] = 0
             llm_call_track[user_prompt]['original_prompt'] = True
             return response
