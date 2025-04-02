@@ -81,7 +81,7 @@ async def async_main(urls):
     async with aiohttp.ClientSession() as session:
         tasks = [fetch(session, url) for url in urls]
         return await asyncio.gather(*tasks)
-    
+
 def top5_results(query):
     final_res = []
     top_2_search_res = search.results(query, 2)
@@ -169,7 +169,7 @@ def fix_actions(array_of_actions,cyclic_ids):
     url = "http://aws_rasa.hertzai.com:5459/gpt3"
     text = f"""From the Below json array of action we are getting cyclic dependency. the action_ids which are creating the cyclic dependecy are {cyclic_ids}.
             You can Refer the below array of actions \n{array_of_actions}\n and return the corrected action dependency without cyclic dependency.
-            complete json array without cyclic dependency, RESPONSE FORMAT: e.g. [{{"action_id":"An integer action_id","actions_this_action_depends_on":[]}}] 
+            complete json array without cyclic dependency, RESPONSE FORMAT: e.g. [{{"action_id":"An integer action_id","actions_this_action_depends_on":[]}}]
             IMPORTANT INSTRUCTIONS: Do not add any unnecessary hallucinated dependencies in actions
             Output array:"""
     payload = json.dumps({
@@ -193,8 +193,8 @@ def fix_actions(array_of_actions,cyclic_ids):
     except Exception as e:
         print(f'GOT ERROR WHILE JSON FIX:{e}')
         return None
-    
-    
+
+
 def gpt_call(prompt):
     url = "http://aws_rasa.hertzai.com:5459/gpt3"
     text = prompt
@@ -217,7 +217,7 @@ def gpt_call(prompt):
     except Exception as e:
         print(f'GOT ERROR WHILE JSON FIX:{e}')
         return None
-    
+
 def gpt_mini(prompt,request_id,history):
     url = "http://aws_rasa.hertzai.com:5459/gpt-json"
     prompt = f'{prompt} conside below as history {history}'
@@ -248,27 +248,27 @@ def strip_json_values(data):
 
 def fix_json(json_text):
     url = "http://aws_rasa.hertzai.com:5459/gpt3"
-    text = """You are an expert JSON fixer. Your task is to correct a given JSON string, ensuring it is compatible with Python’s `eval()`.  
+    text = """You are an expert JSON fixer. Your task is to correct a given JSON string, ensuring it is compatible with Python’s `eval()`.
 
-    ### Instructions:  
-    1. **Fix Formatting Issues:**  
-    - Convert single quotes (`'`) to double quotes (`"`) where necessary (except inside stringified JSON).  
-    - Ensure correct placement of commas, brackets, and braces.  
-    - Fix missing or extra quotes.  
-    - Properly escape special characters like newlines (`\n`).  
+    ### Instructions:
+    1. **Fix Formatting Issues:**
+    - Convert single quotes (`'`) to double quotes (`"`) where necessary (except inside stringified JSON).
+    - Ensure correct placement of commas, brackets, and braces.
+    - Fix missing or extra quotes.
+    - Properly escape special characters like newlines (`\n`).
 
-    2. **Convert JSON to Python-Compatible Format:**  
-    - Ensure `true`, `false`, and `null` are replaced with `True`, `False`, and `None`.  
-    - If the JSON contains a string representation of a dictionary inside a field (e.g., `'{"key": "value"}'`), ensure it remains correctly formatted.  
+    2. **Convert JSON to Python-Compatible Format:**
+    - Ensure `true`, `false`, and `null` are replaced with `True`, `False`, and `None`.
+    - If the JSON contains a string representation of a dictionary inside a field (e.g., `'{"key": "value"}'`), ensure it remains correctly formatted.
 
-    3. **Preserve Key-Value Data:**  
-    - Do not change any key names or values, only correct formatting.  
+    3. **Preserve Key-Value Data:**
+    - Do not change any key names or values, only correct formatting.
 
-    4. **Output Only the Fixed JSON:**  
-    - Provide only the corrected JSON without explanations or extra text.  
+    4. **Output Only the Fixed JSON:**
+    - Provide only the corrected JSON without explanations or extra text.
 
     ### Input JSON: """+f"{json_text}"+"""
-    Output Json: 
+    Output Json:
     """
     payload = json.dumps({
     "text": text,
@@ -292,62 +292,83 @@ def fix_json(json_text):
         return None
 
 
+import ast
+
+
 def retrieve_json(json_message):
     json_obj = None
+
+    # First, try to extract just the JSON part (without the @user prefix)
+    if '@user' in json_message:
+        # Find everything after @user
+        prefix_match = re.search(r'@user\s*(.*)', json_message, re.DOTALL)
+        if prefix_match:
+            json_message = prefix_match.group(1).strip()
+
+    # Try using ast.literal_eval which can handle Python dict syntax with single quotes
     try:
-        json_obj = eval(json_message)
-        current_app.logger.info(f'got json object')
+        json_obj = ast.literal_eval(json_message)
+        current_app.logger.info('got json object using ast.literal_eval')
         return json_obj
-    except:
+    except Exception as e:
+        current_app.logger.info(f'ast.literal_eval failed: {e}')
         json_obj = None
-    
+
+    # Fall back to regex + json.loads approach with more careful quote handling
     try:
         json_match = re.search(r'{[\s\S]*}', json_message)
         if json_match:
             json_part = json_match.group(0)
-            json_obj = json.loads(json_part)
-            current_app.logger.info(f'got json object')
+
+            # A more careful approach to handle quotes correctly
+            # This only replaces outer quotes, not quotes within the content
+            processed_json = re.sub(r"'([^']+)':", r'"\1":', json_part)  # Fix keys
+            # Now handle the string values, being careful about nested quotes
+            processed_json = re.sub(r':\s*\'([^\']*)\'', r': "\1"', processed_json)
+
+            json_obj = json.loads(processed_json)
+            current_app.logger.info('got json object')
             return json_obj
         return None
-    except:
+    except Exception as e:
+        current_app.logger.info(f'json processing failed: {e}')
         json_obj = fix_json(json_message)
         return json_obj
-    
-    
+
 class ToolMessageHandler():
     """Handles tool messages in the conversation history.
-    
+
     This transformation checks the first message (index 0) in the conversation history.
     If the message role is 'tool', it removes that message and returns the remaining messages.
     Otherwise, it returns the conversation history unchanged.
     """
-    
+
     def __init__(self):
         """
         Initialize the ToolMessageHandler.
         No configuration parameters are needed for this simple transformation.
         """
         pass
-        
+
     def apply_transform(self, messages: List[Dict]) -> List[Dict]:
         """Applies the tool message handling transformation to the conversation history.
-        
+
         Args:
             messages (List[Dict]): The list of messages representing the conversation history.
-            
+
         Returns:
             List[Dict]: A new list containing the messages, with the first tool message removed if present.
         """
         if not messages:
             return messages
-        
+
         # Make a copy to avoid modifying the original list
         processed_messages = messages.copy()
-        
+
         # Only process up to second-to-last message
         if not messages or len(messages) < 2:
             return messages
-        
+
         # current_app.logger.info(f'FIRST MESSAGE:-> {processed_messages[0]}')
         # Check if the first message has a role of 'tool'
         if processed_messages and processed_messages[0].get('role') == 'tool':
@@ -362,12 +383,12 @@ class ToolMessageHandler():
                 processed_messages[0]['name'] = 'Helper'
             processed_messages = processed_messages[1:]
             # current_app.logger.info(f'AFTER CHANGE: {processed_messages[0]}')
-        
-        
+
+
         for i in range(len(processed_messages) - 1):
             current_msg = processed_messages[i]
             next_msg = processed_messages[i + 1]
-            
+
             # Case 1: Current message has tool_calls but next message isn't a tool
             if current_msg.get('tool_calls') and next_msg.get('role') != 'tool':
                 current_app.logger.warning(f'CHANGE IN {i}')
@@ -378,13 +399,13 @@ class ToolMessageHandler():
                 current_msg['content'] = ' '
                 current_msg['name'] = 'Helper'
                 # current_app.logger.warning(f'CURRENT MSG AFTER DELETE {current_msg}')
-                
+
             # Case 2: Current message doesn't have tool_calls but next is a tool
             elif not current_msg.get('tool_calls') and next_msg.get('role') == 'tool':
                 current_app.logger.warning(f'CHANGE IN {i}')
                 current_app.logger.warning(f'CHANGE IN NEXT MESSAFE TO USER')
                 # current_app.logger.warning(f'Next MESSAGE BEFORE CHANGE {next_msg}')
-                
+
                 # Convert next message to user and remove tool_calls
                 next_msg['role'] = 'user'
                 if 'tool_responses' in next_msg:
@@ -392,25 +413,25 @@ class ToolMessageHandler():
                     next_msg['role'] = 'user'
                     next_msg['name'] = 'Helper'
                 # current_app.logger.warning(f'Next MESSAGE AFTER CHANGE {next_msg}')
-            
+
             # Case 3: Current message has tool_calls but next message isn't a tool
             elif current_msg.get('role') == 'tool' and next_msg.get('role') == 'tool':
                 current_app.logger.warning(f'CHANGE IN {i}')
                 current_app.logger.warning(f'CURRENT ROLE TO USER')
                 # Fix next message to be a tool message
                 current_msg['role'] = 'user'
-        
+
         current_app.logger.info("processed_messages")
         # current_app.logger.info(processed_messages[0])
         return processed_messages
-        
+
     def get_logs(self, pre_transform_messages: List[Dict], post_transform_messages: List[Dict]) -> Tuple[str, bool]:
         """Generates logs about the transformation.
-        
+
         Args:
             pre_transform_messages (List[Dict]): Messages before transformation
             post_transform_messages (List[Dict]): Messages after transformation
-            
+
         Returns:
             Tuple[str, bool]: A tuple containing the log message and whether a transformation occurred
         """
@@ -425,10 +446,10 @@ class Action:
         self.fallback = False
         self.new_json = []
         self.recipe = False
-    
+
     def get_action(self,current_action):
         return self.actions[current_action]
-    
+
     def get_action_byaction_id(self,action_id):
         for i in self.actions:
             if i['action_id'] == action_id:
@@ -496,7 +517,7 @@ def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual c
             return 'failed to get visual context ask user to check if the camera is turned on'
     else:
         return 'failed to get visual context ask user to check if the camera is turned on'
-        
+
 
 
 def get_time_based_history(prompt: str, session_id: str, start_date: str, end_date: str):
@@ -683,7 +704,7 @@ def create_visual_agent(user_id,prompt_id):
         code_execution_config={"work_dir": "coding", "use_docker": False},
         system_message="You are an helpful AI assistant used to perform visual based tasks given to you. "
     )
-    
+
     visual_user = autogen.UserProxyAgent(
         name=f"UserProxy",
         human_input_mode="NEVER",
@@ -705,7 +726,7 @@ def create_visual_agent(user_id,prompt_id):
             7. If there is any action which is like to perform a task continously you should not do it.
             8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
             9. IMPORTANT instruction: If you want to ask something or send something to the, always use this format: @user {{'message_2_user':'message here'}}
-            10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.            
+            10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
             When writing code, always print the final response just before returning it.
         """,
         is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
@@ -725,7 +746,7 @@ def create_visual_agent(user_id,prompt_id):
             8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
             9. IMPORTANT instruction: If you want to ask something or send something to the user, always use this format: @user {{'message_2_user':'message here'}}
             10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
-        
+
             Note: Your Working Directory is "/home/hertzai2019/newauto/coding" use this if you need,
             Add proper error handling, logging.
             Always provide clear execution results or error messages to the assistant.
@@ -756,11 +777,11 @@ def create_visual_agent(user_id,prompt_id):
             For pending tasks or ongoing actions, respond to helper to complete the task.
             Verify the action performed by assistant and make sure the action is performed correctly as per instructions. if action performed was not as per instructions give the pending actions to the helper agent.
             Report status only—do not perform actions yourself.
-            
+
         """,
         is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
     )
-    
+
     chat_instructor2 = autogen.UserProxyAgent(
         name="ChatInstructor",
         human_input_mode="NEVER",
@@ -769,7 +790,7 @@ def create_visual_agent(user_id,prompt_id):
         code_execution_config=False,
         is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
     )
-    
+
     context_handling = transform_messages.TransformMessages(
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=50,keep_first_message=True),
@@ -782,6 +803,5 @@ def create_visual_agent(user_id,prompt_id):
     context_handling.add_to_agent(executor2)
     context_handling.add_to_agent(multi_role_agent2)
     context_handling.add_to_agent(verify2)
-    
+
     return visual_agent, visual_user, helper2, executor2, multi_role_agent2, verify2, chat_instructor2
-    
