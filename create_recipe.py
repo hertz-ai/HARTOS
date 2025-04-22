@@ -121,9 +121,9 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
                 text = f'This is the time now {current_time}\n your overall task description which might span multiple actions: {task_description}\n the current Action to execute: {current_action}'
             else:
                 current_app.logger.warning(f'it is not a json object the error is:')
-                current_app.logger.info('it is not a json object You should ask status verifier to give response in proper format & not move ahead to next action')
+                current_app.logger.info('it is not a json object You should ask @statusverifier to give response in proper format & not move ahead to next action')
                 actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action-1)
-                text = f'Lets continue the work we were doing, if action is completed then ask status verifier Agent to Please tell the status of the action {user_tasks[user_prompt].current_action}:{actions_prompt}'
+                text = f'Lets continue the work we were doing, if action is completed then ask @statusverifier Agent to Please tell the status of the action {user_tasks[user_prompt].current_action}:{actions_prompt}'
             
             result = chat_instructor.initiate_chat(time_manager, message=text,speaker_selection={"speaker": "assistant"}, clear_history=False)
             continue
@@ -239,6 +239,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             4. If you want to send some message to user directly then ask helper agent to use send_message_to_user tool but if you want to send message after sometime then ask helper to use send_message_in_seconds tool.
             5. If you want to send some pre synthesized video to user then ask helper agent to use send_presynthesize_video_to_user tool.
             6. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
+            7. If you receive a request to perform a task on the user's computer or any other computer, or if the request is related to Chrome or any browser, you should ask @Helper to use the `execute_windows_command` tool.
         
         •Error Handling:
             If there's an error or failure, respond with a structured error message format: {"status":"error","action":"current action","action_id":1/2/3...,"message":"message here"}
@@ -364,7 +365,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
                 ➜If you wnat to get some data ask helper agent to use "get_data_by_key", "get_saved_metadata" tool.
             4. If you want to send some message to user directly then ask helper agent to use send_message_to_user tool but if you want to send message after sometime then ask helper to use send_message_in_seconds tool.
             5. If you want to send some pre synthesized video to user then ask helper agent to use send_presynthesize_video_to_user tool.
-            6. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video."""
+            6. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
+            7. If you receive a request to perform a task on the user's computer or any other computer, or if the request is related to Chrome or any browser, you should ask @Helper to use the `execute_windows_command` tool."""
     )
     
     chat_instructor = autogen.UserProxyAgent(
@@ -1488,10 +1490,10 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     break
                 if user_tasks[user_prompt].fallback == True or user_tasks[user_prompt].recipe == True:
                     actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action-1)
-                    message = f'Lets continue the work we were doing, if action is completed then ask status verifier Agent to Please tell the status of the action {user_tasks[user_prompt].current_action}: {actions_prompt}'
+                    message = f'Lets continue the work we were doing, if action is completed then ask @statusverifier Agent to Please tell the status of the action {user_tasks[user_prompt].current_action}: {actions_prompt}'
                 else:
                     actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
-                    message = f'Lets continue the work we were doing, if action is completed then ask status verifier Agent to Please tell the status of the action {user_tasks[user_prompt].current_action+1}: {actions_prompt}'
+                    message = f'Lets continue the work we were doing, if action is completed then ask @statusverifier Agent to Please tell the status of the action {user_tasks[user_prompt].current_action+1}: {actions_prompt}'
                 result = agents_object['helper'].initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
                 continue
             current_app.logger.info('resuming chat')
