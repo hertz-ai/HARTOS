@@ -53,11 +53,11 @@ agent_data = {}
 # }]
 
 config_list = [{
-    "model": "gpt-4o-mini",
+    "model": "gpt-4.1-mini",
     "api_type": "azure",
-    "api_key": "4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf",
-    "base_url": "https://hertzai-gpt4.openai.azure.com/",
-    "api_version": "2024-02-15-preview",
+    "api_key": "4VnPRwrNBVrB3EQDf9ikWjK8yKuoRArnZ3C1cdJE2u8mpNDTQB9sJQQJ99BCACHYHv6XJ3w3AAAAACOGqheF",
+    "base_url": "https://ai-sahil4975ai400818620199.cognitiveservices.azure.com/",
+    "api_version": "2024-12-01-preview",
     "price":[0.00015,0.0006]
 }]
 
@@ -238,11 +238,11 @@ def get_frame(user_id):
 #TODO Reset action order after it reaches end.
 def create_agents_for_role(user_id: str,prompt_id):
     config_list = [{
-        "model": 'gpt-4o',
+        "model": 'gpt-4.1',
         "api_type": "azure",
-        "api_key": '4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf',
-        "base_url": 'https://hertzai-gpt4.openai.azure.com/',
-        "api_version": "2024-02-15-preview",
+        "api_key": '4VnPRwrNBVrB3EQDf9ikWjK8yKuoRArnZ3C1cdJE2u8mpNDTQB9sJQQJ99BCACHYHv6XJ3w3AAAAACOGqheF',
+        "base_url": 'https://ai-sahil4975ai400818620199.cognitiveservices.azure.com/',
+        "api_version": "2024-12-01-preview",
         "price": [0.0025, 0.01]
     }]
     current_app.logger.info('INSIDE create_agents_for_role')
