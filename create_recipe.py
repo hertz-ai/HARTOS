@@ -33,11 +33,11 @@ user_agents: Dict[str, Tuple[autogen.ConversableAgent, autogen.ConversableAgent]
 time_agents = {}
 
 config_list = [{
-        "model": 'gpt-4.1',
+        "model": 'gpt-4o',
         "api_type": "azure",
-        "api_key": '4VnPRwrNBVrB3EQDf9ikWjK8yKuoRArnZ3C1cdJE2u8mpNDTQB9sJQQJ99BCACHYHv6XJ3w3AAAAACOGqheF',
-        "base_url": 'https://ai-sahil4975ai400818620199.cognitiveservices.azure.com/',
-        "api_version": "2024-12-01-preview",
+        "api_key": '8941f5f6f17f43d391051edc27f4b2f6',
+        "base_url": 'https://openai-api-e7zq7mkk.azure-api.net',
+        "api_version": "2024-02-15-preview",
         "price": [0.0025, 0.01]
     }]
 
