@@ -33,11 +33,11 @@ user_agents: Dict[str, Tuple[autogen.ConversableAgent, autogen.ConversableAgent]
 time_agents = {}
 
 config_list = [{
-        "model": 'gpt-4o',
+        "model": 'gpt-4.1',
         "api_type": "azure",
-        "api_key": '8941f5f6f17f43d391051edc27f4b2f6',
-        "base_url": 'https://openai-api-e7zq7mkk.azure-api.net',
-        "api_version": "2024-02-15-preview",
+        "api_key": '8MMPerfdfcpx63VfIVtg2lpAK7Crv7O5JKiKwhusVhgJNkC8Ql6FJQQJ99BAACHYHv6XJ3w3AAABACOGdxWW',
+        "base_url": 'https://hertzai-gpt4.openai.azure.com/openai/deployments/gpt-4.1/chat/completions?api-version=2025-01-01-preview',
+        "api_version": "2024-12-01-preview",
         "price": [0.0025, 0.01]
     }]
 
