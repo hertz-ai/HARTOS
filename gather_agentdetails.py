@@ -10,12 +10,21 @@ user_agents: Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]] = 
 def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]:
     """Create new assistant & user proxy agents for a user with basic configuration."""
     config_list = [{
-        "model": 'gpt-4o-mini',
+        "model": 'gpt-4.1-mini',
         "api_type": "azure",
-        "api_key": '4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf',
-        "base_url": 'https://hertzai-gpt4.openai.azure.com/',
-        "api_version": "2024-02-15-preview"
+        "api_key": '8MMPerfdfcpx63VfIVtg2lpAK7Crv7O5JKiKwhusVhgJNkC8Ql6FJQQJ99BAACHYHv6XJ3w3AAABACOGdxWW',
+        "base_url": 'https://hertzai-gpt4.openai.azure.com/openai/deployments/gpt-4.1-mini/chat/completions?api-version=2025-01-01-preview',
+        "api_version": "2024-12-01-preview",
+        "price": [0.0025, 0.01]
     }]
+    # config_list = [{
+    #     "model": 'gpt-4.1',
+    #     "api_type": "azure",
+    #     "api_key": '8MMPerfdfcpx63VfIVtg2lpAK7Crv7O5JKiKwhusVhgJNkC8Ql6FJQQJ99BAACHYHv6XJ3w3AAABACOGdxWW',
+    #     "base_url": 'https://hertzai-gpt4.openai.azure.com/openai/deployments/gpt-4.1/chat/completions?api-version=2025-01-01-preview',
+    #     "api_version": "2024-12-01-preview",
+    #     "price": [0.0025, 0.01]
+    # }]
 
     # Create a basic function calling config
     llm_config = {
