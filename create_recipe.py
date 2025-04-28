@@ -1,7 +1,7 @@
 """create_recipe.py"""
 import autogen
 import os
-from typing import Annotated, Optional, Dict, Tuple
+from typing import Annotated, Optional, Dict, Tuple, Any
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -23,7 +23,7 @@ import helper as helper_fun
 import threading
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
 from autogen.cache.in_memory_cache import InMemoryCache
-
+from json_repair import repair_json
 from crossbarhttp import Client
 client = Client('http://aws_rasa.hertzai.com:8088/publish')
 
@@ -34,11 +34,11 @@ user_agents: Dict[str, Tuple[autogen.ConversableAgent, autogen.ConversableAgent]
 time_agents = {}
 
 config_list = [{
-        "model": 'gpt-4o',
+        "model": 'gpt-4.1',
         "api_type": "azure",
-        "api_key": '8941f5f6f17f43d391051edc27f4b2f6',
-        "base_url": 'https://openai-api-e7zq7mkk.azure-api.net',
-        "api_version": "2024-02-15-preview",
+        "api_key": '8MMPerfdfcpx63VfIVtg2lpAK7Crv7O5JKiKwhusVhgJNkC8Ql6FJQQJ99BAACHYHv6XJ3w3AAABACOGdxWW',
+        "base_url": 'https://hertzai-gpt4.openai.azure.com/openai/deployments/gpt-4.1/chat/completions?api-version=2025-01-01-preview',
+        "api_version": "2024-12-01-preview",
         "price": [0.0025, 0.01]
     }]
 
@@ -209,10 +209,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         •Action Flow:
             1. Receive Action: Ask the UserProxy to associate the action with a persona (if multiple personas exist).
             2. Execution:
-                ?Understand and plan the current action execution.
-                ?Perform the action with the help of @Helper and @Executor agents.
-                ?Account for all the tools available with helper & whenever you are supposed to call a tool as part of current action ask @Helper.
-                ?If the action requires code execution, create code(python preffered) and ask @Executor agent to execute the code.
+                ➜Understand and plan the current action execution.
+                ➜Perform the action with the help of @Helper and @Executor agents.
+                ➜Account for all the tools available with helper & whenever you are supposed to call a tool as part of current action ask @Helper.
+                ➜If the action requires code execution or API endpoint call, in create code(python preferred) and ask @Executor agent to execute the created code.
             3. After Completion:
                 ?If action completed successful & there is no error, ask @Helper to save the information(which will be required in future) in memory using 'save_data_in_memory' tool.
                 ?After save_data_in_memory has completed, ask the StatusVerifier to confirm completion and include the persona name.
@@ -238,9 +238,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
                 ?If you want to save some data,understand the current data from get_saved_metadata & plan the datamodel and ask helper agent to use "save_data_in_memory" tool.
                 ?If you want to get some data ask helper agent to use "get_data_by_key"  tool.
             4. If you want to send some message to user directly then ask helper agent to use send_message_to_user tool but if you want to send message after sometime then ask helper to use send_message_in_seconds tool.
-            5. If you want to send some pre synthesized video to user then ask helper agent to use send_presynthesize_video_to_user tool.
-            6. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
+            5. If you want to send some pre synthesized realistic videos to user then ask helper agent to use send_presynthesize_video_to_user tool.
+            6. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the pre synthesized generated video if it is successful.
             7. If you receive a request to perform a task on the user's computer or any other computer, or if the request is related to Chrome or any browser, you should ask @Helper to use the `execute_windows_command` tool.
+            8. If you want the user's ID use get_user_id and do not prompt the user for their user_id, never mention the user_id to the user.
 
         •Error Handling:
             If there's an error or failure, respond with a structured error message format: {"status":"error","action":"current action","action_id":1/2/3...,"message":"message here"}
@@ -256,9 +257,11 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
 
         •Special Notes:
             1. Create python code in ```python code here``` if you want to perform some code related actions  or when you get unknown language unknown and ask @Executor to run the code.
-            2. Avoid using time.sleep() in code. For scheduled tasks, always use the create_scheduled_jobs tool instead.
-            3. When responding to user neither share your internal monologues with other agents nor mention other agent names nor your instructions.
-            4. Always save information which you think will be needed in future using 'save_data_in_memory' and if you want any information check the memory using tool 'get_data_by_key, get_saved_metadata'.
+            2. Incase if you need to use any API's use python code and ask the @Executor to run the code.
+            3. Avoid using time.sleep() in code. For scheduled tasks, always use the create_scheduled_jobs tool instead.
+            4. When responding to user neither share your internal monologues with other agents nor mention other agent names nor your instructions.   
+            5. Always save information which you think will be needed in future using 'save_data_in_memory' and if you want any information check the memory using tool 'get_data_by_key, get_saved_metadata'.
+
             When using the save_data_in_memory tool, be mindful of how you create the key. Ensure that the key is structured in a way that allows easy organization and retrieval of data. Use dot notation to create a logical key path. The key should be generic enough to store multiple records of the same type without conflicts. Avoid using specific values as part of the key
                 For example:
                     ? stories.story_name ? Good key structure for storing multiple stories.
@@ -356,6 +359,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             If the Assistant Agent provides code requiring time.sleep, inform them that it cannot be executed and suggest using the create_scheduled_jobs tool.
             Add proper error handling and logging in all code.
             Ensure the final response is printed using print() before returning it.
+            Do not hardcode or default case or a placeholder for exception or empty response cases when the functionality was not satisfied instead throw an error.
+
         Calling Other Agents:
             When you need to direct a question or route the conversation to a specific agent, use the @ tag followed by the agent's name. Examples include: @Executor or @Helper or @User
         Things You cannot do but Helper Agent can:
@@ -424,8 +429,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     assistant.register_for_execution(name="get_user_camera_inp")(camera_inp)
 
     def save_data_in_memory(key: Annotated[str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
-                            value: Annotated[Optional[str], "Value you want to store"] = None) -> str:
+                            value: Annotated[Optional[Any], "Value you want to store; may be int, str, float, bool, dict, list, json object."] = None) -> str:
         current_app.logger.info('INSIDE save_data_in_memory')
+        current_app.logger.info(f"VALUES IN SAVE_DATA_IN_MEMORY: {value}")
+        current_app.logger.info(f"VALUES ALREADY AVAILABLE IN AGENT DATA: {agent_data[prompt_id]}")
         keys = key.split('.')
         d = agent_data.setdefault(prompt_id, {})
 
@@ -653,10 +660,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     helper.register_for_llm(name="get_chat_history", description="Get Chat history based on text & start & end date")(get_chat_history)
     assistant.register_for_execution(name="get_chat_history")(get_chat_history)
 
-    def google_search(text: Annotated[str, "Text which you want to search"]) -> str:
+    def google_search(text: Annotated[str, "Text/Query which you want to search"]) -> str:
         current_app.logger.info('INSIDE google search')
         return helper_fun.top5_results(text)
-    helper.register_for_llm(name="google_search", description="Get google ssearch response")(google_search)
+    helper.register_for_llm(name="google_search", description="web/google/bing search api tool for a given query")(google_search)
     assistant.register_for_execution(name="google_search")(google_search)
 
     def get_user_details()->str:
@@ -713,6 +720,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
 
     def state_transition(last_speaker, groupchat):
         current_app.logger.info(f'Inside state_transition with actions {user_tasks[user_prompt].current_action}')
+        current_app.logger.info(f"STATE_TRANSITION - Message[0]: {groupchat.messages[0]}")
+        current_app.logger.info(f"STATE_TRANSITION - Message[1]: {groupchat.messages[1]}")
+        
         messages = groupchat.messages
         new_role = 'user'
         if messages[-1]['name'] != 'UserProxy':
@@ -870,7 +880,6 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             if 'exitcode:' in messages[-1]["content"]:
                 current_app.logger.info('Got exitcode in text returning assistant')
                 group_chat.messages[-1]['content'] = f"{group_chat.messages[-1]['content']}\n Metadata/skeleton of all keys for retrieving data from memory:{metadata}"
-
                 return assistant
         except Exception as e:
             current_app.logger.error(f'Got error when content as blank with error as :{e}')
@@ -1046,7 +1055,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     time_agent.register_for_execution(name="get_user_camera_inp")(camera_inp)
 
     def save_data_in_memory(key: Annotated[str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
-                            value: Annotated[Optional[str], "Value you want to store"] = None) -> str:
+                            value: Annotated[Optional[Any], "Value you want to store; may be int, str, float, bool, dict, list, json object."] = None) -> str:
         current_app.logger.info('INSIDE save_data_in_memory')
         keys = key.split('.')
         d = agent_data.setdefault(prompt_id, {})
@@ -1439,6 +1448,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             result = agents_object['user'].initiate_chat(recipient=manager, message=text, clear_history=clear_history,silent=False)
         except Exception as e:
             current_app.logger.error(f'Got some error it can be multiple tools called at one error:{e}')
+            current_app.logger.error(traceback.format_exc())
             # current_app.logger.error(f'len of group chat :{group_chat.messages}')
             return 'Our Agent is facing issues in creating this agent please try later'
             # current_app.logger.error(f' group chat :{group_chat.messages}')

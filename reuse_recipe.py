@@ -61,13 +61,14 @@ agent_data = {}
 # }]
 
 config_list = [{
-    "model": "gpt-4o-mini",
-    "api_type": "azure",
-    "api_key": "4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf",
-    "base_url": "https://hertzai-gpt4.openai.azure.com/",
-    "api_version": "2024-02-15-preview",
-    "price":[0.00015,0.0006]
-}]
+        "model": 'gpt-4.1-mini',
+        "api_type": "azure",
+        "api_key": '8MMPerfdfcpx63VfIVtg2lpAK7Crv7O5JKiKwhusVhgJNkC8Ql6FJQQJ99BAACHYHv6XJ3w3AAABACOGdxWW',
+        "base_url": 'https://hertzai-gpt4.openai.azure.com/openai/deployments/gpt-4.1-mini/chat/completions?api-version=2025-01-01-preview',
+        "api_version": "2024-12-01-preview",
+        "price": [0.0025, 0.01]
+    }]
+
 
 def load_vlm_agent_files(prompt_id, role_number):
     """Loads any VLM agent JSON files for the given prompt_id and role_number and integrates them with existing recipes."""
@@ -101,14 +102,14 @@ def load_vlm_agent_files(prompt_id, role_number):
     return vlm_actions
 
 class Action:
-    def __init__(self,actions):
+    def __init__(self, actions):
         self.actions = actions
         self.current_action = 0
         self.fallback = False
         self.new_json = []
         self.recipe = False
 
-    def get_action(self,current_action):
+    def get_action(self, current_action):
         try:
             return self.actions[current_action]
         except:
@@ -215,9 +216,11 @@ async def subscribe_and_return(message, topic, time=1800000):
             except Exception as e:
                 current_app.logger.error(f"Error stopping component in finally: {e}")
 
+
 database_url = 'https://mailer.hertzai.com'
 
-def save_conversation_db(text,user_id,prompt_id,database_url,request_id):
+
+def save_conversation_db(text, user_id, prompt_id, database_url, request_id):
     headers = {'Content-Type': 'application/json'}
     data = {
         "request": 'VIDEO GENERATION FROM GENERATE_VIDEO',
@@ -242,7 +245,7 @@ def save_conversation_db(text,user_id,prompt_id,database_url,request_id):
     return conv_id
 
 
-def get_role(user_id,prompt_id):
+def get_role(user_id, prompt_id):
     creator = True if f'{user_id}_{prompt_id}' in agents_session.keys() else False
     role = None
     if creator:
@@ -261,70 +264,288 @@ def get_role(user_id,prompt_id):
         role = 'user'
     return role
 
-def send_message_to_user1(user_id,response,inp,prompt_id):
+
+def send_message_to_user1(user_id, response, inp, prompt_id):
     user_prompt = f'{user_id}_{prompt_id}'
     request_id = f'{request_id_list[user_prompt]}-intermediate'
-    request_id_list_sent_intermediate[user_prompt]=request_id_list[user_prompt]
+    request_id_list_sent_intermediate[user_prompt] = request_id_list[user_prompt]
     url = 'http://aws_rasa.hertzai.com:9890/autogen_response'
-    body = json.dumps({'user_id':user_id,'message':response,'inp':inp,'request_id':request_id})
+    body = json.dumps({'user_id': user_id, 'message': response, 'inp': inp, 'request_id': request_id})
     headers = {'Content-Type': 'application/json'}
-    res = requests.post(url,data=body,headers=headers)
+    res = requests.post(url, data=body, headers=headers)
 
-def execute_python_file(task_description:str,user_id: int,prompt_id:int,action_entry_point:int=0):
+
+def execute_python_file(task_description: str, user_id: int, prompt_id: int, action_entry_point: int = 0):
     headers = {'Content-Type': 'application/json'}
     url = 'http://localhost:6777/time_agent'
-    data = json.dumps({'task_description':task_description,'user_id':user_id,'prompt_id':prompt_id,'action_entry_point':action_entry_point,'request_from':'Reuse'})
-    res = requests.post(url,data=data,headers=headers)
+    data = json.dumps({'task_description': task_description, 'user_id': user_id, 'prompt_id': prompt_id,
+                       'action_entry_point': action_entry_point, 'request_from': 'Reuse'})
+    res = requests.post(url, data=data, headers=headers)
     return 'done'
 
-def call_visual_task(task_description:str,user_id: int,prompt_id:int):
+
+def call_visual_task(task_description: str, user_id: int, prompt_id: int, data: list, date: datetime):
     headers = {'Content-Type': 'application/json'}
     url = 'http://localhost:6777/visual_agent'
-    data = json.dumps({'task_description':task_description,'user_id':user_id,'prompt_id':prompt_id,'request_from':'Reuse'})
-    res = requests.post(url,data=data,headers=headers)
-    return 'done'
 
-def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_entry_point:int):
+    # Camera Check - Ensure camera is accessible and functional
+    cap = cv2.VideoCapture(0)  # Try accessing the first camera (device 0)
+
+    # Check if the camera is successfully opened
+    if not cap.isOpened():
+        return "Camera is not accessible. Please ensure the camera is turned on and connected."
+
+    # Attempt to capture a frame from the camera
+    ret, frame = cap.read()
+    if not ret:
+        return "Failed to capture a frame. Please check the camera settings or permissions."
+    cap.release()
+    now = datetime.now()
+    if any(obj["zeroshot_label"] == 'Video Reasoning' for obj in data) and (now - date) > timedelta(seconds=30):
+        data_to_send = json.dumps({
+            'task_description': task_description,
+            'user_id': user_id,
+            'prompt_id': prompt_id,
+            'request_from': 'Reuse'
+        })
+        # Send POST request to the visual agent
+        res = requests.post(url, data=data_to_send, headers=headers)
+        return res.text
+
+    return 'Task not sent to visual agent due to conditions not being met.'
+
+
+def call_visual_task(task_description: str, user_id: int, prompt_id: int, data: list, date: datetime):
+    headers = {'Content-Type': 'application/json'}
+    url = 'http://localhost:6777/visual_agent'
+
+    # Get the current time
+    now = datetime.now()
+
+    # Only send POST request if the conditions are met
+    if any(obj["zeroshot_label"] == 'Video Reasoning' for obj in data) and (now - date) > timedelta(seconds=30):
+        data_to_send = json.dumps({
+            'task_description': task_description,
+            'user_id': user_id,
+            'prompt_id': prompt_id,
+            'request_from': 'Reuse'
+        })
+
+        # Send the POST request to the visual agent
+        res = requests.post(url, data=data_to_send, headers=headers)
+        return 'done'  # Return 'done' as per the original function
+
+    # If conditions are not met, do nothing and return nothing
+    return
+
+
+def time_based_execution(task_description: str, user_id: int, prompt_id: int, action_entry_point: int):
     current_app.logger.info(f'INSIDE TIME_BASED_EXECUTION with action_entry_point"{action_entry_point}')
     user_prompt = f'{user_id}_{prompt_id}'
     if user_prompt not in user_agents:
         current_app.logger.info('user_id is not present')
     else:
-        #TODO use action_entry_point to give actions via chatinstructor by changing currnt action
+        # TODO use action_entry_point to give actions via chatinstructor by changing currnt action
         assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group = user_agents[user_prompt]
         # author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = user_agents[user_id]
         current_time = datetime.now()
         text = f'This is the time now {current_time}\n you must perform this task {task_description}'
-        result = time_user.initiate_chat(manager_1, message=text,speaker_selection={"speaker": "assistant"}, clear_history=False)
+        result = time_user.initiate_chat(manager_1, message=text, speaker_selection={"speaker": "assistant"},
+                                         clear_history=False)
         last_message = group_chat.messages[-1]
         if last_message['content'] == 'TERMINATE':
             last_message = group_chat.messages[-2]
-        #sending response to receiver agent
-        send_message_to_user1(user_id,last_message,task_description,prompt_id)
+        # sending response to receiver agent
+        send_message_to_user1(user_id, last_message, task_description, prompt_id)
     return 'done'
 
-def visual_based_execution(task_description:str,user_id: int,prompt_id:int):
+
+def get_action_user_details(user_id):
+    '''
+        This function helps to extract actions that the user has performed till now.
+    '''
+    unwanted_actions = ['Topic Cofirmation', 'Langchain', 'Assessment Ended', 'Casual Conversation',
+                        'Topic confirmation',
+                        'Topic not found', 'Topic Confirmation', 'Topic Listing', 'Probe', 'Question Answering',
+                        'Fallback']
+    action_url = f"{ACTION_API}?user_id={user_id}"
+
+    # Todo: get, and populate timezone from client
+    time_zone = "Asia/Kolkata"
+
+    india_tz = pytz.timezone(time_zone)
+
+    payload = {}
+    headers = {}
+
+    response = requests.request(
+        "GET", action_url, headers=headers, data=payload)
+
+    if response.status_code == 200:
+
+        data = response.json()
+
+        # Filter out unwanted actions
+        filtered_data = [obj for obj in data if obj["action"]
+                         not in unwanted_actions and obj["zeroshot_label"]
+                         not in ['Video Reasoning']]
+
+        filtered_data_video = [
+            obj for obj in data if obj["zeroshot_label"] == 'Video Reasoning']
+        # Dictionary to store the first and last occurrence dates for each action
+        action_occurrences = {}
+
+        # Iterate over the filtered data
+        for obj in filtered_data:
+            action = obj["action"]
+            date = parse_date(obj["created_date"])
+            gpt3_label = obj["gpt3_label"]
+
+            if action not in action_occurrences:
+                action_occurrences[action] = [date, date]
+            else:
+                first_date, last_date = action_occurrences[action]
+                first_date = min(first_date, date)
+                last_date = max(last_date, date)
+                action_occurrences[action] = [first_date, last_date]
+
+        # Construct the final list of actions with first and last occurrences
+        action_texts = []
+        for action, dates in action_occurrences.items():
+            first_date, last_date = dates
+            first_action_text = f"{action} on {first_date.astimezone(india_tz).strftime('%Y-%m-%dT%H:%M:%S')}"
+            action_texts.append(first_action_text)
+            if first_date != last_date:
+                last_action_text = f"{action} on {last_date.astimezone(india_tz).strftime('%Y-%m-%dT%H:%M:%S')}"
+                action_texts.append(last_action_text)
+
+        # Process video data
+        video_context_texts = []
+        for obj in filtered_data_video:
+            action = obj["action"]
+            date = parse_date(obj["created_date"])
+            gpt3_label = obj["gpt3_label"]
+
+            if gpt3_label == 'Visual Context':
+                now = datetime.now()
+                # Check if the action is older than 5 minutes
+                if (now - date) > timedelta(minutes=5):
+                    continue
+            first_action_text = f"{action} on {date.astimezone(india_tz).strftime('%Y-%m-%dT%H:%M:%S')}"
+
+            video_context_texts.append(first_action_text)
+
+        if video_context_texts:
+            action_texts.append('<Last_5_Minutes_Visual_Context_Start>')
+            action_texts.extend(video_context_texts)
+            action_texts.append('<Last_5_Minutes_Visual_Context_End>')
+            action_texts.append(
+                'If a person is identified in Visual_Context section that\'s most probably the user (me) & most likely not taking any selfie.')
+
+        if len(action_texts) == 0:
+            action_texts = ['user has not performed any actions yet.']
+
+        actions = ", ".join(action_texts)
+        # Get the current time
+
+        # Format the time in the desired format
+        formatted_time = datetime.now(pytz.utc).astimezone(
+            india_tz).strftime('%Y-%m-%d %H:%M:%S')
+
+        actions = actions + ". List of actions ends. <PREVIOUS_USER_ACTION_END> \n " + "Today's datetime in " + time_zone + "is: " + formatted_time + \
+                  " in this format:'%Y-%m-%dT%H:%M:%S' \n Whenever user is asking about current date or current time at particular location then use this datetime format by asking what user's location is. Use the previous sentence datetime info to answer current time based questions coupled with google_search for current time or full_history for historical conversation based answers. Take a deep breath and think step by step.\n"
+        # user detail api
+    else:
+        post_dict = {'user_id': user_id, 'status': TaskStatus.ERROR.value,
+                     'task_name': TaskNames.GET_ACTION_USER_DETAILS.value, 'uid': thread_local_data.get_request_id(
+            ), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}",
+                     'request_id': thread_local_data.get_request_id(),
+                     'failure_reason': 'Exception happend at get action api end'}
+        try:
+            client.publish('com.hertzai.longrunning.log', post_dict)
+        except Exception as e:
+            logging.error(
+                "Error while publish at com.hertzai.longrunning.log topic")
+
+    url = STUDENT_API
+    payload = json.dumps({
+        "user_id": user_id
+    })
+    headers = {
+        'Content-Type': 'application/json'
+    }
+    response = requests.request("POST", url, headers=headers, data=payload)
+    if response.status_code == 200:
+        user_data = response.json()
+
+        user_details = f'''Below are the information about the user.
+        user_name: {user_data["name"]} (Call the user by this name only when required and not always),gender: {user_data["gender"]}, who_pays_for_course: {user_data["who_pays_for_course"]}(Entity Responsible for Paying the Course Fees), preferred_language: {user_data["preferred_language"]}(User's Preferred Language), date_of_birth: {user_data["dob"]}, english_proficiency: {user_data["english_proficiency"]}(User's English Proficiency Level), created_date: {user_data["created_date"]}(user creation date), standard: {user_data["standard"]}(User's Standard in which user studying)
+        '''
+    else:
+        post_dict = {'user_id': user_id, 'status': TaskStatus.ERROR.value,
+                     'task_name': TaskNames.GET_ACTION_USER_DETAILS.value, 'uid': thread_local_data.get_request_id(
+            ), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}",
+                     'request_id': thread_local_data.get_request_id(),
+                     'failure_reason': 'Exception happend at get user detail api end'}
+        try:
+            client.publish('com.hertzai.longrunning.log', post_dict)
+        except Exception as e:
+            logging.error(
+                "Error while publish at com.hertzai.longrunning.log topic")
+    return user_details, actions
+
+
+def visual_based_execution(task_description: str, user_id: int, prompt_id: int):
     current_app.logger.info(f'INSIDE Visual_BASED_EXECUTION')
     user_prompt = f'{user_id}_{prompt_id}'
+
+    # Check if the camera is on and get the frame
+    frame = get_frame(str(user_id))
+    if frame is None:
+        current_app.logger.info("Camera is OFF or no frame found — skipping visual agent.")
+        return
+
+    # Call get_action_user_details if the camera is on
+    actions = get_action_user_details(user_id)  # Get the actions performed by the user
+    current_app.logger.info(f"User actions: {actions}")
+
     if user_prompt not in user_agents:
-        current_app.logger.info('user_id is not present')
+        current_app.logger.info('user_id is not present in user_agents.')
     else:
-        #TODO use action_entry_point to give actions via chatinstructor by changing currnt action
-        assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group = user_agents[user_prompt]
+        assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group = \
+        user_agents[user_prompt]
+
+        # Log the current time
         current_time = datetime.now()
-        text = f'''This is the time now {current_time}\n
-        Instruction: If you want to send some message or information to user you should respond in this format {{"message_2_user":"Message here"}}\n
-        you must perform this task: {task_description}'''
+
+        # Prepare the task message
+        text = f'''This is the time now {current_time}
+            You are an assistant in a visual execution system. Perform the requested action based on the task context.
+            Note: Visual input is available because the user's camera is ON.
+            If the user needs to be informed (e.g., task completed, input needed, error), respond in this exact JSON format:
+            {{"message_2_user": "Your clear and useful message here"}}
+            Only send this if you have something meaningful to say.
+            Do not interrupt the user unless they have asked for a response or the task cannot proceed without their input.
+            You must now perform this task: {task_description}'''
+
+        # Proceed with sending the message to the visual agent group
         manager = visual_agent_group['manager_2']
         user = visual_agent_group['visual_user']
         chat = visual_agent_group['group_chat_2']
-        result = user.initiate_chat(manager, message=text,speaker_selection={"speaker": "assistant"}, clear_history=False)
+
+        result = user.initiate_chat(manager, message=text, speaker_selection={"speaker": "assistant"},
+                                    clear_history=False)
+
+        # Handle the last message
         last_message = chat.messages[-1]
         if last_message['content'] == 'TERMINATE':
             last_message = chat.messages[-2]
-        #sending response to receiver agent
-        # send_message_to_user1(user_id,last_message,task_description,prompt_id)
+
+        # Optionally, you can send a response to the receiver agent or further process the message.
+        # send_message_to_user1(user_id, last_message, task_description, prompt_id)
+
     return 'done'
+
 
 def get_frame(user_id):
     serialized_frame = redis_client.get(user_id)
@@ -343,14 +564,15 @@ def get_frame(user_id):
         raise e
 
 
-#TODO Reset action order after it reaches end.
-def create_agents_for_role(user_id: str,prompt_id):
+# TODO Reset action order after it reaches end.
+def create_agents_for_role(user_id: str, prompt_id):
+
     config_list = [{
-        "model": 'gpt-4o',
+        "model": 'gpt-4.1',
         "api_type": "azure",
-        "api_key": '4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf',
-        "base_url": 'https://hertzai-gpt4.openai.azure.com/',
-        "api_version": "2024-02-15-preview",
+        "api_key": '8MMPerfdfcpx63VfIVtg2lpAK7Crv7O5JKiKwhusVhgJNkC8Ql6FJQQJ99BAACHYHv6XJ3w3AAABACOGdxWW',
+        "base_url": 'https://hertzai-gpt4.openai.azure.com/openai/deployments/gpt-4.1/chat/completions?api-version=2025-01-01-preview',
+        "api_version": "2024-12-01-preview",
         "price": [0.0025, 0.01]
     }]
     current_app.logger.info('INSIDE create_agents_for_role')
@@ -369,7 +591,7 @@ def create_agents_for_role(user_id: str,prompt_id):
             current_app.logger.info(f'Available Personas {personas}')
     except Exception as e:
         current_app.logger.info(e)
-    if len(personas)>1: # & also check if we have record in db/agents_session to reuser
+    if len(personas) > 1:  # & also check if we have record in db/agents_session to reuser
         temp = personas.copy()
         # temp.append({"name":"user","description":"User who will use this app"})
         agent_prompt = f'''You are a Helpful Assistant follow below action's
@@ -402,9 +624,8 @@ def create_agents_for_role(user_id: str,prompt_id):
             is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
         )
 
-
         @helper.register_for_execution()
-        @assistant.register_for_llm(api_style="function",description="update the role/persona in db")
+        @assistant.register_for_llm(api_style="function", description="update the role/persona in db")
         def update_persona(name: Annotated[str, "The persona name user selected"],
                            description: Annotated[str, "The persona description user selected"],
                            new: Annotated[bool, "Wethere it is a new chat or no"],
@@ -415,12 +636,14 @@ def create_agents_for_role(user_id: str,prompt_id):
             if new:
                 current_app.logger.info('Creating new chat')
                 if f"{user_id}_{prompt_id}" not in agents_session.keys():
-                    agents_session[f"{user_id}_{prompt_id}"] = [{'agentInstanceID':f'com.hertzai.hevolve.chat.{prompt_id}.{user_id}',
-                                                'user_id':user_id,'role':name,'deviceID':'something'}]
-                    agents_roles[f"{user_id}_{prompt_id}"] = {user_id:name}
+                    agents_session[f"{user_id}_{prompt_id}"] = [
+                        {'agentInstanceID': f'com.hertzai.hevolve.chat.{prompt_id}.{user_id}',
+                         'user_id': user_id, 'role': name, 'deviceID': 'something'}]
+                    agents_roles[f"{user_id}_{prompt_id}"] = {user_id: name}
                 else:
-                    agents_session[f"{user_id}_{prompt_id}"].append({'agentInstanceID':f'com.hertzai.hevolve.chat.{prompt_id}.{user_id}',
-                                                'user_id':user_id,'role':name,'deviceID':'something'})
+                    agents_session[f"{user_id}_{prompt_id}"].append(
+                        {'agentInstanceID': f'com.hertzai.hevolve.chat.{prompt_id}.{user_id}',
+                         'user_id': user_id, 'role': name, 'deviceID': 'something'})
                     agents_roles[f"{user_id}_{prompt_id}"][user_id] = name
                 current_app.logger.info(f'After persona update {agents_session[f"{user_id}_{prompt_id}"]}')
                 return 'terminate'
@@ -430,11 +653,12 @@ def create_agents_for_role(user_id: str,prompt_id):
                     current_app.logger.info('user found with contact number')
                     if f"{temp_users[contact_number]}_{prompt_id}" in agents_session.keys():
                         current_app.logger.info('user found with contact number in agents_sessiion')
-                        agents_session[f"{temp_users[contact_number]}_{prompt_id}"].append({'agentInstanceID':f'com.hertzai.hevolve.chat.{prompt_id}.{user_id}',
-                                                    'user_id':user_id,'role':name,'deviceID':'something'})
+                        agents_session[f"{temp_users[contact_number]}_{prompt_id}"].append(
+                            {'agentInstanceID': f'com.hertzai.hevolve.chat.{prompt_id}.{user_id}',
+                             'user_id': user_id, 'role': name, 'deviceID': 'something'})
                         agents_roles[f"{user_id}_{prompt_id}"][user_id] = name
                         current_app.logger.info('after append in agent_sessions')
-                        chat_joinees[user_id] = {prompt_id : temp_users[contact_number]}
+                        chat_joinees[user_id] = {prompt_id: temp_users[contact_number]}
 
                         current_app.logger.info(f'agents_session {agents_session}')
                         current_app.logger.info(f'chat_joinees {chat_joinees}')
@@ -445,11 +669,9 @@ def create_agents_for_role(user_id: str,prompt_id):
                     current_app.logger.info('user found not with contact number')
                     return f'Ask the user with contact number:{contact_number} to create a new chat'
 
-
         assistant.description = 'Agent that is designed ask the roles to the user agent'
         user_proxy.description = 'agent will act as user & perform task assigned to user'
         helper.description = 'Agent will only work with assistant agent if needs help with something which is not related to user'
-
 
         def state_transition(last_speaker, groupchat):
             messages = groupchat.messages
@@ -479,22 +701,20 @@ def create_agents_for_role(user_id: str,prompt_id):
 
         manager = autogen.GroupChatManager(
             groupchat=group_chat,
-            llm_config={"cache_seed": None,"config_list": config_list}
+            llm_config={"cache_seed": None, "config_list": config_list}
         )
 
-
-
-
-        return assistant, user_proxy, group_chat, manager, helper,False
+        return assistant, user_proxy, group_chat, manager, helper, False
     else:
-        agents_session[f"{user_id}_{prompt_id}"] = [{'agentInstanceID':f'com.hertzai.hevolve.chat.{prompt_id}.{user_id}',
-                                                'user_id':user_id,'role':personas[0]['name'],'deviceID':'something'}]
+        agents_session[f"{user_id}_{prompt_id}"] = [
+            {'agentInstanceID': f'com.hertzai.hevolve.chat.{prompt_id}.{user_id}',
+             'user_id': user_id, 'role': personas[0]['name'], 'deviceID': 'something'}]
 
-        agents_roles[f"{user_id}_{prompt_id}"] = {user_id:personas[0]['name']}
-        return 'TERMINATE','TERMINATE','TERMINATE','TERMINATE','TERMINATE', True
+        agents_roles[f"{user_id}_{prompt_id}"] = {user_id: personas[0]['name']}
+        return 'TERMINATE', 'TERMINATE', 'TERMINATE', 'TERMINATE', 'TERMINATE', True
 
 
-def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]:
+def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]:
     """Create new assistant & user proxy agents for a user with basic configuration."""
     user_prompt = f'{user_id}_{prompt_id}'
     # Create a basic function calling config
@@ -505,7 +725,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
 
     personas = []
     # role = get_role(user_id,prompt_id)
-    role_number,role = get_flow_number(user_id,prompt_id)
+    role_number, role = get_flow_number(user_id, prompt_id)
 
     with open(f"prompts/{prompt_id}_{role_number}_recipe.json", 'r') as f:
         config = json.load(f)
@@ -513,8 +733,8 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         final_recipe[prompt_id] = config
     goal = ''
     with open(f"prompts/{prompt_id}.json", 'r') as f:
-            config = json.load(f)
-            goal = config['goal']
+        config = json.load(f)
+        goal = config['goal']
 
     current_app.logger.info(f'Got goal as {goal}')
     role_actions = []
@@ -546,7 +766,6 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     for i in recipes[user_prompt]['actions']:
         current_app.logger.info(f'this is action persona:{i["persona"]} ')
         if i['persona'].lower() == role.lower():
-
             role_actions.append(i)
             actions.append(i['action'])
     # current_app.logger.info(f'role_actions: {role_actions}')
@@ -560,7 +779,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     # sorted_actions = topological_sort(role_actions)
     user_tasks[user_prompt] = Action(role_actions)
     individual_recipe = []
-    for i in range(1,(len(recipes[user_prompt]['actions'])+1)):
+    for i in range(1, (len(recipes[user_prompt]['actions']) + 1)):
         current_app.logger.info(f'checking for prompts/{prompt_id}_{role_number}_{i}.json')
         try:
             with open(f"prompts/{prompt_id}_{role_number}_{i}.json", 'r') as f:
@@ -644,7 +863,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     executor = autogen.AssistantAgent(
         name="Executor",
         llm_config=llm_config,
-        code_execution_config={"last_n_messages":2,"work_dir": "coding", "use_docker": False},
+        code_execution_config={"last_n_messages": 2, "work_dir": "coding", "use_docker": False},
         system_message=f'''You are a executor agent. focused solely on creating, running & debugging code.
             Your responsibilities:
             1. Follow the steps below to achieve the goal: {goal}.
@@ -710,7 +929,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
 
     context_handling = transform_messages.TransformMessages(
         transforms=[
-            transforms.MessageHistoryLimiter(max_messages=50,keep_first_message=True),
+            transforms.MessageHistoryLimiter(max_messages=50, keep_first_message=True),
             transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
             ToolMessageHandler(),
         ]
@@ -761,7 +980,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     #         return 'Not able to send Message try again later'
     #
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",description="Text to image Creator")
+    @helper.register_for_llm(api_style="function", description="Text to image Creator")
     def txt2img(text: Annotated[str, "Text to create image"]) -> str:
         current_app.logger.info('INSIDE txt2img')
         url = f"http://aws_rasa.hertzai.com:5459/txt2img?prompt={text}"
@@ -773,8 +992,9 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         return response.json()['img_url']
 
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",description="Image to Text/Question Answering from image")
-    def img2txt(image_url: Annotated[str, "image url of which you want text"],text: Annotated[str, "the details you want from image"]='Describe the Images & Text data in this image in detail') -> str:
+    @helper.register_for_llm(api_style="function", description="Image to Text/Question Answering from image")
+    def img2txt(image_url: Annotated[str, "image url of which you want text"], text: Annotated[
+        str, "the details you want from image"] = 'Describe the Images & Text data in this image in detail') -> str:
         current_app.logger.info('INSIDE img2txt')
         url = "http://azurekong.hertzai.com:8000/llava/image_inference"
 
@@ -792,10 +1012,11 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         else:
             return 'Not able to get this page details try later'
 
-
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",description="Use this to Store and retrieve data using key-value storage system")
-    def save_data_in_memory(key: Annotated[str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
+    @helper.register_for_llm(api_style="function",
+                             description="Use this to Store and retrieve data using key-value storage system")
+    def save_data_in_memory(key: Annotated[
+        str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
                             value: Annotated[Optional[str], "Value you want to store"] = None) -> str:
         current_app.logger.info('INSIDE save_data_in_memory')
         keys = key.split('.')
@@ -807,14 +1028,16 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         return f'{agent_data[prompt_id]}'
 
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",description="Returns the schema of the json from internal memory with all keys but without actual values.")
+    @helper.register_for_llm(api_style="function",
+                             description="Returns the schema of the json from internal memory with all keys but without actual values.")
     def get_saved_metadata() -> str:
         stripped_json = strip_json_values(agent_data[prompt_id])
         return f'{stripped_json}'
 
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",description="Returns all data from the internal Memory using key")
-    def get_data_by_key(key: Annotated[str, "Key path for retrieving data. Use dot notation for nested keys (e.g., 'user.info.name')."]) -> str:
+    @helper.register_for_llm(api_style="function", description="Returns all data from the internal Memory using key")
+    def get_data_by_key(key: Annotated[
+        str, "Key path for retrieving data. Use dot notation for nested keys (e.g., 'user.info.name')."]) -> str:
         keys = key.split('.')
         d = agent_data.get(prompt_id, {})
 
@@ -826,23 +1049,27 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
             return "Key not found in stored data."
 
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",description="Returns the unique identifier (user_id) of the current user.")
+    @helper.register_for_llm(api_style="function",
+                             description="Returns the unique identifier (user_id) of the current user.")
     def get_user_id() -> str:
         current_app.logger.info('INSIDE get_user_id')
         return f'{user_id}'
 
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",description="Returns the unique identifier (prompt_id) associated with the current prompt or conversation.")
+    @helper.register_for_llm(api_style="function",
+                             description="Returns the unique identifier (prompt_id) associated with the current prompt or conversation.")
     def get_prompt_id() -> str:
         current_app.logger.info('INSIDE get_prompt_id')
         return f'{prompt_id}'
 
     database_url = 'https://mailer.hertzai.com'
+
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",description="Generate video with text and save it in database")
+    @helper.register_for_llm(api_style="function", description="Generate video with text and save it in database")
     def Generate_video(text: Annotated[str, "Text to be used for video generation"],
                        avatar_id: Annotated[str, "Unique identifier for the avatar"],
-                       realtime: Annotated[bool,"If True, response is fast but less realistic by default it should be true; if False, response is realistic but slower"]) -> str:
+                       realtime: Annotated[
+                           bool, "If True, response is fast but less realistic by default it should be true; if False, response is realistic but slower"]) -> str:
         print('INSIDE Generate_video')
         database_url = 'https://mailer.hertzai.com'
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
@@ -861,7 +1088,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         except:
             data['openvoice'] = "true"
             new_image_url = None
-            res = {'voice_id':None}
+            res = {'voice_id': None}
         data["cartoon_image"] = "True"
         data["bg_url"] = 'http://stream.mcgroce.com/txt/examples_cartoon/roy_bg.jpg'
         data['vtoonify'] = "false"
@@ -894,13 +1121,13 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
             voice_sample = None
             data["audio_sample_url"] = None
             data['voice_id'] = None
-        conv_id = save_conversation_db(text,user_id,prompt_id,database_url,request_id)
+        conv_id = save_conversation_db(text, user_id, prompt_id, database_url, request_id)
         data['conv_id'] = conv_id
         data['avatar_id'] = avatar_id
         data['timeout'] = timeout
         try:
             video_link = requests.post("{}/video_generate_save".format(database_url),
-                                        data=json.dumps(data), headers=headers, timeout=1)
+                                       data=json.dumps(data), headers=headers, timeout=1)
         except:
             pass
         if data['chattts'] or data['flag_hallo'] == "true":
@@ -908,9 +1135,8 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         else:
             return f"Video Generation completed with conv_id:{conv_id}. Ask the helper to save this conv_id in the same collection from which the story used to generate the video was retrieved, for future reference"
 
-
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",description="get user's recent uploaded files")
+    @helper.register_for_llm(api_style="function", description="get user's recent uploaded files")
     def get_user_uploaded_file() -> str:
         current_app.logger.info('INSIDE get_user_uploaded_file')
         if recent_file_id[user_id]:
@@ -918,9 +1144,8 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
 
         return 'No file uploaded from user'
 
-
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",description="Get user's visual information to process somethings")
+    @helper.register_for_llm(api_style="function", description="Get user's visual information to process somethings")
     def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual context"]) -> str:
         request_id = 'Autogent_1234'
         current_app.logger.info('Using Vision to answer question')
@@ -953,18 +1178,20 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
                 current_app.logger.info('ERROR: Got error in visal QA')
                 return 'failed to get visual context ask user to check if the camera is turned on'
 
-
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",description="Get Chat history based on text & start & end date")
-    def get_chat_history(text: Annotated[str, "Text related to which you want history"],start: Annotated[str, "start date in format %Y-%m-%dT%H:%M:%S.%fZ"],end: Annotated[str, "end date in format %Y-%m-%dT%H:%M:%S.%fZ"]) -> str:
+    @helper.register_for_llm(api_style="function", description="Get Chat history based on text & start & end date")
+    def get_chat_history(text: Annotated[str, "Text related to which you want history"],
+                         start: Annotated[str, "start date in format %Y-%m-%dT%H:%M:%S.%fZ"],
+                         end: Annotated[str, "end date in format %Y-%m-%dT%H:%M:%S.%fZ"]) -> str:
         current_app.logger.info('INSIDE get_chat_history')
         return get_time_based_history(text, f'user_{user_id}', start, end)
 
-
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",description="Creates time-based jobs using APScheduler to schedule jobs")
-    def create_scheduled_jobs(cron_expression: Annotated[str, "Cron expression for scheduling. Example: '0 9 * * 1-5' (Runs at 9:00 AM, Monday to Friday)."],
-                            job_description: Annotated[str, "Description of the job to be performed"]) -> str:
+    @helper.register_for_llm(api_style="function",
+                             description="Creates time-based jobs using APScheduler to schedule jobs")
+    def create_scheduled_jobs(cron_expression: Annotated[
+        str, "Cron expression for scheduling. Example: '0 9 * * 1-5' (Runs at 9:00 AM, Monday to Friday)."],
+                              job_description: Annotated[str, "Description of the job to be performed"]) -> str:
         current_app.logger.info('INSIDE create_scheduled_jobs')
         if not scheduler.running:
             scheduler.start()
@@ -972,7 +1199,8 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         try:
             trigger = CronTrigger.from_crontab(cron_expression)
             job_id = f"job_{int(time.time())}"
-            scheduler.add_job(execute_python_file, trigger=trigger, id=job_id, args=[job_description, user_id,prompt_id,0])
+            scheduler.add_job(execute_python_file, trigger=trigger, id=job_id,
+                              args=[job_description, user_id, prompt_id, 0])
             current_app.logger.info('Successfully created scheduler job')
             return 'Successfully created scheduler job'
         except Exception as e:
@@ -980,52 +1208,62 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
             return f"Error creating scheduled job: {str(e)}"
 
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",description="Sends a message/information to user. You can use this if you want to ask a question")
+    @helper.register_for_llm(api_style="function",
+                             description="Sends a message/information to user. You can use this if you want to ask a question")
     def send_message_to_user(text: Annotated[str, "Text to send to the user"],
-                         avatar_id: Annotated[Optional[str], "Unique identifier for the avatar"] = None,
-                         response_type: Annotated[Optional[str], "Response mode: 'Realistic' (slower, better quality) or 'Realtime' (faster, lower quality)"] = 'Realtime') -> str:
+                             avatar_id: Annotated[Optional[str], "Unique identifier for the avatar"] = None,
+                             response_type: Annotated[Optional[
+                                 str], "Response mode: 'Realistic' (slower, better quality) or 'Realtime' (faster, lower quality)"] = 'Realtime') -> str:
         current_app.logger.info('INSIDE send_message_to_user')
-        current_app.logger.info(f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
+        current_app.logger.info(
+            f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
-        #TODO add avatar_id and conv_id and response_type
-        thread = threading.Thread(target=send_message_to_user1, args=(user_id, text, '', f'{request_id_list[user_prompt]}-intermediate'))
+        # TODO add avatar_id and conv_id and response_type
+        thread = threading.Thread(target=send_message_to_user1,
+                                  args=(user_id, text, '', f'{request_id_list[user_prompt]}-intermediate'))
         thread.start()
         return f'Message sent successfully to user with request_id: {request_id_list[user_prompt]}-intermediate'
 
-
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",description="Sends a presynthesized message/video/dialogue to user using conv_id from memory.")
-    def send_presynthesize_video_to_user(conv_id: Annotated[str, "Conversation ID associated with the text from memory"]) -> str:
+    @helper.register_for_llm(api_style="function",
+                             description="Sends a presynthesized message/video/dialogue to user using conv_id from memory.")
+    def send_presynthesize_video_to_user(
+            conv_id: Annotated[str, "Conversation ID associated with the text from memory"]) -> str:
         current_app.logger.info('INSIDE send_presynthesize_video_to_user')
         current_app.logger.info(f'SENDING DATA 2 user with value: conv_id:{conv_id}.')
         return 'Message sent successfully to user'
 
-
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")
+    @helper.register_for_llm(api_style="function",
+                             description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")
     def send_message_in_seconds(text: Annotated[str, "text to send to user"],
-                       delay: Annotated[int, "time to wait in seconds before sending text"],
-                       conv_id: Annotated[Optional[int], "conv_id for this text if not available make it None"],) -> str:
+                                delay: Annotated[int, "time to wait in seconds before sending text"],
+                                conv_id: Annotated[
+                                    Optional[int], "conv_id for this text if not available make it None"], ) -> str:
         current_app.logger.info('INSIDE send_message_in_seconds')
         current_app.logger.info(f'with text:{text}. and waiting time: {delay} conv_id: {conv_id}')
         run_time = datetime.fromtimestamp(time.time() + delay)
-        scheduler.add_job(send_message_to_user1, 'date', run_date=run_time, args=[user_id, text, '',prompt_id])
+        scheduler.add_job(send_message_to_user1, 'date', run_date=run_time, args=[user_id, text, '', prompt_id])
         return 'Message scheduled successfully'
 
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",description="Retrieve the user's visual camera input from the past specified minutes.")
-    def get_user_camera_inp_by_mins(minutes: Annotated[int, "Time range (in minutes) for fetching the camera visual data. for e.g. 5 will get you last 5 mins data"]) -> str:
+    @helper.register_for_llm(api_style="function",
+                             description="Retrieve the user's visual camera input from the past specified minutes.")
+    def get_user_camera_inp_by_mins(minutes: Annotated[
+        int, "Time range (in minutes) for fetching the camera visual data. for e.g. 5 will get you last 5 mins data"]) -> str:
         current_app.logger.info('INSIDE get user camera inp by mins')
         current_app.logger.info(f'CHECKING FOR VIDEO FOR PAST {minutes} MINS')
-        visual_context = helper_fun.get_visual_context(user_id,minutes)
+        visual_context = helper_fun.get_visual_context(user_id, minutes)
         current_app.logger.info(f'GOT RESPONSE AS {visual_context}')
         if not visual_context:
             visual_context = 'User\'s camera is not on. no visual data'
         return 'Message scheduled successfully'
 
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",description="Processes user-defined commands on a personal Windows or Android system.")
-    async def execute_windows_command(instructions: Annotated[str, "Command in plain English to execute on the Windows machine"])->str:
+    @helper.register_for_llm(api_style="function",
+                             description="Processes user-defined commands on a personal Windows or Android system.")
+    async def execute_windows_command(
+            instructions: Annotated[str, "Command in plain English to execute on the Windows machine"]) -> str:
         """
         Executes a command on a Windows machine and returns the response within 500 seconds.
         """
@@ -1152,7 +1390,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     
             topic = f'com.hertzai.hevolve.action.{user_id}'
             current_app.logger.info(f'calling {topic} for 5 second')
-            response = await subscribe_and_return({'prompt_id':prompt_id},topic,2000)  # Wait for the RPC response
+            response = await subscribe_and_return({'prompt_id': prompt_id}, topic, 2000)  # Wait for the RPC response
             current_app.logger.info(f'Response from call of {topic}: {response}')
             if not response:
                 return 'Ask user to to go to hertzai.com login and start the windows companion app'
@@ -1164,7 +1402,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
                 'os_to_control': 'Windows',
                 'actions_available_in_os': [],
                 'max_ETA_in_seconds': 500,
-                'langchain_server':True
+                'langchain_server': True
             }
             
             # Adding the enhanced_instruction if we have it
@@ -1174,9 +1412,11 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
 
             topic = 'com.hertzai.hevolve.action2'
             current_app.logger.info(f'calling {topic} for 8000 second')
+
             start_time = time.time()
             response = await subscribe_and_return(crossbar_message,topic, 1800000)  # Wait for the RPC response
             execution_time = time.time() - start_time
+
             current_app.logger.info(f'THIS IS RESPONSE type: {type(response)} value: {response}')
             
             # Transform the RPC response into the new format
@@ -1391,7 +1631,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
 
     
     @assistant.register_for_execution()
-    @helper.register_for_llm(api_style="function",description="Get google search response")
+    @helper.register_for_llm(api_style="function", description="Get google search response")
     def google_search(text: Annotated[str, "Text which you want to search"]) -> str:
         current_app.logger.info('INSIDE google search')
         return helper_fun.top5_results(text)
@@ -1403,17 +1643,17 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
         code_execution_config={"work_dir": "coding", "use_docker": False},
         system_message="You are an helpful AI assistant used to perform time based tasks given to you. "
-        f"""You can refer below details to perform task:
+                       f"""You can refer below details to perform task:
             Actions: <actionsStart>{role_actions}<actionEnd>
             Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{individual_recipe}<generalized_functionsEnd><recipeEnd>
 
         """
-        f"When you want to communicate with {role} connect main agent using 'connect_time_main' tool."
-        "Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory.]"
-        "if you have any task which is not doable by these tool check recipe first else create python code to do so"
-        "the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video."
-        f"IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @user {response_format}"
-        "Return 'TERMINATE' when the task is done."
+                       f"When you want to communicate with {role} connect main agent using 'connect_time_main' tool."
+                       "Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory.]"
+                       "if you have any task which is not doable by these tool check recipe first else create python code to do so"
+                       "the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video."
+                       f"IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @user {response_format}"
+                       "Return 'TERMINATE' when the task is done."
     )
 
     time_user = autogen.UserProxyAgent(
@@ -1449,7 +1689,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     executor1 = autogen.AssistantAgent(
         name="Executor",
         llm_config=llm_config,
-        code_execution_config={"last_n_messages":2,"work_dir": "coding", "use_docker": False},
+        code_execution_config={"last_n_messages": 2, "work_dir": "coding", "use_docker": False},
         system_message=f'''You are a executor agent. focused solely on creating, running & debugging code.
             Your responsibilities:
             1. Follow the steps below to achieve the goal: {goal}.
@@ -1511,7 +1751,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
 
     context_handling = transform_messages.TransformMessages(
         transforms=[
-            transforms.MessageHistoryLimiter(max_messages=50,keep_first_message=True),
+            transforms.MessageHistoryLimiter(max_messages=50, keep_first_message=True),
             transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
             ToolMessageHandler(),
         ]
@@ -1527,102 +1767,139 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     time_agent.register_for_execution(name="txt2img")(txt2img)
     helper1.register_for_llm(name="img2txt", description="Image to Text/Question Answering from image")(img2txt)
     time_agent.register_for_execution(name="img2txt")(img2txt)
-    helper1.register_for_llm(name="save_data_in_memory", description="Use this to Store and retrieve data using key-value storage system")(save_data_in_memory)
+    helper1.register_for_llm(name="save_data_in_memory",
+                             description="Use this to Store and retrieve data using key-value storage system")(
+        save_data_in_memory)
     time_agent.register_for_execution(name="save_data_in_memory")(save_data_in_memory)
-    helper1.register_for_llm(name="get_data_by_key", description="Returns all data from the internal Memory")(get_data_by_key)
+    helper1.register_for_llm(name="get_data_by_key", description="Returns all data from the internal Memory")(
+        get_data_by_key)
     time_agent.register_for_execution(name="get_data_by_key")(get_data_by_key)
-    helper1.register_for_llm(name="get_user_id", description="Returns the unique identifier (user_id) of the current user.")(get_user_id)
+    helper1.register_for_llm(name="get_user_id",
+                             description="Returns the unique identifier (user_id) of the current user.")(get_user_id)
     time_agent.register_for_execution(name="get_user_id")(get_user_id)
-    helper1.register_for_llm(name="get_prompt_id", description="Returns the unique identifier (prompt_id) associated with the current prompt or conversation.")(get_prompt_id)
+    helper1.register_for_llm(name="get_prompt_id",
+                             description="Returns the unique identifier (prompt_id) associated with the current prompt or conversation.")(
+        get_prompt_id)
     time_agent.register_for_execution(name="get_prompt_id")(get_prompt_id)
-    helper1.register_for_llm(name="Generate_video", description="Generate video with text and save it in database")(Generate_video)
+    helper1.register_for_llm(name="Generate_video", description="Generate video with text and save it in database")(
+        Generate_video)
     time_agent.register_for_execution(name="Generate_video")(Generate_video)
-    helper1.register_for_llm(name="get_user_uploaded_file", description="get user's recent uploaded files")(get_user_uploaded_file)
+    helper1.register_for_llm(name="get_user_uploaded_file", description="get user's recent uploaded files")(
+        get_user_uploaded_file)
     time_agent.register_for_execution(name="get_user_uploaded_file")(get_user_uploaded_file)
-    helper1.register_for_llm(name="get_user_camera_inp", description="Get user's visual information to process somethings")(get_user_camera_inp)
+    helper1.register_for_llm(name="get_user_camera_inp",
+                             description="Get user's visual information to process somethings")(get_user_camera_inp)
     time_agent.register_for_execution(name="get_user_camera_inp")(get_user_camera_inp)
-    helper1.register_for_llm(name="create_scheduled_jobs", description="Creates time-based jobs using APScheduler to schedule jobs")(create_scheduled_jobs)
+    helper1.register_for_llm(name="create_scheduled_jobs",
+                             description="Creates time-based jobs using APScheduler to schedule jobs")(
+        create_scheduled_jobs)
     time_agent.register_for_execution(name="create_scheduled_jobs")(create_scheduled_jobs)
-    helper1.register_for_llm(name="get_chat_history", description="Get Chat history based on text & start & end date")(get_chat_history)
+    helper1.register_for_llm(name="get_chat_history", description="Get Chat history based on text & start & end date")(
+        get_chat_history)
     time_agent.register_for_execution(name="get_chat_history")(get_chat_history)
     helper1.register_for_llm(name="send_message_to_user", description="Send Message to User")(send_message_to_user)
     time_agent.register_for_execution(name="send_message_to_user")(send_message_to_user)
-    helper1.register_for_llm(name="send_presynthesize_video_to_user", description="Sends a presynthesized message/video/dialogue to user using conv_id.")(send_presynthesize_video_to_user)
+    helper1.register_for_llm(name="send_presynthesize_video_to_user",
+                             description="Sends a presynthesized message/video/dialogue to user using conv_id.")(
+        send_presynthesize_video_to_user)
     time_agent.register_for_execution(name="send_presynthesize_video_to_user")(send_presynthesize_video_to_user)
-    helper1.register_for_llm(name="send_message_in_seconds", description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")(send_message_in_seconds)
+    helper1.register_for_llm(name="send_message_in_seconds",
+                             description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")(
+        send_message_in_seconds)
     time_agent.register_for_execution(name="send_message_in_seconds")(send_message_in_seconds)
 
-    helper1.register_for_llm(name="execute_windows_command", description="Executes a command on a Windows machine and returns the response.")(execute_windows_command)
+    helper1.register_for_llm(name="execute_windows_command",
+                             description="Executes a command on a Windows machine and returns the response.")(
+        execute_windows_command)
     time_agent.register_for_execution(name="execute_windows_command")(execute_windows_command)
 
     helper1.register_for_llm(name="google_search", description="Get google search response")(google_search)
     time_agent.register_for_execution(name="google_search")(google_search)
-
 
     def connect_time_main(message: Annotated[str, "The message time agent want to send to main agent"]) -> str:
         message = f"Role: Time Agent\n Message: {message}"
         print(f'user_id {user_id}')
         user_prompt = f'{user_id}_{prompt_id}'
         assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group = user_agents[user_prompt]
-        response = multi_role_agent.initiate_chat(manager, message=message,speaker_selection={"speaker": "assistant"}, clear_history=False)
+        response = multi_role_agent.initiate_chat(manager, message=message, speaker_selection={"speaker": "assistant"},
+                                                  clear_history=False)
         last_message = group_chat.messages[-1]
         if last_message['content'] == 'TERMINATE':
             last_message = group_chat.messages[-2]
-        #sending response to receiver agent
-        send_message_to_user1(user_id,last_message,'',prompt_id)
+        # sending response to receiver agent
+        send_message_to_user1(user_id, last_message, '', prompt_id)
 
         text = f'The Response from main Agent: {last_message}'
-        result = time_user.initiate_chat(manager_1, message=text,speaker_selection={"speaker": "assistant"}, clear_history=False)
+        result = time_user.initiate_chat(manager_1, message=text, speaker_selection={"speaker": "assistant"},
+                                         clear_history=False)
         last_message = group_chat.messages[-1]
         if last_message['content'] == 'TERMINATE':
             last_message = group_chat.messages[-2]
-        send_message_to_user1(user_id,last_message,'',prompt_id)
+        send_message_to_user1(user_id, last_message, '', prompt_id)
         return 'Done'
 
     # Register the tool signature with the assistant agent.
-    helper1.register_for_llm(name="Connect_to_main_agent", description="Connects time agent to main assistant agemt to perform actions which time agent cannot perform")(connect_time_main)
+    helper1.register_for_llm(name="Connect_to_main_agent",
+                             description="Connects time agent to main assistant agemt to perform actions which time agent cannot perform")(
+        connect_time_main)
 
     # Register the tool function with the user proxy agent.
     time_agent.register_for_execution(name="Connect_to_main_agent")(connect_time_main)
 
-
-    visual_agent, visual_user, helper2, executor2, multi_role_agent2, verify2, chat_instructor2 = helper_fun.create_visual_agent(user_id,prompt_id)
+    visual_agent, visual_user, helper2, executor2, multi_role_agent2, verify2, chat_instructor2 = helper_fun.create_visual_agent(
+        user_id, prompt_id)
 
     ##Tools call
     helper2.register_for_llm(name="txt2img", description="Text to image Creator")(txt2img)
     visual_agent.register_for_execution(name="txt2img")(txt2img)
     helper2.register_for_llm(name="img2txt", description="Image to Text/Question Answering from image")(img2txt)
     visual_agent.register_for_execution(name="img2txt")(img2txt)
-    helper2.register_for_llm(name="save_data_in_memory", description="Use this to Store and retrieve data using key-value storage system")(save_data_in_memory)
+    helper2.register_for_llm(name="save_data_in_memory",
+                             description="Use this to Store and retrieve data using key-value storage system")(
+        save_data_in_memory)
     visual_agent.register_for_execution(name="save_data_in_memory")(save_data_in_memory)
-    helper2.register_for_llm(name="get_data_by_key", description="Returns all data from the internal Memory")(get_data_by_key)
+    helper2.register_for_llm(name="get_data_by_key", description="Returns all data from the internal Memory")(
+        get_data_by_key)
     visual_agent.register_for_execution(name="get_data_by_key")(get_data_by_key)
-    helper2.register_for_llm(name="get_user_id", description="Returns the unique identifier (user_id) of the current user.")(get_user_id)
+    helper2.register_for_llm(name="get_user_id",
+                             description="Returns the unique identifier (user_id) of the current user.")(get_user_id)
     visual_agent.register_for_execution(name="get_user_id")(get_user_id)
-    helper2.register_for_llm(name="get_prompt_id", description="Returns the unique identifier (prompt_id) associated with the current prompt or conversation.")(get_prompt_id)
+    helper2.register_for_llm(name="get_prompt_id",
+                             description="Returns the unique identifier (prompt_id) associated with the current prompt or conversation.")(
+        get_prompt_id)
     visual_agent.register_for_execution(name="get_prompt_id")(get_prompt_id)
-    helper2.register_for_llm(name="Generate_video", description="Generate video with text and save it in database")(Generate_video)
+    helper2.register_for_llm(name="Generate_video", description="Generate video with text and save it in database")(
+        Generate_video)
     visual_agent.register_for_execution(name="Generate_video")(Generate_video)
-    helper2.register_for_llm(name="get_user_uploaded_file", description="get user's recent uploaded files")(get_user_uploaded_file)
+    helper2.register_for_llm(name="get_user_uploaded_file", description="get user's recent uploaded files")(
+        get_user_uploaded_file)
     visual_agent.register_for_execution(name="get_user_uploaded_file")(get_user_uploaded_file)
-    helper2.register_for_llm(name="get_user_camera_inp", description="Get user's visual information to process somethings")(get_user_camera_inp)
+    helper2.register_for_llm(name="get_user_camera_inp",
+                             description="Get user's visual information to process somethings")(get_user_camera_inp)
     visual_agent.register_for_execution(name="get_user_camera_inp")(get_user_camera_inp)
-    helper2.register_for_llm(name="create_scheduled_jobs", description="Creates time-based jobs using APScheduler to schedule jobs")(create_scheduled_jobs)
+    helper2.register_for_llm(name="create_scheduled_jobs",
+                             description="Creates time-based jobs using APScheduler to schedule jobs")(
+        create_scheduled_jobs)
     visual_agent.register_for_execution(name="create_scheduled_jobs")(create_scheduled_jobs)
-    helper2.register_for_llm(name="get_chat_history", description="Get Chat history based on text & start & end date")(get_chat_history)
+    helper2.register_for_llm(name="get_chat_history", description="Get Chat history based on text & start & end date")(
+        get_chat_history)
     visual_agent.register_for_execution(name="get_chat_history")(get_chat_history)
     helper2.register_for_llm(name="send_message_to_user", description="Send Message to User")(send_message_to_user)
     visual_agent.register_for_execution(name="send_message_to_user")(send_message_to_user)
-    helper2.register_for_llm(name="send_presynthesize_video_to_user", description="Sends a presynthesized message/video/dialogue to user using conv_id.")(send_presynthesize_video_to_user)
+    helper2.register_for_llm(name="send_presynthesize_video_to_user",
+                             description="Sends a presynthesized message/video/dialogue to user using conv_id.")(
+        send_presynthesize_video_to_user)
     visual_agent.register_for_execution(name="send_presynthesize_video_to_user")(send_presynthesize_video_to_user)
-    helper2.register_for_llm(name="send_message_in_seconds", description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")(send_message_in_seconds)
+    helper2.register_for_llm(name="send_message_in_seconds",
+                             description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")(
+        send_message_in_seconds)
     visual_agent.register_for_execution(name="send_message_in_seconds")(send_message_in_seconds)
-    helper2.register_for_llm(name="execute_windows_command", description="Executes a command on a Windows machine and returns the response.")(execute_windows_command)
+    helper2.register_for_llm(name="execute_windows_command",
+                             description="Executes a command on a Windows machine and returns the response.")(
+        execute_windows_command)
     visual_agent.register_for_execution(name="execute_windows_command")(execute_windows_command)
     helper2.register_for_llm(name="google_search", description="Get google search response")(google_search)
     visual_agent.register_for_execution(name="google_search")(google_search)
-
-
 
     assistant.description = 'Designed to handle specific tasks by interacting directly with other agents or the user. It acts as the primary orchestrator for task management and ensures tasks are completed efficiently'
     user_proxy.description = 'Acts as a user, performing tasks assigned by the Assistant Agent. It simulates user actions and provides results or feedback as required.'
@@ -1631,20 +1908,15 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
     executor.description = 'A specialized agent responsible for executing code and handling response management. It ensures computational tasks are performed accurately and returns results effectively.'
     verify.description = 'this is a verify status agent. which will verify the status of current action.'
 
-
     time_agent.description = 'Designed to handle specific tasks by interacting directly with other agents or the user. It acts as the primary orchestrator for task management and ensures tasks are completed efficiently'
     time_user.description = 'Acts as a user, performing tasks assigned by the Assistant Agent. It simulates user actions and provides results or feedback as required.'
     helper1.description = 'Athis is a helper agent that calls tools, facilitates task completion & assists other agents it cal perform tools/function like [send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory] calls and supporting backend processes. '
     executor1.description = 'A specialized agent responsible for executing code and handling response management. It ensures computational tasks are performed accurately and returns results effectively.'
 
-
     visual_agent.description = 'Designed to handle specific tasks by interacting directly with other agents or the user. It acts as the primary orchestrator for task management and ensures tasks are completed efficiently'
     visual_user.description = 'Acts as a user, performing tasks assigned by the Assistant Agent. It simulates user actions and provides results or feedback as required.'
     helper2.description = 'Athis is a helper agent that calls tools, facilitates task completion & assists other agents it cal perform tools/function like [send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory] calls and supporting backend processes. '
     executor2.description = 'A specialized agent responsible for executing code and handling response management. It ensures computational tasks are performed accurately and returns results effectively.'
-
-
-
 
     def state_transition(last_speaker, groupchat):
         messages = groupchat.messages
@@ -1652,7 +1924,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
             if 'message_2_user' in messages[-1]["content"].lower():
                 return "auto"
 
-            pattern = r'\{.*?\}' # getting all json from text
+            pattern = r'\{.*?\}'  # getting all json from text
             matches = re.findall(pattern, messages[-1]["content"], re.DOTALL)
             json_objects = [json.loads(match) for match in matches]
             current_app.logger.info(f'Got Json as {len(json_objects)}')
@@ -1669,7 +1941,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
                     return chat_instructor
 
                 currentaction_id = last_json['action_id']
-                if individual_recipe[currentaction_id-1]['can_perform_without_user_input'] == 'yes':
+                if individual_recipe[currentaction_id - 1]['can_perform_without_user_input'] == 'yes':
                     return assistant
         except Exception as e:
             current_app.logger.error(f'Got Error while getting json for current actionid: {e}')
@@ -1700,11 +1972,11 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         #     assistant.update_system_message = f"You should return the response to the user on whatever you are doing now in response format {response_format}"
         #     current_app.logger.info('Updated prompt')
         #     return assistant
-        current_app.logger.info(f'Inside state_transition with message :10 {messages[-1]["content"][:10]} & last_speaker {last_speaker.name}')
+        current_app.logger.info(
+            f'Inside state_transition with message :10 {messages[-1]["content"][:10]} & last_speaker {last_speaker.name}')
         if last_speaker.name == f"user_proxy_{user_id}" or last_speaker.name == "multi_role_agent" or last_speaker.name == "helper" or last_speaker.name == "Executor" or last_speaker.name == "ChatInstructor":
             return assistant
         current_app.logger.info(f'Checking for @user or @user in message')
-
 
         if messages[-1]["role"] == 'function':
             current_app.logger.info('The last speaker was function returning assistant')
@@ -1725,7 +1997,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         # if visual_context:
         #     groupchat.messages.insert(-1,{'content':visual_context,'role':'user','name':'helper'})
         try:
-            pattern = r'\{.*?\}' # getting all json from text
+            pattern = r'\{.*?\}'  # getting all json from text
             matches = re.findall(pattern, messages[-1]["content"], re.DOTALL)
             json_objects = [json.loads(match) for match in matches]
             current_app.logger.info(f'Got Json as {len(json_objects)}')
@@ -1742,7 +2014,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
                     return chat_instructor1
 
                 currentaction_id = last_json['action_id']
-                if final_recipe[prompt_id]['actions'][currentaction_id-1]['can_perform_without_user_input'] == 'yes':
+                if final_recipe[prompt_id]['actions'][currentaction_id - 1]['can_perform_without_user_input'] == 'yes':
                     return time_agent
         except Exception as e:
             current_app.logger.error(f'Got Error while getting json for current actionid: {e}')
@@ -1752,14 +2024,15 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
             current_app.logger.info("String contains @StatusVerifier returnig StatusVerifier")
             return verify1
 
-        current_app.logger.info(f'Inside state_transition with message :10 {messages[-1]["content"][:10]} & last_speaker {last_speaker.name}')
+        current_app.logger.info(
+            f'Inside state_transition with message :10 {messages[-1]["content"][:10]} & last_speaker {last_speaker.name}')
         if last_speaker.name == f"user_proxy_{user_id}" or last_speaker.name == "multi_role_agent" or last_speaker.name == "Helper" or last_speaker.name == "Executor":
             return time_agent
         current_app.logger.info(f'Checking for @user or @user in message')
         if 'message_2_user' in messages[-1]["content"].lower():
             current_app.logger.info('GOT @USER in message')
             temp_message = messages[-1]["content"]
-            temp_message = temp_message.replace("'",'"')
+            temp_message = temp_message.replace("'", '"')
             json_match = re.search(r'{[\s\S]*}', temp_message)
             if json_match:
                 try:
@@ -1768,7 +2041,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
                     json_part = json_match.group(0)
                     current_app.logger.info('Sending user the message')
                     json_obj = json.loads(json_part)
-                    send_message_to_user1(user_id,json_obj['message_2_user'],'',prompt_id)
+                    send_message_to_user1(user_id, json_obj['message_2_user'], '', prompt_id)
                 except:
                     pass
                 return "auto"
@@ -1802,7 +2075,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
         if 'message_2_user' in messages[-1]["content"].lower():
             current_app.logger.info('GOT @USER in message')
             temp_message = messages[-1]["content"]
-            temp_message = temp_message.replace("'",'"')
+            temp_message = temp_message.replace("'", '"')
             json_match = re.search(r'{[\s\S]*}', temp_message)
             if json_match:
                 try:
@@ -1811,7 +2084,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
                     json_part = json_match.group(0)
                     current_app.logger.info('Sending user the message')
                     json_obj = json.loads(json_part)
-                    send_message_to_user1(user_id,json_obj['message_2_user'],'',prompt_id)
+                    send_message_to_user1(user_id, json_obj['message_2_user'], '', prompt_id)
                 except:
                     pass
 
@@ -1820,7 +2093,8 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
             current_app.logger.info("String contains @StatusVerifier returnig StatusVerifier")
             return verify2
 
-        current_app.logger.info(f'Inside state_transition with message :10 {messages[-1]["content"][:10]} & last_speaker {last_speaker.name}')
+        current_app.logger.info(
+            f'Inside state_transition with message :10 {messages[-1]["content"][:10]} & last_speaker {last_speaker.name}')
         if last_speaker.name == f"UserProxy" or last_speaker.name == "multi_role_agent" or last_speaker.name == "Helper" or last_speaker.name == "Executor":
             return visual_agent
 
@@ -1836,16 +2110,15 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
             return None
         return "auto"
 
-
     select_speaker_transforms = transform_messages.TransformMessages(
         transforms=[
-            transforms.MessageHistoryLimiter(max_messages=50,keep_first_message=True),
+            transforms.MessageHistoryLimiter(max_messages=50, keep_first_message=True),
             transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
             ToolMessageHandler(),
         ]
     )
     group_chat = autogen.GroupChat(
-        agents=[assistant, helper, user_proxy,multi_role_agent,executor,chat_instructor,verify],
+        agents=[assistant, helper, user_proxy, multi_role_agent, executor, chat_instructor, verify],
         messages=[],
         max_round=10,
         select_speaker_transform_messages=select_speaker_transforms,
@@ -1856,11 +2129,11 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
 
     manager = autogen.GroupChatManager(
         groupchat=group_chat,
-        llm_config={"cache_seed": None,"config_list": config_list}
+        llm_config={"cache_seed": None, "config_list": config_list}
     )
 
     group_chat_1 = autogen.GroupChat(
-        agents=[time_agent, helper1, time_user,multi_role_agent1,executor1,chat_instructor1,verify1],
+        agents=[time_agent, helper1, time_user, multi_role_agent1, executor1, chat_instructor1, verify1],
         messages=[],
         max_round=10,
         select_speaker_transform_messages=select_speaker_transforms,
@@ -1871,11 +2144,11 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
 
     manager_1 = autogen.GroupChatManager(
         groupchat=group_chat_1,
-        llm_config={"cache_seed": None,"config_list": config_list}
+        llm_config={"cache_seed": None, "config_list": config_list}
     )
 
     group_chat_2 = autogen.GroupChat(
-        agents=[visual_agent, helper2, visual_user,multi_role_agent2,executor2,chat_instructor2,verify2],
+        agents=[visual_agent, helper2, visual_user, multi_role_agent2, executor2, chat_instructor2, verify2],
         messages=[],
         max_round=10,
         select_speaker_transform_messages=select_speaker_transforms,
@@ -1886,7 +2159,7 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
 
     manager_2 = autogen.GroupChatManager(
         groupchat=group_chat_2,
-        llm_config={"cache_seed": None,"config_list": config_list}
+        llm_config={"cache_seed": None, "config_list": config_list}
     )
 
     visual_agent_group = {}
@@ -1902,28 +2175,39 @@ def create_agents_for_user(user_id: str,prompt_id) -> Tuple[autogen.AssistantAge
 
     return assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group
 
-def get_agent_response(assistant: autogen.AssistantAgent,chat_instructor: autogen.UserProxyAgent, helper: autogen.AssistantAgent, user_proxy: autogen.UserProxyAgent,manager: autogen.GroupChatManager,group_chat:autogen.GroupChat, message: str, role:str,user_id:int, prompt_id:int, request_id:str) -> str:
+
+def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autogen.UserProxyAgent,
+                       helper: autogen.AssistantAgent, user_proxy: autogen.UserProxyAgent,
+                       manager: autogen.GroupChatManager, group_chat: autogen.GroupChat, message: str, role: str,
+                       user_id: int, prompt_id: int, request_id: str) -> str:
     """Get a single response from the agent for the given message."""
     user_prompt = f'{user_id}_{prompt_id}'
     try:
 
-        result = user_proxy.initiate_chat(manager, message=message,speaker_selection={"speaker": "assistant"}, clear_history=False)
+        result = user_proxy.initiate_chat(manager, message=message, speaker_selection={"speaker": "assistant"},
+                                          clear_history=False)
 
         count = 0
         while True:
             current_app.logger.info('inside while1')
-            if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
-                current_app.logger.info(f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
+            if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1][
+                'content'] == 'TERMINATE':
+                current_app.logger.info(
+                    f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
                 try:
                     json_obj = eval(group_chat.messages[-2]["content"])
                     current_app.logger.info(f'got json object {json_obj}')
                     if json_obj['status'].lower() == 'completed':
                         current_app.logger.info(f'UPDATIN CURRENT ACTION AS :{int(json_obj["action_id"])}')
                         user_tasks[user_prompt].current_action = int(json_obj['action_id'])
-                        action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)['action']
-                        steps = [{x['steps']:{'tool_name':x.get('tool_name',None),'code':x.get('generalized_functions',None)}} for x in recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action]['recipe']]
-                        user_message = f"Action {user_tasks[user_prompt].current_action+1}:{action_message}\n follow these steps: {steps}"
-                        chat_instructor.initiate_chat(recipient=manager, message=user_message, clear_history=False,silent=False)
+                        action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)[
+                            'action']
+                        steps = [{x['steps']: {'tool_name': x.get('tool_name', None),
+                                               'code': x.get('generalized_functions', None)}} for x in
+                                 recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action]['recipe']]
+                        user_message = f"Action {user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
+                        chat_instructor.initiate_chat(recipient=manager, message=user_message, clear_history=False,
+                                                      silent=False)
                         continue
                 except IndexError as e:
                     current_app.logger.info(f"COmpleted ALL ACTIONS:")
@@ -1939,33 +2223,40 @@ def get_agent_response(assistant: autogen.AssistantAgent,chat_instructor: autoge
                                 current_app.logger.info(f'UPDATIN CURRENT ACTION AS :{int(json_obj["action_id"])}')
                                 user_tasks[user_prompt].current_action = int(json_obj['action_id'])
                                 action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)['action']
-                                steps = [{x['steps']:{'tool_name':x.get('tool_name',None),'code':x.get('generalized_functions',None)}} for x in recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action]['recipe']]
-                                user_message = f"Action {user_tasks[user_prompt].current_action+1}:{action_message}\n follow these steps: {steps}"
-                                chat_instructor.initiate_chat(recipient=manager, message=user_message, clear_history=False,silent=False)
+                                steps = [{x['steps']: {'tool_name': x.get('tool_name', None),
+                                                       'code': x.get('generalized_functions', None)}} for x in
+                                         recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action][
+                                             'recipe']]
+                                user_message = f"Action {user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
+                                chat_instructor.initiate_chat(recipient=manager, message=user_message,
+                                                              clear_history=False, silent=False)
                                 continue
                         else:
                             raise 'No json found'
                     except Exception as e:
                         current_app.logger.warning(f'it is not a json object the error is: {e}')
-                        current_app.logger.info('it is not a json object You should ask status verifier to give response in proper format & not move ahead to next action')
+                        current_app.logger.info(
+                            'it is not a json object You should ask status verifier to give response in proper format & not move ahead to next action')
                         actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
-                        message = 'Hey @StatusVerifier Agent, Please verify the status of the action '+f'{user_tasks[user_prompt].current_action+1}: {actions_prompt}'+'\n performed and Respond in the following format {"status": "status here","action": "current action","action_id": '+f'{user_tasks[user_prompt].current_action+1}'+',"message": "message here"}'
-                        assistant.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
+                        message = 'Hey @StatusVerifier Agent, Please verify the status of the action ' + f'{user_tasks[user_prompt].current_action + 1}: {actions_prompt}' + '\n performed and Respond in the following format {"status": "status here","action": "current action","action_id": ' + f'{user_tasks[user_prompt].current_action + 1}' + ',"message": "message here"}'
+                        assistant.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
                         continue
             try:
-                if user_tasks[user_prompt].actions[user_tasks[user_prompt].current_action]['can_perform_without_user_input'] == 'yes':
+                if user_tasks[user_prompt].actions[user_tasks[user_prompt].current_action][
+                    'can_perform_without_user_input'] == 'yes':
                     current_app.logger.info('GOT can_perform_without_user_input as true')
                     message = 'You should complete this task independently. Feel free to make reasonable assumptions where necessary'
-                    helper.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
+                    helper.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
 
-                count +=1
+                count += 1
                 if count == 4:
                     break
             except Exception as e:
                 current_app.logger.error(f'WE have some indec error here: {e}')
             last_message = group_chat.messages[-1]['content']
             # Check if this message has already been sent to the user by state_transition
-            if f'message_2_user'.lower() in last_message.lower()  and request_id == request_id_list_sent_intermediate.get(user_prompt, None):
+            if f'message_2_user'.lower() in last_message.lower() and request_id == request_id_list_sent_intermediate.get(
+                    user_prompt, None):
                 # Message has already been sent to user in state_transition
                 # Return a placeholder or empty response to prevent duplication
                 current_app.logger.info(f'Message with message_2_user detected - already sent by state_transition')
@@ -1984,7 +2275,6 @@ def get_agent_response(assistant: autogen.AssistantAgent,chat_instructor: autoge
         last_message = group_chat.messages[-1]
         if last_message['content'] == 'TERMINATE':
             last_message = group_chat.messages[-2]
-
 
         if f'message_2_user'.lower() in last_message['content'].lower():
             try:
@@ -2008,8 +2298,8 @@ def get_agent_response(assistant: autogen.AssistantAgent,chat_instructor: autoge
         return f"Error getting response: {str(e)}"
 
 
-def get_flow_number(user_id,prompt_id):
-    role = get_role(user_id,prompt_id)
+def get_flow_number(user_id, prompt_id):
+    role = get_role(user_id, prompt_id)
     if not role:
         role = None
     current_app.logger.info(f'Got role as {role}')
@@ -2022,44 +2312,49 @@ def get_flow_number(user_id,prompt_id):
     if not role:
         role = available_roles[0]
     role_number = 0
-    for num,i in enumerate(available_flows):
+    for num, i in enumerate(available_flows):
         if i['persona'].lower() == role.lower():
             role_number = num
             current_app.logger.info(f'GOT role index as {role_number}')
     return role_number, role
 
-def create_schedule(prompt_id,user_id):
+
+def create_schedule(prompt_id, user_id):
     current_app.logger.info('INSIDE Create Schedule')
     user_prompt = f'{user_id}_{prompt_id}'
-    role_number,role = get_flow_number(user_id,prompt_id)
+    role_number, role = get_flow_number(user_id, prompt_id)
     with open(f"prompts/{prompt_id}_{role_number}_recipe.json", 'r') as f:
         config = json.load(f)
         recipes[user_prompt] = config
     try:
-        if 'scheduled_tasks' in config and len(config['scheduled_tasks'])>0:
+        if 'scheduled_tasks' in config and len(config['scheduled_tasks']) > 0:
             current_app.logger.info('Creating scheduled tasks')
             for i in config['scheduled_tasks']:
                 if role and i['persona'].lower() == role.lower():
                     trigger = CronTrigger.from_crontab(i['cron_expression'])
                     job_id = f"job_{int(time.time())}"
-                    scheduler.add_job(execute_python_file, trigger=trigger, id=job_id,args=[i['job_description'],user_id,prompt_id,i['action_entry_point']])
+                    scheduler.add_job(execute_python_file, trigger=trigger, id=job_id,
+                                      args=[i['job_description'], user_id, prompt_id, i['action_entry_point']])
                     current_app.logger.info(f'Successfully created scheduler job {i["persona"]}')
 
         current_app.logger.info('Creating Visual scheduled tasks')
         trigger = IntervalTrigger(seconds=int(10000))
         job_id = f"job_{int(time.time())}"
-        scheduler.add_job(call_visual_task, trigger=trigger, id=job_id,args=['get past 1 mins visual information',user_id,prompt_id])
+        scheduler.add_job(call_visual_task, trigger=trigger, id=job_id,
+                          args=['get past 1 mins visual information', user_id, prompt_id])
         current_app.logger.info(f'Successfully created scheduler job')
-        if 'visual_scheduled_tasks' in config and len(config['visual_scheduled_tasks'])>0:
+        if 'visual_scheduled_tasks' in config and len(config['visual_scheduled_tasks']) > 0:
             # current_app.logger.info('Creating Visual scheduled tasks')
             for i in config['visual_scheduled_tasks']:
                 if role and i['persona'].lower() == role.lower():
                     trigger = CronTrigger.from_crontab(i['cron_expression'])
                     job_id = f"job_{int(time.time())}"
-                    scheduler.add_job(call_visual_task, trigger=trigger, id=job_id,args=[i['job_description'],user_id,prompt_id])
+                    scheduler.add_job(call_visual_task, trigger=trigger, id=job_id,
+                                      args=[i['job_description'], user_id, prompt_id])
                     current_app.logger.info(f'Successfully created scheduler job {i["persona"]}')
     except Exception as e:
         current_app.logger.error(f'Some Error in creating scheduled tasks error:{e}')
+
 
 recent_file_id = {}
 recipes = {}
@@ -2070,8 +2365,9 @@ request_id_list_sent_intermediate = {}
 time_actions = {}
 final_recipe = {}
 
-def chat_agent(user_id,text,prompt_id,file_id,request_id):
-    current_app.logger.info('--'*100)
+
+def chat_agent(user_id, text, prompt_id, file_id, request_id):
+    current_app.logger.info('--' * 100)
     user_message = text
     user_prompt = f'{user_id}_{prompt_id}'
 
@@ -2082,11 +2378,11 @@ def chat_agent(user_id,text,prompt_id,file_id,request_id):
 
         # Get or create agents for this user
         if user_prompt not in user_agents:
-            llm_call_track[user_prompt] = {'count':0,'original_prompt':False}
+            llm_call_track[user_prompt] = {'count': 0, 'original_prompt': False}
             if user_prompt not in user_journey:
                 if prompt_id not in agent_data.keys():
                     agent_data[prompt_id] = {}
-                role_agents[user_prompt] = create_agents_for_role(user_id,prompt_id)
+                role_agents[user_prompt] = create_agents_for_role(user_id, prompt_id)
                 assistant, user_proxy, group_chat, manager, helper, stop = role_agents[user_prompt]
                 if stop:
                     user_journey[user_prompt] = 'UseBot'
@@ -2095,16 +2391,16 @@ def chat_agent(user_id,text,prompt_id,file_id,request_id):
                 else:
                     user_journey[user_prompt] = 'Roles'
             if user_journey[user_prompt] == 'UseBot':
-                create_schedule(prompt_id,user_id)
-                user_agents[user_prompt] = create_agents_for_user(user_id,prompt_id)
+                create_schedule(prompt_id, user_id)
+                user_agents[user_prompt] = create_agents_for_user(user_id, prompt_id)
                 user_journey[user_prompt] = 'UseBot'
         if user_journey[user_prompt] == 'Roles':
             assistant, user_proxy, group_chat, manager, helper, stop = role_agents[user_prompt]
-            result = user_proxy.initiate_chat(manager, message=user_message,speaker_selection={"speaker": "assistant"}, clear_history=False)
+            result = user_proxy.initiate_chat(manager, message=user_message, speaker_selection={"speaker": "assistant"},
+                                              clear_history=False)
             # Print the chat summary
             current_app.logger.info("\n=== Chat Summary ===")
             # current_app.logger.info(result.summary)
-
 
             # Print the full chat history
             # current_app.logger.info("\n=== Full response ===")
@@ -2115,21 +2411,26 @@ def chat_agent(user_id,text,prompt_id,file_id,request_id):
                 # with open(f"prompts/{prompt_id}_recipe.json", 'r') as f:
                 #     config = json.load(f)
                 #     recipes[user_prompt] = config
-                user_agents[user_prompt] = create_agents_for_user(user_id,prompt_id)
+                user_agents[user_prompt] = create_agents_for_user(user_id, prompt_id)
                 assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group = user_agents[user_prompt]
                 user_journey[user_prompt] = 'UseBot'
-                create_schedule(prompt_id,user_id)
+                create_schedule(prompt_id, user_id)
                 action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)['action']
-                steps = [{x['steps']:{'tool_name':x.get('tool_name',None),'code':x.get('generalized_functions',None)}} for x in recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action]['recipe']]
-                message = f"Action {user_tasks[user_prompt].current_action+1}:{action_message}\n follow these steps: {steps}"
+                steps = [
+                    {x['steps']: {'tool_name': x.get('tool_name', None), 'code': x.get('generalized_functions', None)}}
+                    for x in recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action]['recipe']]
+                message = f"Action {user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
                 # message = "let's perform the actions availabe in sequence\nIMP instruction: keep track of action id you are working on."
-                result = chat_instructor.initiate_chat(manager, message=message,speaker_selection={"speaker": "assistant"}, clear_history=False)
+                result = chat_instructor.initiate_chat(manager, message=message,
+                                                       speaker_selection={"speaker": "assistant"}, clear_history=False)
 
                 count = 0
                 while True:
                     current_app.logger.info('inside while2')
-                    if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
-                        current_app.logger.info(f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
+                    if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1][
+                        'content'] == 'TERMINATE':
+                        current_app.logger.info(
+                            f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
                         try:
                             json_obj = eval(group_chat.messages[-2]["content"])
                             current_app.logger.info(f'got json object {json_obj}')
@@ -2137,9 +2438,13 @@ def chat_agent(user_id,text,prompt_id,file_id,request_id):
                                 current_app.logger.info(f'UPDATIN CURRENT ACTION AS :{int(json_obj["action_id"])}')
                                 user_tasks[user_prompt].current_action = int(json_obj['action_id'])
                                 action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)['action']
-                                steps = [{x['steps']:{'tool_name':x.get('tool_name',None),'code':x.get('generalized_functions',None)}} for x in recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action]['recipe']]
-                                user_message = f"Action {user_tasks[user_prompt].current_action+1}:{action_message}\n follow these steps: {steps}"
-                                chat_instructor.initiate_chat(recipient=manager, message=user_message, clear_history=False,silent=False)
+                                steps = [{x['steps']: {'tool_name': x.get('tool_name', None),
+                                                       'code': x.get('generalized_functions', None)}} for x in
+                                         recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action][
+                                             'recipe']]
+                                user_message = f"Action {user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
+                                chat_instructor.initiate_chat(recipient=manager, message=user_message,
+                                                              clear_history=False, silent=False)
                                 continue
                         except:
                             try:
@@ -2149,12 +2454,17 @@ def chat_agent(user_id,text,prompt_id,file_id,request_id):
                                     json_obj = json.loads(json_part)
                                     current_app.logger.info(f'got json object {json_obj}')
                                     if json_obj['status'].lower() == 'completed':
-                                        current_app.logger.info(f'UPDATIN CURRENT ACTION AS :{int(json_obj["action_id"])}')
+                                        current_app.logger.info(
+                                            f'UPDATIN CURRENT ACTION AS :{int(json_obj["action_id"])}')
                                         user_tasks[user_prompt].current_action = int(json_obj['action_id'])
                                         action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)['action']
-                                        steps = [{x['steps']:{'tool_name':x.get('tool_name',None),'code':x.get('generalized_functions',None)}} for x in recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action]['recipe']]
-                                        user_message = f"Action {user_tasks[user_prompt].current_action+1}:{action_message}\n follow these steps: {steps}"
-                                        chat_instructor.initiate_chat(recipient=manager, message=user_message, clear_history=False,silent=False)
+                                        steps = [{x['steps']: {'tool_name': x.get('tool_name', None),
+                                                               'code': x.get('generalized_functions', None)}} for x in
+                                                 recipes[user_prompt]['actions'][
+                                                     user_tasks[user_prompt].current_action]['recipe']]
+                                        user_message = f"Action {user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
+                                        chat_instructor.initiate_chat(recipient=manager, message=user_message,
+                                                                      clear_history=False, silent=False)
                                         continue
 
 
@@ -2165,19 +2475,23 @@ def chat_agent(user_id,text,prompt_id,file_id,request_id):
                                 return ''
                             except Exception as e:
                                 current_app.logger.warning(f'it is not a json object the error is: {e}')
-                                current_app.logger.info('it is not a json object You should ask status verifier to give response in proper format & not move ahead to next action')
-                                actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
-                                message = 'Hey @StatusVerifier Agent, Please verify the status of the action '+f'{user_tasks[user_prompt].current_action+1}: {actions_prompt}'+'\n performed and Respond in the following format {"status": "status here","action": "current action","action_id": '+f'{user_tasks[user_prompt].current_action+1}'+',"message": "message here"}'
-                                assistant.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
+                                current_app.logger.info(
+                                    'it is not a json object You should ask status verifier to give response in proper format & not move ahead to next action')
+                                actions_prompt = user_tasks[user_prompt].get_action(
+                                    user_tasks[user_prompt].current_action)
+                                message = 'Hey @StatusVerifier Agent, Please verify the status of the action ' + f'{user_tasks[user_prompt].current_action + 1}: {actions_prompt}' + '\n performed and Respond in the following format {"status": "status here","action": "current action","action_id": ' + f'{user_tasks[user_prompt].current_action + 1}' + ',"message": "message here"}'
+                                assistant.initiate_chat(recipient=manager, message=message, clear_history=False,
+                                                        silent=False)
                                 continue
-                    count +=1
+                    count += 1
                     if count == 4:
                         break
                     # role = get_role(user_id,prompt_id)
                     last_message = group_chat.messages[-1]['content']
                     if f'@user'.lower() not in last_message.lower():
                         message = 'If you want to communicate from the user then send the response with @user\nIf you current action is completed and you want next action ask @StatusVerifier for next action\n if you can continue the task without user intervention you can proceed with the actions.'
-                        helper.initiate_chat(manager, message=message,speaker_selection={"speaker": "assistant"}, clear_history=False)
+                        helper.initiate_chat(manager, message=message, speaker_selection={"speaker": "assistant"},
+                                             clear_history=False)
                         continue
                     else:
                         current_app.logger.info(f'@user in last message')
@@ -2196,14 +2510,14 @@ def chat_agent(user_id,text,prompt_id,file_id,request_id):
                             pass
                 return last_message['content']
 
-
             return last_message['content']
         else:
             assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group = user_agents[user_prompt]
 
             prompt_id = int(prompt_id)
-            role = get_role(user_id,prompt_id)
-            response = get_agent_response(assistant,chat_instructor, helper,user_proxy,manager,group_chat, user_message, role,user_id,prompt_id, request_id)
+            role = get_role(user_id, prompt_id)
+            response = get_agent_response(assistant, chat_instructor, helper, user_proxy, manager, group_chat,
+                                          user_message, role, user_id, prompt_id, request_id)
             llm_call_track[user_prompt]['count'] = 0
             llm_call_track[user_prompt]['original_prompt'] = True
             return response
@@ -2211,28 +2525,31 @@ def chat_agent(user_id,text,prompt_id,file_id,request_id):
         current_app.logger.info(f'Some ERROR IN REUSE RECIPE {e}')
         raise
 
+
 def crossbar_multiagent(msg):
     current_app.logger.info("insde crossbar_multiagent")
-    current_app.logger.info('--'*100)
+    current_app.logger.info('--' * 100)
 
     user_prompt = f"{msg['user_id']}_{msg['caller_prompt_id']}"
     assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group = user_agents[user_prompt]
     message = f"Role: {msg['caller_role']}\n Message: {msg['message']}"
-    response = multi_role_agent.initiate_chat(manager, message=message,speaker_selection={"speaker": "assistant"}, clear_history=False)
+    response = multi_role_agent.initiate_chat(manager, message=message, speaker_selection={"speaker": "assistant"},
+                                              clear_history=False)
     last_message = group_chat.messages[-1]
     if last_message['content'] == 'TERMINATE':
         last_message = group_chat.messages[-2]
 
-    #sending response to receiver agent
-    send_message_to_user1(msg['user_id'],last_message,msg['message'],msg['caller_prompt_id'])
+    # sending response to receiver agent
+    send_message_to_user1(msg['user_id'], last_message, msg['message'], msg['caller_prompt_id'])
 
     user_prompt = f"{msg['caller_user_id']}_{msg['caller_prompt_id']}"
     assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group = user_agents[user_prompt]
     message = f"Role: {msg['role']}\n Message: {last_message}"
-    response = multi_role_agent.initiate_chat(manager, message=message,speaker_selection={"speaker": "assistant"}, clear_history=False)
+    response = multi_role_agent.initiate_chat(manager, message=message, speaker_selection={"speaker": "assistant"},
+                                              clear_history=False)
     last_message = group_chat.messages[-1]
     if last_message['content'] == 'TERMINATE':
         last_message = group_chat.messages[-2]
 
-    #sending response to caller agent
-    send_message_to_user1(msg['caller_user_id'],last_message,msg['message'],msg['caller_prompt_id'])
+    # sending response to caller agent
+    send_message_to_user1(msg['caller_user_id'], last_message, msg['message'], msg['caller_prompt_id'])
