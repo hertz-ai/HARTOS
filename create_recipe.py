@@ -84,7 +84,7 @@ def send_message_to_user1(user_id,response,inp,prompt_id):
     body = json.dumps({'user_id':user_id,'message':response,'inp':inp,'request_id':request_id})
     headers = {'Content-Type': 'application/json'}
     res = requests.post(url,data=body,headers=headers)
-    
+
 
 
 def execute_python_file(task_description:str,user_id: int,prompt_id:int,action_entry_point:int=0):
@@ -99,7 +99,7 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
     user_prompt = f'{user_id}_{prompt_id}'
     if user_prompt not in time_agents:
         time_agents[user_prompt] = create_time_agents(user_id,prompt_id,'creator','',actions)
-    
+
     # author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = user_agents[user_id]
     current_time = datetime.now()
     group_chat = time_agents[user_prompt]['time_group_chat']
@@ -124,7 +124,7 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
                 current_app.logger.info('it is not a json object You should ask @statusverifier to give response in proper format & not move ahead to next action')
                 actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action-1)
                 text = f'Lets continue the work we were doing, if action is completed then ask @statusverifier Agent to Please tell the status of the action {user_tasks[user_prompt].current_action}:{actions_prompt}'
-            
+
             result = chat_instructor.initiate_chat(time_manager, message=text,speaker_selection={"speaker": "assistant"}, clear_history=False)
             continue
         if restart == True:
@@ -134,10 +134,10 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
             restart = True
             text = 'You can assume things on your own to complete this task'
             result = chat_instructor.initiate_chat(time_manager, message=text,speaker_selection={"speaker": "assistant"}, clear_history=False)
-            
+
             continue
         break
-            
+
     last_message = group_chat.messages[-1]
     if last_message['content'] == 'TERMINATE':
         last_message = group_chat.messages[-2]
@@ -169,7 +169,7 @@ async def subscribe_and_return(message,topic,time=8000):
         try:
             response = await asyncio.wait_for(session.call(topic,message), timeout=time)
             await SubscriptionHandler().on_rpc_response(session, response)
-            
+
         except Exception as e:
             current_app.logger.error(f"RPC call failed: {e}")
             SubscriptionHandler.message = None
@@ -191,7 +191,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     """Create new assistant & user agents for a given user_id"""
     user_prompt = f'{user_id}_{prompt_id}'
     individual_json[user_prompt] = None
-    
+
     custom_agents = []
     agents_object = {}
     with open(f"prompts/{prompt_id}.json", 'r') as f:
@@ -211,59 +211,61 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
                 ➜Understand and plan the current action execution.
                 ➜Perform the action with the help of @Helper and @Executor agents.
                 ➜Account for all the tools available with helper & whenever you are supposed to call a tool as part of current action ask @Helper.
-                ➜If the action requires code execution or API endpoint call, in create code(python preffered) and ask @Executor agent to execute the created code.
+                ➜If the action requires code execution or API endpoint call, in create code(python preferred) and ask @Executor agent to execute the created code.
             3. After Completion:
-                ➜If action completed successful & there is no error, ask @Helper to save the information(which will be required in future) in memory using 'save_data_in_memory' tool.
-                ➜After save_data_in_memory has completed, ask the StatusVerifier to confirm completion and include the persona name.
-                ➜After confirmation, request the next action from the ChatInstructor.
+                ?If action completed successful & there is no error, ask @Helper to save the information(which will be required in future) in memory using 'save_data_in_memory' tool.
+                ?After save_data_in_memory has completed, ask the StatusVerifier to confirm completion and include the persona name.
+                ?After confirmation, request the next action from the ChatInstructor.
             4. If Failed:
-                ➜Create a summary of the error and ask the UserProxy for help if needed.
-                ➜Never assume; always seek user assistance for unresolved issues.
+                ?Create a summary of the error and ask the UserProxy for help if needed.
+                ?Never assume; always seek user assistance for unresolved issues.
             5. Action Modifications:
-                ➜If the action is modified, ask the user what measures should be taken if it fails in the future.
-        
+                ?If the action is modified, ask the user what measures should be taken if it fails in the future.
+
         •Persona Association:
             list of persona:- """+f'{list_of_persona}'+"""
-            Rules: 
-                ➜If there’s only 1 persona in the list, associate that persona with all actions automatically.
-                ➜If there are multiple personas, ask the @user to select the persona associated with each action.
-        
+            Rules:
+                ?If there’s only 1 persona in the list, associate that persona with all actions automatically.
+                ?If there are multiple personas, ask the @user to select the persona associated with each action.
+
         •Code Execution: Executor Agent: Executes code as needed. Ensure the final response is printed in code using print() before sending to Executor.
-        
+
         •Tools Helper Agent can use:
             1. The tools are: send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,execute_windows_command,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory.
             2. Create Scheduled Jobs: For tasks involving timer or time or periodically or scheduled jobs, ask Helper agent to use the create_scheduled_jobs tool.
             3. Data/Memory Management:
-                ➜If you want to save some data,understand the current data from get_saved_metadata & plan the datamodel and ask helper agent to use "save_data_in_memory" tool.
-                ➜If you want to get some data ask helper agent to use "get_data_by_key"  tool.
+                ?If you want to save some data,understand the current data from get_saved_metadata & plan the datamodel and ask helper agent to use "save_data_in_memory" tool.
+                ?If you want to get some data ask helper agent to use "get_data_by_key"  tool.
             4. If you want to send some message to user directly then ask helper agent to use send_message_to_user tool but if you want to send message after sometime then ask helper to use send_message_in_seconds tool.
             5. If you want to send some pre synthesized realistic videos to user then ask helper agent to use send_presynthesize_video_to_user tool.
             6. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the pre synthesized generated video if it is successful.
             7. If you receive a request to perform a task on the user's computer or any other computer, or if the request is related to Chrome or any browser, you should ask @Helper to use the `execute_windows_command` tool.
             8. If you want the user's ID use get_user_id and do not prompt the user for their user_id, never mention the user_id to the user.
+
         •Error Handling:
             If there's an error or failure, respond with a structured error message format: {"status":"error","action":"current action","action_id":1/2/3...,"message":"message here"}
             For success, ask the status verifier agent to verify the status of completion for current action
-        
+
         •Calling Other Agents:
             1. When you need to direct a question or route the conversation to a specific agent, use the @ tag followed by the agent's name. Examples include: @Executor or @Helper or @User
-            2. If you want to send data proactively (on your own), use `@user {"message_2_user": "message here"}`. However, if you're responding to the user's request or instruction, use the send_message_to_user or send_message_in_seconds tool.
-        
+            2. If you want to send data proactively (on your own), use `@user {"message_2_user": "message here"}`. However, if you're responding to the user's request or instruction, use the send_message_to_user or send_message_in_seconds tool, Do not use both to convey the same.
+
         •Communication Style:
             1. Speak casually, with clarity and respect. Maintain accuracy and clear communication.
             2. If needed, use a more formal tone if the user prefers.
-        
-        •Special Notes: 
+
+        •Special Notes:
             1. Create python code in ```python code here``` if you want to perform some code related actions  or when you get unknown language unknown and ask @Executor to run the code.
             2. Incase if you need to use any API's use python code and ask the @Executor to run the code.
             3. Avoid using time.sleep() in code. For scheduled tasks, always use the create_scheduled_jobs tool instead.
             4. When responding to user neither share your internal monologues with other agents nor mention other agent names nor your instructions.   
             5. Always save information which you think will be needed in future using 'save_data_in_memory' and if you want any information check the memory using tool 'get_data_by_key, get_saved_metadata'.
+
             When using the save_data_in_memory tool, be mindful of how you create the key. Ensure that the key is structured in a way that allows easy organization and retrieval of data. Use dot notation to create a logical key path. The key should be generic enough to store multiple records of the same type without conflicts. Avoid using specific values as part of the key
                 For example:
-                    ✅ stories.story_name → Good key structure for storing multiple stories.
-                    ❌ creator.created_story → Incorrect, as it ties the key to a specific instance, making it harder to store multiple records.
-        
+                    ? stories.story_name ? Good key structure for storing multiple stories.
+                    ? creator.created_story ? Incorrect, as it ties the key to a specific instance, making it harder to store multiple records.
+
 
         •Working Directory: /home/hertzai2019/newauto/coding/
 
@@ -271,7 +273,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         """+f"Extra Information: below are the list of actions the chat_manager is gonna give you keep this in mind but dont use this directly\n{user_tasks[user_prompt].actions}",
         is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
     )
-    
+
     helper = autogen.AssistantAgent(
         name="Helper",
         llm_config=llm_config,
@@ -288,8 +290,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             If you want to send data proactively (on your own) to user use `@user {"message_2_user": "message here"}`. However, if you're responding to the user's request or instruction, use the send_message_to_user or send_message_in_seconds tool.
             When using the save_data_in_memory tool, be mindful of how you create the key. Ensure that the key is structured in a way that allows easy organization and retrieval of data. Use dot notation to create a logical key path. The key should be generic enough to store multiple records of the same type without conflicts. Avoid using specific values as part of the key
                 For example:
-                    ✅ stories.story_name → Good key structure for storing multiple stories.
-                    ❌ creator.created_story → Incorrect, as it ties the key to a specific instance, making it harder to store multiple records.
+                    ? stories.story_name ? Good key structure for storing multiple stories.
+                    ? creator.created_story ? Incorrect, as it ties the key to a specific instance, making it harder to store multiple records.
         Data Management:
             Use the get_set_internal_memory tool to store or retrieve user information as needed.""",
         is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
@@ -314,14 +316,14 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
                 ii. If the action was not executed correctly, return the original action to the Assistant.
             3. Maintain JSON Consistency:
                 i. Always follow the exact JSON structure in your responses.
-                ii. Do not perform actions yourself—only report status. 
+                ii. Do not perform actions yourself—only report status.
             Maintain the exact JSON structure in all responses.
-            
+
         """+f"\nExtra Information: below are the list of actions the chat_manager will give you, keep this in mind but don't use this directly only use this if there is any update in any action or you want to insert/delete the actions & return the entire array as entire_actions\n{user_tasks[user_prompt].actions}",
-        
+
         is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
     )
-    
+
     author = autogen.UserProxyAgent(
         name="UserProxy",
         human_input_mode="NEVER",
@@ -329,14 +331,14 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         max_consecutive_auto_reply=0,
         code_execution_config=False,
     )
-    
+
     executor = autogen.AssistantAgent(
         name="Executor",
         code_execution_config={"last_n_messages":2,"work_dir": "coding", "use_docker": False},
         llm_config=llm_config,
-        system_message="""You are an Executor agent. 
+        system_message="""You are an Executor agent.
         Focus: Creating, running, and debugging code.
-        
+
         Responsibilities:
             1. Code Execution:
                 Execute code provided by the Assistant Agent.
@@ -350,7 +352,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
                 Working Directory: /home/hertzai2019/newauto/coding. Use this path as needed.
                 For storing or retrieving information about the user, request the Helper Agent to use the get_set_internal_memory tool.
                 No General Conversations: Redirect unrelated conversations to the manager to route to the user.
-        
+
         Coding Instructions:
             Avoid using time.sleep. Instead, request the Helper Agent to use the create_scheduled_jobs tool for tasks requiring delays or intervals.
             If the Assistant Agent provides code requiring time.sleep, inform them that it cannot be executed and suggest using the create_scheduled_jobs tool.
@@ -364,14 +366,14 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             1. Tools Helper Agent can use: Can use tools like send_message_in_seconds, send_message_to_user,send_presynthesize_video_to_user, execute_windows_command, text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory.
             2. Create Scheduled Jobs: For tasks involving timers or scheduled jobs, ask Helper agent to use the create_scheduled_jobs tool.
             3. Data/Memory Management:
-                ➜If you want to save some data ask helper agent to use "save_data_in_memory" tool.
-                ➜If you wnat to get some data ask helper agent to use "get_data_by_key", "get_saved_metadata" tool.
+                ?If you want to save some data ask helper agent to use "save_data_in_memory" tool.
+                ?If you wnat to get some data ask helper agent to use "get_data_by_key", "get_saved_metadata" tool.
             4. If you want to send some message to user directly then ask helper agent to use send_message_to_user tool but if you want to send message after sometime then ask helper to use send_message_in_seconds tool.
             5. If you want to send some pre synthesized video to user then ask helper agent to use send_presynthesize_video_to_user tool.
             6. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
             7. If you receive a request to perform a task on the user's computer or any other computer, or if the request is related to Chrome or any browser, you should ask @Helper to use the `execute_windows_command` tool."""
     )
-    
+
     chat_instructor = autogen.UserProxyAgent(
         name="ChatInstructor",
         human_input_mode="NEVER",
@@ -380,7 +382,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         code_execution_config=False,
         is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
     )
-    
+
     context_handling = transform_messages.TransformMessages(
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=50,keep_first_message=True),
@@ -392,8 +394,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     context_handling.add_to_agent(helper)
     context_handling.add_to_agent(executor)
     context_handling.add_to_agent(verify)
-    
-    
+
+
     agents_object['assistant'] = assistant
     agents_object['helper'] = helper
     agents_object['author'] = author
@@ -401,7 +403,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     agents_object['executor'] = executor
     agents_object['verify'] = verify
     agents_object['chat_instructor'] = chat_instructor
-    
+
     # for i in config['personas']:
     #     name = i['name']
     #     name = autogen.UserProxyAgent(
@@ -415,16 +417,16 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     #     name.description = i['description']
     #     custom_agents.append(name)
     #     agents_object[i['name']] = name
-    
+
     helper.register_for_llm(name="text_2_image", description="Text to image Creator")(helper_fun.txt2img)
     assistant.register_for_execution(name="text_2_image")(helper_fun.txt2img)
-    
-    
+
+
     def camera_inp(inp: Annotated[str, "The Question to check from visual context"])->str:
-        return helper_fun.get_user_camera_inp(inp,user_id)        
+        return helper_fun.get_user_camera_inp(inp,user_id)
     helper.register_for_llm(name="get_user_camera_inp", description="Get user's visual information to process somethings")(camera_inp)
-    assistant.register_for_execution(name="get_user_camera_inp")(camera_inp)  
-    
+    assistant.register_for_execution(name="get_user_camera_inp")(camera_inp)
+
     def save_data_in_memory(key: Annotated[str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
                             value: Annotated[Optional[Any], "Value you want to store; may be int, str, float, bool, dict, list, json object."] = None) -> str:
         current_app.logger.info('INSIDE save_data_in_memory')
@@ -432,26 +434,26 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         current_app.logger.info(f"VALUES ALREADY AVAILABLE IN AGENT DATA: {agent_data[prompt_id]}")
         keys = key.split('.')
         d = agent_data.setdefault(prompt_id, {})
-        
+
         for k in keys[:-1]:
             d = d.setdefault(k, {})
         d[keys[-1]] = value
         return f'{agent_data[prompt_id]}'
-    
+
     helper.register_for_llm(name="save_data_in_memory", description="Use this to Store and retrieve data using key-value storage system")(save_data_in_memory)
     assistant.register_for_execution(name="save_data_in_memory")(save_data_in_memory)
-    
+
     def get_saved_metadata() -> str:
         stripped_json = strip_json_values(agent_data[prompt_id])
         return f'{stripped_json}'
 
     helper.register_for_llm(name="get_saved_metadata", description="Returns the schema of the json from internal memory with all keys but without actual values.")(get_saved_metadata)
     assistant.register_for_execution(name="get_saved_metadata")(get_saved_metadata)
-    
+
     def get_data_by_key(key: Annotated[str, "Key path for retrieving data. Use dot notation for nested keys (e.g., 'user.info.name')."]) -> str:
         keys = key.split('.')
         d = agent_data.get(prompt_id, {})
-        
+
         try:
             for k in keys:
                 d = d[k]
@@ -462,23 +464,23 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
 
     helper.register_for_llm(name="get_data_by_key", description="Returns all data from the internal Memory using key")(get_data_by_key)
     assistant.register_for_execution(name="get_data_by_key")(get_data_by_key)
-    
+
     def get_user_id() -> str:
         current_app.logger.info('INSIDE get_user_id')
         return f'{user_id}'
 
-    
+
     helper.register_for_llm(name="get_user_id", description="Returns the unique identifier (user_id) of the current user.")(get_user_id)
     assistant.register_for_execution(name="get_user_id")(get_user_id)
-    
+
     def get_prompt_id() -> str:
         current_app.logger.info('INSIDE get_prompt_id')
         return f'{prompt_id}'
 
-    
+
     helper.register_for_llm(name="get_prompt_id", description="Returns the unique identifier (prompt_id) associated with the current prompt or conversation.")(get_prompt_id)
     assistant.register_for_execution(name="get_prompt_id")(get_prompt_id)
-    
+
     def Generate_video(text: Annotated[str, "Text to be used for video generation"],
                        avatar_id: Annotated[int, "Unique identifier for the avatar"],
                        realtime: Annotated[bool,"If True, response is fast but less realistic by default it should be true; if False, response is realistic but slower"]) -> str:
@@ -486,7 +488,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         database_url = 'https://mailer.hertzai.com'
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
         print(f"avtar_id: {avatar_id}:\n{text[:10]}....\n")
-        
+
         headers = {'Content-Type': 'application/json'}
         data = {}
         data["text"] = text
@@ -515,14 +517,14 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         data['inpainting'] = "false"
         data['prompt'] = ""
         data['gender'] = 'male'
-        
+
         timeout = 60
         if not realtime:
             timeout = 600
             data['chattts'] = True
             data['flag_hallo'] = "true"
             data["cartoon_image"] = False
-            
+
         if res['voice_id'] != None:
             voice_sample = requests.get(
                 "{}/get_voice_sample_id/{}".format(database_url, res['voice_id']))
@@ -531,7 +533,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             data['voice_id'] = res['voice_id']
         else:
             voice_sample = None
-            data["audio_sample_url"] = None    
+            data["audio_sample_url"] = None
             data['voice_id'] = None
         conv_id = save_conversation_db(text,user_id,prompt_id,database_url,request_id)
         data['conv_id'] = conv_id
@@ -546,20 +548,20 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             return f"Video Generation task added to queue with conv_id:{conv_id}. Ask the helper to save this conv_id in the same collection from which the story used to generate the video was retrieved, for future reference"
         else:
             return f"Video Generation completed with conv_id:{conv_id}. Ask the helper to save this conv_id in the same collection from which the story used to generate the video was retrieved, for future reference"
-    
+
     helper.register_for_llm(name="Generate_video", description="Generate/presynthesize video with text and save it in database")(Generate_video)
     assistant.register_for_execution(name="Generate_video")(Generate_video)
-    
+
     def get_user_uploaded_file() -> str:
         current_app.logger.info('INSIDE get_user_uploaded_file')
         if recent_file_id[user_id]:
             return f'Got user uploaded file the file_id is {recent_file_id[user_id]}'
 
         return 'No file uploaded from user'
-    
+
     helper.register_for_llm(name="get_user_uploaded_file", description="get user's recent uploaded files")(get_user_uploaded_file)
     assistant.register_for_execution(name="get_user_uploaded_file")(get_user_uploaded_file)
-    
+
 
     def img2txt(image_url: Annotated[str, "image url of which you want text"],text: Annotated[str, "the details you want from image"]='Describe the Images & Text data in this image in detail') -> str:
         current_app.logger.info('INSIDE img2txt')
@@ -578,22 +580,22 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             return response.text
         else:
             return 'Not able to get this page details try later'
-    
+
     helper.register_for_llm(name="get_text_from_image", description="Image to Text")(img2txt)
     assistant.register_for_execution(name="get_text_from_image")(img2txt)
-    
-    def create_scheduled_jobs(interval_sec: Annotated[int, "time between two Interval in seconds."], 
+
+    def create_scheduled_jobs(interval_sec: Annotated[int, "time between two Interval in seconds."],
                             job_description: Annotated[str, "Description of the job to be performed"],
                             cron_expression: Annotated[Optional[str], "Cron expression for scheduling. Example: '0 9 * * 1-5' (Runs at 9:00 AM, Monday to Friday). If the interval is greater than 60 seconds or it needs to be executed at a dynamic cron time this argument is Mandatory else None"]=None) -> str:
         current_app.logger.info('INSIDE create_scheduled_jobs')
-        
+
         # actual_execution_time = sum(task_time[prompt_id]['times'][-1])
         # if interval_sec < actual_execution_time:
         #     return f"Unable to create scheduled job for the specified interval because the actual execution time ({actual_execution_time} seconds) exceeds the interval between jobs ({interval_sec} seconds). Please use an interval longer than {actual_execution_time} seconds. Would you like to create a scheduled job with this updated interval?"
-        
+
         # if not scheduler.running:
         #     scheduler.start()
-        
+
         # try:
         #     if not interval_sec or int(interval_sec) >60:
         #         trigger = CronTrigger.from_crontab(cron_expression)
@@ -611,10 +613,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         #     current_app.logger.error(f'Error in create_scheduled_jobs: {str(e)}')
         #     return f"Error creating scheduled job: {str(e)}"
         return 'Added this schedule job in creation process will do it at the end. you can go ahead and mark this action as completed.'
-        
+
     helper.register_for_llm(name="create_scheduled_jobs", description="Creates time-based jobs using APScheduler to schedule jobs")(create_scheduled_jobs)
     assistant.register_for_execution(name="create_scheduled_jobs")(create_scheduled_jobs)
-    
+
     def send_message_to_user(text: Annotated[str, "Text you want to send to the user"],
                          avatar_id: Annotated[Optional[str], "Unique identifier for the avatar"] = None,
                          response_type: Annotated[Optional[str], "Response mode: 'Realistic' (slower, better quality) or 'Realtime' (faster, lower quality)"] = 'Realtime') -> str:
@@ -625,18 +627,18 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         thread = threading.Thread(target=send_message_to_user1, args=(user_id, text, '',prompt_id))
         thread.start()
         return f'Message sent successfully to user with request_id: {request_id_list[user_prompt]}-intermediate'
-    
+
     helper.register_for_llm(name="send_message_to_user", description="Sends a message/information to user. You can use this if you want to ask a question")(send_message_to_user)
     assistant.register_for_execution(name="send_message_to_user")(send_message_to_user)
-    
+
     def send_presynthesize_video_to_user(conv_id: Annotated[str, "Conversation ID associated with the text from memory"]) -> str:
         current_app.logger.info('INSIDE send_presynthesize_video_to_user')
         current_app.logger.info(f'SENDING DATA 2 user with value: conv_id:{conv_id}.')
         return 'Message sent successfully to user'
-    
+
     helper.register_for_llm(name="send_presynthesize_video_to_user", description="Sends a presynthesized message/video/dialogue to user using conv_id.")(send_presynthesize_video_to_user)
     assistant.register_for_execution(name="send_presynthesize_video_to_user")(send_presynthesize_video_to_user)
-    
+
     def send_message_in_seconds(text: Annotated[str, "text to send to user"],
                        delay: Annotated[int, "time to wait in seconds before sending text"],
                        conv_id: Annotated[Optional[int], "conv_id for this text if not available make it None"],) -> str:
@@ -645,10 +647,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         run_time = datetime.fromtimestamp(time.time() + delay)
         scheduler.add_job(send_message_to_user1, 'date', run_date=run_time, args=[user_id, text, '',prompt_id])
         return 'Message scheduled successfully'
-    
+
     helper.register_for_llm(name="send_message_in_seconds", description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")(send_message_in_seconds)
     assistant.register_for_execution(name="send_message_in_seconds")(send_message_in_seconds)
-    
+
     def get_chat_history(text: Annotated[str, "Text related to which you want history"],
                          start: Annotated[Optional[str], "start date in format %Y-%m-%dT%H:%M:%S.%fZ"] = None,
                          end: Annotated[Optional[str], "end date in format %Y-%m-%dT%H:%M:%S.%fZ"] = None) -> str:
@@ -656,19 +658,19 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         return helper_fun.get_time_based_history(text, f'user_{user_id}', start, end)
     helper.register_for_llm(name="get_chat_history", description="Get Chat history based on text & start & end date")(get_chat_history)
     assistant.register_for_execution(name="get_chat_history")(get_chat_history)
-    
+
     def google_search(text: Annotated[str, "Text/Query which you want to search"]) -> str:
         current_app.logger.info('INSIDE google search')
         return helper_fun.top5_results(text)
     helper.register_for_llm(name="google_search", description="web/google/bing search api tool for a given query")(google_search)
     assistant.register_for_execution(name="google_search")(google_search)
-    
+
     def get_user_details()->str:
         current_app.logger.info('INSIDE get user details')
         return helper_fun.parse_user_id(user_id)
     helper.register_for_llm(name="get_user_details", description="Get User details like name, dob, gender")(get_user_details)
     assistant.register_for_execution(name="get_user_details")(get_user_details)
-    
+
     async def execute_windows_command(instructions: Annotated[str, "Command in plain English to execute on the Windows machine"])->str:
         """
         Executes a command on a Windows machine and returns the response within 500 seconds.
@@ -707,14 +709,14 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     helper.register_for_llm(name="execute_windows_command", description="Processes user-defined commands on a personal Windows or Android system.")(execute_windows_command)
     assistant.register_for_execution(name="execute_windows_command")(execute_windows_command)
 
-    
+
     assistant.description = 'this is an assistant agent that coordinates & executes requested tasks & actions'
     executor.description = 'this is an executor agent that Specialized agent for code execution & response handling'
     author.description = 'this is an author/user agent that focused on user support, error resolution, contextual information. Contact this agent when you need any user based information or persona based information or if you want to say something to user'
     chat_instructor.description = 'this is a ChatInstructor agent that provides step-by-step action plans for task execution'
     helper.description = 'this is a helper agent that calls tools, facilitates task completion & assists other agents'
     verify.description = 'this is a verify status agent. which will verify the status of current action that will be called after ChatInstructor gives instruction to complete an action & assistant completes it, this agent will provide updates in a structured JSON format & then call user agent'
-    
+
     def state_transition(last_speaker, groupchat):
         current_app.logger.info(f'Inside state_transition with actions {user_tasks[user_prompt].current_action}')
         current_app.logger.info(f"STATE_TRANSITION - Message[0]: {groupchat.messages[0]}")
@@ -725,7 +727,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         if messages[-1]['name'] != 'UserProxy':
             new_role = 'AI'
         helper_fun.history(user_id,prompt_id,new_role,messages[-1]['content'])
-        
+
         # if len(groupchat.messages) == 5:
         #     current_app.logger.info('THE LENGTH OF MESSAGES IS 5 APPENDING tool at start')
         #     groupchat.messages.insert(0,{'role':'tool','name':'Assistant','content':'','tool_responses':''})
@@ -746,8 +748,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         if messages[-1]['role'] == 'tool':
             current_app.logger.info('role is tool returning assistant')
             return assistant
-        
-        
+
+
         if not messages[-1]["content"].startswith('Reflect on the sequence') and not messages[-1]["content"].startswith('Focus on the current task at hand'):
             json_obj = retrieve_json(messages[-1]["content"])
             if json_obj:
@@ -779,7 +781,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
                                 current_app.logger.info(f'CHECKING FOR FALLBACK user_tasks[user_prompt].current_action={user_tasks[user_prompt].current_action} json_obj["action_id"]={json_obj["action_id"]}')
                                 if user_tasks[user_prompt].current_action != int(json_obj['action_id']):
                                     user_tasks[user_prompt].fallback = True
-                                
+
                                 current_app.logger.info(f'UPDATIN CURRENT ACTION AS :{int(json_obj["action_id"])}')
                                 user_tasks[user_prompt].current_action = int(json_obj['action_id'])
                             return chat_instructor
@@ -789,7 +791,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
                                 try:
                                     current_app.logger.info(f"user_tasks[user_prompt].actions:{len(user_tasks[user_prompt].actions)}, len(json_obj['entire_actions']:{len(json_obj['entire_actions'])}")
                                     current_app.logger.info(f"user_tasks[user_prompt].actions:{user_tasks[user_prompt].actions}, len(json_obj['entire_actions']:{json_obj['entire_actions']}")
-                                    
+
                                     current_app.logger.info('')
                                     entire_actions = json_obj['entire_actions']
                                     user_tasks[user_prompt].actions = entire_actions
@@ -826,16 +828,16 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
                             user_tasks[user_prompt].current_action = int(json_obj['action_id'])
                             individual_json[user_prompt] = json_obj
                             current_app.logger.info(f'Saved Individual recipe at: {name}')
-                            
-                            return chat_instructor   
+
+                            return chat_instructor
                 except Exception as e:
                     current_app.logger.error(f'GOT SOME ERROR WHILE JSON: {e}')
-        
-        
+
+
         crossbar_message = {"text": [f"{last_speaker.name} "+f'{messages[-1]["content"]}'], "priority": 49, "action": 'Thinking', "historical_request_id": [], "preffered_language": 'en-US', "options": [], "newoptions": [], "bot_type": 'Agent', "page_image_url": "", "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
         'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0}, 'bottom_left': {'x': 0, 'y': 0}}}
         result = client.publish(
-            f"com.hertzai.hevolve.chat.{user_id}", f'{crossbar_message}')            
+            f"com.hertzai.hevolve.chat.{user_id}", f'{crossbar_message}')
         pattern = r"@Helper"
         pattern1 = r"@Executor"
         pattern2 = r"@User"
@@ -858,16 +860,16 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
                 return executor
         except Exception as e:
             current_app.logger.error(f'Got error when searching for @user in last message :{e}')
-            
-        
-            
+
+
+
         if last_speaker.name == 'Executor' or last_speaker.name == 'Helper' or last_speaker.name == 'UserProxy' or last_speaker.name == 'UserProxy' or last_speaker.name == 'ChatInstructor':
-            
+
             group_chat.messages[-1]['content'] = f"{group_chat.messages[-1]['content']}\n Metadata/skeleton of all keys for retrieving data from memory:{metadata}"
             current_app.logger.info('Got last speaker as executor or helper or author or chat_instructor & reutrning next speaker as assistant')
             return assistant
         json_obj = None
-        
+
         if last_speaker == verify:
             current_app.logger.info('Got last speaker as verify_status & returning next speaker as chat_instructor')
             return chat_instructor
@@ -880,18 +882,18 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
                 return assistant
         except Exception as e:
             current_app.logger.error(f'Got error when content as blank with error as :{e}')
-        
 
-        
+
+
         if 'TERMINATE' in messages[-1]["content"].upper():
             current_app.logger.info('TERMINATING BECAUSE OF TERMINATE')
             # retrieve: action 1 -> action 2
             return None
         else:
             return 'auto'
-    
-    
-    
+
+
+
     all_agents = [assistant, executor, author, chat_instructor,helper,verify]
     all_agents.extend(custom_agents)
     select_speaker_transforms = transform_messages.TransformMessages(
@@ -901,7 +903,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             ToolMessageHandler(),
         ]
     )
-    
+
     group_chat = autogen.GroupChat(
         agents=all_agents,
         messages=[],
@@ -914,21 +916,21 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         allow_repeat_speaker=False,  # Prevent same agent speaking twice
         send_introductions=False
     )
-    
+
     manager = autogen.GroupChatManager(
         groupchat=group_chat,
         llm_config={"config_list": config_list,"cache_seed": None,"max_tokens": 1500}
     )
-    
-    
-    
-    
+
+
+
+
     return author, assistant, executor, group_chat, manager, chat_instructor, agents_object
 
 def create_time_agents(user_id, prompt_id,role,goal,actions):
     user_prompt = f'{user_id}_{prompt_id}'
     time_actions[user_prompt] = Action(actions)
-    
+
     time_agent = autogen.AssistantAgent(
         name='time_agent',
         llm_config=llm_config,
@@ -939,7 +941,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         f"""You can refer below details to perform task:
             Actions: <actionsStart>{user_tasks[user_prompt].actions}<actionEnd>
             Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{final_recipe[prompt_id]}<generalized_functionsEnd><recipeEnd>
-            After completing the current action ask the StatusVerifier to verify the status of current action.        
+            After completing the current action ask the StatusVerifier to verify the status of current action.
         """
         f"When you want to communicate with {role} connect main agent using 'connect_time_main' tool."
         "Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory.]"
@@ -948,7 +950,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         f'IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: `@user {{"message_2_user": "Your message here"}}`'
         "Return 'TERMINATE' when the task is done."
     )
-    
+
     time_user = autogen.UserProxyAgent(
         name=f"user_proxy_{user_id}",
         human_input_mode="NEVER",
@@ -973,8 +975,8 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             9. IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: `@user {{"message_2_user": "Your message here"}}`
             10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
             Actions: <actionsStart>{user_tasks[user_prompt].actions}<actionEnd>
-            Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{final_recipe[prompt_id]}<generalized_functionsEnd><recipeEnd>            
-            
+            Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{final_recipe[prompt_id]}<generalized_functionsEnd><recipeEnd>
+
             When writing code, always print the final response just before returning it.
         """,
         is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
@@ -997,7 +999,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
             Actions: <actionsStart>{user_tasks[user_prompt].actions}<actionEnd>
             Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{final_recipe[prompt_id]}<generalized_functionsEnd><recipeEnd>
-        
+
             Note: Your Working Directory is "/home/hertzai2019/newauto/coding" use this if you need,
             Add proper error handling, logging.
             Always provide clear execution results or error messages to the assistant.
@@ -1028,11 +1030,11 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             For pending tasks or ongoing actions, respond to helper to complete the task.
             Verify the action performed by assistant and make sure the action is performed correctly as per instructions. if action performed was not as per instructions give the pending actions to the helper agent.
             Report status only—do not perform actions yourself.
-            
+
         """,
         is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
     )
-    
+
     chat_instructor1 = autogen.UserProxyAgent(
         name="ChatInstructor",
         human_input_mode="NEVER",
@@ -1041,41 +1043,41 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         code_execution_config=False,
         is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
     )
-    
+
     helper1.register_for_llm(name="text_2_image", description="Text to image Creator")(helper_fun.txt2img)
     time_agent.register_for_execution(name="text_2_image")(helper_fun.txt2img)
-    
-    
+
+
     def camera_inp(inp: Annotated[str, "The Question to check from visual context"])->str:
-        return helper_fun.get_user_camera_inp(inp,user_id)        
+        return helper_fun.get_user_camera_inp(inp,user_id)
     helper1.register_for_llm(name="get_user_camera_inp", description="Get user's visual information to process somethings")(camera_inp)
-    time_agent.register_for_execution(name="get_user_camera_inp")(camera_inp)  
-    
+    time_agent.register_for_execution(name="get_user_camera_inp")(camera_inp)
+
     def save_data_in_memory(key: Annotated[str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
                             value: Annotated[Optional[Any], "Value you want to store; may be int, str, float, bool, dict, list, json object."] = None) -> str:
         current_app.logger.info('INSIDE save_data_in_memory')
         keys = key.split('.')
         d = agent_data.setdefault(prompt_id, {})
-        
+
         for k in keys[:-1]:
             d = d.setdefault(k, {})
         d[keys[-1]] = value
         return f'{agent_data[prompt_id]}'
-    
+
     helper1.register_for_llm(name="save_data_in_memory", description="Use this to Store and retrieve data using key-value storage system")(save_data_in_memory)
     time_agent.register_for_execution(name="save_data_in_memory")(save_data_in_memory)
-    
+
     def get_saved_metadata() -> str:
         stripped_json = strip_json_values(agent_data[prompt_id])
         return f'{stripped_json}'
 
     helper1.register_for_llm(name="get_saved_metadata", description="Returns the schema of the json from internal memory with all keys but without actual values.")(get_saved_metadata)
     time_agent.register_for_execution(name="get_saved_metadata")(get_saved_metadata)
-    
+
     def get_data_by_key(key: Annotated[str, "Key path for retrieving data. Use dot notation for nested keys (e.g., 'user.info.name')."]) -> str:
         keys = key.split('.')
         d = agent_data.get(prompt_id, {})
-        
+
         try:
             for k in keys:
                 d = d[k]
@@ -1086,23 +1088,23 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
 
     helper1.register_for_llm(name="get_data_by_key", description="Returns all data from the internal Memory")(get_data_by_key)
     time_agent.register_for_execution(name="get_data_by_key")(get_data_by_key)
-    
+
     def get_user_id() -> str:
         current_app.logger.info('INSIDE get_user_id')
         return f'{user_id}'
 
-    
+
     helper1.register_for_llm(name="get_user_id", description="Returns the unique identifier (user_id) of the current user.")(get_user_id)
     time_agent.register_for_execution(name="get_user_id")(get_user_id)
-    
+
     def get_prompt_id() -> str:
         current_app.logger.info('INSIDE get_prompt_id')
         return f'{prompt_id}'
 
-    
+
     helper1.register_for_llm(name="get_prompt_id", description="Returns the unique identifier (prompt_id) associated with the current prompt or conversation.")(get_prompt_id)
     time_agent.register_for_execution(name="get_prompt_id")(get_prompt_id)
-    
+
     def Generate_video(text: Annotated[str, "Text to be used for video generation"],
                        avatar_id: Annotated[str, "Unique identifier for the avatar"],
                        realtime: Annotated[bool,"If True, response is fast but less realistic by default it should be true; if False, response is realistic but slower"]) -> str:
@@ -1110,7 +1112,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         database_url = 'https://mailer.hertzai.com'
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
         print(f"avtar_id: {avatar_id}:\n{text[:10]}....\n")
-        
+
         headers = {'Content-Type': 'application/json'}
         data = {}
         data["text"] = text
@@ -1139,14 +1141,14 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         data['inpainting'] = "false"
         data['prompt'] = ""
         data['gender'] = 'male'
-        
+
         timeout = 60
         if not realtime:
             timeout = 600
             data['chattts'] = True
             data['flag_hallo'] = "true"
             data["cartoon_image"] = False
-            
+
         if res['voice_id'] != None:
             voice_sample = requests.get(
                 "{}/get_voice_sample_id/{}".format(database_url, res['voice_id']))
@@ -1155,7 +1157,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             data['voice_id'] = res['voice_id']
         else:
             voice_sample = None
-            data["audio_sample_url"] = None    
+            data["audio_sample_url"] = None
             data['voice_id'] = None
         conv_id = save_conversation_db(text,user_id,prompt_id,database_url,request_id)
         data['conv_id'] = conv_id
@@ -1170,20 +1172,20 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             return f"Video Generation task added to queue with conv_id:{conv_id}. Ask the helper to save this conv_id in the same collection from which the story used to generate the video was retrieved, for future reference"
         else:
             return f"Video Generation completed with conv_id:{conv_id}. Ask the helper to save this conv_id in the same collection from which the story used to generate the video was retrieved, for future reference"
-    
+
     helper1.register_for_llm(name="Generate_video", description="Generate/presynthesize video with text and save it in database")(Generate_video)
     time_agent.register_for_execution(name="Generate_video")(Generate_video)
-    
+
     def recent_files() -> str:
         current_app.logger.info('INSIDE get_user_uploaded_file')
         if recent_file_id[user_id]:
             return f'Got user uploaded file the file_id is {recent_file_id[user_id]}'
 
         return 'No file uploaded from user'
-    
+
     helper1.register_for_llm(name="get_user_uploaded_file", description="get user's recent uploaded files")(recent_files)
     time_agent.register_for_execution(name="get_user_uploaded_file")(recent_files)
-    
+
 
     def img2txt(image_url: Annotated[str, "image url of which you want text"],text: Annotated[str, "the details you want from image"]='Describe the Images & Text data in this image in detail') -> str:
         current_app.logger.info('INSIDE img2txt')
@@ -1202,22 +1204,22 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             return response.text
         else:
             return 'Not able to get this page details try later'
-    
+
     helper1.register_for_llm(name="get_text_from_image", description="Image to Text")(img2txt)
     time_agent.register_for_execution(name="get_text_from_image")(img2txt)
-    
-    def create_scheduled_jobs(interval_sec: Annotated[int, "time between two Interval in seconds."], 
+
+    def create_scheduled_jobs(interval_sec: Annotated[int, "time between two Interval in seconds."],
                             job_description: Annotated[str, "Description of the job to be performed"],
                             cron_expression: Annotated[Optional[str], "Cron expression for scheduling. Example: '0 9 * * 1-5' (Runs at 9:00 AM, Monday to Friday). If the interval is greater than 60 seconds or it needs to be executed at a dynamic cron time this argument is Mandatory else None"]=None) -> str:
         current_app.logger.info('INSIDE create_scheduled_jobs')
-        
+
         # actual_execution_time = sum(task_time[prompt_id]['times'][-1])
         # if interval_sec < actual_execution_time:
         #     return f"Unable to create scheduled job for the specified interval because the actual execution time ({actual_execution_time} seconds) exceeds the interval between jobs ({interval_sec} seconds). Please use an interval longer than {actual_execution_time} seconds. Would you like to create a scheduled job with this updated interval?"
-        
+
         # if not scheduler.running:
         #     scheduler.start()
-        
+
         # try:
         #     if not interval_sec or int(interval_sec) >60:
         #         trigger = CronTrigger.from_crontab(cron_expression)
@@ -1235,10 +1237,10 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         #     current_app.logger.error(f'Error in create_scheduled_jobs: {str(e)}')
         #     return f"Error creating scheduled job: {str(e)}"
         return 'Added this schedule job in creation process will do it at the end. you can go ahead and mark this action as completed.'
-        
+
     helper1.register_for_llm(name="create_scheduled_jobs", description="Creates time-based jobs using APScheduler to schedule jobs")(create_scheduled_jobs)
     time_agent.register_for_execution(name="create_scheduled_jobs")(create_scheduled_jobs)
-    
+
     def send_message_to_user(text: Annotated[str, "Text to send to the user"],
                          avatar_id: Annotated[Optional[str], "Unique identifier for the avatar"] = None,
                          response_type: Annotated[Optional[str], "Response mode: 'Realistic' (slower, better quality) or 'Realtime' (faster, lower quality)"] = 'Realtime') -> str:
@@ -1248,18 +1250,18 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         thread = threading.Thread(target=send_message_to_user1, args=(user_id, text, '',prompt_id))
         thread.start()
         return f'Message sent successfully to user with request_id: {request_id_list[user_prompt]}-intermediate'
-    
+
     helper1.register_for_llm(name="send_message_to_user", description="Sends a message/information to user. You can use this if you want to ask a question")(send_message_to_user)
     time_agent.register_for_execution(name="send_message_to_user")(send_message_to_user)
-    
+
     def send_presynthesize_video_to_user(conv_id: Annotated[str, "Conversation ID associated with the text from memory"]) -> str:
         current_app.logger.info('INSIDE send_presynthesize_video_to_user')
         current_app.logger.info(f'SENDING DATA 2 user with value: conv_id:{conv_id}.')
         return 'Message sent successfully to user'
-    
+
     helper1.register_for_llm(name="send_presynthesize_video_to_user", description="Sends a presynthesized message/video/dialogue to user using conv_id.")(send_presynthesize_video_to_user)
     time_agent.register_for_execution(name="send_presynthesize_video_to_user")(send_presynthesize_video_to_user)
-    
+
     def send_message_in_seconds(text: Annotated[str, "text to send to user"],
                        delay: Annotated[int, "time to wait in seconds before sending text"],
                        conv_id: Annotated[Optional[int], "conv_id for this text if not available make it None"],) -> str:
@@ -1268,11 +1270,11 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         run_time = datetime.fromtimestamp(time.time() + delay)
         scheduler.add_job(send_message_to_user1, 'date', run_date=run_time, args=[user_id, text, '',prompt_id])
         return 'Message scheduled successfully'
-    
+
     helper1.register_for_llm(name="send_message_in_seconds", description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")(send_message_in_seconds)
     time_agent.register_for_execution(name="send_message_in_seconds")(send_message_in_seconds)
-    
-    
+
+
     context_handling = transform_messages.TransformMessages(
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=50,keep_first_message=True),
@@ -1285,7 +1287,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     context_handling.add_to_agent(executor1)
     context_handling.add_to_agent(multi_role_agent1)
     context_handling.add_to_agent(verify1)
-    
+
     time_agent_object = {}
     time_agent_object['time_agent'] = time_agent
     time_agent_object['time_user'] = time_user
@@ -1294,7 +1296,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     time_agent_object['multi_role_agent1'] = multi_role_agent1
     time_agent_object['verify1'] = verify1
     time_agent_object['chat_instructor1'] = chat_instructor1
-    
+
     time_agent.description = 'Designed to handle specific tasks by interacting directly with other agents or the user. It acts as the primary orchestrator for task management and ensures tasks are completed efficiently'
     time_user.description = 'Acts as a user, performing tasks assigned by the Assistant Agent. It simulates user actions and provides results or feedback as required.'
     helper1.description = 'this is a helper agent that calls tools, facilitates task completion & assists other agents'
@@ -1302,16 +1304,16 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     multi_role_agent1.description = 'Acts as an external agent with multi-functional capabilities. Note: This agent should never be directly invoked.'
     verify1.description = 'this is a verify status agent. which will verify the status of current action that will be called after ChatInstructor gives instruction to complete an action & assistant completes it, this agent will provide updates in a structured JSON format & then call user agent'
     chat_instructor1.description = 'this is a ChatInstructor agent that provides step-by-step action plans for task execution'
-    
+
     def state_transition1(last_speaker, groupchat):
-        current_app.logger.info('INSIDE TIMER STATE TRANSITION')      
+        current_app.logger.info('INSIDE TIMER STATE TRANSITION')
         messages = groupchat.messages
         # visual_context = helper_fun.get_visual_context(user_id)
         # if visual_context:
         #     groupchat.messages.insert(-1,{'content':visual_context,'role':'user','name':'helper'})
         try:
             pattern = r'\{.*?\}' # getting all json from text
-            matches = re.findall(pattern, messages[-1]["content"], re.DOTALL)   
+            matches = re.findall(pattern, messages[-1]["content"], re.DOTALL)
             json_objects = [json.loads(match) for match in matches]
             current_app.logger.info(f'Got Json as {len(json_objects)}')
             if json_objects:
@@ -1325,18 +1327,18 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
                         current_app.logger.error('GOT ERROR WHILE UPDATING CURRENT ACTION')
                         time_actions[user_prompt].current_action += 1
                     return chat_instructor1
-                    
+
                 currentaction_id = last_json['action_id']
                 if final_recipe[prompt_id]['actions'][currentaction_id-1]['can_perform_without_user_input'] == 'yes':
                     return time_agent
         except Exception as e:
             current_app.logger.error(f'Got Error while getting json for current actionid: {e}')
-            
+
         pattern3 = r"@statusverifier"
         if re.search(pattern3, messages[-1]["content"].lower()):
             current_app.logger.info("String contains @StatusVerifier returnig StatusVerifier")
             return verify1
-    
+
         current_app.logger.info(f'Inside state_transition with message :10 {messages[-1]["content"][:10]} & last_speaker {last_speaker.name}')
         if last_speaker.name == f"user_proxy_{user_id}" or last_speaker.name == "multi_role_agent" or last_speaker.name == "helper" or last_speaker.name == "Executor":
             return time_agent
@@ -1357,10 +1359,9 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
                 except:
                     pass
                 return "auto"
-        
-            
+
         if messages[-1]["role"] == 'function':
-            current_app.logger.info('The last speaker was function returning assistant') 
+            current_app.logger.info('The last speaker was function returning assistant')
             return time_agent
         if 'exitcode:' in messages[-1]["content"]:
             current_app.logger.info('Got exitcode in text returning assistant')
@@ -1370,7 +1371,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             # retrieve: action 1 -> action 2
             return None
         return "auto"
-    
+
     select_speaker_transforms = transform_messages.TransformMessages(
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=50,keep_first_message=True),
@@ -1387,21 +1388,21 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         allow_repeat_speaker=False,  # Prevent same agent speaking twice
         send_introductions=False
     )
-    
+
     time_manager = autogen.GroupChatManager(
         groupchat=time_group_chat,
         llm_config={"cache_seed": None,"config_list": config_list}
     )
-    
+
     time_agent_object['time_group_chat'] = time_group_chat
     time_agent_object['time_manager'] = time_manager
     return time_agent_object
-    
-    
-    
-    
-    
-    
+
+
+
+
+
+
 
 user_tasks = {}
 
@@ -1415,13 +1416,13 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
     else:
         author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = user_agents[user_prompt]
     clear_history = False
-    
+
     #TOOL CALL AND REPONSE CHECK
     #current_msg.get('tool_calls') and next_msg.get('role') != 'tool':
     if len(group_chat.messages)>2 and 'tool_calls' in group_chat.messages[-1]:
         current_app.logger.warning('GOT INPUT BUT LAST MESSAGE IS tool_calls should wait for tool response')
         return 'Processing a tool now please try later'
-        
+
     if Failure:
         current_app.logger.warning(f'CHECK THIS OUT group_chat.messages:{group_chat.messages[-5:]}')
         current_app.logger.warning(f'CHECK THIS OUT group_chat.messages:{len(group_chat.messages)}')
@@ -1450,14 +1451,14 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             # current_app.logger.error(f'len of group chat :{group_chat.messages}')
             return 'Our Agent is facing issues in creating this agent please try later'
             # current_app.logger.error(f' group chat :{group_chat.messages}')
-            
-            
+
+
             for i in range(len(group_chat.messages)):
                 group_chat.messages[i]['role'] = 'user'
             message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
             text = f'Action {user_tasks[user_prompt].current_action+1}: {message}'
             result = agents_object['helper'].initiate_chat(recipient=manager, message=text, clear_history=True,silent=False)
-            
+
     else:
         message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
         message = f'Action {user_tasks[user_prompt].current_action+1}: {message} '
@@ -1467,13 +1468,13 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             f"com.hertzai.hevolve.chat.{user_id}", f'{crossbar_message}')
         task_time[prompt_id] = {'timer':time.time(),'times':[]}
         result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
-    
+
     current_app.logger.info("\n=== Chat Summary ===")
     current_app.logger.info("\n=== Full response ===")
     # current_app.logger.info(result)
-    
 
-    
+
+
     while True:
         file_path = f'prompts/{prompt_id}.json'
         with open(file_path, 'r') as f:
@@ -1490,7 +1491,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     if user_tasks[user_prompt].current_action != int(json_obj['action_id']):
                         user_tasks[user_prompt].fallback = True
                     current_app.logger.info(f'UPDATIN CURRENT ACTION AS :{int(json_obj["action_id"])}')
-                    user_tasks[user_prompt].current_action = int(json_obj['action_id'])                
+                    user_tasks[user_prompt].current_action = int(json_obj['action_id'])
             else:
                 current_app.logger.warning(f'it is not a json object the error is:')
                 current_app.logger.info('it is not a json object You should ask status verifier to give response in proper format & not move ahead to next action')
@@ -1523,7 +1524,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                 elif user_tasks[user_prompt].fallback == True:
                     user_tasks[user_prompt].recipe = True
                     user_tasks[user_prompt].fallback = False
-                    message = f" Action {user_tasks[user_prompt].current_action} fallback:ask user what actions should be taken if current actions fail in the future after you get the response from user give the conversaation to StatusVerifier agent"      
+                    message = f" Action {user_tasks[user_prompt].current_action} fallback:ask user what actions should be taken if current actions fail in the future after you get the response from user give the conversaation to StatusVerifier agent"
                 else:
                     # if recipe_for_persona[user_prompt]  < total_persona_actions[user_prompt]:
                     #     recipe_for_persona[user_prompt] += 1
@@ -1543,7 +1544,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                                 individual_recipe.append(config)
                         except Exception as e:
                             current_app.logger.error(f'Got error as :{e} while checking for prompts/{prompt_id}_{flow}_{i}.json')
-                            
+
                     group_chat.messages[-1]['content'] = f'{individual_recipe}'
                     assistant_agent.update_system_message = 'Check if the current_action depends on any other action, regardless of order it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.'
                     flow = recipe_for_persona[user_prompt]
@@ -1559,7 +1560,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                                     break
                             if match:
                                 action_ids = eval(match.group())
-                                
+
                                 file_path = f'prompts/{prompt_id}_{flow}_{num}.json'
                                 with open(file_path, 'r') as f:
                                     data = json.load(f)
@@ -1582,7 +1583,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                             with open(file_path, 'w') as f:
                                 json.dump(data, f, indent=4)
                             continue
-                    
+
                     individual_recipe = []
                     for i in range(1,(user_tasks[user_prompt].current_action)):
                         current_app.logger.info(f'checking for prompts/{prompt_id}_{flow}_{i}.json')
@@ -1630,7 +1631,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         continue
                     scheduler_check[user_prompt] = True
                     json_response = final_recipe[prompt_id]
-                    # if json_response and 'status' in json_response.keys(): 
+                    # if json_response and 'status' in json_response.keys():
                     #     merged_dict = {**final_recipe[prompt_id], **json_response}
                     #     current_app.logger.info('Recipe created successfully')
                     #     time_agents[user_prompt] = create_time_agents(user_id,prompt_id,'creator','',[]) #TODO Replace [] with actions
@@ -1690,7 +1691,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                             data['actions_this_action_depends_on'] = []
                             with open(file_path, 'w') as f:
                                 json.dump(data, f, indent=4)
-                    
+
                     individual_recipe = []
                     for i in range(1,(user_tasks[user_prompt].current_action)):
                         current_app.logger.info(f'checking for prompts/{prompt_id}_{flow}_{i}.json')
@@ -1709,7 +1710,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                                     j['actions_this_action_depends_on'] = i['actions_this_action_depends_on']
                                     break
                         status,updated_actions, cyc = topological_sort(individual_recipe)
-                        
+
                     group_chat.messages[-1]['content'] = f'{updated_actions}'
                     file_path = f'prompts/{prompt_id}.json'
                     with open(file_path, 'r') as f:
@@ -1723,7 +1724,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
                     last_message = group_chat.messages[-1]
                     json_response = retrieve_json(last_message['content'])
-                    if json_response and 'status' in json_response.keys(): 
+                    if json_response and 'status' in json_response.keys():
                         merged_dict = {**final_recipe[prompt_id], **json_response}
                         current_app.logger.info('Recipe created successfully')
                         name = f'prompts/{prompt_id}_{flow}_recipe.json'
@@ -1752,7 +1753,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                 elif user_tasks[user_prompt].fallback == True:
                     user_tasks[user_prompt].recipe = True
                     user_tasks[user_prompt].fallback = False
-                    message = f" Action {user_tasks[user_prompt].current_action} fallback:ask user what actions should be taken if current actions fail in the future after you get the response from user give the conversaation to StatusVerifier agent"      
+                    message = f" Action {user_tasks[user_prompt].current_action} fallback:ask user what actions should be taken if current actions fail in the future after you get the response from user give the conversaation to StatusVerifier agent"
                 else:
                     # user_tasks[user_prompt].current_action = user_tasks[user_prompt].current_action+1
                     task_time[prompt_id]['timer'] = time.time()
@@ -1761,27 +1762,27 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0}, 'bottom_left': {'x': 0, 'y': 0}}}
                     result = client.publish(
                         f"com.hertzai.hevolve.chat.{user_id}", f'{crossbar_message}')
-                
+
                 result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
             current_app.logger.info("\n=== Chat Summary ===")
             current_app.logger.info("\n=== Full response ===")
             # current_app.logger.info(result)
-            
+
         elif group_chat.messages[-1]['content'].startswith('Focus on the current task at hand'):
             result = agents_object['assistant'].initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
-            continue      
+            continue
         else:
             break
-            
+
         if user_tasks[user_prompt].current_action >len(user_tasks[user_prompt].actions):
             current_app.logger.info(f'current action {user_tasks[user_prompt].current_action} is greater than legth {len(user_tasks[user_prompt].actions)}')
-            break            
+            break
 
     messages[user_prompt] = group_chat.messages
     last_message = group_chat.messages[-1]
     if last_message['content'] == 'TERMINATE':
         last_message = group_chat.messages[-2]
-    
+
     if f'message_2_user'.lower() in last_message['content'].lower():
         json_obj = retrieve_json(last_message["content"])
         if json_obj:
@@ -1789,7 +1790,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                 last_message['content'] = json_obj['message_2_user']
             except:
                 pass
-    
+
     return last_message['content']
 
 messages = {}
@@ -1814,14 +1815,14 @@ def recipe(user_id, text,prompt_id,file_id,request_id):
         total_persona_actions[user_prompt] = len(config['flows'])
         agent_data[prompt_id] = {'user_id':user_id}
     try:
-        
+
         last_response = get_response_group(user_id,text,prompt_id)
 
     except Exception as e:
         current_app.logger.error(f"Error occurred in create Recipe: {str(e)}")  # Add logging for debugging
         last_response = get_response_group(user_id,text,prompt_id,True,e)
     if scheduler_check[user_prompt] == True:
-        
+
         current_app.logger.info('WORKING on TIMER AGENTS')
         with open(f"prompts/{prompt_id}.json", 'r') as f:
             config = json.load(f)
@@ -1848,7 +1849,7 @@ def recipe(user_id, text,prompt_id,file_id,request_id):
         return 'Agent Created Successfully'
     try:
         json_response = retrieve_json(last_response)
-        if 'status' in json_response.keys() and last_response['status'].lower() == 'completed': 
+        if 'status' in json_response.keys() and last_response['status'].lower() == 'completed':
             if 'recipe' in json_response.keys():
                 url = f'https://mailer.hertzai.com/update_agent_prompt?prompt_id={prompt_id}'
                 headers = {'Content-Type': 'application/json'}
@@ -1857,11 +1858,11 @@ def recipe(user_id, text,prompt_id,file_id,request_id):
                 return 'Agent Created Successfully'
             else:
                 return json_response['message']
-        
+
     except:
         pass
     return last_response
-    
+
 
 def acknowledgment(user_id,prompt_id,request_id):
     user_prompt = f'{user_id}_{prompt_id}'

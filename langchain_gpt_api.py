@@ -603,7 +603,7 @@ class CustomGPT(LLM):
                     app.logger.info(
                         " gpt 3.5 finish in {}".format(time.time()-start))
                     checker = 1
-                    
+
                     # # `response_from_groq`.
 
                     # response_from_groq = structured_llm.invoke(prompt)
@@ -692,10 +692,10 @@ class CustomGPT(LLM):
                         app.logger.info(
                             "gpt 3.5 finish in {}".format(time.time()-start))
                         checker = 1
-                        
+
                         # response_from_groq = structured_llm.invoke(prompt)
 
-                        
+
                         # app.logger.info(
                         #     "finish in groq {}".format(time.time()-start))
                         # app.logger.info(
@@ -727,7 +727,7 @@ class CustomGPT(LLM):
                     f"gpt 4 response format type is {type(response.json())}")
                 app.logger.info("finish in {}".format(time.time()-start))
                 checker = 1
-            
+
         if checker == 0:
             try:
                 app.logger.info(
@@ -1888,7 +1888,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
             <RESPONSE_INSTRUCTIONS_END>
 
             Here is the User and AI conversation in reverse chronological order:
-            
+
             USER'S INPUT:
             -------------
             <USER_INPUT_START>
@@ -2040,22 +2040,22 @@ def chat():
                     review_agents[user_id] = True
                     conversation_agent[user_id] = False
                 else:
-                    app.logger.info(f'{no_of_flow} Recipe JSON doesnot EXISTS')  
+                    app.logger.info(f'{no_of_flow} Recipe JSON doesnot EXISTS')
                     create_agent = True
                     review_agents[user_id] = True
                     conversation_agent[user_id] = False
             else:
-                app.logger.info('0 Recipe JSON doesnot EXISTS')  
+                app.logger.info('0 Recipe JSON doesnot EXISTS')
                 create_agent = True
                 review_agents[user_id] = True
                 conversation_agent[user_id] = False
-                       
+
         else:
             app.logger.info('GATHER JSON doesnot EXISTS')
             create_agent = True
             review_agents[user_id] = False
             conversation_agent[user_id] = True
-        
+
     if create_agent:
         if user_id not in review_agents.keys() or review_agents[user_id] == False:
             review_agents[user_id] = False
@@ -2094,7 +2094,7 @@ def chat():
                     app.logger.info('PENDING STATUS')
                     ans = new_res['question'] if 'question' in new_res else new_res['review_details']
                     return jsonify({'response': ans, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Creation Mode'})
-                else:                        
+                else:
                     app.logger.info('COMPLETED STATUS')
                     new_res['prompt_id'] = prompt_id
                     new_res['creator_user_id'] = user_id
@@ -2122,13 +2122,13 @@ def chat():
             return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Evaluation Mode'})
 
     if prompt_id and os.path.exists(f'prompts/{prompt_id}.json'):
-        
+
         with open(f'prompts/{prompt_id}.json', "r") as file:
             created_json = json.load(file)
-            
-            
+
+
         response = chat_agent(user_id,prompt,prompt_id,file_id,request_id)
-            
+
         # if not user_id or not prompt:
         #     return jsonify({'response': 'Need user_id and text to use agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
         # last_response = ''
@@ -2262,7 +2262,7 @@ def visual_agent():
     if request_from == 'Reuse':
         res = visual_based_execution(str(task_description),int(user_id),int(prompt_id))
     return jsonify({'response':f'{res}'}), 200
-    
+
 @app.route('/response_ack',methods=['POST'])
 def response_ack():
     app.logger.info('GOT REQUEST IN response_ack')
@@ -2308,5 +2308,4 @@ if __name__ == '__main__':
     # from crossbar_server import component
     # # Run the WAMP client
     # run([component])
-    
 
