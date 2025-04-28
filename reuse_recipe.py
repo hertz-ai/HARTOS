@@ -35,8 +35,36 @@ from twisted.internet.defer import inlineCallbacks, returnValue, Deferred
 from twisted.internet import reactor
 import threading
 
-from langchain_gpt_api import TaskStatus, TaskNames, STUDENT_API, ACTION_API, parse_date
 from threadlocal import thread_local_data
+
+
+class TaskStatus(Enum):
+    INITIALIZED = "INITIALIZED"
+    SCHEDULED = "SCHEDULED"
+    EXECUTING = "EXECUTING"
+    TIMEOUT = "TIMEOUT"
+    COMPELETED = "COMPELETED"
+    ERROR = "ERROR"
+
+class TaskNames(Enum):
+    GET_ACTION_USER_DETAILS = "GET_ACTION_USER_DETAILS"
+    GET_TIME_BASED_HISTORY = "GET_TIME_BASED_HISTORY"
+    ANIMATE_CHARACTER = "ANIMATE_CHARACTER"
+    STABLE_DIFF = "STABLE_DIFF"
+    LLAVA = "LLAVA"
+    CRAWLAB = "CRAWLAB"
+    USER_ID_RETRIEVER = "USER_ID_RETRIEVER"
+
+
+with open("config.json", 'r') as f:
+    config = json.load(f)
+
+STUDENT_API = config['STUDENT_API']
+ACTION_API = config['ACTION_API']
+
+def parse_date(date_str):
+    return datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%S")
+
 
 client = Client('http://aws_rasa.hertzai.com:8088/publish')
 scheduler = BackgroundScheduler()

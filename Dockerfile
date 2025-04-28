@@ -7,7 +7,11 @@ COPY . .
 RUN touch /app/langchain.log
 RUN pip install --upgrade pip
 # Install system dependencies for OpenCV
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y \exit \
+
+
+
+
     libgl1-mesa-glx \
     libglib2.0-0 \
     && apt-get clean \
