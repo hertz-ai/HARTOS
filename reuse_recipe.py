@@ -1,7 +1,7 @@
 """reuse_recipe.py"""
+from enum import Enum
 import autogen
 import os
-
 import cv2
 import pytz
 import requests
@@ -23,8 +23,6 @@ from PIL import Image
 from langchain.memory import ZepMemory
 from crossbarhttp import Client
 from flask import current_app
-
-from crossbar_server import component
 from helper import topological_sort, ToolMessageHandler, strip_json_values, get_time_based_history, retrieve_json
 import helper as helper_fun
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
@@ -150,15 +148,6 @@ class Action:
             return self.actions[current_action]
         except:
             raise IndexError("Custom message: Index is out of range!")
-
-
-class SubscriptionHandler:
-    message = None
-
-    async def on_rpc_response(self, session, msg):
-        current_app.logger.info("Received RPC response: {}".format(msg))
-        SubscriptionHandler.message = msg
-        await component.stop()  # Stop the component after getting the response
 
 
 # Updated subscribe_and_return function
