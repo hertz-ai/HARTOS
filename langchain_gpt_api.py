@@ -550,7 +550,7 @@ class CustomGPT(LLM):
             #         GPT_API,
             #         json={
 
-            #             "model": "gpt-4o-mini",
+            #             "model": "gpt-4.1-mini",
             #             "data": [{"role": "user", "content": prompt}],
             #             "max_token": 2000,
             #             "request_id": str(thread_local_data.get_request_id())
@@ -572,7 +572,7 @@ class CustomGPT(LLM):
                     response = requests.post(
                         GPT_API,
                         json={
-                            "model": "gpt-4o-mini",
+                            "model": "gpt-4.1-mini",
                             "data": [{"role": "user", "content": prompt}],
                             "max_token": 1000,
                             "request_id": str(thread_local_data.get_request_id())
@@ -591,7 +591,7 @@ class CustomGPT(LLM):
                     response = requests.post(
                         GPT_API,
                         json={
-                            "model": "gpt-4o-mini",
+                            "model": "gpt-4.1-mini",
                             "data": [{"role": "user", "content": prompt}],
                             "max_token": 1000,
                             "request_id": str(thread_local_data.get_request_id())
@@ -636,7 +636,7 @@ class CustomGPT(LLM):
                 response = requests.post(
                     GPT_API,
                     json={
-                        "model": "gpt-4o-mini",
+                        "model": "gpt-4.1-mini",
                         "data": [{"role": "user", "content": prompt}],
                         "max_token": 1000,
                         "request_id": str(thread_local_data.get_request_id())
@@ -659,7 +659,7 @@ class CustomGPT(LLM):
                     response = requests.post(
                         GPT_API,
                         json={
-                            "model": "gpt-4o-mini",
+                            "model": "gpt-4.1-mini",
                             "data": [{"role": "user", "content": prompt}],
                             "max_token": 1000,
                             "request_id": str(thread_local_data.get_request_id())
@@ -679,7 +679,7 @@ class CustomGPT(LLM):
                         response = requests.post(
                             GPT_API,
                             json={
-                                "model": "gpt-4o-mini",
+                                "model": "gpt-4.1-mini",
                                 "data": [{"role": "user", "content": prompt}],
                                 "max_token": 1000,
                                 "request_id": str(thread_local_data.get_request_id())
@@ -716,7 +716,7 @@ class CustomGPT(LLM):
                 response = requests.post(
                     GPT_API,
                     json={
-                        "model": "gpt-4o-mini",
+                        "model": "gpt-4.1-mini",
                         "data": [{"role": "user", "content": prompt}],
                         "max_token": 1000,
                         "request_id": str(thread_local_data.get_request_id())
