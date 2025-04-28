@@ -1,12 +1,16 @@
+"""reuse_recipe.py"""
 import autogen
 import os
+
+import cv2
+import pytz
 import requests
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Any
 import uuid
 import time
 import re
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Annotated, Optional
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -19,6 +23,8 @@ from PIL import Image
 from langchain.memory import ZepMemory
 from crossbarhttp import Client
 from flask import current_app
+
+from crossbar_server import component
 from helper import topological_sort, ToolMessageHandler, strip_json_values, get_time_based_history, retrieve_json
 import helper as helper_fun
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
@@ -28,6 +34,9 @@ from autobahn.asyncio.component import Component, run
 from twisted.internet.defer import inlineCallbacks, returnValue, Deferred
 from twisted.internet import reactor
 import threading
+
+from langchain_gpt_api import TaskStatus, TaskNames, STUDENT_API, ACTION_API, parse_date
+from threadlocal import thread_local_data
 
 client = Client('http://aws_rasa.hertzai.com:8088/publish')
 scheduler = BackgroundScheduler()
@@ -43,6 +52,9 @@ temp_users = {}
 chat_joinees = {}
 agents_roles = {}
 llm_call_track = {}
+
+_active_tools = {}
+_active_tools_lock = threading.Lock()
 
 redis_client = redis.StrictRedis(
     host='azure_all_vms.hertzai.com', port=6369, db=0)
@@ -65,6 +77,37 @@ config_list = [{
         "price": [0.0025, 0.01]
     }]
 
+
+def load_vlm_agent_files(prompt_id, role_number):
+    """Loads any VLM agent JSON files for the given prompt_id and role_number and integrates them with existing recipes."""
+    vlm_actions = []
+
+    # Look for existing VLM agent files
+    try:
+        for file in os.listdir("prompts"):
+            if file.startswith(f"{prompt_id}_{role_number}_") and file.endswith("_vlm_agent.json"):
+                file_path = os.path.join("prompts", file)
+                try:
+                    with open(file_path, 'r') as f:
+                        recipe_data = json.load(f)
+                        current_app.logger.info(f"Found VLM agent recipe: {file_path}")
+
+                        # Extract the action ID from the filename (assuming format: prompt_id_role_number_action_id_vlm_agent.json)
+                        parts = file.split('_')
+                        if len(parts) >= 4:
+                            try:
+                                action_id = int(parts[2]) # Get the action ID
+                                # Add or replace action in the actions list
+                                recipe_data["action_id"] = action_id
+                                vlm_actions.append(recipe_data)
+                            except (ValueError, IndexError):
+                                current_app.logger.error(f"Couldn't parse action ID from filename {file}")
+                except Exception as e:
+                    current_app.logger.error(f"Error reading VLM agent file {file_path}: {e}")
+    except Exception as e:
+        current_app.logger.error(f"Error listing files in prompts directory: {e}")
+    
+    return vlm_actions
 
 class Action:
     def __init__(self, actions):
@@ -91,7 +134,7 @@ class SubscriptionHandler:
 
 
 # Updated subscribe_and_return function
-async def subscribe_and_return(message, topic, time=8000):
+async def subscribe_and_return(message, topic, time=1800000):
     """
     Makes an RPC call to the specified topic using a component.
     Waits for the full duration of the specified timeout for a response.
@@ -112,11 +155,7 @@ async def subscribe_and_return(message, topic, time=8000):
         realm="realm1",
     )
 
-    # Create an event to signal completion
-    response_received = asyncio.Event()
-
-    # Initialize response storage
-    SubscriptionHandler.message = None
+    response_future = asyncio.Future()
 
     @component.on_join
     async def join(session, details):
@@ -126,24 +165,27 @@ async def subscribe_and_return(message, topic, time=8000):
             timeout_seconds = time / 1000
             current_app.logger.info(f"Using timeout of {timeout_seconds} seconds")
 
-            # Make the RPC call with timeout
-            response = await asyncio.wait_for(session.call(topic, message), timeout=timeout_seconds)
-            current_app.logger.info(f"Received response: {response}")
+            # Set actual timeout
+            try:
+                result = await asyncio.wait_for(
+                    session.call(topic, message),
+                    timeout = timeout_seconds
+                )
 
-            # Store the result
-            SubscriptionHandler.message = response
-
-        except asyncio.TimeoutError:
-            current_app.logger.error(f"RPC call timed out after {timeout_seconds} seconds")
-            SubscriptionHandler.message = None
-        except Exception as e:
-            current_app.logger.error(f"RPC call failed: {e}")
-            SubscriptionHandler.message = None
+                if not response_future.done():
+                    response_future.set_result(result)
+            
+            except asyncio.TimeoutError:
+                if not response_future.done():
+                    response_future.set_exception(
+                        Exception(f"RPC call timed out after {timeout_seconds} seconds")
+                    )
+            except Exception as e:
+                if not response_future.done():
+                    response_future.set_exception(e)
+        
         finally:
-            # Signal that the call is complete
-            response_received.set()
-
-            # Stop the component
+            # Stop the component regardless of success / failure
             try:
                 await component.stop()
             except Exception as e:
@@ -153,20 +195,26 @@ async def subscribe_and_return(message, topic, time=8000):
         # Start the component
         await component.start()
 
-        # Convert time from milliseconds to seconds
-        timeout_seconds = time / 1000
+        # Calculate timeout with a small buffer
+        actual_timeout = (time/1000) + 5 # Add 5 second buffer
 
         # Wait for the response or timeout
-        await asyncio.wait_for(response_received.wait(), timeout=timeout_seconds + 2)
+        result = await asyncio.wait_for(response_future, timeout=actual_timeout)
 
         # Return the result
-        return SubscriptionHandler.message
+        return result
 
     except asyncio.TimeoutError:
-        current_app.logger.error(f"Timed out waiting for response after {timeout_seconds + 2} seconds")
+        current_app.logger.error(f"Timed out waiting for response after {actual_timeout} seconds")
+        # Explicitlt cancel the future if it's still pending
+        if not response_future.done():
+            response_future.cancel()
         return None
     except Exception as e:
         current_app.logger.error(f"Error in subscribe_and_return: {e}")
+        # Explicitly cancel the future if it's still pending
+        if not response_future.done():
+            response_future.cancel()
         return None
     finally:
         # Ensure component is stopped
@@ -424,7 +472,7 @@ def get_action_user_details(user_id):
         try:
             client.publish('com.hertzai.longrunning.log', post_dict)
         except Exception as e:
-            logging.error(
+            current_app.logger.error(
                 "Error while publish at com.hertzai.longrunning.log topic")
 
     url = STUDENT_API
@@ -450,7 +498,7 @@ def get_action_user_details(user_id):
         try:
             client.publish('com.hertzai.longrunning.log', post_dict)
         except Exception as e:
-            logging.error(
+            current_app.logger.error(
                 "Error while publish at com.hertzai.longrunning.log topic")
     return user_details, actions
 
@@ -699,6 +747,29 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     current_app.logger.info(f'Got goal as {goal}')
     role_actions = []
     actions = []
+
+    # Load any VLM agent files
+    vlm_actions = load_vlm_agent_files(prompt_id, role_number)
+
+    # Integrate VLM agent actions with existing recipe actions
+    if vlm_actions:
+        for vlm_action in vlm_actions:
+            # Check if this action should replace an existing one or be added
+            action_id = vlm_action.get("action_id")
+            action_exists = False
+
+            for i, action in enumerate(recipes[user_prompt]['actions']):
+                if action.get("action_id") == action_id:
+                    recipes[user_prompt]["actions"][i] = vlm_action
+                    action_exists = True
+                    break
+            
+            if not action_exists:
+                recipes[user_prompt]['actions'].append(vlm_action)
+        
+        # Update the recipes dictionary
+        final_recipe[prompt_id] = recipes[user_prompt]
+
     current_app.logger.info(f'Getting role actions')
     for i in recipes[user_prompt]['actions']:
         current_app.logger.info(f'this is action persona:{i["persona"]} ')
@@ -849,7 +920,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             Only mark an action as "Completed" if the all the steps are successful completed. If any step is pending then mark the staus as pending and give the message.
             For pending tasks or ongoing actions, respond to helper to complete the task.
             Verify the action performed by assistant and make sure the action is performed correctly as per instructions. if action performed was not as per instructions give the pending actions to the helper agent.
-            Report status only—do not perform actions yourself.
+            Report status only—do not perform actions yourself and do not try calling any functions/tools.
 
         """,
         is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
@@ -952,9 +1023,8 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",
                              description="Use this to Store and retrieve data using key-value storage system")
-    def save_data_in_memory(key: Annotated[
-        str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
-                            value: Annotated[Optional[str], "Value you want to store"] = None) -> str:
+    def save_data_in_memory(key: Annotated[str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
+                            value: Annotated[Optional[Any], "Value you want to store; may be int, str, float, bool, dict, list, json object."] = None) -> str:
         current_app.logger.info('INSIDE save_data_in_memory')
         keys = key.split('.')
         d = agent_data.setdefault(prompt_id, {})
@@ -1157,7 +1227,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
         # TODO add avatar_id and conv_id and response_type
         thread = threading.Thread(target=send_message_to_user1,
-                                  args=(user_id, text, '', f'{request_id_list[user_prompt]}-intermediate'))
+                                  args=(user_id, text, '', prompt_id))
         thread.start()
         return f'Message sent successfully to user with request_id: {request_id_list[user_prompt]}-intermediate'
 
@@ -1204,8 +1274,127 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         """
         Executes a command on a Windows machine and returns the response within 500 seconds.
         """
+        # Generate a unique key for this command
+        command_key = f"windows_command_{user_id}_{prompt_id}"
+
+        # Check if this command is already running
+        with _active_tools_lock:
+            if command_key in _active_tools and _active_tools[command_key]['active']:
+                return f"A Windows command is already being executed. Please wait for it to complete."
+            
+            # Mark this command as active
+            _active_tools[command_key] = {
+                'active': True,
+                'started_at': time.time()
+            }
+
         try:
             current_app.logger.info('INSIDE execute_windows_command')
+            user_prompt = f'{user_id}_{prompt_id}'
+            role_number, role = get_flow_number(user_id, prompt_id)
+            
+            import os
+            import re
+            import json
+
+            prompts_dir = "prompts"
+            current_app.logger.info(f"Checking for VLM files in directory: {os.path.abspath(prompts_dir)}")
+            pattern = f"{prompt_id}_{role_number}_*_vlm_agent.json"
+            current_app.logger.info(f"Looking for files matching pattern: {pattern}")
+
+            
+            existing_vlm_files = []
+            for file in os.listdir(prompts_dir):
+                if file.startswith(f"{prompt_id}_{role_number}_") and file.endswith("_vlm_agent.json"):
+                    existing_vlm_files.append(file)
+            
+            current_app.logger.info(f"Found existing VLM files: {existing_vlm_files}")
+
+            # Reload VLM agent files to ensure latest
+            current_app.logger.info("Reloading VLM agnet files to ensure we have the latest")
+            vlm_actions = load_vlm_agent_files(prompt_id, role_number)
+            if vlm_actions:
+                current_app.logger.info(f"Loaded {len(vlm_actions)} VLM agents")
+                if user_prompt in recipes:
+                    for vlm_action in vlm_actions:
+                        action_id = vlm_action.get("action_id")
+                        action_exists = False
+
+                        for i, action in enumerate(recipes[user_prompt]['actions']):
+                            if action.get("action_id") == action_id:
+                                recipes[user_prompt]['actions'][i] == vlm_action
+                                action_exists = True
+                                break
+                        
+                        if not action_exists:
+                            recipes[user_prompt]['actions'].append(vlm_action)
+                    
+                    # Update the recipes dictionary
+                    final_recipe[prompt_id] = recipes[user_prompt]
+
+
+            # Check if a matching recipe already exists in the loaded recipes
+            simplified_instructions = ' '.join(instructions.lower().strip().split())
+
+            def similar_instructions(instr1, instr2, threshold=0.8):
+                words1 = set(instr1.lower().split())
+                words2 = set(instr2.lower().split())
+                if not words1 or not words2:
+                    return False
+                
+                # Calculate word overlap
+                overlap = len(words1.intersection(words2))
+                similarity = overlap / (max(len(words1), len(words2)))
+                current_app.logger.info(f"Comparing '{instr1}' with '{instr2}' - similarity: {similarity}")
+                return similarity >= threshold
+
+            # Using improved logic -- similar_instructions
+            matching_recipe = None
+            enhanced_instruction = None
+            if user_prompt in recipes:
+                for action in recipes[user_prompt]['actions']:
+                    action_text = action.get('action', '')
+                    if similar_instructions(instructions, action_text):
+                        matching_recipe = action
+                        current_app.logger.info(f"Found existing recipe for instruction: {action_text}")
+                        break
+    
+
+            # Direct file check as backup
+            current_action_id = 1
+            if user_prompt in user_tasks and hasattr(user_tasks[user_prompt], 'current_action'):
+                current_action_id = user_tasks[user_prompt].current_action + 1
+
+            direct_vlm_path = f"prompts/{prompt_id}_{role_number}_{current_action_id}_vlm_agent.json"
+            if os.path.exists(direct_vlm_path):
+                current_app.logger.info(f"Found direct VLM file for current action: {direct_vlm_path}")
+                try:
+                    with open(direct_vlm_path, 'r') as f:
+                        direct_recipe = json.load(f)
+                    # Check if this recipe is relevant for the current instructions
+                    if similar_instructions(instructions, direct_recipe.get('action', '')):
+                        matching_recipe = direct_recipe
+                except Exception as e:
+                    current_app.logger.error(f"Error reading direct VLM file: {e}")
+
+            # If we found a matching recipe, extract guidance steps
+            enhanced_instruction = None
+            if matching_recipe:
+                current_app.logger.info(f"REUSING command - matched with: {matching_recipe.get('action', '')}")
+
+                # Create an enhanced instruction that includes all the recipe steps
+
+                enhanced_instruction = f"{instructions}\n\n"
+                enhanced_instruction += "Follow these steps from a previous successful execution:\n\n"
+
+                for i, step in enumerate(matching_recipe.get('recipe', [])):
+                    step_description = step.get('steps', '').strip()
+                    if step_description:
+                        enhanced_instruction += f"{i+1}. {step_description}\n"
+
+                enhanced_instruction += "\nAdapt these steps to the current screen state as needed."
+                current_app.logger.info(f"Created enhanced instruction with {len(matching_recipe.get('recipe', []))} steps") 
+    
             topic = f'com.hertzai.hevolve.action.{user_id}'
             current_app.logger.info(f'calling {topic} for 5 second')
             response = await subscribe_and_return({'prompt_id': prompt_id}, topic, 2000)  # Wait for the RPC response
@@ -1222,19 +1411,232 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                 'max_ETA_in_seconds': 500,
                 'langchain_server': True
             }
-            topic = 'com.hertzai.hevolve.action'
+            
+            # Adding the enhanced_instruction if we have it
+            if enhanced_instruction:
+                crossbar_message['enhanced_instruction'] = enhanced_instruction
+                current_app.logger.info(f"Added enhanced instruction to crossbar message")
+
+            topic = 'com.hertzai.hevolve.action2'
             current_app.logger.info(f'calling {topic} for 8000 second')
-            response = await subscribe_and_return(crossbar_message, topic, 50000)  # Wait for the RPC response
+
+            start_time = time.time()
+            response = await subscribe_and_return(crossbar_message,topic, 1800000)  # Wait for the RPC response
+            execution_time = time.time() - start_time
+
             current_app.logger.info(f'THIS IS RESPONSE type: {type(response)} value: {response}')
-            if response['status'] == 'success':
-                return 'successfully ran the command in user\' computer.'
+            
+            # Transform the RPC response into the new format
+            if response and response['status'] == 'success':
+                if not matching_recipe:
+                    try:
+                        current_app.logger.info("Processing RPC response to create recipe format")
+
+                        # Get current action ID
+                        action_id = 1
+                        if user_prompt in user_tasks and hasattr(user_tasks[user_prompt], 'current_action'):
+                            action_id = user_tasks[user_prompt].current_action + 1
+                        
+                        # Determine file path with the action_id
+                        role_number, role = get_flow_number(user_id, prompt_id)
+                        action_id_to_use = action_id
+                        base_path = f"prompts/{prompt_id}_{role_number}"
+                        
+                        # Import os here to ensure it's available
+                        import os
+                        import re
+                        import json
+                        
+                        # Check if a file with the current action_id exists, and increment if needed
+                        while os.path.exists(f"{base_path}_{action_id_to_use}_vlm_agent.json"):
+                            action_id_to_use += 1
+                        
+                        vlm_agent_path = f"{base_path}_{action_id_to_use}_vlm_agent.json"
+                        
+                        # Create directory if it doesn't exist
+                        os.makedirs(os.path.dirname(vlm_agent_path), exist_ok=True)
+                        
+                        # Function to clean technical details from text
+                        def clean_text(text):
+                            # Remove lines with technical details
+                            lines = text.split('\n')
+                            cleaned_lines = []
+                            for line in lines:
+                                if (not line.strip().startswith("Next Action:") and 
+                                    not line.strip().startswith("Box ID:") and 
+                                    not line.strip().startswith("box_centroid_coordinate:") and
+                                    not line.strip().startswith("value:")):
+                                    cleaned_lines.append(line)
+                            return '\n'.join(cleaned_lines)
+                        
+                        # Function to format action text consistently
+                        def format_action_text(text):
+                            # For JSON-like strings
+                            if text.strip().startswith("{") and "action" in text:
+                                try:
+                                    # Try to evaluate the string as a Python dict
+                                    action_data = eval(text.strip())
+                                    action_type = action_data.get("action", "")
+                                    
+                                    if action_type == "mouse_move":
+                                        return "Move mouse"
+                                    elif action_type == "left_click":
+                                        return "Perform left click"
+                                    elif action_type == "right_click":
+                                        return "Perform right click"
+                                    elif action_type == "double_click":
+                                        return "Perform double click"
+                                    elif action_type == "type" and "text" in action_data:
+                                        return f"Type '{action_data['text']}'"
+                                    elif action_type == "drag":
+                                        return "Perform drag action"
+                                    else:
+                                        return f"Perform {action_type} action"
+                                except:
+                                    # If eval fails, try regex
+                                    action_match = re.search(r"'action':\s*'([^']+)'", text)
+                                    text_match = re.search(r"'text':\s*'([^']+)'", text)
+                                    
+                                    if action_match:
+                                        action_type = action_match.group(1)
+                                        if action_type == "type" and text_match:
+                                            return f"Type '{text_match.group(1)}'"
+                                        elif action_type == "mouse_move":
+                                            return "Move mouse"
+                                        elif action_type == "left_click":
+                                            return "Perform left click"
+                                        elif action_type == "right_click":
+                                            return "Perform right click"
+                                        elif action_type == "double_click":
+                                            return "Perform double click"
+                                        else:
+                                            return f"Perform {action_type} action"
+                                    else:
+                                        return "Perform action"
+                            
+                            # For text descriptions containing "Perform" 
+                            elif "Perform" in text and "action" in text:
+                                return text  # Already in desired format
+                            
+                            return text
+                        
+                        # Handle different response format
+                        if 'extracted_responses' in response:
+                            # Extract the instruction and responses
+                            instruction = response.get("instruction", instructions)
+                            extracted_responses = response["extracted_responses"]
+                            
+                            # Process all responses and create recipe steps
+                            recipe_steps = []
+                            
+                            for msg in extracted_responses:
+                                msg_type = msg.get("type", "")
+                                msg_content = msg.get("content", "")
+                                
+                                # Clean the content
+                                if msg_type == "analysis":
+                                    cleaned_content = clean_text(msg_content)
+                                    if cleaned_content.strip():  # Only add non-empty content
+                                        recipe_steps.append({
+                                            "steps": cleaned_content,
+                                            "tool_name": "execute_windows_command",
+                                            "agent_to_perform_this_action": "Helper"
+                                        })
+                                elif msg_type == "next_action":
+                                    formatted_content = format_action_text(msg_content)
+                                    if formatted_content.strip():  # Only add non-empty content
+                                        recipe_steps.append({
+                                            "steps": formatted_content,
+                                            "tool_name": "execute_windows_command",
+                                            "agent_to_perform_this_action": "Helper"
+                                        })
+                            
+                            # If no steps were created, add a default one
+                            if not recipe_steps:
+                                recipe_steps.append({
+                                    "steps": instructions,
+                                    "tool_name": "execute_windows_command",
+                                    "agent_to_perform_this_action": "Helper"
+                                })
+                            
+                            persona = f"user{user_id}" if user_id else "user"
+                            
+                            # Create the recipe format
+                            recipe_data = {
+                                "status": "done",
+                                "action": instructions,
+                                "fallback_action": "Perform a Google search using Internet Explorer",
+                                "persona": persona,
+                                "action_id": action_id_to_use,
+                                "recipe": recipe_steps,
+                                "can_perform_without_user_input": "no",
+                                "scheduled_tasks": [],
+                                "metadata": {
+                                    "user_id": f"redacted <class 'int'>"
+                                },
+                                "time_took_to_complete": execution_time,
+                                "actions_this_action_depends_on": []
+                            }
+                            
+                            # Save the recipe format with vlm_agent naming
+                            with open(vlm_agent_path, 'w') as json_file:
+                                json.dump(recipe_data, json_file, indent=4)
+                            
+                            current_app.logger.info(f"Generated recipe data saved to {vlm_agent_path}")
+
+                            try:
+                                if os.path.exists(vlm_agent_path):
+                                    file_size = os.path.getsize(vlm_agent_path)
+                                    current_app.logger.info(f"Confirmed VLM file exists with size: {file_size} bytes")
+                                    with open(vlm_agent_path, 'r') as f:
+                                        test_read = json.load(f)
+                                        current_app.logger.info(f"Successfully read back VLM file with action: {test_read.get('action', 'unknown')}")
+                                else:
+                                    current_app.logger.error(f"VLM file was not created at expected path: {vlm_agent_path}")
+                            except Exception as e:
+                                current_app.logger.error(f"Error verifying VLM file: {e}")
+
+                            vlm_actions = load_vlm_agent_files(prompt_id, role_number)
+                            if vlm_actions and user_prompt in recipes:
+                                for vlm_action in vlm_actions:
+                                    action_id = vlm_action.get("action_id")
+                                    action_exists = False
+
+                                    for i, action in enumerate(recipes[user_prompt]['actions']):
+                                        if action.get("action_id") == action_id:
+                                            recipes[user_prompt]['actions'][i] = vlm_action
+                                            action_exists = True
+                                            break
+                                    if not action_exists:
+                                        recipes[user_prompt]['actions'].append(vlm_action)
+                                
+                                # Update the recipes dictionary
+                                final_recipe[prompt_id] = recipes[user_prompt]
+                            return f'Successfully ran the command in user\'s computer and created the VLM agent data at {vlm_agent_path}.'
+                        else:
+                            # If no structured data available, create a simple response
+                            current_app.logger.error('No extracted_responses found in the response')
+                            return 'Command executed but could not create VLM agent data due to missing response structure'
+                    except Exception as e:
+                        current_app.logger.error(f'Error transforming RPC response to recipe format: {e}')
+                        current_app.logger.error(traceback.format_exc())
+                        return f'Command executed but encountered an error while processing results: {str(e)}'
+
+            if response and response['status'] == 'success':
+                return 'Successfully ran the command in user\'s computer.'
             else:
                 return 'Not able to perform this action now please try later'
         except Exception as e:
             error_message = traceback.format_exc()  # Capture full traceback
             current_app.logger.error(f"Error executing command:\n{error_message}")
             return {"error": e}
+        finally:
+            # Mark the command as complete
+            with _active_tools_lock:
+                if command_key in _active_tools:
+                    _active_tools[command_key]['active'] = False
 
+    
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function", description="Get google search response")
     def google_search(text: Annotated[str, "Text which you want to search"]) -> str:
@@ -1526,7 +1928,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     def state_transition(last_speaker, groupchat):
         messages = groupchat.messages
         try:
-            if 'message_2_user' in messages[-1]["content"].lower():
+            if 'message_2_user' in messages[-1]["content"].lower() and last_speaker.name == "helper":
                 return "auto"
 
             pattern = r'\{.*?\}'  # getting all json from text
@@ -1540,8 +1942,9 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                     current_app.logger.info('GOT COMPLETED FOR ACTION')
                     try:
                         user_tasks[user_prompt].current_action = json_objects['action_id']
-                    except:
-                        current_app.logger.error('GOT ERROR WHILE UPDATING CURRENT ACTION')
+                    except Exception as e:
+                        current_app.logger.error(f'GOT ERROR WHILE UPDATING CURRENT ACTION:{e}')
+                        current_app.logger.error(traceback.format_exc())
                         user_tasks[user_prompt].current_action += 1
                     return chat_instructor
 
@@ -1579,9 +1982,25 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         #     return assistant
         current_app.logger.info(
             f'Inside state_transition with message :10 {messages[-1]["content"][:10]} & last_speaker {last_speaker.name}')
-        if last_speaker.name == f"user_proxy_{user_id}" or last_speaker.name == "multi_role_agent" or last_speaker.name == "helper" or last_speaker.name == "Executor" or last_speaker.name == "ChatInstructor":
+        if (last_speaker.name == f"user_proxy_{user_id}" or last_speaker.name == "multi_role_agent" or last_speaker.name == "helper" or last_speaker.name == "Executor" or last_speaker.name == "ChatInstructor"):
             return assistant
-        current_app.logger.info(f'Checking for @user or @user in message')
+
+        current_app.logger.info(f'Checking for message_2_user , stripping @user from message')
+        if 'message_2_user' in messages[-1]["content"].lower():
+            current_app.logger.info('GOT @USER in message')
+            temp_message = messages[-1]["content"]
+            temp_message = temp_message.replace("'",'"')
+            json_match = re.search(r'{[\s\S]*}', temp_message)
+            if json_match:
+                try:
+                    current_app.logger.info('GOT Json')
+                    current_app.logger.info(f'got json object')
+                    json_part = json_match.group(0)
+                    current_app.logger.info('Sending user the message')
+                    json_obj = json.loads(json_part)
+                    send_message_to_user1(user_id,json_obj['message_2_user'],'',prompt_id)
+                except:
+                    pass
 
         if messages[-1]["role"] == 'function':
             current_app.logger.info('The last speaker was function returning assistant')
