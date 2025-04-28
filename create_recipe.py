@@ -1,6 +1,6 @@
 import autogen
 import os
-from typing import Annotated, Optional, Dict, Tuple
+from typing import Annotated, Optional, Dict, Tuple, Any
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -22,7 +22,7 @@ import helper as helper_fun
 import threading
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
 from autogen.cache.in_memory_cache import InMemoryCache
-
+from json_repair import repair_json
 from crossbarhttp import Client
 client = Client('http://aws_rasa.hertzai.com:8088/publish')
 
@@ -356,6 +356,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             If the Assistant Agent provides code requiring time.sleep, inform them that it cannot be executed and suggest using the create_scheduled_jobs tool.
             Add proper error handling and logging in all code.
             Ensure the final response is printed using print() before returning it.
+            Do not hardcode or default case or a placeholder for exception or empty response cases when the functionality was not satisfied instead throw an error.
+
         Calling Other Agents:
             When you need to direct a question or route the conversation to a specific agent, use the @ tag followed by the agent's name. Examples include: @Executor or @Helper or @User
         Things You cannot do but Helper Agent can:
@@ -424,8 +426,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     assistant.register_for_execution(name="get_user_camera_inp")(camera_inp)  
     
     def save_data_in_memory(key: Annotated[str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
-                            value: Annotated[Optional[str], "Value you want to store"] = None) -> str:
+                            value: Annotated[Optional[Any], "Value you want to store; may be int, str, float, bool, dict, list, json object."] = None) -> str:
         current_app.logger.info('INSIDE save_data_in_memory')
+        current_app.logger.info(f"VALUES IN SAVE_DATA_IN_MEMORY: {value}")
+        current_app.logger.info(f"VALUES ALREADY AVAILABLE IN AGENT DATA: {agent_data[prompt_id]}")
         keys = key.split('.')
         d = agent_data.setdefault(prompt_id, {})
         
@@ -653,10 +657,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     helper.register_for_llm(name="get_chat_history", description="Get Chat history based on text & start & end date")(get_chat_history)
     assistant.register_for_execution(name="get_chat_history")(get_chat_history)
     
-    def google_search(text: Annotated[str, "Text which you want to search"]) -> str:
+    def google_search(text: Annotated[str, "Text/Query which you want to search"]) -> str:
         current_app.logger.info('INSIDE google search')
         return helper_fun.top5_results(text)
-    helper.register_for_llm(name="google_search", description="Get google ssearch response")(google_search)
+    helper.register_for_llm(name="google_search", description="web/google/bing search api tool for a given query")(google_search)
     assistant.register_for_execution(name="google_search")(google_search)
     
     def get_user_details()->str:
@@ -1048,7 +1052,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     time_agent.register_for_execution(name="get_user_camera_inp")(camera_inp)  
     
     def save_data_in_memory(key: Annotated[str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
-                            value: Annotated[Optional[str], "Value you want to store"] = None) -> str:
+                            value: Annotated[Optional[Any], "Value you want to store; may be int, str, float, bool, dict, list, json object."] = None) -> str:
         current_app.logger.info('INSIDE save_data_in_memory')
         keys = key.split('.')
         d = agent_data.setdefault(prompt_id, {})

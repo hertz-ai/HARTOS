@@ -234,17 +234,53 @@ def gpt_mini(prompt,request_id,history):
     return response.json()["text"]
 
 
-def strip_json_values(data):
-    if isinstance(data, dict):
-        return {key: strip_json_values(value) for key, value in data.items()}
-    elif isinstance(data, list):
-        return [strip_json_values(item) for item in data]
-    elif isinstance(data, str):
-        return f"redacted {type(data)}"  # Truncate to 8 characters and add " redact"
-    elif isinstance(data, (int, float, bool)) or data is None:
-        return f'redacted {type(data)}'  # Keep primitive types as is
+import json
+from typing import Any
+
+def strip_json_values(obj: Any) -> Any:
+    """
+    Recursively walk obj.  
+    - If dict: recurse on each value, preserving keys.  
+    - If list/tuple: recurse on each element, preserving order & type.  
+    - Otherwise (leaf): return redacted marker.
+    """
+    current_app.logger.info(f"GOT JSON FOR STRIPPING: {obj}")
+    # 1. Dig into dict
+    if isinstance(obj, dict):
+        return { key: strip_json_values(val) for key, val in obj.items() }
+
+    # 2. Dig into list or tuple
+    elif isinstance(obj, list):
+        return [ strip_json_values(item) for item in obj ]
+    elif isinstance(obj, tuple):
+        return tuple(strip_json_values(item) for item in obj)
+
+    # 3. Optional: if you know some strings actually contain JSON and you want to descend into them,
+    #    uncomment this block.
+    elif isinstance(obj, str):
+        try:
+            parsed = json.loads(obj)
+        except json.JSONDecodeError:
+            pass
+        else:
+            return strip_json_values(parsed)
+
+    # 4. Everything else is a true leaf → redact it
     else:
-        return f"redacted {type(data)}"
+        return f"redacted {type(obj).__name__}"
+
+
+# def strip_json_values(data):
+#     if isinstance(data, dict):
+#         return {key: strip_json_values(value) for key, value in data.items()}
+#     elif isinstance(data, list):
+#         return [strip_json_values(item) for item in data]
+#     elif isinstance(data, str):
+#         return f"redacted {type(data)}"  # Truncate to 8 characters and add " redact"
+#     elif isinstance(data, (int, float, bool)) or data is None:
+#         return f'redacted {type(data)}'  # Keep primitive types as is
+#     else:
+#         return f"redacted {type(data)}"
 
 def fix_json(json_text):
     url = "http://aws_rasa.hertzai.com:5459/gpt3"
