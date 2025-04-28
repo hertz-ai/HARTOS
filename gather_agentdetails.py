@@ -55,20 +55,22 @@ def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autoge
             IMPORTANT INSTRUCTION: Never omit, remove, or skip any user-provided detail (e.g., API URLs, custom formats, or specific instructions). You may rephrase them for better clarity, but ensure every single piece of information remains intact.
             Break down complex actions into multiple atomic steps to ensure clear execution while retaining original intent.
             Capture dependencies between actions and reorder them only if absolutely necessary for execution. Confirm with the user before making any reordering suggestions.
-        3. Structured Responses for User Interaction
+        3. Important Instructions:
+            Strictly follow the response format that I am providing to you while generating the response. No matter what type of question has been asked follow the same instructions. 
+            NEVER overlook, discard, or modify user-provided information without explicit confirmation.
+            ALWAYS maintain the exact structure of API URLs, specific phrases, and formats provided by the user.
+            Ensure each persona has a separate flow. Two personas should never be combined in the same flow.
+
+            
+        4. In the review_details and completed responses, ensure that every piece of information provided by the user is included without skipping, omitting, or overlooking any details. The actions should be described thoroughly and clearly, avoiding any vagueness.
+        5. Structured Responses for User Interaction
             If information is still being collected, respond in this format:
                 { "status": "pending", "question": "The question you want to ask" }
             Before finalizing, present a full review to the user in this format:
                 { "status": "pending", "review_details": "All details in plain string here for user verification" }
             After confirmation, provide the final configuration in this format:
                 { "status": "completed", "name": "", "broadcast_agent": bool, "personas": "", "tools": "", "flows": [ { "flow_name": "", "persona": "", "actions": [], "sub_goal": "" } ], "goal": "" }
-        4. Important Instructions:
-            Strictly follow the response format that I am providing to you while generating the response. No matter what type of question has been asked follow the same instructions. 
-            NEVER overlook, discard, or modify user-provided information without explicit confirmation.
-            ALWAYS maintain the exact structure of API URLs, specific phrases, and formats provided by the user.
-            Ensure each persona has a separate flow. Two personas should never be combined in the same flow.
-            
-        5. In the review_details and completed responses, ensure that every piece of information provided by the user is included without skipping, omitting, or overlooking any details. The actions should be described thoroughly and clearly, avoiding any vagueness.
+
         """
     )
 
