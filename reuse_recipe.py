@@ -1,13 +1,16 @@
 """reuse_recipe.py"""
 import autogen
 import os
+
+import cv2
+import pytz
 import requests
 from typing import Dict, Optional, Tuple, Any
 import uuid
 import time
 import re
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Annotated, Optional
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -20,6 +23,8 @@ from PIL import Image
 from langchain.memory import ZepMemory
 from crossbarhttp import Client
 from flask import current_app
+
+from crossbar_server import component
 from helper import topological_sort, ToolMessageHandler, strip_json_values, get_time_based_history, retrieve_json
 import helper as helper_fun
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
@@ -29,6 +34,9 @@ from autobahn.asyncio.component import Component, run
 from twisted.internet.defer import inlineCallbacks, returnValue, Deferred
 from twisted.internet import reactor
 import threading
+
+from langchain_gpt_api import TaskStatus, TaskNames, STUDENT_API, ACTION_API, parse_date
+from threadlocal import thread_local_data
 
 client = Client('http://aws_rasa.hertzai.com:8088/publish')
 scheduler = BackgroundScheduler()
@@ -464,7 +472,7 @@ def get_action_user_details(user_id):
         try:
             client.publish('com.hertzai.longrunning.log', post_dict)
         except Exception as e:
-            logging.error(
+            current_app.logger.error(
                 "Error while publish at com.hertzai.longrunning.log topic")
 
     url = STUDENT_API
@@ -490,7 +498,7 @@ def get_action_user_details(user_id):
         try:
             client.publish('com.hertzai.longrunning.log', post_dict)
         except Exception as e:
-            logging.error(
+            current_app.logger.error(
                 "Error while publish at com.hertzai.longrunning.log topic")
     return user_details, actions
 
@@ -1219,7 +1227,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
         # TODO add avatar_id and conv_id and response_type
         thread = threading.Thread(target=send_message_to_user1,
-                                  args=(user_id, text, '', f'{request_id_list[user_prompt]}-intermediate'))
+                                  args=(user_id, text, '', prompt_id))
         thread.start()
         return f'Message sent successfully to user with request_id: {request_id_list[user_prompt]}-intermediate'
 
