@@ -214,20 +214,20 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
                 ➜Account for all the tools available with helper & whenever you are supposed to call a tool as part of current action ask @Helper.
                 ➜If the action requires code execution or API endpoint call, in create code(python preferred) and ask @Executor agent to execute the created code.
             3. After Completion:
-                ?If action completed successful & there is no error, ask @Helper to save the information(which will be required in future) in memory using 'save_data_in_memory' tool.
-                ?After save_data_in_memory has completed, ask the StatusVerifier to confirm completion and include the persona name.
-                ?After confirmation, request the next action from the ChatInstructor.
+                ➜If action completed successful & there is no error, ask @Helper to save the information(which will be required in future) in memory using 'save_data_in_memory' tool.
+                ➜After save_data_in_memory has completed, ask the StatusVerifier to confirm completion and include the persona name.
+                ➜After confirmation, request the next action from the ChatInstructor.
             4. If Failed:
-                ?Create a summary of the error and ask the UserProxy for help if needed.
-                ?Never assume; always seek user assistance for unresolved issues.
+                ➜Create a summary of the error and ask the UserProxy for help if needed.
+                ➜Never assume; always seek user assistance for unresolved issues.
             5. Action Modifications:
                 ?If the action is modified, ask the user what measures should be taken if it fails in the future.
 
         •Persona Association:
             list of persona:- """+f'{list_of_persona}'+"""
             Rules:
-                ?If there’s only 1 persona in the list, associate that persona with all actions automatically.
-                ?If there are multiple personas, ask the @user to select the persona associated with each action.
+                ➜If there’s only 1 persona in the list, associate that persona with all actions automatically.
+                ➜If there are multiple personas, ask the @user to select the persona associated with each action.
 
         •Code Execution: Executor Agent: Executes code as needed. Ensure the final response is printed in code using print() before sending to Executor.
 
@@ -235,8 +235,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             1. The tools are: send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,execute_windows_command,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory.
             2. Create Scheduled Jobs: For tasks involving timer or time or periodically or scheduled jobs, ask Helper agent to use the create_scheduled_jobs tool.
             3. Data/Memory Management:
-                ?If you want to save some data,understand the current data from get_saved_metadata & plan the datamodel and ask helper agent to use "save_data_in_memory" tool.
-                ?If you want to get some data ask helper agent to use "get_data_by_key"  tool.
+                ➜If you want to save some data,understand the current data from get_saved_metadata & plan the datamodel and ask helper agent to use "save_data_in_memory" tool.
+                ➜If you want to get some data ask helper agent to use "get_data_by_key"  tool.
             4. If you want to send some message to user directly then ask helper agent to use send_message_to_user tool but if you want to send message after sometime then ask helper to use send_message_in_seconds tool.
             5. If you want to send some pre synthesized realistic videos to user then ask helper agent to use send_presynthesize_video_to_user tool.
             6. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the pre synthesized generated video if it is successful.
@@ -264,8 +264,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
 
             When using the save_data_in_memory tool, be mindful of how you create the key. Ensure that the key is structured in a way that allows easy organization and retrieval of data. Use dot notation to create a logical key path. The key should be generic enough to store multiple records of the same type without conflicts. Avoid using specific values as part of the key
                 For example:
-                    ? stories.story_name ? Good key structure for storing multiple stories.
-                    ? creator.created_story ? Incorrect, as it ties the key to a specific instance, making it harder to store multiple records.
+                    ➜ stories.story_name - Good key structure for storing multiple stories.
+                    ➜ creator.created_story - Incorrect, as it ties the key to a specific instance, making it harder to store multiple records.
 
 
         •Working Directory: /home/hertzai2019/newauto/coding/
@@ -291,8 +291,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             If you want to send data proactively (on your own) to user use `@user {"message_2_user": "message here"}`. However, if you're responding to the user's request or instruction, use the send_message_to_user or send_message_in_seconds tool.
             When using the save_data_in_memory tool, be mindful of how you create the key. Ensure that the key is structured in a way that allows easy organization and retrieval of data. Use dot notation to create a logical key path. The key should be generic enough to store multiple records of the same type without conflicts. Avoid using specific values as part of the key
                 For example:
-                    ? stories.story_name ? Good key structure for storing multiple stories.
-                    ? creator.created_story ? Incorrect, as it ties the key to a specific instance, making it harder to store multiple records.
+                    ➜ stories.story_name - Good key structure for storing multiple stories.
+                    ➜ creator.created_story - Incorrect, as it ties the key to a specific instance, making it harder to store multiple records.
         Data Management:
             Use the get_set_internal_memory tool to store or retrieve user information as needed.""",
         is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
@@ -367,8 +367,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             1. Tools Helper Agent can use: Can use tools like send_message_in_seconds, send_message_to_user,send_presynthesize_video_to_user, execute_windows_command, text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory.
             2. Create Scheduled Jobs: For tasks involving timers or scheduled jobs, ask Helper agent to use the create_scheduled_jobs tool.
             3. Data/Memory Management:
-                ?If you want to save some data ask helper agent to use "save_data_in_memory" tool.
-                ?If you wnat to get some data ask helper agent to use "get_data_by_key", "get_saved_metadata" tool.
+                ➜If you want to save some data ask helper agent to use "save_data_in_memory" tool.
+                ➜If you wnat to get some data ask helper agent to use "get_data_by_key", "get_saved_metadata" tool.
             4. If you want to send some message to user directly then ask helper agent to use send_message_to_user tool but if you want to send message after sometime then ask helper to use send_message_in_seconds tool.
             5. If you want to send some pre synthesized video to user then ask helper agent to use send_presynthesize_video_to_user tool.
             6. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
