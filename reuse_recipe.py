@@ -2,7 +2,7 @@
 import autogen
 import os
 import requests
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Any
 import uuid
 import time
 import re
@@ -912,7 +912,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             Only mark an action as "Completed" if the all the steps are successful completed. If any step is pending then mark the staus as pending and give the message.
             For pending tasks or ongoing actions, respond to helper to complete the task.
             Verify the action performed by assistant and make sure the action is performed correctly as per instructions. if action performed was not as per instructions give the pending actions to the helper agent.
-            Report status only—do not perform actions yourself.
+            Report status only—do not perform actions yourself and do not try calling any functions/tools.
 
         """,
         is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
@@ -1015,9 +1015,8 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",
                              description="Use this to Store and retrieve data using key-value storage system")
-    def save_data_in_memory(key: Annotated[
-        str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
-                            value: Annotated[Optional[str], "Value you want to store"] = None) -> str:
+    def save_data_in_memory(key: Annotated[str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
+                            value: Annotated[Optional[Any], "Value you want to store; may be int, str, float, bool, dict, list, json object."] = None) -> str:
         current_app.logger.info('INSIDE save_data_in_memory')
         keys = key.split('.')
         d = agent_data.setdefault(prompt_id, {})
@@ -1921,7 +1920,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     def state_transition(last_speaker, groupchat):
         messages = groupchat.messages
         try:
-            if 'message_2_user' in messages[-1]["content"].lower():
+            if 'message_2_user' in messages[-1]["content"].lower() and last_speaker.name == "helper":
                 return "auto"
 
             pattern = r'\{.*?\}'  # getting all json from text
@@ -1935,8 +1934,9 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                     current_app.logger.info('GOT COMPLETED FOR ACTION')
                     try:
                         user_tasks[user_prompt].current_action = json_objects['action_id']
-                    except:
-                        current_app.logger.error('GOT ERROR WHILE UPDATING CURRENT ACTION')
+                    except Exception as e:
+                        current_app.logger.error(f'GOT ERROR WHILE UPDATING CURRENT ACTION:{e}')
+                        current_app.logger.error(traceback.format_exc())
                         user_tasks[user_prompt].current_action += 1
                     return chat_instructor
 
@@ -1974,9 +1974,25 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         #     return assistant
         current_app.logger.info(
             f'Inside state_transition with message :10 {messages[-1]["content"][:10]} & last_speaker {last_speaker.name}')
-        if last_speaker.name == f"user_proxy_{user_id}" or last_speaker.name == "multi_role_agent" or last_speaker.name == "helper" or last_speaker.name == "Executor" or last_speaker.name == "ChatInstructor":
+        if (last_speaker.name == f"user_proxy_{user_id}" or last_speaker.name == "multi_role_agent" or last_speaker.name == "helper" or last_speaker.name == "Executor" or last_speaker.name == "ChatInstructor"):
             return assistant
-        current_app.logger.info(f'Checking for @user or @user in message')
+
+        current_app.logger.info(f'Checking for message_2_user , stripping @user from message')
+        if 'message_2_user' in messages[-1]["content"].lower():
+            current_app.logger.info('GOT @USER in message')
+            temp_message = messages[-1]["content"]
+            temp_message = temp_message.replace("'",'"')
+            json_match = re.search(r'{[\s\S]*}', temp_message)
+            if json_match:
+                try:
+                    current_app.logger.info('GOT Json')
+                    current_app.logger.info(f'got json object')
+                    json_part = json_match.group(0)
+                    current_app.logger.info('Sending user the message')
+                    json_obj = json.loads(json_part)
+                    send_message_to_user1(user_id,json_obj['message_2_user'],'',prompt_id)
+                except:
+                    pass
 
         if messages[-1]["role"] == 'function':
             current_app.logger.info('The last speaker was function returning assistant')
