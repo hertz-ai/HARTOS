@@ -63,6 +63,7 @@ def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autoge
             After confirmation, provide the final configuration in this format:
                 { "status": "completed", "name": "", "broadcast_agent": bool, "personas": "", "tools": "", "flows": [ { "flow_name": "", "persona": "", "actions": [], "sub_goal": "" } ], "goal": "" }
         4. Important Instructions:
+            Strictly follow the response format that I am providing to you while generating the response. No matter what type of question has been asked follow the same instructions. 
             NEVER overlook, discard, or modify user-provided information without explicit confirmation.
             ALWAYS maintain the exact structure of API URLs, specific phrases, and formats provided by the user.
             Ensure each persona has a separate flow. Two personas should never be combined in the same flow.
@@ -112,7 +113,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.Us
             if new_res['status'].lower() == 'completed':
                 if 'flows' not in new_res:
                     response = user_proxy.send(
-                        'please give the response in proper format: { "status": "completed", "name": "", "broadcast_agent": bool, "personas": "", "tools": "", "flows": [ { "flow_name": "", "persona": "", "actions": [], "sub_goal": "" } ], "goal": "" } where flows should be outer key',
+                        'please give the response in proper format: { "status": "completed", "name": "", "broadcast_agent": bool, "personas": "", "tools": "", "flows": [ { "flow_name": "", "persona": "", "actions": [], "sub_goal": "" } ], "goal": "" } where flows should be outer key. \n\n             Strictly follow the response format that I am providing to you while generating the response. No matter what type of question has been asked follow the same instructions.  ',
                         assistant,
                         request_reply=True
                     )
