@@ -1,5 +1,6 @@
 """reuse_recipe.py"""
 from enum import Enum
+import random
 import autogen
 import os
 import cv2
@@ -292,7 +293,8 @@ def get_role(user_id, prompt_id):
 
 def send_message_to_user1(user_id, response, inp, prompt_id):
     user_prompt = f'{user_id}_{prompt_id}'
-    request_id = f'{request_id_list[user_prompt]}-intermediate'
+    random_num = random.randint(1000, 9999)
+    request_id = f'{request_id_list[user_prompt]}-intermediate-{random_num}'
     request_id_list_sent_intermediate[user_prompt] = request_id_list[user_prompt]
     url = 'http://aws_rasa.hertzai.com:9890/autogen_response'
     body = json.dumps({'user_id': user_id, 'message': response, 'inp': inp, 'request_id': request_id})
@@ -1241,12 +1243,15 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         current_app.logger.info('INSIDE send_message_to_user')
         current_app.logger.info(
             f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
-        request_id = str(uuid.uuid4()).replace("-", "")[:11]
+        random_num = random.randint(1000, 9999)
+
+        request_id = f'{request_id_list[user_prompt]}-intermediate-{random_num}'
+        request_id_list_sent_intermediate[user_prompt] = request_id_list[user_prompt]
         # TODO add avatar_id and conv_id and response_type
         thread = threading.Thread(target=send_message_to_user1,
                                   args=(user_id, text, '', prompt_id))
         thread.start()
-        return f'Message sent successfully to user with request_id: {request_id_list[user_prompt]}-intermediate'
+        return f'Message sent successfully to user with request_id: {request_id}'
 
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",
@@ -1927,29 +1932,49 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
     assistant.description = 'Designed to handle specific tasks by interacting directly with other agents or the user. It acts as the primary orchestrator for task management and ensures tasks are completed efficiently'
     user_proxy.description = 'Acts as a user, performing tasks assigned by the Assistant Agent. It simulates user actions and provides results or feedback as required.'
-    helper.description = 'Athis is a helper agent that calls tools, facilitates task completion & assists other agents it cal perform tools/function like [send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory] calls and supporting backend processes. '
+    helper.description = 'this is a helper agent that calls tools, facilitates task completion & assists other agents it cal perform tools/function like [send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory] calls and supporting backend processes. '
     multi_role_agent.description = 'Acts as an external agent with multi-functional capabilities. Note: This agent should never be directly invoked.'
     executor.description = 'A specialized agent responsible for executing code and handling response management. It ensures computational tasks are performed accurately and returns results effectively.'
     verify.description = 'this is a verify status agent. which will verify the status of current action.'
 
     time_agent.description = 'Designed to handle specific tasks by interacting directly with other agents or the user. It acts as the primary orchestrator for task management and ensures tasks are completed efficiently'
     time_user.description = 'Acts as a user, performing tasks assigned by the Assistant Agent. It simulates user actions and provides results or feedback as required.'
-    helper1.description = 'Athis is a helper agent that calls tools, facilitates task completion & assists other agents it cal perform tools/function like [send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory] calls and supporting backend processes. '
+    helper1.description = 'this is a helper agent that calls tools, facilitates task completion & assists other agents it cal perform tools/function like [send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory] calls and supporting backend processes. '
     executor1.description = 'A specialized agent responsible for executing code and handling response management. It ensures computational tasks are performed accurately and returns results effectively.'
 
     visual_agent.description = 'Designed to handle specific tasks by interacting directly with other agents or the user. It acts as the primary orchestrator for task management and ensures tasks are completed efficiently'
     visual_user.description = 'Acts as a user, performing tasks assigned by the Assistant Agent. It simulates user actions and provides results or feedback as required.'
-    helper2.description = 'Athis is a helper agent that calls tools, facilitates task completion & assists other agents it cal perform tools/function like [send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory] calls and supporting backend processes. '
+    helper2.description = 'this is a helper agent that calls tools, facilitates task completion & assists other agents it cal perform tools/function like [send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory] calls and supporting backend processes. '
     executor2.description = 'A specialized agent responsible for executing code and handling response management. It ensures computational tasks are performed accurately and returns results effectively.'
 
     def state_transition(last_speaker, groupchat):
         messages = groupchat.messages
         try:
+            request_id = f'{request_id_list[user_prompt]}'
+            if '@user' in messages[-1]["content"].lower() and (user_prompt not in request_id_list_sent_intermediate or request_id in request_id_list_sent_intermediate.get(user_prompt, None)):
+                current_app.logger.info('GOT @USER in message')
+                temp_message = messages[-1]["content"]
+                temp_message = temp_message.replace("'", '"')
+                json_match = re.search(r'{[\s\S]*}', temp_message)
+                if json_match:
+                    try:
+                        current_app.logger.info('GOT Json')
+                        current_app.logger.info(f'got json object')
+                        json_part = json_match.group(0)
+                        current_app.logger.info('Sending user the message')
+                        json_obj = json.loads(json_part)
+                        send_message_to_user1(user_id, json_obj['message_2_user'], '', prompt_id)
+                        return "auto"
+                    except  Exception as e:
+                        current_app.logger.error(f'Ignoring Got Error while getting json for current actionid: {e}')
+                        pass
+
             if 'message_2_user' in messages[-1]["content"].lower() and last_speaker.name == "helper":
                 return "auto"
 
+            temp_message = messages[-1]["content"].replace("'", '"')
             pattern = r'\{.*?\}'  # getting all json from text
-            matches = re.findall(pattern, messages[-1]["content"], re.DOTALL)
+            matches = re.findall(pattern, temp_message, re.DOTALL)
             json_objects = [json.loads(match) for match in matches]
             current_app.logger.info(f'Got Json as {len(json_objects)}')
             if json_objects:
@@ -2296,15 +2321,16 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                 current_app.logger.error(f'WE have some indec error here: {e}')
             last_message = group_chat.messages[-1]['content']
             # Check if this message has already been sent to the user by state_transition
-            if f'message_2_user'.lower() in last_message.lower() and request_id == request_id_list_sent_intermediate.get(
+            if f'message_2_user'.lower() in last_message.lower() and user_prompt in request_id_list_sent_intermediate and request_id in request_id_list_sent_intermediate.get(
                     user_prompt, None):
                 # Message has already been sent to user in state_transition
                 # Return a placeholder or empty response to prevent duplication
                 current_app.logger.info(f'Message with message_2_user detected - already sent by state_transition')
                 # Instead of returning the entire message, return an acknowledgment or empty response
                 return ''
+
             elif f'@user'.lower() not in last_message.lower():
-                message = 'If you want to communicate from the user then send the response with @user\nIf you current action is completed and you want next action ask @StatusVerifier for next action\n if you can continue the task without user intervention you can proceed with the actions.'
+                message = 'If you want to communicate to the user then send the response with @user\nIf you current action is completed and you want next action ask @StatusVerifier for next action\n if you can continue the task without user intervention you can proceed with the actions.'
                 helper.initiate_chat(manager, message=message, speaker_selection={"speaker": "assistant"},
                                      clear_history=False)
                 continue
@@ -2530,7 +2556,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                     # role = get_role(user_id,prompt_id)
                     last_message = group_chat.messages[-1]['content']
                     if f'@user'.lower() not in last_message.lower():
-                        message = 'If you want to communicate from the user then send the response with @user\nIf you current action is completed and you want next action ask @StatusVerifier for next action\n if you can continue the task without user intervention you can proceed with the actions.'
+                        message = 'If you want to communicate to the user then send the response with @user\nIf you current action is completed and you want next action ask @StatusVerifier for next action\n if you can continue the task without user intervention you can proceed with the actions.'
                         helper.initiate_chat(manager, message=message, speaker_selection={"speaker": "assistant"},
                                              clear_history=False)
                         continue
