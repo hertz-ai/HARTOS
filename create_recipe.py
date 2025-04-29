@@ -369,7 +369,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             2. Create Scheduled Jobs: For tasks involving timers or scheduled jobs, ask Helper agent to use the create_scheduled_jobs tool.
             3. Data/Memory Management:
                 ➜If you want to save some data ask helper agent to use "save_data_in_memory" tool.
-                ➜If you wnat to get some data ask helper agent to use "get_data_by_key", "get_saved_metadata" tool.
+                ➜If you want to get some data ask helper agent to use "get_data_by_key", "get_saved_metadata" tool.
             4. If you want to send some message to user directly then ask helper agent to use send_message_to_user tool but if you want to send message after sometime then ask helper to use send_message_in_seconds tool.
             5. If you want to send some pre synthesized video to user then ask helper agent to use send_presynthesize_video_to_user tool.
             6. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.

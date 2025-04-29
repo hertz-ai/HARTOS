@@ -291,16 +291,48 @@ def get_role(user_id, prompt_id):
     return role
 
 
-def send_message_to_user1(user_id, response, inp, prompt_id):
+def clear_message_tracking(user_prompt, original_request_id):
+    """Clear message tracking for a specific request"""
+    try:
+        if (user_prompt in request_id_list_sent_intermediate and
+                original_request_id in request_id_list_sent_intermediate[user_prompt]):
+            del request_id_list_sent_intermediate[user_prompt][original_request_id]
+    except Exception as e:
+        pass
+
+def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_delay=8):
     user_prompt = f'{user_id}_{prompt_id}'
     random_num = random.randint(1000, 9999)
-    request_id = f'{request_id_list[user_prompt]}-intermediate-{random_num}'
-    request_id_list_sent_intermediate[user_prompt] = request_id_list[user_prompt]
+    original_request_id = request_id_list[user_prompt]
+    intermediate_request_id = f'{original_request_id}-intermediate-{random_num}'
+
+    # Initialize the tracking dictionary for this user_prompt if it doesn't exist
+    if user_prompt not in request_id_list_sent_intermediate:
+        request_id_list_sent_intermediate[user_prompt] = {}
+
+    # Track that we've sent a message for this specific original_request_id
+    request_id_list_sent_intermediate[user_prompt][original_request_id] = True
+
+    # Schedule a task to clear the tracking after the delay
+    job_id = f"clear_tracking_{user_prompt}_{original_request_id}_{int(time.time())}"
+    run_time = datetime.fromtimestamp(time.time() + reset_tracking_delay)
+
+    scheduler.add_job(
+        clear_message_tracking,
+        'date',
+        run_date=run_time,
+        id=job_id,
+        args=[user_prompt, original_request_id]
+    )
+
     url = 'http://aws_rasa.hertzai.com:9890/autogen_response'
-    body = json.dumps({'user_id': user_id, 'message': response, 'inp': inp, 'request_id': request_id})
+    body = json.dumps({'user_id': user_id, 'message': response, 'inp': inp, 'request_id': intermediate_request_id})
     headers = {'Content-Type': 'application/json'}
     res = requests.post(url, data=body, headers=headers)
 
+    current_app.logger.info(
+        f'Message sent with request_id: {intermediate_request_id}, tracking will reset in {reset_tracking_delay}s')
+    return
 
 def execute_python_file(task_description: str, user_id: int, prompt_id: int, action_entry_point: int = 0):
     headers = {'Content-Type': 'application/json'}
@@ -824,7 +856,18 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         6.  Always use the pre-tested steps and code from the provided Recipe—**do not create new implementations unless explicitly required**.
         7. **Scheduled, time-based, or continuous tasks should not be manually executed**—they are already handled by the system.
         8. **IMPORTANT CODING INSTRUCTION**: Avoid using `time.sleep` in any code.
-        9. Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory]
+        9. Tools Helper Agent can use:
+            1. The tools are: send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,execute_windows_command,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, google_search and save_data_in_memory.
+            2. Create Scheduled Jobs: For tasks involving timer or time or periodically or scheduled jobs, ask Helper agent to use the create_scheduled_jobs tool.
+            3. Data/Memory Management:
+                ➜If you want to save some data,understand the current data from get_saved_metadata & plan the datamodel and ask helper agent to use "save_data_in_memory" tool.
+                ➜If you want to get some data ask helper agent to use "get_data_by_key"  tool.
+            4. If you want to send some message to user directly then ask helper agent to use send_message_to_user tool but if you want to send message after sometime then ask helper to use send_message_in_seconds tool.
+            5. If you want to send some pre synthesized realistic videos to user then ask helper agent to use send_presynthesize_video_to_user tool.
+            6. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the pre synthesized generated video if it is successful.
+            7. If you receive a request to perform a task or action on the user's computer, or if the request is related to Chrome or any browser, you should ask @Helper to use the `execute_windows_command` tool.
+            8. If you want the user's ID then ask the @Helper to use 'get_user_id' tool and do not prompt the user for their user_id, never mention the user_id to the user.
+            9. If you want to do a google search then you should ask the @Helper to use the 'google_search' tool.        
         10. **Never reveal actions, internal processes, or tools to the user**. Do not ask for user confirmation unless absolutely necessary(You can assume normal things like user's interests).
         11. **To communicate with the {role} user**, always use this format: `@user {response_format}`.
         12. All actions, recipes, and functions provided below have been reviewed and tested. Follow them exactly—do not make assumptions or modify them unless they fail or produce an error.
@@ -1240,18 +1283,27 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                              avatar_id: Annotated[Optional[str], "Unique identifier for the avatar"] = None,
                              response_type: Annotated[Optional[
                                  str], "Response mode: 'Realistic' (slower, better quality) or 'Realtime' (faster, lower quality)"] = 'Realtime') -> str:
-        current_app.logger.info('INSIDE send_message_to_user')
-        current_app.logger.info(
-            f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
-        random_num = random.randint(1000, 9999)
 
-        request_id = f'{request_id_list[user_prompt]}-intermediate-{random_num}'
-        request_id_list_sent_intermediate[user_prompt] = request_id_list[user_prompt]
-        # TODO add avatar_id and conv_id and response_type
-        thread = threading.Thread(target=send_message_to_user1,
-                                  args=(user_id, text, '', prompt_id))
-        thread.start()
-        return f'Message sent successfully to user with request_id: {request_id}'
+        original_request_id = request_id_list[user_prompt]
+
+        # Check if we've already sent a message for this specific request
+        message_already_sent = (
+                user_prompt in request_id_list_sent_intermediate and
+                original_request_id in request_id_list_sent_intermediate[user_prompt]
+        )
+
+        if response_type != 'Realtime' or not message_already_sent:
+            current_app.logger.info('INSIDE send_message_to_user')
+            current_app.logger.info(
+                f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
+            random_num = random.randint(1000, 9999)
+            intermediate_request_id = f'{request_id_list[user_prompt]}-intermediate-{random_num}'
+            request_id_list_sent_intermediate[user_prompt][request_id_list[user_prompt]] = True
+            # TODO add avatar_id and conv_id and response_type
+            send_message_to_user1(user_id, text, '', prompt_id)
+            return f'Message sent successfully to user with request_id: {intermediate_request_id}'
+        else:
+            return f'Message already sent successfully to user with request_id: {original_request_id}'
 
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",
@@ -1447,7 +1499,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             execution_time = time.time() - start_time
 
             current_app.logger.info(f'THIS IS RESPONSE type: {type(response)} value: {response}')
-            
+
             # Transform the RPC response into the new format
             if response and response['status'] == 'success':
                 if not matching_recipe:
@@ -1647,7 +1699,10 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             if response and response['status'] == 'success':
                 return 'Successfully ran the command in user\'s computer.'
             else:
-                return 'Not able to perform this action now please try later'
+                if 'message' in response and 'Failed to capture screenshot' in response['message']:
+                    return 'I\'m unable to perform this action since the Hevolve A I Companion App is not running in your computer, Open the companion app & try again'
+                else:
+                    return 'Not able to perform this action now please try later'
         except Exception as e:
             error_message = traceback.format_exc()  # Capture full traceback
             current_app.logger.error(f"Error executing command:\n{error_message}")
@@ -1951,25 +2006,35 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         messages = groupchat.messages
         try:
             request_id = f'{request_id_list[user_prompt]}'
-            if '@user' in messages[-1]["content"].lower() and (user_prompt not in request_id_list_sent_intermediate or request_id in request_id_list_sent_intermediate.get(user_prompt, None)):
+            # In state_transition
+            if '@user' in messages[-1]["content"].lower():
                 current_app.logger.info('GOT @USER in message')
-                temp_message = messages[-1]["content"]
-                temp_message = temp_message.replace("'", '"')
-                json_match = re.search(r'{[\s\S]*}', temp_message)
-                if json_match:
-                    try:
-                        current_app.logger.info('GOT Json')
-                        current_app.logger.info(f'got json object')
-                        json_part = json_match.group(0)
-                        current_app.logger.info('Sending user the message')
-                        json_obj = json.loads(json_part)
-                        send_message_to_user1(user_id, json_obj['message_2_user'], '', prompt_id)
-                        return "auto"
-                    except  Exception as e:
-                        current_app.logger.error(f'Ignoring Got Error while getting json for current actionid: {e}')
-                        pass
 
-            if 'message_2_user' in messages[-1]["content"].lower() and last_speaker.name == "helper":
+                # Get the current original request ID
+                original_request_id = request_id_list[user_prompt]
+
+                # Check if we've already sent a message for this specific request
+                message_already_sent = (
+                        user_prompt in request_id_list_sent_intermediate and
+                        original_request_id in request_id_list_sent_intermediate[user_prompt]
+                )
+
+                if not message_already_sent:
+                    # Process and send message
+                    temp_message = messages[-1]["content"]
+                    temp_message = temp_message.replace("'", '"')
+                    json_match = re.search(r'{[\s\S]*}', temp_message)
+                    if json_match:
+                        try:
+                            current_app.logger.info('GOT Json')
+                            json_part = json_match.group(0)
+                            json_obj = json.loads(json_part)
+                            send_message_to_user1(user_id, json_obj['message_2_user'], '', prompt_id)
+                        except Exception as e:
+                            current_app.logger.error(f'Error processing JSON: {e}')
+                else:
+                    current_app.logger.info(f'Already sent a message for request {original_request_id} - skipping')
+
                 return "auto"
 
             temp_message = messages[-1]["content"].replace("'", '"')
@@ -1983,7 +2048,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                 if 'status' in last_json.keys() and last_json['status'].lower() == 'completed':
                     current_app.logger.info('GOT COMPLETED FOR ACTION')
                     try:
-                        user_tasks[user_prompt].current_action = json_objects['action_id']
+                        user_tasks[user_prompt].current_action = int(last_json['action_id'])
                     except Exception as e:
                         current_app.logger.error(f'GOT ERROR WHILE UPDATING CURRENT ACTION:{e}')
                         current_app.logger.error(traceback.format_exc())
@@ -2256,8 +2321,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
         count = 0
         while True:
             current_app.logger.info('inside while1')
-            if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1][
-                'content'] == 'TERMINATE':
+            if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
                 current_app.logger.info(
                     f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
                 try:
@@ -2308,8 +2372,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                         assistant.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
                         continue
             try:
-                if user_tasks[user_prompt].actions[user_tasks[user_prompt].current_action][
-                    'can_perform_without_user_input'] == 'yes':
+                if user_tasks[user_prompt].actions[user_tasks[user_prompt].current_action]['can_perform_without_user_input'] == 'yes':
                     current_app.logger.info('GOT can_perform_without_user_input as true')
                     message = 'You should complete this task independently. Feel free to make reasonable assumptions where necessary'
                     helper.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
@@ -2318,21 +2381,32 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                 if count == 4:
                     break
             except Exception as e:
-                current_app.logger.error(f'WE have some indec error here: {e}')
+                current_app.logger.error(f'WE have some indexx error here: {e}')
             last_message = group_chat.messages[-1]['content']
             # Check if this message has already been sent to the user by state_transition
-            if f'message_2_user'.lower() in last_message.lower() and user_prompt in request_id_list_sent_intermediate and request_id in request_id_list_sent_intermediate.get(
-                    user_prompt, None):
-                # Message has already been sent to user in state_transition
-                # Return a placeholder or empty response to prevent duplication
-                current_app.logger.info(f'Message with message_2_user detected - already sent by state_transition')
-                # Instead of returning the entire message, return an acknowledgment or empty response
-                return ''
+            # In get_agent_response
+            if f'message_2_user'.lower() in last_message.lower():
+                original_request_id = request_id_list[user_prompt]
+
+                message_already_sent = (
+                        user_prompt in request_id_list_sent_intermediate and
+                        original_request_id in request_id_list_sent_intermediate[user_prompt]
+                )
+
+                if message_already_sent:
+                    current_app.logger.info(f'Message already sent for request {original_request_id} - skipping')
+                    return ''
+                else:
+                    # Extract and process message
+                    try:
+                        json_obj = retrieve_json(last_message)
+                        if json_obj and 'message_2_user' in json_obj:
+                            send_message_to_user1(user_id, json_obj['message_2_user'], '', prompt_id)
+                            return ''
+                    except Exception as e:
+                        current_app.logger.error(f"Error extracting JSON: {e}")
 
             elif f'@user'.lower() not in last_message.lower():
-                message = 'If you want to communicate to the user then send the response with @user\nIf you current action is completed and you want next action ask @StatusVerifier for next action\n if you can continue the task without user intervention you can proceed with the actions.'
-                helper.initiate_chat(manager, message=message, speaker_selection={"speaker": "assistant"},
-                                     clear_history=False)
                 continue
             else:
                 current_app.logger.info(f'@user in last message')
@@ -2494,8 +2568,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                 count = 0
                 while True:
                     current_app.logger.info('inside while2')
-                    if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1][
-                        'content'] == 'TERMINATE':
+                    if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
                         current_app.logger.info(
                             f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
                         try:
@@ -2556,9 +2629,6 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                     # role = get_role(user_id,prompt_id)
                     last_message = group_chat.messages[-1]['content']
                     if f'@user'.lower() not in last_message.lower():
-                        message = 'If you want to communicate to the user then send the response with @user\nIf you current action is completed and you want next action ask @StatusVerifier for next action\n if you can continue the task without user intervention you can proceed with the actions.'
-                        helper.initiate_chat(manager, message=message, speaker_selection={"speaker": "assistant"},
-                                             clear_history=False)
                         continue
                     else:
                         current_app.logger.info(f'@user in last message')
