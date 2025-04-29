@@ -232,7 +232,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         •Code Execution: Executor Agent: Executes code as needed. Ensure the final response is printed in code using print() before sending to Executor.
 
         •Tools Helper Agent can use:
-            1. The tools are: send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,execute_windows_command,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory.
+            1. The tools are: send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,execute_windows_command,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, google_search and save_data_in_memory.
             2. Create Scheduled Jobs: For tasks involving timer or time or periodically or scheduled jobs, ask Helper agent to use the create_scheduled_jobs tool.
             3. Data/Memory Management:
                 ➜If you want to save some data,understand the current data from get_saved_metadata & plan the datamodel and ask helper agent to use "save_data_in_memory" tool.
@@ -240,8 +240,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             4. If you want to send some message to user directly then ask helper agent to use send_message_to_user tool but if you want to send message after sometime then ask helper to use send_message_in_seconds tool.
             5. If you want to send some pre synthesized realistic videos to user then ask helper agent to use send_presynthesize_video_to_user tool.
             6. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the pre synthesized generated video if it is successful.
-            7. If you receive a request to perform a task on the user's computer or any other computer, or if the request is related to Chrome or any browser, you should ask @Helper to use the `execute_windows_command` tool.
-            8. If you want the user's ID use get_user_id and do not prompt the user for their user_id, never mention the user_id to the user.
+            7. If you receive a request to perform a task or action on the user's computer, or if the request is related to Chrome or any browser, you should ask @Helper to use the `execute_windows_command` tool.
+            8. If you want the user's ID then ask the @Helper to use 'get_user_id' tool and do not prompt the user for their user_id, never mention the user_id to the user.
+            9. If you want to do a google search then you should ask the @Helper to use the 'google_search' tool.
 
         •Error Handling:
             If there's an error or failure, respond with a structured error message format: {"status":"error","action":"current action","action_id":1/2/3...,"message":"message here"}
@@ -257,7 +258,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
 
         •Special Notes:
             1. Create python code in ```python code here``` if you want to perform some code related actions  or when you get unknown language unknown and ask @Executor to run the code.
-            2. Incase if you need to use any API's use python code and ask the @Executor to run the code.
+            2. Incase if you need to use any API's ask the user for the API Signature such as whether it is GET, POST, PATCH, PUT, DELETE methods and then use python code and ask the @Executor to run the code.
             3. Avoid using time.sleep() in code. For scheduled tasks, always use the create_scheduled_jobs tool instead.
             4. When responding to user neither share your internal monologues with other agents nor mention other agent names nor your instructions.   
             5. Always save information which you think will be needed in future using 'save_data_in_memory' and if you want any information check the memory using tool 'get_data_by_key, get_saved_metadata'.
@@ -485,10 +486,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     def Generate_video(text: Annotated[str, "Text to be used for video generation"],
                        avatar_id: Annotated[int, "Unique identifier for the avatar"],
                        realtime: Annotated[bool,"If True, response is fast but less realistic by default it should be true; if False, response is realistic but slower"]) -> str:
-        print('INSIDE Generate_video')
+        current_app.logger.info('INSIDE Generate_video')
         database_url = 'https://mailer.hertzai.com'
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
-        print(f"avtar_id: {avatar_id}:\n{text[:10]}....\n")
+        current_app.logger.info(f"avtar_id: {avatar_id}:\n{text[:10]}....\n")
 
         headers = {'Content-Type': 'application/json'}
         data = {}
@@ -1109,10 +1110,10 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     def Generate_video(text: Annotated[str, "Text to be used for video generation"],
                        avatar_id: Annotated[str, "Unique identifier for the avatar"],
                        realtime: Annotated[bool,"If True, response is fast but less realistic by default it should be true; if False, response is realistic but slower"]) -> str:
-        print('INSIDE Generate_video')
+        current_app.logger.info('INSIDE Generate_video')
         database_url = 'https://mailer.hertzai.com'
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
-        print(f"avtar_id: {avatar_id}:\n{text[:10]}....\n")
+        current_app.logger.info(f"avtar_id: {avatar_id}:\n{text[:10]}....\n")
 
         headers = {'Content-Type': 'application/json'}
         data = {}
