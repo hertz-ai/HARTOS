@@ -1439,7 +1439,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                 crossbar_message['enhanced_instruction'] = enhanced_instruction
                 current_app.logger.info(f"Added enhanced instruction to crossbar message")
 
-            topic = 'com.hertzai.hevolve.action2'
+            topic = 'com.hertzai.hevolve.action'
             current_app.logger.info(f'calling {topic} for 8000 second')
 
             start_time = time.time()
