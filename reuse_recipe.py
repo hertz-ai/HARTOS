@@ -300,7 +300,7 @@ def clear_message_tracking(user_prompt, original_request_id):
     except Exception as e:
         pass
 
-def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_delay=8):
+def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_delay=20):
     user_prompt = f'{user_id}_{prompt_id}'
     random_num = random.randint(1000, 9999)
     original_request_id = request_id_list[user_prompt]
@@ -2328,7 +2328,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                     json_obj = eval(group_chat.messages[-2]["content"])
                     current_app.logger.info(f'got json object {json_obj}')
                     if json_obj['status'].lower() == 'completed':
-                        current_app.logger.info(f'UPDATIN CURRENT ACTION AS :{int(json_obj["action_id"])}')
+                        current_app.logger.info(f'UPDATING CURRENT ACTION AS :{int(json_obj["action_id"])}')
                         user_tasks[user_prompt].current_action = int(json_obj['action_id'])
                         action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)[
                             'action']
@@ -2350,7 +2350,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                             json_obj = json.loads(json_part)
                             current_app.logger.info(f'got json object {json_obj}')
                             if json_obj['status'].lower() == 'completed':
-                                current_app.logger.info(f'UPDATIN CURRENT ACTION AS :{int(json_obj["action_id"])}')
+                                current_app.logger.info(f'UPDATING CURRENT ACTION AS :{int(json_obj["action_id"])}')
                                 user_tasks[user_prompt].current_action = int(json_obj['action_id'])
                                 action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)['action']
                                 steps = [{x['steps']: {'tool_name': x.get('tool_name', None),
@@ -2365,23 +2365,31 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                             raise 'No json found'
                     except Exception as e:
                         current_app.logger.warning(f'it is not a json object the error is: {e}')
-                        current_app.logger.info(
-                            'it is not a json object You should ask status verifier to give response in proper format & not move ahead to next action')
+                        current_app.logger.info('it is not a json object You should ask status verifier to give response in proper format & not move ahead to next action')
                         actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
                         message = 'Hey @StatusVerifier Agent, Please verify the status of the action ' + f'{user_tasks[user_prompt].current_action + 1}: {actions_prompt}' + '\n performed and Respond in the following format {"status": "status here","action": "current action","action_id": ' + f'{user_tasks[user_prompt].current_action + 1}' + ',"message": "message here"}'
                         assistant.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
                         continue
             try:
+                # Safely access recipes
+                if count == 4:
+                    break
+
+                count += 1
+
+                if user_prompt not in recipes or user_tasks[user_prompt].current_action >= len(user_tasks[user_prompt]['actions']):
+                    current_app.logger.error(
+                        f"Cannot access recipe for current action {user_tasks[user_prompt].current_action}")
+                    continue
+
                 if user_tasks[user_prompt].actions[user_tasks[user_prompt].current_action]['can_perform_without_user_input'] == 'yes':
                     current_app.logger.info('GOT can_perform_without_user_input as true')
                     message = 'You should complete this task independently. Feel free to make reasonable assumptions where necessary'
                     helper.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
 
-                count += 1
-                if count == 4:
-                    break
             except Exception as e:
                 current_app.logger.error(f'WE have some indexx error here: {e}')
+
             last_message = group_chat.messages[-1]['content']
             # Check if this message has already been sent to the user by state_transition
             # In get_agent_response
@@ -2395,6 +2403,10 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
 
                 if message_already_sent:
                     current_app.logger.info(f'Message already sent for request {original_request_id} - skipping')
+                    try:
+                        del request_id_list_sent_intermediate[user_prompt][original_request_id]
+                    except Exception as e:
+                        pass
                     return ''
                 else:
                     # Extract and process message
@@ -2407,6 +2419,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                         current_app.logger.error(f"Error extracting JSON: {e}")
 
             elif f'@user'.lower() not in last_message.lower():
+                current_app.logger.info(f'continuing since @user not in last message')
                 continue
             else:
                 current_app.logger.info(f'@user in last message')
@@ -2422,6 +2435,8 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                 json_obj = retrieve_json(last_message['content'])
                 if json_obj and 'message_2_user' in json_obj:
                     last_message['content'] = json_obj['message_2_user']
+                    return last_message['content']
+
             except Exception as e:
                 current_app.logger.error(f"Error extracting JSON: {e}")
                 # Fallback to a basic pattern match if retrieve_json fails
@@ -2429,8 +2444,9 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                 match = re.search(pattern, last_message['content'], re.DOTALL)
                 if match:
                     last_message['content'] = match.group(1)
+                    return last_message['content']
         # At this point, don't process messages with message_2_user as they were already sent
-        return last_message['content']
+        return ''
 
     except Exception as e:
         current_app.logger.info(f'Got some error {e}')
