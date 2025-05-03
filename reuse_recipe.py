@@ -1314,6 +1314,21 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                              response_type: Annotated[Optional[
                                  str], "Response mode: 'Realistic' (slower, better quality) or 'Realtime' (faster, lower quality)"] = 'Realtime') -> str:
 
+        # Check if the message is directed to another agent and not to the user
+        # Define a mapping of agent mentions that should never be sent to users
+        agent_mentions = [
+            "@statusverifier", "@status verifier", "@verification",
+            "@helper", "@executor",
+            "@StatusVerifier", "@Helper", "@Executor"
+        ]
+
+        # If the message contains any agent mention, don't send it to the user
+        if any(mention in text.lower() for mention in agent_mentions):
+            agent_found = next((mention for mention in agent_mentions if mention in text.lower()), None)
+            current_app.logger.info(f'Message directed to agent ({agent_found}), not sending to user: {text[:50]}...')
+            return f'Message directed to {agent_found} agent, not sending to user'
+
+
         original_request_id = request_id_list[user_prompt]
 
         # Check if we've already sent a message for this specific request
@@ -2036,8 +2051,26 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         messages = groupchat.messages
         try:
             request_id = f'{request_id_list[user_prompt]}'
+            # Check for specific agent mentions FIRST - this should take precedence
+            content_lower = messages[-1]["content"].lower()
+
+            # Define a mapping of agent mentions to their respective agent objects
+            agent_mapping = {
+                "@statusverifier": verify,
+                "@status verifier": verify,
+                "@verification": verify,
+                "@helper": helper,
+                "@executor": executor
+            }
+
+            # Check for any agent mentions and return the corresponding agent
+            for mention, agent in agent_mapping.items():
+                if mention in content_lower:
+                    current_app.logger.info(f"Detected mention of {mention} - directing message to appropriate agent")
+                    return agent
+
             # Check for messages directed to the user
-            if '@user' in messages[-1]["content"].lower():
+            if '@user' in content_lower:
                 current_app.logger.info('GOT @USER in message')
 
                 # Get the current original request ID
@@ -2125,16 +2158,29 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             # Check for user messages
             if 'message_2_user' in messages[-1]["content"].lower():
                 current_app.logger.info('GOT message_2_user in message')
-                temp_message = messages[-1]["content"]
-                temp_message = temp_message.replace("'", '"')
-                json_match = re.search(r'{[\s\S]*}', temp_message)
-                if json_match:
-                    try:
-                        json_part = json_match.group(0)
-                        json_obj = json.loads(json_part)
-                        send_message_to_user1(user_id, json_obj['message_2_user'], '', prompt_id)
-                    except Exception as e:
-                        current_app.logger.error(f'Error sending message to user: {e}')
+                # Check if this is directed to an agent and not the user
+                # Use the same agent mapping as before
+                agent_to_return = None
+                for mention, agent in agent_mapping.items():
+                    if mention in content_lower:
+                        current_app.logger.info(
+                            f"Message with message_2_user also contains {mention} - directing to that agent")
+                        agent_to_return = agent
+                        break
+
+                if agent_to_return:
+                    return agent_to_return
+                else:
+                    temp_message = messages[-1]["content"]
+                    temp_message = temp_message.replace("'", '"')
+                    json_match = re.search(r'{[\s\S]*}', temp_message)
+                    if json_match:
+                        try:
+                            json_part = json_match.group(0)
+                            json_obj = json.loads(json_part)
+                            send_message_to_user1(user_id, json_obj['message_2_user'], '', prompt_id)
+                        except Exception as e:
+                            current_app.logger.error(f'Error sending message to user: {e}')
 
             if messages[-1]["role"] == 'function':
                 current_app.logger.info('The last speaker was function returning assistant')
