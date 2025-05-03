@@ -371,19 +371,16 @@ def retrieve_json(json_message):
         json_obj = fix_json(json_message)
         return json_obj
 
-class ToolMessageHandler():
-    """Handles tool messages in the conversation history.
 
-    This transformation checks the first message (index 0) in the conversation history.
-    If the message role is 'tool', it removes that message and returns the remaining messages.
-    Otherwise, it returns the conversation history unchanged.
+class ToolMessageHandler:
+    """Handles tool messages in the conversation history to prevent tool_call_id errors.
+
+    This improved implementation properly handles references between assistant tool calls
+    and tool responses to prevent "Invalid parameter: 'tool_call_id' not found" errors.
     """
 
     def __init__(self):
-        """
-        Initialize the ToolMessageHandler.
-        No configuration parameters are needed for this simple transformation.
-        """
+        """Initialize the ToolMessageHandler."""
         pass
 
     def apply_transform(self, messages: List[Dict]) -> List[Dict]:
@@ -393,7 +390,7 @@ class ToolMessageHandler():
             messages (List[Dict]): The list of messages representing the conversation history.
 
         Returns:
-            List[Dict]: A new list containing the messages, with the first tool message removed if present.
+            List[Dict]: A new list containing properly processed messages.
         """
         if not messages:
             return messages
@@ -401,65 +398,108 @@ class ToolMessageHandler():
         # Make a copy to avoid modifying the original list
         processed_messages = messages.copy()
 
-        # Only process up to second-to-last message
-        if not messages or len(messages) < 2:
-            return messages
+        # First pass: collect all valid tool call IDs from assistant messages
+        tool_call_ids = {}
+        for idx, msg in enumerate(processed_messages):
+            if msg.get('role') == 'assistant' and 'tool_calls' in msg:
+                for tool_call in msg.get('tool_calls', []):
+                    if 'id' in tool_call:
+                        tool_call_ids[tool_call['id']] = {
+                            'message_idx': idx,
+                            'tool_call': tool_call
+                        }
 
-        # current_app.logger.info(f'FIRST MESSAGE:-> {processed_messages[0]}')
-        # Check if the first message has a role of 'tool'
+        # Process the first message if it's a tool message (special case)
         if processed_messages and processed_messages[0].get('role') == 'tool':
             current_app.logger.info('GOT TOOL AS FIRST MESSAGE CHANGING IT')
-            # current_app.logger.info(f'{processed_messages[0]}')
-            # processed_messages.pop(0)
             processed_messages[0]['role'] = 'user'
             processed_messages[0]['name'] = 'Helper'
+            if 'tool_call_id' in processed_messages[0]:
+                del processed_messages[0]['tool_call_id']
             if 'tool_responses' in processed_messages[0]:
                 del processed_messages[0]['tool_responses']
-                processed_messages[0]['role'] = 'user'
-                processed_messages[0]['name'] = 'Helper'
             processed_messages = processed_messages[1:]
-            # current_app.logger.info(f'AFTER CHANGE: {processed_messages[0]}')
 
-
-        for i in range(len(processed_messages) - 1):
+        # Second pass: validate tool messages against collected tool call IDs
+        valid_messages = []
+        i = 0
+        while i < len(processed_messages):
             current_msg = processed_messages[i]
-            next_msg = processed_messages[i + 1]
 
-            # Case 1: Current message has tool_calls but next message isn't a tool
-            if current_msg.get('tool_calls') and next_msg.get('role') != 'tool':
-                current_app.logger.warning(f'CHANGE IN {i}')
-                current_app.logger.warning(f'CURRENT MSG HAS TOOL_CALLS AND NEXT IS NOT TOOL RESPONSE')
-                # current_app.logger.warning(f'CURRENT MSG {current_msg}')
-                del current_msg['tool_calls']
-                current_msg['role'] = 'user'
-                current_msg['content'] = ' '
-                current_msg['name'] = 'Helper'
-                # current_app.logger.warning(f'CURRENT MSG AFTER DELETE {current_msg}')
+            # Handle tool messages with potentially invalid tool_call_id references
+            if current_msg.get('role') == 'tool' and 'tool_call_id' in current_msg:
+                tool_call_id = current_msg.get('tool_call_id')
 
-            # Case 2: Current message doesn't have tool_calls but next is a tool
-            elif not current_msg.get('tool_calls') and next_msg.get('role') == 'tool':
-                current_app.logger.warning(f'CHANGE IN {i}')
-                current_app.logger.warning(f'CHANGE IN NEXT MESSAFE TO USER')
-                # current_app.logger.warning(f'Next MESSAGE BEFORE CHANGE {next_msg}')
+                if tool_call_id not in tool_call_ids:
+                    # Invalid tool_call_id - convert to user message
+                    current_app.logger.warning(f'Invalid tool_call_id: {tool_call_id} - converting to user message')
+                    valid_messages.append({
+                        'role': 'user',
+                        'name': 'Helper',
+                        'content': current_msg.get('content', '')
+                    })
+                else:
+                    # Valid tool_call_id - add the message
+                    valid_messages.append(current_msg)
+            else:
+                # Process assistant messages with tool_calls
+                if current_msg.get('role') == 'assistant' and 'tool_calls' in current_msg:
+                    # Check if any following messages actually reference these tool_calls
+                    has_valid_tool_response = False
 
-                # Convert next message to user and remove tool_calls
-                next_msg['role'] = 'user'
-                if 'tool_responses' in next_msg:
-                    del next_msg['tool_responses']
-                    next_msg['role'] = 'user'
-                    next_msg['name'] = 'Helper'
-                # current_app.logger.warning(f'Next MESSAGE AFTER CHANGE {next_msg}')
+                    if i < len(processed_messages) - 1:
+                        for j in range(i + 1, min(i + 5, len(processed_messages))):  # Look ahead up to 5 messages
+                            next_msg = processed_messages[j]
+                            if (next_msg.get('role') == 'tool' and
+                                    'tool_call_id' in next_msg and
+                                    any(tc.get('id') == next_msg.get('tool_call_id') for tc in
+                                        current_msg.get('tool_calls', []))):
+                                has_valid_tool_response = True
+                                break
 
-            # Case 3: Current message has tool_calls but next message isn't a tool
-            elif current_msg.get('role') == 'tool' and next_msg.get('role') == 'tool':
-                current_app.logger.warning(f'CHANGE IN {i}')
-                current_app.logger.warning(f'CURRENT ROLE TO USER')
-                # Fix next message to be a tool message
-                current_msg['role'] = 'user'
+                    if not has_valid_tool_response:
+                        # No valid tool responses - remove tool_calls
+                        current_app.logger.warning(
+                            f'Assistant message with tool_calls has no valid tool responses - sanitizing')
+                        sanitized_msg = {k: v for k, v in current_msg.items() if k != 'tool_calls'}
+                        valid_messages.append(sanitized_msg)
+                    else:
+                        # Tool calls are valid - keep the message as is
+                        valid_messages.append(current_msg)
+                else:
+                    # Add other messages as is
+                    valid_messages.append(current_msg)
 
-        current_app.logger.info("processed_messages")
-        # current_app.logger.info(processed_messages[0])
-        return processed_messages
+            i += 1
+
+        # Third pass: ensure no consecutive tool messages (they must be separated by assistant messages)
+        final_messages = []
+        for i, msg in enumerate(valid_messages):
+            if i > 0 and msg.get('role') == 'tool' and valid_messages[i - 1].get('role') == 'tool':
+                current_app.logger.warning(f'Consecutive tool messages detected - converting second to user message')
+                # Convert the second tool message to a user message
+                final_messages.append({
+                    'role': 'user',
+                    'name': 'Helper',
+                    'content': msg.get('content', '')
+                })
+            else:
+                final_messages.append(msg)
+
+        # Final cleanup pass: remove any remaining invalid tool_call_id references
+        for i, msg in enumerate(final_messages):
+            if msg.get('role') == 'tool' and 'tool_call_id' in msg:
+                tool_call_id = msg.get('tool_call_id')
+                if tool_call_id not in tool_call_ids:
+                    current_app.logger.warning(f'Removing invalid tool_call_id: {tool_call_id} in final cleanup')
+                    final_messages[i] = {
+                        'role': 'user',
+                        'name': 'Helper',
+                        'content': msg.get('content', '')
+                    }
+
+        current_app.logger.info(f"Processed {len(messages)} messages into {len(final_messages)} validated messages")
+        return final_messages
 
     def get_logs(self, pre_transform_messages: List[Dict], post_transform_messages: List[Dict]) -> Tuple[str, bool]:
         """Generates logs about the transformation.
@@ -471,9 +511,19 @@ class ToolMessageHandler():
         Returns:
             Tuple[str, bool]: A tuple containing the log message and whether a transformation occurred
         """
-        if len(pre_transform_messages) > len(post_transform_messages):
-            return "Removed tool message from the beginning of conversation.", True
-        return "No tool message was removed.", False
+        if len(pre_transform_messages) != len(post_transform_messages):
+            return f"Message count changed: {len(pre_transform_messages)} → {len(post_transform_messages)}", True
+
+        # Count role changes
+        changes = 0
+        for i in range(min(len(pre_transform_messages), len(post_transform_messages))):
+            if pre_transform_messages[i].get('role') != post_transform_messages[i].get('role'):
+                changes += 1
+
+        if changes > 0:
+            return f"Modified {changes} message roles", True
+
+        return "No message transformations needed", False
 
 class Action:
     def __init__(self,actions):
