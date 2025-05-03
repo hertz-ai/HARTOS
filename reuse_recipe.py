@@ -104,6 +104,8 @@ config_list = [{
         "price": [0.0025, 0.01]
     }]
 
+message_tracking_lock = threading.Lock()
+
 
 def load_vlm_agent_files(prompt_id, role_number):
     """Loads any VLM agent JSON files for the given prompt_id and role_number and integrates them with existing recipes."""
@@ -300,39 +302,67 @@ def clear_message_tracking(user_prompt, original_request_id):
     except Exception as e:
         pass
 
+
 def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_delay=20):
+    """
+    Send message to user with improved tracking of sent messages
+    """
     user_prompt = f'{user_id}_{prompt_id}'
     random_num = random.randint(1000, 9999)
-    original_request_id = request_id_list[user_prompt]
+    original_request_id = request_id_list.get(user_prompt, str(uuid.uuid4()))
     intermediate_request_id = f'{original_request_id}-intermediate-{random_num}'
 
-    # Initialize the tracking dictionary for this user_prompt if it doesn't exist
-    if user_prompt not in request_id_list_sent_intermediate:
-        request_id_list_sent_intermediate[user_prompt] = {}
+    # Use a lock to ensure thread safety when updating shared state
+    with message_tracking_lock:
+        # Initialize the tracking dictionary for this user_prompt if it doesn't exist
+        if user_prompt not in request_id_list_sent_intermediate:
+            request_id_list_sent_intermediate[user_prompt] = {}
 
-    # Track that we've sent a message for this specific original_request_id
-    request_id_list_sent_intermediate[user_prompt][original_request_id] = True
+        # Track that we've sent a message for this specific original_request_id
+        request_id_list_sent_intermediate[user_prompt][original_request_id] = True
 
     # Schedule a task to clear the tracking after the delay
     job_id = f"clear_tracking_{user_prompt}_{original_request_id}_{int(time.time())}"
-    run_time = datetime.fromtimestamp(time.time() + reset_tracking_delay)
 
-    scheduler.add_job(
-        clear_message_tracking,
-        'date',
-        run_date=run_time,
-        id=job_id,
-        args=[user_prompt, original_request_id]
-    )
+    try:
+        # Check if job already exists before adding
+        if scheduler.get_job(job_id) is None:
+            run_time = datetime.fromtimestamp(time.time() + reset_tracking_delay)
+            scheduler.add_job(
+                clear_message_tracking,
+                'date',
+                run_date=run_time,
+                id=job_id,
+                args=[user_prompt, original_request_id],
+                replace_existing=True  # Use replace_existing to avoid conflicts
+            )
+    except Exception as e:
+        current_app.logger.error(f"Error scheduling tracking reset: {e}")
 
+    # Process response to ensure it's a string
+    if not isinstance(response, str):
+        if isinstance(response, dict):
+            if 'content' in response:
+                response = response['content']
+            else:
+                response = str(response)
+        else:
+            response = str(response)
+
+    # Send the message to the user
     url = 'http://aws_rasa.hertzai.com:9890/autogen_response'
     body = json.dumps({'user_id': user_id, 'message': response, 'inp': inp, 'request_id': intermediate_request_id})
     headers = {'Content-Type': 'application/json'}
-    res = requests.post(url, data=body, headers=headers)
 
-    current_app.logger.info(
-        f'Message sent with request_id: {intermediate_request_id}, tracking will reset in {reset_tracking_delay}s')
+    try:
+        res = requests.post(url, data=body, headers=headers, timeout=5)
+        current_app.logger.info(
+            f'Message sent with request_id: {intermediate_request_id}, tracking will reset in {reset_tracking_delay}s')
+    except Exception as e:
+        current_app.logger.error(f"Error sending message to user: {e}")
+
     return
+
 
 def execute_python_file(task_description: str, user_id: int, prompt_id: int, action_entry_point: int = 0):
     headers = {'Content-Type': 'application/json'}
@@ -2006,7 +2036,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         messages = groupchat.messages
         try:
             request_id = f'{request_id_list[user_prompt]}'
-            # In state_transition
+            # Check for messages directed to the user
             if '@user' in messages[-1]["content"].lower():
                 current_app.logger.info('GOT @USER in message')
 
@@ -2014,10 +2044,11 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                 original_request_id = request_id_list[user_prompt]
 
                 # Check if we've already sent a message for this specific request
-                message_already_sent = (
-                        user_prompt in request_id_list_sent_intermediate and
-                        original_request_id in request_id_list_sent_intermediate[user_prompt]
-                )
+                with message_tracking_lock:
+                    message_already_sent = (
+                            user_prompt in request_id_list_sent_intermediate and
+                            original_request_id in request_id_list_sent_intermediate[user_prompt]
+                    )
 
                 if not message_already_sent:
                     # Process and send message
@@ -2037,89 +2068,91 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
                 return "auto"
 
+
+            # Process JSON responses from StatusVerifier
             temp_message = messages[-1]["content"].replace("'", '"')
             pattern = r'\{.*?\}'  # getting all json from text
             matches = re.findall(pattern, temp_message, re.DOTALL)
-            json_objects = [json.loads(match) for match in matches]
-            current_app.logger.info(f'Got Json as {len(json_objects)}')
-            if json_objects:
-                last_json = json_objects[-1]
-                current_app.logger.info(f'last json as {last_json}')
-                if 'status' in last_json.keys() and last_json['status'].lower() == 'completed':
-                    current_app.logger.info('GOT COMPLETED FOR ACTION')
+
+            try:
+                json_objects = [json.loads(match) for match in matches]
+                current_app.logger.info(f'Got Json as {len(json_objects)}')
+
+                if json_objects:
+                    last_json = json_objects[-1]
+                    current_app.logger.info(f'last json as {last_json}')
+
+                    if 'status' in last_json.keys() and last_json['status'].lower() == 'completed':
+                        current_app.logger.info('GOT COMPLETED FOR ACTION')
+                        try:
+                            user_tasks[user_prompt].current_action = int(last_json['action_id'])
+                        except Exception as e:
+                            current_app.logger.error(f'GOT ERROR WHILE UPDATING CURRENT ACTION:{e}')
+                            current_app.logger.error(traceback.format_exc())
+                            user_tasks[user_prompt].current_action += 1
+                        return chat_instructor
+
+                    currentaction_id = last_json['action_id']
+                    if individual_recipe[currentaction_id - 1]['can_perform_without_user_input'] == 'yes':
+                        return assistant
+            except Exception as e:
+                current_app.logger.error(f'Got Error while getting json for current actionid: {e}')
+
+            # Check for specific agent mentions
+            if re.search(r"@statusverifier", messages[-1]["content"].lower()):
+                current_app.logger.info("String contains @StatusVerifier returning StatusVerifier")
+                return verify
+
+            if re.search(r"@helper", messages[-1]["content"].lower()):
+                current_app.logger.info("String contains @Helper returning Helper")
+                return helper
+
+            if re.search(r"@executor", messages[-1]["content"].lower()):
+                current_app.logger.info("String contains @Executor returning Executor")
+                return executor
+
+            # Default speaker selection logic
+            current_app.logger.info(
+                f'Inside state_transition with message :10 {messages[-1]["content"][:10]} & last_speaker {last_speaker.name}')
+
+            if (last_speaker.name == f"user_proxy_{user_id}" or
+                    last_speaker.name == "multi_role_agent" or
+                    last_speaker.name == "helper" or
+                    last_speaker.name == "Executor" or
+                    last_speaker.name == "ChatInstructor"):
+                return assistant
+
+            # Check for user messages
+            if 'message_2_user' in messages[-1]["content"].lower():
+                current_app.logger.info('GOT message_2_user in message')
+                temp_message = messages[-1]["content"]
+                temp_message = temp_message.replace("'", '"')
+                json_match = re.search(r'{[\s\S]*}', temp_message)
+                if json_match:
                     try:
-                        user_tasks[user_prompt].current_action = int(last_json['action_id'])
+                        json_part = json_match.group(0)
+                        json_obj = json.loads(json_part)
+                        send_message_to_user1(user_id, json_obj['message_2_user'], '', prompt_id)
                     except Exception as e:
-                        current_app.logger.error(f'GOT ERROR WHILE UPDATING CURRENT ACTION:{e}')
-                        current_app.logger.error(traceback.format_exc())
-                        user_tasks[user_prompt].current_action += 1
-                    return chat_instructor
+                        current_app.logger.error(f'Error sending message to user: {e}')
 
-                currentaction_id = last_json['action_id']
-                if individual_recipe[currentaction_id - 1]['can_perform_without_user_input'] == 'yes':
-                    return assistant
+            if messages[-1]["role"] == 'function':
+                current_app.logger.info('The last speaker was function returning assistant')
+                return assistant
+
+            if 'exitcode:' in messages[-1]["content"]:
+                current_app.logger.info('Got exitcode in text returning assistant')
+                return assistant
+
+            if 'TERMINATE' in messages[-1]["content"].upper():
+                current_app.logger.info('TERMINATING BECAUSE OF TERMINATE')
+                return None
+
+            return "auto"
         except Exception as e:
-            current_app.logger.error(f'Got Error while getting json for current actionid: {e}')
-
-        pattern3 = r"@statusverifier"
-        if re.search(pattern3, messages[-1]["content"].lower()):
-            current_app.logger.info("String contains @StatusVerifier returnig StatusVerifier")
-            return verify
-        pattern3 = r"@helper"
-        if re.search(pattern3, messages[-1]["content"].lower()):
-            current_app.logger.info("String contains @Helper returnig Helper")
-            return helper
-        pattern3 = r"@executor"
-        if re.search(pattern3, messages[-1]["content"].lower()):
-            current_app.logger.info("String contains @Executor returnig Executor")
-            return executor
-
-        # llm_call_track[user_prompt]['count'] +=1
-        # current_app.logger.info(f"llm_call_track[user_prompt]['count']:{llm_call_track[user_prompt]['count']}")
-        # if llm_call_track[user_prompt]['original_prompt'] == True:
-        #     llm_call_track[user_prompt]['original_prompt'] = False
-        #     assistant.update_system_message = agent_prompt
-
-        # if llm_call_track[user_prompt]['count'] == 5:
-        #     current_app.logger.info('LLM CALL COUNT IS 5')
-        #     llm_call_track[user_prompt]['count'] = 0
-        #     llm_call_track[user_prompt]['original_prompt'] = True
-        #     assistant.update_system_message = f"You should return the response to the user on whatever you are doing now in response format {response_format}"
-        #     current_app.logger.info('Updated prompt')
-        #     return assistant
-        current_app.logger.info(
-            f'Inside state_transition with message :10 {messages[-1]["content"][:10]} & last_speaker {last_speaker.name}')
-        if (last_speaker.name == f"user_proxy_{user_id}" or last_speaker.name == "multi_role_agent" or last_speaker.name == "helper" or last_speaker.name == "Executor" or last_speaker.name == "ChatInstructor"):
-            return assistant
-
-        current_app.logger.info(f'Checking for message_2_user , stripping @user from message')
-        if 'message_2_user' in messages[-1]["content"].lower():
-            current_app.logger.info('GOT @USER in message')
-            temp_message = messages[-1]["content"]
-            temp_message = temp_message.replace("'",'"')
-            json_match = re.search(r'{[\s\S]*}', temp_message)
-            if json_match:
-                try:
-                    current_app.logger.info('GOT Json')
-                    current_app.logger.info(f'got json object')
-                    json_part = json_match.group(0)
-                    current_app.logger.info('Sending user the message')
-                    json_obj = json.loads(json_part)
-                    send_message_to_user1(user_id,json_obj['message_2_user'],'',prompt_id)
-                except:
-                    pass
-
-        if messages[-1]["role"] == 'function':
-            current_app.logger.info('The last speaker was function returning assistant')
-            return assistant
-        if 'exitcode:' in messages[-1]["content"]:
-            current_app.logger.info('Got exitcode in text returning assistant')
-            return assistant
-        if 'TERMINATE' in messages[-1]["content"].upper():
-            current_app.logger.info('TERMINATING BECAUSE OF TERMINATE')
-            # retrieve: action 1 -> action 2
-            return None
-        return "auto"
+            current_app.logger.error(f"Error in state_transition: {e}")
+            current_app.logger.error(traceback.format_exc())
+            return "auto"
 
     def state_transition1(last_speaker, groupchat):
         current_app.logger.info('INSIDE TIMER STATE TRANSITION')
