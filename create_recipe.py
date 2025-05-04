@@ -721,30 +721,20 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
 
     def state_transition(last_speaker, groupchat):
         current_app.logger.info(f'Inside state_transition with actions {user_tasks[user_prompt].current_action}')
-        current_app.logger.info(f"STATE_TRANSITION - Message[0]: {groupchat.messages[0]}")
-        current_app.logger.info(f"STATE_TRANSITION - Message[1]: {groupchat.messages[1]}")
-        
+        if len(groupchat.messages) > 0:
+            current_app.logger.info(f"STATE_TRANSITION - Message[0]: {groupchat.messages[0]}")
+
         messages = groupchat.messages
         new_role = 'user'
         if messages[-1]['name'] != 'UserProxy':
             new_role = 'AI'
-        helper_fun.history(user_id,prompt_id,new_role,messages[-1]['content'])
+        try:
+            helper_fun.history(user_id, prompt_id, new_role, messages[-1]['content'])
+        except Exception as e:
+            current_app.logger.error(f"Error in history function: {e}")
 
-        # if len(groupchat.messages) == 5:
-        #     current_app.logger.info('THE LENGTH OF MESSAGES IS 5 APPENDING tool at start')
-        #     groupchat.messages.insert(0,{'role':'tool','name':'Assistant','content':'','tool_responses':''})
-        # if len(messages) % 10 == 0 or messages[-1]['name'] == 'UserProxy':
-        #     current_app.logger.info('CHECKING FOR VIDEO FOR PAST 5MINS')
-        #     visual_context = helper_fun.get_visual_context(user_id)
-        #     current_app.logger.info(f'GOT RESPONSE AS {visual_context}')
-        #     if visual_context:
-        #         groupchat.messages.insert(-2,{'content':visual_context,'role':'user','name':'helper'})
-        # current_app.logger.info(f'{messages[-1]}')
-        current_app.logger.info(f'Inside state_transition with message {messages[-1]["content"][:10]}.. & last_speaker:{last_speaker.name}')
-        # crossbar_message = {"text": ["Working on "+messages[-1]['content']+".\n please evaluate the response i am giving to check if it meets the current action"], "priority": 49, "action": 'Thinking', "historical_request_id": [], "preffered_language": 'en-US', "options": [], "newoptions": [], "bot_type": 'Agent', "page_image_url": "", "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
-        # 'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0}, 'bottom_left': {'x': 0, 'y': 0}}}
-        # result = client.publish(
-        #     f"com.hertzai.hevolve.chat.{user_id}", f'{crossbar_message}')
+        current_app.logger.info(f'Inside state_transition with message {messages[-1]["content"][:10] if messages else "No messages"}.. & last_speaker:{last_speaker.name if last_speaker else "None"}')
+
         metadata = get_saved_metadata()
         # current_app.logger.info(messages[-1])
         if messages[-1]['role'] == 'tool':
@@ -1822,6 +1812,8 @@ def recipe(user_id, text,prompt_id,file_id,request_id):
 
     except Exception as e:
         current_app.logger.error(f"Error occurred in create Recipe: {str(e)}")  # Add logging for debugging
+        error_message = traceback.format_exc()  # Capture full traceback
+        current_app.logger.error(f"Error occurred in create Recipe stack trace:\n{error_message}")
         last_response = get_response_group(user_id,text,prompt_id,True,e)
     if scheduler_check[user_prompt] == True:
 

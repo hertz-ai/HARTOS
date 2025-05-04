@@ -341,6 +341,8 @@ def retrieve_json(json_message):
         if prefix_match:
             json_message = prefix_match.group(1).strip()
 
+    json_message = json_message.replace(''', "'").replace(''', "'").replace('"', '"').replace('"', '"')
+
     # Try using ast.literal_eval which can handle Python dict syntax with single quotes
     try:
         json_obj = ast.literal_eval(json_message)
@@ -377,6 +379,7 @@ class ToolMessageHandler:
 
     This improved implementation properly handles references between assistant tool calls
     and tool responses to prevent "Invalid parameter: 'tool_call_id' not found" errors.
+    It also handles the "only messages with role 'assistant' can have a function call" error.
     """
 
     def __init__(self):
@@ -393,8 +396,11 @@ class ToolMessageHandler:
             List[Dict]: A new list containing properly processed messages.
         """
         if not messages:
+            current_app.logger.info("ToolMessageHandler: No messages to process")
             return messages
 
+        # Log input messages structure
+        current_app.logger.info(f"ToolMessageHandler: Processing {len(messages)} messages")
         # Make a copy to avoid modifying the original list
         processed_messages = messages.copy()
 
@@ -420,11 +426,16 @@ class ToolMessageHandler:
                 del processed_messages[0]['tool_responses']
             processed_messages = processed_messages[1:]
 
-        # Second pass: validate tool messages against collected tool call IDs
+        # Second pass: validate tool messages against collected tool call IDs and fix function_call issues
         valid_messages = []
         i = 0
         while i < len(processed_messages):
             current_msg = processed_messages[i]
+
+            # Fix: Remove function_call from non-assistant messages
+            if current_msg.get('role') != 'assistant' and 'function_call' in current_msg:
+                current_app.logger.warning(f'Removing function_call from non-assistant message')
+                current_msg = {k: v for k, v in current_msg.items() if k != 'function_call'}
 
             # Handle tool messages with potentially invalid tool_call_id references
             if current_msg.get('role') == 'tool' and 'tool_call_id' in current_msg:
@@ -487,7 +498,9 @@ class ToolMessageHandler:
                 final_messages.append(msg)
 
         # Final cleanup pass: remove any remaining invalid tool_call_id references
+        # and ensure only assistant messages have function_call
         for i, msg in enumerate(final_messages):
+            # Remove invalid tool_call_id references
             if msg.get('role') == 'tool' and 'tool_call_id' in msg:
                 tool_call_id = msg.get('tool_call_id')
                 if tool_call_id not in tool_call_ids:
@@ -497,6 +510,11 @@ class ToolMessageHandler:
                         'name': 'Helper',
                         'content': msg.get('content', '')
                     }
+
+            # Remove function_call from non-assistant messages
+            if msg.get('role') != 'assistant' and 'function_call' in msg:
+                current_app.logger.warning(f'Removing function_call from non-assistant message at index {i}')
+                final_messages[i] = {k: v for k, v in msg.items() if k != 'function_call'}
 
         current_app.logger.info(f"Processed {len(messages)} messages into {len(final_messages)} validated messages")
         return final_messages
