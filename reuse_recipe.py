@@ -351,7 +351,7 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
 
     # Send the message to the user
     url = 'http://aws_rasa.hertzai.com:9890/autogen_response'
-    body = json.dumps({'user_id': user_id, 'message': response, 'inp': inp, 'request_id': intermediate_request_id})
+    body = json.dumps({'user_id': user_id, 'message': response, 'inp': inp, 'request_id': intermediate_request_id, 'Agent_status': 'Reuse Mode'})
     headers = {'Content-Type': 'application/json'}
 
     try:
@@ -1399,7 +1399,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         # Check if this command is already running
         with _active_tools_lock:
             if command_key in _active_tools and _active_tools[command_key]['active']:
-                return f"A Windows command is already being executed. Please wait for it to complete."
+                return f"A Windows command is already being executed in your device. Please wait for it to complete."
             
             # Mark this command as active
             _active_tools[command_key] = {
@@ -1527,7 +1527,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                 'instruction_to_vlm_agent': instructions,
                 'os_to_control': 'Windows',
                 'actions_available_in_os': [],
-                'max_ETA_in_seconds': 500,
+                'max_ETA_in_seconds': 1800,
                 'langchain_server': True
             }
             
@@ -1537,7 +1537,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                 current_app.logger.info(f"Added enhanced instruction to crossbar message")
 
             topic = 'com.hertzai.hevolve.action'
-            current_app.logger.info(f'calling {topic} for 8000 second')
+            current_app.logger.info(f'calling {topic} for 1800 seconds')
 
             start_time = time.time()
             response = await subscribe_and_return(crossbar_message,topic, 1800000)  # Wait for the RPC response
@@ -2084,18 +2084,27 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                     )
 
                 if not message_already_sent:
-                    # Process and send message
-                    temp_message = messages[-1]["content"]
-                    temp_message = temp_message.replace("'", '"')
-                    json_match = re.search(r'{[\s\S]*}', temp_message)
-                    if json_match:
-                        try:
-                            current_app.logger.info('GOT Json')
-                            json_part = json_match.group(0)
-                            json_obj = json.loads(json_part)
+                    # Process and send message using retrieve_json
+                    try:
+                        # Use the existing retrieve_json function
+                        json_obj = retrieve_json(messages[-1]["content"])
+                        if json_obj and 'message_2_user' in json_obj:
+                            current_app.logger.info('Successfully extracted message_2_user content')
                             send_message_to_user1(user_id, json_obj['message_2_user'], '', prompt_id)
-                        except Exception as e:
-                            current_app.logger.error(f'Error processing JSON: {e}')
+                        else:
+                            # If retrieve_json fails, try a direct regex approach for this specific format
+                            current_app.logger.info('retrieve_json failed, trying regex extraction')
+                            message_match = re.search(r"@user\s*{'message_2_user':\s*'(.*?)'}\s*$",
+                                                      messages[-1]["content"], re.DOTALL)
+                            if message_match:
+                                message_content = message_match.group(1)
+                                current_app.logger.info('Successfully extracted message using regex')
+                                send_message_to_user1(user_id, message_content, '', prompt_id)
+                            else:
+                                current_app.logger.error('Failed to extract message with all methods')
+                    except Exception as e:
+                        current_app.logger.error(f'Error processing @user message: {e}')
+                        current_app.logger.error(traceback.format_exc())
                 else:
                     current_app.logger.info(f'Already sent a message for request {original_request_id} - skipping')
 
