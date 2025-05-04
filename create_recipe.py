@@ -82,7 +82,7 @@ def send_message_to_user1(user_id,response,inp,prompt_id):
     user_prompt = f'{user_id}_{prompt_id}'
     request_id = f'{request_id_list[user_prompt]}-intermediate'
     url = 'http://aws_rasa.hertzai.com:9890/autogen_response'
-    body = json.dumps({'user_id':user_id,'message':response,'inp':inp,'request_id':request_id})
+    body = json.dumps({'user_id':user_id,'message':response,'inp':inp,'request_id':request_id, 'Agent_status': 'Review Mode'})
     headers = {'Content-Type': 'application/json'}
     res = requests.post(url,data=body,headers=headers)
 
