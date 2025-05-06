@@ -21,6 +21,8 @@ import asyncio
 import os
 from bs4 import BeautifulSoup
 from langchain.memory import ZepMemory
+from json_repair import repair_json
+
 # from autobahn.twisted.wamp import ApplicationSession, ApplicationRunner
 # from twisted.internet.defer import inlineCallbacks
 with open("config.json", 'r') as f:
@@ -341,6 +343,11 @@ def retrieve_json(json_message):
         if prefix_match:
             json_message = prefix_match.group(1).strip()
 
+    try:
+        return json.loads(repair_json(json_message))
+    except Exception as e:
+        current_app.logger.info(f'json_repair failed: {e}')
+
     json_message = json_message.replace(''', "'").replace(''', "'").replace('"', '"').replace('"', '"')
 
     # Try using ast.literal_eval which can handle Python dict syntax with single quotes
@@ -385,6 +392,31 @@ class ToolMessageHandler:
     def __init__(self):
         """Initialize the ToolMessageHandler."""
         pass
+
+    def validate_messages(self, messages: List[Dict]) -> List[Dict]:
+        for i, msg in enumerate(messages):
+            if 'content' in msg and msg['content'] is None:
+                # Log detailed information about the problematic message
+                current_app.logger.warning(f"NULL CONTENT DETECTED: Message at index {i} has null content")
+                current_app.logger.warning(
+                    f"Message type: {msg.get('role', 'unknown')}, name: {msg.get('name', 'unknown')}")
+
+                # Log additional message properties to help debugging
+                tool_calls = "Yes" if "tool_calls" in msg else "No"
+                function_call = "Yes" if "function_call" in msg else "No"
+                current_app.logger.warning(f"Has tool_calls: {tool_calls}, Has function_call: {function_call}")
+
+                # Log message context (previous message if available)
+                if i > 0 and i < len(messages):
+                    prev_msg = messages[i - 1]
+                    current_app.logger.warning(
+                        f"Previous message: role={prev_msg.get('role')}, type={prev_msg.get('type')}")
+
+                # Either provide a default content or log an error
+                messages[i]['content'] = ""  # Replace null with empty string
+                current_app.logger.info(f"FIXED: Replaced null content with empty string in message {i}")
+
+        return messages
 
     def apply_transform(self, messages: List[Dict]) -> List[Dict]:
         """Applies the tool message handling transformation to the conversation history.
@@ -516,8 +548,9 @@ class ToolMessageHandler:
                 current_app.logger.warning(f'Removing function_call from non-assistant message at index {i}')
                 final_messages[i] = {k: v for k, v in msg.items() if k != 'function_call'}
 
+
         current_app.logger.info(f"Processed {len(messages)} messages into {len(final_messages)} validated messages")
-        return final_messages
+        return self.validate_messages(final_messages)
 
     def get_logs(self, pre_transform_messages: List[Dict], post_transform_messages: List[Dict]) -> Tuple[str, bool]:
         """Generates logs about the transformation.
