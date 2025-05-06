@@ -419,35 +419,15 @@ class ToolMessageHandler:
         return messages
 
     def apply_transform(self, messages: List[Dict]) -> List[Dict]:
-        """Applies the tool message handling transformation to the conversation history.
-
-        Args:
-            messages (List[Dict]): The list of messages representing the conversation history.
-
-        Returns:
-            List[Dict]: A new list containing properly processed messages.
-        """
+        """Applies the tool message handling transformation to ensure valid tool call/response pairings."""
         if not messages:
             current_app.logger.info("ToolMessageHandler: No messages to process")
             return messages
 
-        # Log input messages structure
         current_app.logger.info(f"ToolMessageHandler: Processing {len(messages)} messages")
-        # Make a copy to avoid modifying the original list
         processed_messages = messages.copy()
 
-        # First pass: collect all valid tool call IDs from assistant messages
-        tool_call_ids = {}
-        for idx, msg in enumerate(processed_messages):
-            if msg.get('role') == 'assistant' and 'tool_calls' in msg:
-                for tool_call in msg.get('tool_calls', []):
-                    if 'id' in tool_call:
-                        tool_call_ids[tool_call['id']] = {
-                            'message_idx': idx,
-                            'tool_call': tool_call
-                        }
-
-        # Process the first message if it's a tool message (special case)
+        # STEP 1: Handle first message if it's a tool message (special case)
         if processed_messages and processed_messages[0].get('role') == 'tool':
             current_app.logger.info('GOT TOOL AS FIRST MESSAGE CHANGING IT')
             processed_messages[0]['role'] = 'user'
@@ -458,69 +438,81 @@ class ToolMessageHandler:
                 del processed_messages[0]['tool_responses']
             processed_messages = processed_messages[1:]
 
-        # Second pass: validate tool messages against collected tool call IDs and fix function_call issues
-        valid_messages = []
-        i = 0
-        while i < len(processed_messages):
-            current_msg = processed_messages[i]
+        # STEP 2: Map all tool calls to their IDs and source messages
+        tool_call_ids = {}
+        for idx, msg in enumerate(processed_messages):
+            if msg.get('role') == 'assistant' and 'tool_calls' in msg:
+                for tool_call in msg.get('tool_calls', []):
+                    if 'id' in tool_call:
+                        tool_call_ids[tool_call['id']] = {
+                            'message_idx': idx,
+                            'tool_call': tool_call
+                        }
 
-            # Fix: Remove function_call from non-assistant messages
+        # Track which tool messages we'll keep and which assistant messages have tool_calls
+        assistant_with_tool_calls = set()
+        valid_tool_messages = set()
+
+        # STEP 3: First pass - identify valid tool messages and their parent assistant messages
+        for i, msg in enumerate(processed_messages):
+            if msg.get('role') == 'tool' and 'tool_call_id' in msg:
+                tool_call_id = msg.get('tool_call_id')
+                if tool_call_id in tool_call_ids:
+                    # Check if the tool message is after its corresponding assistant message
+                    assistant_idx = tool_call_ids[tool_call_id]['message_idx']
+                    if assistant_idx < i:
+                        valid_tool_messages.add(i)
+                        assistant_with_tool_calls.add(assistant_idx)
+
+        # STEP 4: Create final validated message list
+        valid_messages = []
+        for i, msg in enumerate(processed_messages):
+            current_msg = msg.copy()  # Create a copy to modify
+
+            # Remove function_call from non-assistant messages (OpenAI requirement)
             if current_msg.get('role') != 'assistant' and 'function_call' in current_msg:
                 current_app.logger.warning(f'Removing function_call from non-assistant message')
                 current_msg = {k: v for k, v in current_msg.items() if k != 'function_call'}
 
-            # Handle tool messages with potentially invalid tool_call_id references
+            # Handle tool messages - only keep valid ones
             if current_msg.get('role') == 'tool' and 'tool_call_id' in current_msg:
-                tool_call_id = current_msg.get('tool_call_id')
-
-                if tool_call_id not in tool_call_ids:
-                    # Invalid tool_call_id - convert to user message
-                    current_app.logger.warning(f'Invalid tool_call_id: {tool_call_id} - converting to user message')
+                if i in valid_tool_messages:
+                    valid_messages.append(current_msg)
+                else:
+                    # Convert invalid tool messages to user messages
+                    current_app.logger.warning(f'Converting invalid tool message to user message')
                     valid_messages.append({
                         'role': 'user',
                         'name': 'Helper',
                         'content': current_msg.get('content', '')
                     })
-                else:
-                    # Valid tool_call_id - add the message
+
+            # Handle assistant messages with tool_calls
+            elif current_msg.get('role') == 'assistant' and 'tool_calls' in current_msg:
+                # Special case: Keep recent messages' tool_calls intact (last 2 messages)
+                is_recent_message = (i >= len(processed_messages) - 2)
+
+                if is_recent_message:
+                    # Always preserve tool_calls in recent messages
+                    current_app.logger.info(f'Preserving recent tool call in message {i} to allow execution')
                     valid_messages.append(current_msg)
+                elif i in assistant_with_tool_calls:
+                    # This assistant message has valid tool responses - keep it as is
+                    valid_messages.append(current_msg)
+                else:
+                    # No valid tool responses - sanitize by removing tool_calls
+                    current_app.logger.warning(f'Sanitizing assistant message with no valid tool responses')
+                    sanitized_msg = {k: v for k, v in current_msg.items() if k != 'tool_calls'}
+                    valid_messages.append(sanitized_msg)
             else:
-                # Process assistant messages with tool_calls
-                if current_msg.get('role') == 'assistant' and 'tool_calls' in current_msg:
-                    # Check if any following messages actually reference these tool_calls
-                    has_valid_tool_response = False
+                # Add all other messages as is
+                valid_messages.append(current_msg)
 
-                    if i < len(processed_messages) - 1:
-                        for j in range(i + 1, min(i + 5, len(processed_messages))):  # Look ahead up to 5 messages
-                            next_msg = processed_messages[j]
-                            if (next_msg.get('role') == 'tool' and
-                                    'tool_call_id' in next_msg and
-                                    any(tc.get('id') == next_msg.get('tool_call_id') for tc in
-                                        current_msg.get('tool_calls', []))):
-                                has_valid_tool_response = True
-                                break
-
-                    if not has_valid_tool_response:
-                        # No valid tool responses - remove tool_calls
-                        current_app.logger.warning(
-                            f'Assistant message with tool_calls has no valid tool responses - sanitizing')
-                        sanitized_msg = {k: v for k, v in current_msg.items() if k != 'tool_calls'}
-                        valid_messages.append(sanitized_msg)
-                    else:
-                        # Tool calls are valid - keep the message as is
-                        valid_messages.append(current_msg)
-                else:
-                    # Add other messages as is
-                    valid_messages.append(current_msg)
-
-            i += 1
-
-        # Third pass: ensure no consecutive tool messages (they must be separated by assistant messages)
+        # STEP 5: Ensure no consecutive tool messages
         final_messages = []
         for i, msg in enumerate(valid_messages):
             if i > 0 and msg.get('role') == 'tool' and valid_messages[i - 1].get('role') == 'tool':
                 current_app.logger.warning(f'Consecutive tool messages detected - converting second to user message')
-                # Convert the second tool message to a user message
                 final_messages.append({
                     'role': 'user',
                     'name': 'Helper',
@@ -528,26 +520,6 @@ class ToolMessageHandler:
                 })
             else:
                 final_messages.append(msg)
-
-        # Final cleanup pass: remove any remaining invalid tool_call_id references
-        # and ensure only assistant messages have function_call
-        for i, msg in enumerate(final_messages):
-            # Remove invalid tool_call_id references
-            if msg.get('role') == 'tool' and 'tool_call_id' in msg:
-                tool_call_id = msg.get('tool_call_id')
-                if tool_call_id not in tool_call_ids:
-                    current_app.logger.warning(f'Removing invalid tool_call_id: {tool_call_id} in final cleanup')
-                    final_messages[i] = {
-                        'role': 'user',
-                        'name': 'Helper',
-                        'content': msg.get('content', '')
-                    }
-
-            # Remove function_call from non-assistant messages
-            if msg.get('role') != 'assistant' and 'function_call' in msg:
-                current_app.logger.warning(f'Removing function_call from non-assistant message at index {i}')
-                final_messages[i] = {k: v for k, v in msg.items() if k != 'function_call'}
-
 
         current_app.logger.info(f"Processed {len(messages)} messages into {len(final_messages)} validated messages")
         return self.validate_messages(final_messages)

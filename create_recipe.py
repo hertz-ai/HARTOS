@@ -523,8 +523,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         timeout = 60
         if not realtime:
             timeout = 600
-            data['chattts'] = True
-            data['flag_hallo'] = "true"
+            data['chattts'] = True #F5TTS
+            data['flag_hallo'] = "true" #Echomimic-> Liveportrait
             data["cartoon_image"] = False
 
         if res['voice_id'] != None:
