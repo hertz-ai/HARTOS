@@ -876,9 +876,10 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                 individual_recipe.append(config)
         except Exception as e:
             current_app.logger.error(f'Got error as :{e} while checking for prompts/{prompt_id}_{role_number}_{i}.json')
+
     response_format = {"message_2_user": "Your message here"}
     agent_prompt = f'''You are a Helpful {role} Assistant. Your primary role is to assist the user efficiently while keeping all internal actions and processes hidden from the end user. Follow the guidelines below to perform tasks correctly:
-        1. If you encounter a task you cannot perform, request assistance from the @Helper and @Executor agents. agent. If you need to run a tool, seek guidance from the @Helper agent. For code execution, ask the @Executor agent for assistance.
+        1. If you encounter a task you cannot perform, request assistance from the @Helper and @Executor agents. If you need to run a tool, seek guidance from the @Helper agent. For code execution, ask the @Executor agent for assistance.
         2. Only execute actions where the persona is: {role}.
         3. Follow the steps below to achieve the goal: {goal}.
         4. Utilize the provided **Recipe** for all task-related details.
@@ -887,13 +888,13 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         7. **Scheduled, time-based, or continuous tasks should not be manually executed**—they are already handled by the system.
         8. **IMPORTANT CODING INSTRUCTION**: Avoid using `time.sleep` in any code.
         9. Tools Helper Agent can use:
-            1. The tools are: send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,execute_windows_command,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, google_search and save_data_in_memory.
+            1. The tools are: send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,execute_windows_command,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, google_search and save_data_in_memory.
             2. Create Scheduled Jobs: For tasks involving timer or time or periodically or scheduled jobs, ask Helper agent to use the create_scheduled_jobs tool.
             3. Data/Memory Management:
                 ➜If you want to save some data,understand the current data from get_saved_metadata & plan the datamodel and ask helper agent to use "save_data_in_memory" tool.
                 ➜If you want to get some data ask helper agent to use "get_data_by_key"  tool.
             4. If you want to send some message to user directly then ask helper agent to use send_message_to_user tool but if you want to send message after sometime then ask helper to use send_message_in_seconds tool.
-            5. If you want to send some pre synthesized realistic videos to user then ask helper agent to use send_presynthesize_video_to_user tool.
+            5. If you want to send some pre synthesized realistic videos to user then ask helper agent to use send_presynthesized_video_to_user tool.
             6. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the pre synthesized generated video if it is successful.
             7. If you receive a request to perform a task or action on the user's computer, or if the request is related to Chrome or any browser, you should ask @Helper to use the `execute_windows_command` tool.
             8. If you want the user's ID then ask the @Helper to use 'get_user_id' tool and do not prompt the user for their user_id, never mention the user_id to the user.
@@ -943,10 +944,10 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
             3. Only use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
-            4. Tools you have [txt2img, img2txt, save_data_in_memory, get_data_from_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs, send_message_to_user,send_presynthesize_video_to_user] If a task cannot be completed using the available tools, first check the recipe. If no solution is found, create Python code to accomplish the task.
+            4. Tools you have [txt2img, img2txt, save_data_in_memory, get_data_from_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs, send_message_to_user,send_presynthesized_video_to_user] If a task cannot be completed using the available tools, first check the recipe. If no solution is found, create Python code to accomplish the task.
             5. Keep track of action and only ask for next action when the current action is completed successfully.
             6. Always use code from recipe given below.
-            7. If there is any action which is like to perform a task continously you should not do it.
+            7. If there is any action which is like to perform a task continuously you should not do it.
             8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
             9. IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @user {response_format}
             10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
@@ -969,10 +970,10 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
             3. Ask @Helper to use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
-            4. Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory]
+            4. Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory]
             5. Keep track of action and only ask for next action when the current action is completed successfully.
             6. Always use code from recipe given below.
-            7. If there is any action which is like to perform a task continously you should not do it.
+            7. If there is any action which is like to perform a task continuously you should not do it.
             8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
             9. IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @user {response_format}
             10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
@@ -995,8 +996,8 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         name="multi_role_agent",
         llm_config=llm_config,
         code_execution_config=False,
-        system_message="""You will send message from multiple different personas your, job is to ask those question to assistant agent
-        if you think some text was intent to give to some other agent but i came to you send the same message to user""",
+        system_message="""You will send message from multiple different personas, your job is to ask those question to assistant agent
+        if you think some text was intended to give to some other agent but i came to you instead, send the same message to user/author""",
     )
     verify = autogen.AssistantAgent(
         name="StatusVerifier",
@@ -1353,9 +1354,9 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",
                              description="Sends a presynthesized message/video/dialogue to user using conv_id from memory.")
-    def send_presynthesize_video_to_user(
+    def send_presynthesized_video_to_user(
             conv_id: Annotated[str, "Conversation ID associated with the text from memory"]) -> str:
-        current_app.logger.info('INSIDE send_presynthesize_video_to_user')
+        current_app.logger.info('INSIDE send_presynthesized_video_to_user')
         current_app.logger.info(f'SENDING DATA 2 user with value: conv_id:{conv_id}.')
         return 'Message sent successfully to user'
 
@@ -1778,7 +1779,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
         """
                        f"When you want to communicate with {role} connect main agent using 'connect_time_main' tool."
-                       "Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory.]"
+                       "Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory.]"
                        "if you have any task which is not doable by these tool check recipe first else create python code to do so"
                        "the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video."
                        f"IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @user {response_format}"
@@ -1824,7 +1825,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
             3. Only use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
-            4. Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory]
+            4. Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory]
             5. Keep track of action and only go to next action when the current action is completed successfully
             6. Always use code from recipe given below
             7. If there is any action which is like to perform a task continously you should not do it.
@@ -1928,10 +1929,10 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     time_agent.register_for_execution(name="get_chat_history")(get_chat_history)
     helper1.register_for_llm(name="send_message_to_user", description="Send Message to User")(send_message_to_user)
     time_agent.register_for_execution(name="send_message_to_user")(send_message_to_user)
-    helper1.register_for_llm(name="send_presynthesize_video_to_user",
+    helper1.register_for_llm(name="send_presynthesized_video_to_user",
                              description="Sends a presynthesized message/video/dialogue to user using conv_id.")(
-        send_presynthesize_video_to_user)
-    time_agent.register_for_execution(name="send_presynthesize_video_to_user")(send_presynthesize_video_to_user)
+        send_presynthesized_video_to_user)
+    time_agent.register_for_execution(name="send_presynthesized_video_to_user")(send_presynthesized_video_to_user)
     helper1.register_for_llm(name="send_message_in_seconds",
                              description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")(
         send_message_in_seconds)
@@ -2015,10 +2016,10 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     visual_agent.register_for_execution(name="get_chat_history")(get_chat_history)
     helper2.register_for_llm(name="send_message_to_user", description="Send Message to User")(send_message_to_user)
     visual_agent.register_for_execution(name="send_message_to_user")(send_message_to_user)
-    helper2.register_for_llm(name="send_presynthesize_video_to_user",
+    helper2.register_for_llm(name="send_presynthesized_video_to_user",
                              description="Sends a presynthesized message/video/dialogue to user using conv_id.")(
-        send_presynthesize_video_to_user)
-    visual_agent.register_for_execution(name="send_presynthesize_video_to_user")(send_presynthesize_video_to_user)
+        send_presynthesized_video_to_user)
+    visual_agent.register_for_execution(name="send_presynthesized_video_to_user")(send_presynthesized_video_to_user)
     helper2.register_for_llm(name="send_message_in_seconds",
                              description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")(
         send_message_in_seconds)
@@ -2032,19 +2033,19 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
     assistant.description = 'Designed to handle specific tasks by interacting directly with other agents or the user. It acts as the primary orchestrator for task management and ensures tasks are completed efficiently'
     user_proxy.description = 'Acts as a user, performing tasks assigned by the Assistant Agent. It simulates user actions and provides results or feedback as required.'
-    helper.description = 'this is a helper agent that calls tools, facilitates task completion & assists other agents it cal perform tools/function like [send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory] calls and supporting backend processes. '
+    helper.description = 'this is a helper agent that calls tools, facilitates task completion & assists other agents it cal perform tools/function like [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory] calls and supporting backend processes. '
     multi_role_agent.description = 'Acts as an external agent with multi-functional capabilities. Note: This agent should never be directly invoked.'
     executor.description = 'A specialized agent responsible for executing code and handling response management. It ensures computational tasks are performed accurately and returns results effectively.'
     verify.description = 'this is a verify status agent. which will verify the status of current action.'
 
     time_agent.description = 'Designed to handle specific tasks by interacting directly with other agents or the user. It acts as the primary orchestrator for task management and ensures tasks are completed efficiently'
     time_user.description = 'Acts as a user, performing tasks assigned by the Assistant Agent. It simulates user actions and provides results or feedback as required.'
-    helper1.description = 'this is a helper agent that calls tools, facilitates task completion & assists other agents it cal perform tools/function like [send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory] calls and supporting backend processes. '
+    helper1.description = 'this is a helper agent that calls tools, facilitates task completion & assists other agents it cal perform tools/function like [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory] calls and supporting backend processes. '
     executor1.description = 'A specialized agent responsible for executing code and handling response management. It ensures computational tasks are performed accurately and returns results effectively.'
 
     visual_agent.description = 'Designed to handle specific tasks by interacting directly with other agents or the user. It acts as the primary orchestrator for task management and ensures tasks are completed efficiently'
     visual_user.description = 'Acts as a user, performing tasks assigned by the Assistant Agent. It simulates user actions and provides results or feedback as required.'
-    helper2.description = 'this is a helper agent that calls tools, facilitates task completion & assists other agents it cal perform tools/function like [send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory] calls and supporting backend processes. '
+    helper2.description = 'this is a helper agent that calls tools, facilitates task completion & assists other agents it cal perform tools/function like [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory] calls and supporting backend processes. '
     executor2.description = 'A specialized agent responsible for executing code and handling response management. It ensures computational tasks are performed accurately and returns results effectively.'
 
     def state_transition(last_speaker, groupchat):
@@ -2336,6 +2337,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             ToolMessageHandler(),
         ]
     )
+
     group_chat = autogen.GroupChat(
         agents=[assistant, helper, user_proxy, multi_role_agent, executor, chat_instructor, verify],
         messages=[],
