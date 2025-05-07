@@ -425,6 +425,19 @@ class ToolMessageHandler:
             return messages
 
         current_app.logger.info(f"ToolMessageHandler: Processing {len(messages)} messages")
+
+        # DEBUGGING: Print the entire conversation structure
+        current_app.logger.info(f"=== CONVERSATION STRUCTURE DEBUG ===")
+        for i, msg in enumerate(messages):
+            role = msg.get('role', 'unknown')
+            name = msg.get('name', 'unknown')
+            tool_calls_info = f", tool_calls=[{','.join([tc.get('id') for tc in msg.get('tool_calls', []) if 'id' in tc])}]" if 'tool_calls' in msg else ""
+            tool_call_id_info = f", tool_call_id={msg.get('tool_call_id')}" if 'tool_call_id' in msg else ""
+
+            debug_info = f"Message[{i}]: role={role}, name={name}{tool_calls_info}{tool_call_id_info}"
+            current_app.logger.info(debug_info)
+        current_app.logger.info(f"=== END CONVERSATION STRUCTURE ===")
+
         processed_messages = messages.copy()
 
         # STEP 1: Handle first message if it's a tool message (special case)
@@ -434,92 +447,128 @@ class ToolMessageHandler:
             processed_messages[0]['name'] = 'Helper'
             if 'tool_call_id' in processed_messages[0]:
                 del processed_messages[0]['tool_call_id']
-            if 'tool_responses' in processed_messages[0]:
-                del processed_messages[0]['tool_responses']
             processed_messages = processed_messages[1:]
 
-        # STEP 2: Map all tool calls to their IDs and source messages
-        tool_call_ids = {}
-        for idx, msg in enumerate(processed_messages):
+        # STEP 2: Build a proper sequence of messages
+        final_messages = []
+        tool_call_mapping = {}  # Maps tool_call_id -> assistant_idx
+        pending_tool_calls = []  # Track tool calls that need responses
+        assistant_tool_calls = {}  # Track tool calls grouped by assistant message index
+
+        for i, msg in enumerate(processed_messages):
+            # Track assistant messages with tool calls
             if msg.get('role') == 'assistant' and 'tool_calls' in msg:
+                assistant_idx = len(final_messages)
+                assistant_tool_calls[assistant_idx] = []
+
+                # Register all tool call IDs from this assistant message
                 for tool_call in msg.get('tool_calls', []):
                     if 'id' in tool_call:
-                        tool_call_ids[tool_call['id']] = {
-                            'message_idx': idx,
-                            'tool_call': tool_call
-                        }
+                        tool_call_id = tool_call['id']
+                        tool_call_mapping[tool_call_id] = assistant_idx
+                        pending_tool_calls.append(tool_call_id)  # Add to pending list
+                        assistant_tool_calls[assistant_idx].append(tool_call_id)
+                        current_app.logger.info(
+                            f"Registered tool_call_id {tool_call_id} at assistant index {assistant_idx}")
 
-        # Track which tool messages we'll keep and which assistant messages have tool_calls
-        assistant_with_tool_calls = set()
-        valid_tool_messages = set()
-
-        # STEP 3: First pass - identify valid tool messages and their parent assistant messages
-        for i, msg in enumerate(processed_messages):
-            if msg.get('role') == 'tool' and 'tool_call_id' in msg:
-                tool_call_id = msg.get('tool_call_id')
-                if tool_call_id in tool_call_ids:
-                    # Check if the tool message is after its corresponding assistant message
-                    assistant_idx = tool_call_ids[tool_call_id]['message_idx']
-                    if assistant_idx < i:
-                        valid_tool_messages.add(i)
-                        assistant_with_tool_calls.add(assistant_idx)
-
-        # STEP 4: Create final validated message list
-        valid_messages = []
-        for i, msg in enumerate(processed_messages):
-            current_msg = msg.copy()  # Create a copy to modify
-
-            # Remove function_call from non-assistant messages (OpenAI requirement)
-            if current_msg.get('role') != 'assistant' and 'function_call' in current_msg:
-                current_app.logger.warning(f'Removing function_call from non-assistant message')
-                current_msg = {k: v for k, v in current_msg.items() if k != 'function_call'}
-
-            # Handle tool messages - only keep valid ones
-            if current_msg.get('role') == 'tool' and 'tool_call_id' in current_msg:
-                if i in valid_tool_messages:
-                    valid_messages.append(current_msg)
-                else:
-                    # Convert invalid tool messages to user messages
-                    current_app.logger.warning(f'Converting invalid tool message to user message')
-                    valid_messages.append({
-                        'role': 'user',
-                        'name': 'Helper',
-                        'content': current_msg.get('content', '')
-                    })
-
-            # Handle assistant messages with tool_calls
-            elif current_msg.get('role') == 'assistant' and 'tool_calls' in current_msg:
-                # Special case: Keep recent messages' tool_calls intact (last 2 messages)
-                is_recent_message = (i >= len(processed_messages) - 2)
-
-                if is_recent_message:
-                    # Always preserve tool_calls in recent messages
-                    current_app.logger.info(f'Preserving recent tool call in message {i} to allow execution')
-                    valid_messages.append(current_msg)
-                elif i in assistant_with_tool_calls:
-                    # This assistant message has valid tool responses - keep it as is
-                    valid_messages.append(current_msg)
-                else:
-                    # No valid tool responses - sanitize by removing tool_calls
-                    current_app.logger.warning(f'Sanitizing assistant message with no valid tool responses')
-                    sanitized_msg = {k: v for k, v in current_msg.items() if k != 'tool_calls'}
-                    valid_messages.append(sanitized_msg)
-            else:
-                # Add all other messages as is
-                valid_messages.append(current_msg)
-
-        # STEP 5: Ensure no consecutive tool messages
-        final_messages = []
-        for i, msg in enumerate(valid_messages):
-            if i > 0 and msg.get('role') == 'tool' and valid_messages[i - 1].get('role') == 'tool':
-                current_app.logger.warning(f'Consecutive tool messages detected - converting second to user message')
-                final_messages.append({
-                    'role': 'user',
-                    'name': 'Helper',
-                    'content': msg.get('content', '')
-                })
-            else:
                 final_messages.append(msg)
+
+            # Handle tool messages - ensure they have proper tool_call_id
+            elif msg.get('role') == 'tool':
+                # If this tool message has a tool_call_id
+                if 'tool_call_id' in msg:
+                    tool_call_id = msg.get('tool_call_id')
+
+                    # Check if this tool_call_id exists in our mapping
+                    if tool_call_id in tool_call_mapping:
+                        # If this tool call ID is in our pending list, remove it
+                        if tool_call_id in pending_tool_calls:
+                            pending_tool_calls.remove(tool_call_id)  # Mark as responded
+
+                        current_app.logger.info(f"Valid tool message at index {i} with tool_call_id {tool_call_id}")
+                        final_messages.append(msg)
+                    else:
+                        # No matching tool_call_id found - convert to user message
+                        current_app.logger.warning(f"Tool message with invalid tool_call_id - converting to user")
+                        final_messages.append({
+                            'role': 'user',
+                            'name': 'Helper',
+                            'content': msg.get('content', '')
+                        })
+                else:
+                    # Tool message without tool_call_id
+                    # Check if it directly follows an assistant message with tool calls
+                    if len(final_messages) > 0 and final_messages[-1].get('role') == 'assistant' and 'tool_calls' in \
+                            final_messages[-1]:
+                        last_assistant_idx = len(final_messages) - 1
+
+                        # Get all pending tool calls from the previous assistant message
+                        tool_calls_for_assistant = [tc_id for tc_id in assistant_tool_calls.get(last_assistant_idx, [])
+                                                    if tc_id in pending_tool_calls]
+
+                        if len(tool_calls_for_assistant) == 1:
+                            # If only one pending tool call, assign it directly
+                            tool_call_id = tool_calls_for_assistant[0]
+                            current_app.logger.info(f"Adding missing tool_call_id {tool_call_id} to tool message")
+
+                            tool_msg = msg.copy()
+                            tool_msg['tool_call_id'] = tool_call_id
+                            pending_tool_calls.remove(tool_call_id)  # Mark as responded
+                            final_messages.append(tool_msg)
+                        elif len(tool_calls_for_assistant) > 1:
+                            # Multiple pending tool calls from the same assistant message
+                            # This is likely a case where one response is meant for multiple tool calls
+                            current_app.logger.info(
+                                f"Duplicating tool response for multiple tool calls: {tool_calls_for_assistant}")
+
+                            # Create a separate tool message for each pending tool call
+                            for tool_call_id in tool_calls_for_assistant:
+                                tool_msg = msg.copy()
+                                tool_msg['tool_call_id'] = tool_call_id
+                                final_messages.append(tool_msg)
+                                pending_tool_calls.remove(tool_call_id)  # Mark as responded
+                        else:
+                            # No pending tool calls for this assistant message
+                            current_app.logger.warning(
+                                f"Tool message without tool_call_id and no pending calls - converting to user")
+                            final_messages.append({
+                                'role': 'user',
+                                'name': 'Helper',
+                                'content': msg.get('content', '')
+                            })
+                    else:
+                        # Tool message without tool_call_id and not following an assistant with tool calls
+                        current_app.logger.warning(
+                            f"Tool message without tool_call_id and no preceding assistant - converting to user")
+                        final_messages.append({
+                            'role': 'user',
+                            'name': 'Helper',
+                            'content': msg.get('content', '')
+                        })
+            else:
+                # For all other message types
+                final_messages.append(msg)
+
+        # STEP 3: Check for any remaining pending tool calls
+        if pending_tool_calls:
+            current_app.logger.warning(f"Warning: These tool calls have no responses: {pending_tool_calls}")
+
+            # Create placeholder responses for any remaining tool calls
+            for tool_call_id in pending_tool_calls:
+                if tool_call_id in tool_call_mapping:
+                    assistant_idx = tool_call_mapping[tool_call_id]
+                    # Only add placeholder if the assistant message still exists in our final list
+                    if assistant_idx < len(final_messages) and final_messages[assistant_idx].get('role') == 'assistant':
+                        assistant_msg = final_messages[assistant_idx]
+                        placeholder = {
+                            'role': 'tool',
+                            'name': assistant_msg.get('name', 'Assistant'),
+                            'tool_call_id': tool_call_id,
+                            'content': "Placeholder response"
+                        }
+                        # Insert the placeholder right after the assistant message
+                        final_messages.insert(assistant_idx + 1, placeholder)
+                        current_app.logger.info(f"Added placeholder response for tool_call_id {tool_call_id}")
 
         current_app.logger.info(f"Processed {len(messages)} messages into {len(final_messages)} validated messages")
         return self.validate_messages(final_messages)
@@ -848,10 +897,10 @@ def create_visual_agent(user_id,prompt_id):
             Your responsibilities:
             2. Use the provided Recipe for more details related to the actions.
             3. Only use the "send_message_to_roles" tool when contacting personas other than,Executor,multi_role_agent.
-            4. Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesize_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory]
+            4. Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory]
             5. Keep track of action and only go to next action when the current action is completed successfully
             6. Always use code from recipe given below
-            7. If there is any action which is like to perform a task continously you should not do it.
+            7. If there is any action which is like to perform a task continuously you should not do it.
             8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
             9. IMPORTANT instruction: If you want to ask something or send something to the user, always use this format: @user {{'message_2_user':'message here'}}
             10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.

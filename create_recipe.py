@@ -895,7 +895,6 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         try:
             if re.search(pattern2, messages[-1]["content"]):
                 current_app.logger.info("String contains @User returning author")
-                messages[-1]["content"] = messages[-1]["content"].replace('@User', '')
                 return author
             if re.search(pattern3, messages[-1]["content"]):
                 current_app.logger.info("String contains @StatusVerifier returning StatusVerifier")
