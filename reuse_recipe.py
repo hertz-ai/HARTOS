@@ -1175,6 +1175,14 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
         print(f"avtar_id: {avatar_id}:\n{text[:10]}....\n")
 
+        if avatar_id == "default":
+            avatar_id_int = 1  # Use appropriate default ID number
+        else:
+            try:
+                avatar_id_int = int(avatar_id)
+            except ValueError:
+                avatar_id_int = 1  # Fallback to default ID if conversion fails
+
         headers = {'Content-Type': 'application/json'}
         data = {}
         data["text"] = text
@@ -1222,8 +1230,8 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             data["audio_sample_url"] = None
             data['voice_id'] = None
         conv_id = save_conversation_db(text, user_id, prompt_id, database_url, request_id)
-        data['conv_id'] = conv_id
-        data['avatar_id'] = avatar_id
+        data['conv_id'] = int(conv_id)  # Ensure it's an integer
+        data['avatar_id'] = avatar_id_int  # Use the integer version
         data['timeout'] = timeout
         try:
             video_link = requests.post("{}/video_generate_save".format(database_url),
