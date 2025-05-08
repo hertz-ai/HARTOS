@@ -1,0 +1,167 @@
+openapi: 3.1.0
+info:
+  title: Hevolve-db-app
+  description: The Hevolve-db-app API provides programmatic access to educational resources such as student information, text-to-image conversion, and course-related book details. Explore the various endpoints to retrieve students by ID, convert textual prompts into images, and search or list available books.
+  version: '1.0'
+servers:
+  - url: https://azurekong.hertzai.com:8443/db
+
+tags:
+  - name: Students
+    description: Retrieve student information using specific search criteria.
+  - name: Text To Image
+    description: Convert given textual prompts into visual images.
+  - name: Coursebatchbook
+    description: Access operations for searching and listing available course-related books.
+  - name: Character Animation
+    description: animate user selected image as per prompt given by user. take two parameter user id and prompt.
+
+paths:
+  /getstudent_by_user_id:
+    post:
+      tags:
+        - Students
+      summary: Retrieve Student Information by User ID
+      operationId: getstudent_by_id_getstudent_by_user_id_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GetUserByID'
+        required: true
+      responses:
+        '200':
+          description: Successfully retrieved student information.
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: The request contained invalid parameters or failed validation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+
+  /getbooks:
+    get:
+      tags:
+        - Coursebatchbook
+      summary: Retrieve List of Books
+      operationId: getbook_getbooks_get
+      parameters:
+        - name: skip
+          in: query
+          schema:
+            type: integer
+            default: 0
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+      responses:
+        '200':
+          description: Successfully retrieved the list of books.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/BookInfo'
+        '422':
+          description: The request contained invalid parameters or failed validation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  
+  /generate_stable_image:
+    post: 
+      tags: 
+        -  Character Animation
+      summary: Convert the selected teacher avatar as per prompt given by user
+      operationId: character_animation
+      parameters: 
+        - name: user_id
+          in:  query
+          required: true
+          schema: 
+            type: integer
+            title: User Id
+        - name: prompt
+          in: query
+          required: true
+          schema: 
+            type: string
+            title: Prompt
+      responses: 
+        '200':
+          description: Successful Response
+          content: 
+            application/json:
+              schema: 
+                $ref: '#/components/schemas/CharacterAnimation'
+        '422':
+          description: Validation Error
+          content: 
+            application/json:
+              schema: 
+                $ref: "#/components/schemas/HTTPValidationError"  
+components:
+  schemas:
+    BookInfo:
+      type: object
+      properties:
+        book_id:
+          type: integer
+          title: Book ID
+        name:
+          type: string
+          title: Book Name
+      required:
+        - book_id
+        - name
+
+    GetUserByID:
+      type: object
+      properties:
+        user_id:
+          type: integer
+          title: User ID
+      required:
+        - user_id
+
+    TextToImageResponse:
+      type: object
+      properties:
+        imageUrl:
+          type: string
+          description: URL of the generated image
+
+    CharacterAnimation:
+      type: object
+      properties: 
+        imageUrl:
+          type: string
+          description: URL of image generated
+
+    HTTPValidationError:
+      type: object
+      properties:
+        detail:
+          type: array
+          items:
+            $ref: '#/components/schemas/ValidationError'
+
+    ValidationError:
+      type: object
+      properties:
+        loc:
+          type: array
+          items:
+            type: string
+        msg:
+          type: string
+        type:
+          type: string
+

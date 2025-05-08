@@ -2,6 +2,12 @@
 ==============
 
 ![build](https://github.com/buttons/github-buttons/workflows/build/badge.svg)
+sudo docker build -t langchain_gpt1:v1 .
+
+
+sudo docker run -dp 5000:5000 --network host -v "/opt/hzai-langchain/logs/langchain.log:/app/langchain.log" -v "/opt/hzai-langchain/mount/images:/app/output_images/" -v "/opt/hzai-langchain/mount/prompts:/app/prompts/" --name langchain langchain_gpt1:v1
+LinkedIn
+
 [![LinkedIn](https://img.shields.io/badge/linkedin-%230077B5.svg?style=for-the-badge&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/aboniasojasingarayar/)&nbsp; [![Medium Articles](https://img.shields.io/badge/medium-%230077B5.svg?style=for-the-badge&logo=medium&logoColor=white)](https://medium.com/@abonia)
 
 🤖 This is a chatbot that uses a combination of Langchain, LLM (GPT-3), and Chroma to generate responses based on a user's input and a provided document or context.
@@ -76,3 +82,7 @@ License
 ---
 
 📝 This project is licensed under the MIT License. See the LICENSE file for details.
+
+
+docker build -t langchain_gpt .
+docker run -dp 5000:5000 --name langchain langchain_gpt:latest
