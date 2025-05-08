@@ -246,7 +246,7 @@ def strip_json_values(obj: Any) -> Any:
     - If list/tuple: recurse on each element, preserving order & type.  
     - Otherwise (leaf): return redacted marker.
     """
-    current_app.logger.info(f"GOT JSON FOR STRIPPING: {obj}")
+    #current_app.logger.info(f"GOT JSON FOR STRIPPING: {obj}")
     # 1. Dig into dict
     if isinstance(obj, dict):
         return { key: strip_json_values(val) for key, val in obj.items() }
@@ -425,18 +425,23 @@ class ToolMessageHandler:
             return messages
 
         current_app.logger.info(f"ToolMessageHandler: Processing {len(messages)} messages")
+        # DEBUGGING: Print the entire conversation structure with full message details
+        # current_app.logger.info(f"=== FULL INPUT MESSAGES DEBUG ===")
+        # for i, msg in enumerate(messages):
+        #     current_app.logger.info(f"Message[{i}]: {json.dumps(msg, indent=2)}")
+        # current_app.logger.info(f"=== END FULL INPUT MESSAGES DEBUG ===")
 
         # DEBUGGING: Print the entire conversation structure
-        current_app.logger.info(f"=== CONVERSATION STRUCTURE DEBUG ===")
-        for i, msg in enumerate(messages):
-            role = msg.get('role', 'unknown')
-            name = msg.get('name', 'unknown')
-            tool_calls_info = f", tool_calls=[{','.join([tc.get('id') for tc in msg.get('tool_calls', []) if 'id' in tc])}]" if 'tool_calls' in msg else ""
-            tool_call_id_info = f", tool_call_id={msg.get('tool_call_id')}" if 'tool_call_id' in msg else ""
-
-            debug_info = f"Message[{i}]: role={role}, name={name}{tool_calls_info}{tool_call_id_info}"
-            current_app.logger.info(debug_info)
-        current_app.logger.info(f"=== END CONVERSATION STRUCTURE ===")
+        # current_app.logger.info(f"=== CONVERSATION STRUCTURE DEBUG ===")
+        # for i, msg in enumerate(messages):
+        #     role = msg.get('role', 'unknown')
+        #     name = msg.get('name', 'unknown')
+        #     tool_calls_info = f", tool_calls=[{','.join([tc.get('id') for tc in msg.get('tool_calls', []) if 'id' in tc])}]" if 'tool_calls' in msg else ""
+        #     tool_call_id_info = f", tool_call_id={msg.get('tool_call_id')}" if 'tool_call_id' in msg else ""
+        #
+        #     debug_info = f"Message[{i}]: role={role}, name={name}{tool_calls_info}{tool_call_id_info}"
+        #     current_app.logger.info(debug_info)
+        # current_app.logger.info(f"=== END CONVERSATION STRUCTURE ===")
 
         processed_messages = messages.copy()
 
