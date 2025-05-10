@@ -897,7 +897,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             5. If you want to send some pre synthesized realistic videos to user then ask helper agent to use send_presynthesized_video_to_user tool.
             6. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the pre synthesized generated video if it is successful.
             7. If you receive a request to perform a task or action on the user's computer, or if the request is related to Chrome or any browser, you should ask @Helper to use the `execute_windows_command` tool.
-            8. If you want the user's ID then ask the @Helper to use 'get_user_id' tool and do not prompt the user for their user_id, never mention the user_id to the user.
+            8. If you want the user's ID then ask the @Helper to use 'get_user_id' tool and do not prompt the user for their user_id, never mention the user_id to the user. Important: Get the user Id yourself always, Do not ask the user_id from User ever.
             9. If you want to do a google search then you should ask the @Helper to use the 'google_search' tool.        
         10. **Never reveal actions, internal processes, or tools to the user**. Do not ask for user confirmation unless absolutely necessary(You can assume normal things like user's interests).
         11. **To communicate with the {role} user**, always use this format: `@user {response_format}`.
@@ -1118,14 +1118,64 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                              description="Use this to Store and retrieve data using key-value storage system")
     def save_data_in_memory(key: Annotated[str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
                             value: Annotated[Optional[Any], "Value you want to store; may be int, str, float, bool, dict, list, json object."] = None) -> str:
+        """Store data with validation to prevent corruption."""
         current_app.logger.info('INSIDE save_data_in_memory')
-        keys = key.split('.')
-        d = agent_data.setdefault(prompt_id, {})
 
-        for k in keys[:-1]:
-            d = d.setdefault(k, {})
-        d[keys[-1]] = value
-        return f'{agent_data[prompt_id]}'
+        # Validate the input data
+        try:
+            # Step 1: Use the existing JSON repair function to sanitize input
+            if isinstance(value, str) and (value.startswith('{') or value.startswith('[')):
+                # If the value is a JSON string, repair it
+                value = retrieve_json(value)
+                current_app.logger.info(f"REPAIRED JSON STRING: {value}")
+
+            # Step 2: Force a JSON serialization/deserialization cycle to validate structure
+            if value is not None:
+                # This will fail if the structure isn't JSON-compatible
+                json_str = json.dumps(value)
+                validated_value = json.loads(json_str)
+                current_app.logger.info(f"VALIDATED VALUE (post JSON cycle): {validated_value}")
+            else:
+                validated_value = None
+
+            # Step 3: Store the validated data
+            keys = key.split('.')
+            d = agent_data.setdefault(prompt_id, {})
+            for k in keys[:-1]:
+                d = d.setdefault(k, {})
+
+            d[keys[-1]] = validated_value
+            current_app.logger.info(f"VALUES STORED IN AGENT DATA: {validated_value}")
+            current_app.logger.info(f"FULL AGENT DATA AT KEY: {d}")
+
+            # Step 4: Verify storage was successful
+            try:
+                # Attempt to read back the data to verify it was stored correctly
+                stored_value = get_data_by_key(key)
+                current_app.logger.info(f"VERIFICATION - READ BACK VALUE: {stored_value}")
+
+                # Optional: compare stored_value with what we intended to store
+                if stored_value == "Key not found in stored data.":
+                    current_app.logger.error(f"VERIFICATION FAILED: Data not properly stored at key {key}")
+            except Exception as e:
+                current_app.logger.error(f"VERIFICATION ERROR: {str(e)}")
+
+            return f'{agent_data[prompt_id]}'
+
+        except json.JSONDecodeError as je:
+            error_msg = f"Invalid JSON structure in value: {str(je)}"
+            current_app.logger.error(error_msg)
+            return f"Error: {error_msg} - Data not saved"
+
+        except TypeError as te:
+            error_msg = f"Type error in value: {str(te)}"
+            current_app.logger.error(error_msg)
+            return f"Error: {error_msg} - Data not saved"
+
+        except Exception as e:
+            error_msg = f"Unexpected error saving data: {str(e)}"
+            current_app.logger.error(error_msg)
+            return f"Error: {error_msg} - Data not saved"
 
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",

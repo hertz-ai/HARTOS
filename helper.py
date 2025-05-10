@@ -23,6 +23,8 @@ from bs4 import BeautifulSoup
 from langchain.memory import ZepMemory
 from json_repair import repair_json
 
+from create_recipe import log_tool_execution
+
 # from autobahn.twisted.wamp import ApplicationSession, ApplicationRunner
 # from twisted.internet.defer import inlineCallbacks
 with open("config.json", 'r') as f:

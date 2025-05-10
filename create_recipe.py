@@ -27,6 +27,66 @@ from json_repair import repair_json
 from crossbarhttp import Client
 client = Client('http://aws_rasa.hertzai.com:8088/publish')
 
+import logging
+import os
+import sys
+from datetime import datetime
+from functools import wraps
+
+# Set up a dedicated logger that doesn't depend on Flask context
+log_dir = "logs"
+if not os.path.exists(log_dir):
+    os.makedirs(log_dir)
+
+# Create a custom logger with timestamp in filename
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+log_file = os.path.join(log_dir, f"agent_system_{timestamp}.log")
+
+# Configure the logger
+tool_logger = logging.getLogger("agent_logger")
+tool_logger.setLevel(logging.DEBUG)
+
+# File handler with rotation (10 MB max size, keep 10 backup files)
+file_handler = logging.handlers.RotatingFileHandler(
+    log_file,
+    maxBytes=10*1024*1024,  # 10 MB
+    backupCount=10
+)
+file_handler.setLevel(logging.DEBUG)
+
+# Console handler
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)  # Less verbose on console
+
+# Create formatter with timestamp, level, and message
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s')
+file_handler.setFormatter(formatter)
+console_handler.setFormatter(formatter)
+
+# Add handlers to logger
+tool_logger.addHandler(file_handler)
+tool_logger.addHandler(console_handler)
+tool_logger.propagate = False  # Prevent double logging
+
+# Decorator for logging tool execution
+
+
+def log_tool_execution(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        tool_logger.info(f"TOOL EXECUTION START: {func.__name__}")
+        tool_logger.info(f"Arguments: {args}, Keyword Arguments: {kwargs}")
+        try:
+            result = func(*args, **kwargs)
+            tool_logger.info(f"TOOL EXECUTION SUCCESS: {func.__name__}")
+            tool_logger.info(f"Result: {result[:100]}..." if isinstance(result, str) and len(result) > 100 else f"Result: {result}")
+            return result
+        except Exception as e:
+            tool_logger.error(f"TOOL EXECUTION ERROR: {func.__name__} - {str(e)}")
+            tool_logger.exception("Exception details:")
+            raise
+    return wrapper
+
 scheduler = BackgroundScheduler()
 scheduler.start()
 
@@ -256,11 +316,11 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             5. If you want to send some pre synthesized realistic videos to user then ask helper agent to use send_presynthesized_video_to_user tool.
             6. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the pre synthesized generated video if it is successful.
             7. If you receive a request to perform a task or action on the user's computer, or if the request is related to Chrome or any browser, you should ask @Helper to use the `execute_windows_command` tool.
-            8. If you want the user's ID then ask the @Helper to use 'get_user_id' tool and do not prompt the user for their user_id, never mention the user_id to the user.
+            8. If you want the user's ID then ask the @Helper to use 'get_user_id' tool and do not prompt the user for their user_id, never mention the user_id to the user. Important: Get the user Id yourself always, Do not ask the user_id from User ever.
             9. If you want to do a google search then you should ask the @Helper to use the 'google_search' tool.
 
         •Error Handling:
-            If there's an error or failure, respond with a structured error message format: {"status":"error","action":"current action","action_id":1/2/3...,"message":"message here"}
+            If there's an error or failure try to self heal first, if self healing did not work respond with a structured error message format: {"status":"error","action":"current action","action_id":1/2/3...,"message":"message here"}
             For success, ask the status verifier agent to verify the status of completion for current action
 
         •Calling Other Agents:
@@ -438,24 +498,73 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     helper.register_for_llm(name="text_2_image", description="Text to image Creator")(helper_fun.txt2img)
     assistant.register_for_execution(name="text_2_image")(helper_fun.txt2img)
 
-
+    @log_tool_execution
     def camera_inp(inp: Annotated[str, "The Question to check from visual context"])->str:
         return helper_fun.get_user_camera_inp(inp,user_id)
     helper.register_for_llm(name="get_user_camera_inp", description="Get user's visual information to process somethings")(camera_inp)
     assistant.register_for_execution(name="get_user_camera_inp")(camera_inp)
 
+    @log_tool_execution
     def save_data_in_memory(key: Annotated[str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
                             value: Annotated[Optional[Any], "Value you want to store; may be int, str, float, bool, dict, list, json object."] = None) -> str:
-        current_app.logger.info('INSIDE save_data_in_memory')
-        current_app.logger.info(f"VALUES IN SAVE_DATA_IN_MEMORY: {value}")
-        current_app.logger.info(f"VALUES ALREADY AVAILABLE IN AGENT DATA: {agent_data[prompt_id]}")
-        keys = key.split('.')
-        d = agent_data.setdefault(prompt_id, {})
+        """Store data with validation to prevent corruption."""
+        tool_logger.info('INSIDE save_data_in_memory')
 
-        for k in keys[:-1]:
-            d = d.setdefault(k, {})
-        d[keys[-1]] = value
-        return f'{agent_data[prompt_id]}'
+        # Validate the input data
+        try:
+            # Step 1: Use the existing JSON repair function to sanitize input
+            if isinstance(value, str) and (value.startswith('{') or value.startswith('[')):
+                # If the value is a JSON string, repair it
+                value = retrieve_json(value)
+                tool_logger.info(f"REPAIRED JSON STRING: {value}")
+
+            # Step 2: Force a JSON serialization/deserialization cycle to validate structure
+            if value is not None:
+                # This will fail if the structure isn't JSON-compatible
+                json_str = json.dumps(value)
+                validated_value = json.loads(json_str)
+                tool_logger.info(f"VALIDATED VALUE (post JSON cycle): {validated_value}")
+            else:
+                validated_value = None
+
+            # Step 3: Store the validated data
+            keys = key.split('.')
+            d = agent_data.setdefault(prompt_id, {})
+            for k in keys[:-1]:
+                d = d.setdefault(k, {})
+
+            d[keys[-1]] = validated_value
+            tool_logger.info(f"VALUES STORED IN AGENT DATA: {validated_value}")
+            tool_logger.info(f"FULL AGENT DATA AT KEY: {d}")
+
+            # Step 4: Verify storage was successful
+            try:
+                # Attempt to read back the data to verify it was stored correctly
+                stored_value = get_data_by_key(key)
+                tool_logger.info(f"VERIFICATION - READ BACK VALUE: {stored_value}")
+
+                # Optional: compare stored_value with what we intended to store
+                if stored_value == "Key not found in stored data.":
+                    tool_logger.error(f"VERIFICATION FAILED: Data not properly stored at key {key}")
+            except Exception as e:
+                tool_logger.error(f"VERIFICATION ERROR: {str(e)}")
+
+            return f'{agent_data[prompt_id]}'
+
+        except json.JSONDecodeError as je:
+            error_msg = f"Invalid JSON structure in value: {str(je)}"
+            tool_logger.error(error_msg)
+            return f"Error: {error_msg} - Data not saved"
+
+        except TypeError as te:
+            error_msg = f"Type error in value: {str(te)}"
+            tool_logger.error(error_msg)
+            return f"Error: {error_msg} - Data not saved"
+
+        except Exception as e:
+            error_msg = f"Unexpected error saving data: {str(e)}"
+            tool_logger.error(error_msg)
+            return f"Error: {error_msg} - Data not saved"
 
     helper.register_for_llm(name="save_data_in_memory", description="Use this to Store and retrieve data using key-value storage system")(save_data_in_memory)
     assistant.register_for_execution(name="save_data_in_memory")(save_data_in_memory)
@@ -467,6 +576,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     helper.register_for_llm(name="get_saved_metadata", description="Returns the schema of the json from internal memory with all keys but without actual values.")(get_saved_metadata)
     assistant.register_for_execution(name="get_saved_metadata")(get_saved_metadata)
 
+    @log_tool_execution
     def get_data_by_key(key: Annotated[str, "Key path for retrieving data. Use dot notation for nested keys (e.g., 'user.info.name')."]) -> str:
         keys = key.split('.')
         d = agent_data.get(prompt_id, {})
@@ -482,29 +592,32 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     helper.register_for_llm(name="get_data_by_key", description="Returns all data from the internal Memory using key")(get_data_by_key)
     assistant.register_for_execution(name="get_data_by_key")(get_data_by_key)
 
+    @log_tool_execution
     def get_user_id() -> str:
-        current_app.logger.info('INSIDE get_user_id')
+        tool_logger.info('INSIDE get_user_id')
         return f'{user_id}'
 
 
     helper.register_for_llm(name="get_user_id", description="Returns the unique identifier (user_id) of the current user.")(get_user_id)
     assistant.register_for_execution(name="get_user_id")(get_user_id)
 
+    @log_tool_execution
     def get_prompt_id() -> str:
-        current_app.logger.info('INSIDE get_prompt_id')
+        tool_logger.info('INSIDE get_prompt_id')
         return f'{prompt_id}'
 
 
     helper.register_for_llm(name="get_prompt_id", description="Returns the unique identifier (prompt_id) associated with the current prompt or conversation.")(get_prompt_id)
     assistant.register_for_execution(name="get_prompt_id")(get_prompt_id)
 
+    @log_tool_execution
     def Generate_video(text: Annotated[str, "Text to be used for video generation"],
                        avatar_id: Annotated[int, "Unique identifier for the avatar"],
                        realtime: Annotated[bool,"If True, response is fast but less realistic by default it should be true; if False, response is realistic but slower"]) -> str:
-        current_app.logger.info('INSIDE Generate_video')
+        tool_logger.info('INSIDE Generate_video')
         database_url = 'https://mailer.hertzai.com'
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
-        current_app.logger.info(f"avtar_id: {avatar_id}:\n{text[:10]}....\n")
+        tool_logger.info(f"avtar_id: {avatar_id}:\n{text[:10]}....\n")
 
         headers = {'Content-Type': 'application/json'}
         data = {}
@@ -569,8 +682,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     helper.register_for_llm(name="Generate_video", description="Generate/presynthesize video with text and save it in database")(Generate_video)
     assistant.register_for_execution(name="Generate_video")(Generate_video)
 
+    @log_tool_execution
     def get_user_uploaded_file() -> str:
-        current_app.logger.info('INSIDE get_user_uploaded_file')
+        tool_logger.info('INSIDE get_user_uploaded_file')
         if recent_file_id[user_id]:
             return f'Got user uploaded file the file_id is {recent_file_id[user_id]}'
 
@@ -579,9 +693,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     helper.register_for_llm(name="get_user_uploaded_file", description="get user's recent uploaded files")(get_user_uploaded_file)
     assistant.register_for_execution(name="get_user_uploaded_file")(get_user_uploaded_file)
 
-
+    @log_tool_execution
     def img2txt(image_url: Annotated[str, "image url of which you want text"],text: Annotated[str, "the details you want from image"]='Describe the Images & Text data in this image in detail') -> str:
-        current_app.logger.info('INSIDE img2txt')
+        tool_logger.info('INSIDE img2txt')
         url = "http://azurekong.hertzai.com:8000/llava/image_inference"
 
         payload = {
@@ -601,10 +715,11 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     helper.register_for_llm(name="get_text_from_image", description="Image to Text")(img2txt)
     assistant.register_for_execution(name="get_text_from_image")(img2txt)
 
+    @log_tool_execution
     def create_scheduled_jobs(interval_sec: Annotated[int, "time between two Interval in seconds."],
                             job_description: Annotated[str, "Description of the job to be performed"],
                             cron_expression: Annotated[Optional[str], "Cron expression for scheduling. Example: '0 9 * * 1-5' (Runs at 9:00 AM, Monday to Friday). If the interval is greater than 60 seconds or it needs to be executed at a dynamic cron time this argument is Mandatory else None"]=None) -> str:
-        current_app.logger.info('INSIDE create_scheduled_jobs')
+        tool_logger.info('INSIDE create_scheduled_jobs')
 
         # actual_execution_time = sum(task_time[prompt_id]['times'][-1])
         # if interval_sec < actual_execution_time:
@@ -618,27 +733,28 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         #         trigger = CronTrigger.from_crontab(cron_expression)
         #         job_id = f"job_{int(time.time())}"
         #         scheduler.add_job(execute_python_file, trigger=trigger, id=job_id, args=[job_description, int(user_id),int(prompt_id)])
-        #         current_app.logger.info('Successfully created scheduler job')
+        #         tool_logger.info('Successfully created scheduler job')
         #         return 'Successfully created scheduler job'
         #     else:
         #         trigger = IntervalTrigger(seconds=int(interval_sec))
         #         job_id = f"job_{int(time.time())}"
         #         scheduler.add_job(execute_python_file, trigger=trigger, id=job_id, args=[job_description, int(user_id),int(prompt_id)])
-        #         current_app.logger.info('Successfully created scheduler job')
+        #         tool_logger.info('Successfully created scheduler job')
         #         return 'Successfully created scheduler job'
         # except Exception as e:
-        #     current_app.logger.error(f'Error in create_scheduled_jobs: {str(e)}')
+        #     tool_logger.error(f'Error in create_scheduled_jobs: {str(e)}')
         #     return f"Error creating scheduled job: {str(e)}"
         return 'Added this schedule job in creation process will do it at the end. you can go ahead and mark this action as completed.'
 
     helper.register_for_llm(name="create_scheduled_jobs", description="Creates time-based jobs using APScheduler to schedule jobs")(create_scheduled_jobs)
     assistant.register_for_execution(name="create_scheduled_jobs")(create_scheduled_jobs)
 
+    @log_tool_execution
     def send_message_to_user(text: Annotated[str, "Text you want to send to the user"],
                          avatar_id: Annotated[Optional[str], "Unique identifier for the avatar"] = None,
                          response_type: Annotated[Optional[str], "Response mode: 'Realistic' (slower, better quality) or 'Realtime' (faster, lower quality)"] = 'Realtime') -> str:
-        current_app.logger.info('INSIDE send_message_to_user')
-        current_app.logger.info(f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
+        tool_logger.info('INSIDE send_message_to_user')
+        tool_logger.info(f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
         #TODO add avatar_id and conv_id and response_type
         thread = threading.Thread(target=send_message_to_user1, args=(user_id, text, '',prompt_id))
@@ -648,19 +764,21 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     helper.register_for_llm(name="send_message_to_user", description="Sends a message/information to user. You can use this if you want to ask a question")(send_message_to_user)
     assistant.register_for_execution(name="send_message_to_user")(send_message_to_user)
 
+    @log_tool_execution
     def send_presynthesized_video_to_user(conv_id: Annotated[str, "Conversation ID associated with the text from memory"]) -> str:
-        current_app.logger.info('INSIDE send_presynthesized_video_to_user')
-        current_app.logger.info(f'SENDING DATA 2 user with value: conv_id:{conv_id}.')
+        tool_logger.info('INSIDE send_presynthesized_video_to_user')
+        tool_logger.info(f'SENDING DATA 2 user with value: conv_id:{conv_id}.')
         return 'Message sent successfully to user'
 
     helper.register_for_llm(name="send_presynthesized_video_to_user", description="Sends a presynthesized message/video/dialogue to user using conv_id.")(send_presynthesized_video_to_user)
     assistant.register_for_execution(name="send_presynthesized_video_to_user")(send_presynthesized_video_to_user)
 
+    @log_tool_execution
     def send_message_in_seconds(text: Annotated[str, "text to send to user"],
                        delay: Annotated[int, "time to wait in seconds before sending text"],
                        conv_id: Annotated[Optional[int], "conv_id for this text if not available make it None"],) -> str:
-        current_app.logger.info('INSIDE send_message_in_seconds')
-        current_app.logger.info(f'with text:{text}. and waiting time: {delay} conv_id: {conv_id}')
+        tool_logger.info('INSIDE send_message_in_seconds')
+        tool_logger.info(f'with text:{text}. and waiting time: {delay} conv_id: {conv_id}')
         run_time = datetime.fromtimestamp(time.time() + delay)
         scheduler.add_job(send_message_to_user1, 'date', run_date=run_time, args=[user_id, text, '',prompt_id])
         return 'Message scheduled successfully'
@@ -668,36 +786,40 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     helper.register_for_llm(name="send_message_in_seconds", description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")(send_message_in_seconds)
     assistant.register_for_execution(name="send_message_in_seconds")(send_message_in_seconds)
 
+    @log_tool_execution
     def get_chat_history(text: Annotated[str, "Text related to which you want history"],
                          start: Annotated[Optional[str], "start date in format %Y-%m-%dT%H:%M:%S.%fZ"] = None,
                          end: Annotated[Optional[str], "end date in format %Y-%m-%dT%H:%M:%S.%fZ"] = None) -> str:
-        current_app.logger.info('INSIDE get_chat_history')
+        tool_logger.info('INSIDE get_chat_history')
         return helper_fun.get_time_based_history(text, f'user_{user_id}', start, end)
     helper.register_for_llm(name="get_chat_history", description="Get Chat history based on text & start & end date")(get_chat_history)
     assistant.register_for_execution(name="get_chat_history")(get_chat_history)
 
+    @log_tool_execution
     def google_search(text: Annotated[str, "Text/Query which you want to search"]) -> str:
-        current_app.logger.info('INSIDE google search')
+        tool_logger.info('INSIDE google search')
         return helper_fun.top5_results(text)
     helper.register_for_llm(name="google_search", description="web/google/bing search api tool for a given query")(google_search)
     assistant.register_for_execution(name="google_search")(google_search)
 
+    @log_tool_execution
     def get_user_details()->str:
-        current_app.logger.info('INSIDE get user details')
+        tool_logger.info('INSIDE get user details')
         return helper_fun.parse_user_id(user_id)
     helper.register_for_llm(name="get_user_details", description="Get User details like name, dob, gender")(get_user_details)
     assistant.register_for_execution(name="get_user_details")(get_user_details)
 
+    @log_tool_execution
     async def execute_windows_command(instructions: Annotated[str, "Command in plain English to execute on the Windows machine"])->str:
         """
         Executes a command on a Windows machine and returns the response within 500 seconds.
         """
         try:
-            current_app.logger.info('INSIDE execute_windows_command')
+            tool_logger.info('INSIDE execute_windows_command')
             topic = f'com.hertzai.hevolve.action.{user_id}'
-            current_app.logger.info(f'calling {topic} for 5 second')
+            tool_logger.info(f'calling {topic} for 5 second')
             response = await subscribe_and_return({'prompt_id':prompt_id},topic,5)  # Wait for the RPC response
-            current_app.logger.info(f'Response from call of {topic}: {response}')
+            tool_logger.info(f'Response from call of {topic}: {response}')
             if not response:
                 return 'Ask user to to go to hertzai.com login and start the windows companion app'
             crossbar_message = {
@@ -711,16 +833,16 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
                 'langchain_server':True
             }
             topic = 'com.hertzai.hevolve.action'
-            current_app.logger.info(f'calling {topic} for 8000 second')
+            tool_logger.info(f'calling {topic} for 8000 second')
             response = await subscribe_and_return(crossbar_message,topic)  # Wait for the RPC response
-            current_app.logger.info(f'THIS IS RESPONSE type: {type(response)} value: {response}')
+            tool_logger.info(f'THIS IS RESPONSE type: {type(response)} value: {response}')
             if response['status'] == 'success':
                 return 'successfully ran the command in user\' computer.'
             else:
                 return 'Not able to perform this action now please try later'
         except Exception as e:
             error_message = traceback.format_exc()  # Capture full traceback
-            current_app.logger.error(f"Error executing command:\n{error_message}")
+            tool_logger.error(f"Error executing command:\n{error_message}")
             return {"error": e}
 
     helper.register_for_llm(name="execute_windows_command", description="Processes user-defined commands on a personal Windows or Android system.")(execute_windows_command)
@@ -1107,15 +1229,16 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     helper1.register_for_llm(name="text_2_image", description="Text to image Creator")(helper_fun.txt2img)
     time_agent.register_for_execution(name="text_2_image")(helper_fun.txt2img)
 
-
+    @log_tool_execution
     def camera_inp(inp: Annotated[str, "The Question to check from visual context"])->str:
         return helper_fun.get_user_camera_inp(inp, user_id)
     helper1.register_for_llm(name="get_user_camera_inp", description="Get user's visual information to process somethings")(camera_inp)
     time_agent.register_for_execution(name="get_user_camera_inp")(camera_inp)
 
+    @log_tool_execution
     def save_data_in_memory(key: Annotated[str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
                             value: Annotated[Optional[Any], "Value you want to store; may be int, str, float, bool, dict, list, json object."] = None) -> str:
-        current_app.logger.info('INSIDE save_data_in_memory')
+        tool_logger.info('INSIDE save_data_in_memory')
         keys = key.split('.')
         d = agent_data.setdefault(prompt_id, {})
 
@@ -1127,6 +1250,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     helper1.register_for_llm(name="save_data_in_memory", description="Use this to Store and retrieve data using key-value storage system")(save_data_in_memory)
     time_agent.register_for_execution(name="save_data_in_memory")(save_data_in_memory)
 
+    @log_tool_execution
     def get_saved_metadata() -> str:
         stripped_json = strip_json_values(agent_data[prompt_id])
         return f'{stripped_json}'
@@ -1134,6 +1258,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     helper1.register_for_llm(name="get_saved_metadata", description="Returns the schema of the json from internal memory with all keys but without actual values.")(get_saved_metadata)
     time_agent.register_for_execution(name="get_saved_metadata")(get_saved_metadata)
 
+    @log_tool_execution
     def get_data_by_key(key: Annotated[str, "Key path for retrieving data. Use dot notation for nested keys (e.g., 'user.info.name')."]) -> str:
         keys = key.split('.')
         d = agent_data.get(prompt_id, {})
@@ -1149,29 +1274,32 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     helper1.register_for_llm(name="get_data_by_key", description="Returns all data from the internal Memory")(get_data_by_key)
     time_agent.register_for_execution(name="get_data_by_key")(get_data_by_key)
 
+    @log_tool_execution
     def get_user_id() -> str:
-        current_app.logger.info('INSIDE get_user_id')
+        tool_logger.info('INSIDE get_user_id')
         return f'{user_id}'
 
 
     helper1.register_for_llm(name="get_user_id", description="Returns the unique identifier (user_id) of the current user.")(get_user_id)
     time_agent.register_for_execution(name="get_user_id")(get_user_id)
 
+    @log_tool_execution
     def get_prompt_id() -> str:
-        current_app.logger.info('INSIDE get_prompt_id')
+        tool_logger.info('INSIDE get_prompt_id')
         return f'{prompt_id}'
 
 
     helper1.register_for_llm(name="get_prompt_id", description="Returns the unique identifier (prompt_id) associated with the current prompt or conversation.")(get_prompt_id)
     time_agent.register_for_execution(name="get_prompt_id")(get_prompt_id)
 
+    @log_tool_execution
     def Generate_video(text: Annotated[str, "Text to be used for video generation"],
                        avatar_id: Annotated[str, "Unique identifier for the avatar"],
                        realtime: Annotated[bool,"If True, response is fast but less realistic by default it should be true; if False, response is realistic but slower"]) -> str:
-        current_app.logger.info('INSIDE Generate_video')
+        tool_logger.info('INSIDE Generate_video')
         database_url = 'https://mailer.hertzai.com'
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
-        current_app.logger.info(f"avtar_id: {avatar_id}:\n{text[:10]}....\n")
+        tool_logger.info(f"avtar_id: {avatar_id}:\n{text[:10]}....\n")
         # Convert "default" to a valid integer avatar_id if needed
 
         if avatar_id == "default":
@@ -1246,8 +1374,9 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     helper1.register_for_llm(name="Generate_video", description="Generate/presynthesize video with text and save it in database")(Generate_video)
     time_agent.register_for_execution(name="Generate_video")(Generate_video)
 
+    @log_tool_execution
     def recent_files() -> str:
-        current_app.logger.info('INSIDE get_user_uploaded_file')
+        tool_logger.info('INSIDE get_user_uploaded_file')
         if recent_file_id[user_id]:
             return f'Got user uploaded file the file_id is {recent_file_id[user_id]}'
 
@@ -1256,9 +1385,9 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     helper1.register_for_llm(name="get_user_uploaded_file", description="get user's recent uploaded files")(recent_files)
     time_agent.register_for_execution(name="get_user_uploaded_file")(recent_files)
 
-
+    @log_tool_execution
     def img2txt(image_url: Annotated[str, "image url of which you want text"],text: Annotated[str, "the details you want from image"]='Describe the Images & Text data in this image in detail') -> str:
-        current_app.logger.info('INSIDE img2txt')
+        tool_logger.info('INSIDE img2txt')
         url = "http://azurekong.hertzai.com:8000/llava/image_inference"
 
         payload = {
@@ -1278,10 +1407,11 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     helper1.register_for_llm(name="get_text_from_image", description="Image to Text")(img2txt)
     time_agent.register_for_execution(name="get_text_from_image")(img2txt)
 
+    @log_tool_execution
     def create_scheduled_jobs(interval_sec: Annotated[int, "time between two Interval in seconds."],
                             job_description: Annotated[str, "Description of the job to be performed"],
                             cron_expression: Annotated[Optional[str], "Cron expression for scheduling. Example: '0 9 * * 1-5' (Runs at 9:00 AM, Monday to Friday). If the interval is greater than 60 seconds or it needs to be executed at a dynamic cron time this argument is Mandatory else None"]=None) -> str:
-        current_app.logger.info('INSIDE create_scheduled_jobs')
+        tool_logger.info('INSIDE create_scheduled_jobs')
 
         # actual_execution_time = sum(task_time[prompt_id]['times'][-1])
         # if interval_sec < actual_execution_time:
@@ -1295,27 +1425,28 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         #         trigger = CronTrigger.from_crontab(cron_expression)
         #         job_id = f"job_{int(time.time())}"
         #         scheduler.add_job(execute_python_file, trigger=trigger, id=job_id, args=[job_description, int(user_id),int(prompt_id)])
-        #         current_app.logger.info('Successfully created scheduler job')
+        #         tool_logger.info('Successfully created scheduler job')
         #         return 'Successfully created scheduler job'
         #     else:
         #         trigger = IntervalTrigger(seconds=int(interval_sec))
         #         job_id = f"job_{int(time.time())}"
         #         scheduler.add_job(execute_python_file, trigger=trigger, id=job_id, args=[job_description, int(user_id),int(prompt_id)])
-        #         current_app.logger.info('Successfully created scheduler job')
+        #         tool_logger.info('Successfully created scheduler job')
         #         return 'Successfully created scheduler job'
         # except Exception as e:
-        #     current_app.logger.error(f'Error in create_scheduled_jobs: {str(e)}')
+        #     tool_logger.error(f'Error in create_scheduled_jobs: {str(e)}')
         #     return f"Error creating scheduled job: {str(e)}"
         return 'Added this schedule job in creation process will do it at the end. you can go ahead and mark this action as completed.'
 
     helper1.register_for_llm(name="create_scheduled_jobs", description="Creates time-based jobs using APScheduler to schedule jobs")(create_scheduled_jobs)
     time_agent.register_for_execution(name="create_scheduled_jobs")(create_scheduled_jobs)
 
+    @log_tool_execution
     def send_message_to_user(text: Annotated[str, "Text to send to the user"],
                          avatar_id: Annotated[Optional[str], "Unique identifier for the avatar"] = None,
                          response_type: Annotated[Optional[str], "Response mode: 'Realistic' (slower, better quality) or 'Realtime' (faster, lower quality)"] = 'Realtime') -> str:
-        current_app.logger.info('INSIDE send_message_to_user')
-        current_app.logger.info(f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
+        tool_logger.info('INSIDE send_message_to_user')
+        tool_logger.info(f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
         thread = threading.Thread(target=send_message_to_user1, args=(user_id, text, '',prompt_id))
         thread.start()
@@ -1324,19 +1455,21 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     helper1.register_for_llm(name="send_message_to_user", description="Sends a message/information to user. You can use this if you want to ask a question")(send_message_to_user)
     time_agent.register_for_execution(name="send_message_to_user")(send_message_to_user)
 
+    @log_tool_execution
     def send_presynthesized_video_to_user(conv_id: Annotated[str, "Conversation ID associated with the text from memory"]) -> str:
-        current_app.logger.info('INSIDE send_presynthesized_video_to_user')
-        current_app.logger.info(f'SENDING DATA 2 user with value: conv_id:{conv_id}.')
+        tool_logger.info('INSIDE send_presynthesized_video_to_user')
+        tool_logger.info(f'SENDING DATA 2 user with value: conv_id:{conv_id}.')
         return 'Message sent successfully to user'
 
     helper1.register_for_llm(name="send_presynthesized_video_to_user", description="Sends a presynthesized message/video/dialogue to user using conv_id.")(send_presynthesized_video_to_user)
     time_agent.register_for_execution(name="send_presynthesized_video_to_user")(send_presynthesized_video_to_user)
 
+    @log_tool_execution
     def send_message_in_seconds(text: Annotated[str, "text to send to user"],
                        delay: Annotated[int, "time to wait in seconds before sending text"],
                        conv_id: Annotated[Optional[int], "conv_id for this text if not available make it None"],) -> str:
-        current_app.logger.info('INSIDE send_message_in_seconds')
-        current_app.logger.info(f'with text:{text}. and waiting time: {delay} conv_id: {conv_id}')
+        tool_logger.info('INSIDE send_message_in_seconds')
+        tool_logger.info(f'with text:{text}. and waiting time: {delay} conv_id: {conv_id}')
         run_time = datetime.fromtimestamp(time.time() + delay)
         scheduler.add_job(send_message_to_user1, 'date', run_date=run_time, args=[user_id, text, '',prompt_id])
         return 'Message scheduled successfully'
@@ -1468,14 +1601,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     time_agent_object['time_manager'] = time_manager
     return time_agent_object
 
-
-
-
-
-
-
 user_tasks = {}
-
 
 def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
     """
@@ -1500,8 +1626,7 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
         try:
             author, assistant_agent, executor, group_chat, manager, chat_instructor, agents_object = create_agents(
                 user_id, user_tasks[user_prompt], prompt_id)
-            user_agents[user_prompt] = (
-            author, assistant_agent, executor, group_chat, manager, chat_instructor, agents_object)
+            user_agents[user_prompt] = (author, assistant_agent, executor, group_chat, manager, chat_instructor, agents_object)
             messages[user_prompt] = []
             current_app.logger.info(f"Successfully created agents for user_prompt={user_prompt}")
         except Exception as e:
@@ -1510,19 +1635,13 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
             return f"Error creating agents: {str(e)}"
     else:
         current_app.logger.info(f"Using existing agents for user_prompt={user_prompt}")
-        author, assistant_agent, executor, group_chat, manager, chat_instructor, agents_object = user_agents[
-            user_prompt]
+        author, assistant_agent, executor, group_chat, manager, chat_instructor, agents_object = user_agents[user_prompt]
 
     clear_history = False
 
-    # TOOL CALL AND RESPONSE CHECK
-    # Check if waiting for tool response
-    if len(group_chat.messages) > 2 and 'tool_calls' in group_chat.messages[-1]:
-        current_app.logger.warning('GOT INPUT BUT LAST MESSAGE IS tool_calls should wait for tool response')
-        return 'Processing a tool now please try later'
-
     # Log messages state for debugging
     current_app.logger.info(f"Group chat has {len(group_chat.messages)} messages before processing")
+
     if len(group_chat.messages) > 0:
         current_app.logger.info(
             f"Last message role: {group_chat.messages[-1].get('role')}, name: {group_chat.messages[-1].get('name')}")
