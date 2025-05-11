@@ -2245,7 +2245,7 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
             # Check if there are more actions that can be executed without user input
             if user_tasks[user_prompt].current_action < len(user_tasks[user_prompt].actions):
                 next_action_id = user_tasks[user_prompt].current_action
-                if user_tasks[user_prompt].actions[next_action_id]['can_perform_without_user_input'] == 'yes':
+                if isinstance(user_tasks[user_prompt].new_json[next_action_id], dict) and user_tasks[user_prompt].new_json[next_action_id]['can_perform_without_user_input'] == 'yes':
                     # Continue with next action instead of breaking
                     current_app.logger.info("TERMINATE received but next action can proceed without user input")
                     message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
@@ -2271,7 +2271,7 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
         else:
             if user_tasks[user_prompt].current_action < len(user_tasks[user_prompt].actions):
                 next_action_id = user_tasks[user_prompt].current_action
-                if user_tasks[user_prompt].recipe is False and user_tasks[user_prompt].fallback is False and user_tasks[user_prompt].actions[next_action_id]['can_perform_without_user_input'] == 'yes':
+                if user_tasks[user_prompt].recipe is False and user_tasks[user_prompt].fallback is False and isinstance(user_tasks[user_prompt].new_json[next_action_id], dict) and user_tasks[user_prompt].new_json[next_action_id]['can_perform_without_user_input'] == 'yes':
                     # Continue with next action instead of breaking
                     current_app.logger.info("TERMINATE received but next action can proceed without user input")
                     message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)

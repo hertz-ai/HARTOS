@@ -421,6 +421,25 @@ class ToolMessageHandler:
 
         return messages
 
+    def remove_orphan_tool_messages(self, messages):
+        valid_tool_call_ids = {
+            tc["id"]
+            for msg in messages
+            if msg.get("role") == "assistant" and "tool_calls" in msg
+            for tc in msg["tool_calls"]
+            if "id" in tc
+        }
+
+        cleaned = []
+        for msg in messages:
+            if msg.get("role") == "tool":
+                tcid = msg.get("tool_call_id")
+                if tcid not in valid_tool_call_ids:
+                    current_app.logger.warning(f"Dropping orphan tool message with tool_call_id={tcid}")
+                    continue
+            cleaned.append(msg)
+        return cleaned
+
     def apply_transform(self, messages: List[Dict]) -> List[Dict]:
         """Applies the tool message handling transformation to ensure valid tool call/response pairings."""
         if not messages:
@@ -435,16 +454,16 @@ class ToolMessageHandler:
         # current_app.logger.info(f"=== END FULL INPUT MESSAGES DEBUG ===")
 
         # DEBUGGING: Print the entire conversation structure
-        # current_app.logger.info(f"=== CONVERSATION STRUCTURE DEBUG ===")
-        # for i, msg in enumerate(messages):
-        #     role = msg.get('role', 'unknown')
-        #     name = msg.get('name', 'unknown')
-        #     tool_calls_info = f", tool_calls=[{','.join([tc.get('id') for tc in msg.get('tool_calls', []) if 'id' in tc])}]" if 'tool_calls' in msg else ""
-        #     tool_call_id_info = f", tool_call_id={msg.get('tool_call_id')}" if 'tool_call_id' in msg else ""
-        #
-        #     debug_info = f"Message[{i}]: role={role}, name={name}{tool_calls_info}{tool_call_id_info}"
-        #     current_app.logger.info(debug_info)
-        # current_app.logger.info(f"=== END CONVERSATION STRUCTURE ===")
+        current_app.logger.info(f"=== CONVERSATION STRUCTURE DEBUG ===")
+        for i, msg in enumerate(messages):
+            role = msg.get('role', 'unknown')
+            name = msg.get('name', 'unknown')
+            tool_calls_info = f", tool_calls=[{','.join([tc.get('id') for tc in msg.get('tool_calls', []) if 'id' in tc])}]" if 'tool_calls' in msg else ""
+            tool_call_id_info = f", tool_call_id={msg.get('tool_call_id')}" if 'tool_call_id' in msg else ""
+
+            debug_info = f"Message[{i}]: role={role}, name={name}{tool_calls_info}{tool_call_id_info}"
+            current_app.logger.info(debug_info)
+        current_app.logger.info(f"=== END CONVERSATION STRUCTURE ===")
 
         processed_messages = messages.copy()
 
@@ -523,18 +542,47 @@ class ToolMessageHandler:
                             tool_msg['tool_call_id'] = tool_call_id
                             pending_tool_calls.remove(tool_call_id)  # Mark as responded
                             final_messages.append(tool_msg)
-                        elif len(tool_calls_for_assistant) > 1:
-                            # Multiple pending tool calls from the same assistant message
-                            # This is likely a case where one response is meant for multiple tool calls
-                            current_app.logger.info(
-                                f"Duplicating tool response for multiple tool calls: {tool_calls_for_assistant}")
 
-                            # Create a separate tool message for each pending tool call
+                        elif len(tool_calls_for_assistant) > 1:
+                            # Avoid adding duplicate tool responses for the same call IDs
+                            # Insert each tool message directly after its matching assistant
+                            inserted_count = 0
                             for tool_call_id in tool_calls_for_assistant:
+                                if any(m.get("tool_call_id") == tool_call_id and m.get("role") == "tool" for m in
+                                       final_messages):
+                                    current_app.logger.info(
+                                        f"Tool response for {tool_call_id} already exists. Skipping.")
+                                    continue
+
+                                assistant_idx = tool_call_mapping.get(tool_call_id)
+                                if assistant_idx is None:
+                                    current_app.logger.warning(
+                                        f"No assistant found for tool_call_id {tool_call_id}. Skipping.")
+                                    continue
+
+                                # Find the real index of assistant in final_messages
+                                actual_assistant_index = None
+                                for j in range(len(final_messages) - 1, -1, -1):
+                                    if final_messages[j].get("role") == "assistant" and tool_call_id in [
+                                        tc["id"] for tc in final_messages[j].get("tool_calls", []) if "id" in tc
+                                    ]:
+                                        actual_assistant_index = j
+                                        break
+
+                                if actual_assistant_index is None:
+                                    current_app.logger.warning(
+                                        f"Could not locate assistant message for tool_call_id {tool_call_id}. Skipping.")
+                                    continue
+
                                 tool_msg = msg.copy()
-                                tool_msg['tool_call_id'] = tool_call_id
-                                final_messages.append(tool_msg)
-                                pending_tool_calls.remove(tool_call_id)  # Mark as responded
+                                tool_msg["tool_call_id"] = tool_call_id
+                                final_messages.insert(actual_assistant_index + 1 + inserted_count, tool_msg)
+                                inserted_count += 1
+                                pending_tool_calls.remove(tool_call_id)
+                                current_app.logger.info(
+                                    f"Inserted tool response for {tool_call_id} after assistant[{actual_assistant_index}]")
+
+
                         else:
                             # No pending tool calls for this assistant message
                             current_app.logger.warning(
@@ -619,6 +667,7 @@ class ToolMessageHandler:
                             current_app.logger.info(
                                 f"Added placeholder for historical tool_call_id {tool_call_id}"
                             )
+        final_messages = self.remove_orphan_tool_messages(final_messages)
 
         current_app.logger.info(f"Processed {len(messages)} messages into {len(final_messages)} validated messages")
         return self.validate_messages(final_messages)
