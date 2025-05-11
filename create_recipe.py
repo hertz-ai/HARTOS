@@ -188,7 +188,7 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
 
             result = chat_instructor.initiate_chat(time_manager, message=text,speaker_selection={"speaker": "assistant"}, clear_history=False)
             continue
-        if restart == True:
+        if restart is True:
             break
         current_app.logger.info(f'checking can_perform_without_user_input from {time_actions[user_prompt].get_action_byaction_id(action_entry_point)} ')
         if time_actions[user_prompt].get_action_byaction_id(action_entry_point)['can_perform_without_user_input'] == 'yes':
@@ -929,8 +929,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
                                 final_recipe[prompt_id] = merged_dict
                                 return None
                             if 'action_id' in json_obj.keys():
-                                if user_tasks[user_prompt].fallback == False and user_tasks[
-                                    user_prompt].recipe == False:
+                                if user_tasks[user_prompt].fallback is False and user_tasks[user_prompt].recipe is False:
                                     current_app.logger.info('UPDATED TIMER for this action')
                                     end = time.time()
                                     task_time[prompt_id]['times'].append(end - task_time[prompt_id]['timer'])
@@ -1602,6 +1601,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     return time_agent_object
 
 user_tasks = {}
+tool_call_tracking = {}  # Format: {user_prompt: {tool_call_id: timestamp}}
 
 def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
     """
@@ -1638,6 +1638,107 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
         author, assistant_agent, executor, group_chat, manager, chat_instructor, agents_object = user_agents[user_prompt]
 
     clear_history = False
+    # TOOL CALL AND RESPONSE CHECK with TIMEOUT
+    tool_timeout = 2  # Timeout in seconds (adjust as needed)
+    current_time = time.time()
+
+    if len(group_chat.messages) > 2 and 'tool_calls' in group_chat.messages[-1]:
+        last_message = group_chat.messages[-1]
+
+        # Initialize tracking for this user_prompt if needed
+        if user_prompt not in tool_call_tracking:
+            tool_call_tracking[user_prompt] = {}
+
+        # Extract tool call IDs from the current message
+        current_tool_calls = []
+        if isinstance(last_message.get('tool_calls'), list):
+            for tool_call in last_message.get('tool_calls', []):
+                if 'id' in tool_call:
+                    current_tool_calls.append(tool_call['id'])
+
+        # Check if these are new tool calls
+        new_tool_calls = False
+        for tool_call_id in current_tool_calls:
+            if tool_call_id not in tool_call_tracking[user_prompt]:
+                tool_call_tracking[user_prompt][tool_call_id] = current_time
+                new_tool_calls = True
+                current_app.logger.info(f"Tracking new tool_call_id: {tool_call_id}")
+
+        if new_tool_calls:
+            current_app.logger.info(f"New tool call(s) detected for {user_prompt}, starting timeout")
+            return 'Processing tool request. Please try again shortly.'
+
+        # Check for timeouts on pending tool calls
+        pending_tool_calls = []
+        timed_out_tool_calls = []
+
+        for tool_call_id, start_time in list(tool_call_tracking[user_prompt].items()):
+            elapsed_time = current_time - start_time
+            if elapsed_time < tool_timeout:
+                pending_tool_calls.append(tool_call_id)
+            else:
+                timed_out_tool_calls.append(tool_call_id)
+                # Remove timed out tool call from tracking
+                del tool_call_tracking[user_prompt][tool_call_id]
+
+        # If we still have pending tool calls
+        if pending_tool_calls:
+            # At least one tool call is still within timeout
+            longest_wait = max([current_time - tool_call_tracking[user_prompt][tc_id]
+                                for tc_id in pending_tool_calls])
+            remaining = max(1, int(tool_timeout - longest_wait))
+            current_app.logger.warning(
+                f"Waiting for {len(pending_tool_calls)} tool responses, max elapsed time: {longest_wait:.1f}s"
+            )
+            return f'Still processing tool request. Please try again in {remaining} seconds.'
+
+        # Handle timed out tool calls
+        if timed_out_tool_calls:
+            current_app.logger.warning(
+                f"Tool response timeout reached for {len(timed_out_tool_calls)} tool calls: {timed_out_tool_calls}"
+            )
+
+            # Add a tool response message for each timed out tool call
+            for tool_call_id in timed_out_tool_calls:
+                tool_error_msg = {
+                    'name': 'system',
+                    'role': 'tool',
+                    'tool_call_id': tool_call_id,
+                    'content': json.dumps({
+                        'status': 'error',
+                        'message': f'Tool execution timed out after {tool_timeout} seconds.'
+                    })
+                }
+                group_chat.messages.append(tool_error_msg)
+
+            # We've handled the timeouts, so continue with processing
+    else:
+        # No tool calls in the last message, check if we need to clean up any tracking
+        # But don't delete everything - might be other tool calls still pending
+        if user_prompt in tool_call_tracking:
+            # Find tool call IDs that should be in response messages by now
+            for i in range(len(group_chat.messages) - 1, max(0, len(group_chat.messages) - 5), -1):
+                if i >= 0 and group_chat.messages[i].get('role') == 'tool' and 'tool_call_id' in group_chat.messages[i]:
+                    tool_call_id = group_chat.messages[i]['tool_call_id']
+                    if tool_call_id in tool_call_tracking[user_prompt]:
+                        del tool_call_tracking[user_prompt][tool_call_id]
+                        current_app.logger.info(
+                            f"Found response for tool_call_id {tool_call_id}, removing from tracking")
+
+    # Cleanup empty tracking entries
+    if user_prompt in tool_call_tracking and not tool_call_tracking[user_prompt]:
+        del tool_call_tracking[user_prompt]
+
+    # Cleanup very old tool calls (anything older than 2x timeout)
+    cleanup_time = current_time - (tool_timeout * 2)
+    for up in list(tool_call_tracking.keys()):
+        for tc_id in list(tool_call_tracking[up].keys()):
+            if tool_call_tracking[up][tc_id] < cleanup_time:
+                current_app.logger.info(f"Cleaning up stale tool call {tc_id} for {up}")
+                del tool_call_tracking[up][tc_id]
+        # Remove empty user_prompt entries
+        if not tool_call_tracking[up]:
+            del tool_call_tracking[up]
 
     # Log messages state for debugging
     current_app.logger.info(f"Group chat has {len(group_chat.messages)} messages before processing")
@@ -1668,7 +1769,7 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
 
         # Prepare recovery message
         try:
-            if user_tasks[user_prompt].fallback == True or user_tasks[user_prompt].recipe == True:
+            if user_tasks[user_prompt].fallback is True or user_tasks[user_prompt].recipe is True:
                 current_app.logger.info("Using fallback/recipe recovery path")
                 actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)
                 message = 'Lets continue the work we were doing if action is completed then ask status verifier Agent to Please tell the status of the action'
@@ -1821,7 +1922,7 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
                         break
 
                     # Prepare continuation message
-                    if user_tasks[user_prompt].fallback == True or user_tasks[user_prompt].recipe == True:
+                    if user_tasks[user_prompt].fallback is True or user_tasks[user_prompt].recipe is True:
                         try:
                             actions_prompt = user_tasks[user_prompt].get_action(
                                 user_tasks[user_prompt].current_action - 1)
@@ -1854,7 +1955,7 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
                     current_app.logger.info("Reached end of actions, preparing final processing")
 
                     # Handle recipe creation if needed
-                    if user_tasks[user_prompt].recipe == True:
+                    if user_tasks[user_prompt].recipe is True:
                         current_app.logger.info("Creating detailed recipe")
                         user_tasks[user_prompt].recipe = False
                         user_tasks[user_prompt].fallback = False
@@ -2043,7 +2144,7 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
                     # Handle recipe/fallback flags
                     current_app.logger.info(
                         f"Checking flags: fallback={user_tasks[user_prompt].fallback}, recipe={user_tasks[user_prompt].recipe}")
-                    if user_tasks[user_prompt].recipe == True:
+                    if user_tasks[user_prompt].recipe is True:
                         # Recipe creation logic
                         current_app.logger.info("Creating recipe")
                         user_tasks[user_prompt].recipe = False
@@ -2064,7 +2165,7 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
                             current_app.logger.error(f"Error preparing recipe message: {e}")
                             message = "Please create a detailed recipe for this action."
 
-                    elif user_tasks[user_prompt].fallback == True:
+                    elif user_tasks[user_prompt].fallback is True:
                         # Fallback handling
                         current_app.logger.info("Setting up fallback")
                         user_tasks[user_prompt].recipe = True
@@ -2141,12 +2242,21 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
         # Get the last relevant message
         last_message = group_chat.messages[-1]
         if last_message['content'] == 'TERMINATE':
-            current_app.logger.info("Last message is TERMINATE, using second-to-last message")
-            if len(group_chat.messages) > 1:
-                last_message = group_chat.messages[-2]
+            # Check if there are more actions that can be executed without user input
+            if user_tasks[user_prompt].current_action < len(user_tasks[user_prompt].actions):
+                next_action_id = user_tasks[user_prompt].current_action
+                if user_tasks[user_prompt].actions[next_action_id]['can_perform_without_user_input'] == 'yes':
+                    # Continue with next action instead of breaking
+                    current_app.logger.info("TERMINATE received but next action can proceed without user input")
+                    message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
+                    result = chat_instructor.initiate_chat(manager, message=message, clear_history=False, silent=False)
             else:
-                current_app.logger.warning("Only one message (TERMINATE) in group chat")
-                return "Processing completed but no content was generated"
+                current_app.logger.info("Last message is TERMINATE, using second-to-last message")
+                if len(group_chat.messages) > 1:
+                    last_message = group_chat.messages[-2]
+                else:
+                    current_app.logger.warning("Only one message (TERMINATE) in group chat")
+                    return "Processing completed but no content was generated"
 
         # Handle message_2_user in content
         if f'message_2_user'.lower() in last_message['content'].lower():
@@ -2158,6 +2268,18 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
                     last_message['content'] = json_obj['message_2_user']
             except Exception as e:
                 current_app.logger.error(f"Error extracting message_2_user: {e}")
+        else:
+            if user_tasks[user_prompt].current_action < len(user_tasks[user_prompt].actions):
+                next_action_id = user_tasks[user_prompt].current_action
+                if user_tasks[user_prompt].recipe is False and user_tasks[user_prompt].fallback is False and user_tasks[user_prompt].actions[next_action_id]['can_perform_without_user_input'] == 'yes':
+                    # Continue with next action instead of breaking
+                    current_app.logger.info("TERMINATE received but next action can proceed without user input")
+                    message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
+                    result = chat_instructor.initiate_chat(manager, message=message, clear_history=False, silent=False)
+                elif user_tasks[user_prompt].recipe is True or user_tasks[user_prompt].fallback is True:
+                    actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)
+                    message = f'Lets continue the work we were doing, if action is completed then ask @statusverifier Agent to Please tell the status of the action {user_tasks[user_prompt].current_action}:{actions_prompt}'
+                    result = chat_instructor.initiate_chat(manager, message=message, speaker_selection={"speaker": "assistant"}, clear_history=False , silent=False)
 
         current_app.logger.info(f"END: get_response_group returning content: {last_message['content'][:50]}...")
         return last_message['content']
@@ -2198,7 +2320,7 @@ def recipe(user_id, text,prompt_id,file_id,request_id):
         error_message = traceback.format_exc()  # Capture full traceback
         current_app.logger.error(f"Error occurred in create Recipe stack trace:\n{error_message}")
         last_response = get_response_group(user_id,text,prompt_id,True,e)
-    if scheduler_check[user_prompt] == True:
+    if scheduler_check[user_prompt] is True:
 
         current_app.logger.info('WORKING on TIMER AGENTS')
         with open(f"prompts/{prompt_id}.json", 'r') as f:
