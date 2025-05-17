@@ -96,7 +96,7 @@ stream_handler = logging.StreamHandler(sys.stdout)
 handler = RotatingFileHandler('langchain.log', maxBytes=100000, backupCount=0)
 
 # Set the logging level for the file handler
-handler.setLevel(logging.INFO)
+handler.setLevel(logging.ERROR)
 
 # Create a logging format
 req_id = thread_local_data.get_request_id()

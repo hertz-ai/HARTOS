@@ -440,6 +440,94 @@ class ToolMessageHandler:
             cleaned.append(msg)
         return cleaned
 
+    def is_consolidated_response(self, message):
+        """Improved method to detect consolidated tool responses."""
+        # Check for standard consolidated response format
+        if (message.get('role') == 'tool' and
+                'tool_responses' in message and
+                isinstance(message['tool_responses'], list) and
+                len(message['tool_responses']) > 1):
+            return True
+
+        # Also check for multiple tool_call_ids in a single message (alternative format)
+        if message.get('role') == 'tool' and 'tool_call_ids' in message and isinstance(message['tool_call_ids'], list):
+            return True
+
+        return False
+
+    def get_tool_call_ids_from_consolidated(self, message):
+        """Extract all tool call IDs from a consolidated response."""
+        if not self.is_consolidated_response(message):
+            return []
+
+        tool_call_ids = []
+
+        # Check for direct tool_call_ids array
+        if 'tool_call_ids' in message and isinstance(message['tool_call_ids'], list):
+            tool_call_ids.extend(message['tool_call_ids'])
+
+        # Check for main message tool_call_id
+        if 'tool_call_id' in message:
+            tool_call_ids.append(message['tool_call_id'])
+
+        # Extract IDs from each tool response in the array
+        if 'tool_responses' in message and isinstance(message['tool_responses'], list):
+            for tool_response in message['tool_responses']:
+                if 'tool_call_id' in tool_response:
+                    tool_call_ids.append(tool_response['tool_call_id'])
+
+        # Ensure unique IDs only
+        return list(set(tool_call_ids))
+
+    def find_assistant_for_tool_call_ids(self, messages, tool_call_ids):
+        """Find the assistant message that generated all of the specified tool call IDs.
+
+        Returns the index of the assistant message in messages, or None if not found.
+        """
+        # Reverse the messages to find the most recent matching assistant first
+        for i in range(len(messages) - 1, -1, -1):
+            msg = messages[i]
+            if msg.get('role') == 'assistant' and 'tool_calls' in msg:
+                # Get all tool call IDs from this assistant
+                assistant_ids = {tc['id'] for tc in msg['tool_calls'] if 'id' in tc}
+
+                # Check if all of the requested IDs are in this assistant message
+                if all(tc_id in assistant_ids for tc_id in tool_call_ids):
+                    return i
+
+        return None
+
+    def validate_consolidated_response(self, message):
+        """Validate and potentially fix consolidated response structure."""
+        if not self.is_consolidated_response(message):
+            return message
+
+        tool_call_ids = self.get_tool_call_ids_from_consolidated(message)
+
+        # Ensure we have a valid structure
+        fixed_message = message.copy()
+
+        # If using tool_call_ids format, make sure content is appropriate
+        if 'tool_call_ids' in fixed_message and isinstance(fixed_message['tool_call_ids'], list):
+            if 'content' not in fixed_message or not fixed_message['content']:
+                current_app.logger.warning(
+                    "Consolidated response with tool_call_ids has no content. Adding placeholder.")
+                fixed_message['content'] = json.dumps({"consolidated_result": "Multiple tools executed"})
+
+        # If using tool_responses format, ensure each response has proper structure
+        if 'tool_responses' in fixed_message and isinstance(fixed_message['tool_responses'], list):
+            for i, response in enumerate(fixed_message['tool_responses']):
+                if 'tool_call_id' not in response:
+                    current_app.logger.warning(f"Tool response at index {i} missing tool_call_id. Skipping.")
+                    continue
+
+                if 'content' not in response or response['content'] is None:
+                    current_app.logger.warning(
+                        f"Tool response for {response['tool_call_id']} has null content. Adding empty string.")
+                    fixed_message['tool_responses'][i]['content'] = ""
+
+        return fixed_message
+
     def apply_transform(self, messages: List[Dict]) -> List[Dict]:
         """Applies the tool message handling transformation to ensure valid tool call/response pairings."""
         if not messages:
@@ -448,10 +536,10 @@ class ToolMessageHandler:
 
         current_app.logger.info(f"ToolMessageHandler: Processing {len(messages)} messages")
         # DEBUGGING: Print the entire conversation structure with full message details
-        # current_app.logger.info(f"=== FULL INPUT MESSAGES DEBUG ===")
-        # for i, msg in enumerate(messages):
-        #     current_app.logger.info(f"Message[{i}]: {json.dumps(msg, indent=2)}")
-        # current_app.logger.info(f"=== END FULL INPUT MESSAGES DEBUG ===")
+        current_app.logger.info(f"=== FULL INPUT MESSAGES DEBUG ===")
+        for i, msg in enumerate(messages):
+            current_app.logger.info(f"Message[{i}]: {json.dumps(msg, indent=2)}")
+        current_app.logger.info(f"=== END FULL INPUT MESSAGES DEBUG ===")
 
         # DEBUGGING: Print the entire conversation structure
         current_app.logger.info(f"=== CONVERSATION STRUCTURE DEBUG ===")
@@ -476,13 +564,34 @@ class ToolMessageHandler:
                 del processed_messages[0]['tool_call_id']
             processed_messages = processed_messages[1:]
 
-        # STEP 2: Build a proper sequence of messages
+        # STEP 2: Pre-identify consolidated responses and assistants with tool calls
         final_messages = []
         tool_call_mapping = {}  # Maps tool_call_id -> assistant_idx
         pending_tool_calls = []  # Track tool calls that need responses
         assistant_tool_calls = {}  # Track tool calls grouped by assistant message index
+        consolidated_responses = []  # Track consolidated responses for later processing
 
+        # First sweep: Identify consolidated responses to prevent them from being processed as regular tool messages
         for i, msg in enumerate(processed_messages):
+            if msg.get('role') == 'tool' and self.is_consolidated_response(msg):
+                consolidated_responses.append((i, msg))
+                # Mark this message to be skipped in the main processing
+                processed_messages[i] = {"__skip__": True, "original_index": i}
+                current_app.logger.info(f"Marked consolidated response at index {i} for special handling")
+            # Also identify all assistant messages with tool calls for later reference
+            elif msg.get('role') == 'assistant' and 'tool_calls' in msg:
+                for tool_call in msg.get('tool_calls', []):
+                    if 'id' in tool_call:
+                        tool_call_id = tool_call['id']
+                        tool_call_mapping[tool_call_id] = i
+                        # We'll populate assistant_tool_calls in the main pass
+
+        # Main pass: Process regular messages, skipping marked consolidated responses
+        for i, msg in enumerate(processed_messages):
+            # Skip messages marked for special handling
+            if isinstance(msg, dict) and "__skip__" in msg:
+                continue
+
             # Track assistant messages with tool calls
             if msg.get('role') == 'assistant' and 'tool_calls' in msg:
                 assistant_idx = len(final_messages)
@@ -490,7 +599,7 @@ class ToolMessageHandler:
 
                 # Register all tool call IDs from this assistant message
                 for tool_call in msg.get('tool_calls', []):
-                    if 'id' in tool_call and assistant_idx != (len(processed_messages)-1):
+                    if 'id' in tool_call and assistant_idx != (len(processed_messages) - 1):
                         tool_call_id = tool_call['id']
                         tool_call_mapping[tool_call_id] = assistant_idx
                         pending_tool_calls.append(tool_call_id)  # Add to pending list
@@ -581,8 +690,6 @@ class ToolMessageHandler:
                                 pending_tool_calls.remove(tool_call_id)
                                 current_app.logger.info(
                                     f"Inserted tool response for {tool_call_id} after assistant[{actual_assistant_index}]")
-
-
                         else:
                             # No pending tool calls for this assistant message
                             current_app.logger.warning(
@@ -605,7 +712,96 @@ class ToolMessageHandler:
                 # For all other message types
                 final_messages.append(msg)
 
-        # STEP 3: Check for active vs. historical pending tool calls
+        # STEP 3: Process consolidated responses with improved handling
+        current_app.logger.info(f"Processing {len(consolidated_responses)} consolidated responses")
+        for orig_idx, consolidated_msg in consolidated_responses:
+            # Validate and fix the consolidated response structure
+            fixed_consolidated = self.validate_consolidated_response(consolidated_msg)
+
+            # Get all tool call IDs from this consolidated response
+            tool_call_ids = self.get_tool_call_ids_from_consolidated(fixed_consolidated)
+
+            if not tool_call_ids:
+                current_app.logger.warning(
+                    f"Consolidated response at original index {orig_idx} has no valid tool_call_ids. Converting to user message.")
+                final_messages.append({
+                    'role': 'user',
+                    'name': 'Helper',
+                    'content': fixed_consolidated.get('content', '')
+                })
+                continue
+
+            current_app.logger.info(f"Processing consolidated response with tool_call_ids: {tool_call_ids}")
+
+            # First try to find the most likely assistant index from our tool_call_mapping
+            most_likely_assistant_idx = None
+
+            # Map each tool_call_id to its assistant original index
+            assistant_indices = []
+            for tc_id in tool_call_ids:
+                if tc_id in tool_call_mapping:
+                    assistant_indices.append(tool_call_mapping[tc_id])
+
+            # If we have assistant indices, find the most common one (mode)
+            if assistant_indices:
+                # Simple mode calculation (most frequent value)
+                index_counts = {}
+                for idx in assistant_indices:
+                    if idx not in index_counts:
+                        index_counts[idx] = 0
+                    index_counts[idx] += 1
+
+                most_likely_assistant_orig_idx = max(index_counts, key=index_counts.get)
+
+                # Now find this assistant in our final_messages
+                for i, msg in enumerate(final_messages):
+                    if (msg.get('role') == 'assistant' and
+                            'tool_calls' in msg and
+                            any(tc.get('id') in tool_call_ids for tc in msg.get('tool_calls', []) if 'id' in tc)):
+                        most_likely_assistant_idx = i
+                        break
+
+            # If we couldn't find it by mapping, try the usual method
+            if most_likely_assistant_idx is None:
+                most_likely_assistant_idx = self.find_assistant_for_tool_call_ids(final_messages, tool_call_ids)
+
+            if most_likely_assistant_idx is None:
+                current_app.logger.warning(
+                    f"Could not find corresponding assistant for consolidated response with tool_call_ids: {tool_call_ids}. Converting to user message.")
+                final_messages.append({
+                    'role': 'user',
+                    'name': 'Helper',
+                    'content': fixed_consolidated.get('content', '')
+                })
+                continue
+
+            current_app.logger.info(
+                f"Found corresponding assistant at index {most_likely_assistant_idx} for consolidated response")
+
+            # Insert the consolidated response right after the assistant message
+            # Add 1 to position it after the assistant message
+            insert_position = assistant_idx + 1
+
+            # If we already have tool responses after this assistant,
+            # insert after the last one to maintain proper sequence
+            for j in range(insert_position, len(final_messages)):
+                if final_messages[j].get('role') != 'tool':
+                    break
+                insert_position = j + 1
+
+            # Insert the consolidated response
+            final_messages.insert(insert_position, fixed_consolidated)
+            current_app.logger.info(
+                f"Inserted consolidated response with {len(tool_call_ids)} tool_call_ids after assistant message at index {assistant_idx}")
+
+            # Mark these tool calls as responded
+            for tool_call_id in tool_call_ids:
+                if tool_call_id in pending_tool_calls:
+                    pending_tool_calls.remove(tool_call_id)
+                    current_app.logger.info(
+                        f"Marked tool_call_id {tool_call_id} as responded via consolidated response")
+
+        # STEP 4: Check for active vs. historical pending tool calls
         if pending_tool_calls:
             # Identify active tool calls from the most recent assistant message
             active_tool_call_ids = set()
@@ -652,21 +848,41 @@ class ToolMessageHandler:
                 for tool_call_id in historical_pending_calls:
                     if tool_call_id in tool_call_mapping:
                         assistant_idx = tool_call_mapping[tool_call_id]
+
                         # Only add placeholder if the assistant message still exists
                         if assistant_idx < len(final_messages) and final_messages[assistant_idx].get(
                                 'role') == 'assistant':
                             assistant_msg = final_messages[assistant_idx]
+
+                            # Find the function name for this tool call
+                            function_name = None
+                            for tc in assistant_msg.get('tool_calls', []):
+                                if tc.get('id') == tool_call_id and tc.get('type') == 'function':
+                                    function_name = tc.get('function', {}).get('name')
+                                    break
+
                             placeholder = {
                                 'role': 'tool',
-                                'name': assistant_msg.get('name', 'Assistant'),
+                                'name': function_name or assistant_msg.get('name', 'Assistant'),
                                 'tool_call_id': tool_call_id,
                                 'content': "Placeholder response for historical tool call"
                             }
+
                             # Insert the placeholder right after the assistant message
-                            final_messages.insert(assistant_idx + 1, placeholder)
+                            insert_position = assistant_idx + 1
+
+                            # If we already have tool responses after this assistant,
+                            # insert after the last one to maintain proper sequence
+                            for j in range(insert_position, len(final_messages)):
+                                if final_messages[j].get('role') != 'tool':
+                                    break
+                                insert_position = j + 1
+
+                            final_messages.insert(insert_position, placeholder)
                             current_app.logger.info(
                                 f"Added placeholder for historical tool_call_id {tool_call_id}"
                             )
+
         final_messages = self.remove_orphan_tool_messages(final_messages)
 
         current_app.logger.info(f"Processed {len(messages)} messages into {len(final_messages)} validated messages")
@@ -695,7 +911,6 @@ class ToolMessageHandler:
             return f"Modified {changes} message roles", True
 
         return "No message transformations needed", False
-
 
 class Action:
     def __init__(self,actions):

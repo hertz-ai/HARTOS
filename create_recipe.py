@@ -960,13 +960,11 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
                                     user_tasks[user_prompt].recipe = False
                                 except Exception as e:
                                     current_app.logger.info(f'error is here:{e}')
-                                    user_tasks[user_prompt].actions[int(json_obj['action_id']) - 1] = json_obj[
-                                        'updated_action']
+                                    user_tasks[user_prompt].actions[int(json_obj['action_id']) - 1] = json_obj['updated_action']
                                     user_tasks[user_prompt].new_json.append(json_obj)
                                     user_tasks[user_prompt].fallback = True
                             elif 'action_id' in json_obj.keys():
-                                user_tasks[user_prompt].actions[int(json_obj['action_id']) - 1] = json_obj[
-                                    'updated_action']
+                                user_tasks[user_prompt].actions[int(json_obj['action_id']) - 1] = json_obj['updated_action']
                                 user_tasks[user_prompt].new_json.append(json_obj)
                                 user_tasks[user_prompt].fallback = True
                         elif json_obj['status'].lower() == 'done':
@@ -994,6 +992,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
                             return chat_instructor
                 except Exception as e:
                     current_app.logger.error(f'GOT SOME ERROR WHILE JSON: {e}')
+                    current_app.logger.error(traceback.format_exc())
 
         # Send crossbar message for UI feedback
         try:
@@ -1014,19 +1013,19 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         pattern2 = r"@User"
         pattern3 = r"@StatusVerifier"
         try:
-            if re.search(pattern2, messages[-1]["content"]):
+            if re.search(pattern2, messages[-1]["content"], re.IGNORECASE):
                 current_app.logger.info("String contains @User returning author")
                 return author
-            if re.search(pattern3, messages[-1]["content"]):
+            if re.search(pattern3, messages[-1]["content"], re.IGNORECASE):
                 current_app.logger.info("String contains @StatusVerifier returning StatusVerifier")
                 return verify
-            if re.search(pattern, messages[-1]["content"]) and last_speaker.name != 'Helper':
+            if re.search(pattern, messages[-1]["content"], re.IGNORECASE) and last_speaker.name != 'Helper':
                 current_app.logger.info("String contains @Helper returning helper")
                 messages[-1]["content"] = messages[-1]["content"].replace('@user', '')
                 group_chat.messages[-1][
                     'content'] = f"{group_chat.messages[-1]['content']}\n Metadata/skeleton of all keys for retrieving data from memory:{metadata}"
                 return helper
-            if re.search(pattern1, messages[-1]["content"]):
+            if re.search(pattern1, messages[-1]["content"], re.IGNORECASE):
                 current_app.logger.info("String contains @Executor returning executor")
                 return executor
         except Exception as e:
@@ -1069,6 +1068,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         if 'TERMINATE' in messages[-1]["content"].upper():
             current_app.logger.info('TERMINATING BECAUSE OF TERMINATE')
             return None
+
+
 
         # Default to 'auto' (let the system decide based on content)
         # This preserves the routing mechanism's ability to select appropriate agents
@@ -2153,7 +2154,7 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
                         try:
                             metadata = strip_json_values(agent_data[prompt_id])
                             message = '''Focus on the current task at hand and create a detailed recipe that includes only the necessary steps for this action, along with a suitable name. Provide the output in the following JSON format:
-                                               { "status", "done", "action": "Describe the action performed here","fallback_action":"", "persona":"","action_id": ''' + f'{user_tasks[user_prompt].current_action}' + ''', "recipe": [{{"steps":"steps here","tool_name":"Only include tool name here if used for this step.","generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely."}}],"can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
+                                               { "status", "done", "action": "Describe the action performed here","fallback_action":"", "persona":"","action_id": ''' + f'{user_tasks[user_prompt].current_action}' + ''', "recipe": [{{"steps":"steps here","tool_name":"Only include tool name here if used for this step.","generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely."}}],"can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no then give the reason as well e.g. no-i need user's likes and dislike", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
                                                Recipe Requirements:
                                                1. Generalized Python Functions: Give the code which was created and excuted successfully without any error handling edge cases. leave it blank when there is no code nedded to perform the action
                                                2. Avoid directly storing any specific information provided by the author in the recipe. Use placeholders for variables instead.
@@ -2245,7 +2246,10 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
             # Check if there are more actions that can be executed without user input
             if user_tasks[user_prompt].current_action < len(user_tasks[user_prompt].actions):
                 next_action_id = user_tasks[user_prompt].current_action
-                if isinstance(user_tasks[user_prompt].new_json[next_action_id], dict) and user_tasks[user_prompt].new_json[next_action_id]['can_perform_without_user_input'] == 'yes':
+                current_app.logger.info("TERMINATE received but next action can proceed without user input")
+                current_app.logger.info(f"user_tasks[{user_prompt}]: {user_tasks[user_prompt]}")
+
+                if isinstance(user_tasks[user_prompt].get_action(next_action_id), dict) and user_tasks[user_prompt].get_action(next_action_id)['can_perform_without_user_input'] == 'yes':
                     # Continue with next action instead of breaking
                     current_app.logger.info("TERMINATE received but next action can proceed without user input")
                     message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
@@ -2271,12 +2275,14 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
         else:
             if user_tasks[user_prompt].current_action < len(user_tasks[user_prompt].actions):
                 next_action_id = user_tasks[user_prompt].current_action
-                if user_tasks[user_prompt].recipe is False and user_tasks[user_prompt].fallback is False and isinstance(user_tasks[user_prompt].new_json[next_action_id], dict) and user_tasks[user_prompt].new_json[next_action_id]['can_perform_without_user_input'] == 'yes':
+                current_app.logger.info(f"user_tasks[{user_prompt}]: {user_tasks[user_prompt]}")
+
+                if user_tasks[user_prompt].recipe is False and user_tasks[user_prompt].fallback is False and isinstance(user_tasks[user_prompt].get_action(next_action_id), dict) and user_tasks[user_prompt].get_action(next_action_id)['can_perform_without_user_input'] == 'yes':
                     # Continue with next action instead of breaking
                     current_app.logger.info("TERMINATE received but next action can proceed without user input")
                     message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
                     result = chat_instructor.initiate_chat(manager, message=message, clear_history=False, silent=False)
-                elif user_tasks[user_prompt].recipe is True or user_tasks[user_prompt].fallback is True:
+                elif user_tasks[user_prompt].recipe is True or user_tasks[user_prompt].fallback is True and user_tasks[user_prompt].current_action>0:
                     actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)
                     message = f'Lets continue the work we were doing, if action is completed then ask @statusverifier Agent to Please tell the status of the action {user_tasks[user_prompt].current_action}:{actions_prompt}'
                     result = chat_instructor.initiate_chat(manager, message=message, speaker_selection={"speaker": "assistant"}, clear_history=False , silent=False)
