@@ -6,7 +6,7 @@ import autogen
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
 import json
 from flask import current_app
-from typing import List, Dict, Tuple, Annotated
+from typing import List, Dict, Tuple, Annotated, Set, FrozenSet
 import pickle
 from PIL import Image
 import uuid
@@ -422,6 +422,7 @@ class ToolMessageHandler:
         return messages
 
     def remove_orphan_tool_messages(self, messages):
+        # 1. Collect every tool-call id that appears in an assistant message
         valid_tool_call_ids = {
             tc["id"]
             for msg in messages
@@ -430,14 +431,37 @@ class ToolMessageHandler:
             if "id" in tc
         }
 
-        cleaned = []
+        # Helper ── does this consolidated reply reference at least one valid id?
+        def consolidated_has_valid_id(msg) -> bool:
+            """Return True when a consolidated tool message carries
+            a tool_call_id that belongs to some earlier assistant message."""
+            if not self.is_consolidated_response(msg):
+                return False
+            nested_ids = self.get_tool_call_ids_from_consolidated(msg)
+            return any(tcid in valid_tool_call_ids for tcid in nested_ids)
+
+        cleaned: list[dict] = []
         for msg in messages:
             if msg.get("role") == "tool":
                 tcid = msg.get("tool_call_id")
-                if tcid not in valid_tool_call_ids:
-                    current_app.logger.warning(f"Dropping orphan tool message with tool_call_id={tcid}")
+
+                # ── ordinary single-tool reply ───────────────────────────────
+                if tcid is not None:
+                    if tcid not in valid_tool_call_ids:
+                        current_app.logger.warning(
+                            f"Dropping orphan tool message with tool_call_id={tcid}"
+                        )
+                        continue
+
+                # ── consolidated reply (no top-level tool_call_id) ──────────
+                elif not consolidated_has_valid_id(msg):
+                    current_app.logger.warning(
+                        "Dropping orphan consolidated tool message (no matching IDs)"
+                    )
                     continue
+
             cleaned.append(msg)
+
         return cleaned
 
     def is_consolidated_response(self, message):
@@ -599,7 +623,7 @@ class ToolMessageHandler:
 
                 # Register all tool call IDs from this assistant message
                 for tool_call in msg.get('tool_calls', []):
-                    if 'id' in tool_call and assistant_idx != (len(processed_messages) - 1):
+                    if 'id' in tool_call:
                         tool_call_id = tool_call['id']
                         tool_call_mapping[tool_call_id] = assistant_idx
                         pending_tool_calls.append(tool_call_id)  # Add to pending list
@@ -714,6 +738,12 @@ class ToolMessageHandler:
 
         # STEP 3: Process consolidated responses with improved handling
         current_app.logger.info(f"Processing {len(consolidated_responses)} consolidated responses")
+
+        # ────────────────────────────────────────────────────────────────
+        #  remember which consolidated-ID sets we have already accepted
+        # ────────────────────────────────────────────────────────────────
+        seen_consolidated_id_sets: Set[FrozenSet[str]] = set()
+
         for orig_idx, consolidated_msg in consolidated_responses:
             # Validate and fix the consolidated response structure
             fixed_consolidated = self.validate_consolidated_response(consolidated_msg)
@@ -723,13 +753,24 @@ class ToolMessageHandler:
 
             if not tool_call_ids:
                 current_app.logger.warning(
-                    f"Consolidated response at original index {orig_idx} has no valid tool_call_ids. Converting to user message.")
+                    f"Consolidated response at original index {orig_idx} "
+                    f"has no valid tool_call_ids. Converting to user message.")
                 final_messages.append({
                     'role': 'user',
                     'name': 'Helper',
                     'content': fixed_consolidated.get('content', '')
                 })
                 continue
+
+            # ─── Duplicate guard ───────────────────────────────────────
+            id_set = frozenset(tool_call_ids)
+            if id_set in seen_consolidated_id_sets:
+                current_app.logger.info(
+                    "Duplicate consolidated response detected – skipping second copy"
+                )
+                continue
+            seen_consolidated_id_sets.add(id_set)
+            # ───────────────────────────────────────────────────────────
 
             current_app.logger.info(f"Processing consolidated response with tool_call_ids: {tool_call_ids}")
 
@@ -780,7 +821,7 @@ class ToolMessageHandler:
 
             # Insert the consolidated response right after the assistant message
             # Add 1 to position it after the assistant message
-            insert_position = assistant_idx + 1
+            insert_position = most_likely_assistant_idx + 1
 
             # If we already have tool responses after this assistant,
             # insert after the last one to maintain proper sequence
@@ -792,7 +833,7 @@ class ToolMessageHandler:
             # Insert the consolidated response
             final_messages.insert(insert_position, fixed_consolidated)
             current_app.logger.info(
-                f"Inserted consolidated response with {len(tool_call_ids)} tool_call_ids after assistant message at index {assistant_idx}")
+                f"Inserted consolidated response with {len(tool_call_ids)} tool_call_ids after assistant message at index {most_likely_assistant_idx}")
 
             # Mark these tool calls as responded
             for tool_call_id in tool_call_ids:

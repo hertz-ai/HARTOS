@@ -109,6 +109,7 @@ app = Flask(__name__)
 
 app.logger.addHandler(stream_handler)
 app.logger.addHandler(handler)
+app.logger.propagate = False
 
 # Test logging
 app.logger.info('Logger initialized')

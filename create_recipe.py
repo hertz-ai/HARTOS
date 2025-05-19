@@ -307,7 +307,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         •Code Execution: Executor Agent: Executes code as needed. Ensure the final response is printed in code using print() before sending to Executor.
 
         •Tools Helper Agent can use:
-            1. The tools are: send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,execute_windows_command,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, google_search and save_data_in_memory.
+            1. The tools are: send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,execute_windows_or_android_command,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, google_search and save_data_in_memory.
             2. Create Scheduled Jobs: For tasks involving timer or time or periodically or scheduled jobs, ask Helper agent to use the create_scheduled_jobs tool.
             3. Data/Memory Management:
                 ➜If you want to save some data,understand the current data from get_saved_metadata & plan the datamodel and ask helper agent to use "save_data_in_memory" tool.
@@ -315,7 +315,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             4. If you want to send some message to user directly then ask helper agent to use send_message_to_user tool but if you want to send message after sometime then ask helper to use send_message_in_seconds tool.
             5. If you want to send some pre synthesized realistic videos to user then ask helper agent to use send_presynthesized_video_to_user tool.
             6. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the pre synthesized generated video if it is successful.
-            7. If you receive a request to perform a task or action on the user's computer, or if the request is related to Chrome or any browser, you should ask @Helper to use the `execute_windows_command` tool.
+            7. If you receive a request to perform a task or action on the user's computer, or if the request is related to Chrome or any browser, you should ask @Helper to use the `execute_windows_or_android_command` tool.
             8. If you want the user's ID then ask the @Helper to use 'get_user_id' tool and do not prompt the user for their user_id, never mention the user_id to the user. Important: Get the user Id yourself always, Do not ask the user_id from User ever.
             9. If you want to do a google search then you should ask the @Helper to use the 'google_search' tool.
 
@@ -380,7 +380,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         system_message=""""You are a Status Verification Agent in a multi-agent system.
         Role: Your primary responsibility is to track and verify the status of actions performed by other agents. You must provide updates strictly in JSON format with the following response structures:
         Response formats:
-            1. Action Completed Successfully: {"status": "completed","action": "current action","action_id": 1/2/3...,"message": "message here","can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike","persona_name":"persona name this action belongs to","fallback_action": "fallback action here"}  // If fallback_action is missing, ask the user: "What measures should be taken if this action fails in the future?" Include their response in fallback_action.
+            1. Action Completed Successfully: {"status": "completed","action": "current action","action_id": 1/2/3...,"message": "message here","can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike","persona_name":"persona name this action belongs to","fallback_action": "fallback action here"}  // If fallback_action is missing, ask the user: "What measures should be taken if this action fails in the future?" Include their response in fallback_action and mark completed.
             2. Action Error: {"status": "error","action": "current action","action_id": 1/2/3...,"message": "message here"}
             3. Current Action Updated: {"status": "updated","action": "current action text","updated_action": "updated current action text","action_id": 1/2/3...,"message": "message here","persona_name":"persona name this action belongs to","fallback_action": ""} // If no fallback_action is provided, ask the user for measures to include.
             4. Action pending: {"status": "pending","action": "current action","action_id": 1/2/3...,"message": "what steps are pending message here"}
@@ -440,7 +440,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         Calling Other Agents:
             When you need to direct a question or route the conversation to a specific agent, use the @ tag followed by the agent's name. Examples include: @Executor or @Helper or @User
         Things You cannot do but Helper Agent can:
-            1. Tools Helper Agent can use: Can use tools like send_message_in_seconds, send_message_to_user,send_presynthesized_video_to_user, execute_windows_command, text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory.
+            1. Tools Helper Agent can use: Can use tools like send_message_in_seconds, send_message_to_user,send_presynthesized_video_to_user, execute_windows_or_android_command, text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory.
             2. Create Scheduled Jobs: For tasks involving timers or scheduled jobs, ask Helper agent to use the create_scheduled_jobs tool.
             3. Data/Memory Management:
                 ➜If you want to save some data ask helper agent to use "save_data_in_memory" tool.
@@ -448,7 +448,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             4. If you want to send some message to user directly then ask helper agent to use send_message_to_user tool but if you want to send message after sometime then ask helper to use send_message_in_seconds tool.
             5. If you want to send some pre synthesized video to user then ask helper agent to use send_presynthesized_video_to_user tool.
             6. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
-            7. If you receive a request to perform a task on the user's computer or any other computer, or if the request is related to Chrome or any browser, you should ask @Helper to use the `execute_windows_command` tool."""
+            7. If you receive a request to perform a task on the user's computer or any other computer, or if the request is related to Chrome or any browser, you should ask @Helper to use the `execute_windows_or_android_command` tool."""
     )
 
     chat_instructor = autogen.UserProxyAgent(
@@ -810,12 +810,13 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     assistant.register_for_execution(name="get_user_details")(get_user_details)
 
     @log_tool_execution
-    async def execute_windows_command(instructions: Annotated[str, "Command in plain English to execute on the Windows machine"])->str:
+    async def execute_windows_or_android_command(instructions: Annotated[str, "Command in plain English to execute on the windows or android machine"],
+                                                 os_to_control: Annotated[str, "The os to control, possible values are 'windows' or 'android' only "]) -> str:
         """
         Executes a command on a Windows machine and returns the response within 500 seconds.
         """
         try:
-            tool_logger.info('INSIDE execute_windows_command')
+            tool_logger.info('INSIDE execute_windows_or_android_command')
             topic = f'com.hertzai.hevolve.action.{user_id}'
             tool_logger.info(f'calling {topic} for 5 second')
             response = await subscribe_and_return({'prompt_id':prompt_id},topic,5)  # Wait for the RPC response
@@ -825,13 +826,14 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             crossbar_message = {
                 'parent_request_id': request_id_list[user_prompt],
                 'user_id': f'{user_id}',
-                'prompt_id': '54',
+                'prompt_id': prompt_id,
                 'instruction_to_vlm_agent': instructions,
-                'os_to_control': 'Windows',
+                'os_to_control': os_to_control,
                 'actions_available_in_os': [],
-                'max_ETA_in_seconds': 500,
+                'max_ETA_in_seconds': 1800,
                 'langchain_server':True
             }
+
             topic = 'com.hertzai.hevolve.action'
             tool_logger.info(f'calling {topic} for 8000 second')
             response = await subscribe_and_return(crossbar_message,topic)  # Wait for the RPC response
@@ -845,8 +847,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             tool_logger.error(f"Error executing command:\n{error_message}")
             return {"error": e}
 
-    helper.register_for_llm(name="execute_windows_command", description="Processes user-defined commands on a personal Windows or Android system.")(execute_windows_command)
-    assistant.register_for_execution(name="execute_windows_command")(execute_windows_command)
+    helper.register_for_llm(name="execute_windows_or_android_command", description="Processes user-defined commands on a personal Windows or Android system.")(execute_windows_or_android_command)
+    assistant.register_for_execution(name="execute_windows_or_android_command")(execute_windows_or_android_command)
 
     assistant.description = 'this is an assistant agent that coordinates & executes requested tasks & actions'
     executor.description = 'this is an executor agent that Specialized agent for code execution & response handling'
@@ -1983,7 +1985,7 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
                         current_app.logger.info("Setting up fallback")
                         user_tasks[user_prompt].recipe = True
                         user_tasks[user_prompt].fallback = False
-                        message = f"Action {user_tasks[user_prompt].current_action} fallback:ask user what actions should be taken if current actions fail in the future after you get the response from user give the conversaation to StatusVerifier agent"
+                        message = f"Action {user_tasks[user_prompt].current_action} fallback: send_message_to_user asking what actions should be taken if current actions fail in the future after you get the response from user give the conversaation to StatusVerifier agent"
 
                     # Handle normal end of actions
                     else:
@@ -2145,7 +2147,15 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
                     # Handle recipe/fallback flags
                     current_app.logger.info(
                         f"Checking flags: fallback={user_tasks[user_prompt].fallback}, recipe={user_tasks[user_prompt].recipe}")
-                    if user_tasks[user_prompt].recipe is True:
+
+                    if user_tasks[user_prompt].fallback is True:
+                        # Fallback handling
+                        current_app.logger.info("Setting up fallback")
+                        user_tasks[user_prompt].recipe = True
+                        user_tasks[user_prompt].fallback = False
+                        message = f"Action {user_tasks[user_prompt].current_action} fallback: send_message_to_user asking what actions should be taken if current actions fail in the future after you get the response from user give the conversation to StatusVerifier agent"
+
+                    elif user_tasks[user_prompt].recipe is True:
                         # Recipe creation logic
                         current_app.logger.info("Creating recipe")
                         user_tasks[user_prompt].recipe = False
@@ -2153,10 +2163,10 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
 
                         try:
                             metadata = strip_json_values(agent_data[prompt_id])
-                            message = '''Focus on the current task at hand and create a detailed recipe that includes only the necessary steps for this action, along with a suitable name. Provide the output in the following JSON format:
+                            message = '''Focus on the current task at hand and create a detailed recipe that includes only the necessary steps for this action ''' + f'{user_tasks[user_prompt].current_action}' + ''', along with a suitable name. Provide the output in the following JSON format:
                                                { "status", "done", "action": "Describe the action performed here","fallback_action":"", "persona":"","action_id": ''' + f'{user_tasks[user_prompt].current_action}' + ''', "recipe": [{{"steps":"steps here","tool_name":"Only include tool name here if used for this step.","generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely."}}],"can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no then give the reason as well e.g. no-i need user's likes and dislike", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
                                                Recipe Requirements:
-                                               1. Generalized Python Functions: Give the code which was created and excuted successfully without any error handling edge cases. leave it blank when there is no code nedded to perform the action
+                                               1. Generalized Python Functions: Give the code which was created and executed successfully without any error handling edge cases. leave it blank when there is no code needed to perform the action
                                                2. Avoid directly storing any specific information provided by the author in the recipe. Use placeholders for variables instead.
                                                3. Ensure that coding and non-coding steps are not combined within the same function.
                                                4. For all Python functions, include comprehensive docstrings to explain their purpose, parameters, and usage. This should especially clarify non-coding steps that require utilizing the assistant's language capabilities.
@@ -2165,14 +2175,6 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
                         except Exception as e:
                             current_app.logger.error(f"Error preparing recipe message: {e}")
                             message = "Please create a detailed recipe for this action."
-
-                    elif user_tasks[user_prompt].fallback is True:
-                        # Fallback handling
-                        current_app.logger.info("Setting up fallback")
-                        user_tasks[user_prompt].recipe = True
-                        user_tasks[user_prompt].fallback = False
-                        message = f"Action {user_tasks[user_prompt].current_action} fallback:ask user what actions should be taken if current actions fail in the future after you get the response from user give the conversation to StatusVerifier agent"
-
                     else:
                         # Normal action execution
                         current_app.logger.info("Executing normal action")
