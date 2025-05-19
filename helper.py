@@ -435,8 +435,7 @@ class ToolMessageHandler:
         def consolidated_has_valid_id(msg) -> bool:
             """Return True when a consolidated tool message carries
             a tool_call_id that belongs to some earlier assistant message."""
-            if not self.is_consolidated_response(msg):
-                return False
+
             nested_ids = self.get_tool_call_ids_from_consolidated(msg)
             return any(tcid in valid_tool_call_ids for tcid in nested_ids)
 
@@ -454,7 +453,7 @@ class ToolMessageHandler:
                         continue
 
                 # ── consolidated reply (no top-level tool_call_id) ──────────
-                elif not consolidated_has_valid_id(msg):
+                elif self.is_consolidated_response(msg) and not consolidated_has_valid_id(msg):
                     current_app.logger.warning(
                         "Dropping orphan consolidated tool message (no matching IDs)"
                     )
@@ -742,7 +741,7 @@ class ToolMessageHandler:
         # ────────────────────────────────────────────────────────────────
         #  remember which consolidated-ID sets we have already accepted
         # ────────────────────────────────────────────────────────────────
-        seen_consolidated_id_sets: Set[FrozenSet[str]] = set()
+        seen_consolidated_id_sets: set[frozenset[str]] = set()
 
         for orig_idx, consolidated_msg in consolidated_responses:
             # Validate and fix the consolidated response structure

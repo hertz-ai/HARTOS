@@ -1076,7 +1076,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         # Default to 'auto' (let the system decide based on content)
         # This preserves the routing mechanism's ability to select appropriate agents
         current_app.logger.info('Using auto speaker selection as no specific rule matched')
-        return assistant
+        return 'auto'
 
     all_agents = [assistant, executor, author, chat_instructor,helper,verify]
     all_agents.extend(custom_agents)
@@ -1776,16 +1776,16 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
                 current_app.logger.info("Using fallback/recipe recovery path")
                 actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)
                 message = 'Lets continue the work we were doing if action is completed then ask status verifier Agent to Please tell the status of the action'
-                text = f'Action {user_tasks[user_prompt].current_action + 1}: {message} '
+                text = f'Perform this action -> Action #{user_tasks[user_prompt].current_action + 1}: {message} '
             else:
                 current_app.logger.info("Using standard recovery path")
                 try:
                     message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
-                    text = f'Action {user_tasks[user_prompt].current_action + 1}: {message} '
+                    text = f'Perform this action -> Action #{user_tasks[user_prompt].current_action + 1}: {message} '
                 except Exception as e:
                     current_app.logger.error(f"Error getting action for recovery: {e}")
                     message = ""
-                    text = f'Action {user_tasks[user_prompt].current_action}: {message} '
+                    text = f'Perform this action -> Action #{user_tasks[user_prompt].current_action}: {message} '
         except Exception as e:
             current_app.logger.error(f"Error preparing recovery message: {e}")
             message = "Let's continue where we left off."
@@ -1808,7 +1808,7 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
         else:
             current_app.logger.info("Starting new chat")
             message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
-            message = f'Action {user_tasks[user_prompt].current_action + 1}: {message} '
+            message = f'Perform this action -> Action #{user_tasks[user_prompt].current_action + 1}: {message} '
 
             # Publish crossbar message for UI feedback
             crossbar_message = {
@@ -1848,7 +1848,7 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
 
         # Main processing loop
         while_loop_iterations = 0
-        max_iterations = 8  # Prevent infinite loops
+        max_iterations = 10  # Prevent infinite loops
 
         while while_loop_iterations < max_iterations:
             while_loop_iterations += 1
@@ -1965,16 +1965,18 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
 
                         try:
                             metadata = strip_json_values(agent_data[prompt_id])
-                            message = '''Focus on the current task at hand and create a detailed recipe that includes only the necessary steps for this action from history, along with a suitable name. Provide the output in the following JSON format:
-                            { "status", "done", "action": "''' + str(user_tasks[user_prompt].get_action(user_tasks[
-                                                                                                                                                  user_prompt].current_action - 1)) + '''","fallback_action":"", "persona":"","action_id": ''' + f'{user_tasks[user_prompt].current_action}' + ''', "recipe": [{{"steps":"steps here","tool_name":"Only include tool name here if used for this step.","generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely."}}],"can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
+                            message = ('''Focus on the current task at hand and create a detailed recipe that includes only the necessary steps for this action from history, along with a suitable name. Provide the output in the following JSON format:
+                            { "status", "done", "action": "''' + str(user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1))
+                                       + '''","fallback_action":"", "persona":"","action_id": ''' + f'{user_tasks[user_prompt].current_action}'
+                                       + ''', "recipe": [{{"steps":"steps here","tool_name":"Only include tool name here if used for this step.","generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely."}}],"can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike"'''
+                                       + ''', "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
                             Recipe Requirements:
-                            1. Generalized Python Functions: Give the code which was created and excuted successfully without any error handling edge cases. leave it blank when there is no code nedded to perform the action
+                            1. Generalized Python Functions: Give the code which was created and executed successfully without any error handling edge cases. leave it blank when there is no code nedded to perform the action
                             2. Avoid directly storing any specific information provided by the author in the recipe. Use placeholders for variables instead.
                             3. Ensure that coding and non-coding steps are not combined within the same function.
-		            4. For all Python functions, include comprehensive docstrings to explain their purpose, parameters, and usage. This should especially clarify non-coding steps that require utilizing the assistant's language capabilities.
+                            4. For all Python functions, include comprehensive docstrings to explain their purpose, parameters, and usage. This should especially clarify non-coding steps that require utilizing the assistant's language capabilities.
                             5. If any internal tool is used to complete a step, provide detailed instructions on how to call or utilize that tool instead of providing the code for that step.
-                            ''' + f'6. The persona must be one of the following: {role}. No other personas are allowed.'
+                            ''' + f'6. The persona must be one of the following: {role}. No other personas are allowed.')
 
                         except Exception as e:
                             current_app.logger.error(f"Error preparing recipe message: {e}")
@@ -1985,7 +1987,7 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
                         current_app.logger.info("Setting up fallback")
                         user_tasks[user_prompt].recipe = True
                         user_tasks[user_prompt].fallback = False
-                        message = f"Action {user_tasks[user_prompt].current_action} fallback: send_message_to_user asking what actions should be taken if current actions fail in the future after you get the response from user give the conversaation to StatusVerifier agent"
+                        message = f"JUST Ask user via send_message_to_user to get Action {user_tasks[user_prompt].current_action} fallback, what actions should be taken if current actions fail in the future after you get the response from user give the conversaation to StatusVerifier agent"
 
                     # Handle normal end of actions
                     else:
@@ -2153,7 +2155,7 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
                         current_app.logger.info("Setting up fallback")
                         user_tasks[user_prompt].recipe = True
                         user_tasks[user_prompt].fallback = False
-                        message = f"Action {user_tasks[user_prompt].current_action} fallback: send_message_to_user asking what actions should be taken if current actions fail in the future after you get the response from user give the conversation to StatusVerifier agent"
+                        message = f"JUST Ask user via send_message_to_user to get Action {user_tasks[user_prompt].current_action} fallback, what actions should be taken if current actions fail in the future after you get the response from user give the conversation to StatusVerifier agent"
 
                     elif user_tasks[user_prompt].recipe is True:
                         # Recipe creation logic
@@ -2179,7 +2181,7 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
                         # Normal action execution
                         current_app.logger.info("Executing normal action")
                         task_time[prompt_id]['timer'] = time.time()
-                        message = f'Action {user_tasks[user_prompt].current_action + 1}: {message} '
+                        message = f'Perform this action -> Action #{user_tasks[user_prompt].current_action + 1}: {message} '
 
                         # Send crossbar message
                         try:
