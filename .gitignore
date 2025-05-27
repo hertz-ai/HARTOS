@@ -3,3 +3,4 @@ __pycache__/
 langchain.log
 temp.py
 prompts/temp.json
+/autogen-0.2.37/

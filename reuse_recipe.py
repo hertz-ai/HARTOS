@@ -2484,7 +2484,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                         steps = [{x['steps']: {'tool_name': x.get('tool_name', None),
                                                'code': x.get('generalized_functions', None)}} for x in
                                  recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action]['recipe']]
-                        user_message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
+                        user_message = f"Action #{user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
                         chat_instructor.initiate_chat(recipient=manager, message=user_message, clear_history=False,
                                                       silent=False)
                         continue
@@ -2506,7 +2506,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                                                        'code': x.get('generalized_functions', None)}} for x in
                                          recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action][
                                              'recipe']]
-                                user_message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
+                                user_message = f"Action #{user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
                                 chat_instructor.initiate_chat(recipient=manager, message=user_message,
                                                               clear_history=False, silent=False)
                                 continue
@@ -2693,7 +2693,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                 if stop:
                     user_journey[user_prompt] = 'UseBot'
                     # action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)['action']
-                    # user_message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action+1}:{action_message}"
+                    # user_message = f"Action #{user_tasks[user_prompt].current_action+1}:{action_message}"
                 else:
                     user_journey[user_prompt] = 'Roles'
             if user_journey[user_prompt] == 'UseBot':
@@ -2725,7 +2725,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                 steps = [
                     {x['steps']: {'tool_name': x.get('tool_name', None), 'code': x.get('generalized_functions', None)}}
                     for x in recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action]['recipe']]
-                message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
+                message = f"Action #{user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
                 # message = "let's perform the actions availabe in sequence\nIMP instruction: keep track of action id you are working on."
                 result = chat_instructor.initiate_chat(manager, message=message,
                                                        speaker_selection={"speaker": "assistant"}, clear_history=False)
@@ -2747,7 +2747,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                                        'code': x.get('generalized_functions', None)}} for x in
                                          recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action][
                                              'recipe']]
-                                user_message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
+                                user_message = f"Action #{user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
                                 chat_instructor.initiate_chat(recipient=manager, message=user_message,
                                                               clear_history=False, silent=False)
                                 continue
@@ -2767,7 +2767,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                                                'code': x.get('generalized_functions', None)}} for x in
                                                  recipes[user_prompt]['actions'][
                                                      user_tasks[user_prompt].current_action]['recipe']]
-                                        user_message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
+                                        user_message = f"Action #{user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
                                         chat_instructor.initiate_chat(recipient=manager, message=user_message,
                                                                       clear_history=False, silent=False)
                                         continue

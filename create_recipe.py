@@ -78,13 +78,42 @@ def log_tool_execution(func):
         tool_logger.info(f"Arguments: {args}, Keyword Arguments: {kwargs}")
         try:
             result = func(*args, **kwargs)
+
+            # Ensure result is always a string
+            if not isinstance(result, str):
+                tool_logger.warning(f"Tool function {func.__name__} returned non-string type: {type(result)}")
+                result = str(result)
+
             tool_logger.info(f"TOOL EXECUTION SUCCESS: {func.__name__}")
-            tool_logger.info(f"Result: {result[:100]}..." if isinstance(result, str) and len(result) > 100 else f"Result: {result}")
+            tool_logger.info(
+                f"Result: {result[:100]}..." if isinstance(result, str) and len(result) > 100 else f"Result: {result}")
             return result
         except Exception as e:
             tool_logger.error(f"TOOL EXECUTION ERROR: {func.__name__} - {str(e)}")
             tool_logger.exception("Exception details:")
-            raise
+
+            # Instead of raising, return a structured error response
+            error_response = {
+                "status": "error",
+                "tool_function": func.__name__,
+                "error_type": type(e).__name__,
+                "error_message": str(e),
+                "suggestion": "Check logs for detailed traceback information"
+            }
+
+            # Add specific suggestions for common errors
+            if "NameError" in str(type(e)):
+                error_response[
+                    "suggestion"] = "Variable not found in scope. Check if required variables like prompt_id or agent_data are defined."
+            elif "KeyError" in str(type(e)):
+                error_response["suggestion"] = "Key not found in dictionary. Verify data structure and key names."
+
+            error_json = json.dumps(error_response)
+            tool_logger.info(f"Returning error response: {error_json}")
+
+            # Return error instead of raising - this is the key fix
+            return f"Tool execution failed: {error_json}"
+
     return wrapper
 
 scheduler = BackgroundScheduler()
@@ -1076,7 +1105,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         # Default to 'auto' (let the system decide based on content)
         # This preserves the routing mechanism's ability to select appropriate agents
         current_app.logger.info('Using auto speaker selection as no specific rule matched')
-        return 'auto'
+        return assistant
 
     all_agents = [assistant, executor, author, chat_instructor,helper,verify]
     all_agents.extend(custom_agents)
@@ -1097,7 +1126,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         # select_speaker_prompt_template=f"Read the above conversation, select the next person from [Assistant, Helper, Executor, ChatInstructor, StatusVerifier & User] & only return the role as agent.",
         select_speaker_transform_messages=select_speaker_transforms,
         speaker_selection_method=state_transition,  # using an LLM to decide
-        allow_repeat_speaker=True,  # Prevent same agent speaking twice
+        allow_repeat_speaker=False,  # Prevent same agent speaking twice
         send_introductions=False
     )
 
@@ -1764,9 +1793,9 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
         current_app.logger.warning(f"Total messages count: {len(group_chat.messages)}")
 
         # Convert all messages to user role for recovery
-        for i in range(len(group_chat.messages)):
-            current_app.logger.info(f"Converting message[{i}] role from {group_chat.messages[i].get('role')} to user")
-            group_chat.messages[i]['role'] = 'user'
+        # for i in range(len(group_chat.messages)):
+        #     current_app.logger.info(f"Converting message[{i}] role from {group_chat.messages[i].get('role')} to user")
+        #     group_chat.messages[i]['role'] = 'user'
 
         clear_history = False
 
@@ -1776,16 +1805,16 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
                 current_app.logger.info("Using fallback/recipe recovery path")
                 actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)
                 message = 'Lets continue the work we were doing if action is completed then ask status verifier Agent to Please tell the status of the action'
-                text = f'Perform this action -> Action #{user_tasks[user_prompt].current_action + 1}: {message} '
+                text = f'Action #{user_tasks[user_prompt].current_action + 1}: {message} '
             else:
                 current_app.logger.info("Using standard recovery path")
                 try:
                     message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
-                    text = f'Perform this action -> Action #{user_tasks[user_prompt].current_action + 1}: {message} '
+                    text = f'Action #{user_tasks[user_prompt].current_action + 1}: {message} '
                 except Exception as e:
                     current_app.logger.error(f"Error getting action for recovery: {e}")
                     message = ""
-                    text = f'Perform this action -> Action #{user_tasks[user_prompt].current_action}: {message} '
+                    text = f'Action #{user_tasks[user_prompt].current_action}: {message} '
         except Exception as e:
             current_app.logger.error(f"Error preparing recovery message: {e}")
             message = "Let's continue where we left off."
@@ -1808,7 +1837,7 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
         else:
             current_app.logger.info("Starting new chat")
             message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
-            message = f'Perform this action -> Action #{user_tasks[user_prompt].current_action + 1}: {message} '
+            message = f'Action #{user_tasks[user_prompt].current_action + 1}: {message} '
 
             # Publish crossbar message for UI feedback
             crossbar_message = {
@@ -2181,7 +2210,7 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
                         # Normal action execution
                         current_app.logger.info("Executing normal action")
                         task_time[prompt_id]['timer'] = time.time()
-                        message = f'Perform this action -> Action #{user_tasks[user_prompt].current_action + 1}: {message} '
+                        message = f'Action #{user_tasks[user_prompt].current_action + 1}: {message} '
 
                         # Send crossbar message
                         try:
