@@ -1857,15 +1857,26 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
 
         current_app.logger.info("\n=== Chat Summary ===")
         current_app.logger.info("\n=== Full response ===")
-        # current_app.logger.info(result)
 
+        # Main processing loop
+        while_loop_iterations = 0
+        max_iterations = 10  # Prevent infinite loops
 
+        while while_loop_iterations < max_iterations:
+            while_loop_iterations += 1
+            current_app.logger.info(f"WHILE LOOP ITERATION #{while_loop_iterations}")
 
-        while True:
-            file_path = f'prompts/{prompt_id}.json'
-            with open(file_path, 'r') as f:
-                data = json.load(f)
-                role = data['flows'][recipe_for_persona[user_prompt]]['persona']
+            # Load persona info from config
+            try:
+                file_path = f'prompts/{prompt_id}.json'
+                with open(file_path, 'r') as f:
+                    data = json.load(f)
+                    role = data['flows'][recipe_for_persona[user_prompt]]['persona']
+                current_app.logger.info(f"Loaded role={role} from config")
+            except Exception as e:
+                current_app.logger.error(f"Error loading role info: {e}")
+                role = "unknown"
+
             current_app.logger.info('inside while')
             if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
                 current_app.logger.info(f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
@@ -2164,7 +2175,19 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                 current_app.logger.info(f'current action {user_tasks[user_prompt].current_action} is greater than legth {len(user_tasks[user_prompt].actions)}')
                 break
 
+
+        # Log loop exit
+        if while_loop_iterations >= max_iterations:
+            current_app.logger.warning(f"Exited while loop after reaching max iterations ({max_iterations})")
+        else:
+            current_app.logger.info(f"Exited while loop after {while_loop_iterations} iterations")
+
+        # Store messages and prepare final response
         messages[user_prompt] = group_chat.messages
+
+        if len(group_chat.messages) == 0:
+            current_app.logger.warning("No messages in group chat after processing")
+
         last_message = group_chat.messages[-1]
         if last_message['content'] == 'TERMINATE':
             last_message = group_chat.messages[-2]
