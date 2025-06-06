@@ -28,16 +28,21 @@ from crossbarhttp import Client
 client = Client('http://aws_rasa.hertzai.com:8088/publish')
 
 import logging
-import os
 import sys
-from datetime import datetime
 from functools import wraps
 import cv2
 import redis
 import pickle
 import pytz
 from PIL import Image
+<<<<<<< Updated upstream
 from datetime import timedelta
+=======
+
+from datetime import timedelta
+from lifecycle_hooks import initialize_minimal_lifecycle_hooks
+initialize_minimal_lifecycle_hooks()  # Prints integration guide
+>>>>>>> Stashed changes
 
 # Set up a dedicated logger that doesn't depend on Flask context
 log_dir = "logs"
@@ -109,11 +114,19 @@ config_list = [{
     }]
 with open("config.json", 'r') as f:
     config = json.load(f)
+<<<<<<< Updated upstream
 
+=======
+>>>>>>> Stashed changes
 STUDENT_API = config['STUDENT_API']
 ACTION_API = config['ACTION_API']
 redis_client = redis.StrictRedis(
     host='azure_all_vms.hertzai.com', port=6369, db=0)
+<<<<<<< Updated upstream
+=======
+
+
+>>>>>>> Stashed changes
 
 agent_data = {}
 task_time = {}
@@ -238,10 +251,231 @@ from typing import List
 def get_frame(user_id):
     serialized_frame = redis_client.get(user_id)
 
+<<<<<<< Updated upstream
+=======
+def get_frame(user_id):
+    serialized_frame = redis_client.get(user_id)
+>>>>>>> Stashed changes
     try:
         if serialized_frame is not None:
             frame_bgr = pickle.loads(serialized_frame)
             current_app.logger.info(
+<<<<<<< Updated upstream
+=======
+                 
+                f"Frame for user_id {user_id} retrieved successfully.")
+            frame = frame_bgr[:, :, ::-1]
+            return frame
+        else:
+            current_app.logger.info(f"No frame found for user_id {user_id}.")
+            return None
+    except ModuleNotFoundError as e:
+        raise e
+    
+def get_visual_context(user_id, minutes=2):
+    """Get visual context from the past specified minutes"""
+    try:
+        current_app.logger.info(f'Getting visual context for user {user_id} for past {minutes} minutes')
+        visual_context = helper_fun.get_visual_context(user_id, minutes)
+        current_app.logger.info(f'GOT RESPONSE AS {visual_context}')
+        if not visual_context:
+            visual_context = 'User\'s camera is not on. no visual data'
+        return visual_context
+    except Exception as e:
+        current_app.logger.error(f'Error getting visual context: {e}')
+        return None
+    
+def get_action_user_details(user_id):
+    '''
+        This function helps to extract actions that the user has performed till now.
+    '''
+    unwanted_actions = ['Topic Cofirmation', 'Langchain', 'Assessment Ended', 'Casual Conversation',
+                        'Topic confirmation',
+                        'Topic not found', 'Topic Confirmation', 'Topic Listing', 'Probe', 'Question Answering',
+                        'Fallback']
+    action_url = f"{ACTION_API}?user_id={user_id}"
+    time_zone = "Asia/Kolkata"
+    try:
+        india_tz = pytz.timezone(time_zone)
+    except:
+        india_tz = None
+    payload = {}
+    headers = {}
+    try:
+        response = requests.request("GET", action_url, headers=headers, data=payload)
+        if response.status_code == 200:
+            data = response.json()
+            filtered_data = [obj for obj in data if obj["action"] not in unwanted_actions and obj["zeroshot_label"] not in ['Video Reasoning']]
+            action_texts = []
+            for obj in filtered_data:
+                action = obj["action"]
+                try:
+                    date = parse_date(obj["created_date"])
+                    if india_tz:
+                        first_action_text = f"{action} on {date.astimezone(india_tz).strftime('%Y-%m-%dT%H:%M:%S')}"
+                    else:
+                        first_action_text = f"{action} on {date.strftime('%Y-%m-%dT%H:%M:%S')}"
+                    action_texts.append(first_action_text)
+                except:
+                    action_texts.append(f"{action}")
+                if len(action_texts) == 0:
+                    action_texts = ['user has not performed any actions yet.']
+                actions = ", ".join(action_texts)
+        else:
+            actions = "Could not retrieve user actions"
+    except Exception as e:
+        current_app.logger.error(f"Error getting action details: {e}")
+        actions = "No user action data available"
+    try:
+        url = STUDENT_API
+        payload = json.dumps({"user_id": user_id})
+        headers = {'Content-Type': 'application/json'}
+        response = requests.request("POST", url, headers=headers, data=payload)
+        if response.status_code == 200:
+            user_data = response.json()
+            user_details = f'''Below are the information about the user.
+            user_name: {user_data.get("name", "Unknown")}, gender: {user_data.get("gender", "Unknown")}, 
+            preferred_language: {user_data.get("preferred_language", "Unknown")}, 
+            date_of_birth: {user_data.get("dob", "Unknown")}'''
+        else:
+            user_details = "Could not retrieve user details"
+     except Exception as e:
+        current_app.logger.error(f"Error getting user details: {e}")
+        user_details = "No user details available"
+    return user_details, actions
+
+    
+        
+        
+                        
+                        
+
+
+
+
+
+
+
+
+
+def visual_based_execution(task_description: str, user_id: int, prompt_id: int):
+    current_app.logger.info(f'INSIDE Visual_BASED_EXECUTION')
+    user_prompt = f'{user_id}_{prompt_id}'
+    frame = get_frame(str(user_id))
+    if frame is None:
+        current_app.logger.info("Camera is OFF or no frame found — skipping visual agent.")
+        return
+    try:
+        user_details, actions = helper_fun.get_action_user_details(user_id)
+        current_app.logger.info(f"User actions: {actions}")
+    except Exception as e:
+        current_app.logger.error(f"Error getting user details: {e}")
+        actions = "No user action data available"
+    if user_prompt not in user_agents:
+        current_app.logger.info('user_id is not present in user_agents.')
+        return
+    try:
+        author, assistant_agent, executor, group_chat, manager, chat_instructor, agents_object = user_agents[user_prompt]
+        current_time = datetime.now()
+        text = f'''This is the time now {current_time}
+            You are an assistant in a visual execution system. Perform the requested action based on the task context.
+            Note: Visual input is available because the user's camera is ON.
+            Recent user actions: {actions}
+            If the user needs to be informed (e.g., task completed, input needed, error), respond in this exact JSON format:
+            {{"message_2_user": "Your clear and useful message here"}}
+            Only send this if you have something meaningful to say.
+            Do not interrupt the user unless they have asked for a response or the task cannot proceed without their input.
+            You must now perform this task: {task_description}'''
+        # Use the existing agent structure
+        result = author.initiate_chat(manager, message=text, clear_history=False)
+        last_message = group_chat.messages[-1]
+        if last_message['content'] == 'TERMINATE':
+            if len(group_chat.messages) > 1:
+                last_message = group_chat.messages[-2]
+            if 'message_2_user' in last_message['content'].lower():
+                try:
+                    json_obj = retrieve_json(last_message['content'])
+                    if json_obj and 'message_2_user' in json_obj:
+                        send_message_to_user1(user_id, json_obj['message_2_user'], task_description, prompt_id)
+                except Exception as e:
+                    current_app.logger.error(f"Error processing visual agent response: {e}")
+    except Exception as e:
+        current_app.logger.error(f"Error in visual_based_execution: {e}")
+    return 'done'
+def call_visual_task(task_description: str, user_id: int, prompt_id: int, data: list = None, date: datetime = None):
+    headers = {'Content-Type': 'application/json'}
+    url = 'http://localhost:6777/visual_agent'
+    # Camera Check - Ensure camera is accessible and functional
+    try:
+        cap = cv2.VideoCapture(0)  # Try accessing the first camera (device 0)
+        if not cap.isOpened():
+
+            current_app.logger.warning("Camera is not accessible. Please ensure the camera is turned on and connected.")
+            return visual_based_execution(task_description, user_id, prompt_id)
+        ret, frame = cap.read()
+        if not ret:
+            current_app.logger.warning("Failed to capture a frame. Please check the camera settings or permissions.")
+            cap.release()
+            return visual_based_execution(task_description, user_id, prompt_id)
+        cap.release()
+        current_app.logger.info("Camera is accessible and working")
+    except Exception as e:
+        current_app.logger.error(f"Camera check failed: {e}")
+        return visual_based_execution(task_description, user_id, prompt_id)
+
+    now = datetime.now()
+    
+    # Use current time if date not provided
+    if date is None:
+        date = now - timedelta(seconds=30)
+    if data and any(obj.get("zeroshot_label") == 'Video Reasoning' for obj in data) and (now - date) > timedelta(seconds=30):
+        data_to_send = json.dumps({
+
+            'task_description': task_description,
+            'user_id': user_id,
+            'prompt_id': prompt_id,
+            'request_from': 'Create'
+            })
+        try:
+            # Send POST request to the external visual agent
+            res = requests.post(url, data=data_to_send, headers=headers, timeout=10)
+            current_app.logger.info(f"External visual agent response: {res.status_code}")
+            return 'done'
+        except Exception as e:
+            current_app.logger.error(f"Failed to call external visual agent: {e}")
+            # Fallback to internal visual processing
+            return visual_based_execution(task_description, user_id, prompt_id)
+    else:
+        current_app.logger.info("Using internal visual processing")
+        return visual_based_execution(task_description, user_id, prompt_id)
+    
+def parse_date(date_str):
+    return datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%S")
+
+    
+         
+
+
+         
+                
+    
+
+        
+
+
+
+
+
+
+             
+              
+        
+     
+
+
+         
+         
+>>>>>>> Stashed changes
 
                 f"Frame for user_id {user_id} retrieved successfully.")
             
