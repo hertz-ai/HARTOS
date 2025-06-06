@@ -42,13 +42,10 @@ from lifecycle_hooks import (
     lifecycle_hook_track_recipe_completion, lifecycle_hook_check_all_actions_complete
 )
 
-<<<<<<< HEAD
-=======
+
 # Initialize
 initialize_deterministic_actions()
 
-
->>>>>>> a87d96b (gpt4.1)
 import inspect
 import asyncio
 import logging
@@ -305,11 +302,8 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
     # At this point, don't process messages with message_2_user as they were already sent
     return 'done'
 
-
-<<<<<<< HEAD
 from typing import List
-=======
->>>>>>> a87d96b (gpt4.1)
+
 
 
 class SubscriptionHandler:
@@ -441,19 +435,6 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         •Action Flow:
             1. Receive Action: Ask the UserProxy to associate the action with a persona (if multiple personas exist).
             2. Execution:
-<<<<<<< HEAD
-                ?Understand and plan the current action execution.
-                ?Perform the action with the help of @Helper and @Executor agents.
-                ?Account for all the tools available with helper & whenever you are supposed to call a tool as part of current action ask @Helper.
-                ?If the action requires code execution or API endpoint call, in create code(python preferred) and ask @Executor agent to execute the created code.
-            3. After Completion:
-                ?If action completed successful & there is no error, ask @Helper to save the information(which will be required in future) in memory using 'save_data_in_memory' tool.
-                ?After save_data_in_memory has completed, ask the StatusVerifier to confirm completion and include the persona name.
-                ?After confirmation, request the next action from the ChatInstructor.
-            4. If Failed:
-                ?Create a summary of the error and ask the UserProxy for help if needed.
-                ?Never assume; always seek user assistance for unresolved issues.
-=======
                 - Understand and plan the current action execution.
                 - Perform the action with the help of @Helper and @Executor agents.
                 - Account for all the tools available with helper & whenever you are supposed to call a tool as part of current action ask @Helper.
@@ -465,20 +446,16 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             4. If Failed:
                 - Create a summary of the error and ask the UserProxy for help if needed.
                 - Never assume; always seek user assistance for unresolved issues.
->>>>>>> a87d96b (gpt4.1)
+
             5. Action Modifications:
                 - If the action is modified, ask the user what measures should be taken if it fails in the future.
 
         •Persona Association:
             list of persona:- """+f'{list_of_persona}'+"""
-            Rules:
-<<<<<<< HEAD
-                ?If there’s only 1 persona in the list, associate that persona with all actions automatically.
-                ?If there are multiple personas, ask the @user to select the persona associated with each action.
-=======
-                - If there’s only 1 persona in the list, associate that persona with all actions automatically.
+
+                - If there's only 1 persona in the list, associate that persona with all actions automatically.
                 - If there are multiple personas, ask the @user to select the persona associated with each action.
->>>>>>> a87d96b (gpt4.1)
+
 
         •Code Execution: Executor Agent: Executes code as needed. Ensure the final response is printed in code using print() before sending to Executor.
 
@@ -486,13 +463,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             1. The tools are: send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,execute_windows_or_android_command,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, google_search and save_data_in_memory.
             2. Create Scheduled Jobs: For tasks involving timer or time or periodically or scheduled jobs, ask Helper agent to use the create_scheduled_jobs tool.
             3. Data/Memory Management:
-<<<<<<< HEAD
-                ?If you want to save some data,understand the current data from get_saved_metadata & plan the datamodel and ask helper agent to use "save_data_in_memory" tool.
-                ?If you want to get some data ask helper agent to use "get_data_by_key"  tool.
-=======
+
                 - If you want to save some data,understand the current data from get_saved_metadata & plan the datamodel and ask helper agent to use "save_data_in_memory" tool.
                 - If you want to get some data ask helper agent to use "get_data_by_key"  tool.
->>>>>>> a87d96b (gpt4.1)
             4. If you want to send some message to user directly then ask helper agent to use send_message_to_user tool but if you want to send message after sometime then ask helper to use send_message_in_seconds tool.
             5. If you want to send some pre synthesized realistic videos to user then ask helper agent to use send_presynthesized_video_to_user tool.
             6. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the pre synthesized generated video if it is successful.
@@ -521,13 +494,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
 
             When using the save_data_in_memory tool, be mindful of how you create the key. Ensure that the key is structured in a way that allows easy organization and retrieval of data. Use dot notation to create a logical key path. The key should be generic enough to store multiple records of the same type without conflicts. Avoid using specific values as part of the key
                 For example:
-<<<<<<< HEAD
-                    ? stories.story_name - Good key structure for storing multiple stories.
-                    ? creator.created_story - Incorrect, as it ties the key to a specific instance, making it harder to store multiple records.
-=======
+
                     - stories.story_name - Good key structure for storing multiple stories.
                     - creator.created_story - Incorrect, as it ties the key to a specific instance, making it harder to store multiple records.
->>>>>>> a87d96b (gpt4.1)
+
 
 
         •Working Directory: /home/hertzai2019/newauto/coding/
@@ -565,13 +535,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             If you want to send data proactively (on your own) to user use `@user {"message_2_user": "message here"}`. However, if you're responding to the user's request or instruction, use the send_message_to_user or send_message_in_seconds tool.
             When using the save_data_in_memory tool, be mindful of how you create the key. Ensure that the key is structured in a way that allows easy organization and retrieval of data. Use dot notation to create a logical key path. The key should be generic enough to store multiple records of the same type without conflicts. Avoid using specific values as part of the key
                 For example:
-<<<<<<< HEAD
-                    ? stories.story_name - Good key structure for storing multiple stories.
-                    ? creator.created_story - Incorrect, as it ties the key to a specific instance, making it harder to store multiple records.
-=======
+
                     - stories.story_name - Good key structure for storing multiple stories.
                     - creator.created_story - Incorrect, as it ties the key to a specific instance, making it harder to store multiple records.
->>>>>>> a87d96b (gpt4.1)
+
             When receiving responses from tools that should return JSON, always use the validate_json_response tool to ensure valid JSON formatting before processing further. This helps prevent errors when parsing tool output.
         Data Management:
             Use the get_set_internal_memory tool to store or retrieve user information as needed.""",
@@ -647,13 +614,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             1. Tools Helper Agent can use: Can use tools like send_message_in_seconds, send_message_to_user,send_presynthesized_video_to_user, execute_windows_or_android_command, text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory.
             2. Create Scheduled Jobs: For tasks involving timers or scheduled jobs, ask Helper agent to use the create_scheduled_jobs tool.
             3. Data/Memory Management:
-<<<<<<< HEAD
-                ?If you want to save some data ask helper agent to use "save_data_in_memory" tool.
-                ?If you want to get some data ask helper agent to use "get_data_by_key", "get_saved_metadata" tool.
-=======
                 - If you want to save some data ask helper agent to use "save_data_in_memory" tool.
                 - If you want to get some data ask helper agent to use "get_data_by_key", "get_saved_metadata" tool.
->>>>>>> a87d96b (gpt4.1)
+
             4. If you want to send some message to user directly then ask helper agent to use send_message_to_user tool but if you want to send message after sometime then ask helper to use send_message_in_seconds tool.
             5. If you want to send some pre synthesized video to user then ask helper agent to use send_presynthesized_video_to_user tool.
             6. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
@@ -1120,8 +1083,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
 
 
         try:
-<<<<<<< HEAD
-=======
+
 
             # Enhanced agent selection with state awareness
             if user_prompt and user_tasks[user_prompt]:
@@ -1145,7 +1107,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
                         # Route to StatusVerifier when requested
                         return verify
 
->>>>>>> a87d96b (gpt4.1)
+
             # Check for JSON eroor status pattern
             if "error" in messages[-1]["content"].lower() or "failed" in messages[-1]["content"].lower():
                 json_match = re.search(r'{[\s\S]*?}', messages[-1]["content"])
@@ -1227,10 +1189,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
                             if 'entire_actions' in json_obj.keys() and type(json_obj['entire_actions'])==list:
                                 current_app.logger.info('GOT UPDATED WITH entire actions')
                                 try:
-<<<<<<< HEAD
-=======
 
->>>>>>> a87d96b (gpt4.1)
                                     current_app.logger.info(f"user_tasks[user_prompt].actions:{len(user_tasks[user_prompt].actions)}, len(json_obj['entire_actions']:{len(json_obj['entire_actions'])}")
                                     current_app.logger.info(f"user_tasks[user_prompt].actions:{user_tasks[user_prompt].actions}, len(json_obj['entire_actions']:{json_obj['entire_actions']}")
 
@@ -1244,10 +1203,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
 
                                 except Exception as e:
                                     current_app.logger.info(f'error is here:{e}')
-<<<<<<< HEAD
-=======
 
->>>>>>> a87d96b (gpt4.1)
                                     user_tasks[user_prompt].actions[int(json_obj['action_id'])-1] = json_obj['updated_action']
                                     user_tasks[user_prompt].new_json.append(json_obj)
                                     set_action_state(user_prompt, int(json_obj['action_id']), ActionState.FALLBACK_REQUESTED)
@@ -1957,11 +1913,9 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
     try:
         current_app.logger.info(f"Messages in user_prompt before init: {len(messages.get(user_prompt, []))}")
 
-<<<<<<< HEAD
-        if len(messages[user_prompt])>0:
-=======
+
         if len(messages[user_prompt]) > 0:
->>>>>>> a87d96b (gpt4.1)
+
             # last_agent, last_message = manager.resume(messages=messages[user_prompt])
             try:
                 result = agents_object['user'].initiate_chat(recipient=manager, message=text, clear_history=clear_history,silent=False)
@@ -1969,32 +1923,24 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                 current_app.logger.error(f'Got some error it can be multiple tools called at one error:{e}')
                 current_app.logger.error(traceback.format_exc())
                 # current_app.logger.error(f'len of group chat :{group_chat.messages}')
-<<<<<<< HEAD
-                return 'Our Agent is facing issues in creating this agent please try later'
+
+                # return 'Our Agent is facing issues in creating this agent please try later'
                 # current_app.logger.error(f' group chat :{group_chat.messages}')
 
-
-=======
                 # current_app.logger.error(f' group chat :{group_chat.messages}')
->>>>>>> a87d96b (gpt4.1)
+
                 for i in range(len(group_chat.messages)):
                     group_chat.messages[i]['role'] = 'user'
                 message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
                 text = f'Action {user_tasks[user_prompt].current_action+1}: {message}'
                 result = agents_object['helper'].initiate_chat(recipient=manager, message=text, clear_history=True,silent=False)
-<<<<<<< HEAD
 
-        else:
-            message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
-            message = f'Action {user_tasks[user_prompt].current_action+1}: {message} '
-=======
                 return "I've encountered an issue but I'm trying to auto heal and recover"
 
 
         else:
             message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
             message = f'Action {user_tasks[user_prompt].current_action+1}: {message} '+f'Latest User message: {text}'
->>>>>>> a87d96b (gpt4.1)
             crossbar_message = {"text": ["Working on "+message+".\n please evaluate the response i am giving to check if it meets the current action"], "priority": 49, "action": 'Thinking', "historical_request_id": [], "preffered_language": 'en-US', "options": [], "newoptions": [], "bot_type": 'Agent', "page_image_url": "", "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
             'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0}, 'bottom_left': {'x': 0, 'y': 0}}}
             result = client.publish(
@@ -2038,32 +1984,6 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
                 current_app.logger.info(f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
                 json_obj = retrieve_json(group_chat.messages[-2]["content"])
-<<<<<<< HEAD
-                if not json_obj:
-                    json_obj = individual_json[user_prompt]
-                if json_obj and type(json_obj)==dict and 'status' in json_obj.keys():
-                    if json_obj['status'].lower() == 'completed' and 'recipe' not in json_obj.keys():
-                        if user_tasks[user_prompt].current_action != int(json_obj['action_id']):
-                            user_tasks[user_prompt].fallback = True
-                        current_app.logger.info(f'UPDATIN CURRENT ACTION AS :{int(json_obj["action_id"])}')
-                        user_tasks[user_prompt].current_action = int(json_obj['action_id'])
-                else:
-                    current_app.logger.warning(f'it is not a json object the error is:')
-                    current_app.logger.info('it is not a json object You should ask status verifier to give response in proper format & not move ahead to next action')
-                    if group_chat.messages[-1]['role'] == 'tool':
-                        current_app.logger.info('GOT role is tool')
-                        break
-                    if user_tasks[user_prompt].fallback == True or user_tasks[user_prompt].recipe == True:
-                        actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action-1)
-                        message = f'Lets continue the work we were doing, if action is completed then ask @statusverifier Agent to Please tell the status of the action {user_tasks[user_prompt].current_action}: {actions_prompt}'
-                    else:
-                        actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
-                        message = f'Lets continue the work we were doing, if action is completed then ask @statusverifier Agent to Please tell the status of the action {user_tasks[user_prompt].current_action+1}: {actions_prompt}'
-                    result = agents_object['helper'].initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
-                    continue
-                current_app.logger.info('resuming chat')
-                if user_tasks[user_prompt].current_action>=len(user_tasks[user_prompt].actions):
-=======
 
                 # LIFECYCLE HOOK - Check if JSON status is valid
                 hook_result = lifecycle_hook_process_verifier_response(user_prompt, json_obj,
@@ -2112,23 +2032,18 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     continue
                 current_app.logger.info('resuming chat')
                 if user_tasks[user_prompt].current_action >= len(user_tasks[user_prompt].actions):
->>>>>>> a87d96b (gpt4.1)
+
                     if user_tasks[user_prompt].recipe == True:
                         user_tasks[user_prompt].recipe = False
                         user_tasks[user_prompt].fallback = False
                         metadata = strip_json_values(agent_data[prompt_id])
-<<<<<<< HEAD
-                        message = '''Focus on the current task at hand and create a detailed recipe that includes only the necessary steps for this action from history, along with a suitable name. Provide the output in the following JSON format:
-                        { "status", "done", "action": "'''+str(user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action-1))+'''","fallback_action":"", "persona":"","action_id": '''+f'{user_tasks[user_prompt].current_action}'+''', "recipe": [{{"steps":"steps here","tool_name":"Only include tool name here if used for this step.","generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely."}}],"can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
-                        Recipe Requirements:
-                        1. Generalized Python Functions: Give the code which was created and excuted successfully without any error handling edge cases. leave it blank when there is no code nedded to perform the action
-=======
+
                         set_action_state(user_prompt, current_action_id, ActionState.RECIPE_REQUESTED)
                         message = '''Focus on the current task at hand and create a detailed recipe that includes only the necessary steps for this action from history, along with a suitable name. Provide the output in the following JSON format:
                         { "status", "done", "action": "'''+str(user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action-1))+'''","fallback_action":"", "persona":"","action_id": '''+f'{user_tasks[user_prompt].current_action}'+''', "recipe": [{{"steps":"steps here","tool_name":"Only include tool name here if used for this step.","generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely."}}],"can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
                         Recipe Requirements:
                         1. Generalized Python Functions: Give the code which was created and executed successfully without any error handling edge cases. leave it blank when there is no code nedded to perform the action
->>>>>>> a87d96b (gpt4.1)
+
                         2. Avoid directly storing any specific information provided by the author in the recipe. Use placeholders for variables instead.
                         3. Ensure that coding and non-coding steps are not combined within the same function.
                         4. For all Python functions, include comprehensive docstrings to explain their purpose, parameters, and usage. This should especially clarify non-coding steps that require utilizing the assistant's language capabilities.
@@ -2137,10 +2052,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     elif user_tasks[user_prompt].fallback == True:
                         user_tasks[user_prompt].recipe = True
                         user_tasks[user_prompt].fallback = False
-<<<<<<< HEAD
-                        message = f" Action {user_tasks[user_prompt].current_action} fallback:ask user what actions should be taken if current actions fail in the future after you get the response from user give the conversaation to StatusVerifier agent"
-                    else:
-=======
+
                         set_action_state(user_prompt, current_action_id, ActionState.FALLBACK_REQUESTED)
 
                         message = f" Action {user_tasks[user_prompt].current_action} fallback:ask user what actions should be taken if current actions fail in the future after you get the response from user give the conversaation to StatusVerifier agent"
@@ -2161,7 +2073,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
 
                         # Only proceed if action completed full lifecycle (DONE state)
 
->>>>>>> a87d96b (gpt4.1)
+
                         # if recipe_for_persona[user_prompt]  < total_persona_actions[user_prompt]:
                         #     recipe_for_persona[user_prompt] += 1
                         user_tasks[user_prompt].new_json.append(json_obj)
@@ -2410,14 +2322,8 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             else:
                 break
 
-<<<<<<< HEAD
-            if user_tasks[user_prompt].current_action >len(user_tasks[user_prompt].actions):
-                current_app.logger.info(f'current action {user_tasks[user_prompt].current_action} is greater than legth {len(user_tasks[user_prompt].actions)}')
-                break
 
-
-=======
-            if not lifecycle_hook_track_termination(user_prompt, user_tasks):
+            if not lifecycle_hook_track_termination(user_prompt, user_tasks, group_chat):
                 message = f"Complete action {user_tasks[user_prompt].current_action} first before proceeding"
                 result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False)
                 continue
@@ -2427,9 +2333,6 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                 current_app.logger.info(f'current action {user_tasks[user_prompt].current_action} is greater than length {len(user_tasks[user_prompt].actions)}')
                 break
 
-
-
->>>>>>> a87d96b (gpt4.1)
         # Log loop exit
         if while_loop_iterations >= max_iterations:
             current_app.logger.warning(f"Exited while loop after reaching max iterations ({max_iterations})")
@@ -2539,7 +2442,3 @@ def acknowledgment(user_id,prompt_id,request_id):
     user_prompt = f'{user_id}_{prompt_id}'
     author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = user_agents[user_prompt]
     group_chat.messages.append({'content':f'GOT MESSAGE ACKNOWLEDGEMENT FOR {request_id}','role':'user','name':'Helper'})
-<<<<<<< HEAD
-=======
-
->>>>>>> a87d96b (gpt4.1)
