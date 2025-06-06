@@ -412,20 +412,6 @@ def get_action_user_details(user_id):
         user_details = "No user details available"
     return user_details, actions
 
-    
-        
-        
-                        
-                        
-
-
-
-
-
-
-
-
-
 def visual_based_execution(task_description: str, user_id: int, prompt_id: int):
     current_app.logger.info(f'INSIDE Visual_BASED_EXECUTION')
     user_prompt = f'{user_id}_{prompt_id}'
@@ -518,31 +504,7 @@ def call_visual_task(task_description: str, user_id: int, prompt_id: int, data: 
         return visual_based_execution(task_description, user_id, prompt_id)
     
 def parse_date(date_str):
-    return datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%S")
-
-    
-         
-
-
-         
-                
-    
-
-        
-
-
-
-
-
-
-             
-              
-        
-     
-
-
-         
-         
+    return datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%S")         
 
 class SubscriptionHandler:
     message = None
