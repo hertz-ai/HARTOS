@@ -353,6 +353,7 @@ def retrieve_json(json_message):
 
     # Try using ast.literal_eval which can handle Python dict syntax with single quotes
     try:
+        current_app.logger.info(f"json_repair faild {json_message}")
         json_obj = ast.literal_eval(json_message)
         current_app.logger.info('got json object using ast.literal_eval')
         return json_obj

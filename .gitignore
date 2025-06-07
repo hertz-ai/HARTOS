@@ -1,6 +1,7 @@
-langchain.log.1
-__pycache__/
+prompt/
+prompt/*
+logs/
+log/
 langchain.log
-temp.py
-prompts/temp.json
-/autogen-0.2.37/
+__pycache__/
+

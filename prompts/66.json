@@ -1,0 +1,38 @@
+{
+    "status": "completed",
+    "name": "Generic Story",
+    "broadcast_agent": false,
+    "personas": [
+        {
+            "name": "creator",
+            "description": "Will help in creating stories"
+        },
+        {
+            "name": "user",
+            "description": "Will consume stories"
+        }
+    ],
+    "flows": [
+        {
+            "flow_name": "story creation",
+            "persona": "creator",
+            "actions": [
+                "ask helper to use execute_windows_command to Open notepad and write hi",
+                "Retrieve avatar IDs using the API: https://mailer.hertzai.com/all_teacher_only_avatars_id_user_id?user_id={user_id} and associate each character with a unique avatar ID from the response, saving that info as well.",
+                "Create videos for all dialogues at a time using the associated avatar ID.",
+                "Check the status of generated dialogue videos using the status API: https://mailer.hertzai.com/get-video-conv_id/{{conv_id}} for all conv_ids which do not have a status of success.",
+                "Create a new story every hour."
+            ],
+            "sub_goal": "To generate and present a new engaging story with accompanying avatar dialogues every hour."
+        },
+        {
+            "flow_name": "story consumption",
+            "persona": "user",
+            "actions": [
+                "Check if any story is available in memory. Present the dialogues from the selected story with a 10-second interval until the story is completed. Once that story is done, proceed to give the next story using the same process."
+            ],
+            "sub_goal": "To give stories to the user."
+        }
+    ],
+    "goal": "You should perform task given by user."
+}
