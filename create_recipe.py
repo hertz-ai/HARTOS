@@ -477,7 +477,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
 
         •Calling Other Agents (Important):
             1. When you need to direct a question or route the conversation to a specific agent, use the @ tag followed by the agent's name. Examples include: @Executor or @Helper or @User
-            2. If you're responding to the user's request or need some clarification/information from user, just tag userproxy agent strictly via `@user {"message_2_user": "message here"}` or If you need to send data proactively (on your own) while continuing your current action use tools `send_message_to_user`  or `send_message_in_seconds` for sending message to user with delay,  Do not use both to convey the same.
+            2. If you are responding to the user's request or need some clarification/information from user, just tag userproxy agent strictly via `@user {"message_2_user": "message here"}` or If you need to send data proactively (on your own) while continuing your current action use tools `send_message_to_user`  or `send_message_in_seconds` for sending message to user with delay,  Do not use both to convey the same.
 
         •Communication Style:
             1. Speak casually, with clarity and respect. Maintain accuracy and clear communication.
