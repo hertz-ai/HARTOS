@@ -1032,7 +1032,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=50, keep_first_message=True),
             transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
-            ToolMessageHandler(),
+            ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
 
@@ -1942,7 +1942,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=50, keep_first_message=True),
             transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
-            ToolMessageHandler(),
+            ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
     context_handling.add_to_agent(time_agent)
@@ -2393,7 +2393,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=50, keep_first_message=True),
             transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
-            ToolMessageHandler(),
+            ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
 

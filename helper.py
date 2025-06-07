@@ -394,9 +394,32 @@ class ToolMessageHandler:
     It also handles the "only messages with role 'assistant' can have a function call" error.
     """
 
-    def __init__(self):
-        """Initialize the ToolMessageHandler."""
-        pass
+    def __init__(self, user_tasks=None, user_prompt=None):
+        """
+        Initialize the ToolMessageHandler.
+
+        Args:
+            user_tasks: Global user_tasks dictionary containing session data
+            user_prompt: Current session identifier (e.g., "10077_123")
+        """
+        self.user_tasks = user_tasks
+        self.user_prompt = user_prompt
+
+    def get_current_action_id(self):
+        """Get current action ID from user_tasks."""
+        if not self.user_tasks or not self.user_prompt:
+            return None
+
+        try:
+            if self.user_prompt in self.user_tasks:
+                current_action_id = self.user_tasks[self.user_prompt].current_action
+                current_app.logger.info(
+                    f"Retrieved current_action_id: {current_action_id} for session: {self.user_prompt}")
+                return current_action_id
+        except Exception as e:
+            current_app.logger.error(f"Error getting current_action_id from user_tasks: {e}")
+
+        return None
 
     def validate_messages(self, messages: List[Dict]) -> List[Dict]:
         for i, msg in enumerate(messages):
@@ -553,17 +576,214 @@ class ToolMessageHandler:
 
         return fixed_message
 
+    def remove_recipe_prompt_messages(self, messages):
+        """
+        Remove messages starting with 'Focus on the current task at hand and create a detailed recipe'
+        if the last message is 'Execute action'. Only removes from older messages, preserving the
+        last two messages regardless of content.
+        """
+        if len(messages) < 3:  # Need at least 3 messages to have something to remove
+            return messages
+
+        # Check if the last message contains "Execute action" pattern
+        last_message = messages[-1]
+        last_content = last_message.get('content', '')
+
+        # Use regex to match "Execute Action" followed by optional number and colon
+        execute_action_pattern = r'execute\s+action\s*\d*\s*:?'
+        if not re.search(execute_action_pattern, last_content, re.IGNORECASE):
+            return messages
+
+        current_app.logger.info(
+            "Last message contains 'Execute action' - checking older messages for recipe prompts to remove")
+
+        # Split messages: process older messages, preserve last 2
+        messages_to_process = messages[:-2]  # All except last 2
+        last_two_messages = messages[-2:]  # Last 2 messages (always preserved)
+
+        cleaned_older_messages = []
+        removed_count = 0
+
+        for i, msg in enumerate(messages_to_process):
+            should_remove = False
+
+            if 'content' in msg and isinstance(msg['content'], str):
+                # Check if message starts with the recipe prompt pattern
+                content = msg['content'].strip()
+                if content.startswith('Focus on the current task at hand and create a detailed recipe that includes'):
+                    should_remove = True
+                    removed_count += 1
+                    current_app.logger.info(f"Removing recipe prompt message at index {i}: {content[:100]}...")
+
+            if not should_remove:
+                cleaned_older_messages.append(msg)
+
+        if removed_count > 0:
+            current_app.logger.info(
+                f"Removed {removed_count} recipe prompt messages from older conversation history (preserved last 2 messages)")
+
+        # Combine cleaned older messages with preserved last 2 messages
+        return cleaned_older_messages + last_two_messages
+
+    def truncate_content(self, content, max_words=10):
+        """Truncate content to specified number of words for logging purposes."""
+        if not isinstance(content, str):
+            return content
+
+        words = content.split()
+        if len(words) <= max_words:
+            return content
+
+        truncated = ' '.join(words[:max_words])
+        return f"{truncated}... [truncated from {len(words)} words]"
+
+    def create_log_safe_message(self, msg, max_words=10):
+        """Create a log-safe version of message with truncated content."""
+        log_msg = msg.copy()
+
+        # Truncate main content
+        if 'content' in log_msg and log_msg['content']:
+            log_msg['content'] = self.truncate_content(log_msg['content'], max_words)
+
+        # Truncate tool_responses content if present
+        if 'tool_responses' in log_msg and isinstance(log_msg['tool_responses'], list):
+            for i, response in enumerate(log_msg['tool_responses']):
+                if 'content' in response and response['content']:
+                    log_msg['tool_responses'][i] = response.copy()
+                    log_msg['tool_responses'][i]['content'] = self.truncate_content(
+                        response['content'], max_words
+                    )
+
+        # Truncate tool_calls arguments if they're very large
+        if 'tool_calls' in log_msg and isinstance(log_msg['tool_calls'], list):
+            for i, tool_call in enumerate(log_msg['tool_calls']):
+                if ('function' in tool_call and
+                        'arguments' in tool_call['function'] and
+                        len(str(tool_call['function']['arguments'])) > 200):
+                    log_msg['tool_calls'][i] = tool_call.copy()
+                    log_msg['tool_calls'][i]['function'] = tool_call['function'].copy()
+                    log_msg['tool_calls'][i]['function']['arguments'] = (
+                            str(tool_call['function']['arguments'])[:200] + "... [truncated]"
+                    )
+
+        return log_msg
+
+    def compress_action_messages(self, messages, current_action_id=None):
+        """
+        Compress 'Execute Action X' messages to 'Action X' for older messages.
+        Only applies to messages except the last 2, and only for action IDs less than current_action_id.
+
+        Args:
+            messages: List of message dictionaries
+            current_action_id: Current action ID (int). If None, will try to detect from recent messages.
+
+        Returns:
+            List of messages with compressed action references
+        """
+        if len(messages) <= 2:
+            return messages
+
+        # Auto-detect current action ID if not provided
+        if current_action_id is None:
+            current_action_id = self._detect_current_action_id(messages)
+
+        # Process all messages except last 2
+        messages_to_process = messages[:-2]
+        recent_messages = messages[-2:]
+
+        compressed_messages = []
+
+        for msg in messages_to_process:
+            if 'content' in msg and isinstance(msg['content'], str):
+                compressed_content = self._compress_execute_action_text(
+                    msg['content'],
+                    current_action_id
+                )
+
+                if compressed_content != msg['content']:
+                    # Create a copy with compressed content
+                    compressed_msg = msg.copy()
+                    compressed_msg['content'] = compressed_content
+                    compressed_messages.append(compressed_msg)
+                    current_app.logger.info(
+                        f"Compressed action message: '{msg['content'][:50]}...' -> '{compressed_content[:50]}...'")
+                else:
+                    compressed_messages.append(msg)
+            else:
+                compressed_messages.append(msg)
+
+        # Combine compressed messages with recent unmodified messages
+        return compressed_messages + recent_messages
+
+    def _detect_current_action_id(self, messages):
+        """
+        Try to detect the current action ID from recent messages.
+        Looks for patterns like 'Execute Action X' or 'Action X' in recent messages.
+        """
+        # Check last few messages for action patterns
+        action_pattern = r'(?:Execute\s+)?Action\s+(\d+)'
+
+        for msg in reversed(messages[-5:]):  # Check last 5 messages
+            if 'content' in msg and isinstance(msg['content'], str):
+                matches = re.findall(action_pattern, msg['content'], re.IGNORECASE)
+                if matches:
+                    try:
+                        return int(matches[-1])  # Return the last (most recent) action ID found
+                    except ValueError:
+                        continue
+
+        return None  # Couldn't detect current action ID
+
+    def _compress_execute_action_text(self, content, current_action_id):
+        """
+        Replace 'Execute Action X' with 'Action X' for action IDs less than current_action_id.
+
+        Args:
+            content: Message content string
+            current_action_id: Current action ID (int or None)
+
+        Returns:
+            String with compressed action references
+        """
+        if not current_action_id:
+            return content
+
+        # Pattern to match "Execute Action X" where X is a number
+        pattern = r'Execute\s+Action\s+(\d+)'
+
+        def replace_if_older(match):
+            action_id_str = match.group(1)
+            try:
+                action_id = int(action_id_str)
+                if action_id < current_action_id:
+                    return f"Action {action_id_str}"
+                else:
+                    return match.group(0)  # Keep original if not older
+            except ValueError:
+                return match.group(0)  # Keep original if not a valid number
+
+        return re.sub(pattern, replace_if_older, content, flags=re.IGNORECASE)
+
     def apply_transform(self, messages: List[Dict]) -> List[Dict]:
         """Applies the tool message handling transformation to ensure valid tool call/response pairings."""
         if not messages:
             current_app.logger.info("ToolMessageHandler: No messages to process")
             return messages
+        # Get current action ID from user_tasks
+        current_action_id = self.get_current_action_id()
+
+        """Removes the done status to remove ambiguity for agent to reinforce current action completion without just giving status done"""
+        messages = self.remove_recipe_prompt_messages(messages)
+
+        """Removes the word Execute for historical actions and not for current action"""
+        messages = self.compress_action_messages(messages, current_action_id)
 
         current_app.logger.info(f"ToolMessageHandler: Processing {len(messages)} messages")
         # DEBUGGING: Print the entire conversation structure with full message details
         current_app.logger.info(f"=== FULL INPUT MESSAGES DEBUG ===")
         for i, msg in enumerate(messages):
-            current_app.logger.info(f"Message[{i}]: {json.dumps(msg, indent=2)}")
+            log_safe_msg = self.create_log_safe_message(msg, max_words=20)
+            current_app.logger.info(f"Message[{i}]: {json.dumps(log_safe_msg, indent=2)}")
         current_app.logger.info(f"=== END FULL INPUT MESSAGES DEBUG ===")
 
         # DEBUGGING: Print the entire conversation structure
@@ -924,6 +1144,8 @@ class ToolMessageHandler:
                             current_app.logger.info(
                                 f"Added placeholder for historical tool_call_id {tool_call_id}"
                             )
+
+
 
         final_messages = self.remove_orphan_tool_messages(final_messages)
 

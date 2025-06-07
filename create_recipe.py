@@ -402,7 +402,7 @@ def get_action_user_details(user_id):
             date_of_birth: {user_data.get("dob", "Unknown")}'''
         else:
             user_details = "Could not retrieve user details"
-     except Exception as e:
+    except Exception as e:
         current_app.logger.error(f"Error getting user details: {e}")
         user_details = "No user details available"
     return user_details, actions
@@ -823,7 +823,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=50,keep_first_message=True),
             transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
-            ToolMessageHandler(),
+            ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
     context_handling.add_to_agent(assistant)
@@ -1516,7 +1516,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=50,keep_first_message=True),
             transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
-            ToolMessageHandler(),
+            ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
 
@@ -1911,7 +1911,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=50,keep_first_message=True),
             transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
-            ToolMessageHandler(),
+            ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
     context_handling.add_to_agent(time_agent)
@@ -2008,7 +2008,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=50,keep_first_message=True),
             transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
-            ToolMessageHandler(),
+            ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
     time_group_chat = autogen.GroupChat(
