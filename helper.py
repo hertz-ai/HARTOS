@@ -129,9 +129,11 @@ def topological_sort(actions):
     adj_list = {action["action_id"]: [] for action in actions}
     in_degree = {action["action_id"]: 0 for action in actions}
     action_map = {action["action_id"]: action for action in actions}  # Map ID to full action
-
+    current_app.logger.info(f'got the actions in topological function')
+    current_app.logger.info(f'the actions in topological function: - \n {actions}')
     # Build the graph
     for action in actions:
+
         if action["actions_this_action_depends_on"]:  # Ensure it's not None
             for dep in action["actions_this_action_depends_on"]:
                 if dep != action["action_id"]:  # Ignore self-dependency
@@ -353,7 +355,6 @@ def retrieve_json(json_message):
 
     # Try using ast.literal_eval which can handle Python dict syntax with single quotes
     try:
-        current_app.logger.info(f"json_repair faild {json_message}")
         json_obj = ast.literal_eval(json_message)
         current_app.logger.info('got json object using ast.literal_eval')
         return json_obj
