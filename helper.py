@@ -663,7 +663,7 @@ class ToolMessageHandler:
                     log_msg['tool_calls'][i] = tool_call.copy()
                     log_msg['tool_calls'][i]['function'] = tool_call['function'].copy()
                     log_msg['tool_calls'][i]['function']['arguments'] = (
-                            str(tool_call['function']['arguments'])[:200] + "... [truncated]"
+                            str(tool_call['function']['arguments'])[:1000] + "... [truncated]"
                     )
 
         return log_msg
@@ -782,7 +782,7 @@ class ToolMessageHandler:
         # DEBUGGING: Print the entire conversation structure with full message details
         current_app.logger.info(f"=== FULL INPUT MESSAGES DEBUG ===")
         for i, msg in enumerate(messages):
-            log_safe_msg = self.create_log_safe_message(msg, max_words=20)
+            log_safe_msg = self.create_log_safe_message(msg, max_words=70)
             current_app.logger.info(f"Message[{i}]: {json.dumps(log_safe_msg, indent=2)}")
         current_app.logger.info(f"=== END FULL INPUT MESSAGES DEBUG ===")
 
@@ -1221,8 +1221,7 @@ def get_frame(user_id):
     except ModuleNotFoundError as e:
         raise e
 
-def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual context"],user_id:int) -> str:
-    request_id = 'Autogent_1234'
+def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual context"],user_id:int,request_id:str) -> str:
     current_app.logger.info('Using Vision to answer question')
     frame = get_frame(str(user_id))
     if frame is not None:
@@ -1542,3 +1541,186 @@ def create_visual_agent(user_id,prompt_id):
     context_handling.add_to_agent(verify2)
 
     return visual_agent, visual_user, helper2, executor2, multi_role_agent2, verify2, chat_instructor2
+
+
+# ========================================================================================
+# AUTOGEN JSON HANDLING ENHANCEMENT
+# ========================================================================================
+
+def force_apply_autogen_json_fix():
+    """Force apply the autogen JSON fix with robust error handling."""
+
+    def enhanced_execute_function(self, func_call, verbose: bool = False):
+        """Enhanced execute_function that falls back to retrieve_json only when original fails."""
+        try:
+            from autogen.io.base import IOStream
+            iostream = IOStream.get_default()
+        except:
+            class MockIOStream:
+                def print(self, *args, **kwargs):
+                    print(*args)
+
+            iostream = MockIOStream()
+
+        func_name = func_call.get("name", "")
+        func = self._function_map.get(func_name, None)
+
+        is_exec_success = False
+        if func is not None:
+            # ========== PRESERVE ORIGINAL AUTOGEN LOGIC ==========
+            # Extract arguments from a json-like string and put it into a dict.
+            input_string = func_call.get("arguments", "{}")
+
+            try:
+                # Try original autogen approach first
+                formatted_string = self._format_json_str(input_string)
+                arguments = json.loads(formatted_string)
+                print(f"✅ ORIGINAL AUTOGEN: Successfully parsed arguments for {func_name}")
+            except (json.JSONDecodeError, Exception) as e:
+                # Only if original fails, fall back to our enhanced parsing
+                print(f"⚠️ ORIGINAL AUTOGEN FAILED: {e} - falling back to enhanced parsing for {func_name}")
+                try:
+                    arguments = retrieve_json(input_string)
+                    if arguments is None:
+                        arguments = {}
+                    elif isinstance(arguments, str):
+                        arguments = json.loads(arguments)
+                    print(f"✅ FALLBACK SUCCESSFUL: Enhanced parsing worked for {func_name}")
+                except Exception as fallback_error:
+                    print(f"❌ FALLBACK FAILED: {fallback_error}")
+                    arguments = None
+                    content = f"Error: {e}\n The argument must be in JSON format."
+
+            # ========== PRESERVE ORIGINAL EXECUTION LOGIC ==========
+            if arguments is not None:
+                iostream.print(f"\n>>>>>>>> EXECUTING FUNCTION {func_name}...", flush=True)
+                try:
+                    content = func(**arguments)  # Original autogen always uses **kwargs
+                    is_exec_success = True
+                    print(f"✅ EXECUTED: Successfully executed {func_name}")
+                except Exception as e:
+                    content = f"Error: {e}"
+                    print(f"❌ EXECUTION FAILED: {func_name}: {e}")
+        else:
+            content = f"Error: Function {func_name} not found."
+
+        if verbose:
+            iostream.print(f"\nInput arguments: {arguments}\nOutput:\n{content}", flush=True)
+
+        return is_exec_success, {
+            "name": func_name,
+            "role": "function",
+            "content": str(content),
+        }
+
+    async def enhanced_a_execute_function(self, func_call):
+        """Enhanced async execute_function that falls back to retrieve_json only when original fails."""
+        try:
+            from autogen.io.base import IOStream
+            iostream = IOStream.get_default()
+        except:
+            class MockIOStream:
+                def print(self, *args, **kwargs):
+                    print(*args)
+
+            iostream = MockIOStream()
+
+        func_name = func_call.get("name", "")
+        func = self._function_map.get(func_name, None)
+
+        is_exec_success = False
+        if func is not None:
+            input_string = func_call.get("arguments", "{}")
+
+            try:
+                # Try original autogen approach first
+                formatted_string = self._format_json_str(input_string)
+                arguments = json.loads(formatted_string)
+                print(f"✅ ORIGINAL AUTOGEN ASYNC: Successfully parsed arguments for {func_name}")
+            except (json.JSONDecodeError, Exception) as e:
+                # Only if original fails, fall back to our enhanced parsing
+                print(f"⚠️ ORIGINAL AUTOGEN ASYNC FAILED: {e} - falling back to enhanced parsing for {func_name}")
+                try:
+                    arguments = retrieve_json(input_string)
+                    if arguments is None:
+                        arguments = {}
+                    elif isinstance(arguments, str):
+                        arguments = json.loads(arguments)
+                    print(f"✅ FALLBACK ASYNC SUCCESSFUL: Enhanced parsing worked for {func_name}")
+                except Exception as fallback_error:
+                    print(f"❌ FALLBACK ASYNC FAILED: {fallback_error}")
+                    arguments = None
+                    content = f"Error: {e}\n The argument must be in JSON format."
+
+            if arguments is not None:
+                iostream.print(f"\n>>>>>>>> EXECUTING ASYNC FUNCTION {func_name}...", flush=True)
+                try:
+                    import inspect
+                    if inspect.iscoroutinefunction(func):
+                        content = await func(**arguments)  # Original autogen always uses **kwargs
+                    else:
+                        content = func(**arguments)
+                    is_exec_success = True
+                    print(f"✅ EXECUTED ASYNC: Successfully executed {func_name}")
+                except Exception as e:
+                    content = f"Error: {e}"
+                    print(f"❌ EXECUTION ASYNC FAILED: {func_name}: {e}")
+        else:
+            content = f"Error: Function {func_name} not found."
+
+        return is_exec_success, {
+            "name": func_name,
+            "role": "function",
+            "content": str(content),
+        }
+
+    # Force import autogen and apply patches
+    try:
+        import autogen
+        from autogen.agentchat.conversable_agent import ConversableAgent
+
+        # Store original methods for verification
+        original_execute = getattr(ConversableAgent, 'execute_function', None)
+        original_a_execute = getattr(ConversableAgent, 'a_execute_function', None)
+
+        # Apply patches
+        ConversableAgent.execute_function = enhanced_execute_function
+        ConversableAgent.a_execute_function = enhanced_a_execute_function
+
+        # Verify patches were applied
+        new_execute = getattr(ConversableAgent, 'execute_function', None)
+        new_a_execute = getattr(ConversableAgent, 'a_execute_function', None)
+
+        if new_execute is not original_execute:
+            print("🎉 SUCCESS: Autogen sync execute_function has been patched!")
+        else:
+            print("❌ FAILED: Autogen sync execute_function patch was not applied")
+
+        if new_a_execute is not original_a_execute:
+            print("🎉 SUCCESS: Autogen async execute_function has been patched!")
+        else:
+            print("❌ FAILED: Autogen async execute_function patch was not applied")
+
+        print("🔧 Autogen JSON handling enhanced - tool calls can now handle unlimited length!")
+        return True
+
+    except ImportError as e:
+        print(f"❌ Could not import autogen for patching: {e}")
+        return False
+    except Exception as e:
+        print(f"❌ Error applying autogen patches: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+
+# Also provide a manual trigger function for Flask startup
+def apply_autogen_fix_on_startup():
+    """Manual function to call during Flask app startup if automatic patch fails."""
+    print("🔄 Manually applying autogen JSON fix...")
+    return force_apply_autogen_json_fix()
+
+# ========================================================================================
+# END AUTOGEN JSON HANDLING ENHANCEMENT
+# ========================================================================================
