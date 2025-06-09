@@ -96,7 +96,7 @@ stream_handler = logging.StreamHandler(sys.stdout)
 handler = RotatingFileHandler('langchain.log', maxBytes=100000, backupCount=0)
 
 # Set the logging level for the file handler
-handler.setLevel(logging.INFO)
+handler.setLevel(logging.ERROR)
 
 # Create a logging format
 req_id = thread_local_data.get_request_id()
@@ -109,6 +109,7 @@ app = Flask(__name__)
 
 app.logger.addHandler(stream_handler)
 app.logger.addHandler(handler)
+app.logger.propagate = False
 
 # Test logging
 app.logger.info('Logger initialized')

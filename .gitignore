@@ -1,5 +1,7 @@
-langchain.log.1
-__pycache__/
+prompt/
+prompt/*
+logs/
+log/
 langchain.log
-temp.py
-prompts/temp.json
+__pycache__/
+

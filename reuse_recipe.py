@@ -888,7 +888,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         7. **Scheduled, time-based, or continuous tasks should not be manually executed**—they are already handled by the system.
         8. **IMPORTANT CODING INSTRUCTION**: Avoid using `time.sleep` in any code.
         9. Tools Helper Agent can use:
-            1. The tools are: send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,execute_windows_command,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, google_search and save_data_in_memory.
+            1. The tools are: send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,execute_windows_or_android_command,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, google_search and save_data_in_memory.
             2. Create Scheduled Jobs: For tasks involving timer or time or periodically or scheduled jobs, ask Helper agent to use the create_scheduled_jobs tool.
             3. Data/Memory Management:
                 ➜If you want to save some data,understand the current data from get_saved_metadata & plan the datamodel and ask helper agent to use "save_data_in_memory" tool.
@@ -896,8 +896,8 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             4. If you want to send some message to user directly then ask helper agent to use send_message_to_user tool but if you want to send message after sometime then ask helper to use send_message_in_seconds tool.
             5. If you want to send some pre synthesized realistic videos to user then ask helper agent to use send_presynthesized_video_to_user tool.
             6. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the pre synthesized generated video if it is successful.
-            7. If you receive a request to perform a task or action on the user's computer, or if the request is related to Chrome or any browser, you should ask @Helper to use the `execute_windows_command` tool.
-            8. If you want the user's ID then ask the @Helper to use 'get_user_id' tool and do not prompt the user for their user_id, never mention the user_id to the user.
+            7. If you receive a request to perform a task or action on the user's computer, or if the request is related to Chrome or any browser, you should ask @Helper to use the `execute_windows_or_android_command` tool.
+            8. If you want the user's ID then ask the @Helper to use 'get_user_id' tool and do not prompt the user for their user_id, never mention the user_id to the user. Important: Get the user Id yourself always, Do not ask the user_id from User ever.
             9. If you want to do a google search then you should ask the @Helper to use the 'google_search' tool.        
         10. **Never reveal actions, internal processes, or tools to the user**. Do not ask for user confirmation unless absolutely necessary(You can assume normal things like user's interests).
         11. **To communicate with the {role} user**, always use this format: `@user {response_format}`.
@@ -1032,7 +1032,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=50, keep_first_message=True),
             transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
-            ToolMessageHandler(),
+            ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
 
@@ -1117,15 +1117,65 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     @helper.register_for_llm(api_style="function",
                              description="Use this to Store and retrieve data using key-value storage system")
     def save_data_in_memory(key: Annotated[str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
-                            value: Annotated[Optional[Any], "Value you want to store; may be int, str, float, bool, dict, list, json object."] = None) -> str:
+                            value: Annotated[Optional[Any], "Value you want to store; strictly should be one of int, float, bool, json array or json object."] = None) -> str:
+        """Store data with validation to prevent corruption."""
         current_app.logger.info('INSIDE save_data_in_memory')
-        keys = key.split('.')
-        d = agent_data.setdefault(prompt_id, {})
 
-        for k in keys[:-1]:
-            d = d.setdefault(k, {})
-        d[keys[-1]] = value
-        return f'{agent_data[prompt_id]}'
+        # Validate the input data
+        try:
+            # Step 1: Use the existing JSON repair function to sanitize input
+            if isinstance(value, str) and (value.startswith('{') or value.startswith('[')):
+                # If the value is a JSON string, repair it
+                value = retrieve_json(value)
+                current_app.logger.info(f"REPAIRED JSON STRING: {value}")
+
+            # Step 2: Force a JSON serialization/deserialization cycle to validate structure
+            if value is not None:
+                # This will fail if the structure isn't JSON-compatible
+                json_str = json.dumps(value)
+                validated_value = json.loads(json_str)
+                current_app.logger.info(f"VALIDATED VALUE (post JSON cycle): {validated_value}")
+            else:
+                validated_value = None
+
+            # Step 3: Store the validated data
+            keys = key.split('.')
+            d = agent_data.setdefault(prompt_id, {})
+            for k in keys[:-1]:
+                d = d.setdefault(k, {})
+
+            d[keys[-1]] = validated_value
+            current_app.logger.info(f"VALUES STORED IN AGENT DATA: {validated_value}")
+            current_app.logger.info(f"FULL AGENT DATA AT KEY: {d}")
+
+            # Step 4: Verify storage was successful
+            try:
+                # Attempt to read back the data to verify it was stored correctly
+                stored_value = get_data_by_key(key)
+                current_app.logger.info(f"VERIFICATION - READ BACK VALUE: {stored_value}")
+
+                # Optional: compare stored_value with what we intended to store
+                if stored_value == "Key not found in stored data.":
+                    current_app.logger.error(f"VERIFICATION FAILED: Data not properly stored at key {key}")
+            except Exception as e:
+                current_app.logger.error(f"VERIFICATION ERROR: {str(e)}")
+
+            return f'{agent_data[prompt_id]}'
+
+        except json.JSONDecodeError as je:
+            error_msg = f"Invalid JSON structure in value: {str(je)}"
+            current_app.logger.error(error_msg)
+            return f"Error: {error_msg} - Data not saved"
+
+        except TypeError as te:
+            error_msg = f"Type error in value: {str(te)}"
+            current_app.logger.error(error_msg)
+            return f"Error: {error_msg} - Data not saved"
+
+        except Exception as e:
+            error_msg = f"Unexpected error saving data: {str(e)}"
+            current_app.logger.error(error_msg)
+            return f"Error: {error_msg} - Data not saved"
 
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",
@@ -1175,6 +1225,14 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
         print(f"avtar_id: {avatar_id}:\n{text[:10]}....\n")
 
+        if avatar_id == "default":
+            avatar_id_int = 1  # Use appropriate default ID number
+        else:
+            try:
+                avatar_id_int = int(avatar_id)
+            except ValueError:
+                avatar_id_int = 1  # Fallback to default ID if conversion fails
+
         headers = {'Content-Type': 'application/json'}
         data = {}
         data["text"] = text
@@ -1222,8 +1280,8 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             data["audio_sample_url"] = None
             data['voice_id'] = None
         conv_id = save_conversation_db(text, user_id, prompt_id, database_url, request_id)
-        data['conv_id'] = conv_id
-        data['avatar_id'] = avatar_id
+        data['conv_id'] = int(conv_id)  # Ensure it's an integer
+        data['avatar_id'] = avatar_id_int  # Use the integer version
         data['timeout'] = timeout
         try:
             video_link = requests.post("{}/video_generate_save".format(database_url),
@@ -1389,8 +1447,9 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",
                              description="Processes user-defined commands on a personal Windows or Android system.")
-    async def execute_windows_command(
-            instructions: Annotated[str, "Command in plain English to execute on the Windows machine"]) -> str:
+    async def execute_windows_or_android_command(
+            instructions: Annotated[str, "Command in plain English to execute on the Windows machine"],
+            os_to_control: Annotated[str, "The os to control, possible values are 'windows' or 'android' only "]) -> str:
         """
         Executes a command on a Windows machine and returns the response within 500 seconds.
         """
@@ -1409,7 +1468,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             }
 
         try:
-            current_app.logger.info('INSIDE execute_windows_command')
+            current_app.logger.info('INSIDE execute_windows_or_android_command')
             user_prompt = f'{user_id}_{prompt_id}'
             role_number, role = get_flow_number(user_id, prompt_id)
             
@@ -1526,7 +1585,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                 'user_id': f'{user_id}',
                 'prompt_id': prompt_id,
                 'instruction_to_vlm_agent': instructions,
-                'os_to_control': 'Windows',
+                'os_to_control': os_to_control,
                 'actions_available_in_os': [],
                 'max_ETA_in_seconds': 1800,
                 'langchain_server': True
@@ -1659,7 +1718,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                                     if cleaned_content.strip():  # Only add non-empty content
                                         recipe_steps.append({
                                             "steps": cleaned_content,
-                                            "tool_name": "execute_windows_command",
+                                            "tool_name": "execute_windows_or_android_command",
                                             "agent_to_perform_this_action": "Helper"
                                         })
                                 elif msg_type == "next_action":
@@ -1667,7 +1726,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                                     if formatted_content.strip():  # Only add non-empty content
                                         recipe_steps.append({
                                             "steps": formatted_content,
-                                            "tool_name": "execute_windows_command",
+                                            "tool_name": "execute_windows_or_android_command",
                                             "agent_to_perform_this_action": "Helper"
                                         })
                             
@@ -1675,7 +1734,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                             if not recipe_steps:
                                 recipe_steps.append({
                                     "steps": instructions,
-                                    "tool_name": "execute_windows_command",
+                                    "tool_name": "execute_windows_or_android_command",
                                     "agent_to_perform_this_action": "Helper"
                                 })
                             
@@ -1883,7 +1942,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=50, keep_first_message=True),
             transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
-            ToolMessageHandler(),
+            ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
     context_handling.add_to_agent(time_agent)
@@ -1938,10 +1997,10 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         send_message_in_seconds)
     time_agent.register_for_execution(name="send_message_in_seconds")(send_message_in_seconds)
 
-    helper1.register_for_llm(name="execute_windows_command",
+    helper1.register_for_llm(name="execute_windows_or_android_command",
                              description="Executes a command on a Windows machine and returns the response.")(
-        execute_windows_command)
-    time_agent.register_for_execution(name="execute_windows_command")(execute_windows_command)
+        execute_windows_or_android_command)
+    time_agent.register_for_execution(name="execute_windows_or_android_command")(execute_windows_or_android_command)
 
     helper1.register_for_llm(name="google_search", description="Get google search response")(google_search)
     time_agent.register_for_execution(name="google_search")(google_search)
@@ -2024,10 +2083,10 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                              description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")(
         send_message_in_seconds)
     visual_agent.register_for_execution(name="send_message_in_seconds")(send_message_in_seconds)
-    helper2.register_for_llm(name="execute_windows_command",
+    helper2.register_for_llm(name="execute_windows_or_android_command",
                              description="Executes a command on a Windows machine and returns the response.")(
-        execute_windows_command)
-    visual_agent.register_for_execution(name="execute_windows_command")(execute_windows_command)
+        execute_windows_or_android_command)
+    visual_agent.register_for_execution(name="execute_windows_or_android_command")(execute_windows_or_android_command)
     helper2.register_for_llm(name="google_search", description="Get google search response")(google_search)
     visual_agent.register_for_execution(name="google_search")(google_search)
 
@@ -2334,7 +2393,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=50, keep_first_message=True),
             transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
-            ToolMessageHandler(),
+            ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
 
@@ -2425,7 +2484,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                         steps = [{x['steps']: {'tool_name': x.get('tool_name', None),
                                                'code': x.get('generalized_functions', None)}} for x in
                                  recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action]['recipe']]
-                        user_message = f"Action {user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
+                        user_message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
                         chat_instructor.initiate_chat(recipient=manager, message=user_message, clear_history=False,
                                                       silent=False)
                         continue
@@ -2447,7 +2506,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                                                        'code': x.get('generalized_functions', None)}} for x in
                                          recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action][
                                              'recipe']]
-                                user_message = f"Action {user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
+                                user_message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
                                 chat_instructor.initiate_chat(recipient=manager, message=user_message,
                                                               clear_history=False, silent=False)
                                 continue
@@ -2634,7 +2693,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                 if stop:
                     user_journey[user_prompt] = 'UseBot'
                     # action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)['action']
-                    # user_message = f"Action {user_tasks[user_prompt].current_action+1}:{action_message}"
+                    # user_message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action+1}:{action_message}"
                 else:
                     user_journey[user_prompt] = 'Roles'
             if user_journey[user_prompt] == 'UseBot':
@@ -2666,7 +2725,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                 steps = [
                     {x['steps']: {'tool_name': x.get('tool_name', None), 'code': x.get('generalized_functions', None)}}
                     for x in recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action]['recipe']]
-                message = f"Action {user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
+                message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
                 # message = "let's perform the actions availabe in sequence\nIMP instruction: keep track of action id you are working on."
                 result = chat_instructor.initiate_chat(manager, message=message,
                                                        speaker_selection={"speaker": "assistant"}, clear_history=False)
@@ -2688,7 +2747,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                                        'code': x.get('generalized_functions', None)}} for x in
                                          recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action][
                                              'recipe']]
-                                user_message = f"Action {user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
+                                user_message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
                                 chat_instructor.initiate_chat(recipient=manager, message=user_message,
                                                               clear_history=False, silent=False)
                                 continue
@@ -2708,7 +2767,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                                                'code': x.get('generalized_functions', None)}} for x in
                                                  recipes[user_prompt]['actions'][
                                                      user_tasks[user_prompt].current_action]['recipe']]
-                                        user_message = f"Action {user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
+                                        user_message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
                                         chat_instructor.initiate_chat(recipient=manager, message=user_message,
                                                                       clear_history=False, silent=False)
                                         continue
