@@ -1281,6 +1281,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
 
         try:
             # Lifecycle TRACKING HOOKS:
+            debug_lifecycle_status(user_prompt)
             lifecycle_hook_track_action_assignment(user_prompt, user_tasks, group_chat)  # 1. Track action assignment
             lifecycle_hook_track_status_verification_request(user_prompt, user_tasks, group_chat)  # 3. Track status verification request
             lifecycle_hook_track_fallback_request(user_prompt, user_tasks, group_chat)  # 7. Track fallback request
@@ -2148,7 +2149,9 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             result = client.publish(
                 f"com.hertzai.hevolve.chat.{user_id}", f'{crossbar_message}')
             task_time[prompt_id] = {'timer':time.time(),'times':[]}
+            #ASSIGNED
             result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
+            #IN_PROGRESS
 
         current_app.logger.info("\n=== Chat Summary ===")
         current_app.logger.info("\n=== Full response ===")

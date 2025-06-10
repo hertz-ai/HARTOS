@@ -49,13 +49,14 @@ def validate_state_transition(user_prompt: str, action_id: int, new_state: Actio
         ActionState.STATUS_VERIFICATION_REQUESTED: [ActionState.COMPLETED, ActionState.PENDING, ActionState.ERROR],
         ActionState.COMPLETED: [ActionState.FALLBACK_REQUESTED],
         ActionState.PENDING: [ActionState.COMPLETED, ActionState.ERROR],
-        ActionState.ERROR: [ActionState.IN_PROGRESS, ActionState.FALLBACK_REQUESTED],  # Can retry or ask fallback
+        ActionState.ERROR: [ActionState.IN_PROGRESS, ActionState.PENDING],  # Can retry or ask fallback
         ActionState.FALLBACK_REQUESTED: [ActionState.FALLBACK_RECEIVED],
         ActionState.FALLBACK_RECEIVED: [ActionState.RECIPE_REQUESTED],
         ActionState.RECIPE_REQUESTED: [ActionState.RECIPE_RECEIVED],
         ActionState.RECIPE_RECEIVED: [ActionState.TERMINATED],
         ActionState.TERMINATED: []  # Final state
     }
+
 
     allowed = valid_transitions.get(current_state, [])
     if new_state not in allowed:
