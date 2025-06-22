@@ -22,7 +22,7 @@ import os
 from bs4 import BeautifulSoup
 from langchain.memory import ZepMemory
 from json_repair import repair_json
-
+import traceback
 
 # from autobahn.twisted.wamp import ApplicationSession, ApplicationRunner
 # from twisted.internet.defer import inlineCallbacks
@@ -1370,7 +1370,7 @@ def get_visual_context(user_id,mins=5):
             if gpt3_label == 'Visual Context':
                 now = datetime.now()
                 # Check if the action is older than 5 minutes
-                if (now - date) > timedelta(minutes=5):
+                if (now - date) > timedelta(minutes=mins):
                     continue
             first_action_text = f"{action} on {date.astimezone(india_tz).strftime('%Y-%m-%dT%H:%M:%S')}"
 
@@ -1546,6 +1546,99 @@ def create_visual_agent(user_id,prompt_id):
 # ========================================================================================
 # AUTOGEN JSON HANDLING ENHANCEMENT
 # ========================================================================================
+def safe_function_call(func, arguments):
+    """Fixed version that handles list with dict properly"""
+    import logging
+
+    logger = logging.getLogger("safe_function_call")
+
+    logger.info("🔍 SAFE_FUNCTION_CALL DEBUG:")
+    logger.info(f"   Function: {func.__name__ if hasattr(func, '__name__') else func}")
+    logger.info(f"   Arguments type: {type(arguments)}")
+    logger.info(f"   Arguments content: {arguments}")
+
+    try:
+        # Try original AutoGen approach first
+        if isinstance(arguments, dict):
+            logger.info("   → Using **kwargs approach")
+            result = func(**arguments)
+            logger.info("   ✅ Success with **kwargs")
+            return result
+
+        # Handle list case - FIXED LOGIC
+        elif isinstance(arguments, list):
+            logger.info("   → Analyzing list content")
+
+            # Check if first item is a dict (common pattern from retrieve_json)
+            if len(arguments) >= 1 and isinstance(arguments[0], dict):
+                # The first item is the actual arguments dict
+                actual_args = arguments[0]
+                logger.info(f"   → Found dict in list[0]: {actual_args}")
+                logger.info("   → Using **kwargs approach on extracted dict")
+                result = func(**actual_args)
+                logger.info("   ✅ Success with **kwargs from list")
+                return result
+            else:
+                # Fallback to treating as positional args
+                logger.info("   → Using *args approach")
+                result = func(*arguments)
+                logger.info("   ✅ Success with *args")
+                return result
+
+        # Handle single argument case
+        else:
+            logger.info("   → Using single argument approach")
+            result = func(arguments)
+            logger.info("   ✅ Success with single arg")
+            return result
+
+    except TypeError as e:
+        logger.error(f"   ❌ TypeError: {e}")
+        logger.error(f"   TypeError traceback:\n{traceback.format_exc()}")
+
+        # Enhanced intelligent mapping for lists
+        if isinstance(arguments, list):
+            logger.info("   → Trying enhanced list handling")
+
+            try:
+                # If it's a list with a dict, extract the dict
+                if len(arguments) >= 1 and isinstance(arguments[0], dict):
+                    logger.info("   → Extracting dict from list and retrying")
+                    result = func(**arguments[0])
+                    logger.info("   ✅ Success with extracted dict")
+                    return result
+
+                # If it's a simple list, try intelligent parameter mapping
+                elif hasattr(func, '__annotations__'):
+                    import inspect
+                    sig = inspect.signature(func)
+                    param_names = list(sig.parameters.keys())
+                    logger.info(f"   → Function expects parameters: {param_names}")
+
+                    # Filter out truncation indicators
+                    clean_args = [arg for arg in arguments if
+                                  not (isinstance(arg, list) and len(arg) == 1 and arg[0] == 'truncated')]
+
+                    if len(clean_args) <= len(param_names):
+                        kwargs = dict(zip(param_names, clean_args))
+                        logger.info(f"   → Mapped to kwargs: {kwargs}")
+                        result = func(**kwargs)
+                        logger.info("   ✅ Success with intelligent mapping")
+                        return result
+
+            except Exception as mapping_error:
+                logger.error(f"   ❌ Enhanced list handling failed: {mapping_error}")
+                logger.error(f"   Mapping traceback:\n{traceback.format_exc()}")
+
+        # Re-raise if we can't handle it
+        logger.error("   ❌ Cannot handle - re-raising original TypeError")
+        raise e
+
+    except Exception as e:
+        logger.error(f"   ❌ Unexpected error: {e}")
+        logger.error(f"   Unexpected error traceback:\n{traceback.format_exc()}")
+        raise e
+
 
 def force_apply_autogen_json_fix():
     """Force apply the autogen JSON fix with robust error handling."""
@@ -1595,7 +1688,13 @@ def force_apply_autogen_json_fix():
             if arguments is not None:
                 iostream.print(f"\n>>>>>>>> EXECUTING FUNCTION {func_name}...", flush=True)
                 try:
-                    content = func(**arguments)  # Original autogen always uses **kwargs
+                    print("🔍 Function being called details:")
+                    print(f"   Function: {func}")
+                    print(f"   Function name: {getattr(func, '__name__', 'NO_NAME')}")
+                    print("🔍 Parsed arguments analysis:")
+                    print(f"   Arguments type: {type(arguments)}")
+                    print(f"   Arguments content: {arguments}")
+                    content = safe_function_call(func, arguments)  # Original autogen always uses **kwargs
                     is_exec_success = True
                     print(f"✅ EXECUTED: Successfully executed {func_name}")
                 except Exception as e:
@@ -1655,11 +1754,24 @@ def force_apply_autogen_json_fix():
             if arguments is not None:
                 iostream.print(f"\n>>>>>>>> EXECUTING ASYNC FUNCTION {func_name}...", flush=True)
                 try:
+                    print("🔍 Function being called details:")
+                    print(f"   Function: {func}")
+                    print(f"   Function name: {getattr(func, '__name__', 'NO_NAME')}")
+                    print("🔍 Parsed arguments analysis:")
+                    print(f"   Arguments type: {type(arguments)}")
+                    print(f"   Arguments content: {arguments}")
                     import inspect
                     if inspect.iscoroutinefunction(func):
-                        content = await func(**arguments)  # Original autogen always uses **kwargs
+                        if isinstance(arguments, dict):
+                            content = await func(**arguments)  # Original autogen always uses **kwargs
+                        # Handle list case - convert to positional arguments
+                        elif isinstance(arguments, list):
+                            content = await func(*arguments)  # Original autogen always uses **kwargs
+                        # Handle single argument case
+                        else:
+                            content = await func(arguments)  # Original autogen always uses **kwargs
                     else:
-                        content = func(**arguments)
+                        content = safe_function_call(func, arguments)
                     is_exec_success = True
                     print(f"✅ EXECUTED ASYNC: Successfully executed {func_name}")
                 except Exception as e:
