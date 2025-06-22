@@ -406,29 +406,24 @@ def get_action_user_details(user_id):
         user_details = "No user details available"
     return user_details, actions
 
+
 def visual_based_execution(task_description: str, user_id: int, prompt_id: int):
     current_app.logger.info(f'INSIDE Visual_BASED_EXECUTION')
     user_prompt = f'{user_id}_{prompt_id}'
     frame = get_frame(str(user_id))
-    if frame is None:
+    minutes=5
+    actions = helper_fun.get_visual_context(user_id,minutes)
+    if frame is None or actions is None:
         current_app.logger.info("Camera is OFF or no frame found — skipping visual agent.")
         return
-    try:
-        user_details, actions = helper_fun.get_action_user_details(user_id)
-        current_app.logger.info(f"User actions: {actions}")
-    except Exception as e:
-        current_app.logger.error(f"Error getting user details: {e}")
-        actions = "No user action data available"
-    if user_prompt not in user_agents:
-        current_app.logger.info('user_id is not present in user_agents.')
-        return
+
     try:
         author, assistant_agent, executor, group_chat, manager, chat_instructor, agents_object = user_agents[user_prompt]
         current_time = datetime.now()
         text = f'''This is the time now {current_time}
             You are an assistant in a visual execution system. Perform the requested action based on the task context.
             Note: Visual input is available because the user's camera is ON.
-            Recent user actions: {actions}
+            <Last_{minutes}_Minutes_Visual_Context_End>: {actions}
             If the user needs to be informed (e.g., task completed, input needed, error), respond in this exact JSON format:
             {{"message_2_user": "Your clear and useful message here"}}
             Only send this if you have something meaningful to say.
@@ -450,26 +445,10 @@ def visual_based_execution(task_description: str, user_id: int, prompt_id: int):
     except Exception as e:
         current_app.logger.error(f"Error in visual_based_execution: {e}")
     return 'done'
+
 def call_visual_task(task_description: str, user_id: int, prompt_id: int, data: list = None, date: datetime = None):
     headers = {'Content-Type': 'application/json'}
     url = 'http://localhost:6777/visual_agent'
-    # Camera Check - Ensure camera is accessible and functional
-    try:
-        cap = cv2.VideoCapture(0)  # Try accessing the first camera (device 0)
-        if not cap.isOpened():
-
-            current_app.logger.warning("Camera is not accessible. Please ensure the camera is turned on and connected.")
-            return visual_based_execution(task_description, user_id, prompt_id)
-        ret, frame = cap.read()
-        if not ret:
-            current_app.logger.warning("Failed to capture a frame. Please check the camera settings or permissions.")
-            cap.release()
-            return visual_based_execution(task_description, user_id, prompt_id)
-        cap.release()
-        current_app.logger.info("Camera is accessible and working")
-    except Exception as e:
-        current_app.logger.error(f"Camera check failed: {e}")
-        return visual_based_execution(task_description, user_id, prompt_id)
 
     now = datetime.now()
     
@@ -1693,16 +1672,60 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     time_agent.register_for_execution(name="get_user_camera_inp")(camera_inp)
 
     @log_tool_execution
-    def save_data_in_memory(key: Annotated[str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
-                            value: Annotated[Optional[Any], "Value you want to store; may be int, str, float, bool, dict, list, json object."] = None) -> str:
+    def save_data_in_memory(key: Annotated[
+        str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
+                            value: Annotated[Optional[
+                                Any], "Value you want to store; strictly should be one of int, float, bool, json array or json object."] = None) -> str:
+        """Store data with validation to prevent corruption."""
         tool_logger.info('INSIDE save_data_in_memory')
-        keys = key.split('.')
-        d = agent_data.setdefault(prompt_id, {})
+        # Validate the input data
+        try:
+            # Step 1: Use the existing JSON repair function to sanitize input
+            if isinstance(value, str) and (value.startswith('{') or value.startswith('[')):
+                # If the value is a JSON string, repair it
+                value = retrieve_json(value)
+                tool_logger.info(f"REPAIRED JSON STRING: {value}")
+            # Step 2: Force a JSON serialization/deserialization cycle to validate structure
+            if value is not None:
+                # This will fail if the structure isn't JSON-compatible
+                json_str = json.dumps(value)
+                validated_value = json.loads(json_str)
+                tool_logger.info(f"VALIDATED VALUE (post JSON cycle): {validated_value}")
+            else:
+                validated_value = None
+            # Step 3: Store the validated data
+            keys = key.split('.')
+            d = agent_data.setdefault(prompt_id, {})
 
-        for k in keys[:-1]:
-            d = d.setdefault(k, {})
-        d[keys[-1]] = value
-        return f'{agent_data[prompt_id]}'
+            for k in keys[:-1]:
+                d = d.setdefault(k, {})
+            d[keys[-1]] = validated_value
+            tool_logger.info(f"VALUES STORED IN AGENT DATA: {validated_value}")
+            tool_logger.info(f"FULL AGENT DATA AT KEY: {d}")
+            # Step 4: Verify storage was successful
+            try:
+                # Attempt to read back the data to verify it was stored correctly
+                stored_value = get_data_by_key(key)
+                tool_logger.info(f"VERIFICATION - READ BACK VALUE: {stored_value}")
+                # Optional: compare stored_value with what we intended to store
+                if stored_value == "Key not found in stored data.":
+                    tool_logger.error(f"VERIFICATION FAILED: Data not properly stored at key {key}")
+            except Exception as e:
+                tool_logger.error(f"VERIFICATION ERROR: {str(e)}")
+            return f'{agent_data[prompt_id]}'
+
+        except json.JSONDecodeError as je:
+            error_msg = f"Invalid JSON structure in value: {str(je)}"
+            tool_logger.error(error_msg)
+            return f"Error: {error_msg} - Data not saved"
+        except TypeError as te:
+            error_msg = f"Type error in value: {str(te)}"
+            tool_logger.error(error_msg)
+            return f"Error: {error_msg} - Data not saved"
+        except Exception as e:
+            error_msg = f"Unexpected error saving data: {str(e)}"
+            tool_logger.error(error_msg)
+            return f"Error: {error_msg} - Data not saved"
 
     helper1.register_for_llm(name="save_data_in_memory", description="Use this to Store and retrieve data using key-value storage system")(save_data_in_memory)
     time_agent.register_for_execution(name="save_data_in_memory")(save_data_in_memory)
@@ -2543,6 +2566,11 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         except:
                             pass
                     return last_message['content']
+
+                execute_action_pattern = r'execute\s+action\s*\d*\s*:?'
+                if re.search(execute_action_pattern, last_message['content'], re.IGNORECASE):
+                    result = agents_object['assistant'].initiate_chat(recipient=manager, message=last_message['content'],
+                                                                      clear_history=False, silent=False)
                 else:
                     continue
 

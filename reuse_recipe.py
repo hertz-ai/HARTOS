@@ -377,37 +377,6 @@ def call_visual_task(task_description: str, user_id: int, prompt_id: int, data: 
     headers = {'Content-Type': 'application/json'}
     url = 'http://localhost:6777/visual_agent'
 
-    # Camera Check - Ensure camera is accessible and functional
-    cap = cv2.VideoCapture(0)  # Try accessing the first camera (device 0)
-
-    # Check if the camera is successfully opened
-    if not cap.isOpened():
-        return "Camera is not accessible. Please ensure the camera is turned on and connected."
-
-    # Attempt to capture a frame from the camera
-    ret, frame = cap.read()
-    if not ret:
-        return "Failed to capture a frame. Please check the camera settings or permissions."
-    cap.release()
-    now = datetime.now()
-    if any(obj["zeroshot_label"] == 'Video Reasoning' for obj in data) and (now - date) > timedelta(seconds=30):
-        data_to_send = json.dumps({
-            'task_description': task_description,
-            'user_id': user_id,
-            'prompt_id': prompt_id,
-            'request_from': 'Reuse'
-        })
-        # Send POST request to the visual agent
-        res = requests.post(url, data=data_to_send, headers=headers)
-        return res.text
-
-    return 'Task not sent to visual agent due to conditions not being met.'
-
-
-def call_visual_task(task_description: str, user_id: int, prompt_id: int, data: list, date: datetime):
-    headers = {'Content-Type': 'application/json'}
-    url = 'http://localhost:6777/visual_agent'
-
     # Get the current time
     now = datetime.now()
 
@@ -445,7 +414,23 @@ def time_based_execution(task_description: str, user_id: int, prompt_id: int, ac
         if last_message['content'] == 'TERMINATE':
             last_message = group_chat.messages[-2]
         # sending response to receiver agent
-        send_message_to_user1(user_id, last_message, task_description, prompt_id)
+        if f'message_2_user'.lower() in last_message['content'].lower():
+            try:
+                json_obj = retrieve_json(last_message['content'])
+                if json_obj and 'message_2_user' in json_obj:
+                    last_message['content'] = json_obj['message_2_user']
+                    send_message_to_user1(user_id, last_message['content'], task_description, prompt_id)
+
+            except Exception as e:
+                current_app.logger.error(f"Error extracting JSON: {e}")
+                # Fallback to a basic pattern match if retrieve_json fails
+                pattern = r'@user\s*{[\'"]message_2_user[\'"]\s*:\s*[\'"](.+?)[\'"]}'
+                match = re.search(pattern, last_message['content'], re.DOTALL)
+                if match:
+                    last_message['content'] = match.group(1)
+                    send_message_to_user1(user_id, last_message['content'], task_description, prompt_id)
+        # At this point, don't process messages with message_2_user as they were already sent
+        return 'done'
     return 'done'
 
 
@@ -588,15 +573,12 @@ def visual_based_execution(task_description: str, user_id: int, prompt_id: int):
     current_app.logger.info(f'INSIDE Visual_BASED_EXECUTION')
     user_prompt = f'{user_id}_{prompt_id}'
 
-    # Check if the camera is on and get the frame
     frame = get_frame(str(user_id))
-    if frame is None:
+    minutes = 5
+    actions = helper_fun.get_visual_context(user_id, minutes)
+    if frame is None or actions is None:
         current_app.logger.info("Camera is OFF or no frame found — skipping visual agent.")
         return
-
-    # Call get_action_user_details if the camera is on
-    actions = get_action_user_details(user_id)  # Get the actions performed by the user
-    current_app.logger.info(f"User actions: {actions}")
 
     if user_prompt not in user_agents:
         current_app.logger.info('user_id is not present in user_agents.')
@@ -611,6 +593,7 @@ def visual_based_execution(task_description: str, user_id: int, prompt_id: int):
         text = f'''This is the time now {current_time}
             You are an assistant in a visual execution system. Perform the requested action based on the task context.
             Note: Visual input is available because the user's camera is ON.
+            <Last_{minutes}_Minutes_Visual_Context_End>: {actions}
             If the user needs to be informed (e.g., task completed, input needed, error), respond in this exact JSON format:
             {{"message_2_user": "Your clear and useful message here"}}
             Only send this if you have something meaningful to say.
@@ -625,10 +608,17 @@ def visual_based_execution(task_description: str, user_id: int, prompt_id: int):
         result = user.initiate_chat(manager, message=text, speaker_selection={"speaker": "assistant"},
                                     clear_history=False)
 
-        # Handle the last message
-        last_message = chat.messages[-1]
+        last_message = group_chat.messages[-1]
         if last_message['content'] == 'TERMINATE':
-            last_message = chat.messages[-2]
+            if len(group_chat.messages) > 1:
+                last_message = group_chat.messages[-2]
+            if 'message_2_user' in last_message['content'].lower():
+                try:
+                    json_obj = retrieve_json(last_message['content'])
+                    if json_obj and 'message_2_user' in json_obj:
+                        send_message_to_user1(user_id, json_obj['message_2_user'], task_description, prompt_id)
+                except Exception as e:
+                    current_app.logger.error(f"Error processing visual agent response: {e}")
 
         # Optionally, you can send a response to the receiver agent or further process the message.
         # send_message_to_user1(user_id, last_message, task_description, prompt_id)
@@ -1442,7 +1432,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         current_app.logger.info(f'GOT RESPONSE AS {visual_context}')
         if not visual_context:
             visual_context = 'User\'s camera is not on. no visual data'
-        return 'Message scheduled successfully'
+        return visual_context
 
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",
