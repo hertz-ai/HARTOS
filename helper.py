@@ -80,35 +80,286 @@ async def fetch(session, url):
         print(f"An error occurred while fetching {url}: {e}")
         return ""
 
+
 async def async_main(urls):
     async with aiohttp.ClientSession() as session:
         tasks = [fetch(session, url) for url in urls]
         return await asyncio.gather(*tasks)
 
-def top5_results(query):
-    final_res = []
-    top_2_search_res = search.results(query, 2)
-    top_2_search_res_link = [res['link'] for res in top_2_search_res]
+
+
+# Configuration for Crawl4AI API service
+CRAWL4AI_API_URL = "http://localhost:8094"  # Update this to your actual service URL
+
+
+
+def crawl4ai_fetch(url: str, timeout: int = 30) -> str:
+    """
+    Fetch content from URL using Crawl4AI API service
+    Simple HTTP client - no dependency conflicts!
+    """
     try:
-        text = asyncio.run(async_main(top_2_search_res_link))
-        # Removing punctuation and extra characters
-        print(text)
-        cleaned_text = re.sub(r'[^\w\s]', '', text[0] +
-                              " "+text[1])  # Remove punctuation
-        # Remove extra newlines and leading/trailing whitespaces
-        cleaned_text = re.sub(r'\n+', '\n', cleaned_text).strip()
-    except RuntimeError as e:
-        print(f"Runtime error occurred: {e}")
+        current_app.logger.info(f"Fetching via Crawl4AI API: {url}")
 
-    final_res.append({'text': cleaned_text, 'source': top_2_search_res_link})
-    print(f"res:-->{final_res}")
+        # Prepare request
+        payload = {
+            "url": url,
+            "word_count_threshold": 50,
+            "timeout": timeout * 1000,  # Convert to milliseconds
+            "bypass_cache": True,
+            "wait_for": "css:body"
+        }
 
+        # Call Crawl4AI API
+        response = requests.post(
+            f"{CRAWL4AI_API_URL}/crawl",
+            json=payload,
+            timeout=timeout + 10,  # Add buffer for API processing
+            headers={"Content-Type": "application/json"}
+        )
+
+        if response.status_code == 200:
+            result = response.json()
+
+            if result["success"] and result["markdown"]:
+                content = result["markdown"]
+                current_app.logger.info(f"Crawl4AI success: {result['word_count']} words from {url}")
+                return content
+            else:
+                error_msg = result.get("error_message", "Unknown error")
+                current_app.logger.warning(f"Crawl4AI failed for {url}: {error_msg}")
+                return ""
+        else:
+            current_app.logger.error(f"Crawl4AI API error {response.status_code} for {url}")
+            return ""
+
+    except requests.exceptions.Timeout:
+        current_app.logger.warning(f"Crawl4AI API timeout for {url}")
+        return ""
+    except requests.exceptions.ConnectionError:
+        current_app.logger.error(f"Cannot connect to Crawl4AI API service for {url}")
+        return ""
+    except Exception as e:
+        current_app.logger.error(f"Crawl4AI API error for {url}: {e}")
+        return ""
+
+
+def crawl4ai_batch_fetch(urls: List[str], max_concurrent: int = 2) -> List[str]:
+    """
+    Fetch multiple URLs using Crawl4AI batch API
+    """
+    try:
+        current_app.logger.info(f"Batch fetching {len(urls)} URLs via Crawl4AI API")
+
+        # Prepare batch request
+        payload = {
+            "urls": urls,
+            "word_count_threshold": 50,
+            "timeout": 30000,  # 30 seconds per URL
+            "max_concurrent": max_concurrent
+        }
+
+        # Call Crawl4AI batch API
+        response = requests.post(
+            f"{CRAWL4AI_API_URL}/crawl/batch",
+            json=payload,
+            timeout=120,  # 2 minutes for batch processing
+            headers={"Content-Type": "application/json"}
+        )
+
+        if response.status_code == 200:
+            result = response.json()
+
+            # Extract content from results
+            extracted_content = []
+            for crawl_result in result["results"]:
+                if crawl_result["success"] and crawl_result["markdown"]:
+                    extracted_content.append(crawl_result["markdown"])
+                else:
+                    extracted_content.append("")  # Empty string for failed URLs
+
+            current_app.logger.info(
+                f"Batch crawl completed: {result['successful_crawls']}/{result['total_urls']} successful")
+            return extracted_content
+        else:
+            current_app.logger.error(f"Crawl4AI batch API error {response.status_code}")
+            return [""] * len(urls)  # Return empty strings for all URLs
+
+    except Exception as e:
+        current_app.logger.error(f"Crawl4AI batch API error: {e}")
+        return [""] * len(urls)  # Return empty strings for all URLs
+
+
+def fallback_fetch(url: str) -> str:
+    """
+    Fallback fetch using requests + BeautifulSoup (your original method)
+    """
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # Remove unwanted elements
+        for element in soup(["script", "style", "nav", "header", "footer"]):
+            element.decompose()
+
+        text = soup.get_text()
+        # Clean text
+        lines = (line.strip() for line in text.splitlines())
+        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+        cleaned_text = ' '.join(chunk for chunk in chunks if chunk)
+
+        return cleaned_text
+    except Exception as e:
+        current_app.logger.error(f"Fallback fetch failed for {url}: {e}")
+        return ""
+
+
+def check_crawl4ai_service() -> bool:
+    """
+    Check if Crawl4AI API service is available
+    """
+    try:
+        response = requests.get(f"{CRAWL4AI_API_URL}/health", timeout=5)
+        return response.status_code == 200
+    except:
+        return False
+
+
+def top5_results(query):
+    """
+    Enhanced top5_results using Crawl4AI API service
+    Maintains the same interface as your original function
+    """
+    current_app.logger.info(f"Enhanced search for: {query}")
+
+    final_res = []
+
+    try:
+        # Your existing Google search
+        top_2_search_res = search.results(query, 2)
+        top_2_search_res_link = [res['link'] for res in top_2_search_res]
+
+        if not top_2_search_res_link:
+            current_app.logger.warning("No search links found")
+            return search.results(query, 4)
+
+        current_app.logger.info(f"Processing {len(top_2_search_res_link)} URLs")
+
+        # Check if Crawl4AI service is available
+        if check_crawl4ai_service():
+            current_app.logger.info("Using Crawl4AI API service")
+
+            # Use batch API for better performance
+            extracted_content = crawl4ai_batch_fetch(top_2_search_res_link, max_concurrent=2)
+
+            # Process results
+            processed_texts = []
+            for i, content in enumerate(extracted_content):
+                if content and len(content.strip()) > 100:
+                    # Clean and truncate content
+                    cleaned_text = re.sub(r'\s+', ' ', content.strip())
+
+                    if len(cleaned_text) > 4000:
+                        # Try to break at sentence boundary
+                        truncate_pos = cleaned_text.rfind('.', 0, 4000)
+                        if truncate_pos > 3000:
+                            cleaned_text = cleaned_text[:truncate_pos + 1] + " [Content truncated]"
+                        else:
+                            cleaned_text = cleaned_text[:4000] + "..."
+
+                    processed_texts.append(cleaned_text)
+                    current_app.logger.info(f"Processed {len(cleaned_text)} chars from {top_2_search_res_link[i]}")
+
+            if processed_texts:
+                combined_text = " ".join(processed_texts)
+
+                result = {
+                    'text': combined_text,
+                    'source': top_2_search_res_link,
+                    'enhanced': True,
+                    'method': 'crawl4ai_api',
+                    'word_count': len(combined_text.split()),
+                    'sources_processed': len(processed_texts)
+                }
+
+                final_res.append(result)
+                current_app.logger.info(
+                    f"Crawl4AI API success: {len(combined_text)} chars from {len(processed_texts)} sources")
+            else:
+                raise Exception("No content extracted via Crawl4AI API")
+
+        else:
+            current_app.logger.warning("Crawl4AI API service unavailable, using fallback")
+            raise Exception("Crawl4AI service unavailable")
+
+    except Exception as e:
+        current_app.logger.warning(f"Crawl4AI API method failed: {e}, trying fallback")
+
+        # Fallback to requests + BeautifulSoup
+        try:
+            processed_texts = []
+
+            for i, url in enumerate(top_2_search_res_link):
+                current_app.logger.info(f"Fallback processing URL {i + 1}: {url}")
+
+                content = fallback_fetch(url)
+
+                if content and len(content.strip()) > 100:
+                    cleaned_text = re.sub(r'\s+', ' ', content.strip())
+
+                    if len(cleaned_text) > 3000:
+                        cleaned_text = cleaned_text[:3000] + "..."
+
+                    processed_texts.append(cleaned_text)
+                    current_app.logger.info(f"Fallback extracted {len(cleaned_text)} chars from {url}")
+
+                # Small delay between requests
+                time.sleep(0.5)
+
+            if processed_texts:
+                combined_text = " ".join(processed_texts)
+
+                result = {
+                    'text': combined_text,
+                    'source': top_2_search_res_link,
+                    'enhanced': True,
+                    'method': 'fallback_requests',
+                    'word_count': len(combined_text.split()),
+                    'sources_processed': len(processed_texts)
+                }
+
+                final_res.append(result)
+                current_app.logger.info(
+                    f"Fallback success: {len(combined_text)} chars from {len(processed_texts)} sources")
+            else:
+                raise Exception("Fallback method also failed")
+
+        except Exception as fallback_error:
+            current_app.logger.error(f"All methods failed: {fallback_error}")
+
+            # Final fallback to your original async method if it exists
+            try:
+                text = asyncio.run(async_main(top_2_search_res_link))
+                cleaned_text = re.sub(r'[^\w\s]', '', text[0] + " " + text[1])
+                cleaned_text = re.sub(r'\n+', '\n', cleaned_text).strip()
+
+                if cleaned_text:
+                    final_res.append({'text': cleaned_text, 'source': top_2_search_res_link})
+                    current_app.logger.info("Original async method fallback successful")
+
+            except Exception as async_error:
+                current_app.logger.error(f"Original async method also failed: {async_error}")
+
+    # Your original final fallback
     if len(final_res) == 0:
+        current_app.logger.info("All methods failed, using Google API results")
         return search.results(query, 4)
 
+    current_app.logger.info(f"Returning {len(final_res)} results")
     return final_res
-
-
 
 def parse_user_id(user_id:int):
     url = 'http://azurekong.hertzai.com:8000/db/getstudent_by_user_id'

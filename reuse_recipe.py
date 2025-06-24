@@ -1569,7 +1569,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             response = await subscribe_and_return({'prompt_id': prompt_id}, topic, 2000)  # Wait for the RPC response
             current_app.logger.info(f'Response from call of {topic}: {response}')
             if not response:
-                return 'Ask user to to go to hertzai.com login and start the windows companion app'
+                return 'Ask user to to go to hevolve.ai login and start the windows companion app'
             crossbar_message = {
                 'parent_request_id': request_id_list[user_prompt],
                 'user_id': f'{user_id}',

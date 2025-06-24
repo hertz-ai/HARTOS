@@ -1774,20 +1774,13 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
 
     @log_tool_execution
     def Generate_video(text: Annotated[str, "Text to be used for video generation"],
-                       avatar_id: Annotated[str, "Unique identifier for the avatar"],
-                       realtime: Annotated[bool,"If True, response is fast but less realistic by default it should be true; if False, response is realistic but slower"]) -> str:
+                       avatar_id: Annotated[int, "Unique identifier for the avatar"],
+                       realtime: Annotated[
+                           bool, "If True, response is fast but less realistic by default it should be true; if False, response is realistic but slower"]) -> str:
         tool_logger.info('INSIDE Generate_video')
         database_url = 'https://mailer.hertzai.com'
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
         tool_logger.info(f"avtar_id: {avatar_id}:\n{text[:10]}....\n")
-        # Convert "default" to a valid integer avatar_id if needed
-        if avatar_id == "default":
-            avatar_id_int = 1  # Use appropriate default ID number
-        else:
-            try:
-                avatar_id_int = int(avatar_id)
-            except ValueError:
-                avatar_id_int = 1  # Fallback to default ID if conversion fails
 
         headers = {'Content-Type': 'application/json'}
         data = {}
@@ -1795,6 +1788,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         data['flag_hallo'] = 'false'
         data['chattts'] = False
         data['openvoice'] = "false"
+
         try:
             res = requests.get("https://mailer.hertzai.com/get_image_by_id/{}".format(avatar_id))
             res = res.json()
@@ -1802,8 +1796,10 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         except:
             data['openvoice'] = "true"
             new_image_url = None
-            res = {'voice_id':None}
-        data["cartoon_image"] = "True"
+            res = {'voice_id': None}
+
+        # Correct cartoon_image values based on video_gen endpoint expectations
+        data["cartoon_image"] = "True"  # Use "True" for realtime mode
         data["bg_url"] = 'http://stream.mcgroce.com/txt/examples_cartoon/roy_bg.jpg'
         data['vtoonify'] = "false"
         data["image_url"] = new_image_url
@@ -1821,11 +1817,11 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         timeout = 60
         if not realtime:
             timeout = 600
-            data['chattts'] = True
-            data['flag_hallo'] = "true"
-            data["cartoon_image"] = False
+            data['chattts'] = True  # F5TTS
+            data['flag_hallo'] = "true"  # Echomimic-> Liveportrait
+            data["cartoon_image"] = "False"  # Use "False" for non-realtime mode
 
-        if res['voice_id'] != None:
+        if res['voice_id'] is not None:
             voice_sample = requests.get(
                 "{}/get_voice_sample_id/{}".format(database_url, res['voice_id']))
             voice_sample = voice_sample.json()
@@ -1835,19 +1831,34 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             voice_sample = None
             data["audio_sample_url"] = None
             data['voice_id'] = None
-        conv_id = save_conversation_db(text,user_id,prompt_id,database_url,request_id)
-        data['conv_id'] = int(conv_id)  # Ensure it's an integer
-        data['avatar_id'] = avatar_id_int  # Use the integer version
+
+        conv_id = save_conversation_db(text, user_id, prompt_id, database_url, request_id)
+        data['conv_id'] = conv_id
+        data['avatar_id'] = avatar_id
         data['timeout'] = timeout
+
+        # Add validation logging
+        tool_logger.info(f"Sending data to video_generate_save:")
+        tool_logger.info(f"- cartoon_image: {data['cartoon_image']} (realtime: {realtime})")
+        tool_logger.info(f"- flag_hallo: {data['flag_hallo']}")
+        tool_logger.info(f"- chattts: {data['chattts']}")
+        tool_logger.info(f"- timeout: {timeout}")
+
         try:
             video_link = requests.post("{}/video_generate_save".format(database_url),
-                                        data=json.dumps(data), headers=headers, timeout=1)
-        except:
-            pass
+                                       data=json.dumps(data), headers=headers, timeout=1)
+            tool_logger.info(f"Response status: {video_link.status_code}")
+            if video_link.status_code != 200:
+                tool_logger.error(f"Error response: {video_link.text}")
+        except requests.exceptions.Timeout:
+            tool_logger.warning("Request timed out")
+        except Exception as e:
+            tool_logger.error(f"Request failed: {e}")
+
         if data['chattts'] or data['flag_hallo'] == "true":
-            return f"Video Generation task added to queue with conv_id:{conv_id}. Ask the Helper to save this conv_id in the same collection from which the story used to generate the video was retrieved, for future reference"
+            return f"Video Generation task added to queue with conv_id:{conv_id}. Ask the helper to save this conv_id in the same collection from which the story used to generate the video was retrieved, for future reference"
         else:
-            return f"Video Generation completed with conv_id:{conv_id}. Ask the Helper to save this conv_id in the same collection from which the story used to generate the video was retrieved, for future reference"
+            return f"Video Generation completed with conv_id:{conv_id}. Ask the helper to save this conv_id in the same collection from which the story used to generate the video was retrieved, for future reference"
 
     helper1.register_for_llm(name="Generate_video", description="Generate/presynthesize video with text and save it in database")(Generate_video)
     time_agent.register_for_execution(name="Generate_video")(Generate_video)
