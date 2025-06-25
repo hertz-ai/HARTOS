@@ -992,7 +992,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             timeout = 600
             data['chattts'] = True #F5TTS
             data['flag_hallo'] = "true" #Echomimic-> Liveportrait
-            data["cartoon_image"] = False
+            data["cartoon_image"] = "False"
 
         if res['voice_id'] != None:
             voice_sample = requests.get(
@@ -1775,38 +1775,40 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     @log_tool_execution
     def Generate_video(text: Annotated[str, "Text to be used for video generation"],
                        avatar_id: Annotated[int, "Unique identifier for the avatar"],
-                       realtime: Annotated[
-                           bool, "If True, response is fast but less realistic by default it should be true; if False, response is realistic but slower"]) -> str:
+                       realtime: Annotated[bool, "If True, response is fast but less realistic"]) -> str:
         tool_logger.info('INSIDE Generate_video')
         database_url = 'https://mailer.hertzai.com'
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
         tool_logger.info(f"avtar_id: {avatar_id}:\n{text[:10]}....\n")
 
         headers = {'Content-Type': 'application/json'}
+
+        # Initialize data with correct types to match both VideoGenerateSave model and downstream video_gen
         data = {}
-        data["text"] = text
-        data['flag_hallo'] = 'false'
-        data['chattts'] = False
-        data['openvoice'] = "false"
+        data["text"] = str(text)
+        data['flag_hallo'] = 'false'  # String - downstream: str().lower() == "true"
+        data['chattts'] = False  # Boolean - downstream: data.get("chattts", False)
+        data['openvoice'] = "false"  # String - downstream: str().lower() == "true"
 
         try:
-            res = requests.get("https://mailer.hertzai.com/get_image_by_id/{}".format(avatar_id))
+            res = requests.get(f"https://mailer.hertzai.com/get_image_by_id/{avatar_id}")
             res = res.json()
             new_image_url = res["image_url"]
+            voice_id = res.get('voice_id')
         except:
             data['openvoice'] = "true"
             new_image_url = None
-            res = {'voice_id': None}
+            voice_id = None
 
-        # Correct cartoon_image values based on video_gen endpoint expectations
-        data["cartoon_image"] = "True"  # Use "True" for realtime mode
+        # String values for downstream compatibility
+        data["cartoon_image"] = "True"  # String - downstream: == "True"
         data["bg_url"] = 'http://stream.mcgroce.com/txt/examples_cartoon/roy_bg.jpg'
         data['vtoonify'] = "false"
-        data["image_url"] = new_image_url
+        data["image_url"] = new_image_url  # Optional[str] - can be None
         data['im_crop'] = "false"
         data['remove_bg'] = "false"
         data['hd_video'] = "false"
-        data['uid'] = request_id
+        data['uid'] = str(request_id)
         data['gradient'] = "true"
         data['cus_bg'] = "false"
         data['solid_color'] = "false"
@@ -1817,41 +1819,60 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         timeout = 60
         if not realtime:
             timeout = 600
-            data['chattts'] = True  # F5TTS
-            data['flag_hallo'] = "true"  # Echomimic-> Liveportrait
-            data["cartoon_image"] = "False"  # Use "False" for non-realtime mode
+            data['chattts'] = True  # Boolean - downstream expects boolean
+            data['flag_hallo'] = "true"  # String
+            data["cartoon_image"] = "False"  # String
 
-        if res['voice_id'] is not None:
-            voice_sample = requests.get(
-                "{}/get_voice_sample_id/{}".format(database_url, res['voice_id']))
-            voice_sample = voice_sample.json()
-            data["audio_sample_url"] = voice_sample["voice_sample_url"]
-            data['voice_id'] = res['voice_id']
+        # Handle voice sample
+        if voice_id is not None:
+            try:
+                voice_sample = requests.get(f"{database_url}/get_voice_sample_id/{voice_id}")
+                voice_sample = voice_sample.json()
+                audio_url = voice_sample.get("voice_sample_url")
+                data["audio_sample_url"] = audio_url  # Optional[str] - can be None
+                data['voice_id'] = int(voice_id) if voice_id else None  # Integer or None
+            except:
+                data["audio_sample_url"] = None
+                data['voice_id'] = None
         else:
-            voice_sample = None
             data["audio_sample_url"] = None
             data['voice_id'] = None
 
+        # Integer values for downstream compatibility
         conv_id = save_conversation_db(text, user_id, prompt_id, database_url, request_id)
-        data['conv_id'] = conv_id
-        data['avatar_id'] = avatar_id
-        data['timeout'] = timeout
+        data['conv_id'] = int(conv_id)  # Integer - downstream uses in DB operations
+        data['avatar_id'] = int(avatar_id)  # Integer - downstream: int(data.get("avatar_id", 0))
+        data['timeout'] = int(timeout)  # Integer - downstream uses in calculations
 
-        # Add validation logging
-        tool_logger.info(f"Sending data to video_generate_save:")
-        tool_logger.info(f"- cartoon_image: {data['cartoon_image']} (realtime: {realtime})")
-        tool_logger.info(f"- flag_hallo: {data['flag_hallo']}")
-        tool_logger.info(f"- chattts: {data['chattts']}")
-        tool_logger.info(f"- timeout: {timeout}")
+        # Debug: Show data types being sent
+        tool_logger.info("=== DATA TYPES BEING SENT ===")
+        type_check = {
+            'strings': ['text', 'flag_hallo', 'openvoice', 'cartoon_image', 'bg_url', 'vtoonify',
+                        'im_crop', 'remove_bg', 'hd_video', 'uid', 'gradient', 'cus_bg',
+                        'solid_color', 'inpainting', 'prompt', 'gender'],
+            'integers': ['conv_id', 'avatar_id', 'timeout'],
+            'booleans': ['chattts'],
+            'optional_strings': ['image_url', 'audio_sample_url'],
+            'optional_integers': ['voice_id']
+        }
+
+        for type_name, fields in type_check.items():
+            for field in fields:
+                if field in data:
+                    value = data[field]
+                    tool_logger.info(f"  {field}: {value} (type: {type(value).__name__})")
 
         try:
-            video_link = requests.post("{}/video_generate_save".format(database_url),
+            tool_logger.info(f"Sending request to {database_url}/video_generate_save")
+            video_link = requests.post(f"{database_url}/video_generate_save",
                                        data=json.dumps(data), headers=headers, timeout=1)
             tool_logger.info(f"Response status: {video_link.status_code}")
-            if video_link.status_code != 200:
+            if video_link.status_code == 422:
+                tool_logger.error(f"422 Validation Error: {video_link.text}")
+            elif video_link.status_code != 200:
                 tool_logger.error(f"Error response: {video_link.text}")
-        except requests.exceptions.Timeout:
-            tool_logger.warning("Request timed out")
+            else:
+                tool_logger.info("✅ Request successful!")
         except Exception as e:
             tool_logger.error(f"Request failed: {e}")
 
@@ -1859,7 +1880,6 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             return f"Video Generation task added to queue with conv_id:{conv_id}. Ask the helper to save this conv_id in the same collection from which the story used to generate the video was retrieved, for future reference"
         else:
             return f"Video Generation completed with conv_id:{conv_id}. Ask the helper to save this conv_id in the same collection from which the story used to generate the video was retrieved, for future reference"
-
     helper1.register_for_llm(name="Generate_video", description="Generate/presynthesize video with text and save it in database")(Generate_video)
     time_agent.register_for_execution(name="Generate_video")(Generate_video)
 
