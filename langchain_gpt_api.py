@@ -69,7 +69,7 @@ load_dotenv()
 
 #autogen requirements
 
-from create_recipe import recipe, time_based_execution as time_execution
+from create_recipe import recipe, time_based_execution as time_execution, visual_execution
 from reuse_recipe import chat_agent, crossbar_multiagent, time_based_execution, visual_based_execution
 from autobahn.asyncio.component import Component, run
 import threading
@@ -2262,6 +2262,8 @@ def visual_agent():
     app.logger.info(f'GOT user_id:{user_id} & prompt_id:{prompt_id} & task_description:{task_description}')
     if request_from == 'Reuse':
         res = visual_based_execution(str(task_description),int(user_id),int(prompt_id))
+    else:
+        res = visual_execution(str(task_description),int(user_id),int(prompt_id))
     return jsonify({'response':f'{res}'}), 200
 
 @app.route('/response_ack',methods=['POST'])

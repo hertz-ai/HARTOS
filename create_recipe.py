@@ -406,8 +406,8 @@ def get_action_user_details(user_id):
         user_details = "No user details available"
     return user_details, actions
 
-
-def visual_based_execution(task_description: str, user_id: int, prompt_id: int):
+#called from api when visual task is auto triggered via scheduler
+def visual_execution(task_description: str, user_id: int, prompt_id: int):
     current_app.logger.info(f'INSIDE Visual_BASED_EXECUTION')
     user_prompt = f'{user_id}_{prompt_id}'
     frame = get_frame(str(user_id))
@@ -471,10 +471,10 @@ def call_visual_task(task_description: str, user_id: int, prompt_id: int, data: 
         except Exception as e:
             current_app.logger.error(f"Failed to call external visual agent: {e}")
             # Fallback to internal visual processing
-            return visual_based_execution(task_description, user_id, prompt_id)
+            return visual_execution(task_description, user_id, prompt_id)
     else:
         current_app.logger.info("Using internal visual processing")
-        return visual_based_execution(task_description, user_id, prompt_id)
+        return visual_execution(task_description, user_id, prompt_id)
     
 def parse_date(date_str):
     return datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%S")         
@@ -1454,7 +1454,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
                     'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0},
                     'bottom_left': {'x': 0, 'y': 0}}}
             client.publish(
-            f"com.hertzai.hevolve.chat.{user_id}", f'{crossbar_message}')
+            f"com.hertzai.hevolve.chat.{user_id}", json.dumps(crossbar_message))
         except Exception as e:
             current_app.logger.error(f"Error publishing crossbar message: {e}")
         # Process @ mentions - keeping this logic intact
@@ -2201,7 +2201,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             crossbar_message = {"text": ["Working on "+message+".\n please evaluate the response i am giving to check if it meets the current action"], "priority": 49, "action": 'Thinking', "historical_request_id": [], "preffered_language": 'en-US', "options": [], "newoptions": [], "bot_type": 'Agent', "page_image_url": "", "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
             'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0}, 'bottom_left': {'x': 0, 'y': 0}}}
             result = client.publish(
-                f"com.hertzai.hevolve.chat.{user_id}", f'{crossbar_message}')
+                f"com.hertzai.hevolve.chat.{user_id}", json.dumps(crossbar_message))
             task_time[prompt_id] = {'timer':time.time(),'times':[]}
             #ASSIGNED
             result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
@@ -2563,7 +2563,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         crossbar_message = {"text": ["Working on "+message+".\n please evaluate the response i am giving to check if it meets the current action"], "priority": 49, "action": 'Thinking', "historical_request_id": [], "preffered_language": 'en-US', "options": [], "newoptions": [], "bot_type": 'Agent', "page_image_url": "", "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
                         'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0}, 'bottom_left': {'x': 0, 'y': 0}}}
                         result = client.publish(
-                            f"com.hertzai.hevolve.chat.{user_id}", f'{crossbar_message}')
+                            f"com.hertzai.hevolve.chat.{user_id}", json.dumps(crossbar_message))
 
                     result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
                 current_app.logger.info("\n=== Chat Summary ===")
