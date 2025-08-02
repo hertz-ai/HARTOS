@@ -1447,14 +1447,15 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
 
         # Send crossbar message for UI feedback
         try:
-            crossbar_message = {"text": [f"{last_speaker.name} " + f'{messages[-1]["content"]}'], "priority": 49,
-                                "action": 'Thinking', "historical_request_id": [], "preffered_language": 'en-US',
-                                "options": [], "newoptions": [], "bot_type": 'Agent', "page_image_url": "",
-                                "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
-                    'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0},
-                    'bottom_left': {'x': 0, 'y': 0}}}
-            client.publish(
-            f"com.hertzai.hevolve.chat.{user_id}", json.dumps(crossbar_message))
+            if last_speaker.name not in ['UserProxy', 'User']:
+                crossbar_message = {"text": [f'{messages[-1]["content"]}'], "priority": 49,
+                                    "action": 'Thinking', "historical_request_id": [], "preffered_language": 'en-US',
+                                    "options": [], "newoptions": [], "bot_type": 'Agent', "page_image_url": "",
+                                    "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
+                        'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0},
+                        'bottom_left': {'x': 0, 'y': 0}}}
+                client.publish(
+                f"com.hertzai.hevolve.chat.{user_id}", json.dumps(crossbar_message))
         except Exception as e:
             current_app.logger.error(f"Error publishing crossbar message: {e}")
         # Process @ mentions - keeping this logic intact
@@ -2565,7 +2566,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         result = client.publish(
                             f"com.hertzai.hevolve.chat.{user_id}", json.dumps(crossbar_message))
 
-                    result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
+                    result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False) #It fails here
                 current_app.logger.info("\n=== Chat Summary ===")
                 current_app.logger.info("\n=== Full response ===")
                 # current_app.logger.info(result)
