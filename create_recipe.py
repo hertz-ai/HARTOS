@@ -1,7 +1,7 @@
 """create_recipe.py"""
 import autogen
 import os
-from typing import Annotated, Optional, Dict, Tuple, Any
+from typing import Annotated, Optional, Dict, Tuple, List, Any
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -18,7 +18,7 @@ from autogen import register_function
 import json
 from autogen import ConversableAgent
 from flask import current_app
-from helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values
+from helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup
 import helper as helper_fun
 import threading
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
@@ -26,6 +26,151 @@ from autogen.cache.in_memory_cache import InMemoryCache
 from json_repair import repair_json
 from crossbarhttp import Client
 client = Client('http://aws_rasa.hertzai.com:8088/publish')
+# Add to your create_recipe.py after imports
+from lifecycle_hooks import (
+    initialize_deterministic_actions,
+    lifecycle_hook_track_action_assignment,
+    lifecycle_hook_track_user_fallback,
+    debug_lifecycle_status,
+    ActionState,
+    get_action_state, set_action_state,
+    lifecycle_hook_track_status_verification_request,
+    lifecycle_hook_track_fallback_request,
+    lifecycle_hook_track_recipe_request,
+    lifecycle_hook_track_termination,
+    lifecycle_hook_process_verifier_response,
+    lifecycle_hook_track_recipe_completion,
+    lifecycle_hook_check_all_actions_complete,
+lifecycle_hook_validate_final_agent_creation
+)
+
+# Initialize
+initialize_deterministic_actions()
+
+import inspect
+import asyncio
+import logging
+import sys
+from functools import wraps
+import cv2
+import redis
+import pickle
+import pytz
+from PIL import Image
+
+from datetime import timedelta
+from lifecycle_hooks import initialize_minimal_lifecycle_hooks
+initialize_minimal_lifecycle_hooks()  # Prints integration guide
+
+# Then add the 4 hooks to your get_response_group while loop
+# Then manually add the 4 hooks to your get_response_group while loop
+# Set up a dedicated logger that doesn't depend on Flask context
+log_dir = "logs"
+if not os.path.exists(log_dir):
+    os.makedirs(log_dir)
+
+# Create a custom logger with timestamp in filename
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+log_file = os.path.join(log_dir, f"agent_system_{timestamp}.log")
+
+# Configure the logger
+tool_logger = logging.getLogger("agent_logger")
+tool_logger.setLevel(logging.DEBUG)
+
+# File handler with rotation (10 MB max size, keep 10 backup files)
+file_handler = logging.handlers.RotatingFileHandler(
+    log_file,
+    maxBytes=10*1024*1024,  # 10 MB
+    backupCount=10
+)
+file_handler.setLevel(logging.DEBUG)
+
+# Console handler
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)  # Less verbose on console
+
+# Create formatter with timestamp, level, and message
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s')
+file_handler.setFormatter(formatter)
+console_handler.setFormatter(formatter)
+
+# Add handlers to logger
+tool_logger.addHandler(file_handler)
+tool_logger.addHandler(console_handler)
+tool_logger.propagate = False  # Prevent double logging
+
+# Decorator for logging tool execution
+
+
+
+def log_tool_execution(func):
+    if inspect.iscoroutinefunction(func):
+        # For async functions
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            tool_logger.info(f"TOOL EXECUTION START: {func.__name__}")
+            tool_logger.info(f"Arguments: {args}, Keyword Arguments: {kwargs}")
+            try:
+                result = await func(*args, **kwargs)
+                if not isinstance(result, str):
+                    tool_logger.warning(f"Tool function {func.__name__} returned non-string type: {type(result)}")
+                    result = str(result)
+                tool_logger.info(f"TOOL EXECUTION SUCCESS: {func.__name__}")
+                tool_logger.info(
+                    f"Result: {result[:100]}..." if len(result) > 100 else f"Result: {result}"
+                )
+                return result
+            except Exception as e:
+                tool_logger.error(f"TOOL EXECUTION ERROR: {func.__name__} - {e}")
+                tool_logger.exception("Exception details:")
+                error_response = {
+                    "status": "error",
+                    "tool_function": func.__name__,
+                    "error_type": type(e).__name__,
+                    "error_message": str(e),
+                    "suggestion": "Check logs for detailed traceback information"
+                }
+                # ... (add any special-case suggestions like NameError, KeyError here) ...
+                error_json = json.dumps(error_response)
+                tool_logger.info(f"Returning error response: {error_json}")
+                return f"Tool execution failed: {error_json}"
+        return wrapper
+    else:
+        # For regular (sync) functions
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            tool_logger.info(f"TOOL EXECUTION START: {func.__name__}")
+            tool_logger.info(f"Arguments: {args}, Keyword Arguments: {kwargs}")
+            try:
+                result = func(*args, **kwargs)
+                # If it returns a coroutine by accident, run it to completion
+                if asyncio.iscoroutine(result):
+                    tool_logger.info(f"Detected coroutine return from {func.__name__}, running it to completion")
+                    result = asyncio.get_event_loop().run_until_complete(result)
+                if not isinstance(result, str):
+                    tool_logger.warning(f"Tool function {func.__name__} returned non-string type: {type(result)}")
+                    result = str(result)
+                tool_logger.info(f"TOOL EXECUTION SUCCESS: {func.__name__}")
+                tool_logger.info(
+                    f"Result: {result[:100]}..." if len(result) > 100 else f"Result: {result}"
+                )
+                return result
+            except Exception as e:
+                tool_logger.error(f"TOOL EXECUTION ERROR: {func.__name__} - {e}")
+                tool_logger.exception("Exception details:")
+                error_response = {
+                    "status": "error",
+                    "tool_function": func.__name__,
+                    "error_type": type(e).__name__,
+                    "error_message": str(e),
+                    "suggestion": "Check logs for detailed traceback information"
+                }
+                # ... (add any special-case suggestions here) ...
+                error_json = json.dumps(error_response)
+                tool_logger.info(f"Returning error response: {error_json}")
+                return f"Tool execution failed: {error_json}"
+        return wrapper
+
 
 scheduler = BackgroundScheduler()
 scheduler.start()
@@ -41,6 +186,14 @@ config_list = [{
         "api_version": "2024-12-01-preview",
         "price": [0.0025, 0.01]
     }]
+with open("config.json", 'r') as f:
+    config = json.load(f)
+STUDENT_API = config['STUDENT_API']
+ACTION_API = config['ACTION_API']
+redis_client = redis.StrictRedis(
+    host='azure_all_vms.hertzai.com', port=6369, db=0)
+
+
 
 agent_data = {}
 task_time = {}
@@ -95,6 +248,8 @@ def execute_python_file(task_description:str,user_id: int,prompt_id:int,action_e
     res = requests.post(url,data=data,headers=headers)
     return 'done'
 
+
+
 def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_entry_point:int,actions:list=[]):
     current_app.logger.info(f'INSIDE TIME_BASED_EXECUTION with action_entry_point"{action_entry_point}')
     user_prompt = f'{user_id}_{prompt_id}'
@@ -142,7 +297,7 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
     last_message = group_chat.messages[-1]
     if last_message['content'] == 'TERMINATE':
         last_message = group_chat.messages[-2]
-
+    #sending response to receiver agent
     if f'message_2_user'.lower() in last_message['content'].lower():
         try:
             json_obj = retrieve_json(last_message['content'])
@@ -161,39 +316,268 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
     # At this point, don't process messages with message_2_user as they were already sent
     return 'done'
 
-from typing import List
 
+
+def get_frame(user_id):
+    serialized_frame = redis_client.get(user_id)
+    try:
+        if serialized_frame is not None:
+            frame_bgr = pickle.loads(serialized_frame)
+            current_app.logger.info(
+                 
+                f"Frame for user_id {user_id} retrieved successfully.")
+            frame = frame_bgr[:, :, ::-1]
+            return frame
+        else:
+            current_app.logger.info(f"No frame found for user_id {user_id}.")
+            return None
+    except ModuleNotFoundError as e:
+        raise e
+    
+def get_visual_context(user_id, minutes=2):
+    """Get visual context from the past specified minutes"""
+    try:
+        current_app.logger.info(f'Getting visual context for user {user_id} for past {minutes} minutes')
+        visual_context = helper_fun.get_visual_context(user_id, minutes)
+        current_app.logger.info(f'GOT RESPONSE AS {visual_context}')
+        if not visual_context:
+            visual_context = 'User\'s camera is not on. no visual data'
+        return visual_context
+    except Exception as e:
+        current_app.logger.error(f'Error getting visual context: {e}')
+        return None
+    
+def get_action_user_details(user_id):
+    '''
+        This function helps to extract actions that the user has performed till now.
+    '''
+    unwanted_actions = ['Topic Cofirmation', 'Langchain', 'Assessment Ended', 'Casual Conversation',
+                        'Topic confirmation',
+                        'Topic not found', 'Topic Confirmation', 'Topic Listing', 'Probe', 'Question Answering',
+                        'Fallback']
+    action_url = f"{ACTION_API}?user_id={user_id}"
+    time_zone = "Asia/Kolkata"
+    try:
+        india_tz = pytz.timezone(time_zone)
+    except:
+        india_tz = None
+    payload = {}
+    headers = {}
+    try:
+        response = requests.request("GET", action_url, headers=headers, data=payload)
+        if response.status_code == 200:
+            data = response.json()
+            filtered_data = [obj for obj in data if obj["action"] not in unwanted_actions and obj["zeroshot_label"] not in ['Video Reasoning']]
+            action_texts = []
+            for obj in filtered_data:
+                action = obj["action"]
+                try:
+                    date = parse_date(obj["created_date"])
+                    if india_tz:
+                        first_action_text = f"{action} on {date.astimezone(india_tz).strftime('%Y-%m-%dT%H:%M:%S')}"
+                    else:
+                        first_action_text = f"{action} on {date.strftime('%Y-%m-%dT%H:%M:%S')}"
+                    action_texts.append(first_action_text)
+                except:
+                    action_texts.append(f"{action}")
+                if len(action_texts) == 0:
+                    action_texts = ['user has not performed any actions yet.']
+                actions = ", ".join(action_texts)
+        else:
+            actions = "Could not retrieve user actions"
+    except Exception as e:
+        current_app.logger.error(f"Error getting action details: {e}")
+        actions = "No user action data available"
+    try:
+        url = STUDENT_API
+        payload = json.dumps({"user_id": user_id})
+        headers = {'Content-Type': 'application/json'}
+        response = requests.request("POST", url, headers=headers, data=payload)
+        if response.status_code == 200:
+            user_data = response.json()
+            user_details = f'''Below are the information about the user.
+            user_name: {user_data.get("name", "Unknown")}, gender: {user_data.get("gender", "Unknown")}, 
+            preferred_language: {user_data.get("preferred_language", "Unknown")}, 
+            date_of_birth: {user_data.get("dob", "Unknown")}'''
+        else:
+            user_details = "Could not retrieve user details"
+    except Exception as e:
+        current_app.logger.error(f"Error getting user details: {e}")
+        user_details = "No user details available"
+    return user_details, actions
+
+#called from api when visual task is auto triggered via scheduler
+def visual_execution(task_description: str, user_id: int, prompt_id: int):
+    current_app.logger.info(f'INSIDE Visual_BASED_EXECUTION')
+    user_prompt = f'{user_id}_{prompt_id}'
+    frame = get_frame(str(user_id))
+    minutes=5
+    actions = helper_fun.get_visual_context(user_id,minutes)
+    if frame is None or actions is None:
+        current_app.logger.info("Camera is OFF or no frame found — skipping visual agent.")
+        return
+
+    try:
+        author, assistant_agent, executor, group_chat, manager, chat_instructor, agents_object = user_agents[user_prompt]
+        current_time = datetime.now()
+        text = f'''This is the time now {current_time}
+            You are an assistant in a visual execution system. Perform the requested action based on the task context.
+            Note: Visual input is available because the user's camera is ON.
+            <Last_{minutes}_Minutes_Visual_Context_End>: {actions}
+            If the user needs to be informed (e.g., task completed, input needed, error), respond in this exact JSON format:
+            {{"message_2_user": "Your clear and useful message here"}}
+            Only send this if you have something meaningful to say.
+            Do not interrupt the user unless they have asked for a response or the task cannot proceed without their input.
+            You must now perform this task: {task_description}'''
+        # Use the existing agent structure
+        result = author.initiate_chat(manager, message=text, clear_history=False)
+        last_message = group_chat.messages[-1]
+        if last_message['content'] == 'TERMINATE':
+            if len(group_chat.messages) > 1:
+                last_message = group_chat.messages[-2]
+            if 'message_2_user' in last_message['content'].lower():
+                try:
+                    json_obj = retrieve_json(last_message['content'])
+                    if json_obj and 'message_2_user' in json_obj:
+                        send_message_to_user1(user_id, json_obj['message_2_user'], task_description, prompt_id)
+                except Exception as e:
+                    current_app.logger.error(f"Error processing visual agent response: {e}")
+    except Exception as e:
+        current_app.logger.error(f"Error in visual_based_execution: {e}")
+    return 'done'
+
+def call_visual_task(task_description: str, user_id: int, prompt_id: int, data: list = None, date: datetime = None):
+    headers = {'Content-Type': 'application/json'}
+    url = 'http://localhost:6777/visual_agent'
+
+    now = datetime.now()
+    
+    # Use current time if date not provided
+    if date is None:
+        date = now - timedelta(seconds=30)
+    if data and any(obj.get("zeroshot_label") == 'Video Reasoning' for obj in data) and (now - date) > timedelta(seconds=30):
+        data_to_send = json.dumps({
+
+            'task_description': task_description,
+            'user_id': user_id,
+            'prompt_id': prompt_id,
+            'request_from': 'Create'
+            })
+        try:
+            # Send POST request to the external visual agent
+            res = requests.post(url, data=data_to_send, headers=headers, timeout=10)
+            current_app.logger.info(f"External visual agent response: {res.status_code}")
+            return 'done'
+        except Exception as e:
+            current_app.logger.error(f"Failed to call external visual agent: {e}")
+            # Fallback to internal visual processing
+            return visual_execution(task_description, user_id, prompt_id)
+    else:
+        current_app.logger.info("Using internal visual processing")
+        return visual_execution(task_description, user_id, prompt_id)
+    
+def parse_date(date_str):
+    return datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%S")         
 
 class SubscriptionHandler:
     message = None
 
-    async def on_rpc_response(self, session, msg):
+    async def on_rpc_response(self, session, msg, component):
         current_app.logger.info("Received RPC response: {}".format(msg))
         SubscriptionHandler.message = msg
         await component.stop()  # Stop the component after getting the response
 
-async def subscribe_and_return(message,topic,time=8000):
-    global component
+
+async def subscribe_and_return(message, topic, time=1800000):
+    """
+    Makes an RPC call to the specified topic using a component.
+    Waits for the full duration of the specified timeout for a response.
+
+    Args:
+        message: The message payload to send
+        topic: The topic to call
+        time: Timeout in milliseconds (default: 8000)
+
+    Returns:
+        The response from the RPC call, or None if there was an error or timeout
+    """
+    current_app.logger.info(f"Making RPC Call to {topic}...")
+
+    # Create a new component for this call
     component = Component(
         transports="ws://aws_rasa.hertzai.com:8088/ws",
         realm="realm1",
     )
 
+    response_future = asyncio.Future()
+
     @component.on_join
     async def join(session, details):
-        current_app.logger.info("Making RPC Call...")
+        current_app.logger.info("Session joined, making RPC call...")
         try:
-            response = await asyncio.wait_for(session.call(topic,message), timeout=time)
-            await SubscriptionHandler().on_rpc_response(session, response)
+            # Convert time from milliseconds to seconds
+            timeout_seconds = time / 1000
+            current_app.logger.info(f"Using timeout of {timeout_seconds} seconds")
 
-        except Exception as e:
-            current_app.logger.error(f"RPC call failed: {e}")
-            SubscriptionHandler.message = None
+            # Set actual timeout
+            try:
+                result = await asyncio.wait_for(
+                    session.call(topic, message),
+                    timeout=timeout_seconds
+                )
+
+                if not response_future.done():
+                    response_future.set_result(result)
+
+            except asyncio.TimeoutError:
+                if not response_future.done():
+                    response_future.set_exception(
+                        Exception(f"RPC call timed out after {timeout_seconds} seconds")
+                    )
+            except Exception as e:
+                if not response_future.done():
+                    response_future.set_exception(e)
+
         finally:
-            await component.stop()
+            # Stop the component regardless of success / failure
+            try:
+                await component.stop()
+            except Exception as e:
+                current_app.logger.error(f"Error stopping component: {e}")
 
-    await component.start()
-    return SubscriptionHandler.message
+    try:
+        # Start the component
+        await component.start()
+
+        # Calculate timeout with a small buffer
+        actual_timeout = (time / 1000) + 5  # Add 5 second buffer
+
+        # Wait for the response or timeout
+        result = await asyncio.wait_for(response_future, timeout=actual_timeout)
+
+        # Return the result
+        return result
+
+    except asyncio.TimeoutError:
+        current_app.logger.error(f"Timed out waiting for response after {actual_timeout} seconds")
+        # Explicitlt cancel the future if it's still pending
+        if not response_future.done():
+            response_future.cancel()
+        return None
+    except Exception as e:
+        current_app.logger.error(f"Error in subscribe_and_return: {e}")
+        # Explicitly cancel the future if it's still pending
+        if not response_future.done():
+            response_future.cancel()
+        return None
+    finally:
+        # Ensure component is stopped
+        if hasattr(component, 'session') and component.session:
+            try:
+                await component.stop()
+            except Exception as e:
+                current_app.logger.error(f"Error stopping component in finally: {e}")
+
 
 llm_config = {
         "cache_seed": None,
@@ -201,12 +585,26 @@ llm_config = {
         "max_tokens": 1500
     }
 
-
+def has_pending_tool_calls(messages):
+    """Check if the last message contains tool calls that need execution."""
+    if not messages:
+        return False
+    last_msg = messages[-1]
+    return (last_msg.get('role') == 'assistant' and
+            'tool_calls' in last_msg and
+            last_msg['tool_calls'])
 
 def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent, autogen.ConversableAgent]:
     """Create new assistant & user agents for a given user_id"""
     user_prompt = f'{user_id}_{prompt_id}'
     individual_json[user_prompt] = None
+
+    try:
+        tool_logger.info("🔧 Trying to initialise...")
+
+        apply_autogen_fix_on_startup()
+    except:
+        tool_logger.info("📋 Autogen JSON enhancement ready - will be applied when Flask starts")
 
     custom_agents = []
     agents_object = {}
@@ -224,48 +622,48 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         •Action Flow:
             1. Receive Action: Ask the UserProxy to associate the action with a persona (if multiple personas exist).
             2. Execution:
-                ➜Understand and plan the current action execution.
-                ➜Perform the action with the help of @Helper and @Executor agents.
-                ➜Account for all the tools available with helper & whenever you are supposed to call a tool as part of current action ask @Helper.
-                ➜If the action requires code execution or API endpoint call, in create code(python preferred) and ask @Executor agent to execute the created code.
+                - Understand and plan the current action execution.
+                - Perform the action with the help of @Helper and @Executor agents.
+                - Account for all the tools available with helper & whenever you are supposed to call a tool as part of current action ask @Helper.
+                - If the action requires calculation, code execution or API endpoint call, CREATE code(python preferred) and ask @Executor agent to execute the created code.
             3. After Completion:
-                ➜If action completed successful & there is no error, ask @Helper to save the information(which will be required in future) in memory using 'save_data_in_memory' tool.
-                ➜After save_data_in_memory has completed, ask the StatusVerifier to confirm completion and include the persona name.
-                ➜After confirmation, request the next action from the ChatInstructor.
+                - If action completed successful & there is no error, ask @Helper to save the information(which will be required in future) in memory using 'save_data_in_memory' tool.
+                - After save_data_in_memory has completed, ask the StatusVerifier to confirm completion and include the persona name.
+                - After confirmation, request the next action from the ChatInstructor.
             4. If Failed:
-                ➜Create a summary of the error and ask the UserProxy for help if needed.
-                ➜Never assume; always seek user assistance for unresolved issues.
+                - Create a summary of the error and ask the UserProxy for help if needed.
+                - Never assume; always seek user assistance for unresolved issues.
             5. Action Modifications:
-                ?If the action is modified, ask the user what measures should be taken if it fails in the future.
+                - If the action is modified, ask the user what measures should be taken if it fails in the future.
 
         •Persona Association:
             list of persona:- """+f'{list_of_persona}'+"""
             Rules:
-                ➜If there’s only 1 persona in the list, associate that persona with all actions automatically.
-                ➜If there are multiple personas, ask the @user to select the persona associated with each action.
+                - If there's only 1 persona in the list, associate that persona with all actions automatically.
+                - If there are multiple personas, ask the @user to select the persona associated with each action.
 
-        •Code Execution: Executor Agent: Executes code as needed. Ensure the final response is printed in code using print() before sending to Executor.
+        •Code Execution: Executor Agent: Executes code as needed. Ensure the final response is printed in code using print() before sending to Executor. Only executor can execute the code and not user, hence never ask user the code or code/api execution response.
 
         •Tools Helper Agent can use:
-            1. The tools are: send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,execute_windows_command,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, google_search and save_data_in_memory.
+            1. The tools are: send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,execute_windows_or_android_command,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, google_search and save_data_in_memory.
             2. Create Scheduled Jobs: For tasks involving timer or time or periodically or scheduled jobs, ask Helper agent to use the create_scheduled_jobs tool.
             3. Data/Memory Management:
-                ➜If you want to save some data,understand the current data from get_saved_metadata & plan the datamodel and ask helper agent to use "save_data_in_memory" tool.
-                ➜If you want to get some data ask helper agent to use "get_data_by_key"  tool.
+                - If you want to save some data,understand the current data from get_saved_metadata & plan the datamodel and ask helper agent to use "save_data_in_memory" tool.
+                - If you want to get some data ask helper agent to use "get_data_by_key"  tool.
             4. If you want to send some message to user directly then ask helper agent to use send_message_to_user tool but if you want to send message after sometime then ask helper to use send_message_in_seconds tool.
             5. If you want to send some pre synthesized realistic videos to user then ask helper agent to use send_presynthesized_video_to_user tool.
             6. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the pre synthesized generated video if it is successful.
-            7. If you receive a request to perform a task or action on the user's computer, or if the request is related to Chrome or any browser, you should ask @Helper to use the `execute_windows_command` tool.
-            8. If you want the user's ID then ask the @Helper to use 'get_user_id' tool and do not prompt the user for their user_id, never mention the user_id to the user.
+            7. If you receive a request to perform a task or action on the user's computer, or if the request is related to Chrome or any browser, you should ask @Helper to use the `execute_windows_or_android_command` tool.
+            8. If you want the user's ID then ask the @Helper to use 'get_user_id' tool and do not prompt the user for their user_id, never mention the user_id to the user. Important: Get the user Id yourself always, Do not ask the user_id from User ever.
             9. If you want to do a google search then you should ask the @Helper to use the 'google_search' tool.
 
         •Error Handling:
-            If there's an error or failure, respond with a structured error message format: {"status":"error","action":"current action","action_id":1/2/3...,"message":"message here"}
+            If there's an error or failure try to self heal first, if self healing did not work respond with a structured error message format: {"status":"error","action":"current action","action_id":1/2/3...,"message":"message here"}
             For success, ask the status verifier agent to verify the status of completion for current action
 
-        •Calling Other Agents:
+        •Calling Other Agents (Important):
             1. When you need to direct a question or route the conversation to a specific agent, use the @ tag followed by the agent's name. Examples include: @Executor or @Helper or @User
-            2. If you want to send data user, always use `@user {"message_2_user": "message here"}`. However, if you're responding to the user's request or instruction, use the send_message_to_user or send_message_in_seconds tool, Do not use both to convey the same.
+            2. If you are responding to the user's request or need some clarification/information from user, just tag userproxy agent strictly via `@user {"message_2_user": "message here"}` or If you need to send data proactively (on your own) while continuing your current action use tools `send_message_to_user`  or `send_message_in_seconds` for sending message to user with delay,  Do not use both to convey the same.
 
         •Communication Style:
             1. Speak casually, with clarity and respect. Maintain accuracy and clear communication.
@@ -280,8 +678,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
 
             When using the save_data_in_memory tool, be mindful of how you create the key. Ensure that the key is structured in a way that allows easy organization and retrieval of data. Use dot notation to create a logical key path. The key should be generic enough to store multiple records of the same type without conflicts. Avoid using specific values as part of the key
                 For example:
-                    ➜ stories.story_name - Good key structure for storing multiple stories.
-                    ➜ creator.created_story - Incorrect, as it ties the key to a specific instance, making it harder to store multiple records.
+                    - stories.story_name - Good key structure for storing multiple stories.
+                    - creator.created_story - Incorrect, as it ties the key to a specific instance, making it harder to store multiple records.
 
 
         •Working Directory: /home/hertzai2019/newauto/coding/
@@ -298,6 +696,18 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         system_message="""You are an Helper Agent,
         Focus: Assisting the Assistant Agent to complete actions.
         Note: Do not coordinate with other agents. After your response, always pass the conversation back to the Assistant Agent.
+
+        You serve as the system's self-healing component with these responsibilities:
+        1. Monitor: Continously monitor responses for error patterns, especially JSON with {"status": "error"} format
+        2. Diagnose: When error occur, carefully analyze error messages to identify root causes
+        3. Repair: Take immediate corrective actions based on the specific error type:
+            - For JSON format errors: use validate_json_response tool
+            - For tool execution errors: Suggest parameter adjustments ot alternative tools
+            - For API connection issues: Recommend retry strategies or fallback approaches
+            - For Logical errors: Propose an alternative solution path
+        4. Clearly explain what wenr wrong and how you're fixing it.
+        5. After resolving the issue, help resume the original task flow
+
         Coding Instructions:
             Avoid using time.sleep in code.
             Instead, use the create_scheduled_jobs tool for tasks requiring timed intervals.
@@ -307,8 +717,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             If you want to send data proactively (on your own) to user use `@user {"message_2_user": "message here"}`. However, if you're responding to the user's request or instruction, use the send_message_to_user or send_message_in_seconds tool.
             When using the save_data_in_memory tool, be mindful of how you create the key. Ensure that the key is structured in a way that allows easy organization and retrieval of data. Use dot notation to create a logical key path. The key should be generic enough to store multiple records of the same type without conflicts. Avoid using specific values as part of the key
                 For example:
-                    ➜ stories.story_name - Good key structure for storing multiple stories.
-                    ➜ creator.created_story - Incorrect, as it ties the key to a specific instance, making it harder to store multiple records.
+                    - stories.story_name - Good key structure for storing multiple stories.
+                    - creator.created_story - Incorrect, as it ties the key to a specific instance, making it harder to store multiple records.
+            When receiving responses from tools that should return JSON, always use the validate_json_response tool to ensure valid JSON formatting before processing further. This helps prevent errors when parsing tool output.
         Data Management:
             Use the get_set_internal_memory tool to store or retrieve user information as needed.""",
         is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
@@ -318,7 +729,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         llm_config=llm_config,
         code_execution_config=False,
         system_message=""""You are a Status Verification Agent in a multi-agent system.
-        Role: Your primary responsibility is to track and verify the status of actions performed by other agents. You must provide updates strictly in JSON format with the following response structures:
+        Role: Your primary responsibility is to track, validate and verify the status of actions performed by other agents. You must provide updates strictly in JSON format with the following response structures:
         Response formats:
             1. Action Completed Successfully: {"status": "completed","action": "current action","action_id": 1/2/3...,"message": "message here","can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike","persona_name":"persona name this action belongs to","fallback_action": "fallback action here"}  // If fallback_action is missing, ask the user: "What measures should be taken if this action fails in the future?" Include their response in fallback_action.
             2. Action Error: {"status": "error","action": "current action","action_id": 1/2/3...,"message": "message here"}
@@ -329,11 +740,11 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
                 i. Only mark an action as "completed" if all steps of the action have been successfully executed.
                 ii. For pending or ongoing tasks, instruct the Assistant to complete them.
             2. Ensure Action Accuracy:
-                i. Verify that the action was performed correctly as per instructions.
-                ii. If the action was not executed correctly, return the original action to the Assistant.
+                i. Verify that the last action was performed correctly based on history as per instructions.
+                ii. If the action was not executed correctly or if assistant is incorrectly asking to mark complete, return the original action to the Assistant with pending.
             3. Maintain JSON Consistency:
                 i. Always follow the exact JSON structure in your responses.
-                ii. Do not perform actions yourself—only report status.
+                ii. Do not perform actions yourself - only report status.
             Maintain the exact JSON structure in all responses.
 
         """+f"\nExtra Information: below are the list of actions the chat_manager will give you, keep this in mind but don't use this directly only use this if there is any update in any action or you want to insert/delete the actions & return the entire array as entire_actions\n{user_tasks[user_prompt].actions}",
@@ -354,7 +765,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         code_execution_config={"last_n_messages":2,"work_dir": "coding", "use_docker": False},
         llm_config=llm_config,
         system_message="""You are an Executor agent.
-        Focus: Creating, running, and debugging code.
+        Focus: Running, and debugging code.
 
         Responsibilities:
             1. Code Execution:
@@ -380,15 +791,15 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         Calling Other Agents:
             When you need to direct a question or route the conversation to a specific agent, use the @ tag followed by the agent's name. Examples include: @Executor or @Helper or @User
         Things You cannot do but Helper Agent can:
-            1. Tools Helper Agent can use: Can use tools like send_message_in_seconds, send_message_to_user,send_presynthesized_video_to_user, execute_windows_command, text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory.
+            1. Tools Helper Agent can use: Can use tools like send_message_in_seconds, send_message_to_user,send_presynthesized_video_to_user, execute_windows_or_android_command, text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory.
             2. Create Scheduled Jobs: For tasks involving timers or scheduled jobs, ask Helper agent to use the create_scheduled_jobs tool.
             3. Data/Memory Management:
-                ➜If you want to save some data ask helper agent to use "save_data_in_memory" tool.
-                ➜If you want to get some data ask helper agent to use "get_data_by_key", "get_saved_metadata" tool.
+                - If you want to save some data ask helper agent to use "save_data_in_memory" tool.
+                - If you want to get some data ask helper agent to use "get_data_by_key", "get_saved_metadata" tool.
             4. If you want to send some message to user directly then ask helper agent to use send_message_to_user tool but if you want to send message after sometime then ask helper to use send_message_in_seconds tool.
             5. If you want to send some pre synthesized video to user then ask helper agent to use send_presynthesized_video_to_user tool.
             6. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
-            7. If you receive a request to perform a task on the user's computer or any other computer, or if the request is related to Chrome or any browser, you should ask @Helper to use the `execute_windows_command` tool."""
+            7. If you receive a request to perform a task on the user's computer or any other computer, or if the request is related to Chrome or any browser, you should ask @Helper to use the `execute_windows_or_android_command` tool."""
     )
 
     chat_instructor = autogen.UserProxyAgent(
@@ -404,7 +815,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=50,keep_first_message=True),
             transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
-            ToolMessageHandler(),
+            ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
     context_handling.add_to_agent(assistant)
@@ -438,25 +849,65 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     helper.register_for_llm(name="text_2_image", description="Text to image Creator")(helper_fun.txt2img)
     assistant.register_for_execution(name="text_2_image")(helper_fun.txt2img)
 
-
+    @log_tool_execution
     def camera_inp(inp: Annotated[str, "The Question to check from visual context"])->str:
-        return helper_fun.get_user_camera_inp(inp,user_id)
+        return helper_fun.get_user_camera_inp(inp,int(user_id), request_id_list[user_prompt])
     helper.register_for_llm(name="get_user_camera_inp", description="Get user's visual information to process somethings")(camera_inp)
     assistant.register_for_execution(name="get_user_camera_inp")(camera_inp)
 
+    @log_tool_execution
     def save_data_in_memory(key: Annotated[str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
-                            value: Annotated[Optional[Any], "Value you want to store; may be int, str, float, bool, dict, list, json object."] = None) -> str:
-        current_app.logger.info('INSIDE save_data_in_memory')
-        current_app.logger.info(f"VALUES IN SAVE_DATA_IN_MEMORY: {value}")
-        current_app.logger.info(f"VALUES ALREADY AVAILABLE IN AGENT DATA: {agent_data[prompt_id]}")
-        keys = key.split('.')
-        d = agent_data.setdefault(prompt_id, {})
+                            value: Annotated[Optional[Any], "Value you want to store; strictly should be one of int, float, bool, json array or json object."] = None) -> str:
+        """Store data with validation to prevent corruption."""
+        tool_logger.info('INSIDE save_data_in_memory')
+        # Validate the input data
+        try:
+            # Step 1: Use the existing JSON repair function to sanitize input
+            if isinstance(value, str) and (value.startswith('{') or value.startswith('[')):
+                # If the value is a JSON string, repair it
+                value = retrieve_json(value)
+                tool_logger.info(f"REPAIRED JSON STRING: {value}")
+            # Step 2: Force a JSON serialization/deserialization cycle to validate structure
+            if value is not None:
+                # This will fail if the structure isn't JSON-compatible
+                json_str = json.dumps(value)
+                validated_value = json.loads(json_str)
+                tool_logger.info(f"VALIDATED VALUE (post JSON cycle): {validated_value}")
+            else:
+                validated_value = None
+            # Step 3: Store the validated data
+            keys = key.split('.')
+            d = agent_data.setdefault(prompt_id, {})
 
-        for k in keys[:-1]:
-            d = d.setdefault(k, {})
-        d[keys[-1]] = value
-        return f'{agent_data[prompt_id]}'
+            for k in keys[:-1]:
+                d = d.setdefault(k, {})
+            d[keys[-1]] = validated_value
+            tool_logger.info(f"VALUES STORED IN AGENT DATA: {validated_value}")
+            tool_logger.info(f"FULL AGENT DATA AT KEY: {d}")
+            # Step 4: Verify storage was successful
+            try:
+                # Attempt to read back the data to verify it was stored correctly
+                stored_value = get_data_by_key(key)
+                tool_logger.info(f"VERIFICATION - READ BACK VALUE: {stored_value}")
+                # Optional: compare stored_value with what we intended to store
+                if stored_value == "Key not found in stored data.":
+                    tool_logger.error(f"VERIFICATION FAILED: Data not properly stored at key {key}")
+            except Exception as e:
+                tool_logger.error(f"VERIFICATION ERROR: {str(e)}")
+            return f'{agent_data[prompt_id]}'
 
+        except json.JSONDecodeError as je:
+            error_msg = f"Invalid JSON structure in value: {str(je)}"
+            tool_logger.error(error_msg)
+            return f"Error: {error_msg} - Data not saved"
+        except TypeError as te:
+            error_msg = f"Type error in value: {str(te)}"
+            tool_logger.error(error_msg)
+            return f"Error: {error_msg} - Data not saved"
+        except Exception as e:
+            error_msg = f"Unexpected error saving data: {str(e)}"
+            tool_logger.error(error_msg)
+            return f"Error: {error_msg} - Data not saved"
     helper.register_for_llm(name="save_data_in_memory", description="Use this to Store and retrieve data using key-value storage system")(save_data_in_memory)
     assistant.register_for_execution(name="save_data_in_memory")(save_data_in_memory)
 
@@ -467,6 +918,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     helper.register_for_llm(name="get_saved_metadata", description="Returns the schema of the json from internal memory with all keys but without actual values.")(get_saved_metadata)
     assistant.register_for_execution(name="get_saved_metadata")(get_saved_metadata)
 
+    @log_tool_execution
     def get_data_by_key(key: Annotated[str, "Key path for retrieving data. Use dot notation for nested keys (e.g., 'user.info.name')."]) -> str:
         keys = key.split('.')
         d = agent_data.get(prompt_id, {})
@@ -478,33 +930,33 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         except KeyError:
             return "Key not found in stored data."
 
-
     helper.register_for_llm(name="get_data_by_key", description="Returns all data from the internal Memory using key")(get_data_by_key)
     assistant.register_for_execution(name="get_data_by_key")(get_data_by_key)
 
+    @log_tool_execution
     def get_user_id() -> str:
-        current_app.logger.info('INSIDE get_user_id')
+        tool_logger.info('INSIDE get_user_id')
         return f'{user_id}'
-
 
     helper.register_for_llm(name="get_user_id", description="Returns the unique identifier (user_id) of the current user.")(get_user_id)
     assistant.register_for_execution(name="get_user_id")(get_user_id)
 
+    @log_tool_execution
     def get_prompt_id() -> str:
-        current_app.logger.info('INSIDE get_prompt_id')
+        tool_logger.info('INSIDE get_prompt_id')
         return f'{prompt_id}'
-
 
     helper.register_for_llm(name="get_prompt_id", description="Returns the unique identifier (prompt_id) associated with the current prompt or conversation.")(get_prompt_id)
     assistant.register_for_execution(name="get_prompt_id")(get_prompt_id)
 
+    @log_tool_execution
     def Generate_video(text: Annotated[str, "Text to be used for video generation"],
                        avatar_id: Annotated[int, "Unique identifier for the avatar"],
                        realtime: Annotated[bool,"If True, response is fast but less realistic by default it should be true; if False, response is realistic but slower"]) -> str:
-        current_app.logger.info('INSIDE Generate_video')
+        tool_logger.info('INSIDE Generate_video')
         database_url = 'https://mailer.hertzai.com'
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
-        current_app.logger.info(f"avtar_id: {avatar_id}:\n{text[:10]}....\n")
+        tool_logger.info(f"avtar_id: {avatar_id}:\n{text[:10]}....\n")
 
         headers = {'Content-Type': 'application/json'}
         data = {}
@@ -540,7 +992,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             timeout = 600
             data['chattts'] = True #F5TTS
             data['flag_hallo'] = "true" #Echomimic-> Liveportrait
-            data["cartoon_image"] = False
+            data["cartoon_image"] = "False"
 
         if res['voice_id'] != None:
             voice_sample = requests.get(
@@ -569,8 +1021,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     helper.register_for_llm(name="Generate_video", description="Generate/presynthesize video with text and save it in database")(Generate_video)
     assistant.register_for_execution(name="Generate_video")(Generate_video)
 
+    @log_tool_execution
     def get_user_uploaded_file() -> str:
-        current_app.logger.info('INSIDE get_user_uploaded_file')
+        tool_logger.info('INSIDE get_user_uploaded_file')
         if recent_file_id[user_id]:
             return f'Got user uploaded file the file_id is {recent_file_id[user_id]}'
 
@@ -579,9 +1032,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     helper.register_for_llm(name="get_user_uploaded_file", description="get user's recent uploaded files")(get_user_uploaded_file)
     assistant.register_for_execution(name="get_user_uploaded_file")(get_user_uploaded_file)
 
-
+    @log_tool_execution
     def img2txt(image_url: Annotated[str, "image url of which you want text"],text: Annotated[str, "the details you want from image"]='Describe the Images & Text data in this image in detail') -> str:
-        current_app.logger.info('INSIDE img2txt')
+        tool_logger.info('INSIDE img2txt')
         url = "http://azurekong.hertzai.com:8000/llava/image_inference"
 
         payload = {
@@ -601,10 +1054,11 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     helper.register_for_llm(name="get_text_from_image", description="Image to Text")(img2txt)
     assistant.register_for_execution(name="get_text_from_image")(img2txt)
 
+    @log_tool_execution
     def create_scheduled_jobs(interval_sec: Annotated[int, "time between two Interval in seconds."],
                             job_description: Annotated[str, "Description of the job to be performed"],
                             cron_expression: Annotated[Optional[str], "Cron expression for scheduling. Example: '0 9 * * 1-5' (Runs at 9:00 AM, Monday to Friday). If the interval is greater than 60 seconds or it needs to be executed at a dynamic cron time this argument is Mandatory else None"]=None) -> str:
-        current_app.logger.info('INSIDE create_scheduled_jobs')
+        tool_logger.info('INSIDE create_scheduled_jobs')
 
         # actual_execution_time = sum(task_time[prompt_id]['times'][-1])
         # if interval_sec < actual_execution_time:
@@ -618,27 +1072,28 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         #         trigger = CronTrigger.from_crontab(cron_expression)
         #         job_id = f"job_{int(time.time())}"
         #         scheduler.add_job(execute_python_file, trigger=trigger, id=job_id, args=[job_description, int(user_id),int(prompt_id)])
-        #         current_app.logger.info('Successfully created scheduler job')
+        #         tool_logger.info('Successfully created scheduler job')
         #         return 'Successfully created scheduler job'
         #     else:
         #         trigger = IntervalTrigger(seconds=int(interval_sec))
         #         job_id = f"job_{int(time.time())}"
         #         scheduler.add_job(execute_python_file, trigger=trigger, id=job_id, args=[job_description, int(user_id),int(prompt_id)])
-        #         current_app.logger.info('Successfully created scheduler job')
+        #         tool_logger.info('Successfully created scheduler job')
         #         return 'Successfully created scheduler job'
         # except Exception as e:
-        #     current_app.logger.error(f'Error in create_scheduled_jobs: {str(e)}')
+        #     tool_logger.error(f'Error in create_scheduled_jobs: {str(e)}')
         #     return f"Error creating scheduled job: {str(e)}"
         return 'Added this schedule job in creation process will do it at the end. you can go ahead and mark this action as completed.'
 
     helper.register_for_llm(name="create_scheduled_jobs", description="Creates time-based jobs using APScheduler to schedule jobs")(create_scheduled_jobs)
     assistant.register_for_execution(name="create_scheduled_jobs")(create_scheduled_jobs)
 
+    @log_tool_execution
     def send_message_to_user(text: Annotated[str, "Text you want to send to the user"],
                          avatar_id: Annotated[Optional[str], "Unique identifier for the avatar"] = None,
                          response_type: Annotated[Optional[str], "Response mode: 'Realistic' (slower, better quality) or 'Realtime' (faster, lower quality)"] = 'Realtime') -> str:
-        current_app.logger.info('INSIDE send_message_to_user')
-        current_app.logger.info(f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
+        tool_logger.info('INSIDE send_message_to_user')
+        tool_logger.info(f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
         #TODO add avatar_id and conv_id and response_type
         thread = threading.Thread(target=send_message_to_user1, args=(user_id, text, '',prompt_id))
@@ -648,19 +1103,21 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     helper.register_for_llm(name="send_message_to_user", description="Sends a message/information to user. You can use this if you want to ask a question")(send_message_to_user)
     assistant.register_for_execution(name="send_message_to_user")(send_message_to_user)
 
+    @log_tool_execution
     def send_presynthesized_video_to_user(conv_id: Annotated[str, "Conversation ID associated with the text from memory"]) -> str:
-        current_app.logger.info('INSIDE send_presynthesized_video_to_user')
-        current_app.logger.info(f'SENDING DATA 2 user with value: conv_id:{conv_id}.')
+        tool_logger.info('INSIDE send_presynthesized_video_to_user')
+        tool_logger.info(f'SENDING DATA 2 user with value: conv_id:{conv_id}.')
         return 'Message sent successfully to user'
 
     helper.register_for_llm(name="send_presynthesized_video_to_user", description="Sends a presynthesized message/video/dialogue to user using conv_id.")(send_presynthesized_video_to_user)
     assistant.register_for_execution(name="send_presynthesized_video_to_user")(send_presynthesized_video_to_user)
 
+    @log_tool_execution
     def send_message_in_seconds(text: Annotated[str, "text to send to user"],
                        delay: Annotated[int, "time to wait in seconds before sending text"],
                        conv_id: Annotated[Optional[int], "conv_id for this text if not available make it None"],) -> str:
-        current_app.logger.info('INSIDE send_message_in_seconds')
-        current_app.logger.info(f'with text:{text}. and waiting time: {delay} conv_id: {conv_id}')
+        tool_logger.info('INSIDE send_message_in_seconds')
+        tool_logger.info(f'with text:{text}. and waiting time: {delay} conv_id: {conv_id}')
         run_time = datetime.fromtimestamp(time.time() + delay)
         scheduler.add_job(send_message_to_user1, 'date', run_date=run_time, args=[user_id, text, '',prompt_id])
         return 'Message scheduled successfully'
@@ -668,63 +1125,100 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
     helper.register_for_llm(name="send_message_in_seconds", description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")(send_message_in_seconds)
     assistant.register_for_execution(name="send_message_in_seconds")(send_message_in_seconds)
 
+    @log_tool_execution
     def get_chat_history(text: Annotated[str, "Text related to which you want history"],
                          start: Annotated[Optional[str], "start date in format %Y-%m-%dT%H:%M:%S.%fZ"] = None,
                          end: Annotated[Optional[str], "end date in format %Y-%m-%dT%H:%M:%S.%fZ"] = None) -> str:
-        current_app.logger.info('INSIDE get_chat_history')
+        tool_logger.info('INSIDE get_chat_history')
         return helper_fun.get_time_based_history(text, f'user_{user_id}', start, end)
     helper.register_for_llm(name="get_chat_history", description="Get Chat history based on text & start & end date")(get_chat_history)
     assistant.register_for_execution(name="get_chat_history")(get_chat_history)
 
+    @log_tool_execution
     def google_search(text: Annotated[str, "Text/Query which you want to search"]) -> str:
-        current_app.logger.info('INSIDE google search')
+        tool_logger.info('INSIDE google search')
         return helper_fun.top5_results(text)
     helper.register_for_llm(name="google_search", description="web/google/bing search api tool for a given query")(google_search)
     assistant.register_for_execution(name="google_search")(google_search)
 
+    @log_tool_execution
     def get_user_details()->str:
-        current_app.logger.info('INSIDE get user details')
+        tool_logger.info('INSIDE get user details')
         return helper_fun.parse_user_id(user_id)
     helper.register_for_llm(name="get_user_details", description="Get User details like name, dob, gender")(get_user_details)
     assistant.register_for_execution(name="get_user_details")(get_user_details)
 
-    async def execute_windows_command(instructions: Annotated[str, "Command in plain English to execute on the Windows machine"])->str:
+    @log_tool_execution
+    def validate_json_response(response: Annotated[str, "The response from a tool that should be JSON"]) -> str:
+        """
+        Validates and repairs JSON response from tools.
+
+        Args:
+            response: string responses from a tool that should be JSON formatted
+        Returns:
+            Valid JSON string or the original string if not repairable
+        """
+        tool_logger.info("INSIDE validate json response")
+        try:
+            # First try to parse as is
+            json_obj = json.loads(response)
+            return json.dumps(json_obj)
+        except json.JSONDecodeError:
+            try:
+
+                # If parsing fails, try to repair
+                repaired_json = repair_json(response)
+                # Verify the repaired JSON is valid
+                json_obj = json.loads(repaired_json)
+                return json.dumps(json_obj)
+            except Exception as e:
+                # If repair filas, return the original with a warning
+                tool_logger.info("JSON repair has failed")
+                return f"{response}"
+    helper.register_for_llm(name="validate_json_response", description="Checks and corrects if the tool response is not JSON but expected to be.")(validate_json_response)
+    assistant.register_for_execution(name="validate_json_response")(validate_json_response)
+
+    @log_tool_execution
+    async def execute_windows_or_android_command(instructions: Annotated[str, "Command in plain English to execute on the windows or android machine"],
+                                                 os_to_control: Annotated[str, "The os to control, possible values are 'windows' or 'android' only "]) -> str:
+
         """
         Executes a command on a Windows machine and returns the response within 500 seconds.
         """
         try:
-            current_app.logger.info('INSIDE execute_windows_command')
+            tool_logger.info('INSIDE execute_windows_or_android_command')
             topic = f'com.hertzai.hevolve.action.{user_id}'
-            current_app.logger.info(f'calling {topic} for 5 second')
-            response = await subscribe_and_return({'prompt_id':prompt_id},topic,5)  # Wait for the RPC response
-            current_app.logger.info(f'Response from call of {topic}: {response}')
+            tool_logger.info(f'calling {topic} for 5 second')
+            response = await subscribe_and_return({'prompt_id':prompt_id},topic,2000)  # Wait for the RPC response
+            tool_logger.info(f'Response from call of {topic}: {response}')
             if not response:
-                return 'Ask user to to go to hertzai.com login and start the windows companion app'
+                return 'Ask UserProxy to to go to hertzai.com login and start the windows companion app'
             crossbar_message = {
                 'parent_request_id': request_id_list[user_prompt],
                 'user_id': f'{user_id}',
-                'prompt_id': '54',
+                'prompt_id': prompt_id,
                 'instruction_to_vlm_agent': instructions,
-                'os_to_control': 'Windows',
+                'os_to_control': os_to_control,
                 'actions_available_in_os': [],
-                'max_ETA_in_seconds': 500,
+                'max_ETA_in_seconds': 1800,
                 'langchain_server':True
             }
             topic = 'com.hertzai.hevolve.action'
-            current_app.logger.info(f'calling {topic} for 8000 second')
-            response = await subscribe_and_return(crossbar_message,topic)  # Wait for the RPC response
-            current_app.logger.info(f'THIS IS RESPONSE type: {type(response)} value: {response}')
+            tool_logger.info(f'calling {topic} for 8000 second')
+            response = await subscribe_and_return(crossbar_message,topic,1800000)  # Wait for the RPC response
+            tool_logger.info(f'THIS IS RESPONSE type: {type(response)} value: {response}')
             if response['status'] == 'success':
                 return 'successfully ran the command in user\' computer.'
             else:
                 return 'Not able to perform this action now please try later'
         except Exception as e:
             error_message = traceback.format_exc()  # Capture full traceback
-            current_app.logger.error(f"Error executing command:\n{error_message}")
+            tool_logger.error(f"Error executing command:\n{error_message}")
             return {"error": e}
 
-    helper.register_for_llm(name="execute_windows_command", description="Processes user-defined commands on a personal Windows or Android system.")(execute_windows_command)
-    assistant.register_for_execution(name="execute_windows_command")(execute_windows_command)
+    helper.register_for_llm(name="execute_windows_or_android_command", description="Processes user-defined commands on a personal Windows or Android system.")(execute_windows_or_android_command)
+    assistant.register_for_execution(name="execute_windows_or_android_command")(execute_windows_or_android_command)
+
 
     assistant.description = 'this is an assistant agent that coordinates & executes requested tasks & actions'
     executor.description = 'this is an executor agent that Specialized agent for code execution & response handling'
@@ -739,9 +1233,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         Preserves ChatInstructor's appropriate agent selection logic.
         """
         user_prompt = f'{user_id}_{prompt_id}'
+
         current_app.logger.info(
             f'Inside state_transition with actions {user_tasks.get(user_prompt, Action([])).current_action}')
-
         # Log the first message for debugging if it exists
         if len(groupchat.messages) > 0:
             current_app.logger.info(f"STATE_TRANSITION - Message[0]: {groupchat.messages[0]}")
@@ -751,13 +1245,6 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
                 f"STATE_TRANSITION - Last message role: {groupchat.messages[last_idx].get('role')}, name: {groupchat.messages[last_idx].get('name')}")
 
         messages = groupchat.messages
-
-        # Skip processing for empty messages
-        if not messages:
-            current_app.logger.info('No messages to process in state_transition')
-            return 'auto'  # Let autogen decide when there are no messages
-
-        # Record history
         new_role = 'user'
         if messages[-1]['name'] != 'UserProxy':
             new_role = 'AI'
@@ -770,6 +1257,65 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         content_preview = messages[-1]["content"][:50] if len(messages[-1]["content"]) > 50 else messages[-1]["content"]
         current_app.logger.info(f'Processing message: "{content_preview}..." from {last_speaker.name}')
 
+
+        try:
+            # Lifecycle TRACKING HOOKS:
+            debug_lifecycle_status(user_prompt)
+            lifecycle_hook_track_action_assignment(user_prompt, user_tasks, group_chat)  # 1. Track action assignment
+            lifecycle_hook_track_status_verification_request(user_prompt, user_tasks, group_chat)  # 3. Track status verification request
+            lifecycle_hook_track_fallback_request(user_prompt, user_tasks, group_chat)  # 7. Track fallback request
+            lifecycle_hook_track_user_fallback(user_prompt, user_tasks, group_chat)  # 8. Track user fallback
+            lifecycle_hook_track_recipe_request(user_prompt, user_tasks, group_chat)  # 9. Track recipe request
+            lifecycle_hook_track_termination(user_prompt, user_tasks, group_chat)  # 11. Track termination
+
+            # Enhanced agent selection with state awareness
+            if user_prompt and user_tasks[user_prompt]:
+
+                if messages:
+                    last_message = messages[-1]
+                    current_state = get_action_state(user_prompt, user_tasks[user_prompt].current_action)
+
+                    # State-aware agent routing
+                    if current_state == ActionState.FALLBACK_REQUESTED and last_speaker.name != 'UserProxy':
+                        current_app.logger.error("Force routing to user for fallback")
+
+                        # Force routing to user for fallback
+                        for agent in groupchat.agents:
+                            if agent.name in ['UserProxy', 'User']:
+                                return agent
+
+                    elif current_state == ActionState.FALLBACK_RECEIVED:
+                        current_app.logger.error("After user gives fallback, route to ChatInstructor for recipe request")
+
+                        # After user gives fallback, route to ChatInstructor for recipe request
+                        return chat_instructor
+
+                    elif '@StatusVerifier' in last_message['content']:
+                        current_app.logger.error("Route to StatusVerifier when requested")
+
+                        # Route to StatusVerifier when requested
+                        return verify
+
+            # Check for JSON eroor status pattern
+            if "error" in messages[-1]["content"].lower() or "failed" in messages[-1]["content"].lower():
+                json_match = re.search(r'{[\s\S]*?}', messages[-1]["content"])
+                if json_match:
+                    try:
+                        json_part = json_match.group(0)
+                        json_obj = json.loads(json_part)
+
+                        # If we found a JSON object with error status, route to Helper
+                        if isinstance(json_obj, dict) and json_obj.get("status") =="error":
+                            current_app.logger.info("Error detected - routing to Helper for resolution")
+                            error_context = f"I need you help to resolve this error: {json_part}\nPlease analyze the issue and propose a fix."
+                            # Add the error context as a new message to maintain the original error message
+                            if last_speaker.name != "Helper":
+                                return helper
+                    except:
+                        pass
+        except Exception as e:
+            current_app.logger.error(f"Error in error detection logic: {e}")
+
         # Get metadata once for potential use later
         try:
             metadata = get_saved_metadata()
@@ -777,20 +1323,23 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
             current_app.logger.error(f"Error getting metadata: {e}")
             metadata = "{}"
 
-        # SPECIAL CASE: Tool message - always return assistant
-        if messages[-1].get('role') == 'tool':
-            current_app.logger.info('Message is a tool response, returning assistant')
+        # current_app.logger.info(messages[-1])
+        if messages[-1]['role'] == 'tool':
+            current_app.logger.info('Message role is tool returning assistant')
             return assistant
 
-        # Process JSON content if applicable
-        if not messages[-1]["content"].startswith('Reflect on the sequence') and not messages[-1]["content"].startswith(
-                'Focus on the current task at hand'):
+
+        if not messages[-1]["content"].startswith('Reflect on the sequence') and not messages[-1]["content"].startswith('Focus on the current task at hand'):
             json_obj = retrieve_json(messages[-1]["content"])
             if json_obj:
                 try:
+                    current_state = get_action_state(user_prompt, user_tasks[user_prompt].current_action)
+
                     if 'status' in json_obj:
                         current_app.logger.info(f'got status as:{json_obj["status"]} ')
                         if json_obj['status'].lower() == 'error' and 'message' in json_obj:
+                            set_action_state(user_prompt, user_tasks[user_prompt].current_action, ActionState.ERROR)
+
                             return author
                         elif json_obj['status'].lower() == 'completed' or json_obj['status'].lower() == 'success':
                             if 'recipe' in json_obj.keys():
@@ -802,34 +1351,35 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
                                     json.dump(merged_dict, json_file)
                                 current_app.logger.info(f"Dictionary saved to {name}")
                                 recipe_for_persona[user_prompt] += 1
-                                user_tasks[user_prompt] = Action(
-                                    config['flows'][recipe_for_persona[user_prompt]]['actions'])
+                                user_tasks[user_prompt] = Action(config['flows'][recipe_for_persona[user_prompt]]['actions'])
                                 final_recipe[prompt_id] = merged_dict
+                                set_action_state(user_prompt, user_tasks[user_prompt].current_action, ActionState.DONE)
+
                                 return None
                             if 'action_id' in json_obj.keys():
-                                if user_tasks[user_prompt].fallback == False and user_tasks[
-                                    user_prompt].recipe == False:
+                                if user_tasks[user_prompt].fallback == False and user_tasks[user_prompt].recipe == False:
                                     current_app.logger.info('UPDATED TIMER for this action')
                                     end = time.time()
-                                    task_time[prompt_id]['times'].append(end - task_time[prompt_id]['timer'])
-                                user_tasks[user_prompt].actions[int(json_obj['action_id']) - 1] = json_obj['action']
+                                    task_time[prompt_id]['times'].append(end-task_time[prompt_id]['timer'])
+                                user_tasks[user_prompt].actions[int(json_obj['action_id'])-1] = json_obj['action']
                                 user_tasks[user_prompt].new_json.append(json_obj)
-                                current_app.logger.info(
-                                    f'CHECKING FOR FALLBACK user_tasks[user_prompt].current_action={user_tasks[user_prompt].current_action} json_obj["action_id"]={json_obj["action_id"]}')
+                                current_app.logger.info(f'CHECKING FOR FALLBACK user_tasks[user_prompt].current_action={user_tasks[user_prompt].current_action} json_obj["action_id"]={json_obj["action_id"]}')
                                 if user_tasks[user_prompt].current_action != int(json_obj['action_id']):
                                     user_tasks[user_prompt].fallback = True
 
                                 current_app.logger.info(f'UPDATIN CURRENT ACTION AS :{int(json_obj["action_id"])}')
+                                set_action_state(user_prompt, user_tasks[user_prompt].current_action, ActionState.COMPLETED)
+
                                 user_tasks[user_prompt].current_action = int(json_obj['action_id'])
+
                             return chat_instructor
                         elif json_obj['status'].lower() == 'updated':
-                            if 'entire_actions' in json_obj.keys() and type(json_obj['entire_actions']) == list:
+                            if 'entire_actions' in json_obj.keys() and type(json_obj['entire_actions'])==list:
                                 current_app.logger.info('GOT UPDATED WITH entire actions')
                                 try:
-                                    current_app.logger.info(
-                                        f"user_tasks[user_prompt].actions:{len(user_tasks[user_prompt].actions)}, len(json_obj['entire_actions']:{len(json_obj['entire_actions'])}")
-                                    current_app.logger.info(
-                                        f"user_tasks[user_prompt].actions:{user_tasks[user_prompt].actions}, len(json_obj['entire_actions']:{json_obj['entire_actions']}")
+
+                                    current_app.logger.info(f"user_tasks[user_prompt].actions:{len(user_tasks[user_prompt].actions)}, len(json_obj['entire_actions']:{len(json_obj['entire_actions'])}")
+                                    current_app.logger.info(f"user_tasks[user_prompt].actions:{user_tasks[user_prompt].actions}, len(json_obj['entire_actions']:{json_obj['entire_actions']}")
 
                                     current_app.logger.info('')
                                     entire_actions = json_obj['entire_actions']
@@ -837,122 +1387,134 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
                                     user_tasks[user_prompt].current_action = 0
                                     user_tasks[user_prompt].fallback = False
                                     user_tasks[user_prompt].recipe = False
+                                    set_action_state(user_prompt, user_tasks[user_prompt].current_action, ActionState.ASSIGNED)
+
                                 except Exception as e:
                                     current_app.logger.info(f'error is here:{e}')
-                                    user_tasks[user_prompt].actions[int(json_obj['action_id']) - 1] = json_obj[
-                                        'updated_action']
+
+                                    user_tasks[user_prompt].actions[int(json_obj['action_id'])-1] = json_obj['updated_action']
                                     user_tasks[user_prompt].new_json.append(json_obj)
+                                    set_action_state(user_prompt, int(json_obj['action_id']), ActionState.FALLBACK_REQUESTED)
+
                                     user_tasks[user_prompt].fallback = True
                             elif 'action_id' in json_obj.keys():
-                                user_tasks[user_prompt].actions[int(json_obj['action_id']) - 1] = json_obj[
-                                    'updated_action']
+                                user_tasks[user_prompt].actions[int(json_obj['action_id'])-1] = json_obj['updated_action']
                                 user_tasks[user_prompt].new_json.append(json_obj)
+                                set_action_state(user_prompt, int(json_obj['action_id']), ActionState.FALLBACK_REQUESTED)
+
                                 user_tasks[user_prompt].fallback = True
+                        elif json_obj['status'].lower() == 'pending':
+                            set_action_state(user_prompt, user_tasks[user_prompt].current_action, ActionState.IN_PROGRESS)
+                            return assistant
                         elif json_obj['status'].lower() == 'done':
-                            current_app.logger.info('Got Individual action recipe save it')
-                            flow = recipe_for_persona[user_prompt]
-                            name = f'prompts/{prompt_id}_{flow}_{json_obj["action_id"]}.json'
-                            user_tasks[user_prompt].fallback = False
-                            user_tasks[user_prompt].recipe = False
-                            metadata = strip_json_values(agent_data[prompt_id])
-                            json_obj['metadata'] = metadata
-                            json_obj['time_took_to_complete'] = task_time[prompt_id]['times'][-1]
-                            for i in json_obj['recipe']:
-                                if 'tool_name' in i and i['tool_name'] != "":
-                                    i['agent_to_perform_this_action'] = 'Helper'
-                                elif 'generalized_functions' in i and i['generalized_functions'] != "":
-                                    i['agent_to_perform_this_action'] = 'Executor'
-                                else:
-                                    i['agent_to_perform_this_action'] = 'Assistant'
-                            with open(name, "w") as json_file:
-                                json.dump(json_obj, json_file)
-                            user_tasks[user_prompt].current_action = int(json_obj['action_id'])
-                            individual_json[user_prompt] = json_obj
-                            current_app.logger.info(f'Saved Individual recipe at: {name}')
+                            set_action_state(user_prompt, user_tasks[user_prompt].current_action, ActionState.RECIPE_RECEIVED)
+
+                            recipe_result = lifecycle_hook_track_recipe_completion(user_prompt, json_obj,
+                                                                                   user_tasks)  # 10. Track recipe completion
+
+                            current_state = get_action_state(user_prompt, user_tasks[user_prompt].current_action)
+
+                            if current_state == ActionState.RECIPE_RECEIVED:  # State was set in Location 1
+                                # Recipe received, save it
+                                current_app.logger.info('Got Individual action recipe save it')
+                                flow = recipe_for_persona[user_prompt]
+                                name = f'prompts/{prompt_id}_{flow}_{json_obj["action_id"]}.json'
+                                user_tasks[user_prompt].fallback = False
+                                user_tasks[user_prompt].recipe = False
+                                metadata = strip_json_values(agent_data[prompt_id])
+                                json_obj['metadata'] = metadata
+                                json_obj['time_took_to_complete'] = task_time[prompt_id]['times'][-1]
+                                for i in json_obj['recipe']:
+                                    if 'tool_name' in i and i['tool_name'] != "":
+                                        i['agent_to_perform_this_action'] = 'Helper'
+                                    elif 'generalized_functions' in i and i['generalized_functions'] != "":
+                                        i['agent_to_perform_this_action'] = 'Executor'
+                                    else:
+                                        i['agent_to_perform_this_action'] = 'Assistant'
+                                with open(name, "w") as json_file:
+                                    json.dump(json_obj, json_file)
+                                user_tasks[user_prompt].current_action = int(json_obj['action_id'])
+                                individual_json[user_prompt] = json_obj
+                                current_app.logger.info(f'Saved Individual recipe at: {name}')
+                            else:
+                                current_app.logger.info(f'Current state is {current_state} and we should not save recipe yet')
+
 
                             return chat_instructor
                 except Exception as e:
                     current_app.logger.error(f'GOT SOME ERROR WHILE JSON: {e}')
+                    current_app.logger.error(traceback.format_exc())
 
         # Send crossbar message for UI feedback
         try:
-            crossbar_message = {"text": [f"{last_speaker.name} " + f'{messages[-1]["content"]}'], "priority": 49,
-                                "action": 'Thinking', "historical_request_id": [], "preffered_language": 'en-US',
-                                "options": [], "newoptions": [], "bot_type": 'Agent', "page_image_url": "",
-                                "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
-                    'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0},
-                    'bottom_left': {'x': 0, 'y': 0}}}
-            client.publish(
-                f"com.hertzai.hevolve.chat.{user_id}", f'{crossbar_message}')
+            if last_speaker.name not in ['UserProxy', 'User']:
+                crossbar_message = {"text": [f'{messages[-1]["content"]}'], "priority": 49,
+                                    "action": 'Thinking', "historical_request_id": [], "preffered_language": 'en-US',
+                                    "options": [], "newoptions": [], "bot_type": 'Agent', "page_image_url": "",
+                                    "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
+                        'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0},
+                        'bottom_left': {'x': 0, 'y': 0}}}
+                client.publish(
+                f"com.hertzai.hevolve.chat.{user_id}", json.dumps(crossbar_message))
         except Exception as e:
             current_app.logger.error(f"Error publishing crossbar message: {e}")
-
         # Process @ mentions - keeping this logic intact
         pattern = r"@Helper"
         pattern1 = r"@Executor"
         pattern2 = r"@User"
         pattern3 = r"@StatusVerifier"
         try:
-            if re.search(pattern2, messages[-1]["content"]):
+            if re.search(pattern2, messages[-1]["content"], re.IGNORECASE):
                 current_app.logger.info("String contains @User returning author")
                 return author
-            if re.search(pattern3, messages[-1]["content"]):
+            if re.search(pattern3, messages[-1]["content"], re.IGNORECASE):
                 current_app.logger.info("String contains @StatusVerifier returning StatusVerifier")
                 return verify
-            if re.search(pattern, messages[-1]["content"]) and last_speaker.name != 'Helper':
+            if re.search(pattern, messages[-1]["content"], re.IGNORECASE) and last_speaker.name != 'Helper':
                 current_app.logger.info("String contains @Helper returning helper")
-                messages[-1]["content"] = messages[-1]["content"].replace('@user', '')
-                group_chat.messages[-1][
-                    'content'] = f"{group_chat.messages[-1]['content']}\n Metadata/skeleton of all keys for retrieving data from memory:{metadata}"
+                messages[-1]["content"] = messages[-1]["content"].replace('@user','')
+                group_chat.messages[-1]['content'] = f"{group_chat.messages[-1]['content']}\n Metadata/skeleton of all keys for retrieving data from memory:{metadata}"
                 return helper
             if re.search(pattern1, messages[-1]["content"]):
-                current_app.logger.info("String contains @Executor returning executor")
+                current_app.logger.info("String contains @Executor returnng executor")
                 return executor
         except Exception as e:
             current_app.logger.error(f'Got error when searching for @user in last message :{e}')
 
-        # Process based on last speaker - this part was problematic
-        # Instead of forcing return Assistant for ChatInstructor, check speaker types more carefully
-        known_assistant_senders = ['Executor', 'Helper', 'UserProxy', 'ChatInstructor']
-        if last_speaker.name in known_assistant_senders:
-            # Check if the message appears to be intended for any specific agent
-            has_special_prefix = False
+        if has_pending_tool_calls(messages):
+            current_app.logger.info("DETECTED PENDING TOOL CALLS - routing to Assistant without message modification")
+            return assistant
 
-            # If message content doesn't have clear agent targets:
-            if not has_special_prefix:
-                # Add metadata and return assistant for messages from these speakers
-                group_chat.messages[-1][
-                    'content'] = f"{group_chat.messages[-1]['content']}\n Metadata/skeleton of all keys for retrieving data from memory:{metadata}"
-                current_app.logger.info(
-                    f'Got last speaker as {last_speaker.name} & returning next speaker as assistant')
-                return assistant
+        if last_speaker.name == 'Executor' or last_speaker.name == 'Helper' or last_speaker.name == 'UserProxy' or last_speaker.name == 'UserProxy' or last_speaker.name == 'ChatInstructor':
 
-        # Handle StatusVerifier speaker
-        if last_speaker.name == 'StatusVerifier':
+            group_chat.messages[-1]['content'] = f"{group_chat.messages[-1]['content']}\n Metadata/skeleton of all keys for retrieving data from memory:{metadata}"
+            current_app.logger.info('Got last speaker as executor or helper or author or chat_instructor & reutrning next speaker as assistant')
+            return assistant
+        json_obj = None
+
+        if last_speaker == verify:
             current_app.logger.info('Got last speaker as verify_status & returning next speaker as chat_instructor')
             return chat_instructor
-
-        # Handle special content
         try:
             if messages[-1]["content"] == '':
                 groupchat.messages[-1]["content"] = 'tool call'
             if 'exitcode:' in messages[-1]["content"]:
                 current_app.logger.info('Got exitcode in text returning assistant')
-                group_chat.messages[-1][
-                    'content'] = f"{group_chat.messages[-1]['content']}\n Metadata/skeleton of all keys for retrieving data from memory:{metadata}"
+                group_chat.messages[-1]['content'] = f"{group_chat.messages[-1]['content']}\n Metadata/skeleton of all keys for retrieving data from memory:{metadata}"
                 return assistant
         except Exception as e:
             current_app.logger.error(f'Got error when content as blank with error as :{e}')
 
-        # Check for TERMINATE
+
+
         if 'TERMINATE' in messages[-1]["content"].upper():
             current_app.logger.info('TERMINATING BECAUSE OF TERMINATE')
+            # retrieve: action 1 -> action 2
             return None
+        else:
+            return 'auto'
 
-        # Default to 'auto' (let the system decide based on content)
-        # This preserves the routing mechanism's ability to select appropriate agents
-        current_app.logger.info('Using auto speaker selection as no specific rule matched')
-        return assistant
+
 
     all_agents = [assistant, executor, author, chat_instructor,helper,verify]
     all_agents.extend(custom_agents)
@@ -960,7 +1522,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=50,keep_first_message=True),
             transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
-            ToolMessageHandler(),
+            ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
 
@@ -970,10 +1532,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         max_round=30,
         # select_speaker_message_template='''You manage a team that Completes a list of Actions provided by ChatInstructor Agent.
         # The Agents available in the team are: Assistant, Helper, Executor, ChatInstructor, StatusVerifier & User''',
-        # select_speaker_prompt_template=f"Read the above conversation, select the next person from [Assistant, Helper, Executor, ChatInstructor, StatusVerifier & User] & only return the role as agent.",
+        select_speaker_prompt_template=f"Read the above conversation, select the next person from [Assistant, Helper, Executor, ChatInstructor, StatusVerifier & User] & only return the role as agent. Return User only if the previous message demands it",
         select_speaker_transform_messages=select_speaker_transforms,
         speaker_selection_method=state_transition,  # using an LLM to decide
-        allow_repeat_speaker=True,  # Prevent same agent speaking twice
+        allow_repeat_speaker=False,  # Prevent same agent speaking twice
         send_introductions=False
     )
 
@@ -981,9 +1543,6 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[autogen.ConversableAgent
         groupchat=group_chat,
         llm_config={"config_list": config_list,"cache_seed": None,"max_tokens": 1500}
     )
-
-
-
 
     return author, assistant, executor, group_chat, manager, chat_instructor, agents_object
 
@@ -1107,26 +1666,72 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     helper1.register_for_llm(name="text_2_image", description="Text to image Creator")(helper_fun.txt2img)
     time_agent.register_for_execution(name="text_2_image")(helper_fun.txt2img)
 
-
+    @log_tool_execution
     def camera_inp(inp: Annotated[str, "The Question to check from visual context"])->str:
-        return helper_fun.get_user_camera_inp(inp, user_id)
+        return helper_fun.get_user_camera_inp(inp, int(user_id), request_id_list[user_prompt] )
     helper1.register_for_llm(name="get_user_camera_inp", description="Get user's visual information to process somethings")(camera_inp)
     time_agent.register_for_execution(name="get_user_camera_inp")(camera_inp)
 
-    def save_data_in_memory(key: Annotated[str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
-                            value: Annotated[Optional[Any], "Value you want to store; may be int, str, float, bool, dict, list, json object."] = None) -> str:
-        current_app.logger.info('INSIDE save_data_in_memory')
-        keys = key.split('.')
-        d = agent_data.setdefault(prompt_id, {})
+    @log_tool_execution
+    def save_data_in_memory(key: Annotated[
+        str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
+                            value: Annotated[Optional[
+                                Any], "Value you want to store; strictly should be one of int, float, bool, json array or json object."] = None) -> str:
+        """Store data with validation to prevent corruption."""
+        tool_logger.info('INSIDE save_data_in_memory')
+        # Validate the input data
+        try:
+            # Step 1: Use the existing JSON repair function to sanitize input
+            if isinstance(value, str) and (value.startswith('{') or value.startswith('[')):
+                # If the value is a JSON string, repair it
+                value = retrieve_json(value)
+                tool_logger.info(f"REPAIRED JSON STRING: {value}")
+            # Step 2: Force a JSON serialization/deserialization cycle to validate structure
+            if value is not None:
+                # This will fail if the structure isn't JSON-compatible
+                json_str = json.dumps(value)
+                validated_value = json.loads(json_str)
+                tool_logger.info(f"VALIDATED VALUE (post JSON cycle): {validated_value}")
+            else:
+                validated_value = None
+            # Step 3: Store the validated data
+            keys = key.split('.')
+            d = agent_data.setdefault(prompt_id, {})
 
-        for k in keys[:-1]:
-            d = d.setdefault(k, {})
-        d[keys[-1]] = value
-        return f'{agent_data[prompt_id]}'
+            for k in keys[:-1]:
+                d = d.setdefault(k, {})
+            d[keys[-1]] = validated_value
+            tool_logger.info(f"VALUES STORED IN AGENT DATA: {validated_value}")
+            tool_logger.info(f"FULL AGENT DATA AT KEY: {d}")
+            # Step 4: Verify storage was successful
+            try:
+                # Attempt to read back the data to verify it was stored correctly
+                stored_value = get_data_by_key(key)
+                tool_logger.info(f"VERIFICATION - READ BACK VALUE: {stored_value}")
+                # Optional: compare stored_value with what we intended to store
+                if stored_value == "Key not found in stored data.":
+                    tool_logger.error(f"VERIFICATION FAILED: Data not properly stored at key {key}")
+            except Exception as e:
+                tool_logger.error(f"VERIFICATION ERROR: {str(e)}")
+            return f'{agent_data[prompt_id]}'
+
+        except json.JSONDecodeError as je:
+            error_msg = f"Invalid JSON structure in value: {str(je)}"
+            tool_logger.error(error_msg)
+            return f"Error: {error_msg} - Data not saved"
+        except TypeError as te:
+            error_msg = f"Type error in value: {str(te)}"
+            tool_logger.error(error_msg)
+            return f"Error: {error_msg} - Data not saved"
+        except Exception as e:
+            error_msg = f"Unexpected error saving data: {str(e)}"
+            tool_logger.error(error_msg)
+            return f"Error: {error_msg} - Data not saved"
 
     helper1.register_for_llm(name="save_data_in_memory", description="Use this to Store and retrieve data using key-value storage system")(save_data_in_memory)
     time_agent.register_for_execution(name="save_data_in_memory")(save_data_in_memory)
 
+    @log_tool_execution
     def get_saved_metadata() -> str:
         stripped_json = strip_json_values(agent_data[prompt_id])
         return f'{stripped_json}'
@@ -1134,6 +1739,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     helper1.register_for_llm(name="get_saved_metadata", description="Returns the schema of the json from internal memory with all keys but without actual values.")(get_saved_metadata)
     time_agent.register_for_execution(name="get_saved_metadata")(get_saved_metadata)
 
+    @log_tool_execution
     def get_data_by_key(key: Annotated[str, "Key path for retrieving data. Use dot notation for nested keys (e.g., 'user.info.name')."]) -> str:
         keys = key.split('.')
         d = agent_data.get(prompt_id, {})
@@ -1149,52 +1755,61 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     helper1.register_for_llm(name="get_data_by_key", description="Returns all data from the internal Memory")(get_data_by_key)
     time_agent.register_for_execution(name="get_data_by_key")(get_data_by_key)
 
+    @log_tool_execution
     def get_user_id() -> str:
-        current_app.logger.info('INSIDE get_user_id')
+        tool_logger.info('INSIDE get_user_id')
         return f'{user_id}'
 
 
     helper1.register_for_llm(name="get_user_id", description="Returns the unique identifier (user_id) of the current user.")(get_user_id)
     time_agent.register_for_execution(name="get_user_id")(get_user_id)
 
+    @log_tool_execution
     def get_prompt_id() -> str:
-        current_app.logger.info('INSIDE get_prompt_id')
+        tool_logger.info('INSIDE get_prompt_id')
         return f'{prompt_id}'
 
 
     helper1.register_for_llm(name="get_prompt_id", description="Returns the unique identifier (prompt_id) associated with the current prompt or conversation.")(get_prompt_id)
     time_agent.register_for_execution(name="get_prompt_id")(get_prompt_id)
 
+    @log_tool_execution
     def Generate_video(text: Annotated[str, "Text to be used for video generation"],
-                       avatar_id: Annotated[str, "Unique identifier for the avatar"],
-                       realtime: Annotated[bool,"If True, response is fast but less realistic by default it should be true; if False, response is realistic but slower"]) -> str:
-        current_app.logger.info('INSIDE Generate_video')
+                       avatar_id: Annotated[int, "Unique identifier for the avatar"],
+                       realtime: Annotated[bool, "If True, response is fast but less realistic"]) -> str:
+        tool_logger.info('INSIDE Generate_video')
         database_url = 'https://mailer.hertzai.com'
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
-        current_app.logger.info(f"avtar_id: {avatar_id}:\n{text[:10]}....\n")
+        tool_logger.info(f"avtar_id: {avatar_id}:\n{text[:10]}....\n")
 
         headers = {'Content-Type': 'application/json'}
+
+        # Initialize data with correct types to match both VideoGenerateSave model and downstream video_gen
         data = {}
-        data["text"] = text
-        data['flag_hallo'] = 'false'
-        data['chattts'] = False
-        data['openvoice'] = "false"
+        data["text"] = str(text)
+        data['flag_hallo'] = 'false'  # String - downstream: str().lower() == "true"
+        data['chattts'] = False  # Boolean - downstream: data.get("chattts", False)
+        data['openvoice'] = "false"  # String - downstream: str().lower() == "true"
+
         try:
-            res = requests.get("https://mailer.hertzai.com/get_image_by_id/{}".format(avatar_id))
+            res = requests.get(f"https://mailer.hertzai.com/get_image_by_id/{avatar_id}")
             res = res.json()
             new_image_url = res["image_url"]
+            voice_id = res.get('voice_id')
         except:
             data['openvoice'] = "true"
             new_image_url = None
-            res = {'voice_id':None}
-        data["cartoon_image"] = "True"
+            voice_id = None
+
+        # String values for downstream compatibility
+        data["cartoon_image"] = "True"  # String - downstream: == "True"
         data["bg_url"] = 'http://stream.mcgroce.com/txt/examples_cartoon/roy_bg.jpg'
         data['vtoonify'] = "false"
-        data["image_url"] = new_image_url
+        data["image_url"] = new_image_url  # Optional[str] - can be None
         data['im_crop'] = "false"
         data['remove_bg'] = "false"
         data['hd_video'] = "false"
-        data['uid'] = request_id
+        data['uid'] = str(request_id)
         data['gradient'] = "true"
         data['cus_bg'] = "false"
         data['solid_color'] = "false"
@@ -1205,39 +1820,73 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         timeout = 60
         if not realtime:
             timeout = 600
-            data['chattts'] = True
-            data['flag_hallo'] = "true"
-            data["cartoon_image"] = False
+            data['chattts'] = True  # Boolean - downstream expects boolean
+            data['flag_hallo'] = "true"  # String
+            data["cartoon_image"] = "False"  # String
 
-        if res['voice_id'] != None:
-            voice_sample = requests.get(
-                "{}/get_voice_sample_id/{}".format(database_url, res['voice_id']))
-            voice_sample = voice_sample.json()
-            data["audio_sample_url"] = voice_sample["voice_sample_url"]
-            data['voice_id'] = res['voice_id']
+        # Handle voice sample
+        if voice_id is not None:
+            try:
+                voice_sample = requests.get(f"{database_url}/get_voice_sample_id/{voice_id}")
+                voice_sample = voice_sample.json()
+                audio_url = voice_sample.get("voice_sample_url")
+                data["audio_sample_url"] = audio_url  # Optional[str] - can be None
+                data['voice_id'] = int(voice_id) if voice_id else None  # Integer or None
+            except:
+                data["audio_sample_url"] = None
+                data['voice_id'] = None
         else:
-            voice_sample = None
             data["audio_sample_url"] = None
             data['voice_id'] = None
-        conv_id = save_conversation_db(text,user_id,prompt_id,database_url,request_id)
-        data['conv_id'] = conv_id
-        data['avatar_id'] = avatar_id
-        data['timeout'] = timeout
+
+        # Integer values for downstream compatibility
+        conv_id = save_conversation_db(text, user_id, prompt_id, database_url, request_id)
+        data['conv_id'] = int(conv_id)  # Integer - downstream uses in DB operations
+        data['avatar_id'] = int(avatar_id)  # Integer - downstream: int(data.get("avatar_id", 0))
+        data['timeout'] = int(timeout)  # Integer - downstream uses in calculations
+
+        # Debug: Show data types being sent
+        tool_logger.info("=== DATA TYPES BEING SENT ===")
+        type_check = {
+            'strings': ['text', 'flag_hallo', 'openvoice', 'cartoon_image', 'bg_url', 'vtoonify',
+                        'im_crop', 'remove_bg', 'hd_video', 'uid', 'gradient', 'cus_bg',
+                        'solid_color', 'inpainting', 'prompt', 'gender'],
+            'integers': ['conv_id', 'avatar_id', 'timeout'],
+            'booleans': ['chattts'],
+            'optional_strings': ['image_url', 'audio_sample_url'],
+            'optional_integers': ['voice_id']
+        }
+
+        for type_name, fields in type_check.items():
+            for field in fields:
+                if field in data:
+                    value = data[field]
+                    tool_logger.info(f"  {field}: {value} (type: {type(value).__name__})")
+
         try:
-            video_link = requests.post("{}/video_generate_save".format(database_url),
-                                        data=json.dumps(data), headers=headers, timeout=1)
-        except:
-            pass
+            tool_logger.info(f"Sending request to {database_url}/video_generate_save")
+            video_link = requests.post(f"{database_url}/video_generate_save",
+                                       data=json.dumps(data), headers=headers, timeout=1)
+            tool_logger.info(f"Response status: {video_link.status_code}")
+            if video_link.status_code == 422:
+                tool_logger.error(f"422 Validation Error: {video_link.text}")
+            elif video_link.status_code != 200:
+                tool_logger.error(f"Error response: {video_link.text}")
+            else:
+                tool_logger.info("✅ Request successful!")
+        except Exception as e:
+            tool_logger.error(f"Request failed: {e}")
+
         if data['chattts'] or data['flag_hallo'] == "true":
             return f"Video Generation task added to queue with conv_id:{conv_id}. Ask the helper to save this conv_id in the same collection from which the story used to generate the video was retrieved, for future reference"
         else:
             return f"Video Generation completed with conv_id:{conv_id}. Ask the helper to save this conv_id in the same collection from which the story used to generate the video was retrieved, for future reference"
-
     helper1.register_for_llm(name="Generate_video", description="Generate/presynthesize video with text and save it in database")(Generate_video)
     time_agent.register_for_execution(name="Generate_video")(Generate_video)
 
+    @log_tool_execution
     def recent_files() -> str:
-        current_app.logger.info('INSIDE get_user_uploaded_file')
+        tool_logger.info('INSIDE get_user_uploaded_file')
         if recent_file_id[user_id]:
             return f'Got user uploaded file the file_id is {recent_file_id[user_id]}'
 
@@ -1246,9 +1895,9 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     helper1.register_for_llm(name="get_user_uploaded_file", description="get user's recent uploaded files")(recent_files)
     time_agent.register_for_execution(name="get_user_uploaded_file")(recent_files)
 
-
+    @log_tool_execution
     def img2txt(image_url: Annotated[str, "image url of which you want text"],text: Annotated[str, "the details you want from image"]='Describe the Images & Text data in this image in detail') -> str:
-        current_app.logger.info('INSIDE img2txt')
+        tool_logger.info('INSIDE img2txt')
         url = "http://azurekong.hertzai.com:8000/llava/image_inference"
 
         payload = {
@@ -1268,10 +1917,11 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     helper1.register_for_llm(name="get_text_from_image", description="Image to Text")(img2txt)
     time_agent.register_for_execution(name="get_text_from_image")(img2txt)
 
+    @log_tool_execution
     def create_scheduled_jobs(interval_sec: Annotated[int, "time between two Interval in seconds."],
                             job_description: Annotated[str, "Description of the job to be performed"],
                             cron_expression: Annotated[Optional[str], "Cron expression for scheduling. Example: '0 9 * * 1-5' (Runs at 9:00 AM, Monday to Friday). If the interval is greater than 60 seconds or it needs to be executed at a dynamic cron time this argument is Mandatory else None"]=None) -> str:
-        current_app.logger.info('INSIDE create_scheduled_jobs')
+        tool_logger.info('INSIDE create_scheduled_jobs')
 
         # actual_execution_time = sum(task_time[prompt_id]['times'][-1])
         # if interval_sec < actual_execution_time:
@@ -1285,27 +1935,28 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         #         trigger = CronTrigger.from_crontab(cron_expression)
         #         job_id = f"job_{int(time.time())}"
         #         scheduler.add_job(execute_python_file, trigger=trigger, id=job_id, args=[job_description, int(user_id),int(prompt_id)])
-        #         current_app.logger.info('Successfully created scheduler job')
+        #         tool_logger.info('Successfully created scheduler job')
         #         return 'Successfully created scheduler job'
         #     else:
         #         trigger = IntervalTrigger(seconds=int(interval_sec))
         #         job_id = f"job_{int(time.time())}"
         #         scheduler.add_job(execute_python_file, trigger=trigger, id=job_id, args=[job_description, int(user_id),int(prompt_id)])
-        #         current_app.logger.info('Successfully created scheduler job')
+        #         tool_logger.info('Successfully created scheduler job')
         #         return 'Successfully created scheduler job'
         # except Exception as e:
-        #     current_app.logger.error(f'Error in create_scheduled_jobs: {str(e)}')
+        #     tool_logger.error(f'Error in create_scheduled_jobs: {str(e)}')
         #     return f"Error creating scheduled job: {str(e)}"
         return 'Added this schedule job in creation process will do it at the end. you can go ahead and mark this action as completed.'
 
     helper1.register_for_llm(name="create_scheduled_jobs", description="Creates time-based jobs using APScheduler to schedule jobs")(create_scheduled_jobs)
     time_agent.register_for_execution(name="create_scheduled_jobs")(create_scheduled_jobs)
 
+    @log_tool_execution
     def send_message_to_user(text: Annotated[str, "Text to send to the user"],
                          avatar_id: Annotated[Optional[str], "Unique identifier for the avatar"] = None,
                          response_type: Annotated[Optional[str], "Response mode: 'Realistic' (slower, better quality) or 'Realtime' (faster, lower quality)"] = 'Realtime') -> str:
-        current_app.logger.info('INSIDE send_message_to_user')
-        current_app.logger.info(f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
+        tool_logger.info('INSIDE send_message_to_user')
+        tool_logger.info(f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
         thread = threading.Thread(target=send_message_to_user1, args=(user_id, text, '',prompt_id))
         thread.start()
@@ -1314,19 +1965,21 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     helper1.register_for_llm(name="send_message_to_user", description="Sends a message/information to user. You can use this if you want to ask a question")(send_message_to_user)
     time_agent.register_for_execution(name="send_message_to_user")(send_message_to_user)
 
+    @log_tool_execution
     def send_presynthesized_video_to_user(conv_id: Annotated[str, "Conversation ID associated with the text from memory"]) -> str:
-        current_app.logger.info('INSIDE send_presynthesized_video_to_user')
-        current_app.logger.info(f'SENDING DATA 2 user with value: conv_id:{conv_id}.')
+        tool_logger.info('INSIDE send_presynthesized_video_to_user')
+        tool_logger.info(f'SENDING DATA 2 user with value: conv_id:{conv_id}.')
         return 'Message sent successfully to user'
 
     helper1.register_for_llm(name="send_presynthesized_video_to_user", description="Sends a presynthesized message/video/dialogue to user using conv_id.")(send_presynthesized_video_to_user)
     time_agent.register_for_execution(name="send_presynthesized_video_to_user")(send_presynthesized_video_to_user)
 
+    @log_tool_execution
     def send_message_in_seconds(text: Annotated[str, "text to send to user"],
                        delay: Annotated[int, "time to wait in seconds before sending text"],
                        conv_id: Annotated[Optional[int], "conv_id for this text if not available make it None"],) -> str:
-        current_app.logger.info('INSIDE send_message_in_seconds')
-        current_app.logger.info(f'with text:{text}. and waiting time: {delay} conv_id: {conv_id}')
+        tool_logger.info('INSIDE send_message_in_seconds')
+        tool_logger.info(f'with text:{text}. and waiting time: {delay} conv_id: {conv_id}')
         run_time = datetime.fromtimestamp(time.time() + delay)
         scheduler.add_job(send_message_to_user1, 'date', run_date=run_time, args=[user_id, text, '',prompt_id])
         return 'Message scheduled successfully'
@@ -1339,7 +1992,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=50,keep_first_message=True),
             transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
-            ToolMessageHandler(),
+            ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
     context_handling.add_to_agent(time_agent)
@@ -1436,7 +2089,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=50,keep_first_message=True),
             transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
-            ToolMessageHandler(),
+            ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
     time_group_chat = autogen.GroupChat(
@@ -1445,7 +2098,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         max_round=10,
         select_speaker_transform_messages=select_speaker_transforms,
         speaker_selection_method=state_transition1,  # using an LLM to decide
-        allow_repeat_speaker=False,  # Prevent same agent speaking twice
+        allow_repeat_speaker=True,  # Prevent same agent speaking twice
         send_introductions=False
     )
 
@@ -1466,32 +2119,27 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
 
 user_tasks = {}
 
-
-def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
+def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
     """
     Handles the response generation process for an agent group.
-
     Args:
         user_id: User identifier
         text: Input text message
         prompt_id: Prompt identifier
         Failure: Whether this is being called after a failure
         error: Error information if there was a failure
-
     Returns:
         Response content from the conversation
     """
     user_prompt = f'{user_id}_{prompt_id}'
     current_app.logger.info(f"START: get_response_group for user_prompt={user_prompt}, Failure={Failure}")
-
     # Get or create agents for this user
     if user_prompt not in user_agents:
         current_app.logger.info(f"Creating new agents for user_prompt={user_prompt}")
         try:
             author, assistant_agent, executor, group_chat, manager, chat_instructor, agents_object = create_agents(
                 user_id, user_tasks[user_prompt], prompt_id)
-            user_agents[user_prompt] = (
-            author, assistant_agent, executor, group_chat, manager, chat_instructor, agents_object)
+            user_agents[user_prompt] = (author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object)
             messages[user_prompt] = []
             current_app.logger.info(f"Successfully created agents for user_prompt={user_prompt}")
         except Exception as e:
@@ -1500,126 +2148,86 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
             return f"Error creating agents: {str(e)}"
     else:
         current_app.logger.info(f"Using existing agents for user_prompt={user_prompt}")
-        author, assistant_agent, executor, group_chat, manager, chat_instructor, agents_object = user_agents[
-            user_prompt]
-
+        author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = user_agents[user_prompt]
     clear_history = False
 
-    # TOOL CALL AND RESPONSE CHECK
-    # Check if waiting for tool response
-    if len(group_chat.messages) > 2 and 'tool_calls' in group_chat.messages[-1]:
+    # TOOL CALL AND RESPONSE CHECK with TIMEOUT
+    tool_timeout = 2  # Timeout in seconds (adjust as needed)
+    current_time = time.time()
+    if len(group_chat.messages)>2 and 'tool_calls' in group_chat.messages[-1]:
         current_app.logger.warning('GOT INPUT BUT LAST MESSAGE IS tool_calls should wait for tool response')
         return 'Processing a tool now please try later'
 
-    # Log messages state for debugging
-    current_app.logger.info(f"Group chat has {len(group_chat.messages)} messages before processing")
-    if len(group_chat.messages) > 0:
-        current_app.logger.info(
-            f"Last message role: {group_chat.messages[-1].get('role')}, name: {group_chat.messages[-1].get('name')}")
-        # Log if there are any problematic elements in messages
-        for i, msg in enumerate(group_chat.messages[-min(5, len(group_chat.messages)):]):
-            if 'content' in msg and msg['content'] is None:
-                current_app.logger.warning(f"NULL CONTENT in message index {i} from end")
-            if msg.get('role') != 'assistant' and 'function_call' in msg:
-                current_app.logger.warning(f"FUNCTION_CALL IN NON-ASSISTANT MESSAGE in message index {i} from end")
-
-    # Handle failure recovery
     if Failure:
-        current_app.logger.warning(f"Recovering from failure: {error}")
-        current_app.logger.warning(
-            f"Last 5 messages before failure: {group_chat.messages[-min(5, len(group_chat.messages)):]}")
-        current_app.logger.warning(f"Total messages count: {len(group_chat.messages)}")
-
-        # Convert all messages to user role for recovery
+        current_app.logger.warning(f'CHECK THIS OUT group_chat.messages:{group_chat.messages[-5:]}')
+        current_app.logger.warning(f'CHECK THIS OUT group_chat.messages:{len(group_chat.messages)}')
         for i in range(len(group_chat.messages)):
-            current_app.logger.info(f"Converting message[{i}] role from {group_chat.messages[i].get('role')} to user")
             group_chat.messages[i]['role'] = 'user'
-
         clear_history = False
-
-        # Prepare recovery message
-        try:
-            if user_tasks[user_prompt].fallback == True or user_tasks[user_prompt].recipe == True:
-                current_app.logger.info("Using fallback/recipe recovery path")
-                actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)
-                message = 'Lets continue the work we were doing if action is completed then ask status verifier Agent to Please tell the status of the action'
-                text = f'Action {user_tasks[user_prompt].current_action + 1}: {message} '
-            else:
-                current_app.logger.info("Using standard recovery path")
-                try:
-                    message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
-                    text = f'Action {user_tasks[user_prompt].current_action + 1}: {message} '
-                except Exception as e:
-                    current_app.logger.error(f"Error getting action for recovery: {e}")
-                    message = ""
-                    text = f'Action {user_tasks[user_prompt].current_action}: {message} '
-        except Exception as e:
-            current_app.logger.error(f"Error preparing recovery message: {e}")
-            message = "Let's continue where we left off."
-            text = message
-
+        if user_tasks[user_prompt].fallback == True or user_tasks[user_prompt].recipe == True:
+            message = 'Lets continue the work we were doing if action is completed then ask status verifier Agent to Please tell the status of the action'
+            text = f'Properly Execute Action {user_tasks[user_prompt].current_action+1}: {message} '
+        else:
+            try:
+                actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
+                message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
+                text = f'Properly Execute Action {user_tasks[user_prompt].current_action+1}: {message} '
+            except:
+                message = ""
+                text = f'Properly Execute Action {user_tasks[user_prompt].current_action}: {message} '
     # Initiate or resume chat
     try:
         current_app.logger.info(f"Messages in user_prompt before init: {len(messages.get(user_prompt, []))}")
 
-        if len(messages.get(user_prompt, [])) > 0:
-            current_app.logger.info("Resuming existing chat")
+        if len(messages[user_prompt]) > 0:
+            # last_agent, last_message = manager.resume(messages=messages[user_prompt])
             try:
-                result = agents_object['user'].initiate_chat(recipient=manager, message=text,
-                                                             clear_history=clear_history, silent=False)
-                current_app.logger.info("Successfully initiated chat with existing messages")
+                result = agents_object['user'].initiate_chat(recipient=manager, message=text, clear_history=clear_history,silent=False)
             except Exception as e:
-                current_app.logger.error(f"Error resuming chat: {e}")
+                current_app.logger.error(f'Got some error it can be multiple tools called at one error:{e}')
                 current_app.logger.error(traceback.format_exc())
-                return f'Our Agent is facing issues: {str(e)}'
+                # current_app.logger.error(f'len of group chat :{group_chat.messages}')
+                # current_app.logger.error(f' group chat :{group_chat.messages}')
+                for i in range(len(group_chat.messages)):
+                    group_chat.messages[i]['role'] = 'user'
+                message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
+                text = f'Execute Action {user_tasks[user_prompt].current_action+1}: {message}'
+                result = agents_object['helper'].initiate_chat(recipient=manager, message=text, clear_history=True,silent=False)
+                return "I've encountered an issue but I'm trying to auto heal and recover"
+
+
         else:
-            current_app.logger.info("Starting new chat")
             message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
-            message = f'Action {user_tasks[user_prompt].current_action + 1}: {message} '
+            message = f'Execute Action {user_tasks[user_prompt].current_action+1}: {message} '+f',Latest User message: {text}'
+            crossbar_message = {"text": ["Working on "+message+".\n please evaluate the response i am giving to check if it meets the current action"], "priority": 49, "action": 'Thinking', "historical_request_id": [], "preffered_language": 'en-US', "options": [], "newoptions": [], "bot_type": 'Agent', "page_image_url": "", "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
+            'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0}, 'bottom_left': {'x': 0, 'y': 0}}}
+            result = client.publish(
+                f"com.hertzai.hevolve.chat.{user_id}", json.dumps(crossbar_message))
+            task_time[prompt_id] = {'timer':time.time(),'times':[]}
+            #ASSIGNED
+            result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
+            #IN_PROGRESS
 
-            # Publish crossbar message for UI feedback
-            crossbar_message = {
-                "text": [
-                    "Working on " + message + ".\n please evaluate the response i am giving to check if it meets the current action"],
-                "priority": 49,
-                "action": 'Thinking',
-                "historical_request_id": [],
-                "preffered_language": 'en-US',
-                "options": [],
-                "newoptions": [],
-                "bot_type": 'Agent',
-                "page_image_url": "",
-                "analogy_image_url": '',
-                "request_id": "123456",
-                "zoom_bounding_box": {'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0},
-                                      'bottom_right': {'x': 0, 'y': 0}, 'bottom_left': {'x': 0, 'y': 0}}
-            }
-
-            try:
-                result = client.publish(f"com.hertzai.hevolve.chat.{user_id}", f'{crossbar_message}')
-                current_app.logger.info("Published crossbar message")
-            except Exception as e:
-                current_app.logger.error(f"Error publishing crossbar message: {e}")
-
-            # Initialize timer and start chat
-            task_time[prompt_id] = {'timer': time.time(), 'times': []}
-            try:
-                result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,
-                                                       silent=False)
-                current_app.logger.info("Successfully initiated new chat")
-            except Exception as e:
-                current_app.logger.error(f"Error initiating new chat: {e}")
-                return f'Error starting chat: {str(e)}'
-
-        current_app.logger.info("=== Chat initialization completed ===")
+        current_app.logger.info("\n=== Chat Summary ===")
+        current_app.logger.info("\n=== Full response ===")
 
         # Main processing loop
         while_loop_iterations = 0
-        max_iterations = 8  # Prevent infinite loops
+        max_iterations = 10  # Prevent infinite loops
 
         while while_loop_iterations < max_iterations:
             while_loop_iterations += 1
             current_app.logger.info(f"WHILE LOOP ITERATION #{while_loop_iterations}")
+
+            current_action_id = user_tasks[user_prompt].current_action
+            # Lifecycle TRACKING HOOKS:
+            lifecycle_hook_track_action_assignment(user_prompt, user_tasks, group_chat)  # 1. Track action assignment
+            lifecycle_hook_track_status_verification_request(user_prompt, user_tasks,
+                                                             group_chat)  # 3. Track status verification request
+            lifecycle_hook_track_fallback_request(user_prompt, user_tasks, group_chat)  # 7. Track fallback request
+            lifecycle_hook_track_user_fallback(user_prompt, user_tasks, group_chat)  # 8. Track user fallback
+            lifecycle_hook_track_recipe_request(user_prompt, user_tasks, group_chat)  # 9. Track recipe request
+            lifecycle_hook_track_termination(user_prompt, user_tasks, group_chat)  # 11. Track termination
 
             # Load persona info from config
             try:
@@ -1633,368 +2241,399 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
                 role = "unknown"
 
             current_app.logger.info('inside while')
+            if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
+                current_app.logger.info(f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
+                json_obj = retrieve_json(group_chat.messages[-2]["content"])
 
-            # Check conditions for processing
-            if len(group_chat.messages) < 2:
-                current_app.logger.warning("Not enough messages for processing, breaking loop")
-                break
-            last_message = group_chat.messages[-1]['content']
+                # LIFECYCLE HOOK - Check if JSON status is valid
+                hook_result = lifecycle_hook_process_verifier_response(user_prompt, json_obj,
+                                                                       user_tasks)  # 4-6. Process verifier response
 
-            # Check for termination message from ChatInstructor
-            if group_chat.messages[-1].get('name') == 'ChatInstructor' and group_chat.messages[-1].get(
-                    'content') == 'TERMINATE':
-                current_app.logger.info("Found TERMINATE message from ChatInstructor")
+                if hook_result['action'] != 'allow':
+                    if hook_result['action'] == 'force_fallback':
+                        # Automatically request fallback after completion
+                        set_action_state(user_prompt, user_tasks[user_prompt].current_action,
+                                         ActionState.FALLBACK_REQUESTED)
 
-                # Log the content of the previous message for debugging
-                second_last_content = group_chat.messages[-2].get('content', '')[:50]
-                current_app.logger.info(f"Second-last message begins with: {second_last_content}...")
-
-                # Try to extract JSON from second-to-last message
-                try:
-                    json_obj = retrieve_json(group_chat.messages[-2]["content"])
-                    if not json_obj:
-                        current_app.logger.info("No JSON found in second-last message, using individual_json")
-                        json_obj = individual_json.get(user_prompt)
-
-                    # Log JSON status
-                    if isinstance(json_obj, dict):
-                        current_app.logger.info(f"JSON has keys: {list(json_obj.keys())}")
-                        if 'status' in json_obj:
-                            current_app.logger.info(f"JSON status is: {json_obj['status']}")
-                    else:
-                        current_app.logger.info(f"JSON is not a dictionary: {type(json_obj)}")
-
-                    # Process 'completed' status JSON
-                    if json_obj and isinstance(json_obj, dict) and 'status' in json_obj:
-                        current_app.logger.info(f"Processing JSON with status {json_obj['status']}")
-
-                        if json_obj['status'].lower() == 'completed' and 'recipe' not in json_obj:
-                            current_app.logger.info("Processing 'completed' status without recipe")
-                            if user_tasks[user_prompt].current_action != int(json_obj['action_id']):
-                                user_tasks[user_prompt].fallback = True
-                                current_app.logger.info(
-                                    f"Set fallback=True because current_action={user_tasks[user_prompt].current_action} != action_id={json_obj['action_id']}")
-
-                            current_app.logger.info(f"Updating current action to {int(json_obj['action_id'])}")
-                            user_tasks[user_prompt].current_action = int(json_obj['action_id'])
-                    else:
-                        current_app.logger.warning("JSON object does not have expected format")
-                except Exception as e:
-                    current_app.logger.error(f"Error processing JSON: {e}")
-                    current_app.logger.error(traceback.format_exc())
-
-                    # Handle no JSON case
-                    current_app.logger.warning('It is not a JSON object, will prompt for status verification')
-
-                    # Check for tool message and break if found
-                    if group_chat.messages[-1].get('role') == 'tool':
-                        current_app.logger.info('Last message is a tool message, breaking loop')
-                        break
-
-                    # Prepare continuation message
-                    if user_tasks[user_prompt].fallback == True or user_tasks[user_prompt].recipe == True:
-                        try:
-                            actions_prompt = user_tasks[user_prompt].get_action(
-                                user_tasks[user_prompt].current_action - 1)
-                            message = f'Lets continue the work we were doing, if action is completed then ask @statusverifier Agent to Please tell the status of the action {user_tasks[user_prompt].current_action}: {actions_prompt}'
-                        except Exception as e:
-                            current_app.logger.error(f"Error preparing fallback message: {e}")
-                            message = "Please continue the current task and report status."
-                    else:
-                        try:
-                            actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
-                            message = f'Lets continue the work we were doing, if action is completed then ask @statusverifier Agent to Please tell the status of the action {user_tasks[user_prompt].current_action + 1}: {actions_prompt}'
-                        except Exception as e:
-                            current_app.logger.error(f"Error preparing normal message: {e}")
-                            message = "Please continue the current task and report status."
-
-                    current_app.logger.info(f"Sending continuation message: {message[:50]}...")
-                    try:
-                        result = agents_object['helper'].initiate_chat(recipient=manager, message=message,
-                                                                       clear_history=False, silent=False)
-                        current_app.logger.info("Successfully sent continuation message")
-                    except Exception as e:
-                        current_app.logger.error(f"Error sending continuation message: {e}")
+                    current_app.logger.error(f"lifecycle_hook_check_json_status {hook_result['message']}")
+                    message = hook_result['message']
+                    result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False)
                     continue
 
-                # Continue processing with valid JSON
+                recipe_result = lifecycle_hook_track_recipe_completion(user_prompt, json_obj, user_tasks)
+
+                if recipe_result['action'] == 'save_recipe_and_terminate':
+                    # Only set state here - don't do business logic yet
+                    set_action_state(user_prompt, user_tasks[user_prompt].current_action,
+                                     ActionState.RECIPE_RECEIVED)
+                    current_app.logger.info('🎯 Recipe completion detected - state updated to RECIPE_RECEIVED')
+
+                if not json_obj:
+                    json_obj = individual_json[user_prompt]
+                if json_obj and type(json_obj)==dict and 'status' in json_obj.keys():
+                    if json_obj['status'].lower() == 'completed' and 'recipe' not in json_obj.keys():
+                        if user_tasks[user_prompt].current_action != int(json_obj['action_id']):
+                            user_tasks[user_prompt].fallback = True
+                        current_app.logger.info(f'UPDATIN CURRENT ACTION AS :{int(json_obj["action_id"])}')
+                        user_tasks[user_prompt].current_action = int(json_obj['action_id'])
+                else:
+                    current_app.logger.warning(f'it is not a json object the error is:')
+                    current_app.logger.info('it is not a json object You should ask status verifier to give response in proper format & not move ahead to next action')
+                    if group_chat.messages[-1]['role'] == 'tool':
+                        current_app.logger.info('GOT role is tool')
+                        break
+                    if user_tasks[user_prompt].fallback == True or user_tasks[user_prompt].recipe == True:
+                        actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action-1)
+                        message = f'Lets continue the work we were doing, if action is completed then ask @statusverifier Agent to Please tell the status of the action {user_tasks[user_prompt].current_action}: {actions_prompt}'
+                    else:
+                        actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
+                        message = f'Lets continue the work we were doing, if action is completed then ask @statusverifier Agent to Please tell the status of the action {user_tasks[user_prompt].current_action+1}: {actions_prompt}'
+                    result = agents_object['helper'].initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
+                    continue
                 current_app.logger.info('resuming chat')
-
-                # Check if we're at the end of actions
                 if user_tasks[user_prompt].current_action >= len(user_tasks[user_prompt].actions):
-                    current_app.logger.info("Reached end of actions, preparing final processing")
-
-                    # Handle recipe creation if needed
                     if user_tasks[user_prompt].recipe == True:
-                        current_app.logger.info("Creating detailed recipe")
                         user_tasks[user_prompt].recipe = False
                         user_tasks[user_prompt].fallback = False
-
-                        try:
-                            metadata = strip_json_values(agent_data[prompt_id])
-                            message = '''Focus on the current task at hand and create a detailed recipe that includes only the necessary steps for this action from history, along with a suitable name. Provide the output in the following JSON format:
-                            { "status", "done", "action": "''' + str(user_tasks[user_prompt].get_action(user_tasks[
-                                                                                                                                                  user_prompt].current_action - 1)) + '''","fallback_action":"", "persona":"","action_id": ''' + f'{user_tasks[user_prompt].current_action}' + ''', "recipe": [{{"steps":"steps here","tool_name":"Only include tool name here if used for this step.","generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely."}}],"can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
-                            Recipe Requirements:
-                            1. Generalized Python Functions: Give the code which was created and excuted successfully without any error handling edge cases. leave it blank when there is no code nedded to perform the action
-                            2. Avoid directly storing any specific information provided by the author in the recipe. Use placeholders for variables instead.
-                            3. Ensure that coding and non-coding steps are not combined within the same function.
-		            4. For all Python functions, include comprehensive docstrings to explain their purpose, parameters, and usage. This should especially clarify non-coding steps that require utilizing the assistant's language capabilities.
-                            5. If any internal tool is used to complete a step, provide detailed instructions on how to call or utilize that tool instead of providing the code for that step.
-                            ''' + f'6. The persona must be one of the following: {role}. No other personas are allowed.'
-
-                        except Exception as e:
-                            current_app.logger.error(f"Error preparing recipe message: {e}")
-                            message = "Please create a detailed recipe for this action."
-
-                    # Handle fallback if needed
-                    elif user_tasks[user_prompt].fallback:
-                        current_app.logger.info("Setting up fallback")
+                        metadata = strip_json_values(agent_data[prompt_id])
+                        set_action_state(user_prompt, current_action_id, ActionState.RECIPE_REQUESTED)
+                        message = '''Focus on the current task at hand and create a detailed recipe that includes only the necessary steps for this action from history, along with a suitable name. Provide the output in the following JSON format:
+                        { "status", "done", "action": "'''+str(user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action-1))+'''","fallback_action":"", "persona":"","action_id": '''+f'{user_tasks[user_prompt].current_action}'+''', "recipe": [{{"steps":"steps here","tool_name":"Only include tool name here if used for this step.","generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely."}}],"can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
+                        Recipe Requirements:
+                        1. Generalized Python Functions: Give the code which was created and executed successfully without any error handling edge cases. leave it blank when there is no code nedded to perform the action
+                        2. Avoid directly storing any specific information provided by the author in the recipe. Use placeholders for variables instead.
+                        3. Ensure that coding and non-coding steps are not combined within the same function.
+                        4. For all Python functions, include comprehensive docstrings to explain their purpose, parameters, and usage. This should especially clarify non-coding steps that require utilizing the assistant's language capabilities.
+                        5. If any internal tool is used to complete a step, provide detailed instructions on how to call or utilize that tool instead of providing the code for that step.
+                        '''+f'6. The persona must be one of the following: {role}. No other personas are allowed.'
+                    elif user_tasks[user_prompt].fallback == True:
                         user_tasks[user_prompt].recipe = True
                         user_tasks[user_prompt].fallback = False
-                        message = f"Action {user_tasks[user_prompt].current_action} fallback:ask user what actions should be taken if current actions fail in the future after you get the response from user give the conversaation to StatusVerifier agent"
+                        set_action_state(user_prompt, current_action_id, ActionState.FALLBACK_REQUESTED)
 
-                    # Handle normal end of actions
+                        message = f"To Get Action {user_tasks[user_prompt].current_action} fallback: Ask USER what actions should be taken if current actions fail in the future after you get the response from user give the conversation to StatusVerifier agent"
                     else:
-                        current_app.logger.info("Normal end of actions processing")
-                        # Store JSON and increment action counter
+                        # BEFORE moving to next action lets do THESE SAFETY CHECKS:
+                        lifecycle_check = lifecycle_hook_check_all_actions_complete(user_prompt, user_tasks)
+
+                        if lifecycle_check['action'] != 'allow':
+                            current_app.logger.error(f"lifecycle_hook_enforce_complete_lifecycle {lifecycle_check['message']}")
+                            message = lifecycle_check['message']
+                            result = chat_instructor.initiate_chat(recipient=manager, message=message,
+                                                                   clear_history=False)
+                            continue
+
+
+
+                        # Only proceed with next action logic if 'allow'
+
+                        # Only proceed if action completed full lifecycle (DONE state)
+
+                        # if recipe_for_persona[user_prompt]  < total_persona_actions[user_prompt]:
+                        #     recipe_for_persona[user_prompt] += 1
                         user_tasks[user_prompt].new_json.append(json_obj)
                         user_tasks[user_prompt].current_action += 1
+                        # name = f'prompts/{prompt_id}_new.json'
+                        # with open(name, "w") as json_file:
+                        #     json.dump(user_tasks[user_prompt].new_json, json_file)
+                        current_app.logger.info('updating updated action in .json')
+                        individual_recipe = []
+                        flow = recipe_for_persona[user_prompt]
+                        for i in range(1,(user_tasks[user_prompt].current_action)):
+                            current_app.logger.info(f'checking for prompts/{prompt_id}_{flow}_{i}.json')
+                            try:
+                                with open(f"prompts/{prompt_id}_{flow}_{i}.json", 'r') as f:
+                                    config = json.load(f)
+                                    individual_recipe.append(config)
+                            except Exception as e:
+                                current_app.logger.error(f'Got error as :{e} while checking for prompts/{prompt_id}_{flow}_{i}.json')
 
-                        # Process individual recipes
-                        try:
-                            current_app.logger.info("Processing individual recipes")
-                            individual_recipe = []
-                            flow = recipe_for_persona[user_prompt]
-
-                            # Collect individual recipes
-                            for i in range(1, user_tasks[user_prompt].current_action):
-                                recipe_path = f"prompts/{prompt_id}_{flow}_{i}.json"
-                                current_app.logger.info(f"Checking for recipe at {recipe_path}")
-                                try:
-                                    with open(recipe_path, 'r') as f:
-                                        config = json.load(f)
-                                        individual_recipe.append(config)
-                                except Exception as e:
-                                    current_app.logger.error(f"Error loading recipe {i}: {e}")
-
-                            # Update message content and system message
-                            group_chat.messages[-1]['content'] = f'{individual_recipe}'
-                            assistant_agent.update_system_message = 'Check if the current_action depends on any other action...'
-
-                            # Process action dependencies
-                            for num, action in enumerate(user_tasks[user_prompt].actions, 1):
-                                try:
-                                    current_app.logger.info(f"Processing dependencies for action {num}")
-                                    group_chat.messages[-1]['content'] = f'{individual_recipe}'
-                                    message = f'''Check if the current_action depends on any other action, regardless of order it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.\n current_action: {action}'''
-                                    result = chat_instructor.initiate_chat(recipient=manager, message=message,
-                                                                           clear_history=False, silent=False)
-                                    match=False
-                                    # Find dependency list in response
-                                    for i in range(1, 4):
-                                        if i < len(group_chat.messages):
-                                            text = group_chat.messages[-i].get('content', '')
-                                            match = re.search(r'\[.*?\]', text)
-                                            if match:
-                                                current_app.logger.info(f"Found dependency match: {match.group()}")
-                                                break
-
-                                    # Save dependencies
-                                    action_path = f'prompts/{prompt_id}_{flow}_{num}.json'
+                        group_chat.messages[-1]['content'] = f'{individual_recipe}'
+                        assistant_agent.update_system_message = 'Check if the current_action depends on any other action, regardless of order it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.'
+                        flow = recipe_for_persona[user_prompt]
+                        for num,action in enumerate(user_tasks[user_prompt].actions,1):
+                            try:
+                                group_chat.messages[-1]['content'] = f'{individual_recipe}'
+                                message = f'''Check if the current_action depends on any other action, regardless of order it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.\n current_action: {action}'''
+                                result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
+                                for i in range(1,4):
+                                    text = group_chat.messages[-i]['content']
+                                    match = re.search(r'\[.*?\]', text)
                                     if match:
-                                        action_ids = eval(match.group())
-                                        current_app.logger.info(f"Dependencies for action {num}: {action_ids}")
+                                        break
+                                if match:
+                                    action_ids = eval(match.group())
 
-                                        with open(action_path, 'r') as f:
-                                            data = json.load(f)
-                                        data['actions_this_action_depends_on'] = action_ids
-                                        with open(action_path, 'w') as f:
-                                            json.dump(data, f, indent=4)
-                                    else:
-                                        current_app.logger.info(f"No dependencies found for action {num}")
-                                        with open(action_path, 'r') as f:
-                                            data = json.load(f)
-                                        data['actions_this_action_depends_on'] = []
-                                        with open(action_path, 'w') as f:
-                                            json.dump(data, f, indent=4)
-                                except Exception as e:
-                                    current_app.logger.error(f"Error processing action {num} dependencies: {e}")
+                                    file_path = f'prompts/{prompt_id}_{flow}_{num}.json'
+                                    with open(file_path, 'r') as f:
+                                        data = json.load(f)
+                                    data['actions_this_action_depends_on'] = action_ids
+                                    with open(file_path, 'w') as f:
+                                        json.dump(data, f, indent=4)
+                                else:
                                     file_path = f'prompts/{prompt_id}_{flow}_{num}.json'
                                     with open(file_path, 'r') as f:
                                         data = json.load(f)
                                     data['actions_this_action_depends_on'] = []
                                     with open(file_path, 'w') as f:
                                         json.dump(data, f, indent=4)
-                                    current_app.logger.error(traceback.format_exc())
-                                    continue
-
-                            # Handle topological sorting and cyclic dependencies
-                            try:
-                                current_app.logger.info("Performing topological sort on actions")
-                                status, updated_actions, cyc = topological_sort(individual_recipe)
-
-                                if not status:
-                                    current_app.logger.warning(f"Detected cyclic dependency: {cyc}")
-                                    res = fix_actions(individual_recipe, cyc)
-                                    for i in res:
-                                        for j in individual_recipe:
-                                            if i['action_id'] == j['action_id']:
-                                                j['actions_this_action_depends_on'] = i[
-                                                    'actions_this_action_depends_on']
-                                                break
-                                    status, updated_actions, cyc = topological_sort(individual_recipe)
-
-                                group_chat.messages[-1]['content'] = f'{updated_actions}'
-                                file_path = f'prompts/{prompt_id}.json'
+                            except Exception as e:
+                                current_app.logger.info(f'GOT ERROR AT EVAL OF LIST :{e}')
+                                file_path = f'prompts/{prompt_id}_{flow}_{num}.json'
                                 with open(file_path, 'r') as f:
                                     data = json.load(f)
-                                    role = data['flows'][recipe_for_persona[user_prompt]]['persona']
-                                message = '''Reflect on the sequence of tasks and create scheduled_tasks with proper persona name and action_entry_point. Provide the output in the following JSON format:
-                                    { "status", "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer `action_id` from the list of existing `action_ids` is required as the starting point to perform this job.","action_exit_point":"An integer `action_id` up to which the job should be performed to complete the task. It can be greater than or equal to the entry point.","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ], "visual_scheduled_tasks": [ { "cron_expression": "Create this only if a visual time-based job is present; if no visual time-based job exists, do not create it.","persona":"", "job_description": "Provide a description of the visual scheduled job without specifying the time or frequency" } ] }'''
+                                data['actions_this_action_depends_on'] = []
+                                with open(file_path, 'w') as f:
+                                    json.dump(data, f, indent=4)
+                                continue
 
-                                final_recipe[prompt_id] = {"status": "completed", "actions": updated_actions}
-                                assistant_agent.update_system_message = '''Reflect on the sequence of tasks and create scheduled_tasks with proper persona name and action_entry_point. Provide the output in the following JSON format:
-                                { "status", "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer `action_id` from the list of existing `action_ids` is required as the starting point to perform this job.","action_exit_point":"An integer `action_id` up to which the job should be performed to complete the task. It can be greater than or equal to the entry point.","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ], "visual_scheduled_tasks": [ { "cron_expression": "Create this only if a visual time-based job is present; if no visual time-based job exists, do not create it.","persona":"", "job_description": "Provide a description of the visual scheduled job without specifying the time or frequency" } ] }'''
-                                current_app.logger.info(
-                                    f'user_tasks[user_prompt].current_action:{user_tasks[user_prompt].current_action} == len(user_tasks[user_prompt].actions)')
-                                chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,
-                                                              silent=False)
-                                last_message = group_chat.messages[-1]
-                                current_app.logger.info(
-                                    f'HI I AM HERE AFTER FINAL SCHEDULED JSON NOW I WILL next actions')
-                                current_app.logger.info(
-                                    f'recipe_for_persona[user_prompt]:{recipe_for_persona[user_prompt]} total_persona_actions[user_prompt]:{total_persona_actions[user_prompt]}')
-                                if recipe_for_persona[user_prompt] < total_persona_actions[user_prompt]:
-                                    current_app.logger.info(f'Completed ONE FLOW NOW WE SHOULD WORK ON NEXT FLOW')
-                                    current_app.logger.info(f'DELETED CURRENT AGENTS AND CREATE NEW')
-                                    with open(f"prompts/{prompt_id}.json", 'r') as f:
-                                        config = json.load(f)
-                                    # recipe_for_persona[user_prompt] += 1
-                                    user_tasks[user_prompt] = Action(
-                                        config['flows'][recipe_for_persona[user_prompt]]['actions'])
-                                    del user_agents[user_prompt]
-                                    x = get_response_group(user_id, text, prompt_id)
-                                    continue
-                                scheduler_check[user_prompt] = True
-                                json_response = final_recipe[prompt_id]
-                                return 'Agent created successfully'
+                        individual_recipe = []
+                        for i in range(1,(user_tasks[user_prompt].current_action)):
+                            current_app.logger.info(f'checking for prompts/{prompt_id}_{flow}_{i}.json')
+                            try:
+                                with open(f"prompts/{prompt_id}_{flow}_{i}.json", 'r') as f:
+                                    config = json.load(f)
+                                    individual_recipe.append(config)
                             except Exception as e:
-                                current_app.logger.error(f"Error in topological sort: {e}")
-                                current_app.logger.error(traceback.format_exc())
-                                return f"Error processing action dependencies: {str(e)}"
-                        except Exception as e:
-                            current_app.logger.error(f"Error processing individual recipes: {e}")
-                            current_app.logger.error(traceback.format_exc())
-                            return f"Error processing recipes: {str(e)}"
+                                current_app.logger.error(f'Got error as :{e} while checking for prompts/{prompt_id}_{flow}_{i}.json')
+                        #TOPOLOGICAL SORT & CHECK FOR CYCLIC DEPENDENCY
+                        status,updated_actions, cyc = topological_sort(individual_recipe)
+                        if not status:
+                            res = fix_actions(individual_recipe,cyc)
+                            for i in res:
+                                for j in individual_recipe:
+                                    if i['action_id'] == j['action_id']:
+                                        j['actions_this_action_depends_on'] = i['actions_this_action_depends_on']
+                                        break
+                            status,updated_actions, cyc = topological_sort(individual_recipe)
+                        group_chat.messages[-1]['content'] = f'{updated_actions}'
+                        file_path = f'prompts/{prompt_id}.json'
+                        with open(file_path, 'r') as f:
+                            data = json.load(f)
+                            role = data['flows'][recipe_for_persona[user_prompt]]['persona']
+                        message = '''Reflect on the sequence of tasks and create scheduled_tasks with proper persona name and action_entry_point. Provide the output in the following JSON format:
+                            { "status", "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer `action_id` from the list of existing `action_ids` is required as the starting point to perform this job.","action_exit_point":"An integer `action_id` up to which the job should be performed to complete the task. It can be greater than or equal to the entry point.","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ], "visual_scheduled_tasks": [ { "cron_expression": "Create this only if a visual time-based job is present; if no visual time-based job exists, do not create it.","persona":"", "job_description": "Provide a description of the visual scheduled job without specifying the time or frequency" } ] }'''
 
-                    # Send the prepared message
-                    try:
-                        current_app.logger.info(f"Sending final message: {message[:50]}...")
-                        result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,
-                                                               silent=False)
-                        current_app.logger.info("Successfully sent final message")
-                    except Exception as e:
-                        current_app.logger.error(f"Error sending final message: {e}")
-                        return f"Error in final processing: {str(e)}"
-
-                # Handle normal action processing (not at end of actions)
+                        final_recipe[prompt_id] = {"status":"completed","actions":updated_actions}
+                        assistant_agent.update_system_message = '''Reflect on the sequence of tasks and create scheduled_tasks with proper persona name and action_entry_point. Provide the output in the following JSON format:
+                        { "status", "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer `action_id` from the list of existing `action_ids` is required as the starting point to perform this job.","action_exit_point":"An integer `action_id` up to which the job should be performed to complete the task. It can be greater than or equal to the entry point.","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ], "visual_scheduled_tasks": [ { "cron_expression": "Create this only if a visual time-based job is present; if no visual time-based job exists, do not create it.","persona":"", "job_description": "Provide a description of the visual scheduled job without specifying the time or frequency" } ] }'''
+                        current_app.logger.info(f'user_tasks[user_prompt].current_action:{user_tasks[user_prompt].current_action} == len(user_tasks[user_prompt].actions)')
+                        chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
+                        last_message = group_chat.messages[-1]
+                        current_app.logger.info(f'HI I AM HERE AFTER FINAL SCHEDULED JSON NOW I WILL next actions')
+                        current_app.logger.info(f'recipe_for_persona[user_prompt]:{recipe_for_persona[user_prompt]} total_persona_actions[user_prompt]:{total_persona_actions[user_prompt]}')
+                        if recipe_for_persona[user_prompt]  < total_persona_actions[user_prompt]:
+                            current_app.logger.info(f'Completed ONE FLOW NOW WE SHOULD WORK ON NEXT FLOW')
+                            current_app.logger.info(f'DELETED CURRENT AGENTS AND CREATE NEW')
+                            with open(f"prompts/{prompt_id}.json", 'r') as f:
+                                config = json.load(f)
+                            # recipe_for_persona[user_prompt] += 1
+                            user_tasks[user_prompt] = Action(config['flows'][recipe_for_persona[user_prompt]]['actions'])
+                            del user_agents[user_prompt]
+                            x = get_response_group(user_id,text,prompt_id)
+                            continue
+                        scheduler_check[user_prompt] = True
+                        json_response = final_recipe[prompt_id]
+                        # if json_response and 'status' in json_response.keys():
+                        #     merged_dict = {**final_recipe[prompt_id], **json_response}
+                        #     current_app.logger.info('Recipe created successfully')
+                        #     time_agents[user_prompt] = create_time_agents(user_id,prompt_id,'creator','',[]) #TODO Replace [] with actions
+                        #     #TODO REMOVE FOR LOOP USE SCHEDULER ALL AT ONCE WITH 1 SEC INTERVAL
+                        #     for jobs in merged_dict['scheduled_tasks']:
+                        #         time_based_execution(jobs['job_description'],user_id,prompt_id,jobs['action_entry_point'])
+                        #     flow = recipe_for_persona[user_prompt]
+                        #     name = f'prompts/{prompt_id}_{flow}_recipe.json'
+                        #     with open(name, "w") as json_file:
+                        #         json.dump(merged_dict, json_file)
+                        #     url = f'https://mailer.hertzai.com/update_agent_prompt?prompt_id={prompt_id}'
+                        #     headers = {'Content-Type': 'application/json'}
+                        #     res = requests.patch(url,headers=headers)
+                        #     current_app.logger.info('Completed from here')
+                        #     return 'Agent Created Successfully'
+                        return 'Agent created successfully'
+                    result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
                 else:
-                    current_app.logger.info("Processing next action")
+                    # user_tasks[user_prompt].current_action = int(json_obj['action_id'])
+                    current_app.logger.info(f'current action {user_tasks[user_prompt].current_action} & fallback {user_tasks[user_prompt].fallback} & recipe {user_tasks[user_prompt].recipe}')
                     user_tasks[user_prompt].new_json.append(json_obj)
-
                     try:
                         message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
-                        current_app.logger.info(f"Got next action: {message[:50]}...")
-                    except Exception as e:
-                        current_app.logger.error(f"Error getting next action: {e}")
-                        # Extensive error handling for this case...
-                        # This section is quite large and complex
+                    except:
+                        flow = recipe_for_persona[user_prompt]
+                        individual_recipe = []
+                        for i in range(1,(user_tasks[user_prompt].current_action)):
+                            current_app.logger.info(f'checking for prompts/{prompt_id}_{flow}_{i}.json')
+                            try:
+                                with open(f"prompts/{prompt_id}_{flow}_{i}.json", 'r') as f:
+                                    config = json.load(f)
+                                    individual_recipe.append(config)
+                            except Exception as e:
+                                current_app.logger.error(f'Got error as :{e} while checking for prompts/{prompt_id}_{flow}_{i}.json')
+                        group_chat.messages[-1]['content'] = f'{individual_recipe}'
+                        assistant_agent.update_system_message = 'Check if the current_action depends on any other action, regardless of order it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.'
+                        for num,action in enumerate(user_tasks[user_prompt].actions,1):
+                            message = f'''Check if the current_action depends on any other action, regardless of order it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.\n current_action: {action}'''
+                            result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
+                            for i in range(1,4):
+                                text = group_chat.messages[-i]['content']
+                                match = re.search(r'\[.*?\]', text)
+                                if match:
+                                    break
+                            if match:
+                                action_ids = eval(match.group())
+                                file_path = f'prompts/{prompt_id}_{flow}_{num}.json'
+                                with open(file_path, 'r') as f:
+                                    data = json.load(f)
+                                data['actions_this_action_depends_on'] = action_ids
+                                with open(file_path, 'w') as f:
+                                    json.dump(data, f, indent=4)
+                            else:
+                                file_path = f'prompts/{prompt_id}_{flow}_{num}.json'
+                                with open(file_path, 'r') as f:
+                                    data = json.load(f)
+                                data['actions_this_action_depends_on'] = []
+                                with open(file_path, 'w') as f:
+                                    json.dump(data, f, indent=4)
 
-                    # Handle recipe/fallback flags
-                    current_app.logger.info(
-                        f"Checking flags: fallback={user_tasks[user_prompt].fallback}, recipe={user_tasks[user_prompt].recipe}")
+                        individual_recipe = []
+                        for i in range(1,(user_tasks[user_prompt].current_action)):
+                            current_app.logger.info(f'checking for prompts/{prompt_id}_{flow}_{i}.json')
+                            try:
+                                with open(f"prompts/{prompt_id}_{flow}_{i}.json", 'r') as f:
+                                    config = json.load(f)
+                                    individual_recipe.append(config)
+                            except Exception as e:
+                                current_app.logger.error(f'Got error as :{e} while checking for prompts/{prompt_id}_{flow}_{i}.json')
+                        status,updated_actions, cyc = topological_sort(individual_recipe)
+                        if not status:
+                            res = fix_actions(individual_recipe,cyc)
+                            for i in res:
+                                for j in individual_recipe:
+                                    if i['action_id'] == j['action_id']:
+                                        j['actions_this_action_depends_on'] = i['actions_this_action_depends_on']
+                                        break
+                            status,updated_actions, cyc = topological_sort(individual_recipe)
+
+                        group_chat.messages[-1]['content'] = f'{updated_actions}'
+                        file_path = f'prompts/{prompt_id}.json'
+                        with open(file_path, 'r') as f:
+                            data = json.load(f)
+                            role = data['flows'][recipe_for_persona[user_prompt]]['persona']
+                        final_recipe[prompt_id] = {"status":"completed","actions":updated_actions}
+                        assistant_agent.update_system_message = '''Reflect on the sequence of tasks and create scheduled_tasks with proper persona name and action_entry_point. Provide the output in the following JSON format:
+                        { "status", "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer `action_id` from the list of existing `action_ids` is required as the starting point to perform this job.","action_exit_point":"An integer `action_id` up to which the job should be performed to complete the task. It can be greater than or equal to the entry point.","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ], "visual_scheduled_tasks": [ { "cron_expression": "Create this only if a visual time-based job is present; if no visual time-based job exists, do not create it.","persona":"", "job_description": "Provide a description of the visual scheduled job without specifying the time or frequency" } ] }'''
+                        message = '''Reflect on the sequence of tasks and create scheduled_tasks with proper persona name and action_entry_point. Provide the output in the following JSON format:
+                        { "status", "completed","dependency":[{"action_id":"action id in integer here e.g. 1,2","actions_this_action_depends_on":[e.g. 1,2,3]}], "recipe": "you should keep it blank.", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer `action_id` from the list of existing `action_ids` is required as the starting point to perform this job.","action_exit_point":"An integer `action_id` up to which the job should be performed to complete the task. It can be greater than or equal to the entry point.","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ], "visual_scheduled_tasks": [ { "cron_expression": "Create this only if a visual time-based job is present; if no visual time-based job exists, do not create it.","persona":"", "job_description": "Provide a description of the visual scheduled job without specifying the time or frequency" } ] }'''
+                        chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
+                        last_message = group_chat.messages[-1]
+                        json_response = retrieve_json(last_message['content'])
+                        if json_response and 'status' in json_response.keys():
+                            merged_dict = {**final_recipe[prompt_id], **json_response}
+                            current_app.logger.info('Recipe created successfully')
+                            name = f'prompts/{prompt_id}_{flow}_recipe.json'
+                            with open(name, "w") as json_file:
+                                json.dump(merged_dict, json_file)
+                            url = f'https://mailer.hertzai.com/update_agent_prompt?prompt_id={prompt_id}'
+                            headers = {'Content-Type': 'application/json'}
+                            res = requests.patch(url,headers=headers)
+                            current_app.logger.info('Completed from here2')
+                            return 'Agent Created Successfully'
+                        return 'Agent created successfully'
+                    current_app.logger.info('checking for fallback and recipe')
                     if user_tasks[user_prompt].recipe == True:
-                        # Recipe creation logic
-                        current_app.logger.info("Creating recipe")
                         user_tasks[user_prompt].recipe = False
                         user_tasks[user_prompt].fallback = False
-
-                        try:
-                            metadata = strip_json_values(agent_data[prompt_id])
-                            message = '''Focus on the current task at hand and create a detailed recipe that includes only the necessary steps for this action, along with a suitable name. Provide the output in the following JSON format:
-                                               { "status", "done", "action": "Describe the action performed here","fallback_action":"", "persona":"","action_id": ''' + f'{user_tasks[user_prompt].current_action}' + ''', "recipe": [{{"steps":"steps here","tool_name":"Only include tool name here if used for this step.","generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely."}}],"can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
-                                               Recipe Requirements:
-                                               1. Generalized Python Functions: Give the code which was created and excuted successfully without any error handling edge cases. leave it blank when there is no code nedded to perform the action
-                                               2. Avoid directly storing any specific information provided by the author in the recipe. Use placeholders for variables instead.
-                                               3. Ensure that coding and non-coding steps are not combined within the same function.
-                                               4. For all Python functions, include comprehensive docstrings to explain their purpose, parameters, and usage. This should especially clarify non-coding steps that require utilizing the assistant's language capabilities.
-                                               5. If any internal tool is used to complete a step, provide detailed instructions on how to call or utilize that tool instead of providing the code for that step.
-                                               ''' + f'6. Metadata created till this action: {metadata}\n7. The persona must be one of the following: {role}. No other personas are allowed.'
-                        except Exception as e:
-                            current_app.logger.error(f"Error preparing recipe message: {e}")
-                            message = "Please create a detailed recipe for this action."
-
+                        metadata = strip_json_values(agent_data[prompt_id])
+                        message = '''Focus on the current task at hand and create a detailed recipe that includes only the necessary steps for this action, along with a suitable name. Provide the output in the following JSON format:
+                        { "status", "done", "action": "Describe the action performed here","fallback_action":"", "persona":"","action_id": '''+f'{user_tasks[user_prompt].current_action}'+''', "recipe": [{{"steps":"steps here","tool_name":"Only include tool name here if used for this step.","generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely."}}],"can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
+                        Recipe Requirements:
+                        1. Generalized Python Functions: Give the code which was created and excuted successfully without any error handling edge cases. leave it blank when there is no code nedded to perform the action
+                        2. Avoid directly storing any specific information provided by the author in the recipe. Use placeholders for variables instead.
+                        3. Ensure that coding and non-coding steps are not combined within the same function.
+                        4. For all Python functions, include comprehensive docstrings to explain their purpose, parameters, and usage. This should especially clarify non-coding steps that require utilizing the assistant's language capabilities.
+                        5. If any internal tool is used to complete a step, provide detailed instructions on how to call or utilize that tool instead of providing the code for that step.
+                        '''+f'6. Metadata created till this action: {metadata}\n7. The persona must be one of the following: {role}. No other personas are allowed.'
                     elif user_tasks[user_prompt].fallback == True:
-                        # Fallback handling
-                        current_app.logger.info("Setting up fallback")
                         user_tasks[user_prompt].recipe = True
                         user_tasks[user_prompt].fallback = False
-                        message = f"Action {user_tasks[user_prompt].current_action} fallback:ask user what actions should be taken if current actions fail in the future after you get the response from user give the conversation to StatusVerifier agent"
-
+                        message = f"To Get Action {user_tasks[user_prompt].current_action} fallback: Ask USER what actions should be taken if current actions fail in the future after you get the response from user give the conversation to StatusVerifier agent"
                     else:
-                        # Normal action execution
-                        current_app.logger.info("Executing normal action")
+                        # user_tasks[user_prompt].current_action = user_tasks[user_prompt].current_action+1
                         task_time[prompt_id]['timer'] = time.time()
-                        message = f'Action {user_tasks[user_prompt].current_action + 1}: {message} '
+                        message = f'Execute Action {user_tasks[user_prompt].current_action+1}: {message} '
+                        crossbar_message = {"text": ["Working on "+message+".\n please evaluate the response i am giving to check if it meets the current action"], "priority": 49, "action": 'Thinking', "historical_request_id": [], "preffered_language": 'en-US', "options": [], "newoptions": [], "bot_type": 'Agent', "page_image_url": "", "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
+                        'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0}, 'bottom_left': {'x': 0, 'y': 0}}}
+                        result = client.publish(
+                            f"com.hertzai.hevolve.chat.{user_id}", json.dumps(crossbar_message))
 
-                        # Send crossbar message
-                        try:
-                            crossbar_message = {"text": [
-                                "Working on " + message + ".\n please evaluate the response i am giving to check if it meets the current action"],
-                                                "priority": 49, "action": 'Thinking', "historical_request_id": [],
-                                                "preffered_language": 'en-US', "options": [], "newoptions": [],
-                                                "bot_type": 'Agent', "page_image_url": "", "analogy_image_url": '',
-                                                "request_id": "123456", "zoom_bounding_box": {
-                                    'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0},
-                                    'bottom_right': {'x': 0, 'y': 0}, 'bottom_left': {'x': 0, 'y': 0}}}
-                            client.publish(f"com.hertzai.hevolve.chat.{user_id}", f'{crossbar_message}')
-                            current_app.logger.info("Published crossbar message")
-                        except Exception as e:
-                            current_app.logger.error(f"Error publishing crossbar message: {e}")
+                    result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False) #It fails here
+                current_app.logger.info("\n=== Chat Summary ===")
+                current_app.logger.info("\n=== Full response ===")
+                # current_app.logger.info(result)
 
-                    # Send the action message
-                    try:
-                        current_app.logger.info(f"Sending action message: {message[:50]}...")
-                        result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,
-                                                               silent=False)
-                        current_app.logger.info("Successfully sent action message")
-                    except Exception as e:
-                        current_app.logger.error(f"Error sending action message: {e}")
-                        return f"Error processing next action: {str(e)}"
-
-            # Handle "Focus on current task" message from Assistant
             elif group_chat.messages[-1]['content'].startswith('Focus on the current task at hand'):
-                current_app.logger.info("Found 'Focus on current task' message, continuing with assistant")
-                try:
-                    result = agents_object['assistant'].initiate_chat(recipient=manager, message=message,
+                result = agents_object['assistant'].initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
+                continue
+            elif user_tasks[user_prompt].current_action < len(user_tasks[user_prompt].actions):
+                current_app.logger.info(f'current action {user_tasks[user_prompt].current_action} and length of actions is {len(user_tasks[user_prompt].actions)} but no matching condition found')
+
+                if len(group_chat.messages) == 0:
+                    current_app.logger.warning("No messages in group chat after processing")
+                last_message = group_chat.messages[-1]
+
+                if 'tool_calls' in last_message:
+                    current_app.logger.info(
+                        f'current action {user_tasks[user_prompt].current_action} continuing since we need to wait for tool cal response')
+
+                    continue
+
+                if last_message['content'] == 'TERMINATE':
+                    last_message = group_chat.messages[-2]
+
+                if f'message_2_user'.lower() in last_message['content'].lower():
+                    json_obj = retrieve_json(last_message["content"])
+                    if json_obj:
+                        try:
+                            last_message['content'] = json_obj['message_2_user']
+                        except:
+                            pass
+                    return last_message['content']
+
+                execute_action_pattern = r'execute\s+action\s*\d*\s*:?'
+                if re.search(execute_action_pattern, last_message['content'], re.IGNORECASE):
+                    result = agents_object['assistant'].initiate_chat(recipient=manager, message=last_message['content'],
                                                                       clear_history=False, silent=False)
-                    current_app.logger.info("Successfully redirected to assistant")
-                except Exception as e:
-                    current_app.logger.error(f"Error redirecting to assistant: {e}")
-                continue
-            elif f'@user'.lower() not in last_message.lower():
-                current_app.logger.info(f'continuing since @user not in last message')
-                continue
-            else:
-                current_app.logger.info(f'@user in last message')
+                else:
+                    continue
+
+
+            # Continue with existing termination logic
+            if user_tasks[user_prompt].current_action > len(user_tasks[user_prompt].actions):
+                current_app.logger.info(f'current action {user_tasks[user_prompt].current_action} is greater than length {len(user_tasks[user_prompt].actions)}')
                 break
 
-            # Break loop if we've reached the end of actions
-            if user_tasks[user_prompt].current_action > len(user_tasks[user_prompt].actions):
-                current_app.logger.info(
-                    f"Current action {user_tasks[user_prompt].current_action} exceeds actions length {len(user_tasks[user_prompt].actions)}, breaking loop")
-                break
+            if not lifecycle_hook_track_termination(user_prompt, user_tasks, group_chat) and not lifecycle_hook_track_fallback_request(user_prompt, user_tasks, group_chat):
+                messages[user_prompt] = group_chat.messages
+
+                if len(group_chat.messages) == 0:
+                    current_app.logger.warning("No messages in group chat after processing")
+
+                last_message = group_chat.messages[-1]
+                if last_message['content'] == 'TERMINATE':
+                    last_message = group_chat.messages[-2]
+
+                if f'message_2_user'.lower() in last_message['content'].lower():
+                    json_obj = retrieve_json(last_message["content"])
+                    if json_obj:
+                        try:
+                            last_message['content'] = json_obj['message_2_user']
+                            return last_message['content']
+                        except:
+                            pass
+                else:
+                    continue
+
+
 
         # Log loop exit
         if while_loop_iterations >= max_iterations:
@@ -2007,36 +2646,25 @@ def get_response_group(user_id, text, prompt_id, Failure=False, error=None):
 
         if len(group_chat.messages) == 0:
             current_app.logger.warning("No messages in group chat after processing")
-            return "Processing failed - no messages generated"
 
-        # Get the last relevant message
         last_message = group_chat.messages[-1]
         if last_message['content'] == 'TERMINATE':
-            current_app.logger.info("Last message is TERMINATE, using second-to-last message")
-            if len(group_chat.messages) > 1:
-                last_message = group_chat.messages[-2]
-            else:
-                current_app.logger.warning("Only one message (TERMINATE) in group chat")
-                return "Processing completed but no content was generated"
+            last_message = group_chat.messages[-2]
 
-        # Handle message_2_user in content
         if f'message_2_user'.lower() in last_message['content'].lower():
-            current_app.logger.info("Found message_2_user in last message")
-            try:
-                json_obj = retrieve_json(last_message["content"])
-                if json_obj and 'message_2_user' in json_obj:
-                    current_app.logger.info("Extracted message_2_user from JSON")
+            json_obj = retrieve_json(last_message["content"])
+            if json_obj:
+                try:
                     last_message['content'] = json_obj['message_2_user']
-            except Exception as e:
-                current_app.logger.error(f"Error extracting message_2_user: {e}")
+                except:
+                    pass
 
-        current_app.logger.info(f"END: get_response_group returning content: {last_message['content'][:50]}...")
         return last_message['content']
-
     except Exception as e:
         current_app.logger.error(f"Unhandled exception in get_response_group: {e}")
         current_app.logger.error(traceback.format_exc())
         return f"An error occurred: {str(e)}"
+
 
 
 messages = {}
@@ -2116,3 +2744,4 @@ def acknowledgment(user_id,prompt_id,request_id):
     user_prompt = f'{user_id}_{prompt_id}'
     author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = user_agents[user_prompt]
     group_chat.messages.append({'content':f'GOT MESSAGE ACKNOWLEDGEMENT FOR {request_id}','role':'user','name':'Helper'})
+

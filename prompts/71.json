@@ -17,7 +17,7 @@
             "flow_name": "story creation",
             "persona": "creator",
             "actions": [
-                "ask helper to use execute_windows_command to Open notepad and write hi",
+                "Create a 100-word story in the following format: (character 1 name) character 1 dialogue. (character 2 name) their dialogue and repeat this format till the end of the story making the story engaging, profound, and pushing the limits of human psychology to keep the listener wanting more.",
                 "Retrieve avatar IDs using the API: https://mailer.hertzai.com/all_teacher_only_avatars_id_user_id?user_id={user_id} and associate each character with a unique avatar ID from the response, saving that info as well.",
                 "Create videos for all dialogues at a time using the associated avatar ID.",
                 "Check the status of generated dialogue videos using the status API: https://mailer.hertzai.com/get-video-conv_id/{{conv_id}} for all conv_ids which do not have a status of success.",
