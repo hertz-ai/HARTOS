@@ -2303,7 +2303,7 @@ def status():
     return jsonify({'response': 'Working...'})
 
 if __name__ == '__main__':
-    serve(app, host='0.0.0.0', port=6777, threads=50)
+    serve(app, host='0.0.0.0', port=5000, threads=50)
     # app.debug = True
     # flask_thread = threading.Thread(target=lambda: serve(app, host='0.0.0.0', port=6777))
     # flask_thread.daemon = True
