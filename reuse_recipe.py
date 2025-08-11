@@ -2459,7 +2459,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
 
         count = 0
         while True:
-            current_app.logger.info('inside while1')
+            current_app.logger.info('inside reuse while1')
             if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
                 current_app.logger.info(
                     f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
