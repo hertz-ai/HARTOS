@@ -203,8 +203,9 @@ time_actions = {}
 scheduler_check = {}
 
 
-
 database_url = 'https://mailer.hertzai.com'
+
+
 def save_conversation_db(text,user_id,prompt_id,database_url,request_id):
     headers = {'Content-Type': 'application/json'}
     data = {
@@ -239,14 +240,12 @@ def send_message_to_user1(user_id,response,inp,prompt_id):
     res = requests.post(url,data=body,headers=headers)
 
 
-
 def execute_python_file(task_description:str,user_id: int,prompt_id:int,action_entry_point:int=0):
     headers = {'Content-Type': 'application/json'}
     url = 'http://localhost:6777/time_agent'
     data = json.dumps({'task_description':task_description,'user_id':user_id,'prompt_id':prompt_id,'action_entry_point':action_entry_point,'request_from':'Reuse'})
     res = requests.post(url,data=data,headers=headers)
     return 'done'
-
 
 
 def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_entry_point:int,actions:list=[]):
@@ -789,13 +788,14 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         data['chattts'] = False
         data['openvoice'] = "false"
         try:
-            res = requests.get("https://mailer.hertzai.com/get_image_by_id/{}".format(avatar_id))
+            res = requests.get("{}/get_image_by_id/{}".format(database_url, avatar_id))
             res = res.json()
             new_image_url = res["image_url"]
         except:
             data['openvoice'] = "true"
             new_image_url = None
             res = {'voice_id':None}
+
         data["cartoon_image"] = "True"
         data["bg_url"] = 'http://stream.mcgroce.com/txt/examples_cartoon/roy_bg.jpg'
         data['vtoonify'] = "false"
@@ -837,6 +837,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                         data=json.dumps(data), headers=headers, timeout=1)
         except:
             pass
+
         if data['chattts'] or data['flag_hallo'] == "true":
             return f"Video Generation task added to queue with conv_id:{conv_id}. Ask the helper to save this conv_id in the same collection from which the story used to generate the video was retrieved, for future reference"
         else:
@@ -1335,7 +1336,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             user_tasks[user_prompt].current_action = 0
             user_tasks[user_prompt].fallback = False
             user_tasks[user_prompt].recipe = False
-            prompt_json_config, total_actions = get_total_actions(prompt_id, user_prompt)
+            config, total_actions = get_total_actions_for_current_flow(prompt_id, user_prompt)
 
             reset_to_assigned_for_all_actions(total_actions, user_prompt)
 
@@ -1837,7 +1838,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         data['openvoice'] = "false"  # String - downstream: str().lower() == "true"
 
         try:
-            res = requests.get(f"https://mailer.hertzai.com/get_image_by_id/{avatar_id}")
+            res = requests.get(f"{database_url}/get_image_by_id/{avatar_id}")
             res = res.json()
             new_image_url = res["image_url"]
             voice_id = res.get('voice_id')
@@ -2334,6 +2335,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         message = f'Lets continue the work we were doing, if action is completed then ask @statusverifier Agent to Please tell the status of the action {user_tasks[user_prompt].current_action+1}: {actions_prompt}'
                     result = agents_object['helper'].initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
                     continue
+
                 current_app.logger.info('resuming chat')
                 #When all actions in a particular flow ends or for the last action
                 if user_tasks[user_prompt].current_action >= len(user_tasks[user_prompt].actions):
@@ -2360,21 +2362,17 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
 
                         # Only proceed if action completed full lifecycle (DONE state)
 
-                        # if recipe_for_persona[user_prompt]  < total_persona_actions[user_prompt]:
-                        #     recipe_for_persona[user_prompt] += 1
                         user_tasks[user_prompt].new_json.append(json_obj)
                         user_tasks[user_prompt].current_action += 1 #all actions completed
-                        # name = f'prompts/{prompt_id}_new.json'
-                        # with open(name, "w") as json_file:
-                        #     json.dump(user_tasks[user_prompt].new_json, json_file)
+
                         current_app.logger.info('updating updated action in .json')
                         individual_recipe = []
-                        flow = recipe_for_persona[user_prompt]
+                        flow = get_current_flow(user_prompt)
                         set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt)
 
                         group_chat.messages[-1]['content'] = f'{individual_recipe}'
                         assistant_agent.update_system_message = 'Check if the current_action depends on any other action, regardless of order it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.'
-                        flow = recipe_for_persona[user_prompt]
+                        flow = get_current_flow(user_prompt)
 
                         for num,action in enumerate(user_tasks[user_prompt].actions,1):
                             try:
@@ -2423,12 +2421,12 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
 
                         group_chat.messages[-1]['content'] = f'{updated_actions}'
                         data = get_prompt_config_json(prompt_id)
-                        role = data['flows'][recipe_for_persona[user_prompt]]['persona']
+                        role = data['flows'][get_current_flow(user_prompt)]['persona']
 
                         message = begin_agent_convo_to_get_schedulers(assistant_agent, chat_instructor, manager, prompt_id, updated_actions, user_prompt)
                         last_message = group_chat.messages[-1]
                         current_app.logger.info(f'HI I AM HERE AFTER FINAL SCHEDULED JSON NOW I WILL next actions')
-                        current_app.logger.info(f'recipe_for_persona[user_prompt]:{recipe_for_persona[user_prompt]} total_persona_actions[user_prompt]:{total_persona_actions[user_prompt]}')
+                        current_app.logger.info(f'Current Flow -> recipe_for_persona[user_prompt]:{recipe_for_persona[user_prompt]} total_persona_actions[user_prompt]:{total_persona_actions[user_prompt]}')
                         if recipe_for_persona[user_prompt]  < total_persona_actions[user_prompt]:
                             current_app.logger.info(f'Completed ONE FLOW NOW WE SHOULD WORK ON NEXT FLOW')
                             current_app.logger.info(f'DELETE CURRENT AGENTS AND CREATE NEW')
@@ -2513,7 +2511,8 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                             name = f'prompts/{prompt_id}_{flow}_recipe.json'
                             with open(name, "w") as json_file:
                                 json.dump(merged_dict, json_file)
-                            url = f'https://mailer.hertzai.com/update_agent_prompt?prompt_id={prompt_id}'
+
+                            url = f'{database_url}/update_agent_prompt?prompt_id={prompt_id}'
                             headers = {'Content-Type': 'application/json'}
                             res = requests.patch(url,headers=headers)
                             current_app.logger.info('Completed from here2')
@@ -2785,17 +2784,16 @@ def recipe(user_id, text,prompt_id,file_id,request_id):
 
     if user_prompt not in user_tasks.keys():
         scheduler_check[user_prompt] = False
-        prompt_json_config, total_actions = get_total_actions(prompt_id, user_prompt)
+        config, total_actions = get_total_actions_for_current_flow(prompt_id, user_prompt)
         #lifecycle1 All Actions To ASSIGNED
         for action_id in range(1, total_actions + 1):
             safe_set_state(user_prompt, action_id, ActionState.ASSIGNED, "initial setup")
         recipe_for_persona[user_prompt] = 0
-        total_persona_actions[user_prompt] = len(prompt_json_config['flows'])
+        total_persona_actions[user_prompt] = len(config['flows'])
         agent_data[prompt_id] = {'user_id':user_id}
+
     try:
-
         last_response = get_response_group(user_id, text, prompt_id)
-
     except Exception as e:
         current_app.logger.error(f"Error occurred in create Recipe: {str(e)}")  # Add logging for debugging
         error_message = traceback.format_exc()  # Capture full traceback
@@ -2830,7 +2828,7 @@ def recipe(user_id, text,prompt_id,file_id,request_id):
 
 
 def update_agent_creation_to_db(prompt_id):
-    url = f'https://mailer.hertzai.com/update_agent_prompt?prompt_id={prompt_id}'
+    url = f'{database_url}/update_agent_prompt?prompt_id={prompt_id}'
     headers = {'Content-Type': 'application/json'}
     res = requests.patch(url, headers=headers)
 
@@ -2861,7 +2859,7 @@ def create_time_agents_and_create_scheduled_jobs(flows, number_of_flows, prompt_
     return merged_dict
 
 
-def get_total_actions(prompt_id, user_prompt):
+def get_total_actions_for_current_flow(prompt_id, user_prompt):
     flow_idx = get_current_flow(user_prompt)
     config = get_prompt_config_json(prompt_id)
     user_tasks[user_prompt] = Action(config['flows'][flow_idx]['actions'])
