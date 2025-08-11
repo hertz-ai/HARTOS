@@ -608,7 +608,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     agents_object = {}
     with open(f"prompts/{prompt_id}.json", 'r') as f:
             config = json.load(f)
-            list_of_persona = config['flows'][recipe_for_persona[user_prompt]]['persona']
+            list_of_persona = config['flows'][get_current_flow(user_prompt)]['persona']
             current_app.logger.info(f'WORKING persona as {list_of_persona}')
     # Create assistant agent
     # Create assistant agent
@@ -1220,7 +1220,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                             if current_state == ActionState.RECIPE_RECEIVED:  # State was set in Location 1
                                 # Recipe received, save it
                                 current_app.logger.info('Got Individual action recipe save it')
-                                flow = recipe_for_persona[user_prompt]
+                                flow = get_current_flow(user_prompt)
                                 name = f'prompts/{prompt_id}_{flow}_{json_obj["action_id"]}.json'
                                 user_tasks[user_prompt].fallback = False
                                 user_tasks[user_prompt].recipe = False
@@ -1337,7 +1337,6 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             user_tasks[user_prompt].fallback = False
             user_tasks[user_prompt].recipe = False
             config, total_actions = get_total_actions_for_current_flow(prompt_id, user_prompt)
-
             reset_to_assigned_for_all_actions(total_actions, user_prompt)
 
         except Exception as e:
@@ -1357,16 +1356,17 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     def create_individual_recipe_and_terminate(current_action_id, json_obj, user_prompt):
         current_app.logger.info('Recipe created successfully')
         merged_dict = {**final_recipe[prompt_id], **json_obj}
-        flow = recipe_for_persona[user_prompt]
+        flow = get_current_flow(user_prompt)
         name = f'prompts/{prompt_id}_{flow}_recipe.json'
         with open(name, "w") as json_file:
             json.dump(merged_dict, json_file)
         current_app.logger.info(f"Dictionary saved to {name}")
-        recipe_for_persona[user_prompt] += 1
-        user_tasks[user_prompt] = Action(config['flows'][recipe_for_persona[user_prompt]]['actions'])
-        final_recipe[prompt_id] = merged_dict
         force_state_through_valid_path(user_prompt, current_action_id, ActionState.TERMINATED,
                                        "verified complete")
+        final_recipe[prompt_id] = merged_dict
+
+        increment_current_flow(user_prompt)
+        user_tasks[user_prompt] = Action(config['flows'][get_current_flow(user_prompt)]['actions'])
 
     all_agents = [assistant, executor, author, chat_instructor,helper,verify]
     all_agents.extend(custom_agents)
@@ -2248,10 +2248,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             current_state = get_action_state(user_prompt, current_action_id)
 
             message = f'Execute Action {user_tasks[user_prompt].current_action+1}: {message} '+f',Latest User message: {text}'
-            crossbar_message = {"text": ["Working on "+message+".\n please evaluate the response i am giving to check if it meets the current action"], "priority": 49, "action": 'Thinking', "historical_request_id": [], "preffered_language": 'en-US', "options": [], "newoptions": [], "bot_type": 'Agent', "page_image_url": "", "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
-            'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0}, 'bottom_left': {'x': 0, 'y': 0}}}
-            result = client.publish(
-                f"com.hertzai.hevolve.chat.{user_id}", json.dumps(crossbar_message))
+            publish_to_crossbar_new_action_start(message, user_id)
             task_time[prompt_id] = {'timer':time.time(),'times':[]}
 
             # Only transition if we're in ASSIGNED state (first time)
@@ -2427,12 +2424,12 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         last_message = group_chat.messages[-1]
                         current_app.logger.info(f'HI I AM HERE AFTER FINAL SCHEDULED JSON NOW I WILL next actions')
                         current_app.logger.info(f'Current Flow -> recipe_for_persona[user_prompt]:{recipe_for_persona[user_prompt]} total_persona_actions[user_prompt]:{total_persona_actions[user_prompt]}')
-                        if recipe_for_persona[user_prompt]  < total_persona_actions[user_prompt]:
+                        if get_current_flow(user_prompt)  < total_persona_actions[user_prompt]:
                             current_app.logger.info(f'Completed ONE FLOW NOW WE SHOULD WORK ON NEXT FLOW')
                             current_app.logger.info(f'DELETE CURRENT AGENTS AND CREATE NEW')
                             config = get_prompt_config_json(prompt_id)
                             # recipe_for_persona[user_prompt] += 1
-                            user_tasks[user_prompt] = Action(config['flows'][recipe_for_persona[user_prompt]]['actions'])
+                            user_tasks[user_prompt] = Action(config['flows'][get_current_flow(user_prompt)]['actions'])
                             del user_agents[user_prompt]
                             x = get_response_group(user_id,text,prompt_id)
                             continue
@@ -2463,7 +2460,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     try:
                         message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
                     except:
-                        flow = recipe_for_persona[user_prompt]
+                        flow = get_current_flow(user_prompt)
                         individual_recipe = []
                         set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt)
                         group_chat.messages[-1]['content'] = f'{individual_recipe}'
@@ -2508,16 +2505,12 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         if json_response and 'status' in json_response.keys():
                             merged_dict = {**final_recipe[prompt_id], **json_response}
                             current_app.logger.info('Recipe created successfully')
-                            name = f'prompts/{prompt_id}_{flow}_recipe.json'
-                            with open(name, "w") as json_file:
-                                json.dump(merged_dict, json_file)
-
-                            url = f'{database_url}/update_agent_prompt?prompt_id={prompt_id}'
-                            headers = {'Content-Type': 'application/json'}
-                            res = requests.patch(url,headers=headers)
+                            create_final_recipe_for_current_flow(flow,merged_dict, prompt_id)
+                            update_agent_creation_to_db(prompt_id)
                             current_app.logger.info('Completed from here2')
                             return 'Agent Created Successfully'
                         return 'Agent created successfully'
+
                     current_app.logger.info('checking for fallback and recipe')
 
                     if user_tasks[user_prompt].recipe == True:
@@ -2526,12 +2519,8 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         message = request_fallback_for_action(current_action_id,  user_prompt)
                     else:
                         # user_tasks[user_prompt].current_action = user_tasks[user_prompt].current_action+1
-                        task_time[prompt_id]['timer'] = time.time()
-                        message = f'Execute Action {user_tasks[user_prompt].current_action+1}: {message} '
-                        crossbar_message = {"text": ["Working on "+message+".\n please evaluate the response i am giving to check if it meets the current action"], "priority": 49, "action": 'Thinking', "historical_request_id": [], "preffered_language": 'en-US', "options": [], "newoptions": [], "bot_type": 'Agent', "page_image_url": "", "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
-                        'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0}, 'bottom_left': {'x': 0, 'y': 0}}}
-                        result = client.publish(
-                            f"com.hertzai.hevolve.chat.{user_id}", json.dumps(crossbar_message))
+                        message = get_execute_next_action_message(message, prompt_id, user_prompt)
+                        publish_to_crossbar_new_action_start(message, user_id)
 
                     result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
 
@@ -2652,6 +2641,24 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
         return f"An error occurred: {str(e)}"
 
 
+def publish_to_crossbar_new_action_start(message, user_id):
+    crossbar_message = {"text": [
+        "Working on " + message + ".\n please evaluate the response i am giving to check if it meets the current action"],
+                        "priority": 49, "action": 'Thinking', "historical_request_id": [],
+                        "preffered_language": 'en-US', "options": [], "newoptions": [], "bot_type": 'Agent',
+                        "page_image_url": "", "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
+            'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0},
+            'bottom_left': {'x': 0, 'y': 0}}}
+    result = client.publish(
+        f"com.hertzai.hevolve.chat.{user_id}", json.dumps(crossbar_message))
+
+
+def get_execute_next_action_message(message, prompt_id, user_prompt):
+    task_time[prompt_id]['timer'] = time.time()
+    message = f'Execute Action {user_tasks[user_prompt].current_action + 1}: {message} '
+    return message
+
+
 def begin_agent_convo_to_get_schedulers_not_last(assistant_agent, chat_instructor,  manager, prompt_id,  updated_actions, user_prompt):
 
     final_recipe[prompt_id] = {"status": "completed", "actions": updated_actions}
@@ -2749,7 +2756,7 @@ def set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt):
 def load_persona_role(prompt_id, user_prompt):
     try:
         data = get_prompt_config_json(prompt_id)
-        role = data['flows'][recipe_for_persona[user_prompt]]['persona']
+        role = data['flows'][get_current_flow(user_prompt)]['persona']
         current_app.logger.info(f"Loaded role={role} from config")
     except Exception as e:
         current_app.logger.error(f"Error loading role info: {e}")
@@ -2788,7 +2795,7 @@ def recipe(user_id, text,prompt_id,file_id,request_id):
         #lifecycle1 All Actions To ASSIGNED
         for action_id in range(1, total_actions + 1):
             safe_set_state(user_prompt, action_id, ActionState.ASSIGNED, "initial setup")
-        recipe_for_persona[user_prompt] = 0
+        initialise_current_flow_to_zero(user_prompt)
         total_persona_actions[user_prompt] = len(config['flows'])
         agent_data[prompt_id] = {'user_id':user_id}
 
@@ -2827,6 +2834,14 @@ def recipe(user_id, text,prompt_id,file_id,request_id):
     return last_response
 
 
+def initialise_current_flow_to_zero(user_prompt):
+    recipe_for_persona[user_prompt] = 0
+
+
+def increment_current_flow(user_prompt):
+    recipe_for_persona[user_prompt] += 1
+
+
 def update_agent_creation_to_db(prompt_id):
     url = f'{database_url}/update_agent_prompt?prompt_id={prompt_id}'
     headers = {'Content-Type': 'application/json'}
@@ -2840,8 +2855,12 @@ def create_final_recipe_for_current_flow(flow, merged_dict, prompt_id):
 
 
 def get_current_flow(user_prompt):
-    flow = recipe_for_persona[user_prompt]
-    return flow
+    if user_prompt in recipe_for_persona:
+        flow = recipe_for_persona[user_prompt]
+        return flow
+    else:
+        initialise_current_flow_to_zero(user_prompt)
+        return 0
 
 
 def create_time_agents_and_create_scheduled_jobs(flows, number_of_flows, prompt_id, user_id, user_prompt):
