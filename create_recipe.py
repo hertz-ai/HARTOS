@@ -543,12 +543,11 @@ async def subscribe_and_return(message, topic, time=1800000):
             except Exception as e:
                 current_app.logger.error(f"Error stopping component: {e}")
 
+    # Calculate timeout with a small buffer
+    actual_timeout = (time / 1000) + 5  # Add 5 second buffer
     try:
         # Start the component
         await component.start()
-
-        # Calculate timeout with a small buffer
-        actual_timeout = (time / 1000) + 5  # Add 5 second buffer
 
         # Wait for the response or timeout
         result = await asyncio.wait_for(response_future, timeout=actual_timeout)
@@ -1039,7 +1038,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         except Exception as e:
             error_message = traceback.format_exc()  # Capture full traceback
             tool_logger.error(f"Error executing command:\n{error_message}")
-            return {"error": e}
+            return f"Error executing command:\n{error_message}"
 
     helper.register_for_llm(name="execute_windows_or_android_command", description="Processes user-defined commands on a personal Windows or Android system.")(execute_windows_or_android_command)
     assistant.register_for_execution(name="execute_windows_or_android_command")(execute_windows_or_android_command)
@@ -1250,18 +1249,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                     current_app.logger.error(traceback.format_exc())
 
         # Send crossbar message for UI feedback
-        try:
-            if last_speaker.name not in ['UserProxy', 'User']:
-                crossbar_message = {"text": [f'{messages[-1]["content"]}'], "priority": 49,
-                                    "action": 'Thinking', "historical_request_id": [], "preffered_language": 'en-US',
-                                    "options": [], "newoptions": [], "bot_type": 'Agent', "page_image_url": "",
-                                    "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
-                        'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0},
-                        'bottom_left': {'x': 0, 'y': 0}}}
-                client.publish(
-                f"com.hertzai.hevolve.chat.{user_id}", json.dumps(crossbar_message))
-        except Exception as e:
-            current_app.logger.error(f"Error publishing crossbar message: {e}")
+        publish_intermediate_thoughts_to_user(last_speaker, messages)
         # Process @ mentions - keeping this logic intact
         pattern = r"@Helper"
         pattern1 = r"@Executor"
@@ -1320,6 +1308,20 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             return None
         else:
             return 'auto'
+
+    def publish_intermediate_thoughts_to_user(last_speaker, messages):
+        try:
+            if last_speaker.name not in ['UserProxy', 'User'] and messages[-1]["content"] != '' and messages[-1]["content"] is not None and 'Message already sent successfully to user with request_id' not in messages[-1]["content"] and 'Message sent successfully to user with request_id' not in messages[-1]["content"]:
+                crossbar_message = {"text": [f'{messages[-1]["content"]}'], "priority": 49,
+                                    "action": 'Thinking', "historical_request_id": [], "preffered_language": 'en-US',
+                                    "options": [], "newoptions": [], "bot_type": 'Agent', "page_image_url": "",
+                                    "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
+                        'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0},
+                        'bottom_left': {'x': 0, 'y': 0}}}
+                client.publish(
+                    f"com.hertzai.hevolve.chat.{user_id}", json.dumps(crossbar_message))
+        except Exception as e:
+            current_app.logger.error(f"Error publishing crossbar message: {e}")
 
     def update_entire_actions(json_obj, user_prompt):
         current_app.logger.info('GOT UPDATED WITH entire actions')

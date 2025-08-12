@@ -293,17 +293,17 @@ def get_role(user_id, prompt_id):
     return role
 
 
-def clear_message_tracking(user_prompt, original_request_id):
+def clear_message_tracking(user_prompt, unique_message_key):
     """Clear message tracking for a specific request"""
     try:
         if (user_prompt in request_id_list_sent_intermediate and
-                original_request_id in request_id_list_sent_intermediate[user_prompt]):
-            del request_id_list_sent_intermediate[user_prompt][original_request_id]
+                unique_message_key in request_id_list_sent_intermediate[user_prompt]):
+            del request_id_list_sent_intermediate[user_prompt][unique_message_key]
     except Exception as e:
         pass
 
 
-def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_delay=20):
+def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_delay=50):
     """
     Send message to user with improved tracking of sent messages
     """
@@ -311,6 +311,25 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
     random_num = random.randint(1000, 9999)
     original_request_id = request_id_list.get(user_prompt, str(uuid.uuid4()))
     intermediate_request_id = f'{original_request_id}-intermediate-{random_num}'
+    # Process response to ensure it's a string
+    if not isinstance(response, str):
+        if isinstance(response, dict):
+            if 'content' in response:
+                response = response['content']
+            else:
+                response = str(response)
+        else:
+            response = str(response)
+
+    message_hash = get_message_hash(response, original_request_id)
+    unique_message_key = f"{original_request_id}_{message_hash}"
+
+    message_already_sent = (
+            user_prompt in request_id_list_sent_intermediate and
+            unique_message_key in request_id_list_sent_intermediate[user_prompt]
+    )
+    if message_already_sent:
+        return f'Message already sent successfully to user with request_id: {original_request_id}'
 
     # Use a lock to ensure thread safety when updating shared state
     with message_tracking_lock:
@@ -319,7 +338,7 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
             request_id_list_sent_intermediate[user_prompt] = {}
 
         # Track that we've sent a message for this specific original_request_id
-        request_id_list_sent_intermediate[user_prompt][original_request_id] = True
+        request_id_list_sent_intermediate[user_prompt][unique_message_key] = True
 
     # Schedule a task to clear the tracking after the delay
     job_id = f"clear_tracking_{user_prompt}_{original_request_id}_{int(time.time())}"
@@ -333,21 +352,11 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
                 'date',
                 run_date=run_time,
                 id=job_id,
-                args=[user_prompt, original_request_id],
+                args=[user_prompt, unique_message_key],
                 replace_existing=True  # Use replace_existing to avoid conflicts
             )
     except Exception as e:
         current_app.logger.error(f"Error scheduling tracking reset: {e}")
-
-    # Process response to ensure it's a string
-    if not isinstance(response, str):
-        if isinstance(response, dict):
-            if 'content' in response:
-                response = response['content']
-            else:
-                response = str(response)
-        else:
-            response = str(response)
 
     # Send the message to the user
     url = 'http://aws_rasa.hertzai.com:9890/autogen_response'
@@ -355,13 +364,15 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
     headers = {'Content-Type': 'application/json'}
 
     try:
-        res = requests.post(url, data=body, headers=headers, timeout=5)
+        res = requests.post(url, data=body, headers=headers)
         current_app.logger.info(
             f'Message sent with request_id: {intermediate_request_id}, tracking will reset in {reset_tracking_delay}s')
     except Exception as e:
         current_app.logger.error(f"Error sending message to user: {e}")
+        return f'Failed to send message to user with request_id: {original_request_id}'
 
-    return
+    return f'Message sent successfully to user with request_id: {original_request_id}'
+
 
 
 def execute_python_file(task_description: str, user_id: int, prompt_id: int, action_entry_point: int = 0):
@@ -433,6 +444,15 @@ def time_based_execution(task_description: str, user_id: int, prompt_id: int, ac
         return 'done'
     return 'done'
 
+import hashlib
+def get_message_hash(content, request_id):
+    """
+    Generate a hash for the message content + request_id to track unique messages
+    This prevents conflicts across different requests
+    """
+    # Combine message content with request_id for unique hash
+    hash_input = f"{request_id}:{content}"
+    return hashlib.md5(hash_input.encode()).hexdigest()[:10]
 
 def get_action_user_details(user_id):
     '''
@@ -1378,26 +1398,15 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             return f'Message directed to {agent_found} agent, not sending to user'
 
 
-        original_request_id = request_id_list[user_prompt]
 
-        # Check if we've already sent a message for this specific request
-        message_already_sent = (
-                user_prompt in request_id_list_sent_intermediate and
-                original_request_id in request_id_list_sent_intermediate[user_prompt]
-        )
-
-        if response_type != 'Realtime' or not message_already_sent:
-            current_app.logger.info('INSIDE send_message_to_user')
-            current_app.logger.info(
+        current_app.logger.info('INSIDE send_message_to_user')
+        current_app.logger.info(
                 f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
-            random_num = random.randint(1000, 9999)
-            intermediate_request_id = f'{request_id_list[user_prompt]}-intermediate-{random_num}'
-            request_id_list_sent_intermediate[user_prompt][request_id_list[user_prompt]] = True
-            # TODO add avatar_id and conv_id and response_type
-            send_message_to_user1(user_id, text, '', prompt_id)
-            return f'Message sent successfully to user with request_id: {intermediate_request_id}'
-        else:
-            return f'Message already sent successfully to user with request_id: {original_request_id}'
+        random_num = random.randint(1000, 9999)
+
+        # TODO add avatar_id and conv_id and response_type
+        return send_message_to_user1(user_id, text, '', prompt_id)
+
 
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",
@@ -2115,7 +2124,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
             # Check for any agent mentions and return the corresponding agent
             for mention, agent in agent_mapping.items():
-                if mention in content_lower:
+                if mention.lower() in content_lower:
                     current_app.logger.info(f"Detected mention of {mention} - directing message to appropriate agent")
                     return agent
 
@@ -2123,40 +2132,39 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             if '@user' in content_lower:
                 current_app.logger.info('GOT @USER in message')
 
-                # Get the current original request ID
-                original_request_id = request_id_list[user_prompt]
+                # Always process @user messages - let send_message_to_user1 handle deduplication
+                try:
+                    json_obj = retrieve_json(messages[-1]["content"])
+                    if json_obj and 'message2user' in json_obj:
+                        current_app.logger.info('Successfully extracted message2user content')
+                        send_message_to_user1(user_id, json_obj['message2user'], '', prompt_id)
+                        return "auto"
+                    else:
+                        if json_obj and 'message2' in json_obj:
+                            current_app.logger.info('Successfully extracted message2 content')
+                            send_message_to_user1(user_id, json_obj['message2'], '', prompt_id)
+                            return "auto"
+                        # Fallback regex approach
+                        current_app.logger.info('retrieve_json failed, trying regex extraction')
+                        message_match = re.search(r"@user\s*\{['\"]message2user['\"]\s*:\s*['\"]([^'\"]+)['\"]\s*\}",
+                                                  messages[-1]["content"], re.DOTALL)
 
-                # Check if we've already sent a message for this specific request
-                with message_tracking_lock:
-                    message_already_sent = (
-                            user_prompt in request_id_list_sent_intermediate and
-                            original_request_id in request_id_list_sent_intermediate[user_prompt]
-                    )
-
-                if not message_already_sent:
-                    # Process and send message using retrieve_json
-                    try:
-                        # Use the existing retrieve_json function
-                        json_obj = retrieve_json(messages[-1]["content"])
-                        if json_obj and 'message2user' in json_obj:
-                            current_app.logger.info('Successfully extracted message2user content')
-                            send_message_to_user1(user_id, json_obj['message2user'], '', prompt_id)
+                        if message_match:
+                            message_content = message_match.group(1)
+                            current_app.logger.info('Successfully extracted message using regex')
+                            send_message_to_user1(user_id, message_content, '', prompt_id)
+                            return "auto"
                         else:
-                            # If retrieve_json fails, try a direct regex approach for this specific format
-                            current_app.logger.info('retrieve_json failed, trying regex extraction')
-                            message_match = re.search(r"@user\s*{'message2user':\s*'(.*?)'}\s*$",
-                                                      messages[-1]["content"], re.DOTALL)
+                            message_match = re.search(r"@user\s*\{['\"]message2['\"]\s*:\s*['\"]([^'\"]+)['\"]\s*\}", messages[-1]["content"], re.DOTALL)
                             if message_match:
                                 message_content = message_match.group(1)
                                 current_app.logger.info('Successfully extracted message using regex')
                                 send_message_to_user1(user_id, message_content, '', prompt_id)
-                            else:
-                                current_app.logger.error('Failed to extract message with all methods')
-                    except Exception as e:
-                        current_app.logger.error(f'Error processing @user message: {e}')
-                        current_app.logger.error(traceback.format_exc())
-                else:
-                    current_app.logger.info(f'Already sent a message for request {original_request_id} - skipping')
+                                return "auto"
+                            current_app.logger.error('Failed to extract message with all methods')
+                except Exception as e:
+                    current_app.logger.error(f'Error processing @user message: {e}')
+                    current_app.logger.error(traceback.format_exc())
 
                 return "auto"
 
@@ -2189,6 +2197,8 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                         return assistant
             except Exception as e:
                 current_app.logger.error(f'Got Error while getting json for current actionid: {e}')
+
+            publish_intermediate_thoughts_to_user(last_speaker, messages)
 
             # Check for specific agent mentions
             if re.search(r"@statusverifier", messages[-1]["content"].lower()):
@@ -2379,6 +2389,22 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             return None
         return "auto"
 
+    def publish_intermediate_thoughts_to_user(last_speaker, messages):
+        try:
+            if (last_speaker.name not in ['UserProxy', 'User'] and messages[-1]["content"] != '' and messages[-1]["content"] is not None
+                    and 'Message already sent successfully to user with request_id' not in messages[-1]["content"]
+                    and 'Message sent successfully to user with request_id' not in messages[-1]["content"]):
+                crossbar_message = {"text": [f'{messages[-1]["content"]}'], "priority": 49,
+                                    "action": 'Thinking', "historical_request_id": [], "preffered_language": 'en-US',
+                                    "options": [], "newoptions": [], "bot_type": 'Agent', "page_image_url": "",
+                                    "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
+                        'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0},
+                        'bottom_left': {'x': 0, 'y': 0}}}
+                client.publish(
+                    f"com.hertzai.hevolve.chat.{user_id}", json.dumps(crossbar_message))
+        except Exception as e:
+            current_app.logger.error(f"Error publishing crossbar message: {e}")
+
     select_speaker_transforms = transform_messages.TransformMessages(
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=50, keep_first_message=True),
@@ -2516,7 +2542,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
 
                 count += 1
 
-                if user_prompt not in recipes or user_tasks[user_prompt].current_action >= len(user_tasks[user_prompt]['actions']):
+                if user_prompt not in recipes or user_tasks[user_prompt].current_action >= len(user_tasks[user_prompt].actions):
                     current_app.logger.error(
                         f"Cannot access recipe for current action {user_tasks[user_prompt].current_action}")
                     continue
@@ -2528,48 +2554,56 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
 
             except Exception as e:
                 current_app.logger.error(f'WE have some indexx error here: {e}')
+                error_message = traceback.format_exc()  # Capture full traceback
+                current_app.logger.error(f"Error in get_agent_response indexx:\n{error_message}")
 
-            last_message = group_chat.messages[-1]['content']
+            last_message = group_chat.messages[-1]
+            content_lower = last_message['content'].lower()
             # Check if this message has already been sent to the user by state_transition
             # In get_agent_response
-            if f'message2user'.lower() in last_message.lower():
-                original_request_id = request_id_list[user_prompt]
+            if f'message2user'.lower() in content_lower:
+                # Extract and process message
+                try:
+                    json_obj = retrieve_json(last_message['content'])
+                    if json_obj and 'message2user' in json_obj:
+                        send_message_to_user1(user_id, json_obj['message2user'], '', prompt_id)
+                        return ''
+                except Exception as e:
+                    current_app.logger.error(f"Error extracting JSON: {e}")
+            elif f'message2'.lower() in content_lower:
+                # Extract and process message
+                try:
+                    json_obj = retrieve_json(last_message['content'])
+                    if json_obj and 'message2' in json_obj:
+                        send_message_to_user1(user_id, json_obj['message2'], '', prompt_id)
+                        return ''
+                except Exception as e:
+                    current_app.logger.error(f"Error extracting JSON: {e}")
+            elif f'@user'.lower() not in content_lower:
+                agent_mentions = [
+                    "@statusverifier", "@status verifier", "@verification",
+                    "@helper", "@executor", "@StatusVerifier", "@Helper", "@Executor"
+                ]
 
-                message_already_sent = (
-                        user_prompt in request_id_list_sent_intermediate and
-                        original_request_id in request_id_list_sent_intermediate[user_prompt]
-                )
+                if any(mention in content_lower for mention in agent_mentions):
+                    agent_found = next((mention for mention in agent_mentions if mention in content_lower), None)
+                    current_app.logger.info(f'Message directed to agent ({agent_found}), not sending to user')
+                    current_app.logger.info(f'continuing since @user not in last message')
+                    continue
 
-                if message_already_sent:
-                    current_app.logger.info(f'Message already sent for request {original_request_id} - skipping')
-                    try:
-                        del request_id_list_sent_intermediate[user_prompt][original_request_id]
-                    except Exception as e:
-                        pass
-                    return ''
-                else:
-                    # Extract and process message
-                    try:
-                        json_obj = retrieve_json(last_message)
-                        if json_obj and 'message2user' in json_obj:
-                            send_message_to_user1(user_id, json_obj['message2user'], '', prompt_id)
-                            return ''
-                    except Exception as e:
-                        current_app.logger.error(f"Error extracting JSON: {e}")
-
-            elif f'@user'.lower() not in last_message.lower():
-                current_app.logger.info(f'continuing since @user not in last message')
-                continue
             else:
                 current_app.logger.info(f'@user in last message')
                 break
+
         # if individual_recipe[currentaction_id-1]['can_perform_without_user_input'] == 'yes':
         #     return assistant
         last_message = group_chat.messages[-1]
         if last_message['content'] == 'TERMINATE':
             last_message = group_chat.messages[-2]
 
-        if f'message2user'.lower() in last_message['content'].lower():
+        content_lower = last_message['content'].lower()
+
+        if f'message2user'.lower() in content_lower:
             try:
                 json_obj = retrieve_json(last_message['content'])
                 if json_obj and 'message2user' in json_obj:
@@ -2584,8 +2618,25 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                 if match:
                     last_message['content'] = match.group(1)
                     return last_message['content']
+
+        elif f'message2'.lower() in content_lower:
+            try:
+                json_obj = retrieve_json(last_message['content'])
+                if json_obj and 'message2' in json_obj:
+                    last_message['content'] = json_obj['message2']
+                    return last_message['content']
+
+            except Exception as e:
+                current_app.logger.error(f"Error extracting JSON: {e}")
+                # Fallback to a basic pattern match if retrieve_json fails
+                pattern = r'@user\s*{[\'"]message2[\'"]\s*:\s*[\'"](.+?)[\'"]}'
+                match = re.search(pattern, last_message['content'], re.DOTALL)
+                if match:
+                    last_message['content'] = match.group(1)
+                    return last_message['content']
+
         # At this point, don't process messages with message2user as they were already sent
-        return ''
+        return last_message['content']
 
     except Exception as e:
         current_app.logger.info(f'Got some error {e}')
@@ -2782,15 +2833,18 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                     if count == 4:
                         break
                     # role = get_role(user_id,prompt_id)
-                    last_message = group_chat.messages[-1]['content']
-                    if f'@user'.lower() not in last_message.lower():
+                    last_message = group_chat.messages[-1]
+                    if f'@user'.lower() not in last_message['content'].lower():
                         continue
                     else:
                         current_app.logger.info(f'@user in last message')
                         break
+
                 last_message = group_chat.messages[-1]
+
                 if last_message['content'] == 'TERMINATE':
                     last_message = group_chat.messages[-2]
+
                 llm_call_track[user_prompt]['count'] = 0
                 llm_call_track[user_prompt]['original_prompt'] = True
                 if f'message2user'.lower() in last_message['content'].lower():
@@ -2800,6 +2854,15 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                             last_message['content'] = json_obj['message2user']
                         except:
                             pass
+
+                elif f'message2'.lower() in last_message['content'].lower():
+                    json_obj = retrieve_json(last_message["content"])
+                    if json_obj:
+                        try:
+                            last_message['content'] = json_obj['message2']
+                        except:
+                            pass
+
                 return last_message['content']
 
             return last_message['content']
