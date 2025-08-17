@@ -135,13 +135,13 @@ def load_vlm_agent_files(prompt_id, role_number):
                     current_app.logger.error(f"Error reading VLM agent file {file_path}: {e}")
     except Exception as e:
         current_app.logger.error(f"Error listing files in prompts directory: {e}")
-    
+
     return vlm_actions
 
 class Action:
     def __init__(self, actions):
         self.actions = actions
-        self.current_action = 0
+        self.current_action = 1
         self.fallback = False
         self.new_json = []
         self.recipe = False
@@ -194,7 +194,7 @@ async def subscribe_and_return(message, topic, time=1800000):
 
                 if not response_future.done():
                     response_future.set_result(result)
-            
+
             except asyncio.TimeoutError:
                 if not response_future.done():
                     response_future.set_exception(
@@ -203,7 +203,7 @@ async def subscribe_and_return(message, topic, time=1800000):
             except Exception as e:
                 if not response_future.done():
                     response_future.set_exception(e)
-        
+
         finally:
             # Stop the component regardless of success / failure
             try:
@@ -388,24 +388,72 @@ def call_visual_task(task_description: str, user_id: int, prompt_id: int, data: 
     headers = {'Content-Type': 'application/json'}
     url = 'http://localhost:6777/visual_agent'
 
-    # Get the current time
-    now = datetime.now()
+    # Get current time in UTC for comparison
+    now_utc = datetime.utcnow()
 
-    # Only send POST request if the conditions are met
-    if any(obj["zeroshot_label"] == 'Video Reasoning' for obj in data) and (now - date) > timedelta(seconds=30):
-        data_to_send = json.dumps({
-            'task_description': task_description,
-            'user_id': user_id,
-            'prompt_id': prompt_id,
-            'request_from': 'Reuse'
-        })
+    # Get user action data to check for Video Reasoning entries
+    try:
+        action_url = f"{ACTION_API}?user_id={user_id}"
+        payload = {}
+        headers_api = {}
 
-        # Send the POST request to the visual agent
-        res = requests.post(url, data=data_to_send, headers=headers)
-        return 'done'  # Return 'done' as per the original function
+        response = requests.request("GET", action_url, headers=headers_api, data=payload)
 
-    # If conditions are not met, do nothing and return nothing
-    return
+        if response.status_code == 200:
+            api_data = response.json()
+
+            # Filter for Video Reasoning entries within last 5 minutes
+            recent_video_reasoning_entries = []
+            for obj in api_data:
+                if obj.get("zeroshot_label") == 'Video Reasoning':
+                    try:
+                        # Parse the created_date (assuming UTC)
+                        created_date = datetime.strptime(obj["created_date"], "%Y-%m-%dT%H:%M:%S")
+
+                        # Check if within last 5 minutes
+                        time_diff = now_utc - created_date
+                        current_app.logger.info(
+                            f"Found video Reasoning entry: {obj['action']} (created {time_diff} ago)")
+                        if time_diff <= timedelta(minutes=5):
+                            recent_video_reasoning_entries.append(obj)
+                            current_app.logger.info(
+                                f"Found recent Video Reasoning entry: {obj['action']} (created {time_diff} ago)")
+                    except (ValueError, KeyError) as e:
+                        current_app.logger.warning(f"Error parsing date for entry {obj.get('action_id')}: {e}")
+                        continue
+
+            # Execute visual task if at least one recent Video Reasoning entry is found
+            if recent_video_reasoning_entries:
+                current_app.logger.info(
+                    f"Found {len(recent_video_reasoning_entries)} recent Video Reasoning entries (within last 5 minutes) - executing visual task")
+
+                data_to_send = json.dumps({
+                    'task_description': task_description,
+                    'user_id': user_id,
+                    'prompt_id': prompt_id,
+                    'request_from': 'Reuse'
+                })
+
+                try:
+                    # Send the POST request to the visual agent
+                    res = requests.post(url, data=data_to_send, headers=headers)
+                    current_app.logger.info(f"Visual agent response: {res.status_code}")
+                    return 'done'
+                except Exception as e:
+                    current_app.logger.error(f"Failed to call visual agent: {e}")
+                    return 'error'
+            else:
+                current_app.logger.info(
+                    "No recent Video Reasoning entries found (within last 5 minutes) - skipping visual task")
+                return None
+
+        else:
+            current_app.logger.error(f"Failed to get user actions: {response.status_code}")
+            return 'error'
+
+    except Exception as e:
+        current_app.logger.error(f"Error getting user action details: {e}")
+        return 'error'
 
 
 def time_based_execution(task_description: str, user_id: int, prompt_id: int, action_entry_point: int):
@@ -854,10 +902,10 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                     recipes[user_prompt]["actions"][i] = vlm_action
                     action_exists = True
                     break
-            
+
             if not action_exists:
                 recipes[user_prompt]['actions'].append(vlm_action)
-        
+
         # Update the recipes dictionary
         final_recipe[prompt_id] = recipes[user_prompt]
 
@@ -1459,7 +1507,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         with _active_tools_lock:
             if command_key in _active_tools and _active_tools[command_key]['active']:
                 return f"A Windows command is already being executed in your device. Please wait for it to complete."
-            
+
             # Mark this command as active
             _active_tools[command_key] = {
                 'active': True,
@@ -1470,7 +1518,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             current_app.logger.info('INSIDE execute_windows_or_android_command')
             user_prompt = f'{user_id}_{prompt_id}'
             role_number, role = get_flow_number(user_id, prompt_id)
-            
+
             import os
             import re
             import json
@@ -1480,12 +1528,12 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             pattern = f"{prompt_id}_{role_number}_*_vlm_agent.json"
             current_app.logger.info(f"Looking for files matching pattern: {pattern}")
 
-            
+
             existing_vlm_files = []
             for file in os.listdir(prompts_dir):
                 if file.startswith(f"{prompt_id}_{role_number}_") and file.endswith("_vlm_agent.json"):
                     existing_vlm_files.append(file)
-            
+
             current_app.logger.info(f"Found existing VLM files: {existing_vlm_files}")
 
             # Reload VLM agent files to ensure latest
@@ -1503,10 +1551,10 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                                 recipes[user_prompt]['actions'][i] == vlm_action
                                 action_exists = True
                                 break
-                        
+
                         if not action_exists:
                             recipes[user_prompt]['actions'].append(vlm_action)
-                    
+
                     # Update the recipes dictionary
                     final_recipe[prompt_id] = recipes[user_prompt]
 
@@ -1519,7 +1567,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                 words2 = set(instr2.lower().split())
                 if not words1 or not words2:
                     return False
-                
+
                 # Calculate word overlap
                 overlap = len(words1.intersection(words2))
                 similarity = overlap / (max(len(words1), len(words2)))
@@ -1536,12 +1584,12 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                         matching_recipe = action
                         current_app.logger.info(f"Found existing recipe for instruction: {action_text}")
                         break
-    
+
 
             # Direct file check as backup
             current_action_id = 1
             if user_prompt in user_tasks and hasattr(user_tasks[user_prompt], 'current_action'):
-                current_action_id = user_tasks[user_prompt].current_action + 1
+                current_action_id = user_tasks[user_prompt].current_action
 
             direct_vlm_path = f"prompts/{prompt_id}_{role_number}_{current_action_id}_vlm_agent.json"
             if os.path.exists(direct_vlm_path):
@@ -1571,14 +1619,14 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                         enhanced_instruction += f"{i+1}. {step_description}\n"
 
                 enhanced_instruction += "\nAdapt these steps to the current screen state as needed."
-                current_app.logger.info(f"Created enhanced instruction with {len(matching_recipe.get('recipe', []))} steps") 
-    
+                current_app.logger.info(f"Created enhanced instruction with {len(matching_recipe.get('recipe', []))} steps")
+
             topic = f'com.hertzai.hevolve.action.{user_id}'
             current_app.logger.info(f'calling {topic} for 5 second')
             response = await subscribe_and_return({'prompt_id': prompt_id}, topic, 2000)  # Wait for the RPC response
             current_app.logger.info(f'Response from call of {topic}: {response}')
             if not response:
-                return 'Ask user to to go to hevolve.ai login and start the windows companion app'
+                return 'Ask UserProxy to go to hevolve.ai login and start the windows companion app'
             crossbar_message = {
                 'parent_request_id': request_id_list[user_prompt],
                 'user_id': f'{user_id}',
@@ -1589,7 +1637,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                 'max_ETA_in_seconds': 1800,
                 'langchain_server': True
             }
-            
+
             # Adding the enhanced_instruction if we have it
             if enhanced_instruction:
                 crossbar_message['enhanced_instruction'] = enhanced_instruction
@@ -1613,40 +1661,40 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                         # Get current action ID
                         action_id = 1
                         if user_prompt in user_tasks and hasattr(user_tasks[user_prompt], 'current_action'):
-                            action_id = user_tasks[user_prompt].current_action + 1
-                        
+                            action_id = user_tasks[user_prompt].current_action
+
                         # Determine file path with the action_id
                         role_number, role = get_flow_number(user_id, prompt_id)
                         action_id_to_use = action_id
                         base_path = f"prompts/{prompt_id}_{role_number}"
-                        
+
                         # Import os here to ensure it's available
                         import os
                         import re
                         import json
-                        
+
                         # Check if a file with the current action_id exists, and increment if needed
                         while os.path.exists(f"{base_path}_{action_id_to_use}_vlm_agent.json"):
                             action_id_to_use += 1
-                        
+
                         vlm_agent_path = f"{base_path}_{action_id_to_use}_vlm_agent.json"
-                        
+
                         # Create directory if it doesn't exist
                         os.makedirs(os.path.dirname(vlm_agent_path), exist_ok=True)
-                        
+
                         # Function to clean technical details from text
                         def clean_text(text):
                             # Remove lines with technical details
                             lines = text.split('\n')
                             cleaned_lines = []
                             for line in lines:
-                                if (not line.strip().startswith("Next Action:") and 
-                                    not line.strip().startswith("Box ID:") and 
+                                if (not line.strip().startswith("Next Action:") and
+                                    not line.strip().startswith("Box ID:") and
                                     not line.strip().startswith("box_centroid_coordinate:") and
                                     not line.strip().startswith("value:")):
                                     cleaned_lines.append(line)
                             return '\n'.join(cleaned_lines)
-                        
+
                         # Function to format action text consistently
                         def format_action_text(text):
                             # For JSON-like strings
@@ -1655,7 +1703,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                                     # Try to evaluate the string as a Python dict
                                     action_data = eval(text.strip())
                                     action_type = action_data.get("action", "")
-                                    
+
                                     if action_type == "mouse_move":
                                         return "Move mouse"
                                     elif action_type == "left_click":
@@ -1674,7 +1722,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                                     # If eval fails, try regex
                                     action_match = re.search(r"'action':\s*'([^']+)'", text)
                                     text_match = re.search(r"'text':\s*'([^']+)'", text)
-                                    
+
                                     if action_match:
                                         action_type = action_match.group(1)
                                         if action_type == "type" and text_match:
@@ -1691,26 +1739,26 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                                             return f"Perform {action_type} action"
                                     else:
                                         return "Perform action"
-                            
-                            # For text descriptions containing "Perform" 
+
+                            # For text descriptions containing "Perform"
                             elif "Perform" in text and "action" in text:
                                 return text  # Already in desired format
-                            
+
                             return text
-                        
+
                         # Handle different response format
                         if 'extracted_responses' in response:
                             # Extract the instruction and responses
                             instruction = response.get("instruction", instructions)
                             extracted_responses = response["extracted_responses"]
-                            
+
                             # Process all responses and create recipe steps
                             recipe_steps = []
-                            
+
                             for msg in extracted_responses:
                                 msg_type = msg.get("type", "")
                                 msg_content = msg.get("content", "")
-                                
+
                                 # Clean the content
                                 if msg_type == "analysis":
                                     cleaned_content = clean_text(msg_content)
@@ -1728,7 +1776,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                                             "tool_name": "execute_windows_or_android_command",
                                             "agent_to_perform_this_action": "Helper"
                                         })
-                            
+
                             # If no steps were created, add a default one
                             if not recipe_steps:
                                 recipe_steps.append({
@@ -1736,9 +1784,9 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                                     "tool_name": "execute_windows_or_android_command",
                                     "agent_to_perform_this_action": "Helper"
                                 })
-                            
+
                             persona = f"user{user_id}" if user_id else "user"
-                            
+
                             # Create the recipe format
                             recipe_data = {
                                 "status": "done",
@@ -1755,11 +1803,11 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                                 "time_took_to_complete": execution_time,
                                 "actions_this_action_depends_on": []
                             }
-                            
+
                             # Save the recipe format with vlm_agent naming
                             with open(vlm_agent_path, 'w') as json_file:
                                 json.dump(recipe_data, json_file, indent=4)
-                            
+
                             current_app.logger.info(f"Generated recipe data saved to {vlm_agent_path}")
 
                             try:
@@ -1787,7 +1835,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                                             break
                                     if not action_exists:
                                         recipes[user_prompt]['actions'].append(vlm_action)
-                                
+
                                 # Update the recipes dictionary
                                 final_recipe[prompt_id] = recipes[user_prompt]
                             return f'Successfully ran the command in user\'s computer and created the VLM agent data at {vlm_agent_path}.'
@@ -1817,7 +1865,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                 if command_key in _active_tools:
                     _active_tools[command_key]['active'] = False
 
-    
+
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function", description="Get google search response")
     def google_search(text: Annotated[str, "Text which you want to search"]) -> str:
@@ -1997,7 +2045,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     time_agent.register_for_execution(name="send_message_in_seconds")(send_message_in_seconds)
 
     helper1.register_for_llm(name="execute_windows_or_android_command",
-                             description="Executes a command on a Windows machine and returns the response.")(
+                             description="Executes a command on a user's Windows computer or android device and returns the response.")(
         execute_windows_or_android_command)
     time_agent.register_for_execution(name="execute_windows_or_android_command")(execute_windows_or_android_command)
 
@@ -2083,7 +2131,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         send_message_in_seconds)
     visual_agent.register_for_execution(name="send_message_in_seconds")(send_message_in_seconds)
     helper2.register_for_llm(name="execute_windows_or_android_command",
-                             description="Executes a command on a Windows machine and returns the response.")(
+                             description="Executes a command on a user's Windows computer or android device and returns the response.")(
         execute_windows_or_android_command)
     visual_agent.register_for_execution(name="execute_windows_or_android_command")(execute_windows_or_android_command)
     helper2.register_for_llm(name="google_search", description="Get google search response")(google_search)
@@ -2138,12 +2186,12 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                     if json_obj and 'message2user' in json_obj:
                         current_app.logger.info('Successfully extracted message2user content')
                         send_message_to_user1(user_id, json_obj['message2user'], '', prompt_id)
-                        return "auto"
+                        return assistant
                     else:
                         if json_obj and 'message2' in json_obj:
                             current_app.logger.info('Successfully extracted message2 content')
                             send_message_to_user1(user_id, json_obj['message2'], '', prompt_id)
-                            return "auto"
+                            return assistant
                         # Fallback regex approach
                         current_app.logger.info('retrieve_json failed, trying regex extraction')
                         message_match = re.search(r"@user\s*\{['\"]message2user['\"]\s*:\s*['\"]([^'\"]+)['\"]\s*\}",
@@ -2153,14 +2201,14 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                             message_content = message_match.group(1)
                             current_app.logger.info('Successfully extracted message using regex')
                             send_message_to_user1(user_id, message_content, '', prompt_id)
-                            return "auto"
+                            return assistant
                         else:
                             message_match = re.search(r"@user\s*\{['\"]message2['\"]\s*:\s*['\"]([^'\"]+)['\"]\s*\}", messages[-1]["content"], re.DOTALL)
                             if message_match:
                                 message_content = message_match.group(1)
                                 current_app.logger.info('Successfully extracted message using regex')
                                 send_message_to_user1(user_id, message_content, '', prompt_id)
-                                return "auto"
+                                return assistant
                             current_app.logger.error('Failed to extract message with all methods')
                 except Exception as e:
                     current_app.logger.error(f'Error processing @user message: {e}')
@@ -2189,7 +2237,6 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                         except Exception as e:
                             current_app.logger.error(f'GOT ERROR WHILE UPDATING CURRENT ACTION:{e}')
                             current_app.logger.error(traceback.format_exc())
-                            user_tasks[user_prompt].current_action += 1
                         return chat_instructor
 
                     currentaction_id = last_json['action_id']
@@ -2495,12 +2542,12 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                     if json_obj['status'].lower() == 'completed':
                         current_app.logger.info(f'UPDATING CURRENT ACTION AS :{int(json_obj["action_id"])}')
                         user_tasks[user_prompt].current_action = int(json_obj['action_id'])
-                        action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)[
+                        action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)[
                             'action']
                         steps = [{x['steps']: {'tool_name': x.get('tool_name', None),
                                                'code': x.get('generalized_functions', None)}} for x in
-                                 recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action]['recipe']]
-                        user_message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
+                                 recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action - 1]['recipe']]
+                        user_message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action}:{action_message}\n follow these steps: {steps}"
                         chat_instructor.initiate_chat(recipient=manager, message=user_message, clear_history=False,
                                                       silent=False)
                         continue
@@ -2517,12 +2564,12 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                             if json_obj['status'].lower() == 'completed':
                                 current_app.logger.info(f'UPDATING CURRENT ACTION AS :{int(json_obj["action_id"])}')
                                 user_tasks[user_prompt].current_action = int(json_obj['action_id'])
-                                action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)['action']
+                                action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)['action']
                                 steps = [{x['steps']: {'tool_name': x.get('tool_name', None),
                                                        'code': x.get('generalized_functions', None)}} for x in
-                                         recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action][
+                                         recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action - 1][
                                              'recipe']]
-                                user_message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
+                                user_message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action}:{action_message}\n follow these steps: {steps}"
                                 chat_instructor.initiate_chat(recipient=manager, message=user_message,
                                                               clear_history=False, silent=False)
                                 continue
@@ -2531,8 +2578,8 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                     except Exception as e:
                         current_app.logger.warning(f'it is not a json object the error is: {e}')
                         current_app.logger.info('it is not a json object You should ask status verifier to give response in proper format & not move ahead to next action')
-                        actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
-                        message = 'Hey @StatusVerifier Agent, Please verify the status of the action ' + f'{user_tasks[user_prompt].current_action + 1}: {actions_prompt}' + '\n performed and Respond in the following format {"status": "status here","action": "current action","action_id": ' + f'{user_tasks[user_prompt].current_action + 1}' + ',"message": "message here"}'
+                        actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)
+                        message = 'Hey @StatusVerifier Agent, Please verify the status of the action ' + f'{user_tasks[user_prompt].current_action}: {actions_prompt}' + '\n performed and Respond in the following format {"status": "status here","action": "current action","action_id": ' + f'{user_tasks[user_prompt].current_action}' + ',"message": "message here"}'
                         assistant.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
                         continue
             try:
@@ -2542,7 +2589,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
 
                 count += 1
 
-                if user_prompt not in recipes or user_tasks[user_prompt].current_action >= len(user_tasks[user_prompt].actions):
+                if user_prompt not in recipes or user_tasks[user_prompt].current_action > len(user_tasks[user_prompt].actions):
                     current_app.logger.error(
                         f"Cannot access recipe for current action {user_tasks[user_prompt].current_action}")
                     continue
@@ -2762,11 +2809,11 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                 assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group = user_agents[user_prompt]
                 user_journey[user_prompt] = 'UseBot'
                 create_schedule(prompt_id, user_id)
-                action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)['action']
+                action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)['action']
                 steps = [
                     {x['steps']: {'tool_name': x.get('tool_name', None), 'code': x.get('generalized_functions', None)}}
-                    for x in recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action]['recipe']]
-                message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
+                    for x in recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action - 1]['recipe']]
+                message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action}:{action_message}\n follow these steps: {steps}"
                 # message = "let's perform the actions availabe in sequence\nIMP instruction: keep track of action id you are working on."
                 result = chat_instructor.initiate_chat(manager, message=message,
                                                        speaker_selection={"speaker": "assistant"}, clear_history=False)
@@ -2783,12 +2830,12 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                             if json_obj['status'].lower() == 'completed':
                                 current_app.logger.info(f'UPDATIN CURRENT ACTION AS :{int(json_obj["action_id"])}')
                                 user_tasks[user_prompt].current_action = int(json_obj['action_id'])
-                                action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)['action']
+                                action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)['action']
                                 steps = [{x['steps']: {'tool_name': x.get('tool_name', None),
                                                        'code': x.get('generalized_functions', None)}} for x in
-                                         recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action][
+                                         recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action - 1][
                                              'recipe']]
-                                user_message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
+                                user_message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action}:{action_message}\n follow these steps: {steps}"
                                 chat_instructor.initiate_chat(recipient=manager, message=user_message,
                                                               clear_history=False, silent=False)
                                 continue
@@ -2803,12 +2850,12 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                         current_app.logger.info(
                                             f'UPDATIN CURRENT ACTION AS :{int(json_obj["action_id"])}')
                                         user_tasks[user_prompt].current_action = int(json_obj['action_id'])
-                                        action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)['action']
+                                        action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)['action']
                                         steps = [{x['steps']: {'tool_name': x.get('tool_name', None),
                                                                'code': x.get('generalized_functions', None)}} for x in
                                                  recipes[user_prompt]['actions'][
-                                                     user_tasks[user_prompt].current_action]['recipe']]
-                                        user_message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
+                                                     user_tasks[user_prompt].current_action - 1]['recipe']]
+                                        user_message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action}:{action_message}\n follow these steps: {steps}"
                                         chat_instructor.initiate_chat(recipient=manager, message=user_message,
                                                                       clear_history=False, silent=False)
                                         continue
@@ -2824,8 +2871,8 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                 current_app.logger.info(
                                     'it is not a json object You should ask status verifier to give response in proper format & not move ahead to next action')
                                 actions_prompt = user_tasks[user_prompt].get_action(
-                                    user_tasks[user_prompt].current_action)
-                                message = 'Hey @StatusVerifier Agent, Please verify the status of the action ' + f'{user_tasks[user_prompt].current_action + 1}: {actions_prompt}' + '\n performed and Respond in the following format {"status": "status here","action": "current action","action_id": ' + f'{user_tasks[user_prompt].current_action + 1}' + ',"message": "message here"}'
+                                    user_tasks[user_prompt].current_action - 1)
+                                message = 'Hey @StatusVerifier Agent, Please verify the status of the action ' + f'{user_tasks[user_prompt].current_action}: {actions_prompt}' + '\n performed and Respond in the following format {"status": "status here","action": "current action","action_id": ' + f'{user_tasks[user_prompt].current_action}' + ',"message": "message here"}'
                                 assistant.initiate_chat(recipient=manager, message=message, clear_history=False,
                                                         silent=False)
                                 continue
@@ -2908,3 +2955,8 @@ def crossbar_multiagent(msg):
 
     # sending response to caller agent
     send_message_to_user1(msg['caller_user_id'], last_message, msg['message'], msg['caller_prompt_id'])
+
+def acknowledgment(user_id,prompt_id,request_id):
+    user_prompt = f'{user_id}_{prompt_id}'
+    author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = user_agents[user_prompt]
+    group_chat.messages.append({'content':f'GOT MESSAGE ACKNOWLEDGEMENT FOR {request_id}','role':'user','name':'Helper'})
