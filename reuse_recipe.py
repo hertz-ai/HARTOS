@@ -473,22 +473,22 @@ def time_based_execution(task_description: str, user_id: int, prompt_id: int, ac
         if last_message['content'] == 'TERMINATE':
             last_message = group_chat.messages[-2]
         # sending response to receiver agent
-        if f'message2user'.lower() in last_message['content'].lower():
+        if f'message2userfinal'.lower() in last_message['content'].lower():
             try:
                 json_obj = retrieve_json(last_message['content'])
-                if json_obj and 'message2user' in json_obj:
-                    last_message['content'] = json_obj['message2user']
+                if json_obj and 'message2userfinal' in json_obj:
+                    last_message['content'] = json_obj['message2userfinal']
                     send_message_to_user1(user_id, last_message['content'], task_description, prompt_id)
 
             except Exception as e:
                 current_app.logger.error(f"Error extracting JSON: {e}")
                 # Fallback to a basic pattern match if retrieve_json fails
-                pattern = r'@user\s*{[\'"]message2user[\'"]\s*:\s*[\'"](.+?)[\'"]}'
+                pattern = r'@user\s*{[\'"]message2userfinal[\'"]\s*:\s*[\'"](.+?)[\'"]}'
                 match = re.search(pattern, last_message['content'], re.DOTALL)
                 if match:
                     last_message['content'] = match.group(1)
                     send_message_to_user1(user_id, last_message['content'], task_description, prompt_id)
-        # At this point, don't process messages with message2user as they were already sent
+        # At this point, don't process messages with message2userfinal as they were already sent
         return 'done'
     return 'done'
 
@@ -663,7 +663,7 @@ def visual_based_execution(task_description: str, user_id: int, prompt_id: int):
             Note: Visual input is available because the user's camera is ON.
             <Last_{minutes}_Minutes_Visual_Context_End>: {actions}
             If the user needs to be informed (e.g., task completed, input needed, error), respond in this exact JSON format:
-            {{"message2user": "Your clear and useful message here"}}
+            {{"message2userfinal": "Your clear and useful message here"}}
             Only send this if you have something meaningful to say.
             Do not interrupt the user unless they have asked for a response or the task cannot proceed without their input.
             You must now perform this task: {task_description}'''
@@ -680,11 +680,11 @@ def visual_based_execution(task_description: str, user_id: int, prompt_id: int):
         if last_message['content'] == 'TERMINATE':
             if len(group_chat.messages) > 1:
                 last_message = group_chat.messages[-2]
-            if 'message2user' in last_message['content'].lower():
+            if 'message2userfinal' in last_message['content'].lower():
                 try:
                     json_obj = retrieve_json(last_message['content'])
-                    if json_obj and 'message2user' in json_obj:
-                        send_message_to_user1(user_id, json_obj['message2user'], task_description, prompt_id)
+                    if json_obj and 'message2userfinal' in json_obj:
+                        send_message_to_user1(user_id, json_obj['message2userfinal'], task_description, prompt_id)
                 except Exception as e:
                     current_app.logger.error(f"Error processing visual agent response: {e}")
 
@@ -840,6 +840,7 @@ def create_agents_for_role(user_id: str, prompt_id):
             agents=[assistant, helper, user_proxy],
             messages=[],
             max_round=3,
+            select_speaker_prompt_template=f"Read the above conversation, select the next person from [Assistant, Helper, & User] & only return the role as agent. Return User only if the previous message demands it",
             select_speaker_transform_messages=select_speaker_transforms,
             speaker_selection_method=state_transition,  # using an LLM to decide
             allow_repeat_speaker=False,  # Prevent same agent speaking twice
@@ -935,7 +936,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         except Exception as e:
             current_app.logger.error(f'Got error as :{e} while checking for prompts/{prompt_id}_{role_number}_{i}.json')
 
-    response_format = {"message2user": "Your message here"}
+    response_format = {"message2userfinal": "Your message here"}
     agent_prompt = f'''You are a Helpful {role} Assistant. Your primary role is to assist the user efficiently while keeping all internal actions and processes hidden from the end user. Follow the guidelines below to perform tasks correctly:
         1. If you encounter a task you cannot perform, request assistance from the @Helper and @Executor agents. If you need to run a tool, seek guidance from the @Helper agent. For code execution, ask the @Executor agent for assistance.
         2. Only execute actions where the persona is: {role}.
@@ -958,7 +959,9 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             8. If you want the user's ID then ask the @Helper to use 'get_user_id' tool and do not prompt the user for their user_id, never mention the user_id to the user. Important: Get the user Id yourself always, Do not ask the user_id from User ever.
             9. If you want to do a google search then you should ask the @Helper to use the 'google_search' tool.        
         10. **Never reveal actions, internal processes, or tools to the user**. Do not ask for user confirmation unless absolutely necessary(You can assume normal things like user's interests).
-        11. **To communicate with the {role} user**, always use this format: `@user {response_format}`.
+        11. Calling Other Agents (Important):
+            i. When you need to direct a question or route the conversation to a specific agent, use the @ tag followed by the agent's name. Examples include: @Executor or @Helper or @User
+            ii. If you are responding to the user's request or need some clarification/information from user, just tag userproxy agent strictly via `@user {response_format}` or If you need to send data proactively (on your own) while continuing your current action use tools `send_message_to_user`  or `send_message_in_seconds` for sending message to user with delay,  Do not use both to convey the same.
         12. All actions, recipes, and functions provided below have been reviewed and tested. Follow them exactly—do not make assumptions or modify them unless they fail or produce an error.
         13. Always request the next action from the @StatusVerifier agent—do not determine the next action on your own.
         14. If `can_perform_without_user_input` is `yes`, execute the action automatically without requesting user confirmation.
@@ -1007,7 +1010,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             6. Always use code from recipe given below.
             7. If there is any action which is like to perform a task continuously you should not do it.
             8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
-            9. IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @user {response_format}
+            9. If you want to send data proactively (on your own) to user use `@user {response_format}`. However, if you're responding to the user's request or instruction, use the send_message_to_user or send_message_in_seconds tool.
             10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
             11. Always request the next action from the @StatusVerifier agent—do not determine the next action on your own.
             12. After completing the current action, request the @StatusVerifier agent to verify its completion. It will then provide the next action.
@@ -1033,8 +1036,8 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             6. Always use code from recipe given below.
             7. If there is any action which is like to perform a task continuously you should not do it.
             8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
-            9. IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @user {response_format}
-            10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
+            9. If you want to send data proactively (on your own) to user use `@user {response_format}`. However, if you're responding to the user's request or instruction, use the send_message_to_user or send_message_in_seconds tool.
+            10. The response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
             11. Always request the next action from the @StatusVerifier agent—do not determine the next action on your own.
             12. After completing the current action, request the @StatusVerifier agent to verify its completion. It will then provide the next action.
             13. If you get any request to call a tool always ask @Helper to perfor it.
@@ -1954,7 +1957,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         llm_config=llm_config,
         code_execution_config=False,
         system_message="""You will send message from multiple different personas your, job is to ask those question to assistant agent
-        if you think some text was intent to give to some other agent but i came to you send the same message to user""",
+        if you think some text was intent to give to some other agent but i came to you to send the same message to user""",
     )
     verify1 = autogen.AssistantAgent(
         name="StatusVerifier",
@@ -2177,44 +2180,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                     return agent
 
             # Check for messages directed to the user
-            if '@user' in content_lower:
-                current_app.logger.info('GOT @USER in message')
 
-                # Always process @user messages - let send_message_to_user1 handle deduplication
-                try:
-                    json_obj = retrieve_json(messages[-1]["content"])
-                    if json_obj and 'message2user' in json_obj:
-                        current_app.logger.info('Successfully extracted message2user content')
-                        send_message_to_user1(user_id, json_obj['message2user'], '', prompt_id)
-                        return assistant
-                    else:
-                        if json_obj and 'message2' in json_obj:
-                            current_app.logger.info('Successfully extracted message2 content')
-                            send_message_to_user1(user_id, json_obj['message2'], '', prompt_id)
-                            return assistant
-                        # Fallback regex approach
-                        current_app.logger.info('retrieve_json failed, trying regex extraction')
-                        message_match = re.search(r"@user\s*\{['\"]message2user['\"]\s*:\s*['\"]([^'\"]+)['\"]\s*\}",
-                                                  messages[-1]["content"], re.DOTALL)
-
-                        if message_match:
-                            message_content = message_match.group(1)
-                            current_app.logger.info('Successfully extracted message using regex')
-                            send_message_to_user1(user_id, message_content, '', prompt_id)
-                            return assistant
-                        else:
-                            message_match = re.search(r"@user\s*\{['\"]message2['\"]\s*:\s*['\"]([^'\"]+)['\"]\s*\}", messages[-1]["content"], re.DOTALL)
-                            if message_match:
-                                message_content = message_match.group(1)
-                                current_app.logger.info('Successfully extracted message using regex')
-                                send_message_to_user1(user_id, message_content, '', prompt_id)
-                                return assistant
-                            current_app.logger.error('Failed to extract message with all methods')
-                except Exception as e:
-                    current_app.logger.error(f'Error processing @user message: {e}')
-                    current_app.logger.error(traceback.format_exc())
-
-                return "auto"
 
 
             # Process JSON responses from StatusVerifier
@@ -2272,15 +2238,15 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                 return assistant
 
             # Check for user messages
-            if 'message2user' in messages[-1]["content"].lower():
-                current_app.logger.info('GOT message2user in message')
+            if 'message2userfinal' in messages[-1]["content"].lower():
+                current_app.logger.info('GOT message2userfinal in message')
                 # Check if this is directed to an agent and not the user
                 # Use the same agent mapping as before
                 agent_to_return = None
                 for mention, agent in agent_mapping.items():
                     if mention in content_lower:
                         current_app.logger.info(
-                            f"Message with message2user also contains {mention} - directing to that agent")
+                            f"Message with message2userfinal also contains {mention} - directing to that agent")
                         agent_to_return = agent
                         break
 
@@ -2294,7 +2260,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                         try:
                             json_part = json_match.group(0)
                             json_obj = json.loads(json_part)
-                            send_message_to_user1(user_id, json_obj['message2user'], '', prompt_id)
+                            send_message_to_user1(user_id, json_obj['message2userfinal'], '', prompt_id)
                         except Exception as e:
                             current_app.logger.error(f'Error sending message to user: {e}')
 
@@ -2355,7 +2321,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         if last_speaker.name == f"user_proxy_{user_id}" or last_speaker.name == "multi_role_agent" or last_speaker.name == "Helper" or last_speaker.name == "Executor":
             return time_agent
         current_app.logger.info(f'Checking for @user or @user in message')
-        if 'message2user' in messages[-1]["content"].lower():
+        if 'message2userfinal' in messages[-1]["content"].lower():
             current_app.logger.info('GOT @USER in message')
             temp_message = messages[-1]["content"]
             temp_message = temp_message.replace("'", '"')
@@ -2367,7 +2333,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                     json_part = json_match.group(0)
                     current_app.logger.info('Sending user the message')
                     json_obj = json.loads(json_part)
-                    send_message_to_user1(user_id, json_obj['message2user'], '', prompt_id)
+                    send_message_to_user1(user_id, json_obj['message2userfinal'], '', prompt_id)
                 except:
                     pass
                 return "auto"
@@ -2398,7 +2364,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         #     groupchat.messages.insert(-2,{'content':visual_context,'role':'user','name':'helper'})
         # current_app.logger.info(f'{messages[-1]}'
         current_app.logger.info(f'Checking for @user or @user in message')
-        if 'message2user' in messages[-1]["content"].lower():
+        if 'message2userfinal' in messages[-1]["content"].lower():
             current_app.logger.info('GOT @USER in message')
             temp_message = messages[-1]["content"]
             temp_message = temp_message.replace("'", '"')
@@ -2410,7 +2376,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                     json_part = json_match.group(0)
                     current_app.logger.info('Sending user the message')
                     json_obj = json.loads(json_part)
-                    send_message_to_user1(user_id, json_obj['message2user'], '', prompt_id)
+                    send_message_to_user1(user_id, json_obj['message2userfinal'], '', prompt_id)
                 except:
                     pass
 
@@ -2464,6 +2430,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         agents=[assistant, helper, user_proxy, multi_role_agent, executor, chat_instructor, verify],
         messages=[],
         max_round=10,
+        select_speaker_prompt_template=f"Read the above conversation, select the next person from [Assistant, Helper, Executor, ChatInstructor, StatusVerifier, multi_role_agent & User] & only return the role as agent. Return User only if the previous message demands it",
         select_speaker_transform_messages=select_speaker_transforms,
         speaker_selection_method=state_transition,  # using an LLM to decide
         allow_repeat_speaker=False,  # Prevent same agent speaking twice
@@ -2608,12 +2575,12 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
             content_lower = last_message['content'].lower()
             # Check if this message has already been sent to the user by state_transition
             # In get_agent_response
-            if f'message2user'.lower() in content_lower:
+            if f'message2userfinal'.lower() in content_lower:
                 # Extract and process message
                 try:
                     json_obj = retrieve_json(last_message['content'])
-                    if json_obj and 'message2user' in json_obj:
-                        send_message_to_user1(user_id, json_obj['message2user'], '', prompt_id)
+                    if json_obj and 'message2userfinal' in json_obj:
+                        send_message_to_user1(user_id, json_obj['message2userfinal'], '', prompt_id)
                         return ''
                 except Exception as e:
                     current_app.logger.error(f"Error extracting JSON: {e}")
@@ -2650,17 +2617,17 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
 
         content_lower = last_message['content'].lower()
 
-        if f'message2user'.lower() in content_lower:
+        if f'message2userfinal'.lower() in content_lower:
             try:
                 json_obj = retrieve_json(last_message['content'])
-                if json_obj and 'message2user' in json_obj:
-                    last_message['content'] = json_obj['message2user']
+                if json_obj and 'message2userfinal' in json_obj:
+                    last_message['content'] = json_obj['message2userfinal']
                     return last_message['content']
 
             except Exception as e:
                 current_app.logger.error(f"Error extracting JSON: {e}")
                 # Fallback to a basic pattern match if retrieve_json fails
-                pattern = r'@user\s*{[\'"]message2user[\'"]\s*:\s*[\'"](.+?)[\'"]}'
+                pattern = r'@user\s*{[\'"]message2userfinal[\'"]\s*:\s*[\'"](.+?)[\'"]}'
                 match = re.search(pattern, last_message['content'], re.DOTALL)
                 if match:
                     last_message['content'] = match.group(1)
@@ -2681,8 +2648,10 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                 if match:
                     last_message['content'] = match.group(1)
                     return last_message['content']
+        last_message['content'] = last_message["content"].replace("@userproxy ", '')
+        last_message['content'] = last_message["content"].replace("@user ", '')
 
-        # At this point, don't process messages with message2user as they were already sent
+        # At this point, don't process messages with message2userfinal as they were already sent
         return last_message['content']
 
     except Exception as e:
@@ -2894,11 +2863,11 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
 
                 llm_call_track[user_prompt]['count'] = 0
                 llm_call_track[user_prompt]['original_prompt'] = True
-                if f'message2user'.lower() in last_message['content'].lower():
+                if f'message2userfinal'.lower() in last_message['content'].lower():
                     json_obj = retrieve_json(last_message["content"])
                     if json_obj:
                         try:
-                            last_message['content'] = json_obj['message2user']
+                            last_message['content'] = json_obj['message2userfinal']
                         except:
                             pass
 

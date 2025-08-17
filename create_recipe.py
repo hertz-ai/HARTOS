@@ -1532,7 +1532,7 @@ def instantiate_helper_agent():
             - For tool execution errors: Suggest parameter adjustments ot alternative tools
             - For API connection issues: Recommend retry strategies or fallback approaches
             - For Logical errors: Propose an alternative solution path
-        4. Clearly explain what wenr wrong and how you're fixing it.
+        4. Clearly explain what went wrong and how you're fixing it.
         5. After resolving the issue, help resume the original task flow
 
         Coding Instructions:
