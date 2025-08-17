@@ -221,6 +221,12 @@ def lifecycle_hook_track_action_assignment(user_prompt: str, user_tasks, group_c
     else:
         current_action_id = user_tasks.current_action
 
+    current_state = get_action_state(user_prompt, current_action_id)
+
+    if current_state not in [ActionState.ASSIGNED, ActionState.ERROR]:
+        logger.info(f"🔒 Action {current_action_id} in {current_state.value} - skipping assignment hook")
+        return False
+
     # When ChatInstructor assigns action, move from ASSIGNED to IN_PROGRESS
     if (group_chat.messages and
         group_chat.messages[-1]['name'] == 'ChatInstructor' and f'Action {current_action_id}' in group_chat.messages[-1]['content']):
@@ -370,7 +376,8 @@ def lifecycle_hook_track_recipe_request(user_prompt: str, user_tasks, group_chat
 
 def lifecycle_hook_track_recipe_completion(user_prompt: str, json_obj: dict, user_tasks) -> dict:
     """10. Track when recipe is received and saved"""
-    if not json_obj or json_obj.get('status', '').lower() != 'done':
+
+    if not json_obj or 'status' not in json_obj or json_obj.get('status', '').lower() != 'done':
         return {'action': 'allow', 'message': None}
 
     if isinstance(user_tasks, dict):
@@ -449,7 +456,7 @@ def lifecycle_hook_check_all_actions_terminated(user_prompt: str, user_tasks) ->
         current_action = user_tasks.current_action
 
     # Check if all actions completed
-    if current_action >= total_actions:
+    if current_action > total_actions:
         # Verify all actions reached TERMINATED state
         incomplete_actions = []
         for action_id in range(1, total_actions + 1):

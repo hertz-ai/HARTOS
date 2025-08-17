@@ -1430,13 +1430,16 @@ class ToolMessageHandler:
 class Action:
     def __init__(self,actions):
         self.actions = actions
-        self.current_action = 0
+        self.current_action = 1
         self.fallback = False
         self.new_json = []
         self.recipe = False
 
-    def get_action(self,current_action):
-        return self.actions[current_action]
+    def get_action(self, array_index):
+        if array_index < 0 or array_index >= len(self.actions):
+            raise IndexError(f"Array index {array_index} out of range")
+
+        return self.actions[array_index]
 
     def get_action_byaction_id(self,action_id):
         for i in self.actions:
