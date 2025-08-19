@@ -1086,10 +1086,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         current_action_id = user_tasks[user_prompt].current_action
 
         current_app.logger.info(
-            f'Inside state_transition with actions {user_tasks.get(user_prompt, Action([])).current_action}')
+            f'Inside state_transition with action id {user_tasks.get(user_prompt, Action([])).current_action}')
         # Log the first message for debugging if it exists
         if len(groupchat.messages) > 0:
-            current_app.logger.info(f"STATE_TRANSITION - Message[0]: {groupchat.messages[0]}")
+            current_app.logger.info(f"STATE_TRANSITION - Message[-1]: {groupchat.messages[-1]}")
             # Log last message details
             last_idx = len(groupchat.messages) - 1
             current_app.logger.info(
@@ -1256,8 +1256,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                             json_action_id = int(json_obj.get('action_id', user_tasks[user_prompt].current_action))
 
                             # Normal Set ActionState To Terminate After getting Recipe json for each action
-                            if 'recipe' in json_obj.keys() and json_obj['status'].lower() == 'done': # Done state when recipe is created
-                                create_individual_recipe_and_terminate(json_action_id, json_obj, user_prompt)
+                            if 'recipe' in json_obj.keys() and json_obj['status'].lower() == 'done' and json_action_id > len(user_tasks[user_prompt].actions): # Done state when recipe is created
+                                create_individual_flow_recipe_and_terminate_flow(json_action_id, json_obj, user_prompt)
 
                             recipe_result = lifecycle_hook_track_recipe_completion(user_prompt, json_obj,
                                                                                    user_tasks)  # 10. Track recipe completion
@@ -1288,7 +1288,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                 individual_json[user_prompt] = json_obj
                                 current_app.logger.info(f'Saved Individual recipe at: {name}')
                             else:
-                                current_app.logger.info(f'Current state is {current_state} and we should not save recipe yet')
+                                current_app.logger.info(f'Current state is {current_state}, Recipe Already Saved in get response group')
 
 
                             return chat_instructor
@@ -1383,7 +1383,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             safe_set_state(user_prompt, action_id, ActionState.ASSIGNED,
                            "entire_actions got updated and hence starting again")
 
-    def create_individual_recipe_and_terminate(current_action_id, json_obj, user_prompt):
+    def create_individual_flow_recipe_and_terminate_flow(current_action_id, json_obj, user_prompt):
         current_app.logger.info('Recipe created successfully, Saving Pending')
 
         safe_set_state(user_prompt, user_tasks[user_prompt].current_action, ActionState.RECIPE_RECEIVED, "Recipe Received")
@@ -1395,18 +1395,14 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
         merged_dict = {**final_recipe[prompt_id], **json_obj}
         flow = get_current_flow(user_prompt)
-        name = f'prompts/{prompt_id}_{flow}_recipe.json'
-        with open(name, "w") as json_file:
-            json.dump(merged_dict, json_file)
-        current_app.logger.info(f"Dictionary saved to {name}")
-        current_app.logger.info('Recipe Created & saved successfully')
+        create_final_recipe_for_current_flow(flow, merged_dict, prompt_id)
+        current_app.logger.info('Flow Recipe Created & saved successfully')
 
         force_state_through_valid_path(user_prompt, current_action_id, ActionState.TERMINATED,
                                        "Recipe Created And Terminated")
         final_recipe[prompt_id] = merged_dict
 
-        increment_current_flow(user_prompt)
-        user_tasks[user_prompt] = Action(config['flows'][get_current_flow(user_prompt)]['actions'])
+        safe_increment_flow(user_prompt, prompt_id)
 
     all_agents = [assistant, executor, author, chat_instructor,helper,verify]
     all_agents.extend(custom_agents)
@@ -1498,7 +1494,7 @@ def instantiate_status_verifier_agent(user_prompt):
             4. Action pending: {"status": "pending","action": "current action","action_id": 1/2/3...,"message": "what steps are pending message here"}
         Important Instructions:
             1. Strict Completion Criteria:
-                i. Only mark an action as "completed" if all steps of the action have been successfully executed.
+                i. Only mark an action as "completed" if all steps of the action have been successfully executed. 
                 ii. For pending or ongoing tasks, instruct the Assistant to complete them.
             2. Ensure Action Accuracy:
                 i. Verify that the last action was performed correctly based on history as per instructions.
@@ -2311,8 +2307,9 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
 
         while while_loop_iterations < max_iterations:
             while_loop_iterations += 1
-            current_app.logger.info(f"WHILE LOOP ITERATION #{while_loop_iterations}")
             current_action_id = user_tasks[user_prompt].current_action
+
+            current_app.logger.info(f"WHILE LOOP ITERATION #{while_loop_iterations} , Current Action Id:{current_action_id}")
 
             track_lifecycle_hooks(current_action_id, group_chat, user_prompt)
 
@@ -2413,76 +2410,9 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                                                                    clear_history=False)
                             continue
 
-
-                        # Only proceed with next action logic if 'allow'
-
-                        # Only proceed if action completed full lifecycle (DONE state)
-
-                        user_tasks[user_prompt].new_json.append(json_obj)
-                        user_tasks[user_prompt].current_action += 1 #all actions completed
-
-                        current_app.logger.info('updating updated action in .json')
-                        individual_recipe = []
-                        flow = get_current_flow(user_prompt)
-                        set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt)
-
-                        group_chat.messages[-1]['content'] = f'{individual_recipe}'
-                        assistant_agent.update_system_message = 'Check if the current_action depends on any other action, regardless of order it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.'
-                        flow = get_current_flow(user_prompt)
-
-                        for num,action in enumerate(user_tasks[user_prompt].actions,1):
-                            try:
-                                group_chat.messages[-1]['content'] = f'{individual_recipe}'
-                                message = f'''Check if the current_action depends on any other action, regardless of order it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.\n current_action: {action}'''
-                                result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
-                                match = None
-                                for i in range(1,4):
-                                    text = group_chat.messages[-i]['content']
-                                    match = re.search(r'\[.*?\]', text)
-                                    if match:
-                                        break
-                                if match:
-                                    action_ids = eval(match.group())
-
-                                    file_path = f'prompts/{prompt_id}_{flow}_{num}.json'
-                                    with open(file_path, 'r') as f:
-                                        data = json.load(f)
-                                    data['actions_this_action_depends_on'] = action_ids
-                                    with open(file_path, 'w') as f:
-                                        json.dump(data, f, indent=4)
-                                else:
-                                    file_path = f'prompts/{prompt_id}_{flow}_{num}.json'
-                                    with open(file_path, 'r') as f:
-                                        data = json.load(f)
-                                    data['actions_this_action_depends_on'] = []
-                                    with open(file_path, 'w') as f:
-                                        json.dump(data, f, indent=4)
-                            except Exception as e:
-                                current_app.logger.info(f'GOT ERROR AT EVAL OF LIST :{e}')
-                                file_path = f'prompts/{prompt_id}_{flow}_{num}.json'
-                                with open(file_path, 'r') as f:
-                                    data = json.load(f)
-                                data['actions_this_action_depends_on'] = []
-                                with open(file_path, 'w') as f:
-                                    json.dump(data, f, indent=4)
-                                continue
-
-                        individual_recipe = []
-                        set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt)
-                        #TOPOLOGICAL SORT & CHECK FOR CYCLIC DEPENDENCY
-                        status,updated_actions, cyc = topological_sort(individual_recipe)
-                        if not status:
-                            fix_cyclic_dependency(cyc, individual_recipe)
-                            status, updated_actions, cyc = topological_sort(individual_recipe)
-
-                        group_chat.messages[-1]['content'] = f'{updated_actions}'
-                        data = get_prompt_config_json(prompt_id)
-                        role = data['flows'][get_current_flow(user_prompt)]['persona']
-
-                        message = begin_agent_convo_to_get_schedulers(assistant_agent, chat_instructor, manager, prompt_id, updated_actions, user_prompt)
-                        last_message = group_chat.messages[-1]
-                        current_app.logger.info(f'HI I AM HERE AFTER FINAL SCHEDULED JSON NOW I WILL next actions')
-                        current_app.logger.info(f'Current Flow -> recipe_for_persona[user_prompt]:{recipe_for_persona[user_prompt]} total_persona_actions[user_prompt]:{total_persona_actions[user_prompt]}')
+                        flow, message, text = after_all_actions_terminated(assistant_agent, chat_instructor, group_chat,
+                                                                           json_obj, manager,  prompt_id, text,
+                                                                           user_prompt)
                         if get_current_flow(user_prompt)  < total_persona_actions[user_prompt]:
                             current_app.logger.info(f'Completed ONE FLOW NOW WE SHOULD WORK ON NEXT FLOW')
                             current_app.logger.info(f'DELETE CURRENT AGENTS AND CREATE NEW')
@@ -2494,6 +2424,8 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                             continue
                         scheduler_check[user_prompt] = True
                         json_response = final_recipe[prompt_id]
+
+                        safe_increment_flow(user_prompt, prompt_id)
                         return 'Agent created successfully'
                     result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
                 else:
@@ -2503,56 +2435,21 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     try:
                         message = user_tasks[user_prompt].get_action(current_action_id - 1)
                     except:
-                        flow = get_current_flow(user_prompt)
-                        individual_recipe = []
-                        set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt)
-                        group_chat.messages[-1]['content'] = f'{individual_recipe}'
-                        assistant_agent.update_system_message = 'Check if the current_action depends on any other action, regardless of order it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.'
-                        for num,action in enumerate(user_tasks[user_prompt].actions,1):
-                            message = f'''Check if the current_action depends on any other action, regardless of order it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.\n current_action: {action}'''
-                            result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
-                            match = None
-                            for i in range(1,4):
-                                text = group_chat.messages[-i]['content']
-                                match = re.search(r'\[.*?\]', text)
-                                if match:
-                                    break
-                            if match:
-                                action_ids = eval(match.group())
-                                file_path = f'prompts/{prompt_id}_{flow}_{num}.json'
-                                with open(file_path, 'r') as f:
-                                    data = json.load(f)
-                                data['actions_this_action_depends_on'] = action_ids
-                                with open(file_path, 'w') as f:
-                                    json.dump(data, f, indent=4)
-                            else:
-                                file_path = f'prompts/{prompt_id}_{flow}_{num}.json'
-                                with open(file_path, 'r') as f:
-                                    data = json.load(f)
-                                data['actions_this_action_depends_on'] = []
-                                with open(file_path, 'w') as f:
-                                    json.dump(data, f, indent=4)
-
-                        individual_recipe = []
-                        set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt)
-
-                        status,updated_actions, cyc = topological_sort(individual_recipe)
-                        if not status:
-                            fix_cyclic_dependency(cyc, individual_recipe)
-                            status,updated_actions, cyc = topological_sort(individual_recipe)
-
-                        group_chat.messages[-1]['content'] = f'{updated_actions}'
-                        begin_agent_convo_to_get_schedulers_not_last(assistant_agent, chat_instructor, manager, prompt_id, updated_actions, user_prompt)
-                        last_message = group_chat.messages[-1]
-                        json_response = retrieve_json(last_message['content'])
-                        if json_response and 'status' in json_response.keys():
-                            merged_dict = {**final_recipe[prompt_id], **json_response}
-                            current_app.logger.info('Recipe created successfully')
-                            create_final_recipe_for_current_flow(flow,merged_dict, prompt_id)
-                            update_agent_creation_to_db(prompt_id)
-                            current_app.logger.info('Completed from here2')
-                            return 'Agent Created Successfully'
-                        return 'Agent created successfully'
+                        flow, json_response = after_all_actions_terminated_from_exception(assistant_agent, chat_instructor, flow,
+                                                                                          group_chat, manager, prompt_id, user_prompt)
+                        if all_flows_completed(prompt_id, total_persona_actions[user_prompt], user_prompt):
+                            if json_response and 'status' in json_response.keys():
+                                merged_dict = {**final_recipe[prompt_id], **json_response}
+                                current_app.logger.info('Recipe created successfully')
+                                create_final_recipe_for_current_flow(flow,merged_dict, prompt_id)
+                                update_agent_creation_to_db(prompt_id)
+                                current_app.logger.info('Completed from here2')
+                                return 'Agent Created Successfully'
+                            return 'Agent created successfully'
+                        else:
+                            user_tasks[user_prompt].recipe=False
+                            user_tasks[user_prompt].fallback=False
+                            safe_increment_flow(user_prompt, prompt_id)
 
                     current_app.logger.info('checking for fallback and recipe')
 
@@ -2562,7 +2459,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         message = request_fallback_for_action(current_action_id,  user_prompt)
                     else:
                         # user_tasks[user_prompt].current_action = user_tasks[user_prompt].current_action+1
-                        message = get_execute_next_action_message(message, prompt_id, user_prompt)
+                        message = get_execute_next_action_message(prompt_id, user_prompt)
                         publish_to_crossbar_new_action_start(message, user_id)
                         safe_set_state(user_prompt, current_action_id, ActionState.IN_PROGRESS, "action start")
 
@@ -2584,6 +2481,13 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         # Action already done - this is likely why you're seeing the error
                         current_app.logger.warning(
                             f"Action {current_action_id} already {current_state.value}, not changing state")
+                    elif current_state == ActionState.FALLBACK_REQUESTED and user_tasks[user_prompt].fallback:
+                        # Force route to user for fallback
+                        message = request_fallback_for_action(current_action_id, user_prompt)
+                        result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,
+                                                               silent=False)
+
+                        continue
                     else:
                         # For other states (FALLBACK_REQUESTED, RECIPE_REQUESTED, etc.), keep current state
                         current_app.logger.info(f"Keeping current state: {current_state.value}")
@@ -2742,8 +2646,139 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
         return last_message['content']
     except Exception as e:
         current_app.logger.error(f"Unhandled exception in get_response_group: {e}")
+        safe_set_state(user_prompt, user_tasks[user_prompt].current_action, ActionState.ERROR, "Unhandled exception in get_response_group")
         current_app.logger.error(traceback.format_exc())
+        result = chat_instructor.initiate_chat(recipient=manager, message="Overcome error & continue", clear_history=False,
+                                               silent=False)
         return f"An error occurred: {str(e)}"
+
+def all_flows_completed(prompt_id, total_personas, user_prompt):
+    """Check if ALL flows for ALL personas are complete"""
+    config = get_prompt_config_json(prompt_id)
+
+    # Check each flow is complete
+    for flow_idx, flow in enumerate(config['flows']):
+        flow_recipe_file = f'prompts/{prompt_id}_{flow_idx}_recipe.json'
+        if not os.path.exists(flow_recipe_file):
+            return False
+
+        # Check all actions in flow are TERMINATED
+        for action_id in range(1, len(flow['actions']) + 1):
+            if get_action_state(user_prompt, action_id) != ActionState.TERMINATED:
+                return False
+
+    return True
+def after_all_actions_terminated(assistant_agent, chat_instructor, group_chat, json_obj, manager,  prompt_id,
+                                 text, user_prompt):
+    # Only proceed with next action logic if 'allow'
+    # Only proceed if action completed full lifecycle (DONE state)
+    user_tasks[user_prompt].new_json.append(json_obj)
+    user_tasks[user_prompt].current_action += 1  # all actions completed
+    current_app.logger.info('updating updated action in .json')
+    individual_recipe = []
+    flow = get_current_flow(user_prompt)
+    set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt)
+    group_chat.messages[-1]['content'] = f'{individual_recipe}'
+    assistant_agent.update_system_message = 'Check if the current_action depends on any other action, regardless of order it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.'
+    flow = get_current_flow(user_prompt)
+    for num, action in enumerate(user_tasks[user_prompt].actions, 1):
+        try:
+            group_chat.messages[-1]['content'] = f'{individual_recipe}'
+            message = f'''Check if the current_action depends on any other action, regardless of order it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.\n current_action: {action}'''
+            result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,
+                                                   silent=False)
+            match = None
+            for i in range(1, 4):
+                text = group_chat.messages[-i]['content']
+                match = re.search(r'\[.*?\]', text)
+                if match:
+                    break
+            if match:
+                action_ids = eval(match.group())
+
+                file_path = f'prompts/{prompt_id}_{flow}_{num}.json'
+                with open(file_path, 'r') as f:
+                    data = json.load(f)
+                data['actions_this_action_depends_on'] = action_ids
+                with open(file_path, 'w') as f:
+                    json.dump(data, f, indent=4)
+            else:
+                file_path = f'prompts/{prompt_id}_{flow}_{num}.json'
+                with open(file_path, 'r') as f:
+                    data = json.load(f)
+                data['actions_this_action_depends_on'] = []
+                with open(file_path, 'w') as f:
+                    json.dump(data, f, indent=4)
+        except Exception as e:
+            current_app.logger.info(f'GOT ERROR AT EVAL OF LIST :{e}')
+            file_path = f'prompts/{prompt_id}_{flow}_{num}.json'
+            with open(file_path, 'r') as f:
+                data = json.load(f)
+            data['actions_this_action_depends_on'] = []
+            with open(file_path, 'w') as f:
+                json.dump(data, f, indent=4)
+            continue
+    individual_recipe = []
+    set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt)
+    # TOPOLOGICAL SORT & CHECK FOR CYCLIC DEPENDENCY
+    status, updated_actions, cyc = topological_sort(individual_recipe)
+    if not status:
+        fix_cyclic_dependency(cyc, individual_recipe)
+        status, updated_actions, cyc = topological_sort(individual_recipe)
+    group_chat.messages[-1]['content'] = f'{updated_actions}'
+    data = get_prompt_config_json(prompt_id)
+    role = data['flows'][get_current_flow(user_prompt)]['persona']
+    message = begin_agent_convo_to_get_schedulers(assistant_agent, chat_instructor, manager, prompt_id, updated_actions,
+                                                  user_prompt)
+    last_message = group_chat.messages[-1]
+    current_app.logger.info(f'HI I AM HERE AFTER FINAL SCHEDULED JSON NOW I WILL next actions')
+    current_app.logger.info(
+        f'Current Flow -> recipe_for_persona[user_prompt]:{recipe_for_persona[user_prompt]} total_persona_actions[user_prompt]:{total_persona_actions[user_prompt]}')
+    return flow, message, text
+
+
+def after_all_actions_terminated_from_exception(assistant_agent, chat_instructor, flow, group_chat, manager, prompt_id, user_prompt):
+    flow = get_current_flow(user_prompt)
+    individual_recipe = []
+    set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt)
+    group_chat.messages[-1]['content'] = f'{individual_recipe}'
+    assistant_agent.update_system_message = 'Check if the current_action depends on any other action, regardless of order it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.'
+    for num, action in enumerate(user_tasks[user_prompt].actions, 1):
+        message = f'''Check if the current_action depends on any other action, regardless of order it can be before or after this action. If yes, return the list of action IDs that this action depends on to ChatInstructor (e.g., [1,2]). Otherwise, return an empty array []. \nIMPORTANT: Respond strictly in an array [] format.\n current_action: {action}'''
+        result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
+        match = None
+        for i in range(1, 4):
+            text = group_chat.messages[-i]['content']
+            match = re.search(r'\[.*?\]', text)
+            if match:
+                break
+        if match:
+            action_ids = eval(match.group())
+            file_path = f'prompts/{prompt_id}_{flow}_{num}.json'
+            with open(file_path, 'r') as f:
+                data = json.load(f)
+            data['actions_this_action_depends_on'] = action_ids
+            with open(file_path, 'w') as f:
+                json.dump(data, f, indent=4)
+        else:
+            file_path = f'prompts/{prompt_id}_{flow}_{num}.json'
+            with open(file_path, 'r') as f:
+                data = json.load(f)
+            data['actions_this_action_depends_on'] = []
+            with open(file_path, 'w') as f:
+                json.dump(data, f, indent=4)
+    individual_recipe = []
+    set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt)
+    status, updated_actions, cyc = topological_sort(individual_recipe)
+    if not status:
+        fix_cyclic_dependency(cyc, individual_recipe)
+        status, updated_actions, cyc = topological_sort(individual_recipe)
+    group_chat.messages[-1]['content'] = f'{updated_actions}'
+    begin_agent_convo_to_get_schedulers_not_last(assistant_agent, chat_instructor, manager, prompt_id, updated_actions,
+                                                 user_prompt)
+    last_message = group_chat.messages[-1]
+    json_response = retrieve_json(last_message['content'])
+    return flow, json_response
 
 
 def set_fallback_flags_and_request_recipe(chat_instructor, current_action_id, manager,  prompt_id, role, user_prompt):
@@ -2771,9 +2806,21 @@ def publish_to_crossbar_new_action_start(message, user_id):
         f"com.hertzai.hevolve.chat.{user_id}", json.dumps(crossbar_message))
 
 
-def get_execute_next_action_message(message, prompt_id, user_prompt):
-    user_tasks[user_prompt].current_action += 1
+# Use lifecycle-aware increment:
+def safe_increment_action(user_prompt):
+    current_action_id = user_tasks[user_prompt].current_action
+    next_action_id = current_action_id + 1
 
+    # Ensure current action is TERMINATED before moving to next
+    if get_action_state(user_prompt, current_action_id) != ActionState.TERMINATED:
+        raise StateTransitionError(f"Action {current_action_id} must be TERMINATED before incrementing")
+
+    user_tasks[user_prompt].current_action = next_action_id
+    safe_set_state(user_prompt, next_action_id, ActionState.ASSIGNED, "action incremented")
+
+def get_execute_next_action_message( prompt_id, user_prompt):
+    safe_increment_action(user_prompt)
+    message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)
     task_time[prompt_id]['timer'] = time.time()
     message = f'Execute Action {user_tasks[user_prompt].current_action}: {message} '
     return message
@@ -2960,7 +3007,29 @@ def initialise_current_flow_to_zero(user_prompt):
 
 def increment_current_flow(user_prompt):
     recipe_for_persona[user_prompt] += 1
+    user_tasks[user_prompt].current_action = 1
+    user_tasks[user_prompt] = Action(config['flows'][get_current_flow(user_prompt)]['actions'])
 
+
+def safe_increment_flow(user_prompt, prompt_id):
+    current_flow = get_current_flow(user_prompt)
+
+    # Ensure all actions in current flow are TERMINATED
+    config = get_prompt_config_json(prompt_id)
+    current_flow_actions = config['flows'][current_flow]['actions']
+
+    for action_id in range(1, len(current_flow_actions) + 1):
+        if get_action_state(user_prompt, action_id) != ActionState.TERMINATED:
+            raise StateTransitionError(f"Cannot increment flow: Action {action_id} not terminated")
+
+    increment_current_flow(user_prompt)
+
+    # Reset action states for new flow
+    next_flow = get_current_flow(user_prompt)
+    if next_flow < len(config['flows']):
+        next_flow_actions = config['flows'][next_flow]['actions']
+        for action_id in range(1, len(next_flow_actions) + 1):
+            safe_set_state(user_prompt, action_id, ActionState.ASSIGNED, "new flow started")
 
 def update_agent_creation_to_db(prompt_id):
     url = f'{database_url}/update_agent_prompt?prompt_id={prompt_id}'
@@ -2972,6 +3041,8 @@ def create_final_recipe_for_current_flow(flow, merged_dict, prompt_id):
     name = f'prompts/{prompt_id}_{flow}_recipe.json'
     with open(name, "w") as json_file:
         json.dump(merged_dict, json_file)
+        current_app.logger.info(f"create_final_recipe_for_current_flow Dictionary saved to {name}")
+
 
 
 def get_current_flow(user_prompt):

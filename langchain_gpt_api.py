@@ -2055,6 +2055,7 @@ def chat():
             conversation_agent[user_id] = True
 
     if create_agent:
+        # Phase 1: Gather Requirements
         if user_id not in review_agents.keys() or review_agents[user_id] == False:
             review_agents[user_id] = False
             prompt = data.get('prompt', None)
@@ -2109,12 +2110,14 @@ def chat():
                 app.logger.error('GOT some error while eval and returning the response')
                 app.logger.error(e)
                 return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Creation Mode'})
+        # Phase 2: Review Phase
         if review_agents[user_id] and not conversation_agent[user_id]:
             response = recipe(user_id,prompt,prompt_id,file_id,request_id)
             if response =='Agent Created Successfully':
                 conversation_agent[user_id] = True
                 return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'completed'})
             return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Review Mode'})
+        # Phase 3: Evaluation Phase
         if review_agents[user_id] and conversation_agent[user_id]:
             return evaluate_agent_after_creation_in_review(file_id, prompt, prompt_id, request_id, user_id)
 

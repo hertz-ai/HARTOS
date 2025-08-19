@@ -443,6 +443,7 @@ def lifecycle_hook_can_increment_action(user_prompt: str, user_tasks) -> dict:
     return {'action': 'allow', 'message': None}
 
 
+
 def lifecycle_hook_check_all_actions_terminated(user_prompt: str, user_tasks) -> dict:
     """13. Check if all actions in array are exhausted and can create flow recipe"""
     if isinstance(user_tasks, dict):
