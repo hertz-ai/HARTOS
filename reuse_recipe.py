@@ -135,13 +135,13 @@ def load_vlm_agent_files(prompt_id, role_number):
                     current_app.logger.error(f"Error reading VLM agent file {file_path}: {e}")
     except Exception as e:
         current_app.logger.error(f"Error listing files in prompts directory: {e}")
-    
+
     return vlm_actions
 
 class Action:
     def __init__(self, actions):
         self.actions = actions
-        self.current_action = 0
+        self.current_action = 1
         self.fallback = False
         self.new_json = []
         self.recipe = False
@@ -194,7 +194,7 @@ async def subscribe_and_return(message, topic, time=1800000):
 
                 if not response_future.done():
                     response_future.set_result(result)
-            
+
             except asyncio.TimeoutError:
                 if not response_future.done():
                     response_future.set_exception(
@@ -203,7 +203,7 @@ async def subscribe_and_return(message, topic, time=1800000):
             except Exception as e:
                 if not response_future.done():
                     response_future.set_exception(e)
-        
+
         finally:
             # Stop the component regardless of success / failure
             try:
@@ -293,17 +293,17 @@ def get_role(user_id, prompt_id):
     return role
 
 
-def clear_message_tracking(user_prompt, original_request_id):
+def clear_message_tracking(user_prompt, unique_message_key):
     """Clear message tracking for a specific request"""
     try:
         if (user_prompt in request_id_list_sent_intermediate and
-                original_request_id in request_id_list_sent_intermediate[user_prompt]):
-            del request_id_list_sent_intermediate[user_prompt][original_request_id]
+                unique_message_key in request_id_list_sent_intermediate[user_prompt]):
+            del request_id_list_sent_intermediate[user_prompt][unique_message_key]
     except Exception as e:
         pass
 
 
-def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_delay=20):
+def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_delay=50):
     """
     Send message to user with improved tracking of sent messages
     """
@@ -311,6 +311,25 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
     random_num = random.randint(1000, 9999)
     original_request_id = request_id_list.get(user_prompt, str(uuid.uuid4()))
     intermediate_request_id = f'{original_request_id}-intermediate-{random_num}'
+    # Process response to ensure it's a string
+    if not isinstance(response, str):
+        if isinstance(response, dict):
+            if 'content' in response:
+                response = response['content']
+            else:
+                response = str(response)
+        else:
+            response = str(response)
+
+    message_hash = get_message_hash(response, original_request_id)
+    unique_message_key = f"{original_request_id}_{message_hash}"
+
+    message_already_sent = (
+            user_prompt in request_id_list_sent_intermediate and
+            unique_message_key in request_id_list_sent_intermediate[user_prompt]
+    )
+    if message_already_sent:
+        return f'Message already sent successfully to user with request_id: {original_request_id}'
 
     # Use a lock to ensure thread safety when updating shared state
     with message_tracking_lock:
@@ -319,7 +338,7 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
             request_id_list_sent_intermediate[user_prompt] = {}
 
         # Track that we've sent a message for this specific original_request_id
-        request_id_list_sent_intermediate[user_prompt][original_request_id] = True
+        request_id_list_sent_intermediate[user_prompt][unique_message_key] = True
 
     # Schedule a task to clear the tracking after the delay
     job_id = f"clear_tracking_{user_prompt}_{original_request_id}_{int(time.time())}"
@@ -333,21 +352,11 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
                 'date',
                 run_date=run_time,
                 id=job_id,
-                args=[user_prompt, original_request_id],
+                args=[user_prompt, unique_message_key],
                 replace_existing=True  # Use replace_existing to avoid conflicts
             )
     except Exception as e:
         current_app.logger.error(f"Error scheduling tracking reset: {e}")
-
-    # Process response to ensure it's a string
-    if not isinstance(response, str):
-        if isinstance(response, dict):
-            if 'content' in response:
-                response = response['content']
-            else:
-                response = str(response)
-        else:
-            response = str(response)
 
     # Send the message to the user
     url = 'http://aws_rasa.hertzai.com:9890/autogen_response'
@@ -355,13 +364,15 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
     headers = {'Content-Type': 'application/json'}
 
     try:
-        res = requests.post(url, data=body, headers=headers, timeout=5)
+        res = requests.post(url, data=body, headers=headers)
         current_app.logger.info(
             f'Message sent with request_id: {intermediate_request_id}, tracking will reset in {reset_tracking_delay}s')
     except Exception as e:
         current_app.logger.error(f"Error sending message to user: {e}")
+        return f'Failed to send message to user with request_id: {original_request_id}'
 
-    return
+    return f'Message sent successfully to user with request_id: {original_request_id}'
+
 
 
 def execute_python_file(task_description: str, user_id: int, prompt_id: int, action_entry_point: int = 0):
@@ -377,24 +388,72 @@ def call_visual_task(task_description: str, user_id: int, prompt_id: int, data: 
     headers = {'Content-Type': 'application/json'}
     url = 'http://localhost:6777/visual_agent'
 
-    # Get the current time
-    now = datetime.now()
+    # Get current time in UTC for comparison
+    now_utc = datetime.utcnow()
 
-    # Only send POST request if the conditions are met
-    if any(obj["zeroshot_label"] == 'Video Reasoning' for obj in data) and (now - date) > timedelta(seconds=30):
-        data_to_send = json.dumps({
-            'task_description': task_description,
-            'user_id': user_id,
-            'prompt_id': prompt_id,
-            'request_from': 'Reuse'
-        })
+    # Get user action data to check for Video Reasoning entries
+    try:
+        action_url = f"{ACTION_API}?user_id={user_id}"
+        payload = {}
+        headers_api = {}
 
-        # Send the POST request to the visual agent
-        res = requests.post(url, data=data_to_send, headers=headers)
-        return 'done'  # Return 'done' as per the original function
+        response = requests.request("GET", action_url, headers=headers_api, data=payload)
 
-    # If conditions are not met, do nothing and return nothing
-    return
+        if response.status_code == 200:
+            api_data = response.json()
+
+            # Filter for Video Reasoning entries within last 5 minutes
+            recent_video_reasoning_entries = []
+            for obj in api_data:
+                if obj.get("zeroshot_label") == 'Video Reasoning':
+                    try:
+                        # Parse the created_date (assuming UTC)
+                        created_date = datetime.strptime(obj["created_date"], "%Y-%m-%dT%H:%M:%S")
+
+                        # Check if within last 5 minutes
+                        time_diff = now_utc - created_date
+                        current_app.logger.info(
+                            f"Found video Reasoning entry: {obj['action']} (created {time_diff} ago)")
+                        if time_diff <= timedelta(minutes=5):
+                            recent_video_reasoning_entries.append(obj)
+                            current_app.logger.info(
+                                f"Found recent Video Reasoning entry: {obj['action']} (created {time_diff} ago)")
+                    except (ValueError, KeyError) as e:
+                        current_app.logger.warning(f"Error parsing date for entry {obj.get('action_id')}: {e}")
+                        continue
+
+            # Execute visual task if at least one recent Video Reasoning entry is found
+            if recent_video_reasoning_entries:
+                current_app.logger.info(
+                    f"Found {len(recent_video_reasoning_entries)} recent Video Reasoning entries (within last 5 minutes) - executing visual task")
+
+                data_to_send = json.dumps({
+                    'task_description': task_description,
+                    'user_id': user_id,
+                    'prompt_id': prompt_id,
+                    'request_from': 'Reuse'
+                })
+
+                try:
+                    # Send the POST request to the visual agent
+                    res = requests.post(url, data=data_to_send, headers=headers)
+                    current_app.logger.info(f"Visual agent response: {res.status_code}")
+                    return 'done'
+                except Exception as e:
+                    current_app.logger.error(f"Failed to call visual agent: {e}")
+                    return 'error'
+            else:
+                current_app.logger.info(
+                    "No recent Video Reasoning entries found (within last 5 minutes) - skipping visual task")
+                return None
+
+        else:
+            current_app.logger.error(f"Failed to get user actions: {response.status_code}")
+            return 'error'
+
+    except Exception as e:
+        current_app.logger.error(f"Error getting user action details: {e}")
+        return 'error'
 
 
 def time_based_execution(task_description: str, user_id: int, prompt_id: int, action_entry_point: int):
@@ -414,25 +473,34 @@ def time_based_execution(task_description: str, user_id: int, prompt_id: int, ac
         if last_message['content'] == 'TERMINATE':
             last_message = group_chat.messages[-2]
         # sending response to receiver agent
-        if f'message_2_user'.lower() in last_message['content'].lower():
+        if f'message2userfinal'.lower() in last_message['content'].lower():
             try:
                 json_obj = retrieve_json(last_message['content'])
-                if json_obj and 'message_2_user' in json_obj:
-                    last_message['content'] = json_obj['message_2_user']
+                if json_obj and 'message2userfinal' in json_obj:
+                    last_message['content'] = json_obj['message2userfinal']
                     send_message_to_user1(user_id, last_message['content'], task_description, prompt_id)
 
             except Exception as e:
                 current_app.logger.error(f"Error extracting JSON: {e}")
                 # Fallback to a basic pattern match if retrieve_json fails
-                pattern = r'@user\s*{[\'"]message_2_user[\'"]\s*:\s*[\'"](.+?)[\'"]}'
+                pattern = r'@user\s*{[\'"]message2userfinal[\'"]\s*:\s*[\'"](.+?)[\'"]}'
                 match = re.search(pattern, last_message['content'], re.DOTALL)
                 if match:
                     last_message['content'] = match.group(1)
                     send_message_to_user1(user_id, last_message['content'], task_description, prompt_id)
-        # At this point, don't process messages with message_2_user as they were already sent
+        # At this point, don't process messages with message2userfinal as they were already sent
         return 'done'
     return 'done'
 
+import hashlib
+def get_message_hash(content, request_id):
+    """
+    Generate a hash for the message content + request_id to track unique messages
+    This prevents conflicts across different requests
+    """
+    # Combine message content with request_id for unique hash
+    hash_input = f"{request_id}:{content}"
+    return hashlib.md5(hash_input.encode()).hexdigest()[:10]
 
 def get_action_user_details(user_id):
     '''
@@ -595,7 +663,7 @@ def visual_based_execution(task_description: str, user_id: int, prompt_id: int):
             Note: Visual input is available because the user's camera is ON.
             <Last_{minutes}_Minutes_Visual_Context_End>: {actions}
             If the user needs to be informed (e.g., task completed, input needed, error), respond in this exact JSON format:
-            {{"message_2_user": "Your clear and useful message here"}}
+            {{"message2userfinal": "Your clear and useful message here"}}
             Only send this if you have something meaningful to say.
             Do not interrupt the user unless they have asked for a response or the task cannot proceed without their input.
             You must now perform this task: {task_description}'''
@@ -612,11 +680,11 @@ def visual_based_execution(task_description: str, user_id: int, prompt_id: int):
         if last_message['content'] == 'TERMINATE':
             if len(group_chat.messages) > 1:
                 last_message = group_chat.messages[-2]
-            if 'message_2_user' in last_message['content'].lower():
+            if 'message2userfinal' in last_message['content'].lower():
                 try:
                     json_obj = retrieve_json(last_message['content'])
-                    if json_obj and 'message_2_user' in json_obj:
-                        send_message_to_user1(user_id, json_obj['message_2_user'], task_description, prompt_id)
+                    if json_obj and 'message2userfinal' in json_obj:
+                        send_message_to_user1(user_id, json_obj['message2userfinal'], task_description, prompt_id)
                 except Exception as e:
                     current_app.logger.error(f"Error processing visual agent response: {e}")
 
@@ -772,6 +840,7 @@ def create_agents_for_role(user_id: str, prompt_id):
             agents=[assistant, helper, user_proxy],
             messages=[],
             max_round=3,
+            select_speaker_prompt_template=f"Read the above conversation, select the next person from [Assistant, Helper, & User] & only return the role as agent. Return User only if the previous message demands it",
             select_speaker_transform_messages=select_speaker_transforms,
             speaker_selection_method=state_transition,  # using an LLM to decide
             allow_repeat_speaker=False,  # Prevent same agent speaking twice
@@ -834,10 +903,10 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                     recipes[user_prompt]["actions"][i] = vlm_action
                     action_exists = True
                     break
-            
+
             if not action_exists:
                 recipes[user_prompt]['actions'].append(vlm_action)
-        
+
         # Update the recipes dictionary
         final_recipe[prompt_id] = recipes[user_prompt]
 
@@ -867,7 +936,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         except Exception as e:
             current_app.logger.error(f'Got error as :{e} while checking for prompts/{prompt_id}_{role_number}_{i}.json')
 
-    response_format = {"message_2_user": "Your message here"}
+    response_format = {"message2userfinal": "Your message here"}
     agent_prompt = f'''You are a Helpful {role} Assistant. Your primary role is to assist the user efficiently while keeping all internal actions and processes hidden from the end user. Follow the guidelines below to perform tasks correctly:
         1. If you encounter a task you cannot perform, request assistance from the @Helper and @Executor agents. If you need to run a tool, seek guidance from the @Helper agent. For code execution, ask the @Executor agent for assistance.
         2. Only execute actions where the persona is: {role}.
@@ -890,7 +959,9 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             8. If you want the user's ID then ask the @Helper to use 'get_user_id' tool and do not prompt the user for their user_id, never mention the user_id to the user. Important: Get the user Id yourself always, Do not ask the user_id from User ever.
             9. If you want to do a google search then you should ask the @Helper to use the 'google_search' tool.        
         10. **Never reveal actions, internal processes, or tools to the user**. Do not ask for user confirmation unless absolutely necessary(You can assume normal things like user's interests).
-        11. **To communicate with the {role} user**, always use this format: `@user {response_format}`.
+        11. Calling Other Agents (Important):
+            i. When you need to direct a question or route the conversation to a specific agent, use the @ tag followed by the agent's name. Examples include: @Executor or @Helper or @User
+            ii. If you are responding to the user's request or need some clarification/information from user, just tag userproxy agent strictly via `@user {response_format}` or If you need to send data proactively (on your own) while continuing your current action use tools `send_message_to_user`  or `send_message_in_seconds` for sending message to user with delay,  Do not use both to convey the same.
         12. All actions, recipes, and functions provided below have been reviewed and tested. Follow them exactly—do not make assumptions or modify them unless they fail or produce an error.
         13. Always request the next action from the @StatusVerifier agent—do not determine the next action on your own.
         14. If `can_perform_without_user_input` is `yes`, execute the action automatically without requesting user confirmation.
@@ -939,7 +1010,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             6. Always use code from recipe given below.
             7. If there is any action which is like to perform a task continuously you should not do it.
             8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
-            9. IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @user {response_format}
+            9. If you want to send data proactively (on your own) to user use `@user {response_format}`. However, if you're responding to the user's request or instruction, use the send_message_to_user or send_message_in_seconds tool.
             10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
             11. Always request the next action from the @StatusVerifier agent—do not determine the next action on your own.
             12. After completing the current action, request the @StatusVerifier agent to verify its completion. It will then provide the next action.
@@ -965,8 +1036,8 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             6. Always use code from recipe given below.
             7. If there is any action which is like to perform a task continuously you should not do it.
             8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
-            9. IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @user {response_format}
-            10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
+            9. If you want to send data proactively (on your own) to user use `@user {response_format}`. However, if you're responding to the user's request or instruction, use the send_message_to_user or send_message_in_seconds tool.
+            10. The response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
             11. Always request the next action from the @StatusVerifier agent—do not determine the next action on your own.
             12. After completing the current action, request the @StatusVerifier agent to verify its completion. It will then provide the next action.
             13. If you get any request to call a tool always ask @Helper to perfor it.
@@ -1378,26 +1449,15 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             return f'Message directed to {agent_found} agent, not sending to user'
 
 
-        original_request_id = request_id_list[user_prompt]
 
-        # Check if we've already sent a message for this specific request
-        message_already_sent = (
-                user_prompt in request_id_list_sent_intermediate and
-                original_request_id in request_id_list_sent_intermediate[user_prompt]
-        )
-
-        if response_type != 'Realtime' or not message_already_sent:
-            current_app.logger.info('INSIDE send_message_to_user')
-            current_app.logger.info(
+        current_app.logger.info('INSIDE send_message_to_user')
+        current_app.logger.info(
                 f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
-            random_num = random.randint(1000, 9999)
-            intermediate_request_id = f'{request_id_list[user_prompt]}-intermediate-{random_num}'
-            request_id_list_sent_intermediate[user_prompt][request_id_list[user_prompt]] = True
-            # TODO add avatar_id and conv_id and response_type
-            send_message_to_user1(user_id, text, '', prompt_id)
-            return f'Message sent successfully to user with request_id: {intermediate_request_id}'
-        else:
-            return f'Message already sent successfully to user with request_id: {original_request_id}'
+        random_num = random.randint(1000, 9999)
+
+        # TODO add avatar_id and conv_id and response_type
+        return send_message_to_user1(user_id, text, '', prompt_id)
+
 
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",
@@ -1450,7 +1510,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         with _active_tools_lock:
             if command_key in _active_tools and _active_tools[command_key]['active']:
                 return f"A Windows command is already being executed in your device. Please wait for it to complete."
-            
+
             # Mark this command as active
             _active_tools[command_key] = {
                 'active': True,
@@ -1461,7 +1521,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             current_app.logger.info('INSIDE execute_windows_or_android_command')
             user_prompt = f'{user_id}_{prompt_id}'
             role_number, role = get_flow_number(user_id, prompt_id)
-            
+
             import os
             import re
             import json
@@ -1471,12 +1531,12 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             pattern = f"{prompt_id}_{role_number}_*_vlm_agent.json"
             current_app.logger.info(f"Looking for files matching pattern: {pattern}")
 
-            
+
             existing_vlm_files = []
             for file in os.listdir(prompts_dir):
                 if file.startswith(f"{prompt_id}_{role_number}_") and file.endswith("_vlm_agent.json"):
                     existing_vlm_files.append(file)
-            
+
             current_app.logger.info(f"Found existing VLM files: {existing_vlm_files}")
 
             # Reload VLM agent files to ensure latest
@@ -1494,10 +1554,10 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                                 recipes[user_prompt]['actions'][i] == vlm_action
                                 action_exists = True
                                 break
-                        
+
                         if not action_exists:
                             recipes[user_prompt]['actions'].append(vlm_action)
-                    
+
                     # Update the recipes dictionary
                     final_recipe[prompt_id] = recipes[user_prompt]
 
@@ -1510,7 +1570,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                 words2 = set(instr2.lower().split())
                 if not words1 or not words2:
                     return False
-                
+
                 # Calculate word overlap
                 overlap = len(words1.intersection(words2))
                 similarity = overlap / (max(len(words1), len(words2)))
@@ -1527,12 +1587,12 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                         matching_recipe = action
                         current_app.logger.info(f"Found existing recipe for instruction: {action_text}")
                         break
-    
+
 
             # Direct file check as backup
             current_action_id = 1
             if user_prompt in user_tasks and hasattr(user_tasks[user_prompt], 'current_action'):
-                current_action_id = user_tasks[user_prompt].current_action + 1
+                current_action_id = user_tasks[user_prompt].current_action
 
             direct_vlm_path = f"prompts/{prompt_id}_{role_number}_{current_action_id}_vlm_agent.json"
             if os.path.exists(direct_vlm_path):
@@ -1562,14 +1622,14 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                         enhanced_instruction += f"{i+1}. {step_description}\n"
 
                 enhanced_instruction += "\nAdapt these steps to the current screen state as needed."
-                current_app.logger.info(f"Created enhanced instruction with {len(matching_recipe.get('recipe', []))} steps") 
-    
+                current_app.logger.info(f"Created enhanced instruction with {len(matching_recipe.get('recipe', []))} steps")
+
             topic = f'com.hertzai.hevolve.action.{user_id}'
             current_app.logger.info(f'calling {topic} for 5 second')
             response = await subscribe_and_return({'prompt_id': prompt_id}, topic, 2000)  # Wait for the RPC response
             current_app.logger.info(f'Response from call of {topic}: {response}')
             if not response:
-                return 'Ask user to to go to hevolve.ai login and start the windows companion app'
+                return 'Ask UserProxy to go to hevolve.ai login and start the windows companion app'
             crossbar_message = {
                 'parent_request_id': request_id_list[user_prompt],
                 'user_id': f'{user_id}',
@@ -1580,7 +1640,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                 'max_ETA_in_seconds': 1800,
                 'langchain_server': True
             }
-            
+
             # Adding the enhanced_instruction if we have it
             if enhanced_instruction:
                 crossbar_message['enhanced_instruction'] = enhanced_instruction
@@ -1604,40 +1664,40 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                         # Get current action ID
                         action_id = 1
                         if user_prompt in user_tasks and hasattr(user_tasks[user_prompt], 'current_action'):
-                            action_id = user_tasks[user_prompt].current_action + 1
-                        
+                            action_id = user_tasks[user_prompt].current_action
+
                         # Determine file path with the action_id
                         role_number, role = get_flow_number(user_id, prompt_id)
                         action_id_to_use = action_id
                         base_path = f"prompts/{prompt_id}_{role_number}"
-                        
+
                         # Import os here to ensure it's available
                         import os
                         import re
                         import json
-                        
+
                         # Check if a file with the current action_id exists, and increment if needed
                         while os.path.exists(f"{base_path}_{action_id_to_use}_vlm_agent.json"):
                             action_id_to_use += 1
-                        
+
                         vlm_agent_path = f"{base_path}_{action_id_to_use}_vlm_agent.json"
-                        
+
                         # Create directory if it doesn't exist
                         os.makedirs(os.path.dirname(vlm_agent_path), exist_ok=True)
-                        
+
                         # Function to clean technical details from text
                         def clean_text(text):
                             # Remove lines with technical details
                             lines = text.split('\n')
                             cleaned_lines = []
                             for line in lines:
-                                if (not line.strip().startswith("Next Action:") and 
-                                    not line.strip().startswith("Box ID:") and 
+                                if (not line.strip().startswith("Next Action:") and
+                                    not line.strip().startswith("Box ID:") and
                                     not line.strip().startswith("box_centroid_coordinate:") and
                                     not line.strip().startswith("value:")):
                                     cleaned_lines.append(line)
                             return '\n'.join(cleaned_lines)
-                        
+
                         # Function to format action text consistently
                         def format_action_text(text):
                             # For JSON-like strings
@@ -1646,7 +1706,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                                     # Try to evaluate the string as a Python dict
                                     action_data = eval(text.strip())
                                     action_type = action_data.get("action", "")
-                                    
+
                                     if action_type == "mouse_move":
                                         return "Move mouse"
                                     elif action_type == "left_click":
@@ -1665,7 +1725,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                                     # If eval fails, try regex
                                     action_match = re.search(r"'action':\s*'([^']+)'", text)
                                     text_match = re.search(r"'text':\s*'([^']+)'", text)
-                                    
+
                                     if action_match:
                                         action_type = action_match.group(1)
                                         if action_type == "type" and text_match:
@@ -1682,26 +1742,26 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                                             return f"Perform {action_type} action"
                                     else:
                                         return "Perform action"
-                            
-                            # For text descriptions containing "Perform" 
+
+                            # For text descriptions containing "Perform"
                             elif "Perform" in text and "action" in text:
                                 return text  # Already in desired format
-                            
+
                             return text
-                        
+
                         # Handle different response format
                         if 'extracted_responses' in response:
                             # Extract the instruction and responses
                             instruction = response.get("instruction", instructions)
                             extracted_responses = response["extracted_responses"]
-                            
+
                             # Process all responses and create recipe steps
                             recipe_steps = []
-                            
+
                             for msg in extracted_responses:
                                 msg_type = msg.get("type", "")
                                 msg_content = msg.get("content", "")
-                                
+
                                 # Clean the content
                                 if msg_type == "analysis":
                                     cleaned_content = clean_text(msg_content)
@@ -1719,7 +1779,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                                             "tool_name": "execute_windows_or_android_command",
                                             "agent_to_perform_this_action": "Helper"
                                         })
-                            
+
                             # If no steps were created, add a default one
                             if not recipe_steps:
                                 recipe_steps.append({
@@ -1727,9 +1787,9 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                                     "tool_name": "execute_windows_or_android_command",
                                     "agent_to_perform_this_action": "Helper"
                                 })
-                            
+
                             persona = f"user{user_id}" if user_id else "user"
-                            
+
                             # Create the recipe format
                             recipe_data = {
                                 "status": "done",
@@ -1746,11 +1806,11 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                                 "time_took_to_complete": execution_time,
                                 "actions_this_action_depends_on": []
                             }
-                            
+
                             # Save the recipe format with vlm_agent naming
                             with open(vlm_agent_path, 'w') as json_file:
                                 json.dump(recipe_data, json_file, indent=4)
-                            
+
                             current_app.logger.info(f"Generated recipe data saved to {vlm_agent_path}")
 
                             try:
@@ -1778,7 +1838,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                                             break
                                     if not action_exists:
                                         recipes[user_prompt]['actions'].append(vlm_action)
-                                
+
                                 # Update the recipes dictionary
                                 final_recipe[prompt_id] = recipes[user_prompt]
                             return f'Successfully ran the command in user\'s computer and created the VLM agent data at {vlm_agent_path}.'
@@ -1808,7 +1868,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                 if command_key in _active_tools:
                     _active_tools[command_key]['active'] = False
 
-    
+
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function", description="Get google search response")
     def google_search(text: Annotated[str, "Text which you want to search"]) -> str:
@@ -1897,7 +1957,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         llm_config=llm_config,
         code_execution_config=False,
         system_message="""You will send message from multiple different personas your, job is to ask those question to assistant agent
-        if you think some text was intent to give to some other agent but i came to you send the same message to user""",
+        if you think some text was intent to give to some other agent but i came to you to send the same message to user""",
     )
     verify1 = autogen.AssistantAgent(
         name="StatusVerifier",
@@ -1988,7 +2048,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     time_agent.register_for_execution(name="send_message_in_seconds")(send_message_in_seconds)
 
     helper1.register_for_llm(name="execute_windows_or_android_command",
-                             description="Executes a command on a Windows machine and returns the response.")(
+                             description="Executes a command on a user's Windows computer or android device and returns the response.")(
         execute_windows_or_android_command)
     time_agent.register_for_execution(name="execute_windows_or_android_command")(execute_windows_or_android_command)
 
@@ -2074,7 +2134,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         send_message_in_seconds)
     visual_agent.register_for_execution(name="send_message_in_seconds")(send_message_in_seconds)
     helper2.register_for_llm(name="execute_windows_or_android_command",
-                             description="Executes a command on a Windows machine and returns the response.")(
+                             description="Executes a command on a user's Windows computer or android device and returns the response.")(
         execute_windows_or_android_command)
     visual_agent.register_for_execution(name="execute_windows_or_android_command")(execute_windows_or_android_command)
     helper2.register_for_llm(name="google_search", description="Get google search response")(google_search)
@@ -2115,50 +2175,12 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
             # Check for any agent mentions and return the corresponding agent
             for mention, agent in agent_mapping.items():
-                if mention in content_lower:
+                if mention.lower() in content_lower:
                     current_app.logger.info(f"Detected mention of {mention} - directing message to appropriate agent")
                     return agent
 
             # Check for messages directed to the user
-            if '@user' in content_lower:
-                current_app.logger.info('GOT @USER in message')
 
-                # Get the current original request ID
-                original_request_id = request_id_list[user_prompt]
-
-                # Check if we've already sent a message for this specific request
-                with message_tracking_lock:
-                    message_already_sent = (
-                            user_prompt in request_id_list_sent_intermediate and
-                            original_request_id in request_id_list_sent_intermediate[user_prompt]
-                    )
-
-                if not message_already_sent:
-                    # Process and send message using retrieve_json
-                    try:
-                        # Use the existing retrieve_json function
-                        json_obj = retrieve_json(messages[-1]["content"])
-                        if json_obj and 'message_2_user' in json_obj:
-                            current_app.logger.info('Successfully extracted message_2_user content')
-                            send_message_to_user1(user_id, json_obj['message_2_user'], '', prompt_id)
-                        else:
-                            # If retrieve_json fails, try a direct regex approach for this specific format
-                            current_app.logger.info('retrieve_json failed, trying regex extraction')
-                            message_match = re.search(r"@user\s*{'message_2_user':\s*'(.*?)'}\s*$",
-                                                      messages[-1]["content"], re.DOTALL)
-                            if message_match:
-                                message_content = message_match.group(1)
-                                current_app.logger.info('Successfully extracted message using regex')
-                                send_message_to_user1(user_id, message_content, '', prompt_id)
-                            else:
-                                current_app.logger.error('Failed to extract message with all methods')
-                    except Exception as e:
-                        current_app.logger.error(f'Error processing @user message: {e}')
-                        current_app.logger.error(traceback.format_exc())
-                else:
-                    current_app.logger.info(f'Already sent a message for request {original_request_id} - skipping')
-
-                return "auto"
 
 
             # Process JSON responses from StatusVerifier
@@ -2181,7 +2203,6 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                         except Exception as e:
                             current_app.logger.error(f'GOT ERROR WHILE UPDATING CURRENT ACTION:{e}')
                             current_app.logger.error(traceback.format_exc())
-                            user_tasks[user_prompt].current_action += 1
                         return chat_instructor
 
                     currentaction_id = last_json['action_id']
@@ -2189,6 +2210,8 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                         return assistant
             except Exception as e:
                 current_app.logger.error(f'Got Error while getting json for current actionid: {e}')
+
+            publish_intermediate_thoughts_to_user(last_speaker, messages)
 
             # Check for specific agent mentions
             if re.search(r"@statusverifier", messages[-1]["content"].lower()):
@@ -2215,15 +2238,15 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                 return assistant
 
             # Check for user messages
-            if 'message_2_user' in messages[-1]["content"].lower():
-                current_app.logger.info('GOT message_2_user in message')
+            if 'message2userfinal' in messages[-1]["content"].lower():
+                current_app.logger.info('GOT message2userfinal in message')
                 # Check if this is directed to an agent and not the user
                 # Use the same agent mapping as before
                 agent_to_return = None
                 for mention, agent in agent_mapping.items():
                     if mention in content_lower:
                         current_app.logger.info(
-                            f"Message with message_2_user also contains {mention} - directing to that agent")
+                            f"Message with message2userfinal also contains {mention} - directing to that agent")
                         agent_to_return = agent
                         break
 
@@ -2237,7 +2260,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                         try:
                             json_part = json_match.group(0)
                             json_obj = json.loads(json_part)
-                            send_message_to_user1(user_id, json_obj['message_2_user'], '', prompt_id)
+                            send_message_to_user1(user_id, json_obj['message2userfinal'], '', prompt_id)
                         except Exception as e:
                             current_app.logger.error(f'Error sending message to user: {e}')
 
@@ -2298,7 +2321,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         if last_speaker.name == f"user_proxy_{user_id}" or last_speaker.name == "multi_role_agent" or last_speaker.name == "Helper" or last_speaker.name == "Executor":
             return time_agent
         current_app.logger.info(f'Checking for @user or @user in message')
-        if 'message_2_user' in messages[-1]["content"].lower():
+        if 'message2userfinal' in messages[-1]["content"].lower():
             current_app.logger.info('GOT @USER in message')
             temp_message = messages[-1]["content"]
             temp_message = temp_message.replace("'", '"')
@@ -2310,7 +2333,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                     json_part = json_match.group(0)
                     current_app.logger.info('Sending user the message')
                     json_obj = json.loads(json_part)
-                    send_message_to_user1(user_id, json_obj['message_2_user'], '', prompt_id)
+                    send_message_to_user1(user_id, json_obj['message2userfinal'], '', prompt_id)
                 except:
                     pass
                 return "auto"
@@ -2341,7 +2364,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         #     groupchat.messages.insert(-2,{'content':visual_context,'role':'user','name':'helper'})
         # current_app.logger.info(f'{messages[-1]}'
         current_app.logger.info(f'Checking for @user or @user in message')
-        if 'message_2_user' in messages[-1]["content"].lower():
+        if 'message2userfinal' in messages[-1]["content"].lower():
             current_app.logger.info('GOT @USER in message')
             temp_message = messages[-1]["content"]
             temp_message = temp_message.replace("'", '"')
@@ -2353,7 +2376,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                     json_part = json_match.group(0)
                     current_app.logger.info('Sending user the message')
                     json_obj = json.loads(json_part)
-                    send_message_to_user1(user_id, json_obj['message_2_user'], '', prompt_id)
+                    send_message_to_user1(user_id, json_obj['message2userfinal'], '', prompt_id)
                 except:
                     pass
 
@@ -2379,6 +2402,23 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             return None
         return "auto"
 
+    def publish_intermediate_thoughts_to_user(last_speaker, messages):
+        try:
+            if (last_speaker.name not in ['UserProxy', 'User'] and messages[-1]["content"] != '' and messages[-1]["content"] is not None
+                    and 'Message already sent successfully to user with request_id' not in messages[-1]["content"]
+                    and 'Message sent successfully to user with request_id' not in messages[-1]["content"]
+                    and '@user' not in messages[-1]["content"]):
+                crossbar_message = {"text": [f'{messages[-1]["content"]}'], "priority": 49,
+                                    "action": 'Thinking', "historical_request_id": [], "preferred_language": 'en-US',
+                                    "options": [], "newoptions": [], "bot_type": 'Agent', "page_image_url": "",
+                                    "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
+                        'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0},
+                        'bottom_left': {'x': 0, 'y': 0}}}
+                client.publish(
+                    f"com.hertzai.hevolve.chat.{user_id}", json.dumps(crossbar_message))
+        except Exception as e:
+            current_app.logger.error(f"Error publishing crossbar message: {e}")
+
     select_speaker_transforms = transform_messages.TransformMessages(
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=50, keep_first_message=True),
@@ -2391,6 +2431,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         agents=[assistant, helper, user_proxy, multi_role_agent, executor, chat_instructor, verify],
         messages=[],
         max_round=10,
+        select_speaker_prompt_template=f"Read the above conversation, select the next person from [Assistant, Helper, Executor, ChatInstructor, StatusVerifier, multi_role_agent & User] & only return the role as agent. Return User only if the previous message demands it",
         select_speaker_transform_messages=select_speaker_transforms,
         speaker_selection_method=state_transition,  # using an LLM to decide
         allow_repeat_speaker=False,  # Prevent same agent speaking twice
@@ -2459,7 +2500,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
 
         count = 0
         while True:
-            current_app.logger.info('inside while1')
+            current_app.logger.info('inside reuse while1')
             if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
                 current_app.logger.info(
                     f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
@@ -2469,12 +2510,12 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                     if json_obj['status'].lower() == 'completed':
                         current_app.logger.info(f'UPDATING CURRENT ACTION AS :{int(json_obj["action_id"])}')
                         user_tasks[user_prompt].current_action = int(json_obj['action_id'])
-                        action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)[
+                        action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)[
                             'action']
                         steps = [{x['steps']: {'tool_name': x.get('tool_name', None),
                                                'code': x.get('generalized_functions', None)}} for x in
-                                 recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action]['recipe']]
-                        user_message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
+                                 recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action - 1]['recipe']]
+                        user_message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action}:{action_message}\n follow these steps: {steps}"
                         chat_instructor.initiate_chat(recipient=manager, message=user_message, clear_history=False,
                                                       silent=False)
                         continue
@@ -2491,12 +2532,12 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                             if json_obj['status'].lower() == 'completed':
                                 current_app.logger.info(f'UPDATING CURRENT ACTION AS :{int(json_obj["action_id"])}')
                                 user_tasks[user_prompt].current_action = int(json_obj['action_id'])
-                                action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)['action']
+                                action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)['action']
                                 steps = [{x['steps']: {'tool_name': x.get('tool_name', None),
                                                        'code': x.get('generalized_functions', None)}} for x in
-                                         recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action][
+                                         recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action - 1][
                                              'recipe']]
-                                user_message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
+                                user_message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action}:{action_message}\n follow these steps: {steps}"
                                 chat_instructor.initiate_chat(recipient=manager, message=user_message,
                                                               clear_history=False, silent=False)
                                 continue
@@ -2505,8 +2546,8 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                     except Exception as e:
                         current_app.logger.warning(f'it is not a json object the error is: {e}')
                         current_app.logger.info('it is not a json object You should ask status verifier to give response in proper format & not move ahead to next action')
-                        actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)
-                        message = 'Hey @StatusVerifier Agent, Please verify the status of the action ' + f'{user_tasks[user_prompt].current_action + 1}: {actions_prompt}' + '\n performed and Respond in the following format {"status": "status here","action": "current action","action_id": ' + f'{user_tasks[user_prompt].current_action + 1}' + ',"message": "message here"}'
+                        actions_prompt = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)
+                        message = 'Hey @StatusVerifier Agent, Please verify the status of the action ' + f'{user_tasks[user_prompt].current_action}: {actions_prompt}' + '\n performed and Respond in the following format {"status": "status here","action": "current action","action_id": ' + f'{user_tasks[user_prompt].current_action}' + ',"message": "message here"}'
                         assistant.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
                         continue
             try:
@@ -2516,7 +2557,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
 
                 count += 1
 
-                if user_prompt not in recipes or user_tasks[user_prompt].current_action >= len(user_tasks[user_prompt]['actions']):
+                if user_prompt not in recipes or user_tasks[user_prompt].current_action > len(user_tasks[user_prompt].actions):
                     current_app.logger.error(
                         f"Cannot access recipe for current action {user_tasks[user_prompt].current_action}")
                     continue
@@ -2528,64 +2569,91 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
 
             except Exception as e:
                 current_app.logger.error(f'WE have some indexx error here: {e}')
+                error_message = traceback.format_exc()  # Capture full traceback
+                current_app.logger.error(f"Error in get_agent_response indexx:\n{error_message}")
 
-            last_message = group_chat.messages[-1]['content']
+            last_message = group_chat.messages[-1]
+            content_lower = last_message['content'].lower()
             # Check if this message has already been sent to the user by state_transition
             # In get_agent_response
-            if f'message_2_user'.lower() in last_message.lower():
-                original_request_id = request_id_list[user_prompt]
+            if f'message2userfinal'.lower() in content_lower:
+                # Extract and process message
+                try:
+                    json_obj = retrieve_json(last_message['content'])
+                    if json_obj and 'message2userfinal' in json_obj:
+                        send_message_to_user1(user_id, json_obj['message2userfinal'], '', prompt_id)
+                        return ''
+                except Exception as e:
+                    current_app.logger.error(f"Error extracting JSON: {e}")
+            elif f'message2'.lower() in content_lower:
+                # Extract and process message
+                try:
+                    json_obj = retrieve_json(last_message['content'])
+                    if json_obj and 'message2' in json_obj:
+                        send_message_to_user1(user_id, json_obj['message2'], '', prompt_id)
+                        return ''
+                except Exception as e:
+                    current_app.logger.error(f"Error extracting JSON: {e}")
+            elif f'@user'.lower() not in content_lower:
+                agent_mentions = [
+                    "@statusverifier", "@status verifier", "@verification",
+                    "@helper", "@executor", "@StatusVerifier", "@Helper", "@Executor"
+                ]
 
-                message_already_sent = (
-                        user_prompt in request_id_list_sent_intermediate and
-                        original_request_id in request_id_list_sent_intermediate[user_prompt]
-                )
+                if any(mention in content_lower for mention in agent_mentions):
+                    agent_found = next((mention for mention in agent_mentions if mention in content_lower), None)
+                    current_app.logger.info(f'Message directed to agent ({agent_found}), not sending to user')
+                    current_app.logger.info(f'continuing since @user not in last message')
+                    continue
 
-                if message_already_sent:
-                    current_app.logger.info(f'Message already sent for request {original_request_id} - skipping')
-                    try:
-                        del request_id_list_sent_intermediate[user_prompt][original_request_id]
-                    except Exception as e:
-                        pass
-                    return ''
-                else:
-                    # Extract and process message
-                    try:
-                        json_obj = retrieve_json(last_message)
-                        if json_obj and 'message_2_user' in json_obj:
-                            send_message_to_user1(user_id, json_obj['message_2_user'], '', prompt_id)
-                            return ''
-                    except Exception as e:
-                        current_app.logger.error(f"Error extracting JSON: {e}")
-
-            elif f'@user'.lower() not in last_message.lower():
-                current_app.logger.info(f'continuing since @user not in last message')
-                continue
             else:
                 current_app.logger.info(f'@user in last message')
                 break
+
         # if individual_recipe[currentaction_id-1]['can_perform_without_user_input'] == 'yes':
         #     return assistant
         last_message = group_chat.messages[-1]
         if last_message['content'] == 'TERMINATE':
             last_message = group_chat.messages[-2]
 
-        if f'message_2_user'.lower() in last_message['content'].lower():
+        content_lower = last_message['content'].lower()
+
+        if f'message2userfinal'.lower() in content_lower:
             try:
                 json_obj = retrieve_json(last_message['content'])
-                if json_obj and 'message_2_user' in json_obj:
-                    last_message['content'] = json_obj['message_2_user']
+                if json_obj and 'message2userfinal' in json_obj:
+                    last_message['content'] = json_obj['message2userfinal']
                     return last_message['content']
 
             except Exception as e:
                 current_app.logger.error(f"Error extracting JSON: {e}")
                 # Fallback to a basic pattern match if retrieve_json fails
-                pattern = r'@user\s*{[\'"]message_2_user[\'"]\s*:\s*[\'"](.+?)[\'"]}'
+                pattern = r'@user\s*{[\'"]message2userfinal[\'"]\s*:\s*[\'"](.+?)[\'"]}'
                 match = re.search(pattern, last_message['content'], re.DOTALL)
                 if match:
                     last_message['content'] = match.group(1)
                     return last_message['content']
-        # At this point, don't process messages with message_2_user as they were already sent
-        return ''
+
+        elif f'message2'.lower() in content_lower:
+            try:
+                json_obj = retrieve_json(last_message['content'])
+                if json_obj and 'message2' in json_obj:
+                    last_message['content'] = json_obj['message2']
+                    return last_message['content']
+
+            except Exception as e:
+                current_app.logger.error(f"Error extracting JSON: {e}")
+                # Fallback to a basic pattern match if retrieve_json fails
+                pattern = r'@user\s*{[\'"]message2[\'"]\s*:\s*[\'"](.+?)[\'"]}'
+                match = re.search(pattern, last_message['content'], re.DOTALL)
+                if match:
+                    last_message['content'] = match.group(1)
+                    return last_message['content']
+        last_message['content'] = last_message["content"].replace("@userproxy ", '')
+        last_message['content'] = last_message["content"].replace("@user ", '')
+
+        # At this point, don't process messages with message2userfinal as they were already sent
+        return last_message['content']
 
     except Exception as e:
         current_app.logger.info(f'Got some error {e}')
@@ -2711,11 +2779,11 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                 assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group = user_agents[user_prompt]
                 user_journey[user_prompt] = 'UseBot'
                 create_schedule(prompt_id, user_id)
-                action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)['action']
+                action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)['action']
                 steps = [
                     {x['steps']: {'tool_name': x.get('tool_name', None), 'code': x.get('generalized_functions', None)}}
-                    for x in recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action]['recipe']]
-                message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
+                    for x in recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action - 1]['recipe']]
+                message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action}:{action_message}\n follow these steps: {steps}"
                 # message = "let's perform the actions availabe in sequence\nIMP instruction: keep track of action id you are working on."
                 result = chat_instructor.initiate_chat(manager, message=message,
                                                        speaker_selection={"speaker": "assistant"}, clear_history=False)
@@ -2732,12 +2800,12 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                             if json_obj['status'].lower() == 'completed':
                                 current_app.logger.info(f'UPDATIN CURRENT ACTION AS :{int(json_obj["action_id"])}')
                                 user_tasks[user_prompt].current_action = int(json_obj['action_id'])
-                                action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)['action']
+                                action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)['action']
                                 steps = [{x['steps']: {'tool_name': x.get('tool_name', None),
                                                        'code': x.get('generalized_functions', None)}} for x in
-                                         recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action][
+                                         recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action - 1][
                                              'recipe']]
-                                user_message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
+                                user_message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action}:{action_message}\n follow these steps: {steps}"
                                 chat_instructor.initiate_chat(recipient=manager, message=user_message,
                                                               clear_history=False, silent=False)
                                 continue
@@ -2752,12 +2820,12 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                         current_app.logger.info(
                                             f'UPDATIN CURRENT ACTION AS :{int(json_obj["action_id"])}')
                                         user_tasks[user_prompt].current_action = int(json_obj['action_id'])
-                                        action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action)['action']
+                                        action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)['action']
                                         steps = [{x['steps']: {'tool_name': x.get('tool_name', None),
                                                                'code': x.get('generalized_functions', None)}} for x in
                                                  recipes[user_prompt]['actions'][
-                                                     user_tasks[user_prompt].current_action]['recipe']]
-                                        user_message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action + 1}:{action_message}\n follow these steps: {steps}"
+                                                     user_tasks[user_prompt].current_action - 1]['recipe']]
+                                        user_message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action}:{action_message}\n follow these steps: {steps}"
                                         chat_instructor.initiate_chat(recipient=manager, message=user_message,
                                                                       clear_history=False, silent=False)
                                         continue
@@ -2773,8 +2841,8 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                 current_app.logger.info(
                                     'it is not a json object You should ask status verifier to give response in proper format & not move ahead to next action')
                                 actions_prompt = user_tasks[user_prompt].get_action(
-                                    user_tasks[user_prompt].current_action)
-                                message = 'Hey @StatusVerifier Agent, Please verify the status of the action ' + f'{user_tasks[user_prompt].current_action + 1}: {actions_prompt}' + '\n performed and Respond in the following format {"status": "status here","action": "current action","action_id": ' + f'{user_tasks[user_prompt].current_action + 1}' + ',"message": "message here"}'
+                                    user_tasks[user_prompt].current_action - 1)
+                                message = 'Hey @StatusVerifier Agent, Please verify the status of the action ' + f'{user_tasks[user_prompt].current_action}: {actions_prompt}' + '\n performed and Respond in the following format {"status": "status here","action": "current action","action_id": ' + f'{user_tasks[user_prompt].current_action}' + ',"message": "message here"}'
                                 assistant.initiate_chat(recipient=manager, message=message, clear_history=False,
                                                         silent=False)
                                 continue
@@ -2782,24 +2850,36 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                     if count == 4:
                         break
                     # role = get_role(user_id,prompt_id)
-                    last_message = group_chat.messages[-1]['content']
-                    if f'@user'.lower() not in last_message.lower():
+                    last_message = group_chat.messages[-1]
+                    if f'@user'.lower() not in last_message['content'].lower():
                         continue
                     else:
                         current_app.logger.info(f'@user in last message')
                         break
+
                 last_message = group_chat.messages[-1]
+
                 if last_message['content'] == 'TERMINATE':
                     last_message = group_chat.messages[-2]
+
                 llm_call_track[user_prompt]['count'] = 0
                 llm_call_track[user_prompt]['original_prompt'] = True
-                if f'message_2_user'.lower() in last_message['content'].lower():
+                if f'message2userfinal'.lower() in last_message['content'].lower():
                     json_obj = retrieve_json(last_message["content"])
                     if json_obj:
                         try:
-                            last_message['content'] = json_obj['message_2_user']
+                            last_message['content'] = json_obj['message2userfinal']
                         except:
                             pass
+
+                elif f'message2'.lower() in last_message['content'].lower():
+                    json_obj = retrieve_json(last_message["content"])
+                    if json_obj:
+                        try:
+                            last_message['content'] = json_obj['message2']
+                        except:
+                            pass
+
                 return last_message['content']
 
             return last_message['content']
@@ -2845,3 +2925,8 @@ def crossbar_multiagent(msg):
 
     # sending response to caller agent
     send_message_to_user1(msg['caller_user_id'], last_message, msg['message'], msg['caller_prompt_id'])
+
+def acknowledgment(user_id,prompt_id,request_id):
+    user_prompt = f'{user_id}_{prompt_id}'
+    author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = user_agents[user_prompt]
+    group_chat.messages.append({'content':f'GOT MESSAGE ACKNOWLEDGEMENT FOR {request_id}','role':'user','name':'Helper'})

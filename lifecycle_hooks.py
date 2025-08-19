@@ -4,12 +4,18 @@ STATE MACHINE IMPLEMENTATION
 """
 
 from enum import Enum
-import re
-import json
 import logging
 import os
 
 logger = logging.getLogger(__name__)
+
+# Add new states to ActionState enum:
+class FlowState(Enum):
+    DEPENDENCY_ANALYSIS = "dependency_analysis"
+    TOPOLOGICAL_SORT = "topological_sort"
+    SCHEDULED_JOBS_CREATION = "scheduled_jobs_creation"
+    FLOW_RECIPE_CREATION = "flow_recipe_creation"
+    FLOW_COMPLETED = "flow_completed"
 
 class ActionState(Enum):
     """Updated state machine to match exact user requirements"""
@@ -25,38 +31,176 @@ class ActionState(Enum):
     RECIPE_RECEIVED = "recipe_received"           # 10. Action recipe json received with status done
     TERMINATED = "terminated"                     # 11. Action passed to chat instructor and Terminate issued
 
+
+# Add to lifecycle_hooks.py
+class FlowLifecycleState:
+    """Track overall flow lifecycle beyond individual actions"""
+
+    def __init__(self):
+        self.flows = {}  # {user_prompt: {flow_id: state}}
+
+    def set_flow_state(self, user_prompt, flow_id, state):
+        if user_prompt not in self.flows:
+            self.flows[user_prompt] = {}
+        self.flows[user_prompt][flow_id] = state
+
+
+flow_lifecycle = FlowLifecycleState()
+
+
+# Enforcement functions
+def enforce_action_termination(user_prompt, current_action_id):
+    """Ensure current action is TERMINATED before proceeding"""
+    state = get_action_state(user_prompt, current_action_id)
+    if state != ActionState.TERMINATED:
+        raise StateTransitionError(
+            f"Action {current_action_id} must be TERMINATED before proceeding (current: {state})")
+
+
+def enforce_all_actions_terminated(user_prompt, total_actions):
+    """Ensure all actions reached TERMINATED before flow completion"""
+    for action_id in range(1, total_actions + 1):
+        state = get_action_state(user_prompt, action_id)
+        if state != ActionState.TERMINATED:
+            return False, f"Action {action_id} not terminated (state: {state})"
+    return True, "All actions terminated"
+
+class StateTransitionError(Exception):
+    """Raised when an invalid state transition is attempted"""
+    pass
+
+
+# 2. UPDATE your set_action_state function to enforce transitions:
+def set_action_state(user_prompt: str, action_id: int, state: ActionState, reason: str = ""):
+    """Set state of an action with validation."""
+    current_state = get_action_state(user_prompt, action_id)
+
+    # Allow same-state transitions (idempotent)
+    if current_state == state:
+        return
+
+    # Validate transition
+    if not validate_state_transition(user_prompt, action_id, state):
+        raise StateTransitionError(
+            f"Invalid transition: Action {action_id} cannot go from {current_state.value} to {state.value}")
+
+    # Perform transition
+    if user_prompt not in action_states:
+        action_states[user_prompt] = {}
+    action_states[user_prompt][action_id] = state
+    logger.info(f"🎯 Action {action_id}: {current_state.value} → {state.value} ({reason})")
+
+
+# 3. ADD these wrapper functions for safe state updates:
+def safe_set_state(user_prompt: str, action_id: int, new_state: ActionState, reason: str = ""):
+    """Safely set state with error handling"""
+    try:
+        set_action_state(user_prompt, action_id, new_state, reason)
+        return True
+    except StateTransitionError as e:
+        logger.error(f"❌ {e}")
+        return False
+
+
+def force_state_through_valid_path(user_prompt: str, action_id: int, target_state: ActionState, reason: str = ""):
+    """Force state to target through valid transitions"""
+    current_state = get_action_state(user_prompt, action_id)
+
+    # Map of how to reach each target state from any current state
+    state_paths = {
+        # From ASSIGNED
+        (ActionState.ASSIGNED, ActionState.IN_PROGRESS): [ActionState.IN_PROGRESS],
+        (ActionState.ASSIGNED, ActionState.STATUS_VERIFICATION_REQUESTED): [ActionState.IN_PROGRESS,
+                                                                            ActionState.STATUS_VERIFICATION_REQUESTED],
+        (ActionState.ASSIGNED, ActionState.COMPLETED): [ActionState.IN_PROGRESS,
+                                                        ActionState.STATUS_VERIFICATION_REQUESTED,
+                                                        ActionState.COMPLETED],
+
+        # From IN_PROGRESS
+        (ActionState.IN_PROGRESS, ActionState.STATUS_VERIFICATION_REQUESTED): [
+            ActionState.STATUS_VERIFICATION_REQUESTED],
+        (ActionState.IN_PROGRESS, ActionState.COMPLETED): [ActionState.STATUS_VERIFICATION_REQUESTED,
+                                                           ActionState.COMPLETED],
+
+        # From STATUS_VERIFICATION_REQUESTED
+        (ActionState.STATUS_VERIFICATION_REQUESTED, ActionState.COMPLETED): [ActionState.COMPLETED],
+        (ActionState.STATUS_VERIFICATION_REQUESTED, ActionState.PENDING): [ActionState.PENDING],
+        (ActionState.STATUS_VERIFICATION_REQUESTED, ActionState.ERROR): [ActionState.ERROR],
+
+        # From COMPLETED
+        (ActionState.COMPLETED, ActionState.FALLBACK_REQUESTED): [ActionState.FALLBACK_REQUESTED],
+        (ActionState.COMPLETED, ActionState.FALLBACK_RECEIVED): [ActionState.FALLBACK_REQUESTED,
+                                                                 ActionState.FALLBACK_RECEIVED],
+        (ActionState.COMPLETED, ActionState.RECIPE_REQUESTED): [ActionState.FALLBACK_REQUESTED,
+                                                                ActionState.FALLBACK_RECEIVED,
+                                                                ActionState.RECIPE_REQUESTED],
+
+        # From PENDING (two paths based on your flows)
+        (ActionState.PENDING, ActionState.COMPLETED): [ActionState.COMPLETED],  # Flow #4
+        (ActionState.PENDING, ActionState.ERROR): [ActionState.ERROR],  # Flow #3
+
+        # From ERROR (retry path)
+        (ActionState.ERROR, ActionState.IN_PROGRESS): [ActionState.IN_PROGRESS],
+        (ActionState.ERROR, ActionState.COMPLETED): [ActionState.IN_PROGRESS, ActionState.STATUS_VERIFICATION_REQUESTED,
+                                                     ActionState.COMPLETED],
+
+        # From FALLBACK states
+        (ActionState.FALLBACK_REQUESTED, ActionState.FALLBACK_RECEIVED): [ActionState.FALLBACK_RECEIVED],
+        (ActionState.FALLBACK_RECEIVED, ActionState.RECIPE_REQUESTED): [ActionState.RECIPE_REQUESTED],
+
+        # From RECIPE states
+        (ActionState.RECIPE_REQUESTED, ActionState.RECIPE_RECEIVED): [ActionState.RECIPE_RECEIVED],
+        (ActionState.RECIPE_RECEIVED, ActionState.TERMINATED): [ActionState.TERMINATED],
+    }
+
+    if current_state == target_state:
+        return True
+
+    # Get the path to target state
+    path_key = (current_state, target_state)
+    if path_key in state_paths:
+        path = state_paths[path_key]
+        logger.info(f"🔧 Auto-path for Action {action_id}: {current_state.value} → {target_state.value}")
+
+        # Execute each step in the path
+        for step_state in path:
+            try:
+                set_action_state(user_prompt, action_id, step_state, f"auto-path: {reason}")
+            except StateTransitionError as e:
+                logger.error(f"❌ Auto-path failed at {step_state.value}: {e}")
+                return False
+        return True
+    else:
+        logger.error(f"❌ No valid path from {current_state.value} to {target_state.value}")
+        return False
+
+
 # State tracking
 action_states = {}  # {user_prompt: {action_id: current_state}}
+
 
 def get_action_state(user_prompt: str, action_id: int) -> ActionState:
     """Get current state of an action."""
     return action_states.get(user_prompt, {}).get(action_id, ActionState.ASSIGNED)
 
-def set_action_state(user_prompt: str, action_id: int, state: ActionState):
-    """Set state of an action."""
-    if user_prompt not in action_states:
-        action_states[user_prompt] = {}
-    action_states[user_prompt][action_id] = state
-    logger.info(f"🎯 Action {action_id} state: {state.value}")
 
 def validate_state_transition(user_prompt: str, action_id: int, new_state: ActionState) -> bool:
     """Validate state transitions follow the exact sequence"""
     current_state = get_action_state(user_prompt, action_id)
 
     valid_transitions = {
-        ActionState.ASSIGNED: [ActionState.IN_PROGRESS],
-        ActionState.IN_PROGRESS: [ActionState.STATUS_VERIFICATION_REQUESTED],
-        ActionState.STATUS_VERIFICATION_REQUESTED: [ActionState.COMPLETED, ActionState.PENDING, ActionState.ERROR],
-        ActionState.COMPLETED: [ActionState.FALLBACK_REQUESTED],
-        ActionState.PENDING: [ActionState.COMPLETED, ActionState.ERROR],
-        ActionState.ERROR: [ActionState.IN_PROGRESS, ActionState.PENDING],  # Can retry or ask fallback
-        ActionState.FALLBACK_REQUESTED: [ActionState.FALLBACK_RECEIVED],
-        ActionState.FALLBACK_RECEIVED: [ActionState.RECIPE_REQUESTED],
-        ActionState.RECIPE_REQUESTED: [ActionState.RECIPE_RECEIVED],
-        ActionState.RECIPE_RECEIVED: [ActionState.TERMINATED],
-        ActionState.TERMINATED: []  # Final state
+        ActionState.ASSIGNED: [ActionState.IN_PROGRESS, ActionState.ASSIGNED],
+        ActionState.IN_PROGRESS: [ActionState.STATUS_VERIFICATION_REQUESTED, ActionState.IN_PROGRESS],
+        ActionState.STATUS_VERIFICATION_REQUESTED: [ActionState.COMPLETED, ActionState.PENDING, ActionState.ERROR, ActionState.STATUS_VERIFICATION_REQUESTED],
+        ActionState.COMPLETED: [ActionState.FALLBACK_REQUESTED, ActionState.COMPLETED],
+        ActionState.PENDING: [ActionState.COMPLETED, ActionState.ERROR, ActionState.PENDING],
+        ActionState.ERROR: [ActionState.IN_PROGRESS, ActionState.PENDING,ActionState.ERROR],  # Can retry or ask fallback
+        ActionState.FALLBACK_REQUESTED: [ActionState.FALLBACK_RECEIVED, ActionState.FALLBACK_REQUESTED],
+        ActionState.FALLBACK_RECEIVED: [ActionState.RECIPE_REQUESTED, ActionState.FALLBACK_RECEIVED],
+        ActionState.RECIPE_REQUESTED: [ActionState.RECIPE_RECEIVED, ActionState.RECIPE_REQUESTED],
+        ActionState.RECIPE_RECEIVED: [ActionState.TERMINATED, ActionState.RECIPE_RECEIVED],
+        ActionState.TERMINATED: [ActionState.ASSIGNED]  # Final state but an entire actions can be updated and hence can go to assigned state again
     }
-
 
     allowed = valid_transitions.get(current_state, [])
     if new_state not in allowed:
@@ -65,6 +209,7 @@ def validate_state_transition(user_prompt: str, action_id: int, new_state: Actio
 
     logger.info(f"✅ Valid transition: {current_state.value} → {new_state.value}")
     return True
+
 
 def lifecycle_hook_track_action_assignment(user_prompt: str, user_tasks, group_chat) -> bool:
     """1. Track when action is assigned from array"""
@@ -76,16 +221,22 @@ def lifecycle_hook_track_action_assignment(user_prompt: str, user_tasks, group_c
     else:
         current_action_id = user_tasks.current_action
 
+    current_state = get_action_state(user_prompt, current_action_id)
+
+    if current_state not in [ActionState.ASSIGNED, ActionState.ERROR]:
+        logger.info(f"🔒 Action {current_action_id} in {current_state.value} - skipping assignment hook")
+        return False
+
     # When ChatInstructor assigns action, move from ASSIGNED to IN_PROGRESS
     if (group_chat.messages and
-        group_chat.messages[-1]['name'] == 'ChatInstructor' and
-        f'Action {current_action_id}' in group_chat.messages[-1]['content']):
+        group_chat.messages[-1]['name'] == 'ChatInstructor' and f'Action {current_action_id}' in group_chat.messages[-1]['content']):
 
         if validate_state_transition(user_prompt, current_action_id, ActionState.IN_PROGRESS):
-            set_action_state(user_prompt, current_action_id, ActionState.IN_PROGRESS)
+            safe_set_state(user_prompt, current_action_id, ActionState.IN_PROGRESS,"hook tracking lifecycle_hook_track_action_assignment")
             return True
 
     return False
+
 
 def lifecycle_hook_track_status_verification_request(user_prompt: str, user_tasks, group_chat) -> bool:
     """3. Track when status verification is requested"""
@@ -102,10 +253,11 @@ def lifecycle_hook_track_status_verification_request(user_prompt: str, user_task
         '@StatusVerifier' in group_chat.messages[-1]['content']):
 
         if validate_state_transition(user_prompt, current_action_id, ActionState.STATUS_VERIFICATION_REQUESTED):
-            set_action_state(user_prompt, current_action_id, ActionState.STATUS_VERIFICATION_REQUESTED)
+            safe_set_state(user_prompt, current_action_id, ActionState.STATUS_VERIFICATION_REQUESTED,"hook tracking lifecycle_hook_track_status_verification_request")
             return True
 
     return False
+
 
 def lifecycle_hook_process_verifier_response(user_prompt: str, json_obj: dict, user_tasks) -> dict:
     """4-6. Process verifier response: completed/pending/error"""
@@ -129,7 +281,7 @@ def lifecycle_hook_process_verifier_response(user_prompt: str, json_obj: dict, u
 
     if status == 'completed':
         if validate_state_transition(user_prompt, current_action_id, ActionState.COMPLETED):
-            set_action_state(user_prompt, current_action_id, ActionState.COMPLETED)
+            safe_set_state(user_prompt, current_action_id, ActionState.COMPLETED,"hook tracking lifecycle_hook_process_verifier_response")
             # Automatically request fallback after completion
             return {
                 'action': 'force_fallback',
@@ -138,7 +290,7 @@ def lifecycle_hook_process_verifier_response(user_prompt: str, json_obj: dict, u
 
     elif status == 'pending':
         if validate_state_transition(user_prompt, current_action_id, ActionState.PENDING):
-            set_action_state(user_prompt, current_action_id, ActionState.PENDING)
+            safe_set_state(user_prompt, current_action_id, ActionState.PENDING,"hook tracking lifecycle_hook_process_verifier_response")
             return {
                 'action': 'force_completion',
                 'message': f"Complete pending steps for action {current_action_id} and ask @StatusVerifier to verify completion"
@@ -146,13 +298,14 @@ def lifecycle_hook_process_verifier_response(user_prompt: str, json_obj: dict, u
 
     elif status == 'error':
         if validate_state_transition(user_prompt, current_action_id, ActionState.ERROR):
-            set_action_state(user_prompt, current_action_id, ActionState.ERROR)
+            safe_set_state(user_prompt, current_action_id, ActionState.ERROR,"hook tracking lifecycle_hook_process_verifier_response")
             return {
                 'action': 'force_retry',
                 'message': f"Error in action {current_action_id}: {json_obj.get('message', 'Unknown error')}. Please resolve and retry."
             }
 
     return {'action': 'allow', 'message': None}
+
 
 def lifecycle_hook_track_fallback_request(user_prompt: str, user_tasks, group_chat) -> bool:
     """7. Track when fallback is requested to user"""
@@ -170,10 +323,11 @@ def lifecycle_hook_track_fallback_request(user_prompt: str, user_tasks, group_ch
         'ask user' in group_chat.messages[-1]['content'].lower()):
 
         if validate_state_transition(user_prompt, current_action_id, ActionState.FALLBACK_REQUESTED):
-            set_action_state(user_prompt, current_action_id, ActionState.FALLBACK_REQUESTED)
+            safe_set_state(user_prompt, current_action_id, ActionState.FALLBACK_REQUESTED,"hook tracking lifecycle_hook_track_fallback_request")
             return True
 
     return False
+
 
 def lifecycle_hook_track_user_fallback(user_prompt: str, user_tasks, group_chat) -> bool:
     """8. Track when fallback is received from user"""
@@ -193,10 +347,11 @@ def lifecycle_hook_track_user_fallback(user_prompt: str, user_tasks, group_chat)
         group_chat.messages[-1]['name'] == 'UserProxy'):
 
         if validate_state_transition(user_prompt, current_action_id, ActionState.FALLBACK_RECEIVED):
-            set_action_state(user_prompt, current_action_id, ActionState.FALLBACK_RECEIVED)
+            safe_set_state(user_prompt, current_action_id, ActionState.FALLBACK_RECEIVED,"hook tracking lifecycle_hook_track_user_fallback")
             return True
 
     return False
+
 
 def lifecycle_hook_track_recipe_request(user_prompt: str, user_tasks, group_chat) -> bool:
     """9. Track when recipe creation is requested"""
@@ -213,14 +368,16 @@ def lifecycle_hook_track_recipe_request(user_prompt: str, user_tasks, group_chat
         'Focus on the current task at hand and create a detailed recipe' in group_chat.messages[-1]['content']):
 
         if validate_state_transition(user_prompt, current_action_id, ActionState.RECIPE_REQUESTED):
-            set_action_state(user_prompt, current_action_id, ActionState.RECIPE_REQUESTED)
+            safe_set_state(user_prompt, current_action_id, ActionState.RECIPE_REQUESTED,"hook tracking lifecycle_hook_track_recipe_request")
             return True
 
     return False
 
+
 def lifecycle_hook_track_recipe_completion(user_prompt: str, json_obj: dict, user_tasks) -> dict:
     """10. Track when recipe is received and saved"""
-    if not json_obj or json_obj.get('status', '').lower() != 'done':
+
+    if not json_obj or 'status' not in json_obj or json_obj.get('status', '').lower() != 'done':
         return {'action': 'allow', 'message': None}
 
     if isinstance(user_tasks, dict):
@@ -235,13 +392,14 @@ def lifecycle_hook_track_recipe_completion(user_prompt: str, json_obj: dict, use
 
     if current_state == ActionState.RECIPE_REQUESTED:
         if validate_state_transition(user_prompt, current_action_id, ActionState.RECIPE_RECEIVED):
-            set_action_state(user_prompt, current_action_id, ActionState.RECIPE_RECEIVED)
+            safe_set_state(user_prompt, current_action_id, ActionState.RECIPE_RECEIVED,"hook tracking lifecycle_hook_track_recipe_completion")
             return {
                 'action': 'save_recipe_and_terminate',
                 'message': f"Recipe received for action {current_action_id}. Save and proceed to termination."
             }
 
     return {'action': 'allow', 'message': None}
+
 
 def lifecycle_hook_track_termination(user_prompt: str, user_tasks, group_chat) -> bool:
     """11. Track when action is terminated and passed to chat instructor"""
@@ -258,13 +416,14 @@ def lifecycle_hook_track_termination(user_prompt: str, user_tasks, group_chat) -
         group_chat.messages[-1]['content'] == 'TERMINATE'):
 
         if validate_state_transition(user_prompt, current_action_id, ActionState.TERMINATED):
-            set_action_state(user_prompt, current_action_id, ActionState.TERMINATED)
+            safe_set_state(user_prompt, current_action_id, ActionState.TERMINATED,"hook tracking lifecycle_hook_track_termination")
             return True
 
     return False
 
+
 def lifecycle_hook_can_increment_action(user_prompt: str, user_tasks) -> dict:
-    """12. Check if can increment to next action"""
+    """12. Check if we can increment to next action"""
     if isinstance(user_tasks, dict):
         current_tasks = user_tasks.get(user_prompt)
         if not current_tasks:
@@ -283,7 +442,9 @@ def lifecycle_hook_can_increment_action(user_prompt: str, user_tasks) -> dict:
 
     return {'action': 'allow', 'message': None}
 
-def lifecycle_hook_check_all_actions_complete(user_prompt: str, user_tasks) -> dict:
+
+
+def lifecycle_hook_check_all_actions_terminated(user_prompt: str, user_tasks) -> dict:
     """13. Check if all actions in array are exhausted and can create flow recipe"""
     if isinstance(user_tasks, dict):
         current_tasks = user_tasks.get(user_prompt)
@@ -296,7 +457,7 @@ def lifecycle_hook_check_all_actions_complete(user_prompt: str, user_tasks) -> d
         current_action = user_tasks.current_action
 
     # Check if all actions completed
-    if current_action >= total_actions:
+    if current_action > total_actions:
         # Verify all actions reached TERMINATED state
         incomplete_actions = []
         for action_id in range(1, total_actions + 1):
@@ -316,6 +477,7 @@ def lifecycle_hook_check_all_actions_complete(user_prompt: str, user_tasks) -> d
         }
 
     return {'action': 'continue_actions', 'message': None}
+
 
 def lifecycle_hook_validate_final_agent_creation(user_prompt: str, user_tasks, prompt_id: int) -> dict:
     """16. Final validation before 'Agent created successfully'"""
@@ -368,6 +530,44 @@ def lifecycle_hook_validate_final_agent_creation(user_prompt: str, user_tasks, p
         'message': "✅ All validations passed - Agent creation ready"
     }
 
+
+def debug_action_flow(user_prompt: str, action_id: int):
+    """Debug specific action's flow pattern"""
+    states = action_states.get(user_prompt, {})
+    if action_id not in states:
+        logger.info(f"Action {action_id}: Not started")
+        return
+
+    current_state = states[action_id]
+
+    # Determine which of the 4 flows this matches
+    if current_state == ActionState.TERMINATED:
+        logger.info(f"✅ Action {action_id}: COMPLETED one of the 4 flows")
+    elif current_state == ActionState.ERROR:
+        logger.info(f"🔄 Action {action_id}: In ERROR (Flow #2 or #3)")
+    elif current_state == ActionState.PENDING:
+        logger.info(f"🔄 Action {action_id}: In PENDING (Flow #3 or #4)")
+    else:
+        logger.info(f"🔄 Action {action_id}: In progress ({current_state.value})")
+
+
+# 6. ADD validation function for the 4 specific flows:
+def validate_flow_pattern(user_prompt: str, action_id: int) -> str:
+    """Identify which of the 4 flows this action followed"""
+    # This would need action history tracking to be fully implemented
+    # For now, just return current state info
+    current_state = get_action_state(user_prompt, action_id)
+
+    if current_state == ActionState.TERMINATED:
+        return "completed_flow"
+    elif current_state == ActionState.ERROR:
+        return "error_flow_in_progress"
+    elif current_state == ActionState.PENDING:
+        return "pending_flow_in_progress"
+    else:
+        return "flow_in_progress"
+
+
 def debug_lifecycle_status(user_prompt: str):
     """Debug function to show current lifecycle status"""
     states = action_states.get(user_prompt, {})
@@ -378,10 +578,12 @@ def debug_lifecycle_status(user_prompt: str):
         terminated = "✅ TERMINATED" if state == ActionState.TERMINATED else "🔄 IN PROGRESS"
         logger.info(f"Action {action_id}: {state.value} {terminated}")
 
+
 def initialize_deterministic_actions():
     """Initialize the state machine"""
     logger.info("🎯 Deterministic action lifecycle initialized")
     return True
+
 
 def initialize_minimal_lifecycle_hooks():
     """Alias for initialization"""

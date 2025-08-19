@@ -2036,10 +2036,7 @@ def chat():
                     no_of_flow = len(data['flows'])-1
                     app.logger.info(f'GOT LEN OF FLOW AS {no_of_flow}')
                 if os.path.exists(f'prompts/{prompt_id}_{no_of_flow}_recipe.json'):
-                    app.logger.info(f'{no_of_flow} Recipe Json exist Goinf to reuse')
-                    create_agent = False
-                    review_agents[user_id] = True
-                    conversation_agent[user_id] = False
+                    create_agent = set_flags_to_enter_review_mode(no_of_flow, user_id) #returns false
                 else:
                     app.logger.info(f'{no_of_flow} Recipe JSON doesnot EXISTS')
                     create_agent = True
@@ -2058,6 +2055,7 @@ def chat():
             conversation_agent[user_id] = True
 
     if create_agent:
+        # Phase 1: Gather Requirements
         if user_id not in review_agents.keys() or review_agents[user_id] == False:
             review_agents[user_id] = False
             prompt = data.get('prompt', None)
@@ -2112,15 +2110,16 @@ def chat():
                 app.logger.error('GOT some error while eval and returning the response')
                 app.logger.error(e)
                 return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Creation Mode'})
+        # Phase 2: Review Phase
         if review_agents[user_id] and not conversation_agent[user_id]:
             response = recipe(user_id,prompt,prompt_id,file_id,request_id)
             if response =='Agent Created Successfully':
                 conversation_agent[user_id] = True
                 return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'completed'})
             return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Review Mode'})
+        # Phase 3: Evaluation Phase
         if review_agents[user_id] and conversation_agent[user_id]:
-            response = chat_agent(user_id,prompt,prompt_id,file_id,request_id)
-            return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Evaluation Mode'})
+            return evaluate_agent_after_creation_in_review(file_id, prompt, prompt_id, request_id, user_id)
 
     if prompt_id and os.path.exists(f'prompts/{prompt_id}.json'):
 
@@ -2228,6 +2227,20 @@ def chat():
     app.logger.info(f"time taken for this full call is {elapsed_time}")
 
     return jsonify({'response': ans, 'intent': thread_local_data.get_recognize_intents(), 'req_token_count': thread_local_data.get_req_token_count(), 'res_token_count': thread_local_data.get_res_token_count(), 'history_request_id': thread_local_data.get_reqid_list()})
+
+
+def evaluate_agent_after_creation_in_review(file_id, prompt, prompt_id, request_id, user_id):
+    response = chat_agent(user_id, prompt, prompt_id, file_id, request_id)
+    return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0,
+                    'history_request_id': [], 'Agent_status': 'Evaluation Mode'})
+
+
+def set_flags_to_enter_review_mode(no_of_flow, user_id):
+    app.logger.info(f'{no_of_flow} Recipe Json exist Going to reuse')
+    create_agent = False
+    review_agents[user_id] = True
+    conversation_agent[user_id] = False
+    return create_agent
 
 
 @app.route('/time_agent',methods=['POST'])
