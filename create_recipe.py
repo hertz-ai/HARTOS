@@ -2278,7 +2278,9 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
 
 
         else:
-            config, total_actions_for_current_flow = get_total_actions_for_current_flow_and_reset_actions()
+            config = get_prompt_config_json(prompt_id)
+
+            total_actions_for_current_flow = get_total_actions_length_for_flow(config, get_current_flow(user_prompt))
 
             current_app.logger.warning(
                 f"current_action_id {user_tasks[user_prompt].current_action} for actions of length {total_actions_for_current_flow} and ")
