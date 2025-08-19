@@ -2949,31 +2949,188 @@ request_id_list = {}
 recipe_for_persona = {}
 total_persona_actions = {}
 
-def recipe(user_id, text,prompt_id,file_id,request_id):
+
+def detect_and_resume_progress(prompt_id, user_prompt):
+    """
+    Detect existing progress and resume from the correct point
+    Returns: (current_flow, current_action, completed_flows)
+    """
+    import os
+    import json
+
+    config = get_prompt_config_json(prompt_id)
+    total_flows = len(config['flows'])
+
+    # Track progress across all flows
+    flow_progress = {}
+    completed_flows = []
+    latest_flow = 0
+    latest_action = 1
+
+    current_app.logger.info(f"🔍 Scanning for existing progress for prompt_id={prompt_id}")
+
+    # Scan each flow for existing files
+    for flow_idx in range(total_flows):
+        flow_actions = config['flows'][flow_idx]['actions']
+        total_actions_in_flow = len(flow_actions)
+
+        # Check for flow recipe (indicates flow completion)
+        flow_recipe_file = f'prompts/{prompt_id}_{flow_idx}_recipe.json'
+        flow_complete = os.path.exists(flow_recipe_file)
+
+        # Count completed actions in this flow
+        completed_actions = []
+        for action_id in range(1, total_actions_in_flow + 1):
+            action_file = f'prompts/{prompt_id}_{flow_idx}_{action_id}.json'
+            if os.path.exists(action_file):
+                completed_actions.append(action_id)
+                current_app.logger.info(f"✅ Found: {action_file}")
+
+        flow_progress[flow_idx] = {
+            'total_actions': total_actions_in_flow,
+            'completed_actions': completed_actions,
+            'flow_complete': flow_complete,
+            'last_completed_action': max(completed_actions) if completed_actions else 0
+        }
+
+        # Update latest flow and action
+        if completed_actions or flow_complete:
+            latest_flow = flow_idx
+            if flow_complete:
+                completed_flows.append(flow_idx)
+                latest_action = total_actions_in_flow + 1  # All actions done
+            else:
+                latest_action = max(completed_actions) + 1 if completed_actions else 1
+
+    current_app.logger.info(f"📊 Progress Analysis:")
+    current_app.logger.info(f"   - Latest Flow: {latest_flow}")
+    current_app.logger.info(f"   - Latest Action: {latest_action}")
+    current_app.logger.info(f"   - Completed Flows: {completed_flows}")
+    current_app.logger.info(f"   - Flow Progress: {flow_progress}")
+
+    return latest_flow, latest_action, flow_progress, completed_flows
+
+
+def set_states_from_progress(user_prompt, prompt_id, current_flow, flow_progress):
+    """
+    Set appropriate states based on detected progress
+    """
+    config = get_prompt_config_json(prompt_id)
+
+    for flow_idx, progress in flow_progress.items():
+        if flow_idx < current_flow:
+            # Previous flows - all actions should be TERMINATED
+            for action_id in range(1, progress['total_actions'] + 1):
+                safe_set_state(user_prompt, action_id, ActionState.TERMINATED, "resumed - previous flow")
+
+        elif flow_idx == current_flow:
+            # Current flow - set states based on completion
+            for action_id in range(1, progress['total_actions'] + 1):
+                if action_id in progress['completed_actions']:
+                    # Action has JSON file - mark as TERMINATED
+                    safe_set_state(user_prompt, action_id, ActionState.TERMINATED, "resumed - action complete")
+                else:
+                    # Action not yet complete - mark as ASSIGNED
+                    safe_set_state(user_prompt, action_id, ActionState.ASSIGNED, "resumed - pending action")
+
+        else:
+            # Future flows - all actions ASSIGNED but not started yet
+            for action_id in range(1, progress['total_actions'] + 1):
+                safe_set_state(user_prompt, action_id, ActionState.ASSIGNED, "resumed - future flow")
+
+
+def initialize_with_resume(prompt_id, user_prompt, user_id):
+    """
+    Enhanced initialization that resumes from existing progress
+    """
+    config = get_prompt_config_json(prompt_id)
+
+    # Detect existing progress
+    current_flow, current_action, flow_progress, completed_flows = detect_and_resume_progress(prompt_id, user_prompt)
+
+    # Set flow tracking
+    recipe_for_persona[user_prompt] = current_flow
+    total_persona_actions[user_prompt] = len(config['flows'])
+
+    # Initialize user tasks for current flow
+    current_flow_actions = config['flows'][current_flow]['actions']
+    user_tasks[user_prompt] = Action(current_flow_actions)
+    user_tasks[user_prompt].current_action = current_action
+
+    # Set appropriate states based on progress
+    set_states_from_progress(user_prompt, prompt_id, current_flow, flow_progress)
+
+    # Initialize other tracking
+    scheduler_check[user_prompt] = len(completed_flows) == len(config['flows'])  # All flows complete
+    agent_data[prompt_id] = {'user_id': user_id}
+
+    # Load any existing metadata from completed actions
+    load_existing_metadata(prompt_id, user_prompt, flow_progress)
+
+    current_app.logger.info(f"🎯 RESUME SUMMARY:")
+    current_app.logger.info(f"   - Resumed at Flow {current_flow}, Action {current_action}")
+    current_app.logger.info(f"   - Scheduler Check: {scheduler_check[user_prompt]}")
+    current_app.logger.info(f"   - Completed Flows: {len(completed_flows)}/{len(config['flows'])}")
+
+    return current_flow, current_action, completed_flows
+
+
+def load_existing_metadata(prompt_id, user_prompt, flow_progress):
+    """
+    Load metadata from existing action JSONs to restore agent_data state
+    """
+    try:
+        # Look for the most recent action JSON with metadata
+        for flow_idx, progress in flow_progress.items():
+            for action_id in sorted(progress['completed_actions'], reverse=True):
+                action_file = f'prompts/{prompt_id}_{flow_idx}_{action_id}.json'
+                try:
+                    with open(action_file, 'r') as f:
+                        action_data = json.load(f)
+                        if 'metadata' in action_data and action_data['metadata']:
+                            # Merge metadata into agent_data
+                            if prompt_id not in agent_data:
+                                agent_data[prompt_id] = {}
+                            agent_data[prompt_id].update(action_data['metadata'])
+                            current_app.logger.info(f"📥 Loaded metadata from {action_file}")
+                            return  # Load from most recent only
+                except Exception as e:
+                    current_app.logger.warning(f"⚠️ Could not load metadata from {action_file}: {e}")
+                    continue
+    except Exception as e:
+        current_app.logger.error(f"❌ Error loading existing metadata: {e}")
+
+
+def recipe(user_id, text, prompt_id, file_id, request_id):
     user_prompt = f'{user_id}_{prompt_id}'
     request_id_list[user_prompt] = request_id
-    current_app.logger.info('--'*100)
+    current_app.logger.info('--' * 100)
+
     if file_id:
         recent_file_id[user_id] = file_id
 
     if user_prompt not in user_tasks.keys():
-        scheduler_check[user_prompt] = False
-        config, total_actions = get_total_actions_for_current_flow(prompt_id, user_prompt)
-        #lifecycle1 All Actions To ASSIGNED
-        for action_id in range(1, total_actions + 1):
-            safe_set_state(user_prompt, action_id, ActionState.ASSIGNED, "initial setup")
-        initialise_current_flow_to_zero(user_prompt)
-        total_persona_actions[user_prompt] = len(config['flows'])
-        agent_data[prompt_id] = {'user_id':user_id}
+        # 🎯 ENHANCED: Resume from existing progress instead of starting fresh
+        current_flow, current_action, completed_flows = initialize_with_resume(prompt_id, user_prompt, user_id)
+
+        # Check if all flows are already complete
+        if scheduler_check[user_prompt]:
+            current_app.logger.info("🎉 All flows already completed - Agent already created")
+            return 'Agent Already Created Successfully'
+
+        current_app.logger.info(f"🔄 Resuming from Flow {current_flow}, Action {current_action}")
+    else:
+        current_app.logger.info(f"♻️ Using existing session for {user_prompt}")
 
     try:
         last_response = get_response_group(user_id, text, prompt_id)
     except Exception as e:
-        current_app.logger.error(f"Error occurred in create Recipe: {str(e)}")  # Add logging for debugging
-        error_message = traceback.format_exc()  # Capture full traceback
+        current_app.logger.error(f"Error occurred in create Recipe: {str(e)}")
+        error_message = traceback.format_exc()
         current_app.logger.error(f"Error occurred in create Recipe stack trace:\n{error_message}")
         last_response = get_response_group(user_id, text, prompt_id, True, e)
 
+    # Rest of the function remains the same...
     if scheduler_check[user_prompt] == True:
         current_app.logger.info('WORKING on TIMER AGENTS')
         config = get_prompt_config_json(prompt_id)
@@ -2987,9 +3144,10 @@ def recipe(user_id, text,prompt_id,file_id,request_id):
         update_agent_creation_to_db(prompt_id)
         current_app.logger.info('Completed from here')
         return 'Agent Created Successfully'
+
     try:
         json_response = retrieve_json(last_response)
-        if 'status' in json_response.keys() and last_response['status'].lower() == 'completed':
+        if 'status' in json_response.keys() and json_response['status'].lower() == 'completed':
             if 'recipe' in json_response.keys():
                 update_agent_creation_to_db(prompt_id)
                 current_app.logger.info('Completed from here3')
@@ -2998,6 +3156,7 @@ def recipe(user_id, text,prompt_id,file_id,request_id):
                 return json_response['message']
     except:
         pass
+
     return last_response
 
 
