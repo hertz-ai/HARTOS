@@ -1366,7 +1366,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             user_tasks[user_prompt].current_action = 1
             user_tasks[user_prompt].fallback = False
             user_tasks[user_prompt].recipe = False
-            config, total_actions = get_total_actions_for_current_flow(prompt_id, user_prompt)
+            config, total_actions = get_total_actions_for_current_flow_and_reset_actions(prompt_id, user_prompt)
             reset_to_assigned_for_all_actions(total_actions, user_prompt)
 
         except Exception as e:
@@ -2278,8 +2278,18 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
 
 
         else:
-            message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)
+            config, total_actions_for_current_flow = get_total_actions_for_current_flow_and_reset_actions()
+
+            current_app.logger.warning(
+                f"current_action_id {user_tasks[user_prompt].current_action} for actions of length {total_actions_for_current_flow} and ")
+
+            should_continue, early_response = safe_action_boundary_check(user_prompt, prompt_id, text, user_id)
+            if not should_continue:
+                return early_response
+
             current_action_id = user_tasks[user_prompt].current_action
+
+            message = user_tasks[user_prompt].get_action(current_action_id - 1)
             current_state = get_action_state(user_prompt, current_action_id)
 
             message = f'Execute Action {user_tasks[user_prompt].current_action}: {message} '+f',Latest User message: {text}'
@@ -2355,7 +2365,6 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         force_state_through_valid_path(user_prompt, json_action_id, ActionState.COMPLETED,
                                                        "verified complete")
 
-                        # FIX: Only increment if not in fallback/recipe flow
                         if not user_tasks[user_prompt].fallback and not user_tasks[user_prompt].recipe:
                             # Check if we can move to next action
                             if json_action_id > len(user_tasks[user_prompt].actions):
@@ -2364,8 +2373,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                             else:
                                 # Move to next action
                                 user_tasks[user_prompt].current_action = json_action_id
-                                safe_set_state(user_prompt, user_tasks[user_prompt].current_action + 1,
-                                               ActionState.ASSIGNED, "next action start")
+                                user_tasks[user_prompt].fallback = True
                 else:
                     current_app.logger.warning(f'it is not a json object the error is:')
                     current_app.logger.info('it is not a json object You should ask status verifier to give response in proper format & not move ahead to next action')
@@ -2413,7 +2421,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         flow, message, text = after_all_actions_terminated(assistant_agent, chat_instructor, group_chat,
                                                                            json_obj, manager,  prompt_id, text,
                                                                            user_prompt)
-                        if get_current_flow(user_prompt)  < total_persona_actions[user_prompt]:
+                        if get_current_flow(user_prompt)  < get_total_flows(user_prompt):
                             current_app.logger.info(f'Completed ONE FLOW NOW WE SHOULD WORK ON NEXT FLOW')
                             current_app.logger.info(f'DELETE CURRENT AGENTS AND CREATE NEW')
                             config = get_prompt_config_json(prompt_id)
@@ -2437,7 +2445,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     except:
                         flow, json_response = after_all_actions_terminated_from_exception(assistant_agent, chat_instructor, flow,
                                                                                           group_chat, manager, prompt_id, user_prompt)
-                        if all_flows_completed(prompt_id, total_persona_actions[user_prompt], user_prompt):
+                        if all_flows_completed(prompt_id, get_total_flows(user_prompt), user_prompt):
                             if json_response and 'status' in json_response.keys():
                                 merged_dict = {**final_recipe[prompt_id], **json_response}
                                 current_app.logger.info('Recipe created successfully')
@@ -2648,9 +2656,12 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
         current_app.logger.error(f"Unhandled exception in get_response_group: {e}")
         safe_set_state(user_prompt, user_tasks[user_prompt].current_action, ActionState.ERROR, "Unhandled exception in get_response_group")
         current_app.logger.error(traceback.format_exc())
-        result = chat_instructor.initiate_chat(recipient=manager, message="Overcome error & continue", clear_history=False,
-                                               silent=False)
         return f"An error occurred: {str(e)}"
+
+
+def get_total_flows(user_prompt):
+    return total_persona_actions[user_prompt]
+
 
 def all_flows_completed(prompt_id, total_personas, user_prompt):
     """Check if ALL flows for ALL personas are complete"""
@@ -2673,7 +2684,7 @@ def after_all_actions_terminated(assistant_agent, chat_instructor, group_chat, j
     # Only proceed with next action logic if 'allow'
     # Only proceed if action completed full lifecycle (DONE state)
     user_tasks[user_prompt].new_json.append(json_obj)
-    user_tasks[user_prompt].current_action += 1  # all actions completed
+    safe_increment_action(user_prompt) # all actions completed
     current_app.logger.info('updating updated action in .json')
     individual_recipe = []
     flow = get_current_flow(user_prompt)
@@ -2733,7 +2744,7 @@ def after_all_actions_terminated(assistant_agent, chat_instructor, group_chat, j
     last_message = group_chat.messages[-1]
     current_app.logger.info(f'HI I AM HERE AFTER FINAL SCHEDULED JSON NOW I WILL next actions')
     current_app.logger.info(
-        f'Current Flow -> recipe_for_persona[user_prompt]:{recipe_for_persona[user_prompt]} total_persona_actions[user_prompt]:{total_persona_actions[user_prompt]}')
+        f'Current Flow -> recipe_for_persona[user_prompt]:{get_current_flow(user_prompt)} total_persona_actions[user_prompt]:{get_total_flows()}')
     return flow, message, text
 
 
@@ -2809,14 +2820,12 @@ def publish_to_crossbar_new_action_start(message, user_id):
 # Use lifecycle-aware increment:
 def safe_increment_action(user_prompt):
     current_action_id = user_tasks[user_prompt].current_action
-    next_action_id = current_action_id + 1
-
     # Ensure current action is TERMINATED before moving to next
     if get_action_state(user_prompt, current_action_id) != ActionState.TERMINATED:
         raise StateTransitionError(f"Action {current_action_id} must be TERMINATED before incrementing")
 
-    user_tasks[user_prompt].current_action = next_action_id
-    safe_set_state(user_prompt, next_action_id, ActionState.ASSIGNED, "action incremented")
+    user_tasks[user_prompt].current_action += 1
+    safe_set_state(user_prompt, user_tasks[user_prompt].current_action, ActionState.ASSIGNED, "action incremented")
 
 def get_execute_next_action_message( prompt_id, user_prompt):
     safe_increment_action(user_prompt)
@@ -2950,9 +2959,11 @@ recipe_for_persona = {}
 total_persona_actions = {}
 
 
+# FIX: Resume Logic Issues - Replace detect_and_resume_progress function
+
 def detect_and_resume_progress(prompt_id, user_prompt):
     """
-    Detect existing progress and resume from the correct point
+    Fixed version: Detect existing progress and resume from the correct point
     Returns: (current_flow, current_action, completed_flows)
     """
     import os
@@ -2976,15 +2987,18 @@ def detect_and_resume_progress(prompt_id, user_prompt):
 
         # Check for flow recipe (indicates flow completion)
         flow_recipe_file = f'prompts/{prompt_id}_{flow_idx}_recipe.json'
-        flow_complete = os.path.exists(flow_recipe_file)
+        flow_recipe_exists = os.path.exists(flow_recipe_file)
 
-        # Count completed actions in this flow
+        # Count completed actions in this flow (actions with JSON files)
         completed_actions = []
         for action_id in range(1, total_actions_in_flow + 1):
             action_file = f'prompts/{prompt_id}_{flow_idx}_{action_id}.json'
             if os.path.exists(action_file):
                 completed_actions.append(action_id)
                 current_app.logger.info(f"✅ Found: {action_file}")
+
+        # ✅ FIX: Flow is complete ONLY if ALL actions have JSON files AND recipe exists
+        flow_complete = (len(completed_actions) == total_actions_in_flow) and flow_recipe_exists
 
         flow_progress[flow_idx] = {
             'total_actions': total_actions_in_flow,
@@ -2993,14 +3007,23 @@ def detect_and_resume_progress(prompt_id, user_prompt):
             'last_completed_action': max(completed_actions) if completed_actions else 0
         }
 
-        # Update latest flow and action
-        if completed_actions or flow_complete:
+        # ✅ FIX: Update latest flow and action based on actual completion
+        if completed_actions:
             latest_flow = flow_idx
             if flow_complete:
                 completed_flows.append(flow_idx)
-                latest_action = total_actions_in_flow + 1  # All actions done
+                # If this flow is complete, check if there's a next flow
+                if flow_idx + 1 < total_flows:
+                    latest_flow = flow_idx + 1
+                    latest_action = 1  # Start next flow
+                else:
+                    latest_action = total_actions_in_flow + 1  # Beyond last action
             else:
-                latest_action = max(completed_actions) + 1 if completed_actions else 1
+                # ✅ FIX: Next action should be last_completed + 1, not some random number
+                latest_action = max(completed_actions) + 1
+                # Ensure we don't exceed flow actions
+                if latest_action > total_actions_in_flow:
+                    latest_action = total_actions_in_flow + 1
 
     current_app.logger.info(f"📊 Progress Analysis:")
     current_app.logger.info(f"   - Latest Flow: {latest_flow}")
@@ -3011,9 +3034,11 @@ def detect_and_resume_progress(prompt_id, user_prompt):
     return latest_flow, latest_action, flow_progress, completed_flows
 
 
+# FIX: State setting for resume - Replace set_states_from_progress function
+
 def set_states_from_progress(user_prompt, prompt_id, current_flow, flow_progress):
     """
-    Set appropriate states based on detected progress
+    Fixed version: Set appropriate states based on detected progress using valid transitions
     """
     config = get_prompt_config_json(prompt_id)
 
@@ -3021,14 +3046,17 @@ def set_states_from_progress(user_prompt, prompt_id, current_flow, flow_progress
         if flow_idx < current_flow:
             # Previous flows - all actions should be TERMINATED
             for action_id in range(1, progress['total_actions'] + 1):
-                safe_set_state(user_prompt, action_id, ActionState.TERMINATED, "resumed - previous flow")
+                # ✅ FIX: Use force_state_through_valid_path to handle transitions properly
+                force_state_through_valid_path(user_prompt, action_id, ActionState.TERMINATED,
+                                               "resumed - previous flow")
 
         elif flow_idx == current_flow:
             # Current flow - set states based on completion
             for action_id in range(1, progress['total_actions'] + 1):
                 if action_id in progress['completed_actions']:
-                    # Action has JSON file - mark as TERMINATED
-                    safe_set_state(user_prompt, action_id, ActionState.TERMINATED, "resumed - action complete")
+                    # ✅ FIX: Action has JSON file - use proper state path to TERMINATED
+                    force_state_through_valid_path(user_prompt, action_id, ActionState.TERMINATED,
+                                                   "resumed - action complete")
                 else:
                     # Action not yet complete - mark as ASSIGNED
                     safe_set_state(user_prompt, action_id, ActionState.ASSIGNED, "resumed - pending action")
@@ -3039,32 +3067,117 @@ def set_states_from_progress(user_prompt, prompt_id, current_flow, flow_progress
                 safe_set_state(user_prompt, action_id, ActionState.ASSIGNED, "resumed - future flow")
 
 
+# FIX: Enhanced boundary check before while loop - Add this in get_response_group()
+
+def safe_action_boundary_check(user_prompt, prompt_id, text, user_id):
+    """
+    Enhanced boundary check with proper flow transition logic
+    Returns: (should_continue, response_or_none)
+    """
+    current_action_id = user_tasks[user_prompt].current_action
+    config = get_prompt_config_json(prompt_id)
+    current_flow = get_current_flow(user_prompt)
+    total_flows = len(config['flows'])
+
+    # Check if current flow exists
+    if current_flow >= total_flows:
+        current_app.logger.info(f"All flows ({total_flows}) completed")
+        return False, 'Agent Created Successfully'
+
+    current_flow_actions = get_total_actions_length_for_flow(config, current_flow)
+
+    # ✅ FIX: Handle action exceeding current flow
+    if current_action_id > current_flow_actions:
+        current_app.logger.info(
+            f"Action {current_action_id} exceeds flow {current_flow} actions ({current_flow_actions})")
+
+        # Check if current flow is actually complete (all actions have JSON files)
+        all_actions_complete = True
+        for action_id in range(1, current_flow_actions + 1):
+            action_file = f'prompts/{prompt_id}_{current_flow}_{action_id}.json'
+            if not os.path.exists(action_file):
+                all_actions_complete = False
+                current_app.logger.warning(f"Action {action_id} not complete - missing {action_file}")
+                break
+
+        if not all_actions_complete:
+            # ✅ FIX: Find the first incomplete action and resume from there
+            for action_id in range(1, current_flow_actions + 1):
+                action_file = f'prompts/{prompt_id}_{current_flow}_{action_id}.json'
+                if not os.path.exists(action_file):
+                    current_app.logger.info(f"Resuming from incomplete action {action_id}")
+                    user_tasks[user_prompt].current_action = action_id
+                    return True, None  # Continue with normal execution
+
+        # Flow is complete, try to move to next flow
+        if current_flow + 1 < total_flows:
+            current_app.logger.info(f"Moving to next flow: {current_flow} -> {current_flow + 1}")
+
+            # Simple flow increment
+            recipe_for_persona[user_prompt] += 1
+            next_flow_actions = config['flows'][get_current_flow(user_prompt)]['actions']
+            user_tasks[user_prompt] = Action(next_flow_actions)
+            user_tasks[user_prompt].current_action = 1
+
+            # Initialize states for new flow actions
+            for action_id in range(1, len(next_flow_actions) + 1):
+                safe_set_state(user_prompt, action_id, ActionState.ASSIGNED, "new flow started")
+
+            # Delete old agents and create new ones
+            if user_prompt in user_agents:
+                del user_agents[user_prompt]
+            return False, get_response_group(user_id, text, prompt_id)
+
+        else:
+            # All flows completed
+            current_app.logger.info("All flows completed - agent creation ready")
+            return False, 'Agent Created Successfully'
+
+    # Action is within bounds, continue normal execution
+    return True, None
+
+
+def get_total_actions_length_for_flow(config, current_flow):
+    return len(config['flows'][current_flow]['actions'])
+
+
+# ... rest of existing code
+
+
+# Also replace the resume functions in initialize_with_resume():
+
 def initialize_with_resume(prompt_id, user_prompt, user_id):
     """
-    Enhanced initialization that resumes from existing progress
+    Fixed initialization that resumes from existing progress
     """
     config = get_prompt_config_json(prompt_id)
 
-    # Detect existing progress
-    current_flow, current_action, flow_progress, completed_flows = detect_and_resume_progress(prompt_id, user_prompt)
+    # Use fixed detection
+    current_flow, current_action, flow_progress, completed_flows = detect_and_resume_progress(prompt_id,
+                                                                                                    user_prompt)
 
     # Set flow tracking
     recipe_for_persona[user_prompt] = current_flow
     total_persona_actions[user_prompt] = len(config['flows'])
 
-    # Initialize user tasks for current flow
-    current_flow_actions = config['flows'][current_flow]['actions']
-    user_tasks[user_prompt] = Action(current_flow_actions)
-    user_tasks[user_prompt].current_action = current_action
+    # ✅ FIX: Handle case where we're beyond current flow actions
+    if current_flow < len(config['flows']):
+        current_flow_actions = config['flows'][current_flow]['actions']
+        user_tasks[user_prompt] = Action(current_flow_actions)
+        user_tasks[user_prompt].current_action = current_action
+    else:
+        # All flows complete
+        user_tasks[user_prompt] = Action([])  # Empty actions
+        user_tasks[user_prompt].current_action = 1
 
-    # Set appropriate states based on progress
+    # Use fixed state setting
     set_states_from_progress(user_prompt, prompt_id, current_flow, flow_progress)
 
     # Initialize other tracking
-    scheduler_check[user_prompt] = len(completed_flows) == len(config['flows'])  # All flows complete
+    scheduler_check[user_prompt] = len(completed_flows) == len(config['flows'])
     agent_data[prompt_id] = {'user_id': user_id}
 
-    # Load any existing metadata from completed actions
+    # Load existing metadata
     load_existing_metadata(prompt_id, user_prompt, flow_progress)
 
     current_app.logger.info(f"🎯 RESUME SUMMARY:")
@@ -3073,7 +3186,6 @@ def initialize_with_resume(prompt_id, user_prompt, user_id):
     current_app.logger.info(f"   - Completed Flows: {len(completed_flows)}/{len(config['flows'])}")
 
     return current_flow, current_action, completed_flows
-
 
 def load_existing_metadata(prompt_id, user_prompt, flow_progress):
     """
@@ -3166,8 +3278,9 @@ def initialise_current_flow_to_zero(user_prompt):
 
 def increment_current_flow(user_prompt):
     recipe_for_persona[user_prompt] += 1
-    user_tasks[user_prompt].current_action = 1
     user_tasks[user_prompt] = Action(config['flows'][get_current_flow(user_prompt)]['actions'])
+    user_tasks[user_prompt].current_action = 1
+
 
 
 def safe_increment_flow(user_prompt, prompt_id):
@@ -3228,11 +3341,11 @@ def create_time_agents_and_create_scheduled_jobs(flows, number_of_flows, prompt_
     return merged_dict
 
 
-def get_total_actions_for_current_flow(prompt_id, user_prompt):
+def get_total_actions_for_current_flow_and_reset_actions(prompt_id, user_prompt):
     flow_idx = get_current_flow(user_prompt)
     config = get_prompt_config_json(prompt_id)
     user_tasks[user_prompt] = Action(config['flows'][flow_idx]['actions'])
-    total_actions = len(config['flows'][flow_idx]['actions'])
+    total_actions = get_total_actions_length_for_flow(config,flow_idx)
     return config, total_actions
 
 
