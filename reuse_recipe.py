@@ -2406,9 +2406,10 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         try:
             if (last_speaker.name not in ['UserProxy', 'User'] and messages[-1]["content"] != '' and messages[-1]["content"] is not None
                     and 'Message already sent successfully to user with request_id' not in messages[-1]["content"]
-                    and 'Message sent successfully to user with request_id' not in messages[-1]["content"]):
+                    and 'Message sent successfully to user with request_id' not in messages[-1]["content"]
+                    and '@user' not in messages[-1]["content"]):
                 crossbar_message = {"text": [f'{messages[-1]["content"]}'], "priority": 49,
-                                    "action": 'Thinking', "historical_request_id": [], "preffered_language": 'en-US',
+                                    "action": 'Thinking', "historical_request_id": [], "preferred_language": 'en-US',
                                     "options": [], "newoptions": [], "bot_type": 'Agent', "page_image_url": "",
                                     "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
                         'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0},
