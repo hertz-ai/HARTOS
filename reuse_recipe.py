@@ -384,7 +384,7 @@ def execute_python_file(task_description: str, user_id: int, prompt_id: int, act
     return 'done'
 
 
-def call_visual_task(task_description: str, user_id: int, prompt_id: int, data: list, date: datetime):
+def call_visual_task(task_description: str, user_id: int, prompt_id: int):
     headers = {'Content-Type': 'application/json'}
     url = 'http://localhost:6777/visual_agent'
 
@@ -2708,7 +2708,6 @@ def create_schedule(prompt_id, user_id):
                           args=['get past 1 mins visual information', user_id, prompt_id])
         current_app.logger.info(f'Successfully created scheduler job')
         if 'visual_scheduled_tasks' in config and len(config['visual_scheduled_tasks']) > 0:
-            # current_app.logger.info('Creating Visual scheduled tasks')
             for i in config['visual_scheduled_tasks']:
                 if role and i['persona'].lower() == role.lower():
                     trigger = CronTrigger.from_crontab(i['cron_expression'])

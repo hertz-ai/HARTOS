@@ -464,7 +464,7 @@ def visual_execution(task_description: str, user_id: int, prompt_id: int):
         current_app.logger.error(f"Error in visual_based_execution: {e}")
     return 'done'
 
-def call_visual_task(task_description: str, user_id: int, prompt_id: int, data: list = None, date: datetime = None):
+def call_visual_task(task_description: str, user_id: int, prompt_id: int):
     headers = {'Content-Type': 'application/json'}
     url = 'http://localhost:6777/visual_agent'
 
