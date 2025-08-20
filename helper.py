@@ -6,7 +6,7 @@ import autogen
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
 import json
 from flask import current_app
-from typing import List, Dict, Tuple, Annotated, Set, FrozenSet
+from typing import List, Dict, Tuple, Annotated, Set, FrozenSet, Any
 import pickle
 from PIL import Image
 import uuid
@@ -1685,6 +1685,8 @@ llm_config = {
     "config_list": config_list,
     "cache_seed": None
 }
+
+
 def create_visual_agent(user_id,prompt_id):
     visual_agent = autogen.AssistantAgent(
         name='visual_agent',
@@ -1795,6 +1797,253 @@ def create_visual_agent(user_id,prompt_id):
     context_handling.add_to_agent(verify2)
 
     return visual_agent, visual_user, helper2, executor2, multi_role_agent2, verify2, chat_instructor2
+
+
+# Create agent_data directory if it doesn't exist
+AGENT_DATA_DIR = "agent_data"
+if not os.path.exists(AGENT_DATA_DIR):
+    os.makedirs(AGENT_DATA_DIR)
+
+
+def get_agent_data_file_path(prompt_id: int) -> str:
+    """Get the file path for storing agent data for a specific prompt_id"""
+    return os.path.join(AGENT_DATA_DIR, f"{prompt_id}_agent_data.json")
+
+
+def save_agent_data_to_file(prompt_id: int, agent_data: Dict) -> bool:
+    """
+    Save current agent_data[prompt_id] to a JSON file
+
+    Args:
+        prompt_id: The prompt ID to save data for
+        agent_data: The agent data dictionary
+    Returns:
+        bool: True if saved successfully, False otherwise
+    """
+    try:
+        file_path = get_agent_data_file_path(prompt_id)
+
+        # Get current agent data for this prompt_id
+        data_to_save = agent_data.get(prompt_id, {})
+
+        # Add metadata about when this was saved
+        save_metadata = {
+            "prompt_id": prompt_id,
+            "saved_at": datetime.now().isoformat(),
+            "data": data_to_save
+        }
+
+        # Write to file with pretty formatting
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(save_metadata, f, indent=2, ensure_ascii=False)
+
+        current_app.logger.info(f"💾 Saved agent data to: {file_path}")
+        return True
+
+    except Exception as e:
+        current_app.logger.error(f"❌ Error saving agent data for prompt_id {prompt_id}: {e}")
+        return False
+
+
+def load_agent_data_from_file(prompt_id: int, agent_data: Dict) -> bool:
+    """
+    Load agent_data[prompt_id] from JSON file
+
+    Args:
+        prompt_id: The prompt ID to load data for
+        agent_data: The agent data dictionary
+
+    Returns:
+        bool: True if loaded successfully, False otherwise
+    """
+    try:
+        file_path = get_agent_data_file_path(prompt_id)
+
+        # Check if file exists
+        if not os.path.exists(file_path):
+            current_app.logger.info(f"📁 No saved agent data found for prompt_id {prompt_id}")
+            # Initialize with default data
+            agent_data[prompt_id] = {}
+            return False
+
+        # Load from file
+        with open(file_path, 'r', encoding='utf-8') as f:
+            loaded_data = json.load(f)
+
+        # Extract the actual data (skip metadata)
+        if 'data' in loaded_data:
+            agent_data[prompt_id] = loaded_data['data']
+            current_app.logger.info(f"📂 Loaded agent data from: {file_path}")
+            current_app.logger.info(f"📊 Loaded data keys: {list(agent_data[prompt_id].keys())}")
+            return True
+        else:
+            # Handle old format (direct data)
+            agent_data[prompt_id] = loaded_data
+            current_app.logger.info(f"📂 Loaded agent data (old format) from: {file_path}")
+            return True
+
+    except Exception as e:
+        current_app.logger.error(f"❌ Error loading agent data for prompt_id {prompt_id}: {e}")
+        # Initialize with default data on error
+        agent_data[prompt_id] = {}
+        return False
+
+
+def schedule_periodic_backups(agent_data, scheduler):
+    """Schedule periodic backups of agent data"""
+
+    def backup_all_agent_data():
+        """Backup all active agent data"""
+        backup_count = 0
+        for prompt_id in agent_data.keys():
+            if agent_data[prompt_id]:  # Only backup if there's data
+                if backup_agent_data_file(prompt_id):
+                    backup_count += 1
+
+    # Schedule daily backups at 2 AM
+    if scheduler.running:
+        scheduler.add_job(
+            backup_all_agent_data,
+            'cron',
+            hour=2,
+            minute=0,
+            id='periodic_agent_data_backup'
+        )
+
+
+def initialize_persistent_storage(agent_data: Dict):
+    """
+    Initialize persistent storage and migrate existing data
+    Call this during application startup
+        Args:
+        agent_data: The agent data dictionary
+
+    """
+    try:
+        # Create agent_data directory if it doesn't exist
+        if not os.path.exists(AGENT_DATA_DIR):
+            os.makedirs(AGENT_DATA_DIR)
+
+        return True
+
+    except Exception as e:
+        return False
+
+
+def backup_agent_data_file(prompt_id: int) -> bool:
+    """
+    Create a backup of the current agent data file
+
+    Args:
+        prompt_id: The prompt ID to backup data for
+
+    Returns:
+        bool: True if backup created successfully, False otherwise
+    """
+    try:
+        file_path = get_agent_data_file_path(prompt_id)
+
+        if not os.path.exists(file_path):
+            return False
+
+        # Create backup with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = file_path.replace('.json', f'_backup_{timestamp}.json')
+
+        # Copy file
+        import shutil
+        shutil.copy2(file_path, backup_path)
+
+        current_app.logger.info(f"🔄 Created backup: {backup_path}")
+        return True
+
+    except Exception as e:
+        current_app.logger.error(f"❌ Error creating backup for prompt_id {prompt_id}: {e}")
+        return False
+
+
+def cleanup_old_backups(prompt_id: int, keep_count: int = 5) -> int:
+    """
+    Clean up old backup files, keeping only the most recent ones
+
+    Args:
+        prompt_id: The prompt ID to clean backups for
+        keep_count: Number of backup files to keep
+
+    Returns:
+        int: Number of files deleted
+    """
+    try:
+        backup_pattern = f"{prompt_id}_agent_data_backup_"
+        backup_files = []
+
+        # Find all backup files for this prompt_id
+        for filename in os.listdir(AGENT_DATA_DIR):
+            if filename.startswith(backup_pattern) and filename.endswith('.json'):
+                file_path = os.path.join(AGENT_DATA_DIR, filename)
+                # Get file modification time
+                mtime = os.path.getmtime(file_path)
+                backup_files.append((mtime, file_path))
+
+        # Sort by modification time (newest first)
+        backup_files.sort(reverse=True)
+
+        # Delete old backups
+        deleted_count = 0
+        for i, (mtime, file_path) in enumerate(backup_files):
+            if i >= keep_count:  # Keep only the newest keep_count files
+                os.remove(file_path)
+                deleted_count += 1
+                current_app.logger.info(f"🗑️ Deleted old backup: {file_path}")
+
+        return deleted_count
+
+    except Exception as e:
+        current_app.logger.error(f"❌ Error cleaning up backups for prompt_id {prompt_id}: {e}")
+        return 0
+
+
+def get_agent_data_info(prompt_id: int) -> Dict[str, Any]:
+    """
+    Get information about saved agent data file
+
+    Args:
+        prompt_id: The prompt ID to get info for
+
+    Returns:
+        dict: Information about the file
+    """
+    try:
+        file_path = get_agent_data_file_path(prompt_id)
+
+        if not os.path.exists(file_path):
+            return {"exists": False, "path": file_path}
+
+        # Get file stats
+        stat = os.stat(file_path)
+
+        # Try to get save metadata
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            saved_at = data.get('saved_at', 'unknown')
+            data_keys = list(data.get('data', {}).keys()) if 'data' in data else list(data.keys())
+        except:
+            saved_at = 'unknown'
+            data_keys = []
+
+        return {
+            "exists": True,
+            "path": file_path,
+            "size_bytes": stat.st_size,
+            "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+            "saved_at": saved_at,
+            "data_keys": data_keys
+        }
+
+    except Exception as e:
+        current_app.logger.error(f"❌ Error getting agent data info for prompt_id {prompt_id}: {e}")
+        return {"exists": False, "error": str(e)}
 
 
 # ========================================================================================

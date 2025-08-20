@@ -202,6 +202,11 @@ individual_json = {}
 time_actions = {}
 scheduler_check = {}
 
+# Initialize persistent storage
+helper_fun.initialize_persistent_storage(agent_data)
+
+# Schedule periodic backups (optional)
+helper_fun.schedule_periodic_backups(agent_data, scheduler)
 
 database_url = 'https://mailer.hertzai.com'
 
@@ -704,10 +709,13 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     assistant.register_for_execution(name="get_user_camera_inp")(camera_inp)
 
     @log_tool_execution
-    def save_data_in_memory(key: Annotated[str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
-                            value: Annotated[Optional[Any], "Value you want to store; strictly should be one of int, float, bool, json array or json object."] = None) -> str:
+    def save_data_in_memory(key: Annotated[
+        str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
+                            value: Annotated[Optional[
+                                Any], "Value you want to store; strictly should be one of int, float, bool, json array or json object."] = None) -> str:
         """Store data with validation to prevent corruption."""
         tool_logger.info('INSIDE save_data_in_memory')
+
         # Validate the input data
         try:
             # Step 1: Use the existing JSON repair function to sanitize input
@@ -732,12 +740,18 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             d[keys[-1]] = validated_value
             tool_logger.info(f"VALUES STORED IN AGENT DATA: {validated_value}")
             tool_logger.info(f"FULL AGENT DATA AT KEY: {d}")
-            # Step 4: Verify storage was successful
+
+            # Step 4: Save to persistent storage
+            if helper_fun.save_agent_data_to_file(prompt_id, agent_data):
+                tool_logger.info(f"✅ Data persisted to file for prompt_id {prompt_id}")
+            else:
+                tool_logger.warning(f"⚠️ Failed to persist data to file for prompt_id {prompt_id}")
+            # Step 5: Verify storage was successful
             try:
                 # Attempt to read back the data to verify it was stored correctly
                 stored_value = get_data_by_key(key)
                 tool_logger.info(f"VERIFICATION - READ BACK VALUE: {stored_value}")
-                # Optional: compare stored_value with what we intended to store
+
                 if stored_value == "Key not found in stored data.":
                     tool_logger.error(f"VERIFICATION FAILED: Data not properly stored at key {key}")
             except Exception as e:
@@ -756,10 +770,16 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             error_msg = f"Unexpected error saving data: {str(e)}"
             tool_logger.error(error_msg)
             return f"Error: {error_msg} - Data not saved"
+
     helper.register_for_llm(name="save_data_in_memory", description="Use this to Store and retrieve data using key-value storage system")(save_data_in_memory)
     assistant.register_for_execution(name="save_data_in_memory")(save_data_in_memory)
 
     def get_saved_metadata() -> str:
+        """Get metadata with automatic loading from persistent storage"""
+        if prompt_id not in agent_data or not agent_data[prompt_id]:
+            current_app.logger.info(f"Loading agent data from file for get_saved_metadata, prompt_id {prompt_id}")
+            helper_fun.load_agent_data_from_file(prompt_id,agent_data)
+
         stripped_json = strip_json_values(agent_data[prompt_id])
         return f'{stripped_json}'
 
@@ -767,7 +787,12 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     assistant.register_for_execution(name="get_saved_metadata")(get_saved_metadata)
 
     @log_tool_execution
-    def get_data_by_key(key: Annotated[str, "Key path for retrieving data. Use dot notation for nested keys (e.g., 'user.info.name')."]) -> str:
+    def get_data_by_key(key: Annotated[
+        str, "Key path for retrieving data. Use dot notation for nested keys (e.g., 'user.info.name')."]) -> str:
+        # Ensure data is loaded for this prompt_id
+        if prompt_id not in agent_data or not agent_data[prompt_id]:
+            tool_logger.info(f"Loading agent data from file for prompt_id {prompt_id}")
+            helper_fun.load_agent_data_from_file(prompt_id,agent_data)
         keys = key.split('.')
         d = agent_data.get(prompt_id, {})
 
@@ -3189,11 +3214,16 @@ def initialize_with_resume(prompt_id, user_prompt, user_id):
 
     return current_flow, current_action, completed_flows
 
+
 def load_existing_metadata(prompt_id, user_prompt, flow_progress):
     """
     Load metadata from existing action JSONs to restore agent_data state
     """
     try:
+        # First, try to load from persistent storage
+        if helper_fun.load_agent_data_from_file(prompt_id, agent_data):
+            current_app.logger.info(f"📂 Successfully loaded persistent agent data for prompt_id {prompt_id}")
+            return
         # Look for the most recent action JSON with metadata
         for flow_idx, progress in flow_progress.items():
             for action_id in sorted(progress['completed_actions'], reverse=True):
@@ -3207,6 +3237,8 @@ def load_existing_metadata(prompt_id, user_prompt, flow_progress):
                                 agent_data[prompt_id] = {}
                             agent_data[prompt_id].update(action_data['metadata'])
                             current_app.logger.info(f"📥 Loaded metadata from {action_file}")
+                            # Save to persistent storage for future use
+                            helper_fun.save_agent_data_to_file(prompt_id,agent_data)
                             return  # Load from most recent only
                 except Exception as e:
                     current_app.logger.warning(f"⚠️ Could not load metadata from {action_file}: {e}")
@@ -3219,6 +3251,12 @@ def recipe(user_id, text, prompt_id, file_id, request_id):
     user_prompt = f'{user_id}_{prompt_id}'
     request_id_list[user_prompt] = request_id
     current_app.logger.info('--' * 100)
+
+    # ✅ NEW: Initialize persistent storage for this prompt_id
+    if prompt_id not in agent_data:
+        current_app.logger.info(f"Initializing persistent storage for prompt_id {prompt_id}")
+
+        helper_fun.load_agent_data_from_file(prompt_id,agent_data)
 
     if file_id:
         recent_file_id[user_id] = file_id
@@ -3326,6 +3364,8 @@ def get_current_flow(user_prompt):
     else:
         initialise_current_flow_to_zero(user_prompt)
         return 0
+
+
 
 
 def create_time_agents_and_create_scheduled_jobs(flows, number_of_flows, prompt_id, user_id, user_prompt):
