@@ -1054,20 +1054,19 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     assistant.register_for_execution(name="validate_json_response")(validate_json_response)
 
     @log_tool_execution
-    async def execute_windows_or_android_command(instructions: Annotated[str, "Command in plain English to execute in the user's windows computer or android machine"],
-                                                 os_to_control: Annotated[str, "The os to control, possible values are 'windows' or 'android' only "]) -> str:
-
+    async def execute_windows_or_android_command(instructions: Annotated[str, "Command in plain English to execute in the user's windows computer or android machine"], os_to_control: Annotated[str, "The os to control, possible values are 'windows' or 'android' only "]) -> str:
         """
-        Executes a command on a Windows machine and returns the response within 500 seconds.
+        Executes a command on a Windows machine and returns the response with VLM agent context.
         """
         try:
             tool_logger.info('INSIDE execute_windows_or_android_command')
             topic = f'com.hertzai.hevolve.action.{user_id}'
             tool_logger.info(f'calling {topic} for 5 second')
-            response = await subscribe_and_return({'prompt_id':prompt_id},topic,2000)  # Wait for the RPC response
+            response = await subscribe_and_return({'prompt_id': prompt_id}, topic, 2000)
             tool_logger.info(f'Response from call of {topic}: {response}')
             if not response:
                 return 'Ask UserProxy to go to hevolve.ai login and start the windows companion app'
+
             crossbar_message = {
                 'parent_request_id': request_id_list[user_prompt],
                 'user_id': f'{user_id}',
@@ -1076,24 +1075,139 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                 'os_to_control': os_to_control,
                 'actions_available_in_os': [],
                 'max_ETA_in_seconds': 1800,
-                'langchain_server':True
+                'langchain_server': True
             }
             topic = 'com.hertzai.hevolve.action'
-            tool_logger.info(f'calling {topic} for 8000 second')
-            response = await subscribe_and_return(crossbar_message,topic,1800000)  # Wait for the RPC response
+            tool_logger.info(f'calling {topic} for 1800 seconds')
+            response = await subscribe_and_return(crossbar_message, topic, 1800000)
             tool_logger.info(f'THIS IS RESPONSE type: {type(response)} value: {response}')
-            if response['status'] == 'success':
-                return 'successfully ran the command in user\' computer.'
+
+            if not response:
+                return 'VLM agent did not respond within the timeout period. Please try again later.'
+
+            # Extract VLM context and build comprehensive response
+            vlm_context = ""
+            vlm_status = "unknown"
+
+            # Check if response contains extracted_responses (VLM agent context)
+            if isinstance(response, dict):
+                extracted_responses = response.get('extracted_responses', [])
+                vlm_status = response.get('status', 'unknown')
+                execution_time = response.get('execution_time_seconds', 0)
+                total_messages = response.get('total_messages', 0)
+
+                if extracted_responses:
+                    tool_logger.info(f'Processing {len(extracted_responses)} extracted responses from VLM agent')
+
+                    # Build context from VLM agent's analysis and actions
+                    analysis_parts = []
+                    action_parts = []
+
+                    for msg in extracted_responses:
+                        msg_type = msg.get('type', '')
+                        content = msg.get('content', '')
+
+                        if msg_type == 'analysis':
+                            analysis_parts.append(f"Analysis: {content}")
+                        elif msg_type == 'next_action':
+                            if isinstance(content, dict):
+                                action_parts.append(f"Action: {json.dumps(content, indent=2)}")
+                            else:
+                                action_parts.append(f"Action: {content}")
+
+                    # Combine all VLM context
+                    vlm_context_parts = []
+                    if analysis_parts:
+                        vlm_context_parts.append(f"{os_to_control} Agent Analysis:\n" + "\n".join(analysis_parts))
+                    if action_parts:
+                        vlm_context_parts.append(f"{os_to_control} Agent Actions:\n" + "\n".join(action_parts))
+
+                    vlm_context = "\n\n".join(vlm_context_parts)
+
+                # Trust VLM agent's status determination
+                if vlm_status == 'success':
+                    return f"""✅ COMMAND EXECUTED SUCCESSFULLY
+                        
+                            OS: {os_to_control}
+                            Task: {instructions}
+                        
+                            SUMMARY OF {os_to_control} AGENT EXECUTION CONTEXT:
+                            {vlm_context if vlm_context else 'Command executed without detailed context.'}
+                        
+                            EXECUTION SUMMARY:
+                            - Status: SUCCESS (confirmed by {os_to_control} agent)
+                            - Duration: {execution_time:.2f} seconds
+                            - Total Steps: {total_messages}
+                        
+                            The {os_to_control} agent has confirmed successful execution. The task has been completed as requested."""
+
+                elif vlm_status == 'error':
+                    return f"""❌ COMMAND EXECUTION ERROR
+                            OS: {os_to_control}
+                            Task: {instructions}
+                        
+                            SUMMARY OF {os_to_control} AGENT ERROR CONTEXT:
+                            {vlm_context if vlm_context else 'Error occurred without detailed context.'}
+                        
+                            EXECUTION SUMMARY:
+                            - Status: ERROR (identified by {os_to_control} agent)
+                            - Duration: {execution_time:.2f} seconds
+                            - Total Steps: {total_messages}
+                        
+                            The {os_to_control} agent encountered an issue during execution. Review the context above for troubleshooting."""
+
+                elif vlm_status == 'completed':
+                    return f"""✅ COMMAND COMPLETED
+                        
+                            OS: {os_to_control}
+                            Task: {instructions}
+                        
+                            SUMMARY OF {os_to_control} AGENT COMPLETION CONTEXT:
+                            {vlm_context if vlm_context else 'Task completed without detailed context.'}
+                        
+                            EXECUTION SUMMARY:
+                            - Status: COMPLETED (confirmed by {os_to_control} agent)
+                            - Duration: {execution_time:.2f} seconds
+                            - Total Steps: {total_messages}
+                        
+                            The {os_to_control} agent has completed the execution sequence successfully."""
+
+                else:
+                    return f"""📋 COMMAND EXECUTION FINISHED
+                        
+                            OS: {os_to_control}
+                            Task: {instructions}
+                            Status: {vlm_status.upper()}
+                        
+                            SUMMARY OF {os_to_control} AGENT EXECUTION CONTEXT:
+                            {vlm_context if vlm_context else 'Limited execution information available.'}
+                        
+                            EXECUTION SUMMARY:
+                            - Duration: {execution_time:.2f} seconds
+                            - Total Steps: {total_messages}
+                        
+                            Please review the {os_to_control} agent's assessment above."""
+
             else:
-                return 'Not able to perform this action now please try later'
+                # Handle legacy or non-dict responses
+                tool_logger.warning(f'Received non-dict response: {type(response)}')
+                return f"Command executed on {os_to_control}: {str(response)}"
+
         except Exception as e:
-            error_message = traceback.format_exc()  # Capture full traceback
+            error_message = traceback.format_exc()
             tool_logger.error(f"Error executing command:\n{error_message}")
-            return f"Error executing command:\n{error_message}"
+            return f"""⚠️ SYSTEM ERROR
 
-    helper.register_for_llm(name="execute_windows_or_android_command", description="Processes user-defined commands on a personal Windows or Android system.")(execute_windows_or_android_command)
+                    OS: {os_to_control}
+                    Task: {instructions}
+                    Error: {str(e)}
+                
+                    A system error occurred while communicating with the {os_to_control} agent."""
+
+    # Register the enhanced function
+    helper.register_for_llm(name="execute_windows_or_android_command",
+                            description="Processes user-defined commands on a personal Windows or Android system and returns detailed computer/mobile use agent execution context.")(execute_windows_or_android_command)
     assistant.register_for_execution(name="execute_windows_or_android_command")(execute_windows_or_android_command)
-
 
     assistant.description = 'this is an assistant agent that coordinates & executes requested tasks & actions'
     executor.description = 'this is an executor agent that Specialized agent for code execution & response handling'
@@ -1738,8 +1852,8 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         name="multi_role_agent",
         llm_config=llm_config,
         code_execution_config=False,
-        system_message="""You will send message from multiple different personas your, job is to ask those question to assistant agent
-        if you think some text was intent to give to some other agent but i came to you send the same message to user""",
+        system_message="""You will send message from multiple different personas, your job is to ask those question to assistant agent
+        if you think some text was intended for some other agent, but i came to you send the same message to user""",
     )
     verify1 = autogen.AssistantAgent(
         name="StatusVerifier",
@@ -2417,7 +2531,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         continue
                     else:
                         actions_prompt = user_tasks[user_prompt].get_action(current_action_id - 1)
-                        message = f'Continue with action {current_action_id}: {actions_prompt}'
+                        message = f'Finish what you started, Do not go into loop and do not repeat same thing in different way, Continue with action {current_action_id}: {actions_prompt}'
 
                     result = agents_object['helper'].initiate_chat(recipient=manager, message=message,
                                                                    clear_history=False, silent=False)
