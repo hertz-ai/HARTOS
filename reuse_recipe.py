@@ -24,14 +24,12 @@ from PIL import Image
 from langchain.memory import ZepMemory
 from crossbarhttp import Client
 from flask import current_app
-from helper import topological_sort, ToolMessageHandler, strip_json_values, get_time_based_history, retrieve_json
+from helper import ToolMessageHandler, strip_json_values, get_time_based_history, retrieve_json, load_vlm_agent_files
 import helper as helper_fun
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
 import threading
 import traceback
-from autobahn.asyncio.component import Component, run
-from twisted.internet.defer import inlineCallbacks, returnValue, Deferred
-from twisted.internet import reactor
+from autobahn.asyncio.component import Component
 import threading
 
 from threadlocal import thread_local_data
@@ -106,37 +104,6 @@ config_list = [{
 
 message_tracking_lock = threading.Lock()
 
-
-def load_vlm_agent_files(prompt_id, role_number):
-    """Loads any VLM agent JSON files for the given prompt_id and role_number and integrates them with existing recipes."""
-    vlm_actions = []
-
-    # Look for existing VLM agent files
-    try:
-        for file in os.listdir("prompts"):
-            if file.startswith(f"{prompt_id}_{role_number}_") and file.endswith("_vlm_agent.json"):
-                file_path = os.path.join("prompts", file)
-                try:
-                    with open(file_path, 'r') as f:
-                        recipe_data = json.load(f)
-                        current_app.logger.info(f"Found VLM agent recipe: {file_path}")
-
-                        # Extract the action ID from the filename (assuming format: prompt_id_role_number_action_id_vlm_agent.json)
-                        parts = file.split('_')
-                        if len(parts) >= 4:
-                            try:
-                                action_id = int(parts[2]) # Get the action ID
-                                # Add or replace action in the actions list
-                                recipe_data["action_id"] = action_id
-                                vlm_actions.append(recipe_data)
-                            except (ValueError, IndexError):
-                                current_app.logger.error(f"Couldn't parse action ID from filename {file}")
-                except Exception as e:
-                    current_app.logger.error(f"Error reading VLM agent file {file_path}: {e}")
-    except Exception as e:
-        current_app.logger.error(f"Error listing files in prompts directory: {e}")
-
-    return vlm_actions
 
 class Action:
     def __init__(self, actions):

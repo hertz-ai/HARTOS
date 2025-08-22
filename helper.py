@@ -2339,3 +2339,33 @@ def apply_autogen_fix_on_startup():
 # ========================================================================================
 # END AUTOGEN JSON HANDLING ENHANCEMENT
 # ========================================================================================
+def load_vlm_agent_files(prompt_id, role_number):
+    """Loads any VLM agent JSON files for the given prompt_id and role_number and integrates them with existing recipes."""
+    vlm_actions = []
+
+    # Look for existing VLM agent files
+    try:
+        for file in os.listdir("prompts"):
+            if file.startswith(f"{prompt_id}_{role_number}_") and file.endswith("_vlm_agent.json"):
+                file_path = os.path.join("prompts", file)
+                try:
+                    with open(file_path, 'r') as f:
+                        recipe_data = json.load(f)
+                        current_app.logger.info(f"Found VLM agent recipe: {file_path}")
+
+                        # Extract the action ID from the filename (assuming format: prompt_id_role_number_action_id_vlm_agent.json)
+                        parts = file.split('_')
+                        if len(parts) >= 4:
+                            try:
+                                action_id = int(parts[2]) # Get the action ID
+                                # Add or replace action in the actions list
+                                recipe_data["action_id"] = action_id
+                                vlm_actions.append(recipe_data)
+                            except (ValueError, IndexError):
+                                current_app.logger.error(f"Couldn't parse action ID from filename {file}")
+                except Exception as e:
+                    current_app.logger.error(f"Error reading VLM agent file {file_path}: {e}")
+    except Exception as e:
+        current_app.logger.error(f"Error listing files in prompts directory: {e}")
+
+    return vlm_actions
