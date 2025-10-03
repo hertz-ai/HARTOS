@@ -151,6 +151,17 @@ def force_state_through_valid_path(user_prompt: str, action_id: int, target_stat
         # From RECIPE states
         (ActionState.RECIPE_REQUESTED, ActionState.RECIPE_RECEIVED): [ActionState.RECIPE_RECEIVED],
         (ActionState.RECIPE_RECEIVED, ActionState.TERMINATED): [ActionState.TERMINATED],
+
+        (ActionState.ASSIGNED, ActionState.TERMINATED): [
+            ActionState.IN_PROGRESS,
+            ActionState.STATUS_VERIFICATION_REQUESTED,
+            ActionState.COMPLETED,
+            ActionState.FALLBACK_REQUESTED,
+            ActionState.FALLBACK_RECEIVED,
+            ActionState.RECIPE_REQUESTED,
+            ActionState.RECIPE_RECEIVED,
+            ActionState.TERMINATED
+        ],
     }
 
     if current_state == target_state:
@@ -199,7 +210,14 @@ def validate_state_transition(user_prompt: str, action_id: int, new_state: Actio
         ActionState.FALLBACK_RECEIVED: [ActionState.RECIPE_REQUESTED, ActionState.FALLBACK_RECEIVED],
         ActionState.RECIPE_REQUESTED: [ActionState.RECIPE_RECEIVED, ActionState.RECIPE_REQUESTED],
         ActionState.RECIPE_RECEIVED: [ActionState.TERMINATED, ActionState.RECIPE_RECEIVED],
-        ActionState.TERMINATED: [ActionState.ASSIGNED]  # Final state but an entire actions can be updated and hence can go to assigned state again
+        ActionState.TERMINATED: [ActionState.ASSIGNED],
+        ActionState.IN_PROGRESS: [
+            ActionState.STATUS_VERIFICATION_REQUESTED,
+            ActionState.IN_PROGRESS,
+            ActionState.ERROR,
+            ActionState.COMPLETED,
+            ActionState.TERMINATED,
+        ]
     }
 
     allowed = valid_transitions.get(current_state, [])

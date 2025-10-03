@@ -2171,10 +2171,10 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                             current_app.logger.error(f'GOT ERROR WHILE UPDATING CURRENT ACTION:{e}')
                             current_app.logger.error(traceback.format_exc())
                         return chat_instructor
-
-                    currentaction_id = last_json['action_id']
-                    if individual_recipe[currentaction_id - 1]['can_perform_without_user_input'] == 'yes':
-                        return assistant
+                    if  'action_id' in last_json.keys():
+                        currentaction_id = last_json['action_id']
+                        if individual_recipe[currentaction_id - 1]['can_perform_without_user_input'] == 'yes':
+                            return assistant
             except Exception as e:
                 current_app.logger.error(f'Got Error while getting json for current actionid: {e}')
 
@@ -2271,10 +2271,10 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                         current_app.logger.error('GOT ERROR WHILE UPDATING CURRENT ACTION')
                         time_actions[user_prompt].current_action += 1
                     return chat_instructor1
-
-                currentaction_id = last_json['action_id']
-                if final_recipe[prompt_id]['actions'][currentaction_id - 1]['can_perform_without_user_input'] == 'yes':
-                    return time_agent
+                if 'action_id' in last_json.keys():
+                    currentaction_id = last_json['action_id']
+                    if final_recipe[prompt_id]['actions'][currentaction_id - 1]['can_perform_without_user_input'] == 'yes':
+                        return time_agent
         except Exception as e:
             current_app.logger.error(f'Got Error while getting json for current actionid: {e}')
 
