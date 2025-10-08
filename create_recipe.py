@@ -2608,9 +2608,28 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         message = request_fallback_for_action(current_action_id,  user_prompt)
                     else:
                         # user_tasks[user_prompt].current_action = user_tasks[user_prompt].current_action+1
-                        message = get_execute_next_action_message(prompt_id, user_prompt)
-                        publish_to_crossbar_new_action_start(message, user_id)
-                        safe_set_state(user_prompt, current_action_id, ActionState.IN_PROGRESS, "action start")
+                        # Only increment and start next action if current action is TERMINATED
+                        current_state = get_action_state(user_prompt, current_action_id)
+                        if current_state == ActionState.TERMINATED:
+                            # safe to increment and start next action
+                            new_action_id, message = get_execute_next_action_message(prompt_id, user_prompt)
+                            publish_to_crossbar_new_action_start(message, user_id)
+                            safe_set_state(user_prompt, new_action_id, ActionState.IN_PROGRESS, "action start")
+                        else:
+                            # previous action not finished — continue the current action instead of incrementing
+                            current_app.logger.info(
+                                f"Attempted to start next action but current action {current_action_id} is in state {current_state.value}. Continuing current action.")
+                            # the manager/assistant to continue current action (do NOT increment)
+                            message = user_tasks[user_prompt].get_action(current_action_id - 1)
+                            publish_to_crossbar_new_action_start(message, user_id)
+                            # Ensure action is IN_PROGRESS (or force through valid path if it's stuck)
+                            if current_state == ActionState.ASSIGNED:
+                                safe_set_state(user_prompt, current_action_id, ActionState.IN_PROGRESS,
+                                               "action continue")
+                            else:
+                                # if it's already IN_PROGRESS or other, ensure valid path (safer)
+                                force_state_through_valid_path(user_prompt, current_action_id, ActionState.IN_PROGRESS,
+                                                               "action continue")
 
                     result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
 
@@ -2970,10 +2989,13 @@ def safe_increment_action(user_prompt):
 
 def get_execute_next_action_message( prompt_id, user_prompt):
     safe_increment_action(user_prompt)
-    message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)
+    action_text = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)
     task_time[prompt_id]['timer'] = time.time()
     message = f'Execute Action {user_tasks[user_prompt].current_action}: {message} '
     return message
+    message = f'Execute Action {user_tasks[user_prompt].current_action}: {action_text} '
+    new_action_id = user_tasks[user_prompt].current_action
+    return new_action_id, message
 
 
 def begin_agent_convo_to_get_schedulers_not_last(assistant_agent, chat_instructor,  manager, prompt_id,  updated_actions, user_prompt):
@@ -3248,9 +3270,73 @@ def safe_action_boundary_check(user_prompt, prompt_id, text, user_id):
                 if not os.path.exists(action_file):
                     current_app.logger.info(f"Resuming from incomplete action {action_id}")
                     user_tasks[user_prompt].current_action = action_id
-                    return True, None  # Continue with normal execution
+                    return True, None
 
-        # Flow is complete, try to move to next flow
+        # ✅ All actions complete - NOW CHECK FOR FLOW RECIPE
+        flow_recipe_file = f'prompts/{prompt_id}_{current_flow}_recipe.json'
+
+        if not os.path.exists(flow_recipe_file):
+            current_app.logger.info(f"All actions complete but flow recipe missing - creating it now")
+            try:
+                # ✅ STEP 1: Load all individual action JSONs
+                individual_recipe = []
+                for action_id in range(1, current_flow_actions + 1):
+                    recipe_file = f'prompts/{prompt_id}_{current_flow}_{action_id}.json'
+                    with open(recipe_file, 'r') as f:
+                        action_data = json.load(f)
+                        individual_recipe.append(action_data)
+
+                # ✅ STEP 2: Aggregate dependencies from each action
+                all_dependencies = []
+                for action_data in individual_recipe:
+                    if 'action_id' in action_data and 'actions_this_action_depends_on' in action_data:
+                        all_dependencies.append({
+                            "action_id": action_data['action_id'],
+                            "actions_this_action_depends_on": action_data['actions_this_action_depends_on']
+                        })
+
+                # ✅ STEP 3: Aggregate scheduled tasks from each action
+                all_scheduled_tasks = []
+                all_visual_scheduled_tasks = []
+
+                for action_data in individual_recipe:
+                    # Regular scheduled tasks
+                    if 'scheduled_tasks' in action_data and action_data['scheduled_tasks']:
+                        all_scheduled_tasks.extend(action_data['scheduled_tasks'])
+
+                    # Visual scheduled tasks
+                    if 'visual_scheduled_tasks' in action_data and action_data['visual_scheduled_tasks']:
+                        all_visual_scheduled_tasks.extend(action_data['visual_scheduled_tasks'])
+
+                # ✅ STEP 4: Create merged dictionary with aggregated data
+                merged_dict = {
+                    "status": "completed",
+                    "actions": individual_recipe,
+                    "dependency": all_dependencies,
+                    "scheduled_tasks": all_scheduled_tasks,
+                    "visual_scheduled_tasks": all_visual_scheduled_tasks
+                }
+
+                # ✅ STEP 5: Save flow recipe
+                flow = get_current_flow(user_prompt)
+                create_final_recipe_for_current_flow(flow, merged_dict, prompt_id)
+
+                # ✅ STEP 6: Update in-memory final_recipe
+                final_recipe[prompt_id] = merged_dict
+
+                current_app.logger.info(
+                    f"Flow recipe created successfully at prompts/{prompt_id}_{current_flow}_recipe.json")
+                current_app.logger.info(f"  - Actions: {len(individual_recipe)}")
+                current_app.logger.info(f"  - Dependencies: {len(all_dependencies)}")
+                current_app.logger.info(f"  - Scheduled Tasks: {len(all_scheduled_tasks)}")
+                current_app.logger.info(f"  - Visual Tasks: {len(all_visual_scheduled_tasks)}")
+
+            except Exception as e:
+                current_app.logger.error(f"Error creating flow recipe: {e}")
+                current_app.logger.error(traceback.format_exc())
+                return False, f"Error creating flow recipe: {str(e)}"
+
+        # ✅ Flow recipe now exists - proceed with flow transition
         if current_flow + 1 < total_flows:
             current_app.logger.info(f"Moving to next flow: {current_flow} -> {current_flow + 1}")
 
