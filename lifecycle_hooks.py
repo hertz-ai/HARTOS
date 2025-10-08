@@ -211,13 +211,7 @@ def validate_state_transition(user_prompt: str, action_id: int, new_state: Actio
         ActionState.RECIPE_REQUESTED: [ActionState.RECIPE_RECEIVED, ActionState.RECIPE_REQUESTED],
         ActionState.RECIPE_RECEIVED: [ActionState.TERMINATED, ActionState.RECIPE_RECEIVED],
         ActionState.TERMINATED: [ActionState.ASSIGNED],
-        ActionState.IN_PROGRESS: [
-            ActionState.STATUS_VERIFICATION_REQUESTED,
-            ActionState.IN_PROGRESS,
-            ActionState.ERROR,
-            ActionState.COMPLETED,
-            ActionState.TERMINATED,
-        ]
+
     }
 
     allowed = valid_transitions.get(current_state, [])

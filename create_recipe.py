@@ -2991,8 +2991,6 @@ def get_execute_next_action_message( prompt_id, user_prompt):
     safe_increment_action(user_prompt)
     action_text = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)
     task_time[prompt_id]['timer'] = time.time()
-    message = f'Execute Action {user_tasks[user_prompt].current_action}: {message} '
-    return message
     message = f'Execute Action {user_tasks[user_prompt].current_action}: {action_text} '
     new_action_id = user_tasks[user_prompt].current_action
     return new_action_id, message
