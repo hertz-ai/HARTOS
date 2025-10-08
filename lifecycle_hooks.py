@@ -152,16 +152,6 @@ def force_state_through_valid_path(user_prompt: str, action_id: int, target_stat
         (ActionState.RECIPE_REQUESTED, ActionState.RECIPE_RECEIVED): [ActionState.RECIPE_RECEIVED],
         (ActionState.RECIPE_RECEIVED, ActionState.TERMINATED): [ActionState.TERMINATED],
 
-        (ActionState.ASSIGNED, ActionState.TERMINATED): [
-            ActionState.IN_PROGRESS,
-            ActionState.STATUS_VERIFICATION_REQUESTED,
-            ActionState.COMPLETED,
-            ActionState.FALLBACK_REQUESTED,
-            ActionState.FALLBACK_RECEIVED,
-            ActionState.RECIPE_REQUESTED,
-            ActionState.RECIPE_RECEIVED,
-            ActionState.TERMINATED
-        ],
     }
 
     if current_state == target_state:
