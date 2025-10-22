@@ -18,7 +18,7 @@ from autogen import register_function
 import json
 from autogen import ConversableAgent
 from flask import current_app
-from helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup
+from helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup, load_vlm_agent_files
 import helper as helper_fun
 import threading
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
@@ -201,7 +201,7 @@ final_recipe = {}
 individual_json = {}
 time_actions = {}
 scheduler_check = {}
-
+vlm_recipes = {}
 # Initialize persistent storage
 helper_fun.initialize_persistent_storage(agent_data)
 
@@ -621,6 +621,7 @@ def has_pending_tool_calls(messages):
     return (last_msg.get('role') == 'assistant' and
             'tool_calls' in last_msg and
             last_msg['tool_calls'])
+
 
 def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any, Any, Any]:
     """Create new assistant & user agents for a given user_id"""
@@ -1054,19 +1055,130 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     assistant.register_for_execution(name="validate_json_response")(validate_json_response)
 
     @log_tool_execution
-    async def execute_windows_or_android_command(instructions: Annotated[str, "Command in plain English to execute in the user's windows computer or android machine"], os_to_control: Annotated[str, "The os to control, possible values are 'windows' or 'android' only "]) -> str:
+    async def execute_windows_or_android_command(
+            instructions: Annotated[
+                str, "Command in plain English to execute in the user's windows computer or android machine"],
+            os_to_control: Annotated[
+                str, "The os to control, possible values are 'windows' or 'android' only "]) -> str:
         """
-        Executes a command on a Windows machine and returns the response with VLM agent context.
+        Executes a command on a Windows machine or Android device and returns the response with enhanced VLM agent context.
         """
+
+
+
         try:
             tool_logger.info('INSIDE execute_windows_or_android_command')
+            user_prompt = f'{user_id}_{prompt_id}'
+            role_number = get_current_flow(user_prompt)
+
+            import os
+            import re
+            import json
+
+            # Load and check for existing VLM agent files
+            prompts_dir = "prompts"
+            tool_logger.info(f"Checking for VLM files in directory: {os.path.abspath(prompts_dir)}")
+
+            existing_vlm_files = []
+            if os.path.exists(prompts_dir):
+                for file in os.listdir(prompts_dir):
+                    if file.startswith(f"{prompt_id}_{role_number}_") and file.endswith("_vlm_agent.json"):
+                        existing_vlm_files.append(file)
+
+            tool_logger.info(f"Found existing VLM files: {existing_vlm_files}")
+
+            # Reload VLM agent files to ensure latest
+            current_app.logger.info("Reloading VLM agnet files to ensure we have the latest")
+            vlm_actions = load_vlm_agent_files(prompt_id, role_number)
+            current_app.logger.info(f"Loaded {len(vlm_actions)} VLM agents")
+
+            if vlm_actions:
+                current_app.logger.info(f"Loaded {len(vlm_actions)} VLM agents")
+                if user_prompt in vlm_recipes:
+
+                    for vlm_action in vlm_actions:
+                        action_id = vlm_action.get("action_id")
+                        action_exists = False
+
+                        for i, action in enumerate(vlm_recipes[user_prompt]['actions']):
+                            if action.get("action_id") == action_id:
+                                vlm_recipes[user_prompt]['actions'][i] = vlm_action
+                                action_exists = True
+                                break
+
+                        if not action_exists:
+                            vlm_recipes[user_prompt]['actions'].append(vlm_action)
+
+                    # Update the recipes dictionary
+                    final_recipe[prompt_id] = vlm_recipes[user_prompt]
+
+            # Recipe matching logic for reuse
+            simplified_instructions = ' '.join(instructions.lower().strip().split())
+
+            def similar_instructions(instr1, instr2, threshold=0.8):
+                words1 = set(instr1.lower().split())
+                words2 = set(instr2.lower().split())
+                if not words1 or not words2:
+                    return False
+
+                overlap = len(words1.intersection(words2))
+                similarity = overlap / (max(len(words1), len(words2)))
+                tool_logger.info(f"Comparing '{instr1}' with '{instr2}' - similarity: {similarity}")
+                return similarity >= threshold
+
+            # Check for matching recipe
+            matching_recipe = None
+            enhanced_instruction = None
+            if user_prompt in vlm_recipes:
+                for action in vlm_recipes[user_prompt]['actions']:
+                    action_text = action.get('action', '')
+                    if similar_instructions(instructions, action_text):
+                        matching_recipe = action
+                        tool_logger.info(f"Found existing recipe for instruction: {action_text}")
+                        break
+
+            # Direct file check as backup
+            current_action_id = 1
+            if user_prompt in user_tasks and hasattr(user_tasks[user_prompt], 'current_action'):
+                current_action_id = user_tasks[user_prompt].current_action
+
+            direct_vlm_path = f"prompts/{prompt_id}_{role_number}_{current_action_id}_vlm_agent.json"
+            if os.path.exists(direct_vlm_path):
+                tool_logger.info(f"Found direct VLM file for current action: {direct_vlm_path}")
+                try:
+                    with open(direct_vlm_path, 'r') as f:
+                        direct_recipe = json.load(f)
+                    if similar_instructions(instructions, direct_recipe.get('action', '')):
+                        matching_recipe = direct_recipe
+                except Exception as e:
+                    tool_logger.error(f"Error reading direct VLM file: {e}")
+
+            # Create enhanced instruction if matching recipe found
+            enhanced_instruction = None
+            if matching_recipe:
+                tool_logger.info(f"REUSING command - matched with: {matching_recipe.get('action', '')}")
+
+                enhanced_instruction = f"{instructions}\n\n"
+                enhanced_instruction += "Follow these steps from a previous successful execution:\n\n"
+
+                for i, step in enumerate(matching_recipe.get('recipe', [])):
+                    step_description = step.get('steps', '').strip()
+                    if step_description:
+                        enhanced_instruction += f"{i + 1}. {step_description}\n"
+
+                enhanced_instruction += "\nAdapt these steps to the current screen state as needed."
+                tool_logger.info(f"Created enhanced instruction with {len(matching_recipe.get('recipe', []))} steps")
+
+            # Initial connectivity check
             topic = f'com.hertzai.hevolve.action.{user_id}'
             tool_logger.info(f'calling {topic} for 5 second')
             response = await subscribe_and_return({'prompt_id': prompt_id}, topic, 2000)
             tool_logger.info(f'Response from call of {topic}: {response}')
+
             if not response:
                 return 'Ask UserProxy to go to hevolve.ai login and start the windows companion app'
 
+            # Prepare crossbar message
             crossbar_message = {
                 'parent_request_id': request_id_list[user_prompt],
                 'user_id': f'{user_id}',
@@ -1077,23 +1189,43 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                 'max_ETA_in_seconds': 1800,
                 'langchain_server': True
             }
+
+            # Add enhanced instruction if available
+            if enhanced_instruction:
+                crossbar_message['enhanced_instruction'] = enhanced_instruction
+                tool_logger.info(f"Added enhanced instruction to crossbar message")
+
+            # Execute the command
             topic = 'com.hertzai.hevolve.action'
             tool_logger.info(f'calling {topic} for 1800 seconds')
+
+            start_time = time.time()
             response = await subscribe_and_return(crossbar_message, topic, 1800000)
+            execution_time = time.time() - start_time
+
             tool_logger.info(f'THIS IS RESPONSE type: {type(response)} value: {response}')
 
             if not response:
-                return 'VLM agent did not respond within the timeout period. Please try again later.'
+                return f'''⏰ EXECUTION TIMEOUT
 
-            # Extract VLM context and build comprehensive response
+                OS: {os_to_control}
+                Task: {instructions}
+
+                The {os_to_control} agent did not respond within the timeout period (30 minutes). 
+                This could be due to:
+                • Complex task requiring more time
+                • Network connectivity issues
+                • Companion app not running
+
+                Please check your device and try again.'''
+
+            # Process response and extract VLM context
             vlm_context = ""
             vlm_status = "unknown"
 
-            # Check if response contains extracted_responses (VLM agent context)
             if isinstance(response, dict):
                 extracted_responses = response.get('extracted_responses', [])
                 vlm_status = response.get('status', 'unknown')
-                execution_time = response.get('execution_time_seconds', 0)
                 total_messages = response.get('total_messages', 0)
 
                 if extracted_responses:
@@ -1124,85 +1256,252 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
                     vlm_context = "\n\n".join(vlm_context_parts)
 
-                # Trust VLM agent's status determination
-                if vlm_status == 'success':
-                    return f"""✅ COMMAND EXECUTED SUCCESSFULLY
-                        
-                            OS: {os_to_control}
-                            Task: {instructions}
-                        
-                            SUMMARY OF {os_to_control} AGENT EXECUTION CONTEXT:
-                            {vlm_context if vlm_context else 'Command executed without detailed context.'}
-                        
-                            EXECUTION SUMMARY:
-                            - Status: SUCCESS (confirmed by {os_to_control} agent)
-                            - Duration: {execution_time:.2f} seconds
-                            - Total Steps: {total_messages}
-                        
-                            The {os_to_control} agent has confirmed successful execution. The task has been completed as requested."""
+                # Create VLM agent file for future reuse if no matching recipe was found
+                if not matching_recipe and vlm_status == 'success':
+                    try:
+                        tool_logger.info("Processing response to create recipe format for future reuse")
 
-                elif vlm_status == 'error':
-                    return f"""❌ COMMAND EXECUTION ERROR
-                            OS: {os_to_control}
-                            Task: {instructions}
-                        
-                            SUMMARY OF {os_to_control} AGENT ERROR CONTEXT:
-                            {vlm_context if vlm_context else 'Error occurred without detailed context.'}
-                        
-                            EXECUTION SUMMARY:
-                            - Status: ERROR (identified by {os_to_control} agent)
-                            - Duration: {execution_time:.2f} seconds
-                            - Total Steps: {total_messages}
-                        
-                            The {os_to_control} agent encountered an issue during execution. Review the context above for troubleshooting."""
+                        # Get current action ID
+                        action_id = 1
+                        if user_prompt in user_tasks and hasattr(user_tasks[user_prompt], 'current_action'):
+                            action_id = user_tasks[user_prompt].current_action
 
-                elif vlm_status == 'completed':
-                    return f"""✅ COMMAND COMPLETED
-                        
-                            OS: {os_to_control}
-                            Task: {instructions}
-                        
-                            SUMMARY OF {os_to_control} AGENT COMPLETION CONTEXT:
-                            {vlm_context if vlm_context else 'Task completed without detailed context.'}
-                        
-                            EXECUTION SUMMARY:
-                            - Status: COMPLETED (confirmed by {os_to_control} agent)
-                            - Duration: {execution_time:.2f} seconds
-                            - Total Steps: {total_messages}
-                        
-                            The {os_to_control} agent has completed the execution sequence successfully."""
+                        # Determine file path
+                        role_number = get_current_flow(user_prompt)
+                        action_id_to_use = action_id
+                        base_path = f"prompts/{prompt_id}_{role_number}"
 
-                else:
-                    return f"""📋 COMMAND EXECUTION FINISHED
-                        
-                            OS: {os_to_control}
-                            Task: {instructions}
-                            Status: {vlm_status.upper()}
-                        
-                            SUMMARY OF {os_to_control} AGENT EXECUTION CONTEXT:
-                            {vlm_context if vlm_context else 'Limited execution information available.'}
-                        
-                            EXECUTION SUMMARY:
-                            - Duration: {execution_time:.2f} seconds
-                            - Total Steps: {total_messages}
-                        
-                            Please review the {os_to_control} agent's assessment above."""
+                        # Find next available action_id
+                        while os.path.exists(f"{base_path}_{action_id_to_use}_vlm_agent.json"):
+                            action_id_to_use += 1
+
+                        vlm_agent_path = f"{base_path}_{action_id_to_use}_vlm_agent.json"
+                        os.makedirs(os.path.dirname(vlm_agent_path), exist_ok=True)
+
+                        # Helper functions for processing response data
+                        def clean_text(text):
+                            lines = text.split('\n')
+                            cleaned_lines = []
+                            for line in lines:
+                                if (not line.strip().startswith("Next Action:") and
+                                        not line.strip().startswith("Box ID:") and
+                                        not line.strip().startswith("box_centroid_coordinate:") and
+                                        not line.strip().startswith("value:")):
+                                    cleaned_lines.append(line)
+                            return '\n'.join(cleaned_lines)
+
+                        def format_action_text(text):
+                            if text.strip().startswith("{") and "action" in text:
+                                try:
+                                    action_data = eval(text.strip())
+                                    action_type = action_data.get("action", "")
+
+                                    if action_type == "mouse_move":
+                                        return "Move mouse"
+                                    elif action_type == "left_click":
+                                        return "Perform left click"
+                                    elif action_type == "right_click":
+                                        return "Perform right click"
+                                    elif action_type == "double_click":
+                                        return "Perform double click"
+                                    elif action_type == "type" and "text" in action_data:
+                                        return f"Type '{action_data['text']}'"
+                                    elif action_type == "drag":
+                                        return "Perform drag action"
+                                    else:
+                                        return f"Perform {action_type} action"
+                                except:
+                                    action_match = re.search(r"'action':\s*'([^']+)'", text)
+                                    text_match = re.search(r"'text':\s*'([^']+)'", text)
+
+                                    if action_match:
+                                        action_type = action_match.group(1)
+                                        if action_type == "type" and text_match:
+                                            return f"Type '{text_match.group(1)}'"
+                                        elif action_type == "mouse_move":
+                                            return "Move mouse"
+                                        elif action_type == "left_click":
+                                            return "Perform left click"
+                                        elif action_type == "right_click":
+                                            return "Perform right click"
+                                        elif action_type == "double_click":
+                                            return "Perform double click"
+                                        else:
+                                            return f"Perform {action_type} action"
+                            return text
+
+                        # Process extracted responses into recipe steps
+                        recipe_steps = []
+                        for msg in extracted_responses:
+                            msg_type = msg.get("type", "")
+                            msg_content = msg.get("content", "")
+
+                            if msg_type == "analysis":
+                                cleaned_content = clean_text(msg_content)
+                                if cleaned_content.strip():
+                                    recipe_steps.append({
+                                        "steps": cleaned_content,
+                                        "tool_name": "execute_windows_or_android_command",
+                                        "agent_to_perform_this_action": "Helper"
+                                    })
+                            elif msg_type == "next_action":
+                                formatted_content = format_action_text(msg_content)
+                                if formatted_content.strip():
+                                    recipe_steps.append({
+                                        "steps": formatted_content,
+                                        "tool_name": "execute_windows_or_android_command",
+                                        "agent_to_perform_this_action": "Helper"
+                                    })
+
+                        if not recipe_steps:
+                            recipe_steps.append({
+                                "steps": instructions,
+                                "tool_name": "execute_windows_or_android_command",
+                                "agent_to_perform_this_action": "Helper"
+                            })
+
+                        persona = f"user{user_id}" if user_id else "user"
+
+                        # Create the recipe format
+                        recipe_data = {
+                            "status": "done",
+                            "action": instructions,
+                            "fallback_action": f"Perform a Google search using {os_to_control}",
+                            "persona": persona,
+                            "action_id": action_id_to_use,
+                            "recipe": recipe_steps,
+                            "can_perform_without_user_input": "no",
+                            "scheduled_tasks": [],
+                            "metadata": {
+                                "user_id": f"redacted <class 'int'>",
+                                "os_controlled": os_to_control,
+                                "execution_time": execution_time,
+                                "vlm_context_available": bool(vlm_context)
+                            },
+                            "time_took_to_complete": execution_time,
+                            "actions_this_action_depends_on": []
+                        }
+
+                        # Save the recipe
+                        with open(vlm_agent_path, 'w') as json_file:
+                            json.dump(recipe_data, json_file, indent=4)
+
+                        tool_logger.info(f"Generated recipe data saved to {vlm_agent_path}")
+
+                        # Verify file creation
+                        if os.path.exists(vlm_agent_path):
+                            file_size = os.path.getsize(vlm_agent_path)
+                            tool_logger.info(f"Confirmed VLM file exists with size: {file_size} bytes")
+
+                    except Exception as e:
+                        tool_logger.error(f'Error creating VLM agent file: {e}')
+                        tool_logger.error(traceback.format_exc())
+
+                # Generate appropriate response based on status
+                status_responses = {
+                    'success': f"""✅ COMMAND EXECUTED SUCCESSFULLY
+
+    OS: {os_to_control}
+    Task: {instructions}
+
+    SUMMARY OF {os_to_control} AGENT EXECUTION CONTEXT:
+    {vlm_context if vlm_context else 'Command executed successfully.'}
+
+    PERFORMANCE METRICS:
+    • Status: SUCCESS (confirmed by {os_to_control} agent)
+    • Duration: {execution_time:.2f} seconds
+    • Steps Completed: {total_messages}
+    • Recipe {'Reused' if matching_recipe else 'Created'}: {'✓' if matching_recipe else '✓ (New)'}
+
+    The {os_to_control} agent has confirmed successful execution.""",
+
+                    'error': f"""❌ COMMAND EXECUTION ERROR
+
+    OS: {os_to_control}  
+    Task: {instructions}
+
+    ERROR DETAILS:
+    {vlm_context if vlm_context else 'Error occurred during execution.'}
+
+    DIAGNOSTIC INFO:
+    • Status: ERROR (identified by {os_to_control} agent)
+    • Duration: {execution_time:.2f} seconds
+    • Steps Attempted: {total_messages}
+
+    Please review the error details above for troubleshooting.""",
+
+                    'completed': f"""✅ COMMAND COMPLETED
+
+    OS: {os_to_control}
+    Task: {instructions}
+
+    COMPLETION SUMMARY:
+    {vlm_context if vlm_context else 'Task completed successfully.'}
+
+    EXECUTION METRICS:
+    • Status: COMPLETED (confirmed by {os_to_control} agent)
+    • Duration: {execution_time:.2f} seconds  
+    • Total Steps: {total_messages}
+
+    The {os_to_control} agent has completed the execution sequence."""
+                }
+
+                return status_responses.get(vlm_status, f"""📋 COMMAND EXECUTION FINISHED
+
+    OS: {os_to_control}
+    Task: {instructions}
+    Status: {vlm_status.upper()}
+
+    EXECUTION CONTEXT:
+    {vlm_context if vlm_context else 'Limited execution information available.'}
+
+    SUMMARY:
+    • Duration: {execution_time:.2f} seconds
+    • Total Steps: {total_messages}
+
+    Please review the {os_to_control} agent's assessment above.""")
 
             else:
                 # Handle legacy or non-dict responses
                 tool_logger.warning(f'Received non-dict response: {type(response)}')
-                return f"Command executed on {os_to_control}: {str(response)}"
+                return f"""⚠️ LEGACY RESPONSE FORMAT
+
+    OS: {os_to_control}
+    Task: {instructions}
+
+    Response: {str(response)}
+
+    Note: Received response in legacy format. Consider updating the {os_to_control} companion app."""
 
         except Exception as e:
             error_message = traceback.format_exc()
             tool_logger.error(f"Error executing command:\n{error_message}")
-            return f"""⚠️ SYSTEM ERROR
 
-                    OS: {os_to_control}
-                    Task: {instructions}
-                    Error: {str(e)}
-                
-                    A system error occurred while communicating with the {os_to_control} agent."""
+            # Provide specific error guidance
+            if 'Failed to capture screenshot' in str(e):
+                return f"""📱 COMPANION APP REQUIRED
+
+    OS: {os_to_control}
+    Task: {instructions}
+
+    The Hevolve AI Companion App is not running on your {os_to_control} device.
+
+    STEPS TO RESOLVE:
+    1. Open the Hevolve AI Companion App
+    2. Ensure it's connected and running
+    3. Try the command again
+
+    Error: {str(e)}"""
+            else:
+                return f"""⚠️ SYSTEM ERROR
+
+    OS: {os_to_control}
+    Task: {instructions}
+    Error: {str(e)}
+
+    A system error occurred while communicating with the {os_to_control} agent. Please try again or contact support if the issue persists."""
+
+
 
     # Register the enhanced function
     helper.register_for_llm(name="execute_windows_or_android_command",

@@ -2669,7 +2669,7 @@ def create_schedule(prompt_id, user_id):
                     current_app.logger.info(f'Successfully created scheduler job {i["persona"]}')
 
         current_app.logger.info('Creating Visual scheduled tasks')
-        trigger = IntervalTrigger(seconds=int(10000))
+        trigger = IntervalTrigger(seconds=int(2))
         job_id = f"job_{int(time.time())}"
         scheduler.add_job(call_visual_task, trigger=trigger, id=job_id,
                           args=['get past 1 mins visual information', user_id, prompt_id])
