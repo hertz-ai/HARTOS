@@ -192,7 +192,7 @@ def validate_state_transition(user_prompt: str, action_id: int, new_state: Actio
         ActionState.ASSIGNED: [ActionState.IN_PROGRESS, ActionState.ASSIGNED],
         ActionState.IN_PROGRESS: [ActionState.STATUS_VERIFICATION_REQUESTED, ActionState.IN_PROGRESS],
         ActionState.STATUS_VERIFICATION_REQUESTED: [ActionState.COMPLETED, ActionState.PENDING, ActionState.ERROR, ActionState.STATUS_VERIFICATION_REQUESTED],
-        ActionState.COMPLETED: [ActionState.FALLBACK_REQUESTED, ActionState.COMPLETED],
+        ActionState.COMPLETED: [ActionState.FALLBACK_REQUESTED, ActionState.RECIPE_REQUESTED, ActionState.TERMINATED, ActionState.COMPLETED],  # Allow direct recipe request (autonomous) or termination
         ActionState.PENDING: [ActionState.COMPLETED, ActionState.ERROR, ActionState.PENDING],
         ActionState.ERROR: [ActionState.IN_PROGRESS, ActionState.PENDING,ActionState.ERROR],  # Can retry or ask fallback
         ActionState.FALLBACK_REQUESTED: [ActionState.FALLBACK_RECEIVED, ActionState.FALLBACK_REQUESTED],

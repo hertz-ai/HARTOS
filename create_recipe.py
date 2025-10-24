@@ -61,6 +61,16 @@ from datetime import timedelta
 from lifecycle_hooks import initialize_minimal_lifecycle_hooks
 initialize_minimal_lifecycle_hooks()  # Prints integration guide
 
+# MCP Integration
+from integrations.mcp import load_user_mcp_servers, get_mcp_tools_for_autogen, mcp_registry
+
+# Internal Agent Communication (formerly called A2A, now renamed to avoid confusion with Google's A2A protocol)
+from integrations.internal_comm import (
+    skill_registry, a2a_context, register_agent_with_skills,
+    create_delegation_function, create_context_sharing_function,
+    create_context_retrieval_function
+)
+
 # Then add the 4 hooks to your get_response_group while loop
 # Then manually add the 4 hooks to your get_response_group while loop
 # Set up a dedicated logger that doesn't depend on Flask context
@@ -176,7 +186,7 @@ scheduler.start()
 
 user_agents: Dict[str, Tuple[Any, Any, Any, Any, Any, Any, Any]] = {}
 time_agents = {}
-
+# Azure OpenAI configuration (fallback)
 config_list = [{
         "model": 'gpt-4.1',
         "api_type": "azure",
@@ -185,6 +195,14 @@ config_list = [{
         "api_version": "2024-12-01-preview",
         "price": [0.0025, 0.01]
     }]
+
+# Local Qwen3-VL server configuration (ACTIVE)
+# config_list = [{
+#         "model": 'Qwen3-VL-2B-Instruct',
+#         "api_key": 'dummy',  # Not needed for local server
+#         "base_url": 'http://localhost:8000/v1',  # Local Qwen3-VL server
+#         "price": [0, 0]  # FREE! No API costs
+#     }]
 with open("config.json", 'r') as f:
     config = json.load(f)
 STUDENT_API = config['STUDENT_API']
@@ -629,11 +647,11 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     individual_json[user_prompt] = None
 
     try:
-        tool_logger.info("🔧 Trying to initialise...")
+        tool_logger.info(" Trying to initialise...")
 
         apply_autogen_fix_on_startup()
     except:
-        tool_logger.info("📋 Autogen JSON enhancement ready - will be applied when Flask starts")
+        tool_logger.info(" Autogen JSON enhancement ready - will be applied when Flask starts")
 
     custom_agents = []
     agents_object = {}
@@ -1446,7 +1464,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     The {os_to_control} agent has completed the execution sequence."""
                 }
 
-                return status_responses.get(vlm_status, f"""📋 COMMAND EXECUTION FINISHED
+                return status_responses.get(vlm_status, f""" COMMAND EXECUTION FINISHED
 
     OS: {os_to_control}
     Task: {instructions}
@@ -1479,7 +1497,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
             # Provide specific error guidance
             if 'Failed to capture screenshot' in str(e):
-                return f"""📱 COMPANION APP REQUIRED
+                return f""" COMPANION APP REQUIRED
 
     OS: {os_to_control}
     Task: {instructions}
@@ -1507,6 +1525,115 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     helper.register_for_llm(name="execute_windows_or_android_command",
                             description="Processes user-defined commands on a personal Windows or Android system and returns detailed computer/mobile use agent execution context.")(execute_windows_or_android_command)
     assistant.register_for_execution(name="execute_windows_or_android_command")(execute_windows_or_android_command)
+
+    # MCP Integration: Load and register user-provided MCP server tools
+    try:
+        tool_logger.info("Loading user-provided MCP servers...")
+        num_servers = load_user_mcp_servers()
+
+        if num_servers > 0:
+            tool_logger.info(f"Successfully loaded {num_servers} MCP servers")
+
+            # Get all MCP tool functions
+            mcp_tools = mcp_registry.get_all_tool_functions()
+            tool_logger.info(f"Discovered {len(mcp_tools)} MCP tools")
+
+            # Register each MCP tool with the agents
+            for tool_name, tool_func in mcp_tools.items():
+                # Get tool definition for description
+                tool_defs = mcp_registry.get_tool_definitions()
+                tool_def = next((t for t in tool_defs if t['name'] == tool_name), None)
+
+                if tool_def:
+                    description = tool_def.get('description', f'MCP tool: {tool_name}')
+
+                    # Register for LLM (helper agent suggests tool use)
+                    helper.register_for_llm(name=tool_name, description=description)(tool_func)
+
+                    # Register for execution (assistant agent executes tool)
+                    assistant.register_for_execution(name=tool_name)(tool_func)
+
+                    tool_logger.info(f"Registered MCP tool: {tool_name}")
+        else:
+            tool_logger.info("No MCP servers configured - continuing with default tools")
+    except Exception as e:
+        tool_logger.warning(f"MCP integration error (non-critical): {e}")
+        # Continue with default tools if MCP fails
+
+    # Internal Agent Communication: Register agents and their skills for in-process communication
+    try:
+        tool_logger.info("Initializing Internal Agent Communication (skill-based delegation)...")
+
+        # Define agent skills
+        agent_skills = {
+            'assistant': [
+                {'name': 'task_coordination', 'description': 'Coordinating complex multi-step tasks', 'proficiency': 0.95},
+                {'name': 'decision_making', 'description': 'Making strategic decisions', 'proficiency': 0.9},
+                {'name': 'context_management', 'description': 'Managing conversation context', 'proficiency': 0.9}
+            ],
+            'helper': [
+                {'name': 'tool_execution', 'description': 'Executing various tools and functions', 'proficiency': 1.0},
+                {'name': 'data_processing', 'description': 'Processing and transforming data', 'proficiency': 0.95},
+                {'name': 'external_api', 'description': 'Interacting with external APIs', 'proficiency': 0.9}
+            ],
+            'executor': [
+                {'name': 'code_execution', 'description': 'Executing code safely', 'proficiency': 1.0},
+                {'name': 'computation', 'description': 'Performing complex computations', 'proficiency': 0.95},
+                {'name': 'data_analysis', 'description': 'Analyzing data and generating insights', 'proficiency': 0.9}
+            ],
+            'verify': [
+                {'name': 'status_verification', 'description': 'Verifying task completion status', 'proficiency': 0.95},
+                {'name': 'quality_assurance', 'description': 'Ensuring output quality', 'proficiency': 0.9},
+                {'name': 'validation', 'description': 'Validating results and outputs', 'proficiency': 0.9}
+            ]
+        }
+
+        # Register agents with their skills
+        for agent_name, skills in agent_skills.items():
+            register_agent_with_skills(agent_name, skills)
+            tool_logger.info(f"Registered {agent_name} with {len(skills)} skills")
+
+        # Add A2A delegation tool to assistant
+        @log_tool_execution
+        def delegate_to_specialist(task: Annotated[str, "Description of the task to delegate"],
+                                  required_skills: Annotated[List[str], "List of skills required (e.g., ['code_execution', 'data_analysis'])"],
+                                  context: Annotated[Optional[Dict], "Optional context to pass to the specialist agent"] = None) -> str:
+            """Delegate a task to a specialist agent based on required skills"""
+            delegation_func = create_delegation_function('assistant')
+            return delegation_func(task, required_skills, context)
+
+        helper.register_for_llm(name="delegate_to_specialist",
+                               description="Delegate complex tasks to specialist agents based on required skills")(delegate_to_specialist)
+        assistant.register_for_execution(name="delegate_to_specialist")(delegate_to_specialist)
+
+        # Add context sharing tool
+        @log_tool_execution
+        def share_context_with_agents(context_key: Annotated[str, "Unique identifier for the context"],
+                                      context_value: Annotated[Any, "Context data to share"]) -> str:
+            """Share context information with other agents"""
+            sharing_func = create_context_sharing_function('assistant')
+            return sharing_func(context_key, context_value)
+
+        helper.register_for_llm(name="share_context_with_agents",
+                               description="Share context information with other agents in the system")(share_context_with_agents)
+        assistant.register_for_execution(name="share_context_with_agents")(share_context_with_agents)
+
+        # Add context retrieval tool
+        @log_tool_execution
+        def get_shared_context(context_key: Annotated[str, "Identifier of the context to retrieve"]) -> str:
+            """Retrieve context information shared by other agents"""
+            retrieval_func = create_context_retrieval_function()
+            return retrieval_func(context_key)
+
+        helper.register_for_llm(name="get_shared_context",
+                               description="Retrieve context information shared by other agents")(get_shared_context)
+        assistant.register_for_execution(name="get_shared_context")(get_shared_context)
+
+        tool_logger.info("Internal Agent Communication complete - agents can now delegate tasks and share context")
+
+    except Exception as e:
+        tool_logger.warning(f"Internal Agent Communication error (non-critical): {e}")
+        # Continue without internal communication if it fails
 
     assistant.description = 'this is an assistant agent that coordinates & executes requested tasks & actions'
     executor.description = 'this is an executor agent that Specialized agent for code execution & response handling'
@@ -1670,9 +1797,19 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                 user_tasks[user_prompt].new_json.append(json_obj)
                                 current_app.logger.info(f'CHECKING FOR FALLBACK user_tasks[user_prompt].current_action={user_tasks[user_prompt].current_action} json_obj["action_id"]={json_obj["action_id"]}')
 
-                                # After completion, request recipe for this action
+                                # After completion, only request fallback from user if LLM didn't provide one
+                                # This enables autonomous operation - LLM generates fallback strategies automatically
+                                fallback_action = json_obj.get('fallback_action', '').strip()
+                                if not fallback_action or len(fallback_action) == 0:
+                                    current_app.logger.warning(f'Action {json_action_id} completed but no fallback_action provided by StatusVerifier - this should not happen with updated instructions')
+                                    # Request fallback from user only if LLM failed to generate one
+                                    user_tasks[user_prompt].fallback = True
+                                else:
+                                    current_app.logger.info(f'Action {json_action_id} completed with auto-generated fallback: {fallback_action[:100]}...')
+                                    # Fallback was provided by LLM, proceed to recipe phase
+                                    user_tasks[user_prompt].fallback = False
+                                    user_tasks[user_prompt].recipe = True
 
-                                user_tasks[user_prompt].fallback = True
                                 force_state_through_valid_path(user_prompt, json_action_id, ActionState.COMPLETED,"verified complete")
 
 
@@ -1725,8 +1862,15 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                 user_tasks[user_prompt].current_action = int(json_obj['action_id'])
                                 individual_json[user_prompt] = json_obj
                                 current_app.logger.info(f'Saved Individual recipe at: {name}')
+                                # Transition to TERMINATED so next action can start
+                                force_state_through_valid_path(user_prompt, int(json_obj['action_id']), ActionState.TERMINATED, "Recipe saved and action complete")
                             else:
                                 current_app.logger.info(f'Current state is {current_state}, Recipe Already Saved in get response group')
+                                # Even if recipe already saved, ensure action is TERMINATED via proper state path
+                                if current_state == ActionState.COMPLETED:
+                                    # Must go through RECIPE_RECEIVED before TERMINATED
+                                    safe_set_state(user_prompt, user_tasks[user_prompt].current_action, ActionState.RECIPE_RECEIVED, "Recipe already saved, set to RECIPE_RECEIVED")
+                                    force_state_through_valid_path(user_prompt, user_tasks[user_prompt].current_action, ActionState.TERMINATED, "Now terminate action")
 
 
                             return chat_instructor
@@ -1891,11 +2035,12 @@ def instantiate_executor_agent():
                 Report back to the Assistant with clear details.
             3. Key Notes:
                 You can create code if not provided to you.
-                Working Directory: /home/hertzai2019/newauto/coding. Use this path as needed.
+                Working Directory: {os.getcwd()}. Use this as the base path for all file operations. Always use absolute paths by joining with this directory.
                 For storing or retrieving information about the user, request the Helper Agent to use the get_set_internal_memory tool.
                 No General Conversations: Redirect unrelated conversations to the manager to route to the user.
 
         Coding Instructions:
+            CRITICAL: When creating file paths, ALWAYS use os.path.join(os.getcwd(), filename) or similar. NEVER use hardcoded absolute paths like '/home/user/path' or 'C:\\path'. All paths must be relative to the current working directory.
             Avoid using time.sleep. Instead, request the Helper Agent to use the create_scheduled_jobs tool for tasks requiring delays or intervals.
             If the Assistant Agent provides code requiring time.sleep, inform them that it cannot be executed and suggest using the create_scheduled_jobs tool.
             Add proper error handling and logging in all code.
@@ -1926,13 +2071,13 @@ def instantiate_status_verifier_agent(user_prompt):
         system_message=""""You are a Status Verification Agent in a multi-agent system.
         Role: Your primary responsibility is to track, validate and verify the status of actions performed by other agents. You must provide updates strictly in JSON format with the following response structures:
         Response formats:
-            1. Action Completed Successfully: {"status": "completed","action": "current action","action_id": 1/2/3...,"message": "message here","can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike","persona_name":"persona name this action belongs to","fallback_action": "fallback action here"}  // If fallback_action is missing, ask the user: "What measures should be taken if this action fails in the future?" Include their response in fallback_action.
+            1. Action Completed Successfully: {"status": "completed","action": "current action","action_id": 1/2/3...,"message": "message here","can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike","persona_name":"persona name this action belongs to","fallback_action": "Automatically determine and provide intelligent fallback strategy here based on the action type. Examples: For file operations - retry with alternate path; For API calls - implement exponential backoff; For calculations - use alternative algorithm; For data processing - validate and sanitize inputs before retry. NEVER leave this empty."}
             2. Action Error: {"status": "error","action": "current action","action_id": 1/2/3...,"message": "message here"}
-            3. Current Action Updated: {"status": "updated","action": "current action text","updated_action": "updated current action text","action_id": 1/2/3...,"message": "message here","persona_name":"persona name this action belongs to","fallback_action": ""} // If no fallback_action is provided, ask the user for measures to include.
+            3. Current Action Updated: {"status": "updated","action": "current action text","updated_action": "updated current action text","action_id": 1/2/3...,"message": "message here","persona_name":"persona name this action belongs to","fallback_action": "Provide intelligent fallback strategy based on the updated action"}
             4. Action pending: {"status": "pending","action": "current action","action_id": 1/2/3...,"message": "what steps are pending message here"}
         Important Instructions:
             1. Strict Completion Criteria:
-                i. Only mark an action as "completed" if all steps of the action have been successfully executed. 
+                i. Only mark an action as "completed" if all steps of the action have been successfully executed.
                 ii. For pending or ongoing tasks, instruct the Assistant to complete them.
             2. Ensure Action Accuracy:
                 i. Verify that the last action was performed correctly based on history as per instructions.
@@ -1940,6 +2085,11 @@ def instantiate_status_verifier_agent(user_prompt):
             3. Maintain JSON Consistency:
                 i. Always follow the exact JSON structure in your responses.
                 ii. Do not perform actions yourself - only report status.
+            4. Fallback Action Requirements:
+                i. ALWAYS provide a non-empty fallback_action for completed and updated statuses
+                ii. Fallback should be context-aware and actionable
+                iii. Consider the specific failure modes of the action type
+                iv. Provide multiple recovery strategies when applicable (e.g., "Retry up to 3 times with 2-second delays, then log error and notify user")
             Maintain the exact JSON structure in all responses.
 
         """ + f"\nExtra Information: below are the list of actions the chat_manager will give you, keep this in mind but don't use this directly only use this if there is any update in any action or you want to insert/delete the actions & return the entire array as entire_actions\n{user_tasks[user_prompt].actions}",
@@ -2057,7 +2207,7 @@ def instantiate_assistant_agent(list_of_persona, user_prompt):
                     - creator.created_story - Incorrect, as it ties the key to a specific instance, making it harder to store multiple records.
 
 
-        •Working Directory: /home/hertzai2019/newauto/coding/
+        •Working Directory: {os.getcwd()}/ - CRITICAL: Always use os.path.join(os.getcwd(), filename) for file paths. NEVER use hardcoded absolute paths.
 
         •Reminder: If camera input is needed, ask the user to turn on their camera. All responses should be played via TTS with a talking-head animation.
         """ + f"Extra Information: below are the list of actions the chat_manager is gonna give you keep this in mind but dont use this directly\n{user_tasks[user_prompt].actions}",
@@ -2139,7 +2289,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             Actions: <actionsStart>{user_tasks[user_prompt].actions}<actionEnd>
             Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{final_recipe[prompt_id]}<generalized_functionsEnd><recipeEnd>
 
-            Note: Your Working Directory is "/home/hertzai2019/newauto/coding" use this if you need,
+            Note: Your Working Directory is "{os.getcwd()}" - CRITICAL: When writing code, ALWAYS use os.path.join(os.getcwd(), filename) for file paths. NEVER hardcode paths like '/home/user/path'.
             Add proper error handling, logging.
             Always provide clear execution results or error messages to the assistant.
             if you get any conversation which is not related to coding ask the manager to route this conversation to user
@@ -2794,7 +2944,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
 
                 if recipe_result['action'] == 'save_recipe_and_terminate':
                     # Only set state here - don't do business logic yet
-                    current_app.logger.info('🎯 Recipe completion detected - state updated to RECIPE_RECEIVED')
+                    current_app.logger.info(' Recipe completion detected - state updated to RECIPE_RECEIVED')
 
                 if not json_obj:
                     json_obj = individual_json[user_prompt]
@@ -3418,7 +3568,7 @@ def detect_and_resume_progress(prompt_id, user_prompt):
     latest_flow = 0
     latest_action = 1
 
-    current_app.logger.info(f"🔍 Scanning for existing progress for prompt_id={prompt_id}")
+    current_app.logger.info(f" Scanning for existing progress for prompt_id={prompt_id}")
 
     # Scan each flow for existing files
     for flow_idx in range(total_flows):
@@ -3465,7 +3615,7 @@ def detect_and_resume_progress(prompt_id, user_prompt):
                 if latest_action > total_actions_in_flow:
                     latest_action = total_actions_in_flow + 1
 
-    current_app.logger.info(f"📊 Progress Analysis:")
+    current_app.logger.info(f" Progress Analysis:")
     current_app.logger.info(f"   - Latest Flow: {latest_flow}")
     current_app.logger.info(f"   - Latest Action: {latest_action}")
     current_app.logger.info(f"   - Completed Flows: {completed_flows}")
@@ -3620,7 +3770,7 @@ def initialize_with_resume(prompt_id, user_prompt, user_id):
     # Load existing metadata
     load_existing_metadata(prompt_id, user_prompt, flow_progress)
 
-    current_app.logger.info(f"🎯 RESUME SUMMARY:")
+    current_app.logger.info(f" RESUME SUMMARY:")
     current_app.logger.info(f"   - Resumed at Flow {current_flow}, Action {current_action}")
     current_app.logger.info(f"   - Scheduler Check: {scheduler_check[user_prompt]}")
     current_app.logger.info(f"   - Completed Flows: {len(completed_flows)}/{len(config['flows'])}")
@@ -3635,7 +3785,7 @@ def load_existing_metadata(prompt_id, user_prompt, flow_progress):
     try:
         # First, try to load from persistent storage
         if helper_fun.load_agent_data_from_file(prompt_id, agent_data):
-            current_app.logger.info(f"📂 Successfully loaded persistent agent data for prompt_id {prompt_id}")
+            current_app.logger.info(f" Successfully loaded persistent agent data for prompt_id {prompt_id}")
             return
         # Look for the most recent action JSON with metadata
         for flow_idx, progress in flow_progress.items():
@@ -3649,7 +3799,7 @@ def load_existing_metadata(prompt_id, user_prompt, flow_progress):
                             if prompt_id not in agent_data:
                                 agent_data[prompt_id] = {}
                             agent_data[prompt_id].update(action_data['metadata'])
-                            current_app.logger.info(f"📥 Loaded metadata from {action_file}")
+                            current_app.logger.info(f" Loaded metadata from {action_file}")
                             # Save to persistent storage for future use
                             helper_fun.save_agent_data_to_file(prompt_id,agent_data)
                             return  # Load from most recent only
@@ -3675,15 +3825,15 @@ def recipe(user_id, text, prompt_id, file_id, request_id):
         recent_file_id[user_id] = file_id
 
     if user_prompt not in user_tasks.keys():
-        # 🎯 ENHANCED: Resume from existing progress instead of starting fresh
+        #  ENHANCED: Resume from existing progress instead of starting fresh
         current_flow, current_action, completed_flows = initialize_with_resume(prompt_id, user_prompt, user_id)
 
         # Check if all flows are already complete
         if scheduler_check[user_prompt]:
-            current_app.logger.info("🎉 All flows already completed - Agent already created")
+            current_app.logger.info(" All flows already completed - Agent already created")
             return 'Agent Already Created Successfully'
 
-        current_app.logger.info(f"🔄 Resuming from Flow {current_flow}, Action {current_action}")
+        current_app.logger.info(f" Resuming from Flow {current_flow}, Action {current_action}")
     else:
         current_app.logger.info(f"♻️ Using existing session for {user_prompt}")
 

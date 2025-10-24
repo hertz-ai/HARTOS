@@ -34,6 +34,16 @@ import threading
 
 from threadlocal import thread_local_data
 
+# MCP Integration
+from integrations.mcp import load_user_mcp_servers, get_mcp_tools_for_autogen, mcp_registry
+
+# Internal Agent Communication (formerly called A2A, now renamed to avoid confusion with Google's A2A protocol)
+from integrations.internal_comm import (
+    skill_registry, a2a_context, register_agent_with_skills,
+    create_delegation_function, create_context_sharing_function,
+    create_context_retrieval_function
+)
+
 
 class TaskStatus(Enum):
     INITIALIZED = "INITIALIZED"
@@ -84,6 +94,7 @@ _active_tools_lock = threading.Lock()
 redis_client = redis.StrictRedis(
     host='azure_all_vms.hertzai.com', port=6369, db=0)
 agent_data = {}
+# Azure OpenAI configuration (fallback - gpt-4o)
 # config_list = [{
 #     "model": 'gpt-4o',
 #     "api_type": "azure",
@@ -93,6 +104,7 @@ agent_data = {}
 #     "price": [0.0025, 0.01]
 # }]
 
+# Azure OpenAI configuration (fallback - gpt-4.1-mini)
 config_list = [{
         "model": 'gpt-4.1-mini',
         "api_type": "azure",
@@ -101,6 +113,14 @@ config_list = [{
         "api_version": "2024-12-01-preview",
         "price": [0.0025, 0.01]
     }]
+
+# Local Qwen3-VL server configuration (ACTIVE)
+# config_list = [{
+#         "model": 'Qwen3-VL-2B-Instruct',
+#         "api_key": 'dummy',  # Not needed for local server
+#         "base_url": 'http://localhost:8000/v1',  # Local Qwen3-VL server
+#         "price": [0, 0]  # FREE! No API costs
+#     }]
 
 message_tracking_lock = threading.Lock()
 
@@ -977,6 +997,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             6. Always use code from recipe given below.
             7. If there is any action which is like to perform a task continuously you should not do it.
             8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
+            8a. CRITICAL PATH INSTRUCTION: When creating file paths in code, ALWAYS use os.path.join(os.getcwd(), filename) or similar. NEVER use hardcoded absolute paths like '/home/user/path' or 'C:\\path'. All paths must be relative to the current working directory.
             9. If you want to send data proactively (on your own) to user use `@user {response_format}`. However, if you're responding to the user's request or instruction, use the send_message_to_user or send_message_in_seconds tool.
             10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
             11. Always request the next action from the @StatusVerifier agent—do not determine the next action on your own.
@@ -1003,6 +1024,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             6. Always use code from recipe given below.
             7. If there is any action which is like to perform a task continuously you should not do it.
             8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
+            8a. CRITICAL PATH INSTRUCTION: When creating file paths in code, ALWAYS use os.path.join(os.getcwd(), filename) or similar. NEVER use hardcoded absolute paths like '/home/user/path' or 'C:\\path'. All paths must be relative to the current working directory.
             9. If you want to send data proactively (on your own) to user use `@user {response_format}`. However, if you're responding to the user's request or instruction, use the send_message_to_user or send_message_in_seconds tool.
             10. The response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
             11. Always request the next action from the @StatusVerifier agent—do not determine the next action on your own.
@@ -1011,7 +1033,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             Actions: <actionsStart>{role_actions}<actionEnd>
             Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{individual_recipe}<generalized_functionsEnd><recipeEnd>
 
-            Note: Your Working Directory is "/home/hertzai2019/newauto/coding" use this if you need,
+            Note: Your Working Directory is "{os.getcwd()}" - use this as the base path for all file operations. Always use absolute paths by joining with this directory,
             Add proper error handling, logging.
             Always provide clear execution results or error messages to the assistant.
             if you get any conversation which is not related to coding ask the manager to route this conversation to user
@@ -1911,7 +1933,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             Actions: <actionsStart>{role_actions}<actionEnd>
             Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{individual_recipe}<generalized_functionsEnd><recipeEnd>
 
-            Note: Your Working Directory is "/home/hertzai2019/newauto/coding" use this if you need,
+            Note: Your Working Directory is "{os.getcwd()}" - use this as the base path for all file operations. Always use absolute paths by joining with this directory,
             Add proper error handling, logging.
             Always provide clear execution results or error messages to the assistant.
             if you get any conversation which is not related to coding ask the manager to route this conversation to user
@@ -2106,6 +2128,110 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     visual_agent.register_for_execution(name="execute_windows_or_android_command")(execute_windows_or_android_command)
     helper2.register_for_llm(name="google_search", description="Get google search response")(google_search)
     visual_agent.register_for_execution(name="google_search")(google_search)
+
+    # MCP Integration: Load and register user-provided MCP server tools
+    try:
+        current_app.logger.info("Loading user-provided MCP servers...")
+        num_servers = load_user_mcp_servers()
+
+        if num_servers > 0:
+            current_app.logger.info(f"Successfully loaded {num_servers} MCP servers")
+
+            # Get all MCP tool functions
+            mcp_tools = mcp_registry.get_all_tool_functions()
+            current_app.logger.info(f"Discovered {len(mcp_tools)} MCP tools")
+
+            # Register each MCP tool with the agents
+            for tool_name, tool_func in mcp_tools.items():
+                # Get tool definition for description
+                tool_defs = mcp_registry.get_tool_definitions()
+                tool_def = next((t for t in tool_defs if t['name'] == tool_name), None)
+
+                if tool_def:
+                    description = tool_def.get('description', f'MCP tool: {tool_name}')
+
+                    # Register for LLM (helper agent suggests tool use)
+                    helper.register_for_llm(name=tool_name, description=description)(tool_func)
+
+                    # Register for execution (assistant agent executes tool)
+                    assistant.register_for_execution(name=tool_name)(tool_func)
+
+                    current_app.logger.info(f"Registered MCP tool: {tool_name}")
+        else:
+            current_app.logger.info("No MCP servers configured - continuing with default tools")
+    except Exception as e:
+        current_app.logger.warning(f"MCP integration error (non-critical): {e}")
+        # Continue with default tools if MCP fails
+
+    # Internal Agent Communication: Register agents and their skills for in-process communication
+    try:
+        current_app.logger.info("Initializing Internal Agent Communication (skill-based delegation)...")
+
+        # Define agent skills (same as in create_recipe.py for consistency)
+        agent_skills = {
+            'assistant': [
+                {'name': 'task_coordination', 'description': 'Coordinating complex multi-step tasks', 'proficiency': 0.95},
+                {'name': 'decision_making', 'description': 'Making strategic decisions', 'proficiency': 0.9},
+                {'name': 'context_management', 'description': 'Managing conversation context', 'proficiency': 0.9}
+            ],
+            'helper': [
+                {'name': 'tool_execution', 'description': 'Executing various tools and functions', 'proficiency': 1.0},
+                {'name': 'data_processing', 'description': 'Processing and transforming data', 'proficiency': 0.95},
+                {'name': 'external_api', 'description': 'Interacting with external APIs', 'proficiency': 0.9}
+            ],
+            'executor': [
+                {'name': 'code_execution', 'description': 'Executing code safely', 'proficiency': 1.0},
+                {'name': 'computation', 'description': 'Performing complex computations', 'proficiency': 0.95},
+                {'name': 'data_analysis', 'description': 'Analyzing data and generating insights', 'proficiency': 0.9}
+            ],
+            'verify': [
+                {'name': 'status_verification', 'description': 'Verifying task completion status', 'proficiency': 0.95},
+                {'name': 'quality_assurance', 'description': 'Ensuring output quality', 'proficiency': 0.9},
+                {'name': 'validation', 'description': 'Validating results and outputs', 'proficiency': 0.9}
+            ]
+        }
+
+        # Register agents with their skills
+        for agent_name, skills in agent_skills.items():
+            register_agent_with_skills(agent_name, skills)
+            current_app.logger.info(f"Registered {agent_name} with {len(skills)} skills")
+
+        # Add A2A tools (similar to create_recipe.py)
+        def delegate_to_specialist(task: Annotated[str, "Description of the task to delegate"],
+                                  required_skills: Annotated[List[str], "List of skills required"],
+                                  context: Annotated[Optional[Dict], "Optional context"] = None) -> str:
+            """Delegate a task to a specialist agent based on required skills"""
+            delegation_func = create_delegation_function('assistant')
+            return delegation_func(task, required_skills, context)
+
+        helper.register_for_llm(name="delegate_to_specialist",
+                               description="Delegate complex tasks to specialist agents based on required skills")(delegate_to_specialist)
+        assistant.register_for_execution(name="delegate_to_specialist")(delegate_to_specialist)
+
+        def share_context_with_agents(context_key: Annotated[str, "Context identifier"],
+                                      context_value: Annotated[Any, "Context data"]) -> str:
+            """Share context information with other agents"""
+            sharing_func = create_context_sharing_function('assistant')
+            return sharing_func(context_key, context_value)
+
+        helper.register_for_llm(name="share_context_with_agents",
+                               description="Share context information with other agents")(share_context_with_agents)
+        assistant.register_for_execution(name="share_context_with_agents")(share_context_with_agents)
+
+        def get_shared_context(context_key: Annotated[str, "Context identifier"]) -> str:
+            """Retrieve context information shared by other agents"""
+            retrieval_func = create_context_retrieval_function()
+            return retrieval_func(context_key)
+
+        helper.register_for_llm(name="get_shared_context",
+                               description="Retrieve context information shared by other agents")(get_shared_context)
+        assistant.register_for_execution(name="get_shared_context")(get_shared_context)
+
+        current_app.logger.info("Internal Agent Communication complete - agents can now delegate tasks and share context")
+
+    except Exception as e:
+        current_app.logger.warning(f"Internal Agent Communication error (non-critical): {e}")
+        # Continue without internal communication if it fails
 
     assistant.description = 'Designed to handle specific tasks by interacting directly with other agents or the user. It acts as the primary orchestrator for task management and ensures tasks are completed efficiently'
     user_proxy.description = 'Acts as a user, performing tasks assigned by the Assistant Agent. It simulates user actions and provides results or feedback as required.'
