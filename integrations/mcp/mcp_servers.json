@@ -1,0 +1,39 @@
+{
+  "servers": [
+    {
+      "name": "example_mcp_server",
+      "url": "http://localhost:9000",
+      "api_key": null,
+      "enabled": false,
+      "description": "Example MCP server configuration"
+    },
+    {
+      "name": "user_provider",
+      "url": "http://localhost:9001",
+      "api_key": null,
+      "enabled": false,
+      "description": "User provider MCP server - manages user data and authentication"
+    },
+    {
+      "name": "data_access",
+      "url": "http://localhost:9002",
+      "api_key": null,
+      "enabled": false,
+      "description": "Data access MCP server - provides database and file system access"
+    }
+  ],
+  "settings": {
+    "auto_discover": true,
+    "connection_timeout": 5,
+    "execution_timeout": 30,
+    "retry_attempts": 2
+  },
+  "instructions": {
+    "usage": "Enable MCP servers by setting 'enabled': true and providing the correct URL",
+    "api_key": "Add API key if your MCP server requires authentication",
+    "custom_servers": "Add your own MCP servers by following the same structure",
+    "tool_naming": "Tools will be prefixed with server name (e.g., user_provider_get_user)",
+    "health_endpoint": "MCP servers must implement /health endpoint",
+    "tools_endpoint": "MCP servers must implement /tools/list and /tools/execute endpoints"
+  }
+}

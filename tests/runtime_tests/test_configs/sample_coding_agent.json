@@ -1,0 +1,27 @@
+{
+  "status": "pending",
+  "name": "Test Coder",
+  "broadcast_agent": false,
+  "personas": [
+    {
+      "name": "coder",
+      "description": "This agent is good at coding and can execute commands"
+    }
+  ],
+  "tools": ["execute_windows_command"],
+  "flows": [
+    {
+      "flow_name": "Simple code task",
+      "persona": "coder",
+      "actions": [
+        "Create a simple Python file",
+        "Write Hello World code",
+        "Execute the Python file"
+      ],
+      "sub_goal": "Test basic coding functionality"
+    }
+  ],
+  "goal": "Test coding agent",
+  "prompt_id": null,
+  "creator_user_id": 1001
+}

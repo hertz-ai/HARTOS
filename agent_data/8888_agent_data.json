@@ -1,0 +1,13 @@
+{
+  "prompt_id": 8888,
+  "saved_at": "2025-10-24T20:15:49.140793",
+  "data": {
+    "datasets": {
+      "dataset_txt": "C:\\Users\\sathi\\PycharmProjects\\LLM-langchain_Chatbot-Agent\\coding\\dataset.txt",
+      "random_integers_1_1000": {
+        "file_path": "C:\\Users\\sathi\\PycharmProjects\\LLM-langchain_Chatbot-Agent\\coding\\dataset.txt",
+        "description": "Contains 100 random numbers between 1 and 1000, one per line"
+      }
+    }
+  }
+}
