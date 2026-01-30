@@ -4,4 +4,4 @@ logs/
 log/
 langchain.log
 __pycache__/
-
+venv_old/*

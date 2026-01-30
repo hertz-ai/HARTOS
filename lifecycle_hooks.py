@@ -48,6 +48,38 @@ class FlowLifecycleState:
 flow_lifecycle = FlowLifecycleState()
 
 
+# Action retry tracking to prevent infinite loops
+class ActionRetryTracker:
+    """Track retry counts to force ERROR state after threshold"""
+
+    def __init__(self):
+        self.pending_counts = {}  # {(user_prompt, action_id): count}
+        self.MAX_PENDING_RETRIES = 3  # Force ERROR after 3 pending attempts
+
+    def increment_pending(self, user_prompt, action_id):
+        """Increment pending count and return True if threshold exceeded"""
+        key = (user_prompt, action_id)
+        count = self.pending_counts.get(key, 0) + 1
+        self.pending_counts[key] = count
+
+        if count > self.MAX_PENDING_RETRIES:
+            logger.warning(f"[RETRY LIMIT] Action {action_id} has been PENDING {count} times - forcing to ERROR state")
+            return True  # Exceeded threshold
+
+        logger.info(f"[RETRY TRACKING] Action {action_id} pending count: {count}/{self.MAX_PENDING_RETRIES}")
+        return False  # Still under threshold
+
+    def reset_count(self, user_prompt, action_id):
+        """Reset counter when action completes or errors"""
+        key = (user_prompt, action_id)
+        if key in self.pending_counts:
+            del self.pending_counts[key]
+            logger.info(f"[RETRY TRACKING] Reset pending count for action {action_id}")
+
+
+retry_tracker = ActionRetryTracker()
+
+
 # Enforcement functions
 def enforce_action_termination(user_prompt, current_action_id):
     """Ensure current action is TERMINATED before proceeding"""
@@ -88,7 +120,7 @@ def set_action_state(user_prompt: str, action_id: int, state: ActionState, reaso
     if user_prompt not in action_states:
         action_states[user_prompt] = {}
     action_states[user_prompt][action_id] = state
-    logger.info(f"🎯 Action {action_id}: {current_state.value} → {state.value} ({reason})")
+    logger.info(f"[TARGET] Action {action_id}: {current_state.value} → {state.value} ({reason})")
 
 
 # 3. ADD these wrapper functions for safe state updates:
@@ -98,7 +130,7 @@ def safe_set_state(user_prompt: str, action_id: int, new_state: ActionState, rea
         set_action_state(user_prompt, action_id, new_state, reason)
         return True
     except StateTransitionError as e:
-        logger.error(f"❌ {e}")
+        logger.error(f"[ERROR] {e}")
         return False
 
 
@@ -167,11 +199,11 @@ def force_state_through_valid_path(user_prompt: str, action_id: int, target_stat
             try:
                 set_action_state(user_prompt, action_id, step_state, f"auto-path: {reason}")
             except StateTransitionError as e:
-                logger.error(f"❌ Auto-path failed at {step_state.value}: {e}")
+                logger.error(f"[ERROR] Auto-path failed at {step_state.value}: {e}")
                 return False
         return True
     else:
-        logger.error(f"❌ No valid path from {current_state.value} to {target_state.value}")
+        logger.error(f"[ERROR] No valid path from {current_state.value} to {target_state.value}")
         return False
 
 
@@ -194,7 +226,8 @@ def validate_state_transition(user_prompt: str, action_id: int, new_state: Actio
         ActionState.STATUS_VERIFICATION_REQUESTED: [ActionState.COMPLETED, ActionState.PENDING, ActionState.ERROR, ActionState.STATUS_VERIFICATION_REQUESTED],
         ActionState.COMPLETED: [ActionState.FALLBACK_REQUESTED, ActionState.COMPLETED],
         ActionState.PENDING: [ActionState.COMPLETED, ActionState.ERROR, ActionState.PENDING],
-        ActionState.ERROR: [ActionState.IN_PROGRESS, ActionState.PENDING,ActionState.ERROR],  # Can retry or ask fallback
+        # FIX: Allow ERROR to reach TERMINATED via FALLBACK_REQUESTED/RECIPE_REQUESTED or directly
+        ActionState.ERROR: [ActionState.IN_PROGRESS, ActionState.PENDING, ActionState.ERROR, ActionState.FALLBACK_REQUESTED, ActionState.RECIPE_REQUESTED, ActionState.TERMINATED],
         ActionState.FALLBACK_REQUESTED: [ActionState.FALLBACK_RECEIVED, ActionState.FALLBACK_REQUESTED],
         ActionState.FALLBACK_RECEIVED: [ActionState.RECIPE_REQUESTED, ActionState.FALLBACK_RECEIVED],
         ActionState.RECIPE_REQUESTED: [ActionState.RECIPE_RECEIVED, ActionState.RECIPE_REQUESTED],
@@ -204,10 +237,10 @@ def validate_state_transition(user_prompt: str, action_id: int, new_state: Actio
 
     allowed = valid_transitions.get(current_state, [])
     if new_state not in allowed:
-        logger.error(f"❌ Invalid transition: {current_state.value} → {new_state.value}")
+        logger.error(f"[ERROR] Invalid transition: {current_state.value} → {new_state.value}")
         return False
 
-    logger.info(f"✅ Valid transition: {current_state.value} → {new_state.value}")
+    logger.info(f"[OK] Valid transition: {current_state.value} → {new_state.value}")
     return True
 
 
@@ -224,7 +257,7 @@ def lifecycle_hook_track_action_assignment(user_prompt: str, user_tasks, group_c
     current_state = get_action_state(user_prompt, current_action_id)
 
     if current_state not in [ActionState.ASSIGNED, ActionState.ERROR]:
-        logger.info(f"🔒 Action {current_action_id} in {current_state.value} - skipping assignment hook")
+        logger.info(f"[LOCKED] Action {current_action_id} in {current_state.value} - skipping assignment hook")
         return False
 
     # When ChatInstructor assigns action, move from ASSIGNED to IN_PROGRESS
@@ -280,6 +313,8 @@ def lifecycle_hook_process_verifier_response(user_prompt: str, json_obj: dict, u
         return {'action': 'allow', 'message': None}
 
     if status == 'completed':
+        # Reset retry counter on completion
+        retry_tracker.reset_count(user_prompt, current_action_id)
         if validate_state_transition(user_prompt, current_action_id, ActionState.COMPLETED):
             safe_set_state(user_prompt, current_action_id, ActionState.COMPLETED,"hook tracking lifecycle_hook_process_verifier_response")
             # Automatically request fallback after completion
@@ -289,19 +324,32 @@ def lifecycle_hook_process_verifier_response(user_prompt: str, json_obj: dict, u
             }
 
     elif status == 'pending':
-        if validate_state_transition(user_prompt, current_action_id, ActionState.PENDING):
-            safe_set_state(user_prompt, current_action_id, ActionState.PENDING,"hook tracking lifecycle_hook_process_verifier_response")
-            return {
-                'action': 'force_completion',
-                'message': f"Complete pending steps for action {current_action_id} and ask @StatusVerifier to verify completion"
-            }
+        # SAFETY NET: Check if pending count exceeded (prevents infinite retry loops)
+        if retry_tracker.increment_pending(user_prompt, current_action_id):
+            # Force transition to ERROR if pending too many times
+            logger.error(f"[SAFETY NET] Action {current_action_id} exceeded max pending retries - forcing ERROR state")
+            status = 'error'  # Override to error
+            json_obj['message'] = f"Action failed after {retry_tracker.MAX_PENDING_RETRIES} retry attempts. Original message: {json_obj.get('message', 'No details')}"
+            # Fall through to error handling below
 
-    elif status == 'error':
+        if status == 'pending':  # Still pending (not overridden)
+            if validate_state_transition(user_prompt, current_action_id, ActionState.PENDING):
+                safe_set_state(user_prompt, current_action_id, ActionState.PENDING,"hook tracking lifecycle_hook_process_verifier_response")
+                return {
+                    'action': 'force_completion',
+                    'message': f"Complete pending steps for action {current_action_id} and ask @StatusVerifier to verify completion"
+                }
+
+    if status == 'error':  # Separated to allow fall-through from pending override
+        # Reset retry counter on error (will start fresh if retried)
+        retry_tracker.reset_count(user_prompt, current_action_id)
         if validate_state_transition(user_prompt, current_action_id, ActionState.ERROR):
             safe_set_state(user_prompt, current_action_id, ActionState.ERROR,"hook tracking lifecycle_hook_process_verifier_response")
+            # FIX: Automatically request fallback for failed actions (like completed actions)
+            # This allows ERROR to progress toward TERMINATED instead of getting stuck
             return {
-                'action': 'force_retry',
-                'message': f"Error in action {current_action_id}: {json_obj.get('message', 'Unknown error')}. Please resolve and retry."
+                'action': 'force_fallback',
+                'message': f"Action {current_action_id} failed: {json_obj.get('message', 'Unknown error')}. Please provide fallback actions for future failures of this type, then we'll create the recipe and move forward."
             }
 
     return {'action': 'allow', 'message': None}
@@ -527,7 +575,7 @@ def lifecycle_hook_validate_final_agent_creation(user_prompt: str, user_tasks, p
 
     return {
         'action': 'allow',
-        'message': "✅ All validations passed - Agent creation ready"
+        'message': "[OK] All validations passed - Agent creation ready"
     }
 
 
@@ -542,13 +590,13 @@ def debug_action_flow(user_prompt: str, action_id: int):
 
     # Determine which of the 4 flows this matches
     if current_state == ActionState.TERMINATED:
-        logger.info(f"✅ Action {action_id}: COMPLETED one of the 4 flows")
+        logger.info(f"[OK] Action {action_id}: COMPLETED one of the 4 flows")
     elif current_state == ActionState.ERROR:
-        logger.info(f"🔄 Action {action_id}: In ERROR (Flow #2 or #3)")
+        logger.info(f"[PROCESSING] Action {action_id}: In ERROR (Flow #2 or #3)")
     elif current_state == ActionState.PENDING:
-        logger.info(f"🔄 Action {action_id}: In PENDING (Flow #3 or #4)")
+        logger.info(f"[PROCESSING] Action {action_id}: In PENDING (Flow #3 or #4)")
     else:
-        logger.info(f"🔄 Action {action_id}: In progress ({current_state.value})")
+        logger.info(f"[PROCESSING] Action {action_id}: In progress ({current_state.value})")
 
 
 # 6. ADD validation function for the 4 specific flows:
@@ -571,17 +619,17 @@ def validate_flow_pattern(user_prompt: str, action_id: int) -> str:
 def debug_lifecycle_status(user_prompt: str):
     """Debug function to show current lifecycle status"""
     states = action_states.get(user_prompt, {})
-    logger.info(f"\n🔍 Lifecycle Status for {user_prompt}:")
+    logger.info(f"\n[STATUS] Lifecycle Status for {user_prompt}:")
     logger.info("-" * 50)
 
     for action_id, state in states.items():
-        terminated = "✅ TERMINATED" if state == ActionState.TERMINATED else "🔄 IN PROGRESS"
+        terminated = "[OK] TERMINATED" if state == ActionState.TERMINATED else "[PROCESSING] IN PROGRESS"
         logger.info(f"Action {action_id}: {state.value} {terminated}")
 
 
 def initialize_deterministic_actions():
     """Initialize the state machine"""
-    logger.info("🎯 Deterministic action lifecycle initialized")
+    logger.info("[TARGET] Deterministic action lifecycle initialized")
     return True
 
 

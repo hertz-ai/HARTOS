@@ -21,11 +21,44 @@ from flask import current_app
 from helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup
 import helper as helper_fun
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
 from autogen.cache.in_memory_cache import InMemoryCache
 from json_repair import repair_json
 from crossbarhttp import Client
 client = Client('http://aws_rasa.hertzai.com:8088/publish')
+
+# Create thread pool executor for async Crossbar publishing
+crossbar_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='crossbar_publish')
+
+def publish_async(topic, message, timeout=2.0):
+    """
+    Publish to Crossbar in a background thread without blocking the main request.
+
+    Args:
+        topic: Crossbar topic to publish to
+        message: Message payload (dict or JSON string)
+        timeout: Maximum time to wait for publish (default: 2.0 seconds)
+    """
+    def _publish():
+        import socket
+        try:
+            # Set socket timeout to prevent long waits
+            original_timeout = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(timeout)
+
+            client.publish(topic, message)
+            current_app.logger.debug(f"Successfully published to {topic}")
+        except Exception as e:
+            current_app.logger.error(f"Error publishing to {topic}: {e}")
+        finally:
+            # Restore original timeout
+            if original_timeout is not None:
+                socket.setdefaulttimeout(original_timeout)
+
+    # Submit to executor without waiting for result
+    crossbar_executor.submit(_publish)
+
 # Add to your create_recipe.py after imports
 from lifecycle_hooks import (
     initialize_deterministic_actions,
@@ -628,11 +661,11 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     individual_json[user_prompt] = None
 
     try:
-        tool_logger.info("🔧 Trying to initialise...")
+        tool_logger.info("[INIT] Trying to initialise...")
 
         apply_autogen_fix_on_startup()
     except:
-        tool_logger.info("📋 Autogen JSON enhancement ready - will be applied when Flask starts")
+        tool_logger.info("[INFO] Autogen JSON enhancement ready - will be applied when Flask starts")
 
     custom_agents = []
     agents_object = {}
@@ -743,7 +776,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
             # Step 4: Save to persistent storage
             if helper_fun.save_agent_data_to_file(prompt_id, agent_data):
-                tool_logger.info(f"✅ Data persisted to file for prompt_id {prompt_id}")
+                tool_logger.info(f"[OK] Data persisted to file for prompt_id {prompt_id}")
             else:
                 tool_logger.warning(f"⚠️ Failed to persist data to file for prompt_id {prompt_id}")
             # Step 5: Verify storage was successful
@@ -1126,7 +1159,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
                 # Trust VLM agent's status determination
                 if vlm_status == 'success':
-                    return f"""✅ COMMAND EXECUTED SUCCESSFULLY
+                    return f"""[OK] COMMAND EXECUTED SUCCESSFULLY
                         
                             OS: {os_to_control}
                             Task: {instructions}
@@ -1157,7 +1190,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                             The {os_to_control} agent encountered an issue during execution. Review the context above for troubleshooting."""
 
                 elif vlm_status == 'completed':
-                    return f"""✅ COMMAND COMPLETED
+                    return f"""[OK] COMMAND COMPLETED
                         
                             OS: {os_to_control}
                             Task: {instructions}
@@ -1485,7 +1518,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                     "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
                         'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0},
                         'bottom_left': {'x': 0, 'y': 0}}}
-                client.publish(
+                publish_async(
                     f"com.hertzai.hevolve.chat.{user_id}", json.dumps(crossbar_message))
         except Exception as e:
             current_app.logger.error(f"Error publishing crossbar message: {e}")
@@ -1553,18 +1586,30 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         ]
     )
 
-    group_chat = autogen.GroupChat(
-        agents=all_agents,
-        messages=[],
-        max_round=30,
-        # select_speaker_message_template='''You manage a team that Completes a list of Actions provided by ChatInstructor Agent.
-        # The Agents available in the team are: Assistant, Helper, Executor, ChatInstructor, StatusVerifier & User''',
-        select_speaker_prompt_template=f"Read the above conversation, select the next person from [Assistant, Helper, Executor, ChatInstructor, StatusVerifier & User] & only return the role as agent. Return User only if the previous message demands it",
-        select_speaker_transform_messages=select_speaker_transforms,
-        speaker_selection_method=state_transition,  # using an LLM to decide
-        allow_repeat_speaker=False,  # Prevent same agent speaking twice
-        send_introductions=False
-    )
+    # Try to use select_speaker_transform_messages if supported (added in AutoGen 0.2.36+)
+    group_chat_kwargs = {
+        'agents': all_agents,
+        'messages': [],
+        'max_round': 30,
+        'select_speaker_prompt_template': f"Read the above conversation, select the next person from [Assistant, Helper, Executor, ChatInstructor, StatusVerifier & User] & only return the role as agent. Return User only if the previous message demands it",
+        'speaker_selection_method': state_transition,  # using an LLM to decide
+        'allow_repeat_speaker': False,  # Prevent same agent speaking twice
+        'send_introductions': False
+    }
+
+    # Check if GroupChat supports select_speaker_transform_messages parameter
+    try:
+        import inspect
+        sig = inspect.signature(autogen.GroupChat.__init__)
+        if 'select_speaker_transform_messages' in sig.parameters:
+            group_chat_kwargs['select_speaker_transform_messages'] = select_speaker_transforms
+            current_app.logger.info("Using select_speaker_transform_messages (AutoGen 0.2.36+)")
+        else:
+            current_app.logger.warning("select_speaker_transform_messages not supported in this AutoGen version, skipping")
+    except Exception as e:
+        current_app.logger.warning(f"Could not check AutoGen version compatibility: {e}")
+
+    group_chat = autogen.GroupChat(**group_chat_kwargs)
 
     manager = autogen.GroupChatManager(
         groupchat=group_chat,
@@ -1633,7 +1678,7 @@ def instantiate_status_verifier_agent(user_prompt):
             4. Action pending: {"status": "pending","action": "current action","action_id": 1/2/3...,"message": "what steps are pending message here"}
         Important Instructions:
             1. Strict Completion Criteria:
-                i. Only mark an action as "completed" if all steps of the action have been successfully executed. 
+                i. Only mark an action as "completed" if all steps of the action have been successfully executed.
                 ii. For pending or ongoing tasks, instruct the Assistant to complete them.
             2. Ensure Action Accuracy:
                 i. Verify that the last action was performed correctly based on history as per instructions.
@@ -1641,6 +1686,23 @@ def instantiate_status_verifier_agent(user_prompt):
             3. Maintain JSON Consistency:
                 i. Always follow the exact JSON structure in your responses.
                 ii. Do not perform actions yourself - only report status.
+            4. CRITICAL - Error Detection Rules (MUST FOLLOW):
+                i. Report "error" (not "pending") when you see these PERMANENT FAILURES in tool responses or conversation history:
+                    - HTTP 403 Forbidden (API access denied - requires project/key setup)
+                    - HTTP 404 Not Found (endpoint does not exist)
+                    - HTTP 500 Internal Server Error (server-side failure)
+                    - HTTP 401 Unauthorized (missing/invalid credentials)
+                    - Connection timeout errors (ConnectTimeout, ReadTimeout after retry)
+                    - Permission denied errors
+                    - Tool execution errors with "status": "error" in response
+                    - Any error that has occurred 2+ times with same failure
+                ii. Only report "pending" for TRULY RETRYABLE situations:
+                    - First attempt at an action (not started yet)
+                    - Waiting for user input/response
+                    - Waiting for external system (first time only)
+                    - Transient rate limits (429 with retry-after)
+                iii. When in doubt between "error" and "pending": If the same failure happened multiple times, always report "error"
+                iv. If you see tool responses containing error statuses, connection failures, or permission denials, you MUST report status as "error" not "pending"
             Maintain the exact JSON structure in all responses.
 
         """ + f"\nExtra Information: below are the list of actions the chat_manager will give you, keep this in mind but don't use this directly only use this if there is any update in any action or you want to insert/delete the actions & return the entire array as entire_actions\n{user_tasks[user_prompt].actions}",
@@ -2094,7 +2156,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             elif video_link.status_code != 200:
                 tool_logger.error(f"Error response: {video_link.text}")
             else:
-                tool_logger.info("✅ Request successful!")
+                tool_logger.info("[OK] Request successful!")
         except Exception as e:
             tool_logger.error(f"Request failed: {e}")
 
@@ -2555,8 +2617,14 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         if lifecycle_check['action'] != 'allow':
                             current_app.logger.error(f"lifecycle_hook_enforce_complete_lifecycle {lifecycle_check['message']}")
                             message = lifecycle_check['message']
-                            result = chat_instructor.initiate_chat(recipient=manager, message=message,
-                                                                   clear_history=False)
+
+                            # Only initiate chat if there's an actual message (not None)
+                            # None would trigger AutoGen to ask for interactive input, causing EOFError
+                            if message:
+                                result = chat_instructor.initiate_chat(recipient=manager, message=message,
+                                                                       clear_history=False)
+                            else:
+                                current_app.logger.info(f"Lifecycle check action '{lifecycle_check['action']}' with no message - continuing")
                             continue
 
                         flow, message, text = after_all_actions_terminated(assistant_agent, chat_instructor, group_chat,
@@ -2954,7 +3022,7 @@ def publish_to_crossbar_new_action_start(message, user_id):
                         "page_image_url": "", "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
             'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0},
             'bottom_left': {'x': 0, 'y': 0}}}
-    result = client.publish(
+    publish_async(
         f"com.hertzai.hevolve.chat.{user_id}", json.dumps(crossbar_message))
 
 
@@ -3119,7 +3187,7 @@ def detect_and_resume_progress(prompt_id, user_prompt):
     latest_flow = 0
     latest_action = 1
 
-    current_app.logger.info(f"🔍 Scanning for existing progress for prompt_id={prompt_id}")
+    current_app.logger.info(f"[SCAN] Scanning for existing progress for prompt_id={prompt_id}")
 
     # Scan each flow for existing files
     for flow_idx in range(total_flows):
@@ -3136,9 +3204,9 @@ def detect_and_resume_progress(prompt_id, user_prompt):
             action_file = f'prompts/{prompt_id}_{flow_idx}_{action_id}.json'
             if os.path.exists(action_file):
                 completed_actions.append(action_id)
-                current_app.logger.info(f"✅ Found: {action_file}")
+                current_app.logger.info(f"[OK] Found: {action_file}")
 
-        # ✅ FIX: Flow is complete ONLY if ALL actions have JSON files AND recipe exists
+        # [OK] FIX: Flow is complete ONLY if ALL actions have JSON files AND recipe exists
         flow_complete = (len(completed_actions) == total_actions_in_flow) and flow_recipe_exists
 
         flow_progress[flow_idx] = {
@@ -3148,7 +3216,7 @@ def detect_and_resume_progress(prompt_id, user_prompt):
             'last_completed_action': max(completed_actions) if completed_actions else 0
         }
 
-        # ✅ FIX: Update latest flow and action based on actual completion
+        # [OK] FIX: Update latest flow and action based on actual completion
         if completed_actions:
             latest_flow = flow_idx
             if flow_complete:
@@ -3160,13 +3228,13 @@ def detect_and_resume_progress(prompt_id, user_prompt):
                 else:
                     latest_action = total_actions_in_flow + 1  # Beyond last action
             else:
-                # ✅ FIX: Next action should be last_completed + 1, not some random number
+                # [OK] FIX: Next action should be last_completed + 1, not some random number
                 latest_action = max(completed_actions) + 1
                 # Ensure we don't exceed flow actions
                 if latest_action > total_actions_in_flow:
                     latest_action = total_actions_in_flow + 1
 
-    current_app.logger.info(f"📊 Progress Analysis:")
+    current_app.logger.info(f"[PROGRESS] Progress Analysis:")
     current_app.logger.info(f"   - Latest Flow: {latest_flow}")
     current_app.logger.info(f"   - Latest Action: {latest_action}")
     current_app.logger.info(f"   - Completed Flows: {completed_flows}")
@@ -3187,7 +3255,7 @@ def set_states_from_progress(user_prompt, prompt_id, current_flow, flow_progress
         if flow_idx < current_flow:
             # Previous flows - all actions should be TERMINATED
             for action_id in range(1, progress['total_actions'] + 1):
-                # ✅ FIX: Use force_state_through_valid_path to handle transitions properly
+                # [OK] FIX: Use force_state_through_valid_path to handle transitions properly
                 force_state_through_valid_path(user_prompt, action_id, ActionState.TERMINATED,
                                                "resumed - previous flow")
 
@@ -3195,7 +3263,7 @@ def set_states_from_progress(user_prompt, prompt_id, current_flow, flow_progress
             # Current flow - set states based on completion
             for action_id in range(1, progress['total_actions'] + 1):
                 if action_id in progress['completed_actions']:
-                    # ✅ FIX: Action has JSON file - use proper state path to TERMINATED
+                    # [OK] FIX: Action has JSON file - use proper state path to TERMINATED
                     force_state_through_valid_path(user_prompt, action_id, ActionState.TERMINATED,
                                                    "resumed - action complete")
                 else:
@@ -3227,7 +3295,7 @@ def safe_action_boundary_check(user_prompt, prompt_id, text, user_id):
 
     current_flow_actions = get_total_actions_length_for_flow(config, current_flow)
 
-    # ✅ FIX: Handle action exceeding current flow
+    # [OK] FIX: Handle action exceeding current flow
     if current_action_id > current_flow_actions:
         current_app.logger.info(
             f"Action {current_action_id} exceeds flow {current_flow} actions ({current_flow_actions})")
@@ -3242,7 +3310,7 @@ def safe_action_boundary_check(user_prompt, prompt_id, text, user_id):
                 break
 
         if not all_actions_complete:
-            # ✅ FIX: Find the first incomplete action and resume from there
+            # [OK] FIX: Find the first incomplete action and resume from there
             for action_id in range(1, current_flow_actions + 1):
                 action_file = f'prompts/{prompt_id}_{current_flow}_{action_id}.json'
                 if not os.path.exists(action_file):
@@ -3301,7 +3369,7 @@ def initialize_with_resume(prompt_id, user_prompt, user_id):
     recipe_for_persona[user_prompt] = current_flow
     total_persona_actions[user_prompt] = len(config['flows'])
 
-    # ✅ FIX: Handle case where we're beyond current flow actions
+    # [OK] FIX: Handle case where we're beyond current flow actions
     if current_flow < len(config['flows']):
         current_flow_actions = config['flows'][current_flow]['actions']
         user_tasks[user_prompt] = Action(current_flow_actions)
@@ -3321,7 +3389,7 @@ def initialize_with_resume(prompt_id, user_prompt, user_id):
     # Load existing metadata
     load_existing_metadata(prompt_id, user_prompt, flow_progress)
 
-    current_app.logger.info(f"🎯 RESUME SUMMARY:")
+    current_app.logger.info(f"[RESUME] RESUME SUMMARY:")
     current_app.logger.info(f"   - Resumed at Flow {current_flow}, Action {current_action}")
     current_app.logger.info(f"   - Scheduler Check: {scheduler_check[user_prompt]}")
     current_app.logger.info(f"   - Completed Flows: {len(completed_flows)}/{len(config['flows'])}")
@@ -3366,7 +3434,7 @@ def recipe(user_id, text, prompt_id, file_id, request_id):
     request_id_list[user_prompt] = request_id
     current_app.logger.info('--' * 100)
 
-    # ✅ NEW: Initialize persistent storage for this prompt_id
+    # [OK] NEW: Initialize persistent storage for this prompt_id
     if prompt_id not in agent_data:
         current_app.logger.info(f"Initializing persistent storage for prompt_id {prompt_id}")
 
@@ -3384,7 +3452,7 @@ def recipe(user_id, text, prompt_id, file_id, request_id):
             current_app.logger.info("🎉 All flows already completed - Agent already created")
             return 'Agent Already Created Successfully'
 
-        current_app.logger.info(f"🔄 Resuming from Flow {current_flow}, Action {current_action}")
+        current_app.logger.info(f"[RESUMING] Resuming from Flow {current_flow}, Action {current_action}")
     else:
         current_app.logger.info(f"♻️ Using existing session for {user_prompt}")
 

@@ -1,6 +1,18 @@
+# Fix Windows encoding for non-ASCII characters (Telugu, emojis, etc.)
+import sys
+import io
+if sys.platform == 'win32':
+    # Force UTF-8 encoding for stdout/stderr to prevent crashes with non-ASCII characters
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
 from bs4 import BeautifulSoup
 from enum import Enum
-from langchain import OpenAI, LLMChain, PromptTemplate
+
+# Use langchain-classic for pydantic v2 compatibility
+from langchain.llms import OpenAI
+from langchain.chains import LLMChain
+from langchain.prompts import PromptTemplate
 from langchain.agents import (
     ZeroShotAgent, Tool, AgentExecutor, ConversationalAgent,
     ConversationalChatAgent, LLMSingleActionAgent, AgentOutputParser,
@@ -14,20 +26,29 @@ from langchain.prompts import (
     SystemMessagePromptTemplate,
     HumanMessagePromptTemplate
 )
-from langchain.chains import LLMMathChain, OpenAPIEndpointChain
+from langchain.chains import LLMMathChain
 from langchain.chains.conversation.memory import ConversationSummaryMemory, ConversationBufferWindowMemory
-from langchain.chains.openai_functions.openapi import get_openapi_chain
+
+# ChatOpenAI - use langchain
 from langchain.chat_models import ChatOpenAI
-from langchain_groq import ChatGroq
-# from langchain.experimental.plan_and_execute import PlanAndExecute, load_agent_executor, load_chat_planner
-from langchain.llms import OpenAI, OpenAIChat
+
+# ChatGroq - optional import (version compatibility issues)
+try:
+    from langchain_groq import ChatGroq
+except (ImportError, ModuleNotFoundError):
+    ChatGroq = None
+
+# LLM base class
 from langchain.llms.base import LLM
 from langchain.memory import ConversationBufferMemory, ReadOnlySharedMemory, ZepMemory
-from langchain.requests import Requests
 from langchain.schema import AgentAction, AgentFinish, OutputParserException, HumanMessage, AIMessage, SystemMessage
 from langchain.tools import OpenAPISpec, APIOperation, StructuredTool
-# from langchain.tools.python.tool import PythonREPLTool
 from langchain.utilities import GoogleSearchAPIWrapper
+try:
+    from langchain.requests import Requests
+except (ImportError, AttributeError):
+    # Requests might not be in langchain
+    Requests = None
 from flask import Flask, jsonify, request
 import json
 import os
@@ -37,43 +58,98 @@ import requests
 import pytz
 from datetime import datetime, timezone
 from typing import List, Union, Optional, Mapping, Any, Dict
-from langchain.agents.conversational_chat.output_parser import ConvoOutputParser
+
+# Conversational chat imports from langchain-classic
+try:
+    from langchain.agents.conversational_chat.output_parser import ConvoOutputParser
+    from langchain.agents.conversational_chat.prompt import FORMAT_INSTRUCTIONS
+    from langchain.output_parsers.json import parse_json_markdown
+except (ImportError, AttributeError) as e:
+    # These might not exist in langchain-classic
+    ConvoOutputParser = None
+    FORMAT_INSTRUCTIONS = None
+    parse_json_markdown = None
+
+# Tools imports - try langchain_community first
+try:
+    from langchain_community.tools import RequestsGetTool
+except ImportError:
+    try:
+        from langchain.tools.requests.tool import RequestsGetTool
+    except (ImportError, AttributeError):
+        RequestsGetTool = None
+
+try:
+    from langchain_community.utilities import TextRequestsWrapper
+except ImportError:
+    try:
+        from langchain.utilities.requests import TextRequestsWrapper
+    except (ImportError, AttributeError):
+        TextRequestsWrapper = None
+
 import time
 import tiktoken
 from pytz import timezone
 from datetime import datetime, timedelta
 from waitress import serve
 from logging.handlers import RotatingFileHandler
-from typing import Union
-from langchain.agents import AgentOutputParser
-from langchain.agents.conversational_chat.prompt import FORMAT_INSTRUCTIONS
-from langchain.output_parsers.json import parse_json_markdown
-from langchain.schema import AgentAction, AgentFinish, OutputParserException
-from langchain.tools.requests.tool import RequestsGetTool, TextRequestsWrapper
-from pydantic import BaseModel, Field, root_validator
+
+# Pydantic v2 imports (we have pydantic 2.12.5)
+try:
+    from pydantic import BaseModel, Field, field_validator as root_validator
+except ImportError:
+    from pydantic import BaseModel, Field, root_validator
 from threadlocal import thread_local_data
 import crossbarhttp
 from PIL import Image
 import numpy as np
-from langchain.retrievers.document_compressors import cohere_rerank
+# Cohere rerank - make optional to avoid pydantic v2 incompatibility with old langchain
+try:
+    from langchain_community.retrievers.document_compressors import cohere_rerank
+except (ImportError, ModuleNotFoundError):
+    cohere_rerank = None  # Not available
 import asyncio
 import aiohttp
 import sys
 import redis
 import pickle
 from threading import Thread
+from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
-import autogen
+try:
+    import autogen
+except ImportError:
+    autogen = None  # Optional dependency
 from typing import Dict, Tuple
 load_dotenv()
 
 #autogen requirements
 
-from create_recipe import recipe, time_based_execution as time_execution, visual_execution
-from reuse_recipe import chat_agent, crossbar_multiagent, time_based_execution, visual_based_execution
-from autobahn.asyncio.component import Component, run
+try:
+    from create_recipe import recipe, time_based_execution as time_execution, visual_execution
+    from reuse_recipe import chat_agent, crossbar_multiagent, time_based_execution, visual_based_execution
+except ImportError as e:
+    print(f"Could not import recipe modules: {e}")
+    recipe = None
+    time_execution = None
+    visual_execution = None
+    chat_agent = None
+    crossbar_multiagent = None
+    time_based_execution = None
+    visual_based_execution = None
+
+try:
+    from autobahn.asyncio.component import Component, run
+except ImportError:
+    Component = None
+    run = None
+
 import threading
-from helper import retrieve_json
+
+try:
+    from helper import retrieve_json
+except ImportError:
+    retrieve_json = None
 # os.environ['LANGCHAIN_TRACING_V2'] = 'true'
 # os.environ['LANGCHAIN_ENDPOINT'] = 'https://api.smith.langchain.com'
 # os.environ['LANGCHAIN_API_KEY'] = os.getenv("LANGCHAIN_API_KEY")
@@ -115,9 +191,13 @@ app.logger.propagate = False
 app.logger.info('Logger initialized')
 
 # openAPI spec
-spec = OpenAPISpec.from_file(
-    "./openapi.yaml"
-)
+try:
+    spec = OpenAPISpec.from_file(
+        "./openapi.yaml"
+    )
+except Exception as e:
+    app.logger.warning(f"Could not load OpenAPI spec: {e}")
+    spec = None
 
 
 with open("config.json", 'r') as f:
@@ -170,7 +250,11 @@ class TaskNames(Enum):
 
 
 # google search API
-search = GoogleSearchAPIWrapper(k=4)
+try:
+    search = GoogleSearchAPIWrapper(k=4)
+except Exception as e:
+    app.logger.warning(f"Could not initialize Google Search: {e}")
+    search = None
 
 # constants
 # llm = ChatOpenAI(model_name="gpt-3.5-turbo-16k")
@@ -189,10 +273,48 @@ llm_math = LLMMathChain(llm=ChatOpenAI(model_name="gpt-3.5-turbo"))
 
 # app.logger.info(llm.invoke("hi how are you?"))
 
-chain = get_openapi_chain(spec)
+if spec is not None:
+    try:
+        chain = get_openapi_chain(spec)
+    except Exception as e:
+        app.logger.warning(f"Could not create OpenAPI chain: {e}")
+        chain = None
+else:
+    chain = None
 
 
 client = crossbarhttp.Client('http://aws_rasa.hertzai.com:8088/publish')
+
+# Create thread pool executor for async Crossbar publishing
+crossbar_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='crossbar_publish')
+
+def publish_async(topic, message, timeout=2.0):
+    """
+    Publish to Crossbar in a background thread without blocking the main request.
+
+    Args:
+        topic: Crossbar topic to publish to
+        message: Message payload (dict)
+        timeout: Maximum time to wait for publish (default: 2.0 seconds)
+    """
+    def _publish():
+        import socket
+        try:
+            # Set socket timeout to prevent long waits
+            original_timeout = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(timeout)
+
+            client.publish(topic, message)
+            app.logger.debug(f"Successfully published to {topic}")
+        except Exception as e:
+            app.logger.error(f"Error publishing to {topic}: {e}")
+        finally:
+            # Restore original timeout
+            if original_timeout is not None:
+                socket.setdefaulttimeout(original_timeout)
+
+    # Submit to executor without waiting for result
+    crossbar_executor.submit(_publish)
 
 
 # create prompt
@@ -278,7 +400,11 @@ def get_tools(req_tool, is_first: bool = False):
                 func=llm_math.run,
                 description='Useful for when you need to answer questions about math.'
             ),
-            Tool(
+        ]
+
+        # Only add OpenAPI tool if chain is initialized
+        if chain is not None:
+            tool.append(Tool(
                 name="OpenAPI_Specification",
                 func=chain.run,
                 description="Use this feature only when the user's request specifically pertains to one of the following scenarios:\
@@ -287,9 +413,9 @@ def get_tools(req_tool, is_first: bool = False):
                 Query Available Books: When the user is inquiring about available books, this feature should be used to locate and provide information about the required texts.\
                 Any CRUD operation which is not a READ or anything related to curriculum should not use this tool,  It is vital to ensure that the intent precisely falls within one of the above  categories before engaging this functionality.\
                 Don't use this to create a custom curriculum for user",
+            ))
 
-
-            ),
+        tool += [
             Tool(
                 name="FULL_HISTORY",
                 func=parsing_string,
@@ -363,7 +489,6 @@ def get_tools(req_tool, is_first: bool = False):
         tools_func = {
             'google_search': top5_results,
             'Calculator': llm_math.run,
-            'OpenAPI_Specificationd': chain.run,
             'FULL_HISTORY': parsing_string,
             'Text to image': parse_text_to_image,
             'Image_Inference_Tool': parse_image_to_text,
@@ -371,6 +496,10 @@ def get_tools(req_tool, is_first: bool = False):
             'User_details_tool': parse_user_id,
             'Visual_Context_Camera': parse_visual_context
         }
+
+        # Only add OpenAPI_Specification to tools_func if chain is initialized
+        if chain is not None:
+            tools_func['OpenAPI_Specification'] = chain.run
         if req_tool == "google_search":
             req_tool = "Google Search Snippets"
         if req_tool is not None and req_tool in tools_dict.values():
@@ -399,11 +528,17 @@ def get_tools(req_tool, is_first: bool = False):
                 func=llm_math.run,
                 description='Useful for when you need to answer questions about math.'
             ),
-            Tool(
+        ]
+
+        # Only add OpenAPI tool if chain is initialized
+        if chain is not None:
+            tool.append(Tool(
                 name="OpenAPI_Specification",
                 func=chain.run,
                 description="Use the specialized feature for image generation, student information retrieval, and querying available books, while avoiding its use for non-READ CRUD operations or custom curriculum creation.",
-            ),
+            ))
+
+        tool += [
             Tool(
                 name="FULL_HISTORY",
                 func=parsing_string,
@@ -573,10 +708,10 @@ class CustomGPT(LLM):
                     response = requests.post(
                         GPT_API,
                         json={
-                            "model": "gpt-4.1-mini",
-                            "data": [{"role": "user", "content": prompt}],
-                            "max_token": 1000,
-                            "request_id": str(thread_local_data.get_request_id())
+                            "model": "llama",
+                            "messages": [{"role": "user", "content": prompt}],
+                            "max_tokens": 200,  # Reduced from 1000 for faster responses
+                            "temperature": 0.7
                         })
                     app.logger.info(
                         f"gpt 3.5 response format is {response.json()}")
@@ -592,10 +727,10 @@ class CustomGPT(LLM):
                     response = requests.post(
                         GPT_API,
                         json={
-                            "model": "gpt-4.1-mini",
-                            "data": [{"role": "user", "content": prompt}],
-                            "max_token": 1000,
-                            "request_id": str(thread_local_data.get_request_id())
+                            "model": "llama",
+                            "messages": [{"role": "user", "content": prompt}],
+                            "max_tokens": 200,  # Reduced from 1000 for faster responses
+                            "temperature": 0.7
                         })
                     app.logger.info(
                         f"gpt 3.5 response format is {response.json()}")
@@ -637,10 +772,9 @@ class CustomGPT(LLM):
                 response = requests.post(
                     GPT_API,
                     json={
-                        "model": "gpt-4.1-mini",
-                        "data": [{"role": "user", "content": prompt}],
-                        "max_token": 1000,
-                        "request_id": str(thread_local_data.get_request_id())
+                        "model": "llama",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": 1000
                     })
                 app.logger.info(
                     f"gpt 3.5 response format is {response.json()}")
@@ -660,10 +794,9 @@ class CustomGPT(LLM):
                     response = requests.post(
                         GPT_API,
                         json={
-                            "model": "gpt-4.1-mini",
-                            "data": [{"role": "user", "content": prompt}],
-                            "max_token": 1000,
-                            "request_id": str(thread_local_data.get_request_id())
+                            "model": "llama",
+                            "messages": [{"role": "user", "content": prompt}],
+                            "max_tokens": 1000
                         }
                     )
                     app.logger.info(
@@ -680,10 +813,9 @@ class CustomGPT(LLM):
                         response = requests.post(
                             GPT_API,
                             json={
-                                "model": "gpt-4.1-mini",
-                                "data": [{"role": "user", "content": prompt}],
-                                "max_token": 1000,
-                                "request_id": str(thread_local_data.get_request_id())
+                                "model": "llama",
+                                "messages": [{"role": "user", "content": prompt}],
+                                "max_tokens": 1000
                             }
                         )
                         app.logger.info(
@@ -717,10 +849,9 @@ class CustomGPT(LLM):
                 response = requests.post(
                     GPT_API,
                     json={
-                        "model": "gpt-4.1-mini",
-                        "data": [{"role": "user", "content": prompt}],
-                        "max_token": 1000,
-                        "request_id": str(thread_local_data.get_request_id())
+                        "model": "llama",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": 1000
                     }
                 )
                 app.logger.info(f"gpt 4 response format is {response.json()}")
@@ -768,7 +899,8 @@ class CustomGPT(LLM):
             # return response_from_groq.content.replace('\n', ' ').replace('\t', '')
         if checker == 1:
             try:
-                text = str(response.json()["text"])
+                # Extract text from OpenAI-compatible response format
+                text = str(response.json()["choices"][0]["message"]["content"])
                 try:
                     text = text.strip('`').replace('json\n', '').strip()
                 except:
@@ -789,10 +921,11 @@ class CustomGPT(LLM):
             end_time = time.time()
             elapsed_time = end_time - start_time
             app.logger.info(f"time taken for this call is {elapsed_time}")
+            response_text = response.json()["choices"][0]["message"]["content"]
             num_tokens = len(encoding.encode(
-                response.json()["text"].replace('\n', ' ').replace('\t', '')))
+                response_text.replace('\n', ' ').replace('\t', '')))
             thread_local_data.update_res_token_count(num_tokens)
-            return response.json()["text"].replace('\n', ' ').replace('\t', '')
+            return response_text.replace('\n', ' ').replace('\t', '')
 
     @property
     def _identifying_params(self) -> Mapping[str, Any]:
@@ -820,9 +953,16 @@ class CustomAgentExecutor(AgentExecutor):
         if self.memory is not None:
             app.logger.info(
                 f"memory object is not none and metadata is {metadata}")
-            self.memory.save_context(inputs, outputs, metadata)
-        app.logger.info(
-            f"After: memory object is not none and metadata is {metadata}")
+            try:
+                self.memory.save_context(inputs, outputs, metadata)
+                app.logger.info(
+                    f"After: memory saved successfully with metadata {metadata}")
+            except Exception as e:
+                app.logger.error(f"Failed to save memory (Zep server may be down): {e}")
+                # Continue without crashing - memory save is not critical
+        else:
+            app.logger.info(
+                f"Memory object is None, skipping save")
         if return_only_outputs:
             return outputs
         else:
@@ -857,20 +997,24 @@ class CustomAgentExecutor(AgentExecutor):
                 )
             inputs = {list(_input_keys)[0]: inputs}
         if self.memory is not None:
+            try:
+                external_context = self.memory.load_memory_variables(inputs)
 
-            external_context = self.memory.load_memory_variables(inputs)
+                inputs = dict(inputs, **external_context)
+                filtered_messages = []
+                for msg in inputs['chat_history']:
+                    try:
+                        if msg.additional_kwargs['metadata']['prompt_id'] == thread_local_data.get_prompt_id():
+                            # If it does, append the message content to the filtered_messages list
+                            filtered_messages.append(msg)
+                    except:
+                        pass
 
-            inputs = dict(inputs, **external_context)
-            filtered_messages = []
-            for msg in inputs['chat_history']:
-                try:
-                    if msg.additional_kwargs['metadata']['prompt_id'] == thread_local_data.get_prompt_id():
-                        # If it does, append the message content to the filtered_messages list
-                        filtered_messages.append(msg)
-                except:
-                    pass
-
-            inputs['chat_history'] = filtered_messages[-8:]
+                inputs['chat_history'] = filtered_messages[-8:]
+            except Exception as e:
+                # Handle empty Zep session or API errors gracefully
+                app.logger.warning(f"Could not load memory from Zep (likely empty session): {e}")
+                inputs['chat_history'] = []
 
             # time.sleep(4)
         self._validate_inputs(inputs)
@@ -898,6 +1042,10 @@ def get_action_user_details(user_id):
     '''
         This function help to extract action that user have perfomed till time
     '''
+    # Initialize default values
+    user_details = "No user details available."
+    actions = "user has not performed any actions yet."
+
     unwanted_actions = ['Topic Cofirmation', 'Langchain', 'Assessment Ended', 'Casual Conversation', 'Topic confirmation',
                         'Topic not found', 'Topic Confirmation', 'Topic Listing', 'Probe', 'Question Answering', 'Fallback']
     action_url = f"{ACTION_API}?user_id={user_id}"
@@ -910,10 +1058,18 @@ def get_action_user_details(user_id):
     payload = {}
     headers = {}
 
-    response = requests.request(
-        "GET", action_url, headers=headers, data=payload)
+    try:
+        response = requests.request(
+            "GET", action_url, headers=headers, data=payload, timeout=5.0)
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+        app.logger.error(f"Failed to get actions from {action_url}: {e}")
+        post_dict = {'user_id': user_id, 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.GET_ACTION_USER_DETAILS.value, 'uid': thread_local_data.get_request_id(
+        ), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Connection timeout/error at get action api: {e}'}
+        publish_async('com.hertzai.longrunning.log', post_dict)
+        # Continue with defaults instead of crashing
+        response = None
 
-    if response.status_code == 200:
+    if response and response.status_code == 200:
 
         data = response.json()
 
@@ -990,11 +1146,7 @@ def get_action_user_details(user_id):
     else:
         post_dict = {'user_id': user_id, 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.GET_ACTION_USER_DETAILS.value, 'uid': thread_local_data.get_request_id(
         ), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': 'Exception happend at get action api end'}
-        try:
-            client.publish('com.hertzai.longrunning.log', post_dict)
-        except Exception as e:
-            logging.error(
-                "Error while publish at com.hertzai.longrunning.log topic")
+        publish_async('com.hertzai.longrunning.log', post_dict)
 
     url = STUDENT_API
     payload = json.dumps({
@@ -1003,7 +1155,16 @@ def get_action_user_details(user_id):
     headers = {
         'Content-Type': 'application/json'
     }
-    response = requests.request("POST", url, headers=headers, data=payload)
+
+    try:
+        response = requests.request("POST", url, headers=headers, data=payload, timeout=5.0)
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+        app.logger.error(f"Failed to get user details from {url}: {e}")
+        post_dict = {'user_id': user_id, 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.GET_ACTION_USER_DETAILS.value, 'uid': thread_local_data.get_request_id(
+        ), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Connection timeout/error at get user detail api: {e}'}
+        publish_async('com.hertzai.longrunning.log', post_dict)
+        return user_details, actions  # Return defaults
+
     if response.status_code == 200:
         user_data = response.json()
 
@@ -1013,11 +1174,7 @@ def get_action_user_details(user_id):
     else:
         post_dict = {'user_id': user_id, 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.GET_ACTION_USER_DETAILS.value, 'uid': thread_local_data.get_request_id(
         ), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': 'Exception happend at get user detail api end'}
-        try:
-            client.publish('com.hertzai.longrunning.log', post_dict)
-        except Exception as e:
-            logging.error(
-                "Error while publish at com.hertzai.longrunning.log topic")
+        publish_async('com.hertzai.longrunning.log', post_dict)
     return user_details, actions
 
 
@@ -1032,6 +1189,8 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
     '''
 
     start_time = time.time()
+    messages = []  # Initialize to prevent UnboundLocalError
+
     memory = ZepMemory(
         session_id=session_id,
         url=ZEP_API_URL,
@@ -1054,11 +1213,8 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
                     f"Error while data search in zep response: {e}")
             post_dict = {'user_id': '', 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.GET_TIME_BASED_HISTORY.value, 'uid': thread_local_data.get_request_id(
             ), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': 'Exception happend at zep api end memory object found none'}
-            try:
-                client.publish('com.hertzai.longrunning.log', post_dict)
-            except Exception as e:
-                app.logger.error(
-                    "Error while publish at com.hertzai.longrunning.log topic")
+            publish_async('com.hertzai.longrunning.log', post_dict)
+            messages = []  # Set empty list if search fails
         try:
             extracted_metadata = [message.message['metadata']
                                   for message in messages]
@@ -1095,14 +1251,12 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
         app.logger.info(f"Exception {e}")
         try:
             messages = memory.chat_memory.search(prompt)
-        except:
+        except Exception as search_error:
+            app.logger.error(f"Fallback search also failed: {search_error}")
             post_dict = {'user_id': '', 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.GET_TIME_BASED_HISTORY.value, 'uid': thread_local_data.get_request_id(
             ), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': 'Exception happend at zep api end memory object found none'}
-            try:
-                client.publish('com.hertzai.longrunning.log', post_dict)
-            except Exception as e:
-                logging.error(
-                    "Error while publish at com.hertzai.longrunning.log topic")
+            publish_async('com.hertzai.longrunning.log', post_dict)
+            messages = []  # Set empty list if fallback search also fails
 
         # app.logger.info(f"final messages in except-->{messages}")
         try:
@@ -1115,8 +1269,8 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
             app.logger.info(f"Error while getting req ids {e}")
         end_time = time.time()
         elapsed_time = end_time - start_time
-        app.logger.info("time taken for zep is {elapsed_time}")
-        return json.dumps({'res': [message.message['content'] for message in messages]})
+        app.logger.info(f"time taken for zep is {elapsed_time}")
+        return json.dumps({'res': [message.message['content'] for message in messages] if messages else []})
 
 
 def parsing_string(string):
@@ -1151,11 +1305,7 @@ def parse_character_animation(string):
     try:
         post_dict = {'user_id': '', 'task_type': 'async', 'status': TaskStatus.EXECUTING.value, 'task_name': TaskNames.ANIMATE_CHARACTER.value, 'uid': thread_local_data.get_request_id(
         ), 'task_id': f"{TaskNames.ANIMATE_CHARACTER.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id()}
-        try:
-            client.publish('com.hertzai.longrunning.log', post_dict)
-        except Exception as e:
-            logging.error(
-                "Error while publish at com.hertzai.longrunning.log topic")
+        publish_async('com.hertzai.longrunning.log', post_dict)
         prompt = string
         student_id_url = STUDENT_API
 
@@ -1203,22 +1353,14 @@ def parse_character_animation(string):
         else:
             post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.ANIMATE_CHARACTER.value, 'uid': thread_local_data.get_request_id(
             ), 'task_id': f"{TaskNames.ANIMATE_CHARACTER.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at dreamooth api end for re {thread_local_data.get_request_id()}'}
-            try:
-                client.publish('com.hertzai.longrunning.log', post_dict)
-            except Exception as e:
-                logging.error(
-                    "Error while publish at com.hertzai.longrunning.log topic")
+            publish_async('com.hertzai.longrunning.log', post_dict)
 
     except Exception as e:
         # logging.info(f"exception {e}")
         time.sleep(30)
         post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.TIMEOUT.value, 'task_name': TaskNames.ANIMATE_CHARACTER.value, 'uid': thread_local_data.get_request_id(
         ), 'task_id': f"{TaskNames.ANIMATE_CHARACTER.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at dreamooth api end for req_id {thread_local_data.get_request_id()} timed out'}
-        try:
-            client.publish('com.hertzai.longrunning.log', post_dict)
-        except Exception as e:
-            logging.error(
-                "Error while publish at com.hertzai.longrunning.log topic")
+        publish_async('com.hertzai.longrunning.log', post_dict)
         return "something went wrong"
 
 
@@ -1230,11 +1372,7 @@ def parse_text_to_image(inp):
 
         post_dict = {'user_id': '', 'task_type': 'async', 'status': TaskStatus.EXECUTING.value, 'task_name': TaskNames.STABLE_DIFF.value, 'uid': thread_local_data.get_request_id(
         ), 'task_id': f"{TaskNames.STABLE_DIFF.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id()}
-        try:
-            client.publish('com.hertzai.longrunning.log', post_dict)
-        except Exception as e:
-            logging.error(
-                "Error while publish at com.hertzai.longrunning.log topic")
+        publish_async('com.hertzai.longrunning.log', post_dict)
 
         url = f'{STABLE_DIFF_API}?prompt={inp}'
         payload = {}
@@ -1247,19 +1385,11 @@ def parse_text_to_image(inp):
         else:
             post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.STABLE_DIFF.value, 'uid': thread_local_data.get_request_id(
             ), 'task_id': f"{TaskNames.STABLE_DIFF.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at stable diff for req_id: {thread_local_data.get_request_id()}'}
-            try:
-                client.publish('com.hertzai.longrunning.log', post_dict)
-            except Exception as e:
-                logging.error(
-                    "Error while publish at com.hertzai.longrunning.log topic")
+            publish_async('com.hertzai.longrunning.log', post_dict)
     except Exception as e:
         post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.TIMEOUT.value, 'task_name': TaskNames.ANIMATE_CHARACTER.value, 'uid': thread_local_data.get_request_id(
         ), 'task_id': f"{TaskNames.ANIMATE_CHARACTER.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at stable diff for req_id: {thread_local_data.get_request_id()} timed out'}
-        try:
-            client.publish('com.hertzai.longrunning.log', post_dict)
-        except Exception as e:
-            logging.error(
-                "Error while publish at com.hertzai.longrunning.log topic")
+        publish_async('com.hertzai.longrunning.log', post_dict)
         return f"{e} Not able to generating image at this moment please try later"
 
 
@@ -1271,11 +1401,7 @@ def parse_image_to_text(inp):
     try:
         post_dict = {'user_id': '', 'task_type': 'async', 'status': TaskStatus.EXECUTING.value, 'task_name': TaskNames.LLAVA.value, 'uid': thread_local_data.get_request_id(
         ), 'task_id': f"{TaskNames.LLAVA.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id()}
-        try:
-            client.publish('com.hertzai.longrunning.log', post_dict)
-        except Exception as e:
-            logging.error(
-                "Error while publish at com.hertzai.longrunning.log topic")
+        publish_async('com.hertzai.longrunning.log', post_dict)
         inp_list = inp.split(',')
         url = f'{LLAVA_API}'
         payload = {
@@ -1292,19 +1418,11 @@ def parse_image_to_text(inp):
         else:
             post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.LLAVA.value, 'uid': thread_local_data.get_request_id(
             ), 'task_id': f"{TaskNames.LLAVA.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at LLAVA for req_id: {thread_local_data.get_request_id()}'}
-            try:
-                client.publish('com.hertzai.longrunning.log', post_dict)
-            except Exception as e:
-                logging.error(
-                    "Error while publish at com.hertzai.longrunning.log topic")
+            publish_async('com.hertzai.longrunning.log', post_dict)
     except Exception as e:
         post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.TIMEOUT.value, 'task_name': TaskNames.LLAVA.value, 'uid': thread_local_data.get_request_id(
         ), 'task_id': f"{TaskNames.LLAVA.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at LLAVA for req_id: {thread_local_data.get_request_id()} timed out'}
-        try:
-            client.publish('com.hertzai.longrunning.log', post_dict)
-        except Exception as e:
-            logging.error(
-                "Error while publish at com.hertzai.longrunning.log topic")
+        publish_async('com.hertzai.longrunning.log', post_dict)
         return f'{e} Not able to generating answer at this moment please try later'
 
 
@@ -1373,11 +1491,7 @@ def parse_link_for_crwalab(inp):
     try:
         post_dict = {'user_id': '', 'task_type': 'async', 'status': TaskStatus.EXECUTING.value, 'task_name': TaskNames.CRAWLAB.value, 'uid': thread_local_data.get_request_id(
         ), 'task_id': f"{TaskNames.CRAWLAB.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id()}
-        try:
-            client.publish('com.hertzai.longrunning.log', post_dict)
-        except Exception as e:
-            logging.error(
-                "Error while publish at com.hertzai.longrunning.log topic")
+        publish_async('com.hertzai.longrunning.log', post_dict)
         inp_list = inp.split(',')
         input_url = inp_list[0]
         link_type = inp_list[1].strip(' ')
@@ -1415,11 +1529,7 @@ def parse_link_for_crwalab(inp):
                 app.logger.info("Got exception in book parsing api {e}")
                 post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.CRAWLAB.value, 'uid': thread_local_data.get_request_id(
                 ), 'task_id': f"{TaskNames.CRAWLAB.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at CRWALAB for req_id: {thread_local_data.get_request_id()} for pdf upload'}
-                try:
-                    client.publish('com.hertzai.longrunning.log', post_dict)
-                except:
-                    logging.error(
-                        "Error while publish at com.hertzai.longrunning.log topic")
+                publish_async('com.hertzai.longrunning.log', post_dict)
                 return "sorry I am not able to process your request at this moment"
 
         elif link_type == 'website':
@@ -1449,12 +1559,7 @@ def parse_link_for_crwalab(inp):
                     app.logger.info(f"Got exception in crawlab api {e}")
                     post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.CRAWLAB.value, 'uid': thread_local_data.get_request_id(
                     ), 'task_id': f"{TaskNames.CRAWLAB.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at CRWALAB for req_id: {thread_local_data.get_request_id()} for weblink upload'}
-                    try:
-                        client.publish(
-                            'com.hertzai.longrunning.log', post_dict)
-                    except Exception as e:
-                        logging.error(
-                            "Error while publish at com.hertzai.longrunning.log topic")
+                    publish_async('com.hertzai.longrunning.log', post_dict)
                     return f"sorry I am not able to process your request at this moment but here is some brief information about url you hava provided {response.text}"
 
                 return f"your url got uploaded and data extraction is being processes. Here is some brief information about url you hava provided {response.text}"
@@ -1462,11 +1567,7 @@ def parse_link_for_crwalab(inp):
                 app.logger.info(f"Got exception in crawlab api {e}")
                 post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.CRAWLAB.value, 'uid': thread_local_data.get_request_id(
                 ), 'task_id': f"{TaskNames.CRAWLAB.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at CRWALAB for req_id: {thread_local_data.get_request_id()} for weblink upload'}
-                try:
-                    client.publish('com.hertzai.longrunning.log', post_dict)
-                except Exception as e:
-                    logging.error(
-                        "Error while publish at com.hertzai.longrunning.log topic")
+                publish_async('com.hertzai.longrunning.log', post_dict)
                 return "sorry I am not able to process your request at this moment"
 
         else:
@@ -1668,6 +1769,9 @@ class CustomConvoOutputParser(AgentOutputParser):
                 if ai_match:
                     final_answer = ai_match.group(1).strip()
                     return AgentFinish({"output": final_answer}, text)
+                # Fallback: treat entire response as final answer
+                app.logger.info("No parsable format found, using raw text as final answer")
+                return AgentFinish({"output": text.strip()}, text)
 
     @property
     def _type(self) -> str:
@@ -1675,138 +1779,156 @@ class CustomConvoOutputParser(AgentOutputParser):
 
 
 # Store user-specific agents and their chat history
-user_agents_creator: Dict[str, Tuple[autogen.AssistantAgent,
-                                     autogen.UserProxyAgent]] = {}
+# Only initialize if autogen is available
+if autogen is not None:
+    user_agents_creator: Dict[str, Tuple[autogen.AssistantAgent,
+                                         autogen.UserProxyAgent]] = {}
 
-# Store agents for each user
-user_agents: Dict[str, Tuple[autogen.ConversableAgent,
-                             autogen.ConversableAgent]] = {}
-
-
-def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]:
-    """Create new assistant and user proxy agents for a user with basic configuration."""
-    config_list = [{
-        "model": 'hertzai-4o',
-        "api_type": "azure",
-        "api_key": '4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf',
-        "base_url": 'https://hertzai-gpt4.openai.azure.com/',
-        "api_version": "2024-02-15-preview"
-    }]
-
-    # Create a basic function calling config
-    llm_config = {
-        "config_list": config_list,
-        "seed": 42
-    }
-
-    # Create the assistant agent with context awareness
-    assistant = autogen.AssistantAgent(
-        name=f"assistant_{user_id}",
-        llm_config=llm_config,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get(
-            "content") else False,
-        system_message="""You are a custom agent bot creator. Your task is to interact with the user to gather all the necessary details to create an agent. Once you have collected all the required information, you will generate a complete agent configuration.
-
-        The information you need to collect includes:
-
-        Name: The name of the agent.
-        Purpose: A brief description of the agent's purpose.
-        Flow: The operational flow of the agent.
-        Actions: The actions the agent will perform.
-        Goal: The ultimate goal of the agent.
-        Guidelines for Responses:
-
-        If you are still gathering information, your response should be formatted as: { "status": "pending", "question": "The question you want to ask" }
-        Once all the requirements are complete and you are ready to provide the agent configuration, your response should be formatted as: { "status": "completed", "name": "","Recipe":"", "purpose": "", "tools": "", "flow": { "actions": [] }, "goal": ""}
-        the recipe should be containing all the steps
-        necessary and name for it. Suggest well-documented, generalized python function(s)
-        only if necessary if the task is achievable without python then dont give python code just give the prompt
-        to perform similar tasks for coding steps in future. Make sure coding steps and
-        non-coding steps are never mixed in one function. In the docstr of the function(s),
-        clarify what non-coding steps are needed to use the language skill of the assistant.
-        """
-    )
-
-    # Create the user proxy agent
-    user_proxy = autogen.UserProxyAgent(
-        name=f"user_proxy_{user_id}",
-        human_input_mode="NEVER",
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get(
-            "content") else False,
-        code_execution_config={"work_dir": "coding", "use_docker": False}
-    )
-
-    return assistant, user_proxy
+    # Store agents for each user
+    user_agents: Dict[str, Tuple[autogen.ConversableAgent,
+                                 autogen.ConversableAgent]] = {}
+else:
+    user_agents_creator: Dict[str, Tuple] = {}
+    user_agents: Dict[str, Tuple] = {}
 
 
-def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.UserProxyAgent, message: str) -> str:
-    """Get a single response from the agent for the given message."""
-    try:
-        # Get the current chat history
-        current_chat = user_proxy.chat_messages.get(assistant.name, [])
+# Define autogen-dependent functions only if autogen is available
+if autogen is not None:
+    def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]:
+        """Create new assistant and user proxy agents for a user with basic configuration."""
+        config_list = [{
+            "model": 'hertzai-4o',
+            "api_type": "azure",
+            "api_key": '4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf',
+            "base_url": 'https://hertzai-gpt4.openai.azure.com/',
+            "api_version": "2024-02-15-preview"
+        }]
 
-        # Create context from previous messages (last 5 messages for efficiency)
-        context = current_chat[-5:] if current_chat else []
-        context_str = "\n".join(
-            [f"{msg['role']}: {msg['content']}" for msg in context])
+        # Create a basic function calling config
+        llm_config = {
+            "config_list": config_list,
+            "seed": 42
+        }
 
-        # Append context to the message if there's history
-        enhanced_message = message
-        if context:
-            enhanced_message = f"Previous conversation:\n{context_str}\n\nCurrent message: {message}"
+        # Create the assistant agent with context awareness
+        assistant = autogen.AssistantAgent(
+            name=f"assistant_{user_id}",
+            llm_config=llm_config,
+            is_termination_msg=lambda x: True if "TERMINATE" in x.get(
+                "content") else False,
+            system_message="""You are a custom agent bot creator. Your task is to interact with the user to gather all the necessary details to create an agent. Once you have collected all the required information, you will generate a complete agent configuration.
 
-        # Send message and get response
-        response = user_proxy.send(
-            enhanced_message,
-            assistant,
-            request_reply=True
+            The information you need to collect includes:
+
+            Name: The name of the agent.
+            Purpose: A brief description of the agent's purpose.
+            Flow: The operational flow of the agent.
+            Actions: The actions the agent will perform.
+            Goal: The ultimate goal of the agent.
+            Guidelines for Responses:
+
+            If you are still gathering information, your response should be formatted as: { "status": "pending", "question": "The question you want to ask" }
+            Once all the requirements are complete and you are ready to provide the agent configuration, your response should be formatted as: { "status": "completed", "name": "","Recipe":"", "purpose": "", "tools": "", "flow": { "actions": [] }, "goal": ""}
+            the recipe should be containing all the steps
+            necessary and name for it. Suggest well-documented, generalized python function(s)
+            only if necessary if the task is achievable without python then dont give python code just give the prompt
+            to perform similar tasks for coding steps in future. Make sure coding steps and
+            non-coding steps are never mixed in one function. In the docstr of the function(s),
+            clarify what non-coding steps are needed to use the language skill of the assistant.
+            """
         )
 
-        key = list(user_proxy.chat_messages.keys())[0]
+        # Create the user proxy agent
+        user_proxy = autogen.UserProxyAgent(
+            name=f"user_proxy_{user_id}",
+            human_input_mode="NEVER",
+            is_termination_msg=lambda x: True if "TERMINATE" in x.get(
+                "content") else False,
+            code_execution_config={"work_dir": "coding", "use_docker": False}
+        )
 
-        return user_proxy.chat_messages[key][-1]['content']
-
-    except Exception as e:
-        return f"Error getting response: {str(e)}"
+        return assistant, user_proxy
 
 
-def create_agents(user_id: str,recipe:str) -> Tuple[autogen.ConversableAgent, autogen.ConversableAgent]:
-    """Create new assistant and user agents for a given user_id"""
+    def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.UserProxyAgent, message: str) -> str:
+        """Get a single response from the agent for the given message."""
+        try:
+            # Get the current chat history
+            current_chat = user_proxy.chat_messages.get(assistant.name, [])
 
-    llm_config = {
-        "temperature": 0.7,
-        "config_list": [{
-        "model": 'hertzai-4o',
-        "api_type": "azure",
-        "api_key": '4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf',
-        "base_url": 'https://hertzai-gpt4.openai.azure.com/',
-        "api_version": "2024-02-15-preview"
-    }],
-    }
-    conversation = True
-    if conversation:
-        recipe = recipe+'\n Note: Wait for user confirmation to proceed after every action.'
+            # Create context from previous messages (last 5 messages for efficiency)
+            context = current_chat[-5:] if current_chat else []
+            context_str = "\n".join(
+                [f"{msg['role']}: {msg['content']}" for msg in context])
 
-    # Create assistant agent
-    assistant = autogen.ConversableAgent(
-        name=f"assistant_{user_id}",
-        llm_config=llm_config,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get(
-            "content") else False,
-        system_message=recipe
-    )
+            # Append context to the message if there's history
+            enhanced_message = message
+            if context:
+                enhanced_message = f"Previous conversation:\n{context_str}\n\nCurrent message: {message}"
 
-    # Create user agent
-    user = autogen.ConversableAgent(
-        name=f"user_{user_id}",
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get(
-            "content") else False,
-        llm_config=None,  # User agent doesn't need LLM
-        human_input_mode="NEVER",  # We'll manually send messages
-        max_consecutive_auto_reply=1  # Limit to 1 auto reply
-    )
+            # Send message and get response
+            response = user_proxy.send(
+                enhanced_message,
+                assistant,
+                request_reply=True
+            )
 
-    return user, assistant
+            key = list(user_proxy.chat_messages.keys())[0]
+
+            return user_proxy.chat_messages[key][-1]['content']
+
+        except Exception as e:
+            return f"Error getting response: {str(e)}"
+
+
+    def create_agents(user_id: str,recipe:str) -> Tuple[autogen.ConversableAgent, autogen.ConversableAgent]:
+        """Create new assistant and user agents for a given user_id"""
+
+        llm_config = {
+            "temperature": 0.7,
+            "config_list": [{
+            "model": 'hertzai-4o',
+            "api_type": "azure",
+            "api_key": '4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf',
+            "base_url": 'https://hertzai-gpt4.openai.azure.com/',
+            "api_version": "2024-02-15-preview"
+        }],
+        }
+        conversation = True
+        if conversation:
+            recipe = recipe+'\n Note: Wait for user confirmation to proceed after every action.'
+
+        # Create assistant agent
+        assistant = autogen.ConversableAgent(
+            name=f"assistant_{user_id}",
+            llm_config=llm_config,
+            is_termination_msg=lambda x: True if "TERMINATE" in x.get(
+                "content") else False,
+            system_message=recipe
+        )
+
+        # Create user agent
+        user = autogen.ConversableAgent(
+            name=f"user_{user_id}",
+            is_termination_msg=lambda x: True if "TERMINATE" in x.get(
+                "content") else False,
+            llm_config=None,  # User agent doesn't need LLM
+            human_input_mode="NEVER",  # We'll manually send messages
+            max_consecutive_auto_reply=1  # Limit to 1 auto reply
+        )
+
+        return user, assistant
+
+else:
+    # Provide stub functions when autogen is not available
+    def create_agents_for_user(user_id: str):
+        raise ImportError("autogen package is not installed")
+
+    def get_agent_response(assistant, user_proxy, message: str) -> str:
+        raise ImportError("autogen package is not installed")
+
+    def create_agents(user_id: str, recipe: str):
+        raise ImportError("autogen package is not installed")
 
 
 # main function
@@ -1832,32 +1954,19 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
     language = SUPPORTED_LANG_DICT.get(preferred_lang[:2], 'English')
     colloquial = True
 
-    prefix = f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+    prefix = f"""You are Hevolve, an expert educational AI teacher with knowledge in every field.
+        Answer questions accurately and respond as quickly as possible in {language}.
+        Keep responses under 200 words. Be colloquial and natural - don't always greet or use the user's name.
 
-        <GENERAL_INSTRUCTION_START>
-        Context:
-        Imagine that you are the world's leading teacher, possessing knowledge in every field. Consider the consequences of each response you provide.
-        Your answers must be meaningful and colloquial in nature and delivered as quickly as possible. As a highly educated and informed teacher, you have access to an extensive wealth of information.
-        Your primary goal as a teacher is to assist students by answering their questions, providing accurate and up-to-date information.
-        Please create a distinct personality for yourself, and remember never to refer to the user as a human or yourself as mere AI.\
-        your response should not be more than 200 words. Do not greet always, do not use the username always.
-        RESPONSE_LANGUAGE_PREFERENCE: {language}
+        User details: {user_details}
+        Context: {custom_prompt}
 
-        <GENERAL_INSTRUCTION_END>
-        User details:
-        <USER_DETAILS_START>
-        {user_details}
-        <USER_DETAILS_END>
-        <CONTEXT_START>
-        Before you respond, consider the context in which you are utilized. {custom_prompt}
-        You are designed to answer questions, provide revisions, conduct assessments, teach various topics, create personalised curriculum and assist with research for both students and working professionals.
-        Your expertise draws from various knowledge sources like books, websites, and white papers. Your responses will be conveyed to the user through a video, using an avatar and text-to-speech technology, and can be translated into various languages.
-        Consider the user's location, time and context of previous dialogues with time to create a proper prompt for tools and follow up in-context questions.
-        Your responses will be conveyed to the user through a video, using an avatar and you have ability to see using Visual_Context_Camera tool.
-        <CONTEXT_END>
-        These are all the actions that the user has performed up to now:
-        <PREVIOUS_USER_ACTION_START>
-        {actions}
+        You can answer questions, provide revisions, conduct assessments, teach topics, create curriculum, and assist with research.
+        Your responses are conveyed via video with an avatar and text-to-speech.
+
+        IMPORTANT: Always respond with valid JSON in a markdown code block with "action" and "action_input" fields.
+
+        Previous user actions: {actions}
 
         Conversation History:
         <HISTORY_START>
@@ -2076,6 +2185,7 @@ def chat():
             try:
                 try:
                     new_res = retrieve_json(new_response)
+                    app.logger.info(f"new_res: {new_res}")
                 except Exception as e:
                     app.logger.error(f'Got some error while will try with re match error:{e}')
                     json_match = re.search(r'{[\s\S]*}', response)
@@ -2168,11 +2278,7 @@ def chat():
 
     post_dict = {'user_id': user_id, 'status': 'INITIALIZED', 'task_name': "CHAT",
                  'uid': request_id, 'task_id': f"CHAT_{str(request_id)}", 'request_id': request_id}
-    try:
-        client.publish('com.hertzai.longrunning.log', post_dict)
-    except Exception as e:
-        app.logger.error(
-            "Error while publish at com.hertzai.longrunning.log topic")
+    publish_async('com.hertzai.longrunning.log', post_dict)
 
     thread_local_data.set_user_id(user_id=user_id)
     thread_local_data.set_req_token_count(value=0)
@@ -2208,19 +2314,11 @@ def chat():
     if ans != "":
         post_dict = {'user_id': user_id, 'status': 'FINISHED', 'task_name': "CHAT",
                      'uid': request_id, 'task_id': f"CHAT_{str(request_id)}", 'request_id': request_id}
-        try:
-            client.publish('com.hertzai.longrunning.log', post_dict)
-        except Exception as e:
-            app.logger.error(
-                "Error while publish at com.hertzai.longrunning.log topic")
+        publish_async('com.hertzai.longrunning.log', post_dict)
     else:
         post_dict = {'user_id': user_id, 'status': 'ERROR', 'task_name': "CHAT", 'uid': request_id,
                      'task_id': f"CHAT_{str(request_id)}", 'request_id': request_id, 'failure_reason': 'Got null response from GPT'}
-        try:
-            client.publish('com.hertzai.longrunning.log', post_dict)
-        except Exception as e:
-            app.logger.error(
-                "Error while publish at com.hertzai.longrunning.log topic")
+        publish_async('com.hertzai.longrunning.log', post_dict)
 
     end_time = time.time()
     elapsed_time = end_time - start_time
@@ -2315,8 +2413,144 @@ def history():
 def status():
     return jsonify({'response': 'Working...'})
 
+@app.route('/zeroshot/', methods=['POST'])
+def zeroshot():
+    """
+    Zero-shot classification endpoint using GPT-4.1-mini model.
+
+    Request JSON format:
+    {
+        "input_text": "text to classify",
+        "labels": ["label1", "label2", "label3"],
+        "multi_label": false  // optional, default is false
+    }
+
+    Response format:
+    {
+        "sequence": "input text",
+        "labels": ["label1", "label2", "label3"],
+        "scores": [0.85, 0.10, 0.05]
+    }
+    """
+    try:
+        # Get request data
+        data = request.get_json(force=True)
+        input_text = data.get('input_text', '')
+        labels = data.get('labels', [])
+        multi_label = data.get('multi_label', False)
+
+        # Validate inputs
+        if not input_text:
+            return jsonify({"error": "input_text is required"}), 400
+        if not labels or len(labels) == 0:
+            return jsonify({"error": "labels list is required and cannot be empty"}), 400
+
+        # Create prompt for zero-shot classification
+        if multi_label:
+            prompt = f"""You are a text classification system. Given the following text and a list of labels, determine which labels apply to the text. Multiple labels can apply.
+
+Text: "{input_text}"
+
+Available labels: {', '.join(labels)}
+
+For each label, provide a confidence score between 0 and 1 indicating how well it applies to the text. The scores don't need to sum to 1.
+
+Respond ONLY with a JSON object in this exact format:
+{{"scores": {{"label1": score1, "label2": score2, ...}}}}
+
+Example response format:
+{{"scores": {{"sports": 0.85, "entertainment": 0.60, "politics": 0.15}}}}"""
+        else:
+            prompt = f"""You are a text classification system. Given the following text and a list of labels, classify the text into ONE of the provided labels.
+
+Text: "{input_text}"
+
+Available labels: {', '.join(labels)}
+
+Provide a confidence score between 0 and 1 for each label. The scores should sum to approximately 1.0, with the highest score indicating the most likely label.
+
+Respond ONLY with a JSON object in this exact format:
+{{"scores": {{"label1": score1, "label2": score2, ...}}}}
+
+Example response format:
+{{"scores": {{"sports": 0.75, "entertainment": 0.15, "politics": 0.10}}}}"""
+
+        app.logger.info(f"Zero-shot classification request - Text: {input_text[:100]}..., Labels: {labels}")
+
+        # Call Llama API
+        response = requests.post(
+            GPT_API,
+            json={
+                "model": "llama",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 500
+            }
+        )
+
+        app.logger.info(f"GPT API response status: {response.status_code}")
+
+        if response.status_code != 200:
+            return jsonify({"error": "GPT API request failed", "details": response.text}), 500
+
+        # Parse GPT response
+        gpt_result = response.json()
+        app.logger.info(f"GPT response: {gpt_result}")
+
+        # Extract the response content
+        if isinstance(gpt_result, dict) and 'text' in gpt_result:
+            response_text = gpt_result['text']
+        elif isinstance(gpt_result, dict) and 'response' in gpt_result:
+            response_text = gpt_result['response']
+        elif isinstance(gpt_result, dict) and 'choices' in gpt_result:
+            response_text = gpt_result['choices'][0]['message']['content']
+        else:
+            response_text = str(gpt_result)
+
+        app.logger.info(f"Response text: {response_text}")
+
+        # Parse JSON from response
+        try:
+            # Try to find JSON in the response
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if json_match:
+                parsed_response = json.loads(json_match.group())
+            else:
+                parsed_response = json.loads(response_text)
+
+            scores_dict = parsed_response.get('scores', {})
+
+            # Convert to list format sorted by scores (descending)
+            sorted_items = sorted(scores_dict.items(), key=lambda x: x[1], reverse=True)
+            sorted_labels = [item[0] for item in sorted_items]
+            sorted_scores = [item[1] for item in sorted_items]
+
+            # Build response in format similar to transformers zero-shot-classification
+            result = {
+                "sequence": input_text,
+                "labels": sorted_labels,
+                "scores": sorted_scores
+            }
+
+            app.logger.info(f"Final result: {result}")
+            return jsonify(result)
+
+        except json.JSONDecodeError as e:
+            app.logger.error(f"JSON parsing error: {e}, Response: {response_text}")
+            # Fallback: return equal probabilities if parsing fails
+            equal_score = 1.0 / len(labels)
+            return jsonify({
+                "sequence": input_text,
+                "labels": labels,
+                "scores": [equal_score] * len(labels),
+                "warning": "Could not parse model response, returning equal probabilities"
+            })
+
+    except Exception as e:
+        app.logger.error(f"Error in /zeroshot/ endpoint: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
 if __name__ == '__main__':
-    serve(app, host='0.0.0.0', port=6777, threads=50)
+    serve(app, host='0.0.0.0', port=6778, threads=50)
     # app.debug = True
     # flask_thread = threading.Thread(target=lambda: serve(app, host='0.0.0.0', port=6777))
     # flask_thread.daemon = True
