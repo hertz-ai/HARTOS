@@ -1,0 +1,57 @@
+{
+    "status": "done",
+    "action": "Retrieve avatar IDs using the API: https://mailer.hertzai.com/all_teacher_only_avatars_id_user_id?user_id=10086 and associate each character with a unique avatar ID from the response, saving that info as well.",
+    "fallback_action": "If fails then hit API with user_id 1.",
+    "persona": "creator",
+    "action_id": 2,
+    "recipe": [
+        {
+            "steps": "Retrieve the user ID.",
+            "tool_name": "get_user_id",
+            "generalized_functions": "",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Use the API to fetch avatar IDs based on the retrieved user ID.",
+            "tool_name": "",
+            "generalized_functions": "```python\nimport requests\n\ndef get_avatar_ids(user_id):\n    \"\"\"\n    Function to retrieve avatar IDs from the API.\n    Args:\n        user_id (int): The user ID for which avatars are to be retrieved.\n    Returns:\n        dict: Dictionary containing avatar IDs or error message on failure.\n    \"\"\"\n    url = f'https://mailer.hertzai.com/all_teacher_only_avatars_id_user_id?user_id={user_id}'\n    response = requests.get(url)\n    if response.status_code == 200:\n        return response.json()\n    else:\n        return {\"status\": \"error\", \"message\": \"Failed to retrieve avatar IDs\"}\n\nuser_id = 10086\navatar_ids = get_avatar_ids(user_id)\nprint(avatar_ids)\n```",
+            "agent_to_perform_this_action": "Executor"
+        },
+        {
+            "steps": "Associate each character with a unique avatar ID from the response.",
+            "tool_name": "",
+            "generalized_functions": "",
+            "agent_to_perform_this_action": "Assistant"
+        },
+        {
+            "steps": "Save the character-avatar associations in memory.",
+            "tool_name": "save_data_in_memory",
+            "generalized_functions": "",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Verify the completion of the action and include the persona name.",
+            "tool_name": "StatusVerifier",
+            "generalized_functions": "",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [],
+    "metadata": {
+        "user_id": "redacted <class 'int'>",
+        "stories": {
+            "current_story": {
+                "content": "redacted <class 'str'>",
+                "character_1": "redacted <class 'str'>",
+                "character_2": "redacted <class 'str'>",
+                "character_avatars": {
+                    "Alex": "redacted <class 'int'>",
+                    "Jamie": "redacted <class 'int'>"
+                }
+            }
+        }
+    },
+    "time_took_to_complete": 524.7883982658386,
+    "actions_this_action_depends_on": []
+}

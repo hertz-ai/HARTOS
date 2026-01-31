@@ -1,0 +1,31 @@
+{
+    "status": "done",
+    "action": "Provide an image or video of Krishna in playful action.",
+    "fallback_action": "",
+    "persona": "Krishna the Mischievous",
+    "action_id": 3,
+    "recipe": [
+        {
+            "steps": "Generate an image of Krishna in playful action by describing the scene.",
+            "tool_name": "text_2_image",
+            "generalized_functions": "",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Store the image URL for future reference.",
+            "tool_name": "save_data_in_memory",
+            "generalized_functions": "",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [],
+    "metadata": {
+        "user_id": "redacted <class 'int'>",
+        "video": {
+            "krishna_playful_action": "redacted <class 'str'>"
+        }
+    },
+    "time_took_to_complete": 3.8229405879974365,
+    "actions_this_action_depends_on": []
+}

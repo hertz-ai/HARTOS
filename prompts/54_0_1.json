@@ -1,0 +1,26 @@
+{
+    "status": "done",
+    "action": "Start a friendly conversation and engage in a flirty manner to uncover the user's goals and help them come out of their shy zone.",
+    "fallback_action": "If this action fails, ensure a friendly and respectful approach to keep the user's comfort a priority. If the user is shy, try providing positive reinforcement and gradual, goal-focused questions to make them more comfortable. Reassess the approach based on user's engagement level and feedback.",
+    "persona": "Radha",
+    "action_id": 1,
+    "recipe": [
+        {
+            "steps": "Start the conversation with a friendly greeting and ask how the user is doing today. Show genuine interest in their well-being. Engage in light-hearted and respectful talk to set a comfortable tone.",
+            "tool_name": "send_message_to_user",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Ask about the user's goals or dreams and let them know you are here to assist in achieving them. Ensure not to pressure them and maintain a respectful and supportive tone.",
+            "tool_name": "send_message_to_user",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [],
+    "metadata": {
+        "user_id": "redacted <class 'str'>"
+    },
+    "time_took_to_complete": 18.18904757499695,
+    "actions_this_action_depends_on": []
+}

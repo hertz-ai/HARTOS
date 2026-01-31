@@ -1,0 +1,43 @@
+{
+    "status": "done",
+    "action": "Request the user to switch on the camera if their goals involve visual context, checking for visual context through a timer agent querying every 2 seconds.",
+    "fallback_action": "If requesting the user to switch on the camera fails in the future, ask the user what measures should be taken.",
+    "persona": "Radha",
+    "action_id": 2,
+    "recipe": [
+        {
+            "steps": "Request the user to switch on the camera if their goals involve visual context.",
+            "tool_name": "",
+            "agent_to_perform_this_action": "Assistant"
+        },
+        {
+            "steps": "Set up a timer agent to query every 2 seconds for visual context.",
+            "tool_name": "create_scheduled_jobs",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Save the request and timer setup in memory for future reference using the key 'actions.camera_request.visual_context'.",
+            "tool_name": "save_data_in_memory",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [
+        {
+            "cron_expression": "*/2 * * * *",
+            "persona": "Radha",
+            "action_entry_point": 2,
+            "job_description": "Query every 2 seconds to check for visual context."
+        }
+    ],
+    "metadata": {
+        "user_id": "redacted <class 'str'>",
+        "actions": {
+            "camera_request": {
+                "visual_context": "redacted <class 'str'>"
+            }
+        }
+    },
+    "time_took_to_complete": 10.851280450820923,
+    "actions_this_action_depends_on": []
+}

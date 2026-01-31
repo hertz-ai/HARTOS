@@ -1,0 +1,45 @@
+{
+    "status": "done",
+    "action": "For each genre, perform a Google search query like 'latest [genre] news', extract the top 2-3 headlines, summarize content, and combine it with a starter line.",
+    "fallback_action": "",
+    "persona": "News Curator",
+    "action_id": 5,
+    "recipe": [
+        {
+            "steps": "Access Google search to retrieve the latest headlines for each genre: Politics, Business, Sports, Breaking News, Weather.",
+            "tool_name": "Google Search API",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Extract and compile the top 2-3 headlines for each genre.",
+            "generalized_functions": "",
+            "agent_to_perform_this_action": "Assistant"
+        },
+        {
+            "steps": "Summarize the content for each headline and combine it with a starter line.",
+            "tool_name": "NLP summary tool",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Combine the summaries with the starter line: 'Hello, welcome to the news briefing. Here's your quick update on [genre name].'",
+            "generalized_functions": "",
+            "agent_to_perform_this_action": "Assistant"
+        },
+        {
+            "steps": "Store the final summaries in memory for video generation.",
+            "tool_name": "save_data_in_memory",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [],
+    "metadata": {
+        "user_id": "redacted <class 'int'>",
+        "source_conv_id": "redacted <class 'str'>",
+        "avatar_ids": "redacted <class 'str'>",
+        "genre_avatar_ids": "redacted <class 'str'>",
+        "assigned_avatars": "redacted <class 'str'>"
+    },
+    "time_took_to_complete": 13.70656132698059,
+    "actions_this_action_depends_on": []
+}

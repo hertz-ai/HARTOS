@@ -1,0 +1,108 @@
+{
+    "status": "done",
+    "action": "Generate and save videos",
+    "fallback_action": "If video generation/saving fails, notify the user and retry the process. If it continues to fail, log the error and alert a support team member to investigate further.",
+    "persona": "News Curator",
+    "action_id": 6,
+    "recipe": [
+        {
+            "steps": "Retrieve the scripts and avatar assignments for each genre from memory.",
+            "tool_name": "get_saved_metadata",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Generate videos for each genre using the respective scripts and avatars.",
+            "tool_name": "Generate_video",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Save the generated videos and their metadata (conversation IDs) in memory.",
+            "tool_name": "save_data_in_memory",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [],
+    "metadata": {
+        "user_id": "redacted <class 'int'>",
+        "session": {
+            "conv_id": "redacted <class 'str'>",
+            "source_conv_id": "redacted <class 'str'>"
+        },
+        "news": {
+            "content": "redacted <class 'str'>",
+            "avatar_assignment": "redacted <class 'str'>",
+            "script": {
+                "politics": "redacted <class 'str'>",
+                "business": "redacted <class 'str'>",
+                "sports": "redacted <class 'str'>",
+                "breaking_news": "redacted <class 'str'>",
+                "weather": "redacted <class 'str'>"
+            },
+            "video": {
+                "politics": {
+                    "conv_id": "redacted <class 'str'>"
+                },
+                "business": {
+                    "conv_id": "redacted <class 'str'>"
+                },
+                "sports": {
+                    "conv_id": "redacted <class 'str'>"
+                },
+                "breaking_news": {
+                    "conv_id": "redacted <class 'str'>"
+                },
+                "weather": {
+                    "conv_id": "redacted <class 'str'>"
+                },
+                "metadata": {
+                    "conv_id": "redacted <class 'str'>",
+                    "metadata": {
+                        "politics": {
+                            "avatar": "redacted <class 'str'>",
+                            "video_link": "redacted <class 'str'>",
+                            "status": "redacted <class 'str'>",
+                            "timestamp": "redacted <class 'str'>"
+                        },
+                        "business": {
+                            "avatar": "redacted <class 'str'>",
+                            "video_link": "redacted <class 'str'>",
+                            "status": "redacted <class 'str'>",
+                            "timestamp": "redacted <class 'str'>"
+                        },
+                        "sports": {
+                            "avatar": "redacted <class 'str'>",
+                            "video_link": "redacted <class 'str'>",
+                            "status": "redacted <class 'str'>",
+                            "timestamp": "redacted <class 'str'>"
+                        },
+                        "breaking_news": {
+                            "avatar": "redacted <class 'str'>",
+                            "video_link": "redacted <class 'str'>",
+                            "status": "redacted <class 'str'>",
+                            "timestamp": "redacted <class 'str'>"
+                        },
+                        "weather": {
+                            "avatar": "redacted <class 'str'>",
+                            "video_link": "redacted <class 'str'>",
+                            "status": "redacted <class 'str'>",
+                            "timestamp": "redacted <class 'str'>"
+                        }
+                    }
+                },
+                "conv_id": {
+                    "politics": "redacted <class 'str'>",
+                    "business": "redacted <class 'str'>",
+                    "sports": "redacted <class 'str'>",
+                    "breaking_news": "redacted <class 'str'>",
+                    "weather": "redacted <class 'str'>"
+                }
+            }
+        }
+    },
+    "time_took_to_complete": 85.09071135520935,
+    "actions_this_action_depends_on": [
+        5,
+        6
+    ]
+}
