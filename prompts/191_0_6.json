@@ -1,0 +1,41 @@
+{
+    "status": "done",
+    "action": "Generate one AI video per genre using the assigned avatar and the compiled script",
+    "fallback_action": "If this action fails in the future, play the briefings with whatever functionality or data that you can retrieve.",
+    "persona": "News Curator",
+    "action_id": 6,
+    "recipe": [
+        {
+            "steps": "Retrieve the assigned avatar ID and compiled script for each genre.",
+            "tool_name": "",
+            "agent_to_perform_this_action": "Assistant"
+        },
+        {
+            "steps": "Use the Generate_video tool to create AI videos.",
+            "tool_name": "Generate_video",
+            "generalized_functions": [
+                {
+                    "function_name": "generate_video",
+                    "code": "def generate_video(avatar_id, script):\n    \"\"\"\n    Generates an AI video using the specified avatar ID and script.\n\n    Parameters:\n    avatar_id (int): The ID of the avatar to be used for video generation.\n    script (str): The script to be used for video generation.\n\n    Returns:\n    int: The conv_id of the generated video.\n    \"\"\"\n    request_body = {\n        \"tool_name\": \"Generate_video\",\n        \"parameters\": {\n            \"avatar_id\": avatar_id,\n            \"script\": script\n        }\n    }\n    response = requests.post(URL, json=request_body)\n    conv_id = response.json().get('conv_id')\n    return conv_id"
+                }
+            ],
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Save the generated video conv_ids in memory along with their respective genres and avatar ids.",
+            "tool_name": "save_data_in_memory",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [],
+    "metadata": {
+        "user_id": "redacted <class 'int'>",
+        "source_conv_id": "redacted <class 'str'>",
+        "avatar_ids": "redacted <class 'str'>",
+        "genre_avatar_ids": "redacted <class 'str'>",
+        "assigned_avatars": "redacted <class 'str'>"
+    },
+    "time_took_to_complete": 85.00275039672852,
+    "actions_this_action_depends_on": []
+}

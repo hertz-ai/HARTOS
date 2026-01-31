@@ -1,0 +1,61 @@
+# Dockerfile for End-to-End Runtime Testing
+# This creates a controlled environment for testing the agent system
+
+FROM python:3.12-slim
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    redis-tools \
+    gcc \
+    g++ \
+    make \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first for better caching
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install test dependencies
+RUN pip install --no-cache-dir \
+    pytest==8.4.2 \
+    pytest-asyncio==1.2.0 \
+    pytest-mock==3.15.1 \
+    pytest-cov==7.0.0 \
+    pytest-timeout==2.3.1 \
+    pytest-xdist==3.6.1 \
+    requests-mock==1.12.1 \
+    faker==30.8.2 \
+    python-dotenv==1.0.1
+
+# Install autogen if not in requirements
+RUN pip install --no-cache-dir pyautogen || true
+
+# Copy application code
+COPY . .
+
+# Create necessary directories
+RUN mkdir -p prompts logs tests/runtime_tests
+
+# Set environment variables for testing
+ENV PYTHONPATH=/app
+ENV TESTING=true
+ENV FLASK_ENV=testing
+ENV REDIS_HOST=redis
+ENV REDIS_PORT=6379
+
+# Create a non-root user for testing
+RUN useradd -m -u 1000 testuser && \
+    chown -R testuser:testuser /app
+
+USER testuser
+
+# Default command runs tests
+CMD ["pytest", "tests/runtime_tests/", "-v", "--tb=short"]

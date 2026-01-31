@@ -1,0 +1,37 @@
+{
+    "status": "done",
+    "action": "Generate one realistic AI video for each genre's narration script using its assigned avatar and save the generated conversation ID (conv_id) with a status of 'pending'.",
+    "fallback_action": "",
+    "persona": "News Curator",
+    "action_id": 4,
+    "recipe": [
+        {
+            "steps": "For each genre, use the narration script and the assigned avatar to generate a realistic AI video.",
+            "tool_name": "Generate_video",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "After video generation, save the conv_id with a status of 'pending' for each genre to track the video processing status.",
+            "tool_name": "save_data_in_memory",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [],
+    "metadata": {
+        "user_id": "redacted int",
+        "avatars": {
+            "genre_mapping": {
+                "Politics": "redacted int",
+                "Business": "redacted int",
+                "Sports": "redacted int",
+                "Breaking News": "redacted int",
+                "Science": "redacted int",
+                "AI": "redacted int",
+                "Weather": "redacted int"
+            }
+        }
+    },
+    "time_took_to_complete": 15.99416708946228,
+    "actions_this_action_depends_on": []
+}

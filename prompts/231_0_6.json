@@ -1,0 +1,40 @@
+{
+    "status": "done",
+    "action": "Store all 7 videos under their respective conv_ids, saving metadata for each, including genre, avatar, video URL, generation timestamp, and expiry timestamp (+2 hours).",
+    "fallback_action": "Notify user with an error message if metadata saving fails.",
+    "persona": "News Curator",
+    "action_id": 6,
+    "recipe": [
+        {
+            "steps": "Retrieve successful video generation records (with conv_ids, associated genres, avatar IDs, video URLs, and timestamps) from memory using the data retrieval tool.",
+            "tool_name": "get_data_by_key",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "For each video, calculate an expiry timestamp by adding 2 hours to the generation timestamp.",
+            "generalized_functions": "from datetime import datetime, timedelta\n\ndef add_expiry_timestamp(generation_timestamp):\n    \"\"\"\n    Adds 2 hours to the provided generation timestamp.\n    Parameters:\n        generation_timestamp (str): ISO 8601 formatted string of the generation timestamp.\n    Returns:\n        str: ISO 8601 formatted string of the expiry timestamp.\n    \"\"\"\n    gen_time = datetime.fromisoformat(generation_timestamp)\n    expiry_time = gen_time + timedelta(hours=2)\n    return expiry_time.isoformat()\n",
+            "agent_to_perform_this_action": "Executor"
+        },
+        {
+            "steps": "For each video, create and save metadata in memory including genre, avatar, video URL, generation timestamp, and expiry timestamp using the data save tool.",
+            "tool_name": "save_data_in_memory",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [],
+    "metadata": {
+        "user_id": "redacted <class 'int'>",
+        "avatars": {
+            "teacher_ids": "redacted <class 'str'>"
+        },
+        "genres": {
+            "avatar_map": "redacted <class 'str'>"
+        }
+    },
+    "time_took_to_complete": 26.01675009727478,
+    "actions_this_action_depends_on": [
+        4,
+        5
+    ]
+}

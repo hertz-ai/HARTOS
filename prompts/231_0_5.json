@@ -1,0 +1,47 @@
+{
+    "status": "done",
+    "action": "Periodically check the status of each video generation using the API for all saved conv_ids and update the script/video record to 'success' if video is generated successfully.",
+    "fallback_action": "Notify user with an error message if status check or update fails.",
+    "persona": "News Curator",
+    "action_id": 5,
+    "recipe": [
+        {
+            "steps": "Retrieve all conv_ids with status 'pending' from memory using the data retrieval tool.",
+            "tool_name": "get_data_by_key",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "For each conv_id, send a GET request to https://mailer.hertzai.com/get-video-conv_id/{{conv_id}} to check the video status. If the API indicates success, update the corresponding script/video record in memory to set status to 'success'.",
+            "generalized_functions": "import requests\n\ndef check_video_status_and_update(conv_id, update_func):\n    \"\"\"\n    Checks the video generation status using the API and calls update_func to mark 'success' if video is ready.\n    Parameters:\n        conv_id (str): The conversation ID for the generated video.\n        update_func (callable): Function to update the status in memory.\n    Returns:\n        status (str): The new status, 'success' or previous status if not updated.\n    \"\"\"\n    url = f'https://mailer.hertzai.com/get-video-conv_id/{conv_id}'\n    response = requests.get(url)\n    data = response.json()\n    status = data.get('status')\n    if status == 'success':\n        update_func(conv_id, 'success')\n    return status\n",
+            "agent_to_perform_this_action": "Executor"
+        },
+        {
+            "steps": "Save any updated status information for conv_ids to memory using the data save tool.",
+            "tool_name": "save_data_in_memory",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [
+        {
+            "cron_expression": "*/1 * * * *",
+            "persona": "News Curator",
+            "action_entry_point": 5,
+            "job_description": "Periodically check the status of generated videos for all conv_ids and update them as successful when ready."
+        }
+    ],
+    "metadata": {
+        "user_id": "redacted <class 'int'>",
+        "avatars": {
+            "teacher_ids": "redacted <class 'str'>"
+        },
+        "genres": {
+            "avatar_map": "redacted <class 'str'>"
+        }
+    },
+    "time_took_to_complete": 26.01675009727478,
+    "actions_this_action_depends_on": [
+        1,
+        2
+    ]
+}

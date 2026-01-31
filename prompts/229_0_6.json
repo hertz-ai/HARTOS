@@ -1,0 +1,54 @@
+{
+    "status": "done",
+    "action": "Check the video generation status for each genre using the provided API until all videos are marked as 'success'.",
+    "fallback_action": "",
+    "persona": "News Curator",
+    "action_id": 6,
+    "recipe": [
+        {
+            "steps": "Retrieve the list of video conversation IDs (conv_id) for each genre from memory.",
+            "tool_name": "get_data_by_key",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "For each conv_id, query the API endpoint 'https://mailer.hertzai.com/get-video-conv_id/{{conv_id}}' to check the video generation status.",
+            "generalized_functions": "import requests\n\ndef check_video_status(conv_id):\n    \"\"\"\n    Query the video generation status from the API for a given conversation ID.\n    Args:\n        conv_id (str): The conversation ID for the generated video.\n    Returns:\n        dict: API response containing the video status and related data.\n    \"\"\"\n    url = f\"https://mailer.hertzai.com/get-video-conv_id/{conv_id}\"\n    response = requests.get(url)\n    return response.json()\n\n# Example usage:\n# status = check_video_status('12345')",
+            "agent_to_perform_this_action": "Executor"
+        },
+        {
+            "steps": "Repeat querying the API for any conv_ids not yet marked as 'success' until all are complete.",
+            "tool_name": "create_scheduled_jobs",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Once all videos are marked as 'success', store the statuses and URLs in memory indexed by genre and conv_id.",
+            "tool_name": "save_data_in_memory",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [
+        {
+            "cron_expression": "*/5 * * * *",
+            "persona": "News Curator",
+            "action_entry_point": 6,
+            "job_description": "Periodically check the video generation status using the API until all videos are marked as 'success'."
+        }
+    ],
+    "metadata": {
+        "user_id": "redacted <class 'int'>",
+        "conv": {
+            "source_window": "redacted <class 'str'>"
+        },
+        "avatars": {
+            "teacher_avatar_ids": "redacted <class 'str'>"
+        },
+        "genres": {
+            "avatar_assignment": "redacted <class 'str'>"
+        }
+    },
+    "time_took_to_complete": 22.327492237091064,
+    "actions_this_action_depends_on": [
+        5
+    ]
+}

@@ -1,0 +1,28 @@
+{
+    "status": "done",
+    "action": "Wait for 1 minute.",
+    "fallback_action": "",
+    "persona": "Spotlight",
+    "action_id": 2,
+    "recipe": [
+        {
+            "steps": "Create a scheduled job to wait for 1 minute.",
+            "tool_name": "create_scheduled_jobs",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [
+        {
+            "cron_expression": "N/A",
+            "persona": "Spotlight",
+            "action_entry_point": 2,
+            "job_description": "Scheduled job to wait for 1 minute."
+        }
+    ],
+    "metadata": {
+        "user_id": "redacted <class 'int'>"
+    },
+    "time_took_to_complete": 10.5693199634552,
+    "actions_this_action_depends_on": []
+}

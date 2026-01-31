@@ -1434,6 +1434,7 @@ class Action:
         self.fallback = False
         self.new_json = []
         self.recipe = False
+        self.ledger = None  # Smart Ledger for persistent task tracking
 
     def get_action(self, array_index):
         if array_index < 0 or array_index >= len(self.actions):
@@ -1446,6 +1447,11 @@ class Action:
             if i['action_id'] == action_id:
                 return i
         return None
+
+    def set_ledger(self, ledger):
+        """Attach Smart Ledger to this Action instance"""
+        self.ledger = ledger
+        current_app.logger.info(f"Smart Ledger attached with {len(ledger.tasks)} tasks")
 
 def txt2img(text: Annotated[str, "Text to create image"]) -> str:
     current_app.logger.info('INSIDE txt2img')
@@ -1672,13 +1678,12 @@ def history(user_id,prompt_id,role,message):
         return "Memory object not found"
 
 
+# Local llama.cpp server (Qwen3-VL)
 config_list = [{
-    "model": "gpt-4o-mini",
-    "api_type": "azure",
-    "api_key": "4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf",
-    "base_url": "https://hertzai-gpt4.openai.azure.com/",
-    "api_version": "2024-02-15-preview",
-    "price":[0.00015,0.0006]
+    "model": 'Qwen3-VL-4B-Instruct',
+    "api_key": 'dummy',
+    "base_url": 'http://localhost:8080/v1',
+    "price": [0, 0]
 }]
 
 llm_config = {
@@ -1739,7 +1744,7 @@ def create_visual_agent(user_id,prompt_id):
             9. IMPORTANT instruction: If you want to ask something or send something to the user, always use this format: @user {{'message_2_user':'message here'}}
             10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
 
-            Note: Your Working Directory is "/home/hertzai2019/newauto/coding" use this if you need,
+            Note: Your Working Directory is "{os.getcwd()}" - CRITICAL: When writing code, ALWAYS use os.path.join(os.getcwd(), filename) for file paths. NEVER hardcode paths like '/home/user/path'.
             Add proper error handling, logging.
             Always provide clear execution results or error messages to the assistant.
             if you get any conversation which is not related to coding ask the manager to route this conversation to user
@@ -1763,12 +1768,14 @@ def create_visual_agent(user_id,prompt_id):
         Response formats:
             1. Action Completed Successfully: {"status": "completed","action": "current action","action_id": 1/2/3...,"message": "message here"}
             2. Action Error: {"status": "error","action": "current action","action_id": 1/2/3...,"message": "message here"}
-            2. Action Pending: {"status": "pending","action": "current action","action_id": 1/2/3...,"message": "pending actions here"}
+            3. Action Pending: {"status": "pending","action": "current action","action_id": 1/2/3...,"message": "pending actions here"}
+            4. Action Requires Breakdown: {"status": "requires_breakdown","action": "current action","action_id": 1/2/3...,"reason": "Why this action needs to be broken down","subtasks": [{"subtask_id": "1.1","description": "First subtask description","depends_on": [],"can_perform_autonomously": true},{"subtask_id": "1.2","description": "Second subtask","depends_on": ["1.1"],"can_perform_autonomously": true}]}
         Important Instructions:
             Only mark an action as "Completed" if the Assistant Agent confirms successful completion.
             For pending tasks or ongoing actions, respond to helper to complete the task.
             Verify the action performed by assistant and make sure the action is performed correctly as per instructions. if action performed was not as per instructions give the pending actions to the helper agent.
             Report status only—do not perform actions yourself.
+            Use "requires_breakdown" when an action is too complex and needs to be split into smaller subtasks.
 
         """,
         is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
@@ -1837,11 +1844,11 @@ def save_agent_data_to_file(prompt_id: int, agent_data: Dict) -> bool:
         with open(file_path, 'w', encoding='utf-8') as f:
             json.dump(save_metadata, f, indent=2, ensure_ascii=False)
 
-        current_app.logger.info(f"💾 Saved agent data to: {file_path}")
+        current_app.logger.info(f" Saved agent data to: {file_path}")
         return True
 
     except Exception as e:
-        current_app.logger.error(f"❌ Error saving agent data for prompt_id {prompt_id}: {e}")
+        current_app.logger.error(f" Error saving agent data for prompt_id {prompt_id}: {e}")
         return False
 
 
@@ -1873,17 +1880,17 @@ def load_agent_data_from_file(prompt_id: int, agent_data: Dict) -> bool:
         # Extract the actual data (skip metadata)
         if 'data' in loaded_data:
             agent_data[prompt_id] = loaded_data['data']
-            current_app.logger.info(f"📂 Loaded agent data from: {file_path}")
-            current_app.logger.info(f"📊 Loaded data keys: {list(agent_data[prompt_id].keys())}")
+            current_app.logger.info(f" Loaded agent data from: {file_path}")
+            current_app.logger.info(f" Loaded data keys: {list(agent_data[prompt_id].keys())}")
             return True
         else:
             # Handle old format (direct data)
             agent_data[prompt_id] = loaded_data
-            current_app.logger.info(f"📂 Loaded agent data (old format) from: {file_path}")
+            current_app.logger.info(f" Loaded agent data (old format) from: {file_path}")
             return True
 
     except Exception as e:
-        current_app.logger.error(f"❌ Error loading agent data for prompt_id {prompt_id}: {e}")
+        current_app.logger.error(f" Error loading agent data for prompt_id {prompt_id}: {e}")
         # Initialize with default data on error
         agent_data[prompt_id] = {}
         return False
@@ -1954,11 +1961,11 @@ def backup_agent_data_file(prompt_id: int) -> bool:
         import shutil
         shutil.copy2(file_path, backup_path)
 
-        current_app.logger.info(f"🔄 Created backup: {backup_path}")
+        current_app.logger.info(f" Created backup: {backup_path}")
         return True
 
     except Exception as e:
-        current_app.logger.error(f"❌ Error creating backup for prompt_id {prompt_id}: {e}")
+        current_app.logger.error(f" Error creating backup for prompt_id {prompt_id}: {e}")
         return False
 
 
@@ -1994,12 +2001,12 @@ def cleanup_old_backups(prompt_id: int, keep_count: int = 5) -> int:
             if i >= keep_count:  # Keep only the newest keep_count files
                 os.remove(file_path)
                 deleted_count += 1
-                current_app.logger.info(f"🗑️ Deleted old backup: {file_path}")
+                current_app.logger.info(f" Deleted old backup: {file_path}")
 
         return deleted_count
 
     except Exception as e:
-        current_app.logger.error(f"❌ Error cleaning up backups for prompt_id {prompt_id}: {e}")
+        current_app.logger.error(f" Error cleaning up backups for prompt_id {prompt_id}: {e}")
         return 0
 
 
@@ -2042,7 +2049,7 @@ def get_agent_data_info(prompt_id: int) -> Dict[str, Any]:
         }
 
     except Exception as e:
-        current_app.logger.error(f"❌ Error getting agent data info for prompt_id {prompt_id}: {e}")
+        current_app.logger.error(f" Error getting agent data info for prompt_id {prompt_id}: {e}")
         return {"exists": False, "error": str(e)}
 
 
@@ -2055,7 +2062,7 @@ def safe_function_call(func, arguments):
 
     logger = logging.getLogger("safe_function_call")
 
-    logger.info("🔍 SAFE_FUNCTION_CALL DEBUG:")
+    logger.info(" SAFE_FUNCTION_CALL DEBUG:")
     logger.info(f"   Function: {func.__name__ if hasattr(func, '__name__') else func}")
     logger.info(f"   Arguments type: {type(arguments)}")
     logger.info(f"   Arguments content: {arguments}")
@@ -2065,7 +2072,7 @@ def safe_function_call(func, arguments):
         if isinstance(arguments, dict):
             logger.info("   → Using **kwargs approach")
             result = func(**arguments)
-            logger.info("   ✅ Success with **kwargs")
+            logger.info("    Success with **kwargs")
             return result
 
         # Handle list case - FIXED LOGIC
@@ -2079,24 +2086,24 @@ def safe_function_call(func, arguments):
                 logger.info(f"   → Found dict in list[0]: {actual_args}")
                 logger.info("   → Using **kwargs approach on extracted dict")
                 result = func(**actual_args)
-                logger.info("   ✅ Success with **kwargs from list")
+                logger.info("    Success with **kwargs from list")
                 return result
             else:
                 # Fallback to treating as positional args
                 logger.info("   → Using *args approach")
                 result = func(*arguments)
-                logger.info("   ✅ Success with *args")
+                logger.info("    Success with *args")
                 return result
 
         # Handle single argument case
         else:
             logger.info("   → Using single argument approach")
             result = func(arguments)
-            logger.info("   ✅ Success with single arg")
+            logger.info("    Success with single arg")
             return result
 
     except TypeError as e:
-        logger.error(f"   ❌ TypeError: {e}")
+        logger.error(f"    TypeError: {e}")
         logger.error(f"   TypeError traceback:\n{traceback.format_exc()}")
 
         # Enhanced intelligent mapping for lists
@@ -2108,7 +2115,7 @@ def safe_function_call(func, arguments):
                 if len(arguments) >= 1 and isinstance(arguments[0], dict):
                     logger.info("   → Extracting dict from list and retrying")
                     result = func(**arguments[0])
-                    logger.info("   ✅ Success with extracted dict")
+                    logger.info("    Success with extracted dict")
                     return result
 
                 # If it's a simple list, try intelligent parameter mapping
@@ -2126,19 +2133,19 @@ def safe_function_call(func, arguments):
                         kwargs = dict(zip(param_names, clean_args))
                         logger.info(f"   → Mapped to kwargs: {kwargs}")
                         result = func(**kwargs)
-                        logger.info("   ✅ Success with intelligent mapping")
+                        logger.info("    Success with intelligent mapping")
                         return result
 
             except Exception as mapping_error:
-                logger.error(f"   ❌ Enhanced list handling failed: {mapping_error}")
+                logger.error(f"    Enhanced list handling failed: {mapping_error}")
                 logger.error(f"   Mapping traceback:\n{traceback.format_exc()}")
 
         # Re-raise if we can't handle it
-        logger.error("   ❌ Cannot handle - re-raising original TypeError")
+        logger.error("    Cannot handle - re-raising original TypeError")
         raise e
 
     except Exception as e:
-        logger.error(f"   ❌ Unexpected error: {e}")
+        logger.error(f"    Unexpected error: {e}")
         logger.error(f"   Unexpected error traceback:\n{traceback.format_exc()}")
         raise e
 
@@ -2171,19 +2178,19 @@ def force_apply_autogen_json_fix():
                 # Try original autogen approach first
                 formatted_string = self._format_json_str(input_string)
                 arguments = json.loads(formatted_string)
-                print(f"✅ ORIGINAL AUTOGEN: Successfully parsed arguments for {func_name}")
+                print(f" ORIGINAL AUTOGEN: Successfully parsed arguments for {func_name}")
             except (json.JSONDecodeError, Exception) as e:
                 # Only if original fails, fall back to our enhanced parsing
-                print(f"⚠️ ORIGINAL AUTOGEN FAILED: {e} - falling back to enhanced parsing for {func_name}")
+                print(f" ORIGINAL AUTOGEN FAILED: {e} - falling back to enhanced parsing for {func_name}")
                 try:
                     arguments = retrieve_json(input_string)
                     if arguments is None:
                         arguments = {}
                     elif isinstance(arguments, str):
                         arguments = json.loads(arguments)
-                    print(f"✅ FALLBACK SUCCESSFUL: Enhanced parsing worked for {func_name}")
+                    print(f" FALLBACK SUCCESSFUL: Enhanced parsing worked for {func_name}")
                 except Exception as fallback_error:
-                    print(f"❌ FALLBACK FAILED: {fallback_error}")
+                    print(f" FALLBACK FAILED: {fallback_error}")
                     arguments = None
                     content = f"Error: {e}\n The argument must be in JSON format."
 
@@ -2191,18 +2198,18 @@ def force_apply_autogen_json_fix():
             if arguments is not None:
                 iostream.print(f"\n>>>>>>>> EXECUTING FUNCTION {func_name}...", flush=True)
                 try:
-                    print("🔍 Function being called details:")
+                    print(" Function being called details:")
                     print(f"   Function: {func}")
                     print(f"   Function name: {getattr(func, '__name__', 'NO_NAME')}")
-                    print("🔍 Parsed arguments analysis:")
+                    print(" Parsed arguments analysis:")
                     print(f"   Arguments type: {type(arguments)}")
                     print(f"   Arguments content: {arguments}")
                     content = safe_function_call(func, arguments)  # Original autogen always uses **kwargs
                     is_exec_success = True
-                    print(f"✅ EXECUTED: Successfully executed {func_name}")
+                    print(f" EXECUTED: Successfully executed {func_name}")
                 except Exception as e:
                     content = f"Error: {e}"
-                    print(f"❌ EXECUTION FAILED: {func_name}: {e}")
+                    print(f" EXECUTION FAILED: {func_name}: {e}")
         else:
             content = f"Error: Function {func_name} not found."
 
@@ -2238,29 +2245,29 @@ def force_apply_autogen_json_fix():
                 # Try original autogen approach first
                 formatted_string = self._format_json_str(input_string)
                 arguments = json.loads(formatted_string)
-                print(f"✅ ORIGINAL AUTOGEN ASYNC: Successfully parsed arguments for {func_name}")
+                print(f" ORIGINAL AUTOGEN ASYNC: Successfully parsed arguments for {func_name}")
             except (json.JSONDecodeError, Exception) as e:
                 # Only if original fails, fall back to our enhanced parsing
-                print(f"⚠️ ORIGINAL AUTOGEN ASYNC FAILED: {e} - falling back to enhanced parsing for {func_name}")
+                print(f" ORIGINAL AUTOGEN ASYNC FAILED: {e} - falling back to enhanced parsing for {func_name}")
                 try:
                     arguments = retrieve_json(input_string)
                     if arguments is None:
                         arguments = {}
                     elif isinstance(arguments, str):
                         arguments = json.loads(arguments)
-                    print(f"✅ FALLBACK ASYNC SUCCESSFUL: Enhanced parsing worked for {func_name}")
+                    print(f" FALLBACK ASYNC SUCCESSFUL: Enhanced parsing worked for {func_name}")
                 except Exception as fallback_error:
-                    print(f"❌ FALLBACK ASYNC FAILED: {fallback_error}")
+                    print(f" FALLBACK ASYNC FAILED: {fallback_error}")
                     arguments = None
                     content = f"Error: {e}\n The argument must be in JSON format."
 
             if arguments is not None:
                 iostream.print(f"\n>>>>>>>> EXECUTING ASYNC FUNCTION {func_name}...", flush=True)
                 try:
-                    print("🔍 Function being called details:")
+                    print(" Function being called details:")
                     print(f"   Function: {func}")
                     print(f"   Function name: {getattr(func, '__name__', 'NO_NAME')}")
-                    print("🔍 Parsed arguments analysis:")
+                    print(" Parsed arguments analysis:")
                     print(f"   Arguments type: {type(arguments)}")
                     print(f"   Arguments content: {arguments}")
                     import inspect
@@ -2276,10 +2283,10 @@ def force_apply_autogen_json_fix():
                     else:
                         content = safe_function_call(func, arguments)
                     is_exec_success = True
-                    print(f"✅ EXECUTED ASYNC: Successfully executed {func_name}")
+                    print(f" EXECUTED ASYNC: Successfully executed {func_name}")
                 except Exception as e:
                     content = f"Error: {e}"
-                    print(f"❌ EXECUTION ASYNC FAILED: {func_name}: {e}")
+                    print(f" EXECUTION ASYNC FAILED: {func_name}: {e}")
         else:
             content = f"Error: Function {func_name} not found."
 
@@ -2307,23 +2314,23 @@ def force_apply_autogen_json_fix():
         new_a_execute = getattr(ConversableAgent, 'a_execute_function', None)
 
         if new_execute is not original_execute:
-            print("🎉 SUCCESS: Autogen sync execute_function has been patched!")
+            print(" SUCCESS: Autogen sync execute_function has been patched!")
         else:
-            print("❌ FAILED: Autogen sync execute_function patch was not applied")
+            print(" FAILED: Autogen sync execute_function patch was not applied")
 
         if new_a_execute is not original_a_execute:
-            print("🎉 SUCCESS: Autogen async execute_function has been patched!")
+            print(" SUCCESS: Autogen async execute_function has been patched!")
         else:
-            print("❌ FAILED: Autogen async execute_function patch was not applied")
+            print(" FAILED: Autogen async execute_function patch was not applied")
 
-        print("🔧 Autogen JSON handling enhanced - tool calls can now handle unlimited length!")
+        print(" Autogen JSON handling enhanced - tool calls can now handle unlimited length!")
         return True
 
     except ImportError as e:
-        print(f"❌ Could not import autogen for patching: {e}")
+        print(f" Could not import autogen for patching: {e}")
         return False
     except Exception as e:
-        print(f"❌ Error applying autogen patches: {e}")
+        print(f" Error applying autogen patches: {e}")
         import traceback
         traceback.print_exc()
         return False

@@ -1,0 +1,125 @@
+version: '3.8'
+
+services:
+  # Redis for frame storage and caching
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - test-network
+
+  # Note: LLM server should be running on host at localhost:8000
+  # This uses the actual Qwen3-VL-2B-Instruct model configured in the system
+
+  # Mock Crossbar server (for pub/sub)
+  mock-crossbar:
+    build:
+      context: .
+      dockerfile: Dockerfile.mock-crossbar
+    ports:
+      - "8088:8088"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8088/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - test-network
+
+  # Mock external APIs (student API, action API, etc.)
+  mock-apis:
+    build:
+      context: .
+      dockerfile: Dockerfile.mock-apis
+    ports:
+      - "9890:9890"  # autogen_response endpoint
+      - "5459:5459"  # txt2img endpoint
+    environment:
+      - STUDENT_API_PORT=9891
+      - ACTION_API_PORT=9892
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9890/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - test-network
+
+  # Main application container for testing
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      redis:
+        condition: service_healthy
+      mock-crossbar:
+        condition: service_healthy
+      mock-apis:
+        condition: service_healthy
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - CROSSBAR_URL=http://mock-crossbar:8088
+      - AUTOGEN_RESPONSE_URL=http://mock-apis:9890/autogen_response
+      - STUDENT_API=http://mock-apis:9891/student
+      - ACTION_API=http://mock-apis:9892/actions
+      - TESTING=true
+      - PYTHONUNBUFFERED=1
+    network_mode: host  # Use host network to access LLM on localhost:8000
+    volumes:
+      - ./tests/runtime_tests:/app/tests/runtime_tests
+      - ./prompts:/app/prompts
+      - ./logs:/app/logs
+      - test-data:/app/test_data
+    networks:
+      - test-network
+    command: >
+      bash -c "
+        echo 'Waiting for all services to be ready...' &&
+        sleep 10 &&
+        echo 'Running end-to-end tests...' &&
+        pytest tests/runtime_tests/ -v --tb=short --maxfail=5 --timeout=300
+      "
+
+  # Test runner with interactive shell (for debugging)
+  test-shell:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    depends_on:
+      - redis
+      - mock-llm
+      - mock-crossbar
+      - mock-apis
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - LLM_BASE_URL=http://mock-llm:8000/v1
+      - CROSSBAR_URL=http://mock-crossbar:8088
+      - TESTING=true
+    volumes:
+      - ./tests/runtime_tests:/app/tests/runtime_tests
+      - ./prompts:/app/prompts
+      - ./logs:/app/logs
+    networks:
+      - test-network
+    command: /bin/bash
+    stdin_open: true
+    tty: true
+    profiles:
+      - debug
+
+networks:
+  test-network:
+    driver: bridge
+
+volumes:
+  test-data:

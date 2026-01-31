@@ -1,0 +1,66 @@
+{
+    "status": "done",
+    "action": "Schedule execution every 2 hours, track news stories till closure, and manage array with timestamps based on metadata.",
+    "fallback_action": "",
+    "persona": "News Curator",
+    "action_id": 8,
+    "recipe": [
+        {
+            "steps": "Schedule the AI news update workflow to run automatically every 2 hours, ensuring new headlines are fetched, scripts are generated, videos are created, and all relevant metadata is updated for each genre.",
+            "tool_name": "create_scheduled_jobs",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Schedule a clean-up job to run every hour, which checks the metadata array and removes expired news stories (those older than 2 hours, based on their expiry timestamp) to keep only current news items.",
+            "tool_name": "create_scheduled_jobs",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [
+        {
+            "cron_expression": "0 */2 * * *",
+            "persona": "News Curator",
+            "action_entry_point": 8,
+            "job_description": "Run the AI news update workflow: fetch latest headlines, generate scripts and videos, and refresh video metadata for all genres."
+        },
+        {
+            "cron_expression": "0 * * * *",
+            "persona": "News Curator",
+            "action_entry_point": 8,
+            "job_description": "Clean up the news metadata array by removing expired video entries based on expiry timestamps."
+        }
+    ],
+    "metadata": {
+        "user_id": "redacted int",
+        "avatars": {
+            "teacher_avatar_ids": [
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int"
+            ]
+        },
+        "genres": {
+            "avatar_assignment": {
+                "Politics": "redacted int",
+                "Business": "redacted int",
+                "Sports": "redacted int",
+                "Breaking News": "redacted int",
+                "Science": "redacted int",
+                "AI": "redacted int",
+                "Weather": "redacted int"
+            }
+        }
+    },
+    "time_took_to_complete": 21.16752529144287,
+    "actions_this_action_depends_on": [
+        7
+    ]
+}

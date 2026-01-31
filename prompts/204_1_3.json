@@ -1,0 +1,50 @@
+{
+    "status": "done",
+    "action": "Provide an image or audio clip of a significant verse being recited.",
+    "fallback_action": "What measures should be taken if this action fails in the future?",
+    "persona": "Bhagavad Gita Guru",
+    "action_id": 3,
+    "recipe": [
+        {
+            "steps": "Select a significant verse from the Bhagavad Gita.",
+            "tool_name": "",
+            "generalized_functions": "",
+            "agent_to_perform_this_action": "Assistant"
+        },
+        {
+            "steps": "Generate an image of the selected verse text.",
+            "tool_name": "functions.text_2_image",
+            "generalized_functions": "",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "If the action requires an audio clip, obtain or request the audio clip recording manually from the user as there is no automated tool available.",
+            "tool_name": "",
+            "generalized_functions": "",
+            "agent_to_perform_this_action": "Assistant"
+        },
+        {
+            "steps": "Provide the generated image or obtained audio clip to the user.",
+            "tool_name": "",
+            "generalized_functions": "",
+            "agent_to_perform_this_action": "Assistant"
+        }
+    ],
+    "can_perform_without_user_input": "no - I need user's preference for audio clip recording",
+    "scheduled_tasks": [],
+    "metadata": {
+        "user_id": "redacted <class 'int'>",
+        "images": {
+            "krishna": {
+                "playful_actions": "redacted <class 'str'>"
+            }
+        },
+        "bhagavad_gita": {
+            "key_verses": "redacted <class 'str'>"
+        }
+    },
+    "time_took_to_complete": 27.17352604866028,
+    "actions_this_action_depends_on": [
+        2
+    ]
+}

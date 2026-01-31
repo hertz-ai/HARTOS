@@ -1,0 +1,45 @@
+{
+    "status": "done",
+    "action": "Fetch the latest headline for each genre via Google search, generate a short news anchor narration script, and save it with the current timestamp.",
+    "fallback_action": "Notify user with an error message if headline retrieval or script generation fails.",
+    "persona": "News Curator",
+    "action_id": 3,
+    "recipe": [
+        {
+            "steps": "Retrieve the list of genres for which news scripts need to be generated from memory using the appropriate data retrieval tool.",
+            "tool_name": "get_data_by_key",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "For each genre, fetch the latest headline from Google using a search API or web scraping.",
+            "generalized_functions": "import requests\nfrom bs4 import BeautifulSoup\n\ndef get_latest_headline(genre):\n    \"\"\"\n    Retrieve the latest headline for a given genre from Google search.\n    Parameters:\n        genre (str): The name of the news genre (e.g., 'Politics').\n    Returns:\n        str: The latest headline found for the given genre.\n    \"\"\"\n    query = f\"{genre} news\"\n    url = f\"https://www.google.com/search?q={query}&tbm=nws\"\n    headers = {'User-Agent': 'Mozilla/5.0'}\n    response = requests.get(url, headers=headers)\n    soup = BeautifulSoup(response.text, 'html.parser')\n    headline = soup.find('div', class_='BNeawe vvjwJb AP7Wnd')\n    return headline.text if headline else \"No headline found.\"\n",
+            "agent_to_perform_this_action": "Executor"
+        },
+        {
+            "steps": "For each genre and headline, generate a short narration script in a news anchor reading style.",
+            "generalized_functions": "from datetime import datetime\n\ndef generate_news_script(genre, headline):\n    \"\"\"\n    Generate a short narration script for a given genre and headline in news anchor style.\n    Parameters:\n        genre (str): The news genre.\n        headline (str): The latest headline for the genre.\n    Returns:\n        dict: Script data with genre, script, and timestamp.\n    \"\"\"\n    now = datetime.now().isoformat()\n    script = f\"Here\u2019s your quick update on {genre}: {headline}\" if headline else f\"No recent news for {genre} at the moment.\"\n    return {\"genre\": genre, \"script\": script, \"timestamp\": now}\n",
+            "agent_to_perform_this_action": "Executor"
+        },
+        {
+            "steps": "Save each script with its genre and the current timestamp using the data save tool.",
+            "tool_name": "save_data_in_memory",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [],
+    "metadata": {
+        "user_id": "redacted <class 'int'>",
+        "avatars": {
+            "teacher_ids": "redacted <class 'str'>"
+        },
+        "genres": {
+            "avatar_map": "redacted <class 'str'>"
+        }
+    },
+    "time_took_to_complete": 26.01675009727478,
+    "actions_this_action_depends_on": [
+        1,
+        2
+    ]
+}

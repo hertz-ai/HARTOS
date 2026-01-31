@@ -1,13 +1,70 @@
 """
 STATE MACHINE IMPLEMENTATION
 =====================================
+
+This module manages the ActionState state machine for tracking action lifecycle.
+It also provides functions to sync ActionState with SmartLedger TaskStatus.
 """
 
 from enum import Enum
 import logging
 import os
+from typing import Dict, Optional, Any
 
 logger = logging.getLogger(__name__)
+
+# Global ledger registry for auto-sync
+_ledger_registry: Dict[str, Any] = {}
+
+def register_ledger_for_session(user_prompt: str, ledger: Any):
+    """Register a ledger instance for a session to enable auto-sync."""
+    _ledger_registry[user_prompt] = ledger
+    logger.debug(f"Registered ledger for {user_prompt}")
+
+def get_registered_ledger(user_prompt: str) -> Optional[Any]:
+    """Get the registered ledger for a session."""
+    return _ledger_registry.get(user_prompt)
+
+def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState'):
+    """Auto-sync state change to ledger if registered."""
+    ledger = _ledger_registry.get(user_prompt)
+    if ledger is None:
+        return  # No ledger registered, skip sync
+
+    try:
+        LedgerTaskStatus = _get_ledger_task_status()
+        task_id = f"action_{action_id}"
+
+        if task_id not in ledger.tasks:
+            return  # Task doesn't exist in ledger
+
+        # Map ActionState to LedgerTaskStatus
+        STATE_MAP = {
+            ActionState.ASSIGNED: LedgerTaskStatus.PENDING,
+            ActionState.IN_PROGRESS: LedgerTaskStatus.IN_PROGRESS,
+            ActionState.STATUS_VERIFICATION_REQUESTED: LedgerTaskStatus.VALIDATING,
+            ActionState.COMPLETED: LedgerTaskStatus.COMPLETED,
+            ActionState.PENDING: LedgerTaskStatus.BLOCKED,
+            ActionState.ERROR: LedgerTaskStatus.FAILED,
+            ActionState.FALLBACK_REQUESTED: LedgerTaskStatus.BLOCKED,
+            ActionState.FALLBACK_RECEIVED: LedgerTaskStatus.IN_PROGRESS,
+            ActionState.RECIPE_REQUESTED: LedgerTaskStatus.IN_PROGRESS,
+            ActionState.RECIPE_RECEIVED: LedgerTaskStatus.COMPLETED,
+            ActionState.TERMINATED: LedgerTaskStatus.COMPLETED,
+        }
+
+        ledger_status = STATE_MAP.get(state)
+        if ledger_status:
+            ledger.update_task_status(task_id, ledger_status, reason=f"ActionState: {state.value}")
+            logger.info(f"📋 Auto-synced {task_id} → {ledger_status.value} (ActionState: {state.value})")
+    except Exception as e:
+        logger.error(f"Failed to auto-sync to ledger: {e}", exc_info=True)
+
+# Import ledger types for sync function (lazy import to avoid circular deps)
+def _get_ledger_task_status():
+    """Lazy import to avoid circular dependencies"""
+    from agent_ledger import TaskStatus as LedgerTaskStatus
+    return LedgerTaskStatus
 
 # Add new states to ActionState enum:
 class FlowState(Enum):
@@ -122,6 +179,9 @@ def set_action_state(user_prompt: str, action_id: int, state: ActionState, reaso
     action_states[user_prompt][action_id] = state
     logger.info(f"[TARGET] Action {action_id}: {current_state.value} → {state.value} ({reason})")
 
+    # Auto-sync to ledger if registered
+    _auto_sync_to_ledger(user_prompt, action_id, state)
+
 
 # 3. ADD these wrapper functions for safe state updates:
 def safe_set_state(user_prompt: str, action_id: int, new_state: ActionState, reason: str = ""):
@@ -224,7 +284,7 @@ def validate_state_transition(user_prompt: str, action_id: int, new_state: Actio
         ActionState.ASSIGNED: [ActionState.IN_PROGRESS, ActionState.ASSIGNED],
         ActionState.IN_PROGRESS: [ActionState.STATUS_VERIFICATION_REQUESTED, ActionState.IN_PROGRESS],
         ActionState.STATUS_VERIFICATION_REQUESTED: [ActionState.COMPLETED, ActionState.PENDING, ActionState.ERROR, ActionState.STATUS_VERIFICATION_REQUESTED],
-        ActionState.COMPLETED: [ActionState.FALLBACK_REQUESTED, ActionState.COMPLETED],
+        ActionState.COMPLETED: [ActionState.FALLBACK_REQUESTED, ActionState.RECIPE_REQUESTED, ActionState.TERMINATED, ActionState.COMPLETED],  # Allow direct recipe request (autonomous) or termination
         ActionState.PENDING: [ActionState.COMPLETED, ActionState.ERROR, ActionState.PENDING],
         # FIX: Allow ERROR to reach TERMINATED via FALLBACK_REQUESTED/RECIPE_REQUESTED or directly
         ActionState.ERROR: [ActionState.IN_PROGRESS, ActionState.PENDING, ActionState.ERROR, ActionState.FALLBACK_REQUESTED, ActionState.RECIPE_REQUESTED, ActionState.TERMINATED],
@@ -636,3 +696,144 @@ def initialize_deterministic_actions():
 def initialize_minimal_lifecycle_hooks():
     """Alias for initialization"""
     return initialize_deterministic_actions()
+
+
+# =============================================================================
+# LEDGER SYNC FUNCTIONS
+# =============================================================================
+
+def sync_action_state_to_ledger(
+    user_prompt: str,
+    action_id: int,
+    state: ActionState,
+    user_ledgers: Dict[str, Any]
+) -> bool:
+    """
+    Sync ActionState changes to SmartLedger TaskStatus.
+
+    This function should be called after every ActionState change to keep
+    the ledger in sync. This ensures the ledger accurately reflects the
+    current state of all actions.
+
+    Args:
+        user_prompt: The user_prompt key (e.g., "123_456")
+        action_id: The action ID (1-based)
+        state: The new ActionState
+        user_ledgers: The global user_ledgers dictionary
+
+    Returns:
+        bool: True if sync was successful, False otherwise
+
+    State Mapping:
+        ActionState.ASSIGNED → LedgerTaskStatus.PENDING
+        ActionState.IN_PROGRESS → LedgerTaskStatus.IN_PROGRESS
+        ActionState.STATUS_VERIFICATION_REQUESTED → LedgerTaskStatus.IN_PROGRESS
+        ActionState.COMPLETED → LedgerTaskStatus.COMPLETED
+        ActionState.PENDING → LedgerTaskStatus.BLOCKED
+        ActionState.ERROR → LedgerTaskStatus.FAILED
+        ActionState.FALLBACK_REQUESTED → LedgerTaskStatus.PAUSED
+        ActionState.FALLBACK_RECEIVED → LedgerTaskStatus.IN_PROGRESS
+        ActionState.RECIPE_REQUESTED → LedgerTaskStatus.IN_PROGRESS
+        ActionState.RECIPE_RECEIVED → LedgerTaskStatus.IN_PROGRESS
+        ActionState.TERMINATED → LedgerTaskStatus.COMPLETED
+    """
+    if user_prompt not in user_ledgers:
+        logger.debug(f"No ledger found for {user_prompt}, skipping sync")
+        return False
+
+    ledger = user_ledgers[user_prompt]
+    task_id = f"action_{action_id}"
+
+    if task_id not in ledger.tasks:
+        logger.debug(f"Task {task_id} not found in ledger, skipping sync")
+        return False
+
+    try:
+        LedgerTaskStatus = _get_ledger_task_status()
+
+        # Map ActionState to LedgerTaskStatus
+        STATE_MAP = {
+            ActionState.ASSIGNED: LedgerTaskStatus.PENDING,
+            ActionState.IN_PROGRESS: LedgerTaskStatus.IN_PROGRESS,
+            ActionState.STATUS_VERIFICATION_REQUESTED: LedgerTaskStatus.IN_PROGRESS,
+            ActionState.COMPLETED: LedgerTaskStatus.COMPLETED,
+            ActionState.PENDING: LedgerTaskStatus.BLOCKED,
+            ActionState.ERROR: LedgerTaskStatus.FAILED,
+            ActionState.FALLBACK_REQUESTED: LedgerTaskStatus.PAUSED,
+            ActionState.FALLBACK_RECEIVED: LedgerTaskStatus.IN_PROGRESS,
+            ActionState.RECIPE_REQUESTED: LedgerTaskStatus.IN_PROGRESS,
+            ActionState.RECIPE_RECEIVED: LedgerTaskStatus.IN_PROGRESS,
+            ActionState.TERMINATED: LedgerTaskStatus.COMPLETED,
+        }
+
+        ledger_status = STATE_MAP.get(state)
+        if ledger_status is None:
+            logger.warning(f"No mapping for ActionState {state}")
+            return False
+
+        # Get current ledger status to avoid unnecessary updates
+        current_ledger_status = ledger.tasks[task_id].status
+        if current_ledger_status == ledger_status:
+            return True  # Already in correct state
+
+        # Update ledger
+        ledger.update_task_status(
+            task_id,
+            ledger_status,
+            reason=f"Synced from ActionState.{state.value}"
+        )
+        logger.debug(f"Synced {task_id}: ActionState.{state.value} → LedgerTaskStatus.{ledger_status.value}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Error syncing action state to ledger: {e}")
+        return False
+
+
+def sync_all_actions_to_ledger(user_prompt: str, user_ledgers: Dict[str, Any]) -> int:
+    """
+    Sync all current ActionStates to the ledger.
+
+    Useful for bulk sync after recovery or initialization.
+
+    Args:
+        user_prompt: The user_prompt key
+        user_ledgers: The global user_ledgers dictionary
+
+    Returns:
+        int: Number of actions successfully synced
+    """
+    if user_prompt not in action_states:
+        return 0
+
+    synced = 0
+    for action_id, state in action_states[user_prompt].items():
+        if sync_action_state_to_ledger(user_prompt, action_id, state, user_ledgers):
+            synced += 1
+
+    logger.info(f"Synced {synced} actions to ledger for {user_prompt}")
+    return synced
+
+
+def get_ledger_status_for_action(user_prompt: str, action_id: int, user_ledgers: Dict[str, Any]) -> Optional[str]:
+    """
+    Get the current ledger status for an action.
+
+    Args:
+        user_prompt: The user_prompt key
+        action_id: The action ID
+        user_ledgers: The global user_ledgers dictionary
+
+    Returns:
+        str: The current ledger status value, or None if not found
+    """
+    if user_prompt not in user_ledgers:
+        return None
+
+    ledger = user_ledgers[user_prompt]
+    task_id = f"action_{action_id}"
+
+    if task_id not in ledger.tasks:
+        return None
+
+    return ledger.tasks[task_id].status.value
