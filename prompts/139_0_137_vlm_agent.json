@@ -1,0 +1,61 @@
+{
+    "status": "done",
+    "action": "Open PowerPoint application on the computer by clicking the Start menu, searching for PowerPoint, and launching it.",
+    "fallback_action": "Perform a Google search using Internet Explorer",
+    "persona": "user10077",
+    "action_id": 137,
+    "recipe": [
+        {
+            "steps": "is the first action. The task is to open the PowerPoint application by clicking the Start menu, searching for PowerPoint, and launching it. On the current screen, I can see the Windows interface but not the Start menu. To begin, I need to click the Start menu to open it.\nAction Description: Click the Start menu to begin searching for PowerPoint.",
+            "tool_name": "execute_windows_or_android_command",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Move mouse",
+            "tool_name": "execute_windows_or_android_command",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Perform left click",
+            "tool_name": "execute_windows_or_android_command",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "previous action: The previous action was to click the Start menu to begin searching for PowerPoint. On the current screen, the Start menu is now open, as indicated by the presence of the search bar and various app icons. This confirms the previous action succeeded. The next step is to type 'PowerPoint' in the search bar to search for the application.\nAction Description: Type 'PowerPoint' in the Start menu search bar to search for the application.",
+            "tool_name": "execute_windows_or_android_command",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Move mouse",
+            "tool_name": "execute_windows_or_android_command",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Type 'PowerPoint'",
+            "tool_name": "execute_windows_or_android_command",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "previous action: The previous action was to type 'PowerPoint' in the Start menu search bar. On the current screen, I can see that the search results have updated and the PowerPoint application icon is visible among the results. This confirms that the search was successful. The next step is to launch PowerPoint by clicking on its icon in the search results.\nAction Description: Click the PowerPoint application icon in the Start menu search results to launch PowerPoint.",
+            "tool_name": "execute_windows_or_android_command",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Move mouse",
+            "tool_name": "execute_windows_or_android_command",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Perform left click",
+            "tool_name": "execute_windows_or_android_command",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "no",
+    "scheduled_tasks": [],
+    "metadata": {
+        "user_id": "redacted <class 'int'>"
+    },
+    "time_took_to_complete": 63.825151681900024,
+    "actions_this_action_depends_on": []
+}

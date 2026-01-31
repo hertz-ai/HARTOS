@@ -1,0 +1,53 @@
+{
+    "status": "done",
+    "action": "Plan, decompose instructions, and create evaluation/checks to understand the percentage of instruction achievement and track the user's instruction until 100% completion in a reasonable time.",
+    "fallback_action": "",
+    "persona": "Radha",
+    "action_id": 4,
+    "recipe": [
+        {
+            "steps": "Ask the user for their instructions or goals.",
+            "tool_name": "",
+            "agent_to_perform_this_action": "Assistant"
+        },
+        {
+            "steps": "Analyze the user's instructions to break them down into smaller, manageable steps or tasks.",
+            "tool_name": "",
+            "agent_to_perform_this_action": "Assistant"
+        },
+        {
+            "steps": "Create a detailed plan with the decomposed tasks and assign priorities to each task.",
+            "tool_name": "",
+            "agent_to_perform_this_action": "Assistant"
+        },
+        {
+            "steps": "Define evaluation criteria and checkpoints to track progress and assess the percentage of instruction achievement.",
+            "tool_name": "",
+            "agent_to_perform_this_action": "Assistant"
+        },
+        {
+            "steps": "Provide regular updates to the user on the progress of their instruction until 100% completion.",
+            "tool_name": "",
+            "agent_to_perform_this_action": "Assistant"
+        },
+        {
+            "steps": "Save the current instruction and progress in memory using the key 'instruction_progress.current'.",
+            "tool_name": "save_data_in_memory",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "no-I need user's instructions to proceed",
+    "scheduled_tasks": [],
+    "metadata": {
+        "user_id": "redacted <class 'str'>",
+        "actions": {
+            "camera_request": {
+                "visual_context": "redacted <class 'str'>"
+            }
+        }
+    },
+    "time_took_to_complete": 10.851280450820923,
+    "actions_this_action_depends_on": [
+        3
+    ]
+}

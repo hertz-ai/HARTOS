@@ -150,11 +150,118 @@ try:
     from helper import retrieve_json
 except ImportError:
     retrieve_json = None
+
+# Google A2A integration (from gpt4.1)
+try:
+    from integrations.google_a2a import initialize_a2a_server, get_a2a_server, register_all_agents
+except ImportError:
+    initialize_a2a_server = None
+    get_a2a_server = None
+    register_all_agents = None
 # os.environ['LANGCHAIN_TRACING_V2'] = 'true'
 # os.environ['LANGCHAIN_ENDPOINT'] = 'https://api.smith.langchain.com'
 # os.environ['LANGCHAIN_API_KEY'] = os.getenv("LANGCHAIN_API_KEY")
 # os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGCHAIN_PROJECT")
 groq_api_key = os.environ['GROQ_API_KEY']
+
+
+# ============================================================================
+# Custom Qwen3-VL LangChain Wrapper
+# ============================================================================
+class ChatQwen3VL(LLM):
+    """
+    Custom LangChain LLM wrapper for local Qwen3-VL API server.
+
+    Compatible with LangChain's LLM interface while calling the local
+    Qwen3-VL server at http://localhost:8000/v1/chat/completions.
+
+    Features:
+    - OpenAI-compatible API interface
+    - Multimodal support (text + images)
+    - Zero API costs (local server)
+    - Drop-in replacement for ChatOpenAI
+    """
+
+    base_url: str = "http://localhost:8080/v1"
+    model_name: str = "Qwen3-VL-4B-Instruct"
+    temperature: float = 0.7
+    max_tokens: int = 1500
+
+    @property
+    def _llm_type(self) -> str:
+        return "qwen3-vl"
+
+    def _call(self, prompt: str, stop: list = None) -> str:
+        """
+        Call the Qwen3-VL API with the given prompt.
+
+        Args:
+            prompt: The input text prompt
+            stop: Optional stop sequences
+
+        Returns:
+            The generated response text
+        """
+        import requests
+
+        payload = {
+            "model": self.model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens
+        }
+
+        if stop:
+            payload["stop"] = stop
+
+        try:
+            response = requests.post(
+                f"{self.base_url}/chat/completions",
+                json=payload,
+                timeout=60
+            )
+            response.raise_for_status()
+
+            data = response.json()
+            return data["choices"][0]["message"]["content"]
+
+        except Exception as e:
+            app.logger.error(f"[Qwen3-VL] Error calling API: {e}")
+            raise
+
+    @property
+    def _identifying_params(self) -> dict:
+        """Return identifying parameters."""
+        return {
+            "model_name": self.model_name,
+            "base_url": self.base_url,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens
+        }
+
+
+# Flag to switch between OpenAI and Qwen3-VL
+USE_QWEN3VL = True  # Set to False to use OpenAI instead
+
+def get_llm(model_name="gpt-3.5-turbo", temperature=0.7, max_tokens=1500):
+    """
+    Get LLM instance based on configuration.
+
+    Returns ChatQwen3VL if USE_QWEN3VL is True, otherwise ChatOpenAI.
+    """
+    if USE_QWEN3VL:
+        return ChatQwen3VL(
+            model_name="Qwen3-VL-2B-Instruct",
+            temperature=temperature,
+            max_tokens=max_tokens
+        )
+    else:
+        return ChatOpenAI(
+            model_name=model_name,
+            temperature=temperature,
+            max_tokens=max_tokens
+        )
+# ============================================================================
 
 
 class RequestLogRecord(logging.LogRecord):
@@ -189,6 +296,21 @@ app.logger.propagate = False
 
 # Test logging
 app.logger.info('Logger initialized')
+
+# ============================================================================
+# Google A2A Protocol Initialization
+# ============================================================================
+# Initialize A2A server for cross-platform agent communication
+try:
+    app.logger.info("Initializing Google A2A Protocol server...")
+    a2a_server = initialize_a2a_server(app, base_url="http://localhost:6777")
+    app.logger.info("Google A2A Protocol server initialized successfully")
+
+    # Register all agents with A2A
+    register_all_agents()
+    app.logger.info("All agents registered with Google A2A Protocol")
+except Exception as e:
+    app.logger.warning(f"Google A2A Protocol initialization error (non-critical): {e}")
 
 # openAPI spec
 try:
@@ -264,7 +386,9 @@ except Exception as e:
 # initialized with a `ChatOpenAI` object using the model name "gpt-3.5-turbo".
 
 # llm_math = LLMMathChain(ChatOpenAI(model_name="gpt-3.5-turbo"))
-llm_math = LLMMathChain(llm=ChatOpenAI(model_name="gpt-3.5-turbo"))
+# Old: llm_math = LLMMathChain(llm=ChatOpenAI(model_name="gpt-3.5-turbo"))
+# New: Using get_llm() to automatically use Qwen3-VL or OpenAI based on USE_QWEN3VL flag
+llm_math = LLMMathChain(llm=get_llm(model_name="gpt-3.5-turbo"))
 # llm_math = LLMMathChain(llm= ChatGroq(groq_api_key=groq_api_key,
 #                model_name = "mixtral-8x7b-32768"))
 

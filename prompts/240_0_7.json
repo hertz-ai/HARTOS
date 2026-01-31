@@ -1,0 +1,43 @@
+{
+    "status": "done",
+    "action": "Schedule flow execution every two hours, track each story using metadata timestamps, and manage information contextually.",
+    "fallback_action": "If the scheduling or story tracking fails, notify the user with the reason for failure and offer to retry the action or provide manual intervention options (such as direct rescheduling or manual story management).",
+    "persona": "News Curator",
+    "action_id": 7,
+    "recipe": [
+        {
+            "steps": "Initiate a scheduled job that triggers the news curation and video generation flow automatically every two hours using the scheduling tool.",
+            "tool_name": "create_scheduled_jobs",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Use stored metadata (timestamps) to track the status and expiry of each news story and associated video, ensuring context-aware information management across each scheduled flow execution.",
+            "agent_to_perform_this_action": "Assistant"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [
+        {
+            "cron_expression": "0 */2 * * *",
+            "persona": "News Curator",
+            "action_entry_point": 7,
+            "job_description": "Trigger the news-to-video orchestration and manage contextual story and video metadata using timestamps."
+        }
+    ],
+    "metadata": {
+        "user_id": "redacted int",
+        "avatars": {
+            "genre_mapping": {
+                "Politics": "redacted int",
+                "Business": "redacted int",
+                "Sports": "redacted int",
+                "Breaking News": "redacted int",
+                "Science": "redacted int",
+                "AI": "redacted int",
+                "Weather": "redacted int"
+            }
+        }
+    },
+    "time_took_to_complete": 13.524152040481567,
+    "actions_this_action_depends_on": []
+}

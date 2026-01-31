@@ -1,0 +1,31 @@
+{
+    "status": "done",
+    "action": "Launch Visual Studio Code by clicking the desktop icon or via the Start menu.",
+    "fallback_action": "Perform a Google search using Internet Explorer",
+    "persona": "user16695",
+    "action_id": 1,
+    "recipe": [
+        {
+            "steps": "is the first action. The task is to launch Visual Studio Code by clicking the desktop icon or via the Start menu. On the screen, I can see the Visual Studio Code icon (Box ID 381) on the left side of the desktop. I will double-click this icon to launch Visual Studio Code.",
+            "tool_name": "execute_windows_or_android_command",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Move mouse",
+            "tool_name": "execute_windows_or_android_command",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Perform double click",
+            "tool_name": "execute_windows_or_android_command",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "no",
+    "scheduled_tasks": [],
+    "metadata": {
+        "user_id": "redacted <class 'int'>"
+    },
+    "time_took_to_complete": 19.671258687973022,
+    "actions_this_action_depends_on": []
+}

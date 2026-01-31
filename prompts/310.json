@@ -1,0 +1,134 @@
+{
+  "status": "completed",
+  "name": "VLM Computer Use Coding Agent",
+  "broadcast_agent": false,
+  "personas": [
+    {
+      "name": "IDE Coder",
+      "description": "IDE Coder operates VS Code entirely via GUI - creating files, writing Python code, using IntelliSense, navigating with keyboard shortcuts, and saving work."
+    },
+    {
+      "name": "Terminal Operator",
+      "description": "Terminal Operator executes commands in VS Code integrated terminal - running Python scripts, pip install, pytest, git commands, and reading output."
+    },
+    {
+      "name": "File Manager",
+      "description": "File Manager creates project structure via File Explorer and VS Code - making folders (src, tests, docs), organizing files, and managing workspace."
+    },
+    {
+      "name": "Debugger",
+      "description": "Debugger uses VS Code debugging GUI - setting breakpoints by clicking line numbers, stepping through code, inspecting variables, and fixing issues."
+    },
+    {
+      "name": "Browser Researcher",
+      "description": "Browser Researcher opens Chrome to search documentation, Stack Overflow, and GitHub - copying code snippets and pasting into the IDE."
+    }
+  ],
+  "flows": [
+    {
+      "flow_name": "Project Setup Flow",
+      "persona": "File Manager",
+      "actions": [
+        "Open VS Code via Start menu or desktop shortcut",
+        "Click File > Open Folder and create new project folder called MyPythonProject in Documents",
+        "In VS Code Explorer, right-click and create src folder",
+        "Right-click and create tests folder",
+        "Right-click and create docs folder",
+        "Open integrated terminal using Ctrl+` or View > Terminal",
+        "In terminal, type 'python -m venv venv' and press Enter to create virtual environment",
+        "In terminal, type 'git init' and press Enter to initialize repository"
+      ],
+      "sub_goal": "Set up complete Python project structure with folders, virtual environment, and git"
+    },
+    {
+      "flow_name": "Code Development Flow",
+      "persona": "IDE Coder",
+      "actions": [
+        "Right-click on src folder in Explorer and select New File, name it main.py",
+        "Click into editor and type the Python shebang and docstring at top of file",
+        "Type import statements: import sys, import argparse",
+        "Type main function with argparse setup and basic logic",
+        "Type if __name__ == '__main__': sys.exit(main()) at bottom",
+        "Press Ctrl+S to save the file",
+        "Right-click src folder, create utils.py with utility functions",
+        "Right-click src folder, create __init__.py to make it a package",
+        "Save all files with Ctrl+S"
+      ],
+      "sub_goal": "Write modular Python code with main entry point and utility modules"
+    },
+    {
+      "flow_name": "Test Development Flow",
+      "persona": "IDE Coder",
+      "actions": [
+        "Right-click on tests folder and create test_main.py",
+        "Type import pytest and from src import main at top",
+        "Write test functions using def test_function_name(): pattern",
+        "Add assertions using assert statements",
+        "Save the test file with Ctrl+S",
+        "Right-click tests folder, create __init__.py",
+        "Create conftest.py with any shared fixtures"
+      ],
+      "sub_goal": "Create pytest test files covering main functionality"
+    },
+    {
+      "flow_name": "Run Tests Flow",
+      "persona": "Terminal Operator",
+      "actions": [
+        "Click into the integrated terminal",
+        "Type '.\\venv\\Scripts\\activate' and press Enter to activate venv",
+        "Type 'pip install pytest pytest-cov' and press Enter",
+        "Type 'pytest tests/ -v' and press Enter to run tests",
+        "Read the test output to see passed/failed tests",
+        "If tests fail, note the error messages for debugging"
+      ],
+      "sub_goal": "Run pytest and verify all tests pass"
+    },
+    {
+      "flow_name": "Debug Flow",
+      "persona": "Debugger",
+      "actions": [
+        "Open the Python file to debug in VS Code editor",
+        "Click on line number where you want breakpoint - red dot appears",
+        "Press F5 or click Run and Debug icon in activity bar",
+        "Select 'Python File' from debug configuration dropdown",
+        "When breakpoint hits, use F10 to step over, F11 to step into",
+        "Hover over variables to see values in tooltip",
+        "Check Variables pane in Debug sidebar for current state",
+        "Press F5 to continue or Shift+F5 to stop debugging"
+      ],
+      "sub_goal": "Debug Python code using VS Code visual debugger with breakpoints"
+    },
+    {
+      "flow_name": "Documentation Flow",
+      "persona": "IDE Coder",
+      "actions": [
+        "Right-click project root in Explorer, create README.md",
+        "Type markdown header: # MyPythonProject",
+        "Add description section explaining what the project does",
+        "Add installation section with pip install instructions",
+        "Add usage section with code examples",
+        "Add testing section explaining how to run tests",
+        "Save with Ctrl+S",
+        "Create requirements.txt with project dependencies"
+      ],
+      "sub_goal": "Create comprehensive README and requirements documentation"
+    },
+    {
+      "flow_name": "Git Commit Flow",
+      "persona": "Terminal Operator",
+      "actions": [
+        "Click Source Control icon in VS Code activity bar (branch icon)",
+        "Review changed files listed in the panel",
+        "Click + icon next to each file to stage, or click + next to Changes to stage all",
+        "Type commit message in the text box at top",
+        "Click checkmark icon or press Ctrl+Enter to commit",
+        "Alternatively in terminal: type 'git add .' and Enter",
+        "Type 'git commit -m \"Initial commit\"' and Enter"
+      ],
+      "sub_goal": "Stage and commit changes using Git via VS Code GUI or terminal"
+    }
+  ],
+  "goal": "Develop Python applications entirely through VS Code GUI interaction - creating projects, writing code, running tests, debugging, and managing git - all via visual computer use without direct file system access.",
+  "prompt_id": 310,
+  "creator_user_id": 999
+}

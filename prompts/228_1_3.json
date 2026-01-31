@@ -1,0 +1,37 @@
+{
+    "status": "done",
+    "action": "Deliver the full set of up to 5 pre-generated videos and their assigned avatars to the user, in sequence, without generating additional videos during the same active 2-hour window.",
+    "fallback_action": "If the videos cannot be delivered, notify the user of the unavailability.",
+    "persona": "News Curator",
+    "action_id": 3,
+    "recipe": [
+        {
+            "steps": "Obtain the list of up to 5 pre-generated videos and associated avatar IDs (prepared in the previous step).",
+            "agent_to_perform_this_action": "Assistant"
+        },
+        {
+            "steps": "For each video in the set, send the video along with the avatar information to the user in sequence.",
+            "tool_name": "send_presynthesize_video_to_user",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Ensure that no new video generation requests are initiated for the user during the current active 2-hour window.",
+            "agent_to_perform_this_action": "Assistant"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [],
+    "metadata": {
+        "user_id": "redacted <class 'int'>",
+        "source_conv_id": {
+            "active_window": "redacted <class 'str'>"
+        },
+        "avatars": {
+            "genre_to_avatar_id": "redacted <class 'str'>"
+        }
+    },
+    "time_took_to_complete": 122.38143539428711,
+    "actions_this_action_depends_on": [
+        2
+    ]
+}

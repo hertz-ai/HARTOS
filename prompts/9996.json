@@ -1,0 +1,1 @@
+{"status": "completed", "name": "HelloBot", "broadcast_agent": false, "personas": [{"name": "Greeter", "description": "A persona that greets users"}], "tools": [], "flows": [{"flow_name": "GreetFlow", "persona": "Greeter", "actions": ["Detect user", "Say hello"], "sub_goal": "greet users"}], "goal": "greet users", "prompt_id": 9996, "creator_user_id": 999}

@@ -1,0 +1,126 @@
+{
+    "status": "done",
+    "action": "Generate narration scripts (~5 minutes) per genre.",
+    "fallback_action": "",
+    "persona": "News Curator",
+    "action_id": 5,
+    "recipe": [
+        {
+            "steps": "Fetch the latest news content for each genre: Politics, Business, Sports, Breaking News, and Weather.",
+            "tool_name": "get_data_by_key",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Generate a 5-minute narration script for the Politics genre using the content fetched.",
+            "tool_name": "",
+            "generalized_functions": "import textwrap\n\ndef generate_script(news_content, genre):\n    script = f\"Here is the latest {genre} news for you:\\n\\n\"\n    wrapped_content = textwrap.fill(news_content, width=80)\n    script += wrapped_content + \"\\n\\n\"\n    script += \"Thank you for listening to the latest updates.\"\n    return script\n\nnews_content = \"BBC News - Politics... content\"\ngenre = \"Politics\"\nscript = generate_script(news_content, genre)\nprint(script)",
+            "agent_to_perform_this_action": "Executor"
+        },
+        {
+            "steps": "Generate a 5-minute narration script for the Business genre using the content fetched.",
+            "tool_name": "",
+            "generalized_functions": "news_content = \"BBC News - Business... content\"\ngenre = \"Business\"\nscript = generate_script(news_content, genre)\nprint(script)",
+            "agent_to_perform_this_action": "Executor"
+        },
+        {
+            "steps": "Generate a 5-minute narration script for the Sports genre using the content fetched.",
+            "tool_name": "",
+            "generalized_functions": "news_content = \"BBC News - Sports... content\"\ngenre = \"Sports\"\nscript = generate_script(news_content, genre)\nprint(script)",
+            "agent_to_perform_this_action": "Executor"
+        },
+        {
+            "steps": "Generate a 5-minute narration script for the Breaking News genre using the content fetched.",
+            "tool_name": "",
+            "generalized_functions": "news_content = \"BBC News - Breaking News... content\"\ngenre = \"Breaking News\"\nscript = generate_script(news_content, genre)\nprint(script)",
+            "agent_to_perform_this_action": "Executor"
+        },
+        {
+            "steps": "Generate a 5-minute narration script for the Weather genre using the content fetched.",
+            "tool_name": "",
+            "generalized_functions": "news_content = \"BBC News - Weather... content\"\ngenre = \"Weather\"\nscript = generate_script(news_content, genre)\nprint(script)",
+            "agent_to_perform_this_action": "Executor"
+        },
+        {
+            "steps": "Save the generated scripts in memory for future reference.",
+            "tool_name": "save_data_in_memory",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [],
+    "metadata": {
+        "user_id": "redacted <class 'int'>",
+        "session": {
+            "conv_id": "redacted <class 'str'>",
+            "source_conv_id": "redacted <class 'str'>"
+        },
+        "news": {
+            "content": "redacted <class 'str'>",
+            "avatar_assignment": "redacted <class 'str'>",
+            "script": {
+                "politics": "redacted <class 'str'>",
+                "business": "redacted <class 'str'>",
+                "sports": "redacted <class 'str'>",
+                "breaking_news": "redacted <class 'str'>",
+                "weather": "redacted <class 'str'>"
+            },
+            "video": {
+                "politics": {
+                    "conv_id": "redacted <class 'str'>"
+                },
+                "business": {
+                    "conv_id": "redacted <class 'str'>"
+                },
+                "sports": {
+                    "conv_id": "redacted <class 'str'>"
+                },
+                "breaking_news": {
+                    "conv_id": "redacted <class 'str'>"
+                },
+                "weather": {
+                    "conv_id": "redacted <class 'str'>"
+                },
+                "metadata": {
+                    "conv_id": "redacted <class 'str'>",
+                    "metadata": {
+                        "politics": {
+                            "avatar": "redacted <class 'str'>",
+                            "video_link": "redacted <class 'str'>",
+                            "status": "redacted <class 'str'>",
+                            "timestamp": "redacted <class 'str'>"
+                        },
+                        "business": {
+                            "avatar": "redacted <class 'str'>",
+                            "video_link": "redacted <class 'str'>",
+                            "status": "redacted <class 'str'>",
+                            "timestamp": "redacted <class 'str'>"
+                        },
+                        "sports": {
+                            "avatar": "redacted <class 'str'>",
+                            "video_link": "redacted <class 'str'>",
+                            "status": "redacted <class 'str'>",
+                            "timestamp": "redacted <class 'str'>"
+                        },
+                        "breaking_news": {
+                            "avatar": "redacted <class 'str'>",
+                            "video_link": "redacted <class 'str'>",
+                            "status": "redacted <class 'str'>",
+                            "timestamp": "redacted <class 'str'>"
+                        },
+                        "weather": {
+                            "avatar": "redacted <class 'str'>",
+                            "video_link": "redacted <class 'str'>",
+                            "status": "redacted <class 'str'>",
+                            "timestamp": "redacted <class 'str'>"
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "time_took_to_complete": 38.37455177307129,
+    "actions_this_action_depends_on": [
+        3,
+        4
+    ]
+}

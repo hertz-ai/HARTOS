@@ -1,0 +1,54 @@
+{
+    "status": "done",
+    "action": "Check the generation status of each video (by conv_id) every minute using the provided API, and update the status to success as soon as it is confirmed.",
+    "fallback_action": "If a conv_id status check fails, retry once after a short delay. If status remains unconfirmed, retain previous status and log the failure for manual review.",
+    "persona": "News Curator",
+    "action_id": 6,
+    "recipe": [
+        {
+            "steps": "Retrieve the list of conv_ids for pending videos from memory.",
+            "tool_name": "get_saved_metadata",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "For each conv_id, call the API endpoint https://mailer.hertzai.com/get-video-conv_id/{{conv_id}} to check the current status of video generation.",
+            "generalized_functions": "def check_video_status(conv_id):\n    \"\"\"\n    Check the status of video generation for a given conv_id via API.\n    Args:\n        conv_id (str): The video conversation ID.\n    Returns:\n        dict: API response with current status.\n    Usage:\n        check_video_status('abcd1234')\n    \"\"\"\n    import requests\n    url = f\"https://mailer.hertzai.com/get-video-conv_id/{conv_id}\"\n    response = requests.get(url)\n    return response.json()\n",
+            "agent_to_perform_this_action": "Executor"
+        },
+        {
+            "steps": "If the API response indicates success, update the video's status to success in memory. Otherwise, retain status as pending.",
+            "tool_name": "save_data_in_memory",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [
+        {
+            "cron_expression": "* * * * *",
+            "persona": "News Curator",
+            "action_entry_point": 6,
+            "job_description": "Periodically check and update the status of each AI-generated news video every minute"
+        }
+    ],
+    "metadata": {
+        "user_id": "redacted int",
+        "avatars": {
+            "teacher_avatar_ids": [
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int"
+            ]
+        }
+    },
+    "time_took_to_complete": 26.288475036621094,
+    "actions_this_action_depends_on": [
+        5
+    ]
+}

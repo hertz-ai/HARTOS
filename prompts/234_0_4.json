@@ -1,0 +1,96 @@
+{
+    "status": "done",
+    "action": "Generate one realistic AI news anchor-style video for each genre using the assigned avatar and the narration script, then save the resulting conv_id alongside the corresponding script with status 'pending'.",
+    "fallback_action": "If video generation fails for any script or avatar, retry automatically up to three times, then notify the user with details for manual review or approval.",
+    "persona": "News Curator",
+    "action_id": 4,
+    "recipe": [
+        {
+            "steps": "For each genre, retrieve the assigned avatar ID and its corresponding news narration script.",
+            "tool_name": "",
+            "agent_to_perform_this_action": "Assistant"
+        },
+        {
+            "steps": "Call the Generate_video tool with the selected avatar and the script to create a realistic AI video of a news anchor reading.",
+            "tool_name": "Generate_video",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Capture the returned conv_id from the video generation tool and link it to the script and genre with its current status set as 'pending'.",
+            "tool_name": "",
+            "agent_to_perform_this_action": "Assistant"
+        },
+        {
+            "steps": "Save the mapping of genre, avatar, script, conv_id, and status in memory using a generic key structure for later reference and workflow steps.",
+            "tool_name": "save_data_in_memory",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [],
+    "metadata": {
+        "user_id": "redacted int",
+        "avatars": {
+            "teacher_avatar_ids": [
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int"
+            ]
+        },
+        "genres": {
+            "avatar_assignment": {
+                "Politics": "redacted int",
+                "Business": "redacted int",
+                "Sports": "redacted int",
+                "Breaking News": "redacted int",
+                "Science": "redacted int",
+                "AI": "redacted int",
+                "Weather": "redacted int"
+            }
+        },
+        "news_scripts": {
+            "latest_batch": {
+                "Politics": {
+                    "script": null,
+                    "timestamp": null
+                },
+                "Business": {
+                    "script": null,
+                    "timestamp": null
+                },
+                "Sports": {
+                    "script": null,
+                    "timestamp": null
+                },
+                "Breaking News": {
+                    "script": null,
+                    "timestamp": null
+                },
+                "Science": {
+                    "script": null,
+                    "timestamp": null
+                },
+                "AI": {
+                    "script": null,
+                    "timestamp": null
+                },
+                "Weather": {
+                    "script": null,
+                    "timestamp": null
+                }
+            }
+        }
+    },
+    "time_took_to_complete": 102.44193649291992,
+    "actions_this_action_depends_on": [
+        2,
+        3
+    ]
+}

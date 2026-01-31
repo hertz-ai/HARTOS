@@ -1,0 +1,42 @@
+{
+    "status": "done",
+    "action": "Set up a scheduled job to repeat the following every 5 minutes: check for conv_id with status 'success', fetch 7 pre-generated videos for each valid conv_id including assigned avatars, and publish them to the user while saving the conv_id list to metadata.",
+    "fallback_action": "If any step fails during an iteration, follow the individual fallback strategies for each action (retry, await data, etc.), and continue monitoring on the next scheduled interval.",
+    "persona": "User",
+    "action_id": 4,
+    "recipe": [
+        {
+            "steps": "Create a scheduled job that triggers the workflow of checking valid conv_id, fetching pre-generated videos, and publishing videos/saving metadata every 5 minutes.",
+            "tool_name": "create_scheduled_jobs",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [
+        {
+            "cron_expression": "*/5 * * * *",
+            "persona": "User",
+            "action_entry_point": 1,
+            "job_description": "Every 5 minutes, check for new valid conv_id entries, fetch pre-generated videos associated with each, publish those videos to the user, and save processed conv_ids in metadata."
+        }
+    ],
+    "metadata": {
+        "user_id": "redacted int",
+        "avatars": {
+            "teacher_avatar_ids": [
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int"
+            ]
+        }
+    },
+    "time_took_to_complete": 16.251949310302734,
+    "actions_this_action_depends_on": []
+}

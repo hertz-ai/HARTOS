@@ -1,0 +1,24 @@
+# Mock API Services
+# Simulates external API dependencies for testing
+
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Install dependencies
+RUN pip install --no-cache-dir \
+    flask==3.0.0 \
+    flask-cors==4.0.0
+
+# Copy mock server code
+COPY tests/runtime_tests/mock_services/mock_api_server.py .
+
+# Expose ports
+EXPOSE 9890 9891 9892 5459
+
+# Health check
+HEALTHCHECK --interval=10s --timeout=5s --retries=3 \
+    CMD python -c "import requests; requests.get('http://localhost:9890/health')"
+
+# Run server
+CMD ["python", "mock_api_server.py"]

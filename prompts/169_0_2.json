@@ -1,0 +1,87 @@
+{
+    "status": "done",
+    "action": "Check for Active 2-Hour Window",
+    "fallback_action": "",
+    "persona": "News Curator",
+    "action_id": 2,
+    "recipe": [
+        {
+            "steps": "Retrieve the status of the last active 2-hour window from saved metadata.",
+            "tool_name": "get_data_by_key",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "If the last active 2-hour window is still valid, mark it as an active session.",
+            "tool_name": "",
+            "agent_to_perform_this_action": "Assistant"
+        },
+        {
+            "steps": "If the last active 2-hour window has expired, create a new 2-hour active session.",
+            "tool_name": "create_scheduled_jobs",
+            "generalized_functions": "",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Save the status of the new active 2-hour window in memory.",
+            "tool_name": "save_data_in_memory",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [],
+    "metadata": {
+        "user_id": "redacted <class 'int'>",
+        "user": {
+            "details": {
+                "16767": "redacted <class 'str'>"
+            }
+        },
+        "memory": {
+            "active_2_hour_window": {
+                "check": "redacted <class 'str'>"
+            }
+        },
+        "news_content": {
+            "technology": "redacted <class 'str'>",
+            "health": "redacted <class 'str'>",
+            "sports": "redacted <class 'str'>",
+            "business": "redacted <class 'str'>",
+            "entertainment": "redacted <class 'str'>"
+        },
+        "teacher_avatars": [
+            "redacted <class 'int'>",
+            "redacted <class 'int'>",
+            "redacted <class 'int'>",
+            "redacted <class 'int'>",
+            "redacted <class 'int'>",
+            "redacted <class 'int'>",
+            "redacted <class 'int'>",
+            "redacted <class 'int'>",
+            "redacted <class 'int'>",
+            "redacted <class 'int'>"
+        ],
+        "assigned_avatars": {
+            "technology": "redacted <class 'int'>",
+            "health": "redacted <class 'int'>",
+            "sports": "redacted <class 'int'>",
+            "business": "redacted <class 'int'>",
+            "entertainment": "redacted <class 'int'>"
+        },
+        "narration_scripts": {
+            "technology": "redacted <class 'str'>",
+            "health": "redacted <class 'str'>",
+            "sports": "redacted <class 'str'>",
+            "business": "redacted <class 'str'>",
+            "entertainment": "redacted <class 'str'>"
+        },
+        "generated_videos": {
+            "technology": "redacted <class 'str'>",
+            "health": "redacted <class 'str'>",
+            "sports": "redacted <class 'str'>",
+            "business": "redacted <class 'str'>",
+            "entertainment": "redacted <class 'str'>"
+        }
+    },
+    "time_took_to_complete": 146.0325961112976,
+    "actions_this_action_depends_on": []
+}
