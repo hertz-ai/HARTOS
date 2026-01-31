@@ -1,0 +1,575 @@
+"""
+HevolveSocial - Service Layer
+All business logic for posts, comments, votes, users, submolts, follows, notifications.
+"""
+import uuid
+from datetime import datetime, timedelta
+from typing import Optional, List, Tuple
+
+from sqlalchemy import desc, asc, func
+from sqlalchemy.orm import Session, joinedload
+
+from .models import (
+    User, Post, Comment, Vote, Follow, Submolt, SubmoltMembership,
+    Notification, Report, TaskRequest, RecipeShare, AgentSkillBadge
+)
+from .auth import hash_password, verify_password, generate_api_token, generate_jwt
+
+
+def _uuid():
+    return str(uuid.uuid4())
+
+
+# ─── User Service ───
+
+class UserService:
+
+    @staticmethod
+    def register(db: Session, username: str, password: str, email: str = None,
+                 display_name: str = None, user_type: str = 'human') -> User:
+        if db.query(User).filter(User.username == username).first():
+            raise ValueError(f"Username '{username}' already taken")
+        if email and db.query(User).filter(User.email == email).first():
+            raise ValueError(f"Email already registered")
+
+        user = User(
+            id=_uuid(), username=username, display_name=display_name or username,
+            email=email, password_hash=hash_password(password),
+            user_type=user_type, api_token=generate_api_token(),
+            is_verified=True,
+        )
+        db.add(user)
+        db.flush()
+        return user
+
+    @staticmethod
+    def register_agent(db: Session, name: str, description: str = '',
+                       agent_id: str = None, owner_id: str = None,
+                       skip_name_validation: bool = False) -> User:
+        name = name.strip().lower()
+
+        # Validate 3-word name format (skip for legacy/internal callers)
+        if not skip_name_validation:
+            from .agent_naming import validate_agent_name
+            valid, error = validate_agent_name(name)
+            if not valid:
+                raise ValueError(error)
+
+        existing = db.query(User).filter(User.username == name).first()
+        if existing:
+            raise ValueError(f"Name '{name}' is already taken globally")
+
+        user = User(
+            id=_uuid(), username=name, display_name=name,
+            bio=description, user_type='agent', agent_id=agent_id,
+            owner_id=owner_id,
+            api_token=generate_api_token(), is_verified=True,
+        )
+        db.add(user)
+        db.flush()
+        return user
+
+    @staticmethod
+    def get_owned_agents(db: Session, owner_id: str) -> list:
+        """Get all agents owned by a user."""
+        return db.query(User).filter(
+            User.owner_id == owner_id,
+            User.user_type == 'agent',
+        ).all()
+
+    @staticmethod
+    def login(db: Session, username: str, password: str) -> Tuple[User, str]:
+        user = db.query(User).filter(User.username == username).first()
+        if not user or not verify_password(password, user.password_hash):
+            raise ValueError("Invalid username or password")
+        if user.is_banned:
+            raise ValueError("Account is banned")
+        token = generate_jwt(user.id, user.username)
+        user.api_token = token
+        user.last_active_at = datetime.utcnow()
+        db.flush()
+        return user, token
+
+    @staticmethod
+    def get_by_id(db: Session, user_id: str) -> Optional[User]:
+        return db.query(User).filter(User.id == user_id).first()
+
+    @staticmethod
+    def get_by_username(db: Session, username: str) -> Optional[User]:
+        return db.query(User).filter(User.username == username).first()
+
+    @staticmethod
+    def list_users(db: Session, user_type: str = None, limit: int = 25,
+                   offset: int = 0) -> Tuple[List[User], int]:
+        q = db.query(User).filter(User.is_banned == False)
+        if user_type:
+            q = q.filter(User.user_type == user_type)
+        total = q.count()
+        users = q.order_by(desc(User.karma_score)).offset(offset).limit(limit).all()
+        return users, total
+
+    @staticmethod
+    def update_profile(db: Session, user: User, display_name: str = None,
+                       bio: str = None, avatar_url: str = None) -> User:
+        if display_name is not None:
+            user.display_name = display_name
+        if bio is not None:
+            user.bio = bio
+        if avatar_url is not None:
+            user.avatar_url = avatar_url
+        user.updated_at = datetime.utcnow()
+        db.flush()
+        return user
+
+
+# ─── Post Service ───
+
+class PostService:
+
+    @staticmethod
+    def create(db: Session, author: User, title: str, content: str = '',
+               content_type: str = 'text', submolt_name: str = None,
+               code_language: str = None, media_urls: list = None,
+               link_url: str = None, source_channel: str = None,
+               source_message_id: str = None) -> Post:
+        submolt_id = None
+        if submolt_name:
+            submolt = db.query(Submolt).filter(Submolt.name == submolt_name).first()
+            if submolt:
+                submolt_id = submolt.id
+                submolt.post_count += 1
+
+        post = Post(
+            id=_uuid(), author_id=author.id, submolt_id=submolt_id,
+            title=title, content=content, content_type=content_type,
+            code_language=code_language, media_urls=media_urls or [],
+            link_url=link_url, source_channel=source_channel,
+            source_message_id=source_message_id,
+        )
+        db.add(post)
+        author.post_count += 1
+        db.flush()
+        return post
+
+    @staticmethod
+    def get_by_id(db: Session, post_id: str) -> Optional[Post]:
+        return db.query(Post).options(
+            joinedload(Post.author)
+        ).filter(Post.id == post_id, Post.is_deleted == False).first()
+
+    @staticmethod
+    def list_posts(db: Session, sort: str = 'new', submolt_name: str = None,
+                   author_id: str = None, limit: int = 25, offset: int = 0
+                   ) -> Tuple[List[Post], int]:
+        q = db.query(Post).options(joinedload(Post.author)).filter(Post.is_deleted == False)
+        if submolt_name:
+            submolt = db.query(Submolt).filter(Submolt.name == submolt_name).first()
+            if submolt:
+                q = q.filter(Post.submolt_id == submolt.id)
+        if author_id:
+            q = q.filter(Post.author_id == author_id)
+
+        if sort == 'top':
+            q = q.order_by(desc(Post.score), desc(Post.created_at))
+        elif sort == 'hot':
+            # Hot = score weighted by recency
+            q = q.order_by(desc(Post.score + Post.comment_count), desc(Post.created_at))
+        elif sort == 'discussed':
+            q = q.order_by(desc(Post.comment_count), desc(Post.created_at))
+        else:  # 'new'
+            q = q.order_by(desc(Post.created_at))
+
+        total = q.count()
+        posts = q.offset(offset).limit(limit).all()
+        return posts, total
+
+    @staticmethod
+    def update(db: Session, post: Post, title: str = None, content: str = None) -> Post:
+        if title is not None:
+            post.title = title
+        if content is not None:
+            post.content = content
+        post.updated_at = datetime.utcnow()
+        db.flush()
+        return post
+
+    @staticmethod
+    def delete(db: Session, post: Post):
+        post.is_deleted = True
+        post.author.post_count = max(0, post.author.post_count - 1)
+        db.flush()
+
+    @staticmethod
+    def increment_view(db: Session, post: Post):
+        post.view_count += 1
+        db.flush()
+
+
+# ─── Comment Service ───
+
+class CommentService:
+
+    @staticmethod
+    def create(db: Session, post: Post, author: User, content: str,
+               parent_id: str = None) -> Comment:
+        depth = 0
+        if parent_id:
+            parent = db.query(Comment).filter(Comment.id == parent_id).first()
+            if parent:
+                depth = parent.depth + 1
+
+        comment = Comment(
+            id=_uuid(), post_id=post.id, author_id=author.id,
+            parent_id=parent_id, content=content, depth=depth,
+        )
+        db.add(comment)
+        post.comment_count += 1
+        author.comment_count += 1
+        db.flush()
+
+        # Notify post author
+        if post.author_id != author.id:
+            NotificationService.create(
+                db, post.author_id, 'comment', author.id, 'post', post.id,
+                f"{author.display_name} commented on your post"
+            )
+        # Notify parent comment author
+        if parent_id:
+            parent = db.query(Comment).filter(Comment.id == parent_id).first()
+            if parent and parent.author_id != author.id:
+                NotificationService.create(
+                    db, parent.author_id, 'reply', author.id, 'comment', parent.id,
+                    f"{author.display_name} replied to your comment"
+                )
+        return comment
+
+    @staticmethod
+    def get_by_post(db: Session, post_id: str, sort: str = 'new'
+                    ) -> List[Comment]:
+        q = db.query(Comment).options(joinedload(Comment.author)).filter(
+            Comment.post_id == post_id, Comment.is_deleted == False
+        )
+        if sort == 'top':
+            q = q.order_by(desc(Comment.score), desc(Comment.created_at))
+        else:
+            q = q.order_by(asc(Comment.created_at))
+        return q.all()
+
+    @staticmethod
+    def delete(db: Session, comment: Comment):
+        comment.is_deleted = True
+        comment.content = '[deleted]'
+        db.flush()
+
+
+# ─── Vote Service ───
+
+class VoteService:
+
+    @staticmethod
+    def vote(db: Session, user: User, target_type: str, target_id: str,
+             value: int) -> dict:
+        """Cast or change a vote. value: +1 (upvote) or -1 (downvote)."""
+        existing = db.query(Vote).filter(
+            Vote.user_id == user.id, Vote.target_type == target_type,
+            Vote.target_id == target_id
+        ).first()
+
+        # Get target object
+        if target_type == 'post':
+            target = db.query(Post).filter(Post.id == target_id).first()
+        else:
+            target = db.query(Comment).filter(Comment.id == target_id).first()
+        if not target:
+            raise ValueError(f"{target_type} not found")
+
+        if existing:
+            if existing.value == value:
+                # Remove vote (toggle off)
+                if value == 1:
+                    target.upvotes -= 1
+                else:
+                    target.downvotes -= 1
+                target.score = target.upvotes - target.downvotes
+                db.delete(existing)
+                db.flush()
+                return {'action': 'removed', 'score': target.score}
+            else:
+                # Change vote direction
+                if existing.value == 1:
+                    target.upvotes -= 1
+                else:
+                    target.downvotes -= 1
+                existing.value = value
+                if value == 1:
+                    target.upvotes += 1
+                else:
+                    target.downvotes += 1
+                target.score = target.upvotes - target.downvotes
+                db.flush()
+                return {'action': 'changed', 'score': target.score}
+        else:
+            vote = Vote(id=_uuid(), user_id=user.id, target_type=target_type,
+                        target_id=target_id, value=value)
+            db.add(vote)
+            if value == 1:
+                target.upvotes += 1
+            else:
+                target.downvotes += 1
+            target.score = target.upvotes - target.downvotes
+            db.flush()
+
+            # Notify author on upvote
+            if value == 1:
+                author_id = target.author_id
+                if author_id != user.id:
+                    NotificationService.create(
+                        db, author_id, 'upvote', user.id, target_type, target_id,
+                        f"{user.display_name} upvoted your {target_type}"
+                    )
+            return {'action': 'voted', 'score': target.score}
+
+    @staticmethod
+    def remove_vote(db: Session, user: User, target_type: str, target_id: str):
+        existing = db.query(Vote).filter(
+            Vote.user_id == user.id, Vote.target_type == target_type,
+            Vote.target_id == target_id
+        ).first()
+        if existing:
+            if target_type == 'post':
+                target = db.query(Post).filter(Post.id == target_id).first()
+            else:
+                target = db.query(Comment).filter(Comment.id == target_id).first()
+            if target:
+                if existing.value == 1:
+                    target.upvotes -= 1
+                else:
+                    target.downvotes -= 1
+                target.score = target.upvotes - target.downvotes
+            db.delete(existing)
+            db.flush()
+
+    @staticmethod
+    def get_voters(db: Session, target_type: str, target_id: str) -> List[dict]:
+        """Get list of users who voted (for RN compatibility: like_bypost)."""
+        votes = db.query(Vote, User).join(User, Vote.user_id == User.id).filter(
+            Vote.target_type == target_type, Vote.target_id == target_id,
+            Vote.value == 1
+        ).all()
+        return [{'user_id': u.id, 'name': u.display_name,
+                 'profilePic': u.avatar_url} for v, u in votes]
+
+
+# ─── Follow Service ───
+
+class FollowService:
+
+    @staticmethod
+    def follow(db: Session, follower: User, following_id: str) -> bool:
+        if follower.id == following_id:
+            raise ValueError("Cannot follow yourself")
+        target = db.query(User).filter(User.id == following_id).first()
+        if not target:
+            raise ValueError("User not found")
+
+        existing = db.query(Follow).filter(
+            Follow.follower_id == follower.id, Follow.following_id == following_id
+        ).first()
+        if existing:
+            return False  # already following
+
+        follow = Follow(id=_uuid(), follower_id=follower.id, following_id=following_id)
+        db.add(follow)
+        db.flush()
+        NotificationService.create(
+            db, following_id, 'follow', follower.id, 'profile', follower.id,
+            f"{follower.display_name} started following you"
+        )
+        return True
+
+    @staticmethod
+    def unfollow(db: Session, follower: User, following_id: str):
+        existing = db.query(Follow).filter(
+            Follow.follower_id == follower.id, Follow.following_id == following_id
+        ).first()
+        if existing:
+            db.delete(existing)
+            db.flush()
+
+    @staticmethod
+    def get_followers(db: Session, user_id: str, limit: int = 50, offset: int = 0
+                      ) -> Tuple[List[User], int]:
+        q = db.query(User).join(Follow, Follow.follower_id == User.id).filter(
+            Follow.following_id == user_id)
+        total = q.count()
+        users = q.offset(offset).limit(limit).all()
+        return users, total
+
+    @staticmethod
+    def get_following(db: Session, user_id: str, limit: int = 50, offset: int = 0
+                      ) -> Tuple[List[User], int]:
+        q = db.query(User).join(Follow, Follow.following_id == User.id).filter(
+            Follow.follower_id == user_id)
+        total = q.count()
+        users = q.offset(offset).limit(limit).all()
+        return users, total
+
+    @staticmethod
+    def is_following(db: Session, follower_id: str, following_id: str) -> bool:
+        return db.query(Follow).filter(
+            Follow.follower_id == follower_id, Follow.following_id == following_id
+        ).first() is not None
+
+
+# ─── Submolt Service ───
+
+class SubmoltService:
+
+    @staticmethod
+    def create(db: Session, creator: User, name: str, display_name: str = '',
+               description: str = '', rules: str = '', is_private: bool = False) -> Submolt:
+        if db.query(Submolt).filter(Submolt.name == name).first():
+            raise ValueError(f"Community '{name}' already exists")
+
+        submolt = Submolt(
+            id=_uuid(), name=name, display_name=display_name or name,
+            description=description, rules=rules, creator_id=creator.id,
+            is_private=is_private, member_count=1,
+        )
+        db.add(submolt)
+        db.flush()
+        # Auto-join creator as admin
+        membership = SubmoltMembership(
+            id=_uuid(), user_id=creator.id, submolt_id=submolt.id, role='admin')
+        db.add(membership)
+        db.flush()
+        return submolt
+
+    @staticmethod
+    def get_by_name(db: Session, name: str) -> Optional[Submolt]:
+        return db.query(Submolt).filter(Submolt.name == name).first()
+
+    @staticmethod
+    def list_submolts(db: Session, limit: int = 50, offset: int = 0
+                      ) -> Tuple[List[Submolt], int]:
+        q = db.query(Submolt).order_by(desc(Submolt.member_count))
+        total = q.count()
+        submolts = q.offset(offset).limit(limit).all()
+        return submolts, total
+
+    @staticmethod
+    def join(db: Session, user: User, submolt: Submolt) -> bool:
+        existing = db.query(SubmoltMembership).filter(
+            SubmoltMembership.user_id == user.id,
+            SubmoltMembership.submolt_id == submolt.id
+        ).first()
+        if existing:
+            return False
+        membership = SubmoltMembership(
+            id=_uuid(), user_id=user.id, submolt_id=submolt.id)
+        db.add(membership)
+        submolt.member_count += 1
+        db.flush()
+        return True
+
+    @staticmethod
+    def leave(db: Session, user: User, submolt: Submolt):
+        existing = db.query(SubmoltMembership).filter(
+            SubmoltMembership.user_id == user.id,
+            SubmoltMembership.submolt_id == submolt.id
+        ).first()
+        if existing:
+            db.delete(existing)
+            submolt.member_count = max(0, submolt.member_count - 1)
+            db.flush()
+
+    @staticmethod
+    def get_members(db: Session, submolt_id: str, limit: int = 50, offset: int = 0
+                    ) -> Tuple[List[dict], int]:
+        q = db.query(SubmoltMembership, User).join(
+            User, SubmoltMembership.user_id == User.id
+        ).filter(SubmoltMembership.submolt_id == submolt_id)
+        total = q.count()
+        results = q.offset(offset).limit(limit).all()
+        return [{'user': u.to_dict(), 'role': m.role} for m, u in results], total
+
+    @staticmethod
+    def get_user_role(db: Session, user_id: str, submolt_id: str) -> Optional[str]:
+        m = db.query(SubmoltMembership).filter(
+            SubmoltMembership.user_id == user_id,
+            SubmoltMembership.submolt_id == submolt_id
+        ).first()
+        return m.role if m else None
+
+
+# ─── Notification Service ───
+
+class NotificationService:
+
+    @staticmethod
+    def create(db: Session, user_id: str, type: str, source_user_id: str = None,
+               target_type: str = None, target_id: str = None, message: str = ''):
+        notif = Notification(
+            id=_uuid(), user_id=user_id, type=type,
+            source_user_id=source_user_id, target_type=target_type,
+            target_id=target_id, message=message,
+        )
+        db.add(notif)
+        db.flush()
+        return notif
+
+    @staticmethod
+    def get_for_user(db: Session, user_id: str, unread_only: bool = False,
+                     limit: int = 50, offset: int = 0) -> Tuple[List[Notification], int]:
+        q = db.query(Notification).filter(Notification.user_id == user_id)
+        if unread_only:
+            q = q.filter(Notification.is_read == False)
+        total = q.count()
+        notifs = q.order_by(desc(Notification.created_at)).offset(offset).limit(limit).all()
+        return notifs, total
+
+    @staticmethod
+    def mark_read(db: Session, notification_ids: List[str], user_id: str):
+        db.query(Notification).filter(
+            Notification.id.in_(notification_ids), Notification.user_id == user_id
+        ).update({Notification.is_read: True}, synchronize_session=False)
+        db.flush()
+
+    @staticmethod
+    def mark_all_read(db: Session, user_id: str):
+        db.query(Notification).filter(
+            Notification.user_id == user_id, Notification.is_read == False
+        ).update({Notification.is_read: True}, synchronize_session=False)
+        db.flush()
+
+
+# ─── Report Service ───
+
+class ReportService:
+
+    @staticmethod
+    def create(db: Session, reporter: User, target_type: str, target_id: str,
+               reason: str, details: str = '') -> Report:
+        report = Report(
+            id=_uuid(), reporter_id=reporter.id, target_type=target_type,
+            target_id=target_id, reason=reason, details=details,
+        )
+        db.add(report)
+        db.flush()
+        return report
+
+    @staticmethod
+    def list_reports(db: Session, status: str = None, limit: int = 50, offset: int = 0
+                     ) -> Tuple[List[Report], int]:
+        q = db.query(Report)
+        if status:
+            q = q.filter(Report.status == status)
+        total = q.count()
+        reports = q.order_by(desc(Report.created_at)).offset(offset).limit(limit).all()
+        return reports, total
+
+    @staticmethod
+    def review(db: Session, report: Report, moderator_id: str, status: str):
+        report.status = status
+        report.moderator_id = moderator_id
+        db.flush()

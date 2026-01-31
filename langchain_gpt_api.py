@@ -85,41 +85,59 @@ groq_api_key = os.environ['GROQ_API_KEY']
 # ============================================================================
 # Custom Qwen3-VL LangChain Wrapper
 # ============================================================================
+# ============================================================================
+# Embodied AI Server Configuration
+# The crawl4ai embodied-ai project runs as a separate process on port 8000.
+# It exposes an OpenAI-compatible /v1/chat/completions endpoint with
+# real-time learning, zero-forgetting, and epistemic confidence metadata.
+#
+# Start the server:  cd ../crawl4ai && scripts\start.bat
+# Or:                cd ../crawl4ai && python run_server.py
+# ============================================================================
+
+EMBODIED_AI_BASE_URL = os.getenv(
+    "EMBODIED_AI_URL", "http://localhost:8000/v1"
+)
+
+
 class ChatQwen3VL(LLM):
     """
-    Custom LangChain LLM wrapper for local Qwen3-VL API server.
+    LangChain LLM wrapper for the crawl4ai embodied-ai server.
 
-    Compatible with LangChain's LLM interface while calling the local
-    Qwen3-VL server at http://localhost:8000/v1/chat/completions.
+    Calls the OpenAI-compatible endpoint at EMBODIED_AI_BASE_URL.
+    The server learns from every interaction (zero-forgetting) and
+    returns epistemic metadata (confidence, uncertainty, should_defer).
 
-    Features:
-    - OpenAI-compatible API interface
-    - Multimodal support (text + images)
-    - Zero API costs (local server)
-    - Drop-in replacement for ChatOpenAI
+    The epistemic metadata is stored in `self.last_epistemic` after each
+    call so downstream agents can check confidence and decide whether
+    to defer to a larger model.
     """
 
-    base_url: str = "http://localhost:8080/v1"
-    model_name: str = "Qwen3-VL-4B-Instruct"
+    base_url: str = EMBODIED_AI_BASE_URL
+    model_name: str = "Qwen3-VL-2B-Instruct"
     temperature: float = 0.7
     max_tokens: int = 1500
+    _last_epistemic: dict = {}
+
+    class Config:
+        underscore_attrs_are_private = True
 
     @property
     def _llm_type(self) -> str:
-        return "qwen3-vl"
+        return "embodied-ai"
+
+    @property
+    def last_epistemic(self) -> dict:
+        """Epistemic metadata from the most recent call.
+
+        Keys: confidence (0-1), uncertainty, should_defer (bool),
+              total_latency_ms
+        """
+        return self._last_epistemic
 
     def _call(self, prompt: str, stop: list = None) -> str:
-        """
-        Call the Qwen3-VL API with the given prompt.
-
-        Args:
-            prompt: The input text prompt
-            stop: Optional stop sequences
-
-        Returns:
-            The generated response text
-        """
-        import requests
+        """Call the embodied-ai server."""
+        import requests as _requests
 
         payload = {
             "model": self.model_name,
@@ -132,23 +150,28 @@ class ChatQwen3VL(LLM):
             payload["stop"] = stop
 
         try:
-            response = requests.post(
+            response = _requests.post(
                 f"{self.base_url}/chat/completions",
                 json=payload,
-                timeout=60
+                timeout=120
             )
             response.raise_for_status()
 
             data = response.json()
+            self._last_epistemic = data.get("epistemic", {})
             return data["choices"][0]["message"]["content"]
 
+        except _requests.ConnectionError:
+            raise ConnectionError(
+                f"Cannot reach embodied-ai server at {self.base_url}. "
+                f"Start it with: cd ../crawl4ai && python run_server.py"
+            )
         except Exception as e:
-            app.logger.error(f"[Qwen3-VL] Error calling API: {e}")
+            logging.getLogger(__name__).error(f"[EmbodiedAI] Error: {e}")
             raise
 
     @property
     def _identifying_params(self) -> dict:
-        """Return identifying parameters."""
         return {
             "model_name": self.model_name,
             "base_url": self.base_url,
@@ -157,14 +180,27 @@ class ChatQwen3VL(LLM):
         }
 
 
-# Flag to switch between OpenAI and Qwen3-VL
+def is_embodied_ai_available() -> bool:
+    """Check if the crawl4ai embodied-ai server is reachable."""
+    try:
+        resp = requests.get(
+            EMBODIED_AI_BASE_URL.replace("/v1", "/health"), timeout=3
+        )
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+# Flag to switch between OpenAI and Embodied AI (Qwen3-VL)
 USE_QWEN3VL = True  # Set to False to use OpenAI instead
 
 def get_llm(model_name="gpt-3.5-turbo", temperature=0.7, max_tokens=1500):
     """
     Get LLM instance based on configuration.
 
-    Returns ChatQwen3VL if USE_QWEN3VL is True, otherwise ChatOpenAI.
+    When USE_QWEN3VL is True, returns ChatQwen3VL pointing at the local
+    crawl4ai embodied-ai server. Falls back to ChatOpenAI if the server
+    is unreachable and USE_QWEN3VL is True but not forced.
     """
     if USE_QWEN3VL:
         return ChatQwen3VL(
@@ -215,6 +251,17 @@ app.logger.propagate = False
 app.logger.info('Logger initialized')
 
 # ============================================================================
+# HevolveSocial - Agent Social Network
+# ============================================================================
+try:
+    from integrations.social import social_bp, init_social
+    app.register_blueprint(social_bp)
+    init_social(app)
+    app.logger.info("HevolveSocial registered at /api/social")
+except Exception as e:
+    app.logger.warning(f"HevolveSocial init skipped (non-critical): {e}")
+
+# ============================================================================
 # Google A2A Protocol Initialization
 # ============================================================================
 # Initialize A2A server for cross-platform agent communication
@@ -262,6 +309,7 @@ BOOKPARSING_API = config['BOOKPARSING_API']
 CRAWLAB_API = config['CRAWLAB_API']
 RAG_API = config['RAG_API']
 DB_URL = config['DB_URL']
+EMBODIED_AI_BASE_URL = config.get('EMBODIED_AI_URL', EMBODIED_AI_BASE_URL)
 # task scheduling and logging
 
 
@@ -2232,6 +2280,11 @@ def chat():
             response = recipe(user_id,prompt,prompt_id,file_id,request_id)
             if response =='Agent Created Successfully':
                 conversation_agent[user_id] = True
+                # Bridge: auto-create social identity for this agent
+                try:
+                    _create_social_agent_from_prompt(user_id, prompt_id)
+                except Exception as e:
+                    app.logger.debug(f"Social agent bridge skipped: {e}")
                 return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'completed'})
             return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Review Mode'})
         # Phase 3: Evaluation Phase
@@ -2426,6 +2479,158 @@ def history():
         return jsonify({'response': "Messages are saved!!!"}), 200
     else:
         return jsonify({'response': "Memory object not found"}), 400
+
+
+# ═══════════════════════════════════════════════════════════════
+# Social Bridge: auto-create social user when agent is created via /chat
+# ═══════════════════════════════════════════════════════════════
+
+def _create_social_agent_from_prompt(user_id, prompt_id):
+    """Read prompts/{prompt_id}.json and create a social User for this agent."""
+    prompt_file = f'prompts/{prompt_id}.json'
+    if not os.path.exists(prompt_file):
+        return
+    with open(prompt_file, 'r') as f:
+        data = json.load(f)
+
+    agent_display_name = data.get('name', f'Agent {prompt_id}')
+    agent_name = data.get('agent_name', '')  # 3-word name from LLM
+    goal = data.get('goal', '')
+
+    from integrations.social.models import get_db
+    from integrations.social.services import UserService
+    db = get_db()
+    try:
+        # Use LLM-generated 3-word name if available, otherwise generate one
+        if not agent_name:
+            from integrations.social.agent_naming import generate_agent_name
+            suggestions = generate_agent_name(db, count=1)
+            agent_name = suggestions[0] if suggestions else f"agent-{prompt_id}"
+
+        try:
+            user = UserService.register_agent(
+                db, agent_name, goal or agent_display_name,
+                agent_id=str(prompt_id), owner_id=str(user_id),
+                skip_name_validation=not bool(agent_name))
+            user.display_name = agent_display_name
+            db.flush()
+        except ValueError:
+            pass  # already exists
+
+        db.commit()
+        app.logger.info(f"Social agent created: {agent_name} for prompt {prompt_id}")
+    except Exception as e:
+        db.rollback()
+        app.logger.debug(f"Social bridge error: {e}")
+    finally:
+        db.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+# Local-first Prompt CRUD (syncs to cloud DB)
+# ═══════════════════════════════════════════════════════════════
+
+@app.route('/prompts', methods=['GET'])
+def get_prompts():
+    """List prompts for a user. Local-first, cloud DB fallback."""
+    req_user_id = request.args.get('user_id', '')
+    if not req_user_id:
+        return jsonify({'error': 'user_id required'}), 400
+
+    prompts = []
+
+    # 1. Read from local prompts/*.json files
+    prompts_dir = os.path.join(os.path.dirname(__file__), 'prompts')
+    if os.path.isdir(prompts_dir):
+        for fname in os.listdir(prompts_dir):
+            if fname.endswith('.json') and '_' not in fname:
+                try:
+                    fpath = os.path.join(prompts_dir, fname)
+                    with open(fpath, 'r') as f:
+                        data = json.load(f)
+                    pid = fname.replace('.json', '')
+                    creator = str(data.get('creator_user_id', ''))
+                    if creator == str(req_user_id) or not creator:
+                        prompts.append({
+                            'prompt_id': pid,
+                            'name': data.get('name', ''),
+                            'prompt': data.get('goal', ''),
+                            'agent_name': data.get('agent_name', ''),
+                            'is_active': data.get('status', '') == 'completed',
+                            'user_id': creator or req_user_id,
+                            'has_recipe': os.path.exists(
+                                os.path.join(prompts_dir, f'{pid}_0_recipe.json')),
+                            'flow_count': len(data.get('flows', [])),
+                            'source': 'local',
+                        })
+                except Exception:
+                    continue
+
+    # 2. Fallback: try cloud DB if no local results
+    if not prompts:
+        try:
+            res = requests.get(
+                f'{DB_URL}/getprompt_onlyuserid/?user_id={req_user_id}',
+                timeout=5)
+            if res.status_code == 200:
+                cloud_data = res.json()
+                for item in cloud_data:
+                    item['source'] = 'cloud'
+                    item['has_recipe'] = False
+                prompts = cloud_data
+        except Exception:
+            pass
+
+    return jsonify(prompts)
+
+
+@app.route('/prompts', methods=['POST'])
+def create_prompts():
+    """Create/update prompts. Saves locally AND syncs to cloud DB."""
+    data = request.get_json()
+    listprompts = data.get('listprompts', [data] if 'name' in data else [])
+
+    saved = []
+    for item in listprompts:
+        pid = item.get('prompt_id')
+        if not pid:
+            # Auto-assign prompt_id from existing files
+            existing = [f.replace('.json', '') for f in os.listdir('prompts')
+                        if f.endswith('.json') and '_' not in f and f[0].isdigit()]
+            pid = max([int(x) for x in existing if x.isdigit()] or [0]) + 1
+            item['prompt_id'] = pid
+
+        # Save locally
+        local_path = f'prompts/{pid}.json'
+        local_data = {}
+        if os.path.exists(local_path):
+            with open(local_path, 'r') as f:
+                local_data = json.load(f)
+
+        local_data['name'] = item.get('name', local_data.get('name', ''))
+        local_data['goal'] = item.get('prompt', item.get('goal', local_data.get('goal', '')))
+        local_data['prompt_id'] = pid
+        local_data['creator_user_id'] = item.get('user_id', local_data.get('creator_user_id'))
+        if 'agent_name' in item:
+            local_data['agent_name'] = item['agent_name']
+        if 'status' not in local_data:
+            local_data['status'] = 'pending'
+
+        with open(local_path, 'w') as f:
+            json.dump(local_data, f, indent=2)
+
+        saved.append({'prompt_id': pid, 'name': local_data['name']})
+
+    # Sync to cloud DB (non-blocking, best effort)
+    try:
+        requests.post(
+            f'{DB_URL}/createpromptlist',
+            json={'listprompts': listprompts},
+            timeout=5)
+    except Exception as e:
+        app.logger.debug(f"Cloud sync failed (non-fatal): {e}")
+
+    return jsonify({'success': True, 'saved': saved})
 
 
 @app.route('/status', methods=['GET'])

@@ -8,7 +8,7 @@ Features:
 - Text messages
 - Media (images, videos, documents)
 - Group chats
-- Message reactions
+- Message reactionsC:\Users\sathi\PycharmProjects\LLM-langchain_Chatbot-Agent
 - Read receipts
 - QR code authentication
 """
