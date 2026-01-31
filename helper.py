@@ -1868,7 +1868,7 @@ def load_agent_data_from_file(prompt_id: int, agent_data: Dict) -> bool:
 
         # Check if file exists
         if not os.path.exists(file_path):
-            current_app.logger.info(f" No saved agent data found for prompt_id {prompt_id}")
+            current_app.logger.info(f"[FILE] No saved agent data found for prompt_id {prompt_id}")
             # Initialize with default data
             agent_data[prompt_id] = {}
             return False
@@ -2340,7 +2340,7 @@ def force_apply_autogen_json_fix():
 # Also provide a manual trigger function for Flask startup
 def apply_autogen_fix_on_startup():
     """Manual function to call during Flask app startup if automatic patch fails."""
-    print(" Manually applying autogen JSON fix...")
+    print("[INIT] Manually applying autogen JSON fix...")
     return force_apply_autogen_json_fix()
 
 # ========================================================================================
