@@ -28,6 +28,7 @@ from helper import ToolMessageHandler, strip_json_values, get_time_based_history
 import helper as helper_fun
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import traceback
 from autobahn.asyncio.component import Component
 import threading
@@ -119,6 +120,38 @@ def parse_date(date_str):
 
 
 client = Client('http://aws_rasa.hertzai.com:8088/publish')
+
+# Create thread pool executor for async Crossbar publishing
+crossbar_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='crossbar_publish')
+
+def publish_async(topic, message, timeout=2.0):
+    """
+    Publish to Crossbar in a background thread without blocking the main request.
+
+    Args:
+        topic: Crossbar topic to publish to
+        message: Message payload (dict or JSON string)
+        timeout: Maximum time to wait for publish (default: 2.0 seconds)
+    """
+    def _publish():
+        import socket
+        try:
+            # Set socket timeout to prevent long waits
+            original_timeout = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(timeout)
+
+            client.publish(topic, message)
+            current_app.logger.debug(f"Successfully published to {topic}")
+        except Exception as e:
+            current_app.logger.error(f"Error publishing to {topic}: {e}")
+        finally:
+            # Restore original timeout
+            if original_timeout is not None:
+                socket.setdefaulttimeout(original_timeout)
+
+    # Submit to executor without waiting for result
+    crossbar_executor.submit(_publish)
+
 scheduler = BackgroundScheduler()
 scheduler.start()
 # logging_session_id = runtime_logging.start(config={"dbname": "logs.db"})
@@ -653,11 +686,7 @@ def get_action_user_details(user_id):
             ), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}",
                      'request_id': thread_local_data.get_request_id(),
                      'failure_reason': 'Exception happend at get action api end'}
-        try:
-            client.publish('com.hertzai.longrunning.log', post_dict)
-        except Exception as e:
-            current_app.logger.error(
-                "Error while publish at com.hertzai.longrunning.log topic")
+        publish_async('com.hertzai.longrunning.log', post_dict)
 
     url = STUDENT_API
     payload = json.dumps({
@@ -679,11 +708,7 @@ def get_action_user_details(user_id):
             ), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}",
                      'request_id': thread_local_data.get_request_id(),
                      'failure_reason': 'Exception happend at get user detail api end'}
-        try:
-            client.publish('com.hertzai.longrunning.log', post_dict)
-        except Exception as e:
-            current_app.logger.error(
-                "Error while publish at com.hertzai.longrunning.log topic")
+        publish_async('com.hertzai.longrunning.log', post_dict)
     return user_details, actions
 
 
@@ -2757,7 +2782,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                                     "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
                         'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0},
                         'bottom_left': {'x': 0, 'y': 0}}}
-                client.publish(
+                publish_async(
                     f"com.hertzai.hevolve.chat.{user_id}", json.dumps(crossbar_message))
         except Exception as e:
             current_app.logger.error(f"Error publishing crossbar message: {e}")
