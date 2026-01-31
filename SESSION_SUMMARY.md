@@ -143,12 +143,36 @@ The system now makes intelligent decisions based on action context:
 - **Files Generated**: 1/11 (only dataset.txt)
 - **Root Cause**: Timeout waiting for user fallback input
 
-### After Fix (In Progress)
+### After Fix
 - **Agent Creation**: ✅ PASS
 - **Autonomous Fallback Generation**: ✅ WORKING
 - **First Action Execution**: ✅ PASS with auto-generated fallback
-- **Recipe Generation**: ✅ IN PROGRESS
-- **Issue Detected**: State transition error after recipe (needs investigation)
+- **Recipe Generation**: ✅ PASS
+- **State Machine Transitions**: ✅ FIXED
+- **Multi-Action Execution**: ✅ WORKING
+
+### 4. **State Transition Blocking** ✅ SOLVED
+
+**Problem**: After autonomous fallback fix, new error: "Action 1 must be TERMINATED before incrementing"
+**Root Cause**: Action remained in COMPLETED state instead of transitioning to TERMINATED after recipe save
+**Solution Part 1**: Added state transition in create_recipe.py:1866
+```python
+force_state_through_valid_path(user_prompt, int(json_obj['action_id']), ActionState.TERMINATED, "Recipe saved and action complete")
+```
+
+**Solution Part 2**: Modified lifecycle_hooks.py:195 to allow direct COMPLETED → RECIPE_REQUESTED transition
+```python
+ActionState.COMPLETED: [ActionState.FALLBACK_REQUESTED, ActionState.RECIPE_REQUESTED, ActionState.TERMINATED, ActionState.COMPLETED]
+```
+
+**Impact**: Enables autonomous operation where LLM-generated fallbacks skip FALLBACK_REQUESTED state and proceed directly to RECIPE_REQUESTED, then TERMINATED, allowing next action to start.
+
+**Validation**: Flask logs confirmed multi-action execution:
+```
+Action 1: terminated TERMINATED
+Execute Action 2: Read the dataset from 'dataset.txt'...
+Action 2: assigned → in_progress
+```
 
 ---
 

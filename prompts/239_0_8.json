@@ -1,0 +1,60 @@
+{
+    "status": "done",
+    "action": "Schedule the entire news video generation and curation flow to automatically execute every 2 hours, ensuring that each run tracks news stories with associated timestamps and manages metadata context for continuity and historical record-keeping.",
+    "fallback_action": "If scheduling fails, attempt immediate manual execution and alert a system administrator about the scheduling issue.",
+    "persona": "News Curator",
+    "action_id": 8,
+    "recipe": [
+        {
+            "steps": "Initiate a scheduled job to trigger the full multi-step news video flow (starting from avatar retrieval) every 2 hours using the system scheduler tool.",
+            "tool_name": "create_scheduled_jobs",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "For each execution cycle, store and update an array of timestamps for news stories generated, preserving links to generated metadata for historical tracking.",
+            "tool_name": "save_data_in_memory",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Ensure that metadata context, including story history and expiry rules, is appropriately updated and referenced before each flow execution.",
+            "tool_name": "save_data_in_memory",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [
+        {
+            "cron_expression": "0 */2 * * *",
+            "persona": "News Curator",
+            "action_entry_point": 1,
+            "job_description": "Automate the full headline-to-video news curation flow every 2 hours with metadata and timestamp tracking"
+        }
+    ],
+    "metadata": {
+        "user_id": "redacted int",
+        "avatars": {
+            "teacher_avatar_ids": [
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int"
+            ]
+        }
+    },
+    "time_took_to_complete": 26.288475036621094,
+    "actions_this_action_depends_on": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+    ]
+}

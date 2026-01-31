@@ -1,0 +1,23 @@
+{
+  "user_id": 12345,
+  "prompt_id": 88888,
+  "last_updated": "2025-10-24T22:46:37.280041",
+  "tasks": {
+    "persist_test": {
+      "task_id": "persist_test",
+      "description": "Persistence test task",
+      "task_type": "pre_assigned",
+      "execution_mode": "sequential",
+      "status": "pending",
+      "prerequisites": [],
+      "context": {},
+      "priority": 50,
+      "parent_task_id": null,
+      "created_at": "2025-10-24T22:46:37.280041",
+      "updated_at": "2025-10-24T22:46:37.280041",
+      "completed_at": null,
+      "error_message": null,
+      "result": null
+    }
+  }
+}

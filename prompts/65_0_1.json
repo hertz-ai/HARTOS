@@ -1,1 +1,37 @@
-{"status": "done", "action": "Create a 100-word story with multiple characters in the format: character1: dialogue, character2: dialogue and save it.", "fallback_action": "If story creation or saving fails, retry generating the story or alert the user for manual intervention.", "persona": "Creator", "action_id": 1, "recipe": [{"steps": "Compose a short story (about 100 words) involving multiple characters. Each character's lines should be presented in the format: character_name: dialogue.", "tool_name": "", "agent_to_perform_this_action": "Assistant"}, {"steps": "Store the created story in memory using a structured key such as stories.story_title.", "tool_name": "save_data_in_memory", "agent_to_perform_this_action": "Helper"}], "can_perform_without_user_input": "yes", "scheduled_tasks": [], "metadata": {"user_id": "redacted <class 'int'>", "stories": {"woodland_piano_adventure": "redacted <class 'str'>"}}, "time_took_to_complete": 19.52024269104004}
+{
+    "status": "done",
+    "action": "Create a 100-word story in the following format: character 1 name character 1 dialogue. character 2 name their dialogue and repeat this format till the end of the story making the story engaging, profound, and pushing the limits of human psychology to keep the listener wanting more",
+    "fallback_action": "If fails then create a 50 words story with only one character.",
+    "persona": "creator",
+    "action_id": 1,
+    "recipe": [
+        {
+            "steps": "Create a 100-word story with the given format and rules.",
+            "tool_name": "",
+            "generalized_functions": "",
+            "agent_to_perform_this_action": "Assistant"
+        },
+        {
+            "steps": "Save the created story in memory under key 'stories.current_story'.",
+            "tool_name": "save_data_in_memory",
+            "generalized_functions": "",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Verify the completion of the action and include the persona name.",
+            "tool_name": "StatusVerifier",
+            "generalized_functions": "",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [],
+    "metadata": {
+        "user_id": "redacted <class 'int'>",
+        "stories": {
+            "current_story": "redacted <class 'str'>"
+        }
+    },
+    "time_took_to_complete": 18.51469135284424,
+    "actions_this_action_depends_on": []
+}

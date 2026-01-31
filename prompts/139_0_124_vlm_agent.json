@@ -1,0 +1,31 @@
+{
+    "status": "done",
+    "action": "Move mouse to the search bar in the Start menu and click to focus on it.",
+    "fallback_action": "Perform a Google search using Internet Explorer",
+    "persona": "user16952",
+    "action_id": 124,
+    "recipe": [
+        {
+            "steps": "is the first action. The task is to move the mouse to the search bar in the Start menu and click to focus on it. The Start menu is open, and the search bar is visible with the text 'Search web & PC' (Box ID 223). I should click on this box to focus the search bar.\nAction Description: Click on the search bar in the Start menu to focus it.",
+            "tool_name": "execute_windows_or_android_command",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Move mouse",
+            "tool_name": "execute_windows_or_android_command",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Perform left click",
+            "tool_name": "execute_windows_or_android_command",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "no",
+    "scheduled_tasks": [],
+    "metadata": {
+        "user_id": "redacted <class 'int'>"
+    },
+    "time_took_to_complete": 22.461609601974487,
+    "actions_this_action_depends_on": []
+}

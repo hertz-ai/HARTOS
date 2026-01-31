@@ -1,0 +1,35 @@
+{
+    "status": "done",
+    "action": "If no conv_id has been marked 'ready' in the last 2 hours, that user is the first user of the cycle and their conv_id becomes the source conv_id.",
+    "fallback_action": "",
+    "persona": "News Curator",
+    "action_id": 2,
+    "recipe": [
+        {
+            "steps": "Fetch metadata to check for a 'ready' conv_id within the last 2 hours.",
+            "tool_name": "get_saved_metadata",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Create and execute a function to determine and assign the source conv_id.",
+            "tool_name": "",
+            "agent_to_perform_this_action": "Assistant"
+        },
+        {
+            "steps": "Save the resulting source conv_id in memory with the key as 'session.source_conv_id'.",
+            "tool_name": "save_data_in_memory",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [],
+    "metadata": {
+        "user_id": "redacted <class 'int'>",
+        "session": {
+            "conv_id": "redacted <class 'str'>",
+            "source_conv_id": "redacted <class 'str'>"
+        }
+    },
+    "time_took_to_complete": 12.179279565811157,
+    "actions_this_action_depends_on": []
+}

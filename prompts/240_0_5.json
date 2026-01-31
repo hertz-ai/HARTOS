@@ -1,0 +1,51 @@
+{
+    "status": "done",
+    "action": "Set up a scheduled job to check the status of each generated video every minute by calling the provided API URL with the specific conv_id. Upon detection of a completed video, update its status to 'success' in memory.",
+    "fallback_action": "",
+    "persona": "News Curator",
+    "action_id": 5,
+    "recipe": [
+        {
+            "steps": "Create a scheduled job that, every minute, calls the external API 'https://mailer.hertzai.com/get-video-conv_id/{{conv_id}}' for each conversation ID corresponding to a generated video.",
+            "tool_name": "create_scheduled_jobs",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Parse the API response for each conv_id, checking if the video generation has succeeded. When success is detected, update the video's status to 'success' in internal memory.",
+            "tool_name": "save_data_in_memory",
+            "generalized_functions": "def update_video_status_if_complete(api_response, conv_id):\n    \"\"\"\n    Checks the API response for video completion and updates the status to 'success' for the given conv_id if complete.\n    Args:\n        api_response (dict): The response from the video status API.\n        conv_id (str): The unique conversation ID of the video.\n    Returns:\n        None\n    \"\"\"\n    if api_response.get('status') == 'success':\n        # Update status in memory (tool required for actual data update)\n        pass\n",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [
+        {
+            "cron_expression": "*/1 * * * *",
+            "persona": "News Curator",
+            "action_entry_point": 5,
+            "job_description": "Check the status of each video generation every minute using the video status API, updating any completed videos to 'success' in memory."
+        }
+    ],
+    "metadata": {
+        "user_id": "redacted int",
+        "avatars": {
+            "genre_mapping": {
+                "Politics": "redacted int",
+                "Business": "redacted int",
+                "Sports": "redacted int",
+                "Breaking News": "redacted int",
+                "Science": "redacted int",
+                "AI": "redacted int",
+                "Weather": "redacted int"
+            }
+        }
+    },
+    "time_took_to_complete": 15.99416708946228,
+    "actions_this_action_depends_on": [
+        1,
+        2,
+        3,
+        4,
+        5
+    ]
+}

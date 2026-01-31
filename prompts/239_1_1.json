@@ -1,0 +1,40 @@
+{
+    "status": "done",
+    "action": "Check and retrieve the list of conv_id entries with status 'success' by comparing the current timestamp with new script timestamps.",
+    "fallback_action": "If metadata is missing or incomplete, retry the action up to 5 times in short intervals before notifying the user.",
+    "persona": "User",
+    "action_id": 1,
+    "recipe": [
+        {
+            "steps": "Retrieve all available metadata relevant to conv_id entries and script timestamps for the current user using internal storage tools.",
+            "tool_name": "get_saved_metadata",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Identify and extract conv_id items where status is marked 'success' and the corresponding script timestamp is before or equal to the current system time.",
+            "tool_name": "",
+            "agent_to_perform_this_action": "Assistant"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [],
+    "metadata": {
+        "user_id": "redacted int",
+        "avatars": {
+            "teacher_avatar_ids": [
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int"
+            ]
+        }
+    },
+    "time_took_to_complete": 16.251949310302734,
+    "actions_this_action_depends_on": []
+}
