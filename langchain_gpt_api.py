@@ -99,8 +99,8 @@ class ChatQwen3VL(LLM):
     - Drop-in replacement for ChatOpenAI
     """
 
-    base_url: str = "http://localhost:8000/v1"
-    model_name: str = "Qwen3-VL-2B-Instruct"
+    base_url: str = "http://localhost:8080/v1"
+    model_name: str = "Qwen3-VL-4B-Instruct"
     temperature: float = 0.7
     max_tokens: int = 1500
 
@@ -1802,12 +1802,12 @@ user_agents: Dict[str, Tuple[autogen.ConversableAgent,
 
 def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]:
     """Create new assistant and user proxy agents for a user with basic configuration."""
+    # Local llama.cpp server (Qwen3-VL)
     config_list = [{
-        "model": 'hertzai-4o',
-        "api_type": "azure",
-        "api_key": '4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf',
-        "base_url": 'https://hertzai-gpt4.openai.azure.com/',
-        "api_version": "2024-02-15-preview"
+        "model": 'Qwen3-VL-4B-Instruct',
+        "api_key": 'dummy',
+        "base_url": 'http://localhost:8080/v1',
+        "price": [0, 0]
     }]
 
     # Create a basic function calling config

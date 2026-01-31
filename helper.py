@@ -1434,6 +1434,7 @@ class Action:
         self.fallback = False
         self.new_json = []
         self.recipe = False
+        self.ledger = None  # Smart Ledger for persistent task tracking
 
     def get_action(self, array_index):
         if array_index < 0 or array_index >= len(self.actions):
@@ -1446,6 +1447,11 @@ class Action:
             if i['action_id'] == action_id:
                 return i
         return None
+
+    def set_ledger(self, ledger):
+        """Attach Smart Ledger to this Action instance"""
+        self.ledger = ledger
+        current_app.logger.info(f"Smart Ledger attached with {len(ledger.tasks)} tasks")
 
 def txt2img(text: Annotated[str, "Text to create image"]) -> str:
     current_app.logger.info('INSIDE txt2img')
@@ -1672,13 +1678,12 @@ def history(user_id,prompt_id,role,message):
         return "Memory object not found"
 
 
+# Local llama.cpp server (Qwen3-VL)
 config_list = [{
-    "model": "gpt-4o-mini",
-    "api_type": "azure",
-    "api_key": "4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf",
-    "base_url": "https://hertzai-gpt4.openai.azure.com/",
-    "api_version": "2024-02-15-preview",
-    "price":[0.00015,0.0006]
+    "model": 'Qwen3-VL-4B-Instruct',
+    "api_key": 'dummy',
+    "base_url": 'http://localhost:8080/v1',
+    "price": [0, 0]
 }]
 
 llm_config = {
@@ -1763,12 +1768,14 @@ def create_visual_agent(user_id,prompt_id):
         Response formats:
             1. Action Completed Successfully: {"status": "completed","action": "current action","action_id": 1/2/3...,"message": "message here"}
             2. Action Error: {"status": "error","action": "current action","action_id": 1/2/3...,"message": "message here"}
-            2. Action Pending: {"status": "pending","action": "current action","action_id": 1/2/3...,"message": "pending actions here"}
+            3. Action Pending: {"status": "pending","action": "current action","action_id": 1/2/3...,"message": "pending actions here"}
+            4. Action Requires Breakdown: {"status": "requires_breakdown","action": "current action","action_id": 1/2/3...,"reason": "Why this action needs to be broken down","subtasks": [{"subtask_id": "1.1","description": "First subtask description","depends_on": [],"can_perform_autonomously": true},{"subtask_id": "1.2","description": "Second subtask","depends_on": ["1.1"],"can_perform_autonomously": true}]}
         Important Instructions:
             Only mark an action as "Completed" if the Assistant Agent confirms successful completion.
             For pending tasks or ongoing actions, respond to helper to complete the task.
             Verify the action performed by assistant and make sure the action is performed correctly as per instructions. if action performed was not as per instructions give the pending actions to the helper agent.
             Report status only—do not perform actions yourself.
+            Use "requires_breakdown" when an action is too complex and needs to be split into smaller subtasks.
 
         """,
         is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
