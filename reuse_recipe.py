@@ -31,7 +31,6 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 import traceback
 from autobahn.asyncio.component import Component
-import threading
 
 from threadlocal import thread_local_data
 
@@ -109,11 +108,15 @@ class TaskNames(Enum):
     USER_ID_RETRIEVER = "USER_ID_RETRIEVER"
 
 
-with open("config.json", 'r') as f:
-    config = json.load(f)
+# Performance: cached config loading (shared singleton)
+from core.config_cache import get_config as _get_config
+from core.http_pool import pooled_post, pooled_get, pooled_request
+from core.event_loop import get_or_create_event_loop
+from core.session_cache import TTLCache
 
-STUDENT_API = config['STUDENT_API']
-ACTION_API = config['ACTION_API']
+config = _get_config()
+STUDENT_API = config.get('STUDENT_API', '')
+ACTION_API = config.get('ACTION_API', '')
 
 def parse_date(date_str):
     return datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%S")
@@ -156,15 +159,16 @@ scheduler = BackgroundScheduler()
 scheduler.start()
 # logging_session_id = runtime_logging.start(config={"dbname": "logs.db"})
 # Store user-specific agents & their chat history
-user_agents: Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]] = {}
-role_agents: Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]] = {}
-agents_session = {}
-recipes = {}
-user_journey = {}
-temp_users = {}
-chat_joinees = {}
-agents_roles = {}
-llm_call_track = {}
+# Performance: TTL caches replace unbounded global dicts (auto-expire after 2 hours)
+user_agents: Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]] = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_agents')
+role_agents: Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]] = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_role_agents')
+agents_session = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_agents_session')
+recipes = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_recipes')
+user_journey = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_journey')
+temp_users = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_temp_users')
+chat_joinees = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_chat_joinees')
+agents_roles = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_agents_roles')
+llm_call_track = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_llm_call_track')
 
 _active_tools = {}
 _active_tools_lock = threading.Lock()
@@ -774,7 +778,8 @@ def get_frame(user_id):
 
     try:
         if serialized_frame is not None:
-            frame_bgr = pickle.loads(serialized_frame)
+            from security.safe_deserialize import safe_load_frame
+            frame_bgr = safe_load_frame(serialized_frame)
             current_app.logger.info(
                 f"Frame for user_id {user_id} retrieved successfully.")
             frame = frame_bgr[:, :, ::-1]
@@ -1549,9 +1554,8 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         ) -> str:
             """Search compressed long-term memory using semantic retrieval."""
             try:
-                loop = asyncio.new_event_loop()
+                loop = get_or_create_event_loop()
                 results = loop.run_until_complete(simplemem_store.search(query))
-                loop.close()
                 if results:
                     return results[0].content
                 return "No relevant memories found."
@@ -1568,13 +1572,12 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         ) -> str:
             """Save important information to compressed long-term memory."""
             try:
-                loop = asyncio.new_event_loop()
+                loop = get_or_create_event_loop()
                 loop.run_until_complete(simplemem_store.add(content, {
                     "sender_name": speaker,
                     "user_id": user_id,
                     "prompt_id": prompt_id,
                 }))
-                loop.close()
                 return "Saved to long-term memory."
             except Exception as e:
                 current_app.logger.info(f"SimpleMem save error: {e}")
@@ -2863,13 +2866,12 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                         content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
                         speaker = msg.get("name", "Agent") if isinstance(msg, dict) else "Agent"
                         if content and len(content.strip()) > 5:
-                            loop = asyncio.new_event_loop()
+                            loop = get_or_create_event_loop()
                             loop.run_until_complete(store.add(content, {
                                 "sender_name": speaker,
                                 "user_id": user_id,
                                 "prompt_id": prompt_id,
                             }))
-                            loop.close()
                     except Exception:
                         pass  # Non-blocking
                 return _simplemem_ingest_hook

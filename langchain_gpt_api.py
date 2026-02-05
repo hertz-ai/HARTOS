@@ -56,6 +56,7 @@ import re
 import logging
 import requests
 import pytz
+from core.http_pool import pooled_get, pooled_post
 from datetime import datetime, timezone
 from typing import List, Union, Optional, Mapping, Any, Dict
 
@@ -87,7 +88,6 @@ except ImportError:
     except (ImportError, AttributeError):
         TextRequestsWrapper = None
 
-import time
 import tiktoken
 from pytz import timezone
 from datetime import datetime, timedelta
@@ -110,7 +110,6 @@ except (ImportError, ModuleNotFoundError):
     cohere_rerank = None  # Not available
 import asyncio
 import aiohttp
-import sys
 import redis
 import pickle
 from threading import Thread
@@ -168,60 +167,40 @@ groq_api_key = os.environ['GROQ_API_KEY']
 # ============================================================================
 # Custom Qwen3-VL LangChain Wrapper
 # ============================================================================
-# ============================================================================
-# Embodied AI Server Configuration
-# The crawl4ai embodied-ai project runs as a separate process on port 8000.
-# It exposes an OpenAI-compatible /v1/chat/completions endpoint with
-# real-time learning, zero-forgetting, and epistemic confidence metadata.
-#
-# Start the server:  cd ../crawl4ai && scripts\start.bat
-# Or:                cd ../crawl4ai && python run_server.py
-# ============================================================================
-
-EMBODIED_AI_BASE_URL = os.getenv(
-    "EMBODIED_AI_URL", "http://localhost:8000/v1"
-)
-
-
 class ChatQwen3VL(LLM):
     """
-    LangChain LLM wrapper for the crawl4ai embodied-ai server.
+    Custom LangChain LLM wrapper for local Qwen3-VL API server.
 
-    Calls the OpenAI-compatible endpoint at EMBODIED_AI_BASE_URL.
-    The server learns from every interaction (zero-forgetting) and
-    returns epistemic metadata (confidence, uncertainty, should_defer).
+    Compatible with LangChain's LLM interface while calling the local
+    crawl4ai server at http://localhost:8000/v1/chat/completions.
 
-    The epistemic metadata is stored in `self.last_epistemic` after each
-    call so downstream agents can check confidence and decide whether
-    to defer to a larger model.
+    Features:
+    - OpenAI-compatible API interface
+    - Multimodal support (text + images)
+    - Zero API costs (local server)
+    - Drop-in replacement for ChatOpenAI
     """
 
-    base_url: str = EMBODIED_AI_BASE_URL
-    model_name: str = "Qwen3-VL-2B-Instruct"
+    base_url: str = "http://localhost:8000/v1"
+    model_name: str = "Qwen3-VL-4B-Instruct"
     temperature: float = 0.7
     max_tokens: int = 1500
-    _last_epistemic: dict = {}
-
-    class Config:
-        underscore_attrs_are_private = True
 
     @property
     def _llm_type(self) -> str:
-        return "embodied-ai"
-
-    @property
-    def last_epistemic(self) -> dict:
-        """Epistemic metadata from the most recent call.
-
-        Keys: confidence (0-1), uncertainty, should_defer (bool),
-              total_latency_ms
-        """
-        return self._last_epistemic
+        return "qwen3-vl"
 
     def _call(self, prompt: str, stop: list = None) -> str:
-        """Call the embodied-ai server."""
-        import requests as _requests
+        """
+        Call the Qwen3-VL API with the given prompt.
 
+        Args:
+            prompt: The input text prompt
+            stop: Optional stop sequences
+
+        Returns:
+            The generated response text
+        """
         payload = {
             "model": self.model_name,
             "messages": [{"role": "user", "content": prompt}],
@@ -233,28 +212,23 @@ class ChatQwen3VL(LLM):
             payload["stop"] = stop
 
         try:
-            response = _requests.post(
+            response = pooled_post(
                 f"{self.base_url}/chat/completions",
                 json=payload,
-                timeout=120
+                timeout=60
             )
             response.raise_for_status()
 
             data = response.json()
-            self._last_epistemic = data.get("epistemic", {})
             return data["choices"][0]["message"]["content"]
 
-        except _requests.ConnectionError:
-            raise ConnectionError(
-                f"Cannot reach embodied-ai server at {self.base_url}. "
-                f"Start it with: cd ../crawl4ai && python run_server.py"
-            )
         except Exception as e:
-            logging.getLogger(__name__).error(f"[EmbodiedAI] Error: {e}")
+            app.logger.error(f"[Qwen3-VL] Error calling API: {e}")
             raise
 
     @property
     def _identifying_params(self) -> dict:
+        """Return identifying parameters."""
         return {
             "model_name": self.model_name,
             "base_url": self.base_url,
@@ -263,27 +237,14 @@ class ChatQwen3VL(LLM):
         }
 
 
-def is_embodied_ai_available() -> bool:
-    """Check if the crawl4ai embodied-ai server is reachable."""
-    try:
-        resp = requests.get(
-            EMBODIED_AI_BASE_URL.replace("/v1", "/health"), timeout=3
-        )
-        return resp.status_code == 200
-    except Exception:
-        return False
-
-
-# Flag to switch between OpenAI and Embodied AI (Qwen3-VL)
+# Flag to switch between OpenAI and Qwen3-VL
 USE_QWEN3VL = True  # Set to False to use OpenAI instead
 
 def get_llm(model_name="gpt-3.5-turbo", temperature=0.7, max_tokens=1500):
     """
     Get LLM instance based on configuration.
 
-    When USE_QWEN3VL is True, returns ChatQwen3VL pointing at the local
-    crawl4ai embodied-ai server. Falls back to ChatOpenAI if the server
-    is unreachable and USE_QWEN3VL is True but not forced.
+    Returns ChatQwen3VL if USE_QWEN3VL is True, otherwise ChatOpenAI.
     """
     if USE_QWEN3VL:
         return ChatQwen3VL(
@@ -330,8 +291,23 @@ app.logger.addHandler(stream_handler)
 app.logger.addHandler(handler)
 app.logger.propagate = False
 
+# Security: Audit logging — redact API keys, JWTs, passwords from all logs
+try:
+    from security.audit_log import apply_sensitive_filter_to_all
+    apply_sensitive_filter_to_all()
+except Exception:
+    pass  # Degrade gracefully — logs will still work, just unredacted
+
 # Test logging
 app.logger.info('Logger initialized')
+
+# Security: Apply middleware (headers, CORS, CSRF, host validation, API auth)
+try:
+    from security.middleware import apply_security_middleware
+    apply_security_middleware(app)
+    app.logger.info("Security middleware applied")
+except Exception as e:
+    app.logger.warning(f"Security middleware not applied: {e}")
 
 # ============================================================================
 # HevolveSocial - Agent Social Network
@@ -396,7 +372,6 @@ BOOKPARSING_API = config['BOOKPARSING_API']
 CRAWLAB_API = config['CRAWLAB_API']
 RAG_API = config['RAG_API']
 DB_URL = config['DB_URL']
-EMBODIED_AI_BASE_URL = config.get('EMBODIED_AI_URL', EMBODIED_AI_BASE_URL)
 # task scheduling and logging
 
 
@@ -854,7 +829,7 @@ class CustomGPT(LLM):
             #     # app.logger.info(f"the prompt we are sending is {prompt}")
 
             #     start = time.time()
-            #     response = requests.post(
+            #     response = pooled_post(
             #         GPT_API,
             #         json={
 
@@ -877,7 +852,7 @@ class CustomGPT(LLM):
                 if self.casual_conv:
                     app.logger.info(f"casual conv!")
                     start = time.time()
-                    response = requests.post(
+                    response = pooled_post(
                         GPT_API,
                         json={
                             "model": "llama",
@@ -896,7 +871,7 @@ class CustomGPT(LLM):
                 else:
                     app.logger.info("Non casual conv")
                     start = time.time()
-                    response = requests.post(
+                    response = pooled_post(
                         GPT_API,
                         json={
                             "model": "llama",
@@ -941,7 +916,7 @@ class CustomGPT(LLM):
             except Exception as e:
                 app.logger.info(f"In except the exception is {e}")
                 start = time.time()
-                response = requests.post(
+                response = pooled_post(
                     GPT_API,
                     json={
                         "model": "llama",
@@ -963,7 +938,7 @@ class CustomGPT(LLM):
                         f"the casual conv line 519 casual conv {self.casual_conv} type of casual conv {type(self.casual_conv)}")
                     start = time.time()
 
-                    response = requests.post(
+                    response = pooled_post(
                         GPT_API,
                         json={
                             "model": "llama",
@@ -982,7 +957,7 @@ class CustomGPT(LLM):
                     try:
                         app.logger.info("non casual conv")
                         start = time.time()
-                        response = requests.post(
+                        response = pooled_post(
                             GPT_API,
                             json={
                                 "model": "llama",
@@ -1018,7 +993,7 @@ class CustomGPT(LLM):
                 app.logger.info(f"In except the exception is {e}")
                 start = time.time()
 
-                response = requests.post(
+                response = pooled_post(
                     GPT_API,
                     json={
                         "model": "llama",
@@ -1504,7 +1479,7 @@ def parse_character_animation(string):
         image_name = response.json()["image_name"]
 
         image_url = response.json()["image_url"]
-        image_response = requests.get(image_url)
+        image_response = pooled_get(image_url)
         image_content = image_response.content
 
         image_name = image_name.replace("vtoonify_", "", 1)
@@ -1518,7 +1493,7 @@ def parse_character_animation(string):
             ('image', ('image.jpeg', image_content, 'image/jpeg'))
         ]
         url = "http://20.197.30.74:8000/generate_image/"
-        response = requests.post(url, headers=headers,
+        response = pooled_post(url, headers=headers,
                                  data=payload, files=files)
         if response.status_code == 200:
             return response.json()["url"]
@@ -1635,12 +1610,9 @@ async def call_crwalab_api(input_url, input_str_list, user_id, request_id):
 
 def start_async_tasks(coroutine):
     def run():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(coroutine)
-        finally:
-            loop.close()
+        from core.event_loop import get_or_create_event_loop
+        loop = get_or_create_event_loop()
+        loop.run_until_complete(coroutine)
     Thread(target=run).start()
 
 
@@ -1679,7 +1651,7 @@ def parse_link_for_crwalab(inp):
                     os.makedirs(upload_folder_path)
                 pdf_save_path = f'{upload_folder_path}/{pdf_file_name}'
 
-                response = requests.get(input_url)
+                response = pooled_get(input_url)
                 with open(pdf_save_path, 'wb') as file:
                     file.write(response.content)
 
@@ -1691,7 +1663,7 @@ def parse_link_for_crwalab(inp):
                 # Open the file and send it in the POST request
                 with open(pdf_save_path, 'rb') as file:
                     files = [('file', (pdf_file_name, file, 'application/pdf'))]
-                    response = requests.post(
+                    response = pooled_post(
                         BOOKPARSING_API, data=payload, files=files)
 
                 os.remove(pdf_save_path)
@@ -1757,7 +1729,8 @@ def get_frame(user_id):
 
     try:
         if serialized_frame is not None:
-            frame_bgr = pickle.loads(serialized_frame)
+            from security.safe_deserialize import safe_load_frame
+            frame_bgr = safe_load_frame(serialized_frame)
             app.logger.info(
                 f"Frame for user_id {user_id} retrieved successfully.")
             frame = frame_bgr[:, :, ::-1]
@@ -1795,7 +1768,7 @@ def parse_visual_context(inp: str):
         ]
         headers = {}
         try:
-            response = requests.post(
+            response = pooled_post(
                 url, headers=headers, data=payload, files=files)
             app.logger.info(response.text)
             response = response.text
@@ -2306,6 +2279,18 @@ def chat():
     # return ""
     thread_local_data.set_request_id(request_id=request_id)
     prompt = data.get('prompt', None)
+
+    # Security: Prompt injection detection
+    if prompt:
+        try:
+            from security.prompt_guard import check_prompt_injection
+            is_safe, reason = check_prompt_injection(prompt)
+            if not is_safe:
+                app.logger.warning(f"Prompt injection detected: {reason}")
+                return jsonify({'error': f'Input rejected: {reason}'}), 400
+        except Exception:
+            pass  # Degrade gracefully
+
     if prompt_id:
         if os.path.exists(f'prompts/{prompt_id}.json'):
             app.logger.info('GATHER JSON EXISTS')
@@ -2343,7 +2328,7 @@ def chat():
             if prompt_id not in first_promts:
                 first_promts.append(prompt_id)
                 try:
-                    res = requests.get(
+                    res = pooled_get(
                         f'{DB_URL}/getprompt/?prompt_id={prompt_id}').json()
                     prompt = prompt+f" name:{res[0]['name']} goal:{res[0]['prompt']}"
                 except:
@@ -2424,14 +2409,14 @@ def chat():
 
     if prompt_id:
         try:
-            res = requests.get(
+            res = pooled_get(
                 f'{DB_URL}/getprompt/?prompt_id={prompt_id}').json()
             # use config for url
             custom_prompt = res[0]['prompt']
             if res[0]['prompt'] == 'Learn Language':
                 app.logger.info(
                     'found Learn languague getting user preffered language')
-                lang = requests.post('{}/getstudent_by_user_id'.format(DB_URL),
+                lang = pooled_post('{}/getstudent_by_user_id'.format(DB_URL),
                                      data=json.dumps({"user_id": user_id})).json()
                 language = lang['preferred_language'][:2]
                 app.logger.info(f'user preffered language is {language}')
@@ -2476,7 +2461,7 @@ def chat():
     app.logger.info("the time taken by get ans in main api is %s seconds",
                     time.time() - ans_start_time)
     if req_tool == 'Image_Inference_Tool':
-        action_response = requests.post(f'{DB_URL}/create_action',)
+        action_response = pooled_post(f'{DB_URL}/create_action',)
         payload = json.dumps({
             "conv_id": None,
             "user_id": user_id,
@@ -2487,7 +2472,7 @@ def chat():
         headers = {
             'Content-Type': 'application/json'
         }
-        action_response = requests.post(f'{DB_URL}/create_action', headers=headers, data=payload)
+        action_response = pooled_post(f'{DB_URL}/create_action', headers=headers, data=payload)
     if ans != "":
         post_dict = {'user_id': user_id, 'status': 'FINISHED', 'task_name': "CHAT",
                      'uid': request_id, 'task_id': f"CHAT_{str(request_id)}", 'request_id': request_id}
@@ -2674,7 +2659,7 @@ def get_prompts():
     # 2. Fallback: try cloud DB if no local results
     if not prompts:
         try:
-            res = requests.get(
+            res = pooled_get(
                 f'{DB_URL}/getprompt_onlyuserid/?user_id={req_user_id}',
                 timeout=5)
             if res.status_code == 200:
@@ -2728,7 +2713,7 @@ def create_prompts():
 
     # Sync to cloud DB (non-blocking, best effort)
     try:
-        requests.post(
+        pooled_post(
             f'{DB_URL}/createpromptlist',
             json={'listprompts': listprompts},
             timeout=5)
@@ -2807,7 +2792,7 @@ Example response format:
         app.logger.info(f"Zero-shot classification request - Text: {input_text[:100]}..., Labels: {labels}")
 
         # Call Llama API
-        response = requests.post(
+        response = pooled_post(
             GPT_API,
             json={
                 "model": "llama",
@@ -2878,8 +2863,16 @@ Example response format:
         app.logger.error(f"Error in /zeroshot/ endpoint: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
-if __name__ == '__main__':
+def main():
+    """
+    Main entry point for hevolve-server CLI command.
+    Starts the Flask server using waitress.
+    """
     serve(app, host='0.0.0.0', port=6778, threads=50)
+
+
+if __name__ == '__main__':
+    main()
     # app.debug = True
     # flask_thread = threading.Thread(target=lambda: serve(app, host='0.0.0.0', port=6777))
     # flask_thread.daemon = True

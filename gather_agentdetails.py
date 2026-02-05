@@ -43,8 +43,8 @@ def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autoge
         Speak in a casual, playful, and respectful tone, keeping it natural, funny, colloquial, and relatable. Expressions should be clear, accurate, grammatically, and contextually correct, avoiding tense confusion. Switch to a more formal tone only if the user keeps it formal.
         ## Information Collection:
         You need to collect the following details from the user:
-        { "name": "The name of the agent", "agent_name": "A unique 3-word hyphenated lowercase identifier like swift-amber-falcon or calm-jade-oracle (adjective-color-noun pattern)", "goal": "The ultimate goal of the agent", "broadcast_agent": "yes/no", "personas": [ { "name": "The role of the persona", "description": "A description of what this persona can do" } ], "flows": [ { "flow_name": "", "persona": "Each persona will have a separate flow", "actions": ["String array with actions (including tool usage) to perform to reach the sub-goal for this flow"], "sub_goal": "The goal for this flow" } ], "extra_information": "Additional notes or relevant information" }
-        IMPORTANT: The "agent_name" field must be a creative, unique 3-word phrase in the format adjective-color-noun, all lowercase and hyphenated. Examples: swift-amber-falcon, calm-jade-oracle, bold-crimson-storm, fierce-emerald-phoenix. Generate this automatically — do NOT ask the user for it. Each word must be 2-15 lowercase letters only.
+        { "name": "The name of the agent", "agent_name": "A unique 2-word dot-separated lowercase identifier like swift.falcon or calm.oracle (adjective.noun pattern)", "goal": "The ultimate goal of the agent", "broadcast_agent": "yes/no", "personas": [ { "name": "The role of the persona", "description": "A description of what this persona can do" } ], "flows": [ { "flow_name": "", "persona": "Each persona will have a separate flow", "actions": ["String array with actions (including tool usage) to perform to reach the sub-goal for this flow"], "sub_goal": "The goal for this flow" } ], "extra_information": "Additional notes or relevant information" }
+        IMPORTANT: The "agent_name" field must be a unique 2-word phrase in the format adjective.noun, all lowercase and separated by a dot (like what3words). Examples: swift.falcon, calm.oracle, bold.storm, fierce.phoenix. Ask the user if they'd like to pick their own agent name or have one suggested. If they provide one, validate it follows the 2-word dot format. If they want a suggestion, generate a creative one. Each word must be 2-15 lowercase letters only.
         
         ## Guidelines for Responses:
         1.Information Gathering Process
@@ -69,7 +69,7 @@ def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autoge
             Before finalizing, present a full review to the user in this format:
                 { "status": "pending", "review_details": "All details in plain string here for user verification" }
             After confirmation, provide the final configuration in this format:
-                { "status": "completed", "name": "", "agent_name": "three-word-name", "broadcast_agent": bool, "personas": "", "tools": "", "flows": [ { "flow_name": "", "persona": "", "actions": [], "sub_goal": "" } ], "goal": "" }
+                { "status": "completed", "name": "", "agent_name": "two.word.name", "broadcast_agent": bool, "personas": "", "tools": "", "flows": [ { "flow_name": "", "persona": "", "actions": [], "sub_goal": "" } ], "goal": "" }
 
         """
     )
@@ -115,7 +115,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.Us
             if new_res['status'].lower() == 'completed':
                 if 'flows' not in new_res:
                     response = user_proxy.send(
-                        'please give the response in proper format: { "status": "completed", "name": "", "agent_name": "three-word-name", "broadcast_agent": bool, "personas": "", "tools": "", "flows": [ { "flow_name": "", "persona": "", "actions": [], "sub_goal": "" } ], "goal": "" } where flows should be outer key. agent_name must be a creative 3-word hyphenated lowercase name like swift-amber-falcon. \n\n             Strictly follow the response format that I am providing to you while generating the response. No matter what type of question has been asked follow the same instructions.  ',
+                        'please give the response in proper format: { "status": "completed", "name": "", "agent_name": "two.word.name", "broadcast_agent": bool, "personas": "", "tools": "", "flows": [ { "flow_name": "", "persona": "", "actions": [], "sub_goal": "" } ], "goal": "" } where flows should be outer key. agent_name must be a creative 2-word dot-separated lowercase name like swift.falcon. \n\n             Strictly follow the response format that I am providing to you while generating the response. No matter what type of question has been asked follow the same instructions.  ',
                         assistant,
                         request_reply=True
                     )

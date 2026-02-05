@@ -1,6 +1,6 @@
 """
 HevolveSocial - External Bot Bridge
-Bridge for moltbot/OpenClaw and bmoltbook agents to register, post, and interact
+Bridge for SantaClaw/OpenClaw and bmoltbook agents to register, post, and interact
 with HevolveSocial — HevolveBot's AI-native social network.
 """
 import logging
@@ -16,11 +16,11 @@ from .realtime import on_new_post, on_new_comment, on_vote_update
 
 logger = logging.getLogger('hevolve_social')
 
-SUPPORTED_PLATFORMS = ['moltbot', 'openclaw', 'bmoltbook', 'a2a', 'generic']
+SUPPORTED_PLATFORMS = ['santaclaw', 'openclaw', 'bmoltbook', 'a2a', 'generic']
 
 
 class ExternalBotRegistry:
-    """Registry for external bots (moltbot, OpenClaw, bmoltbook) that connect to HevolveSocial."""
+    """Registry for external bots (SantaClaw, OpenClaw, bmoltbook) that connect to HevolveSocial."""
 
     @staticmethod
     def register_bot(db, bot_id: str, bot_name: str, platform: str = 'generic',
@@ -191,11 +191,11 @@ def _handle_follow(db, bot_user, action):
     return {'action': 'follow', 'status': 'followed' if created else 'already_following'}
 
 
-# ─── Outbound: Discover moltbot/OpenClaw agents ───
+# ─── Outbound: Discover SantaClaw/OpenClaw agents ───
 
-def discover_moltbot_agents(gateway_url: str, timeout: int = 10) -> list:
+def discover_santaclaw_agents(gateway_url: str, timeout: int = 10) -> list:
     """
-    Discover available agents from a moltbot/OpenClaw gateway.
+    Discover available agents from a SantaClaw/OpenClaw gateway.
     Tries HTTP endpoint for session listing.
     """
     agents = []
@@ -212,7 +212,7 @@ def discover_moltbot_agents(gateway_url: str, timeout: int = 10) -> list:
                         agents.append({
                             'session_id': s.get('id') or s.get('session_id', ''),
                             'name': s.get('name') or s.get('label', ''),
-                            'platform': 'moltbot',
+                            'platform': 'santaclaw',
                             'gateway_url': gateway_url,
                         })
                     break
@@ -236,14 +236,14 @@ def discover_moltbot_agents(gateway_url: str, timeout: int = 10) -> list:
             pass
 
     except Exception as e:
-        logger.debug(f"Moltbot discovery failed for {gateway_url}: {e}")
+        logger.debug(f"SantaClaw discovery failed for {gateway_url}: {e}")
 
     return agents
 
 
-def send_to_moltbot(gateway_url: str, session_id: str, message: str,
-                    timeout: int = 30) -> dict:
-    """Send a message to a moltbot/OpenClaw agent session."""
+def send_to_santaclaw(gateway_url: str, session_id: str, message: str,
+                      timeout: int = 30) -> dict:
+    """Send a message to a SantaClaw/OpenClaw agent session."""
     try:
         for path in [f'/sessions/{session_id}/send', f'/api/sessions/{session_id}/messages']:
             try:

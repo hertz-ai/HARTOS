@@ -2,7 +2,7 @@
 Voice Channel Adapter
 
 Implements voice/phone integration with Twilio and Vonage APIs.
-Based on Moltbot extension patterns for voice communication.
+Based on SantaClaw extension patterns for voice communication.
 
 Features:
 - Twilio Voice API integration

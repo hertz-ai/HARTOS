@@ -27,6 +27,40 @@ def init_social(app):
     except Exception as e:
         logger.warning(f"HevolveSocial DB init failed (non-fatal): {e}")
 
+    # Seed default achievements
+    try:
+        from .gamification_service import GamificationService
+        from .models import get_db
+        db = get_db()
+        count = GamificationService.seed_achievements(db)
+        if count > 0:
+            db.commit()
+            logger.info(f"HevolveSocial: seeded {count} achievements")
+        db.close()
+    except Exception as e:
+        logger.debug(f"HevolveSocial achievement seeding skipped: {e}")
+
+    # Seed default ad placements
+    try:
+        from .ad_service import AdService
+        from .models import get_db as _get_db
+        db = _get_db()
+        count = AdService.seed_placements(db)
+        if count > 0:
+            db.commit()
+            logger.info(f"HevolveSocial: seeded {count} ad placements")
+        db.close()
+    except Exception as e:
+        logger.debug(f"HevolveSocial ad placement seeding skipped: {e}")
+
+    # Register gamification blueprint
+    try:
+        from .api_gamification import gamification_bp
+        app.register_blueprint(gamification_bp)
+        logger.info("HevolveSocial gamification endpoints registered")
+    except Exception as e:
+        logger.warning(f"HevolveSocial gamification blueprint skipped: {e}")
+
     # Register discovery blueprint (.well-known/hevolve-social.json)
     try:
         from .discovery import discovery_bp
@@ -34,6 +68,15 @@ def init_social(app):
         logger.info("HevolveSocial discovery endpoint registered at /.well-known/hevolve-social.json")
     except Exception as e:
         logger.debug(f"HevolveSocial discovery blueprint skipped: {e}")
+
+    # Initialize node keypair for integrity verification
+    try:
+        from security.node_integrity import get_or_create_keypair, get_public_key_hex
+        get_or_create_keypair()
+        pubkey = get_public_key_hex()
+        logger.info(f"HevolveSocial node keypair initialized: {pubkey[:16]}...")
+    except Exception as e:
+        logger.debug(f"HevolveSocial keypair init skipped: {e}")
 
     # Start decentralized gossip peer discovery (background thread)
     try:
@@ -43,6 +86,20 @@ def init_social(app):
                     f"seeds={len(gossip.seed_peers)}")
     except Exception as e:
         logger.debug(f"HevolveSocial gossip start skipped: {e}")
+
+    # Register with central registry if configured
+    import os
+    registry_url = os.environ.get('HEVOLVE_REGISTRY_URL', '')
+    if registry_url:
+        try:
+            from .integrity_service import IntegrityService
+            from .peer_discovery import gossip as _gossip
+            from security.node_integrity import get_public_key_hex as _get_pubkey
+            IntegrityService.register_with_registry(
+                registry_url, _gossip.node_id, _get_pubkey(), _gossip.version)
+            logger.info(f"HevolveSocial registered with registry: {registry_url}")
+        except Exception as e:
+            logger.debug(f"HevolveSocial registry registration skipped: {e}")
 
     # Sync trained agents as social users on first request
     @app.before_request

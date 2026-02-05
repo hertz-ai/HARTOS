@@ -437,9 +437,9 @@ def get_default_llm_client():
     """
     class SimpleLLMClient:
         def complete(self, prompt: str) -> str:
-            import requests
+            from core.http_pool import pooled_post
             try:
-                response = requests.post(
+                response = pooled_post(
                     "http://localhost:8080/v1/chat/completions",
                     json={
                         "model": "Qwen3-VL-4B-Instruct",

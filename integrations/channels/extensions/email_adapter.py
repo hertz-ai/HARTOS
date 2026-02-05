@@ -2,7 +2,7 @@
 Email Channel Adapter
 
 Implements email messaging via IMAP/SMTP.
-Based on Moltbot extension patterns for email.
+Based on SantaClaw extension patterns for email.
 
 Features:
 - IMAP for receiving emails

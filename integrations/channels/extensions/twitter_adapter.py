@@ -2,7 +2,7 @@
 Twitter/X Channel Adapter
 
 Implements Twitter/X Direct Messages and mentions handling.
-Based on Moltbot extension patterns for Twitter.
+Based on SantaClaw extension patterns for Twitter.
 
 Features:
 - Direct Messages (DMs) send/receive

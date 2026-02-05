@@ -1,11 +1,13 @@
 """
 HevolveSocial - Authentication
 JWT token generation, password hashing, and @require_auth decorator.
+Uses security.jwt_manager for hardened token management.
 """
 import hashlib
 import hmac
 import os
 import secrets
+import logging
 import time
 from functools import wraps
 
@@ -17,8 +19,31 @@ try:
 except ImportError:
     HAS_JWT = False
 
-SECRET_KEY = os.environ.get('SOCIAL_SECRET_KEY', 'hevolve-social-secret-change-in-production')
-TOKEN_EXPIRY = 86400 * 30  # 30 days
+logger = logging.getLogger('hevolve_social')
+
+# Use hardened JWT manager when available
+_jwt_manager = None
+
+def _get_jwt_manager():
+    global _jwt_manager
+    if _jwt_manager is not None:
+        return _jwt_manager
+    try:
+        from security.jwt_manager import JWTManager
+        _jwt_manager = JWTManager()
+        logger.info("Using hardened JWTManager")
+        return _jwt_manager
+    except Exception as e:
+        logger.warning(f"JWTManager unavailable ({e}), using legacy JWT")
+        return None
+
+# Legacy fallback values
+SECRET_KEY = os.environ.get('SOCIAL_SECRET_KEY', '')
+if not SECRET_KEY:
+    SECRET_KEY = 'hevolve-social-secret-change-in-production'
+    logger.warning("SOCIAL_SECRET_KEY not set - using insecure default. Set this in production!")
+
+TOKEN_EXPIRY = 3600  # 1 hour (was 30 days)
 
 
 def hash_password(password: str) -> str:
@@ -40,24 +65,54 @@ def generate_api_token() -> str:
 
 
 def generate_jwt(user_id: str, username: str) -> str:
+    mgr = _get_jwt_manager()
+    if mgr:
+        return mgr.generate_access_token(str(user_id), username)
     if HAS_JWT:
+        import uuid
         payload = {
-            'user_id': user_id,
+            'user_id': str(user_id),
             'username': username,
+            'jti': str(uuid.uuid4()),
             'iat': int(time.time()),
             'exp': int(time.time()) + TOKEN_EXPIRY,
+            'type': 'access',
         }
         return pyjwt.encode(payload, SECRET_KEY, algorithm='HS256')
     return generate_api_token()
 
 
+def generate_token_pair(user_id: str, username: str) -> dict:
+    """Generate access + refresh token pair."""
+    mgr = _get_jwt_manager()
+    if mgr:
+        return mgr.generate_token_pair(str(user_id), username)
+    return {
+        'access_token': generate_jwt(user_id, username),
+        'refresh_token': generate_api_token(),
+        'token_type': 'bearer',
+        'expires_in': TOKEN_EXPIRY,
+    }
+
+
 def decode_jwt(token: str) -> dict:
+    mgr = _get_jwt_manager()
+    if mgr:
+        result = mgr.decode_token(token, expected_type='access')
+        return result or {}
     if HAS_JWT:
         try:
             return pyjwt.decode(token, SECRET_KEY, algorithms=['HS256'])
         except (pyjwt.ExpiredSignatureError, pyjwt.InvalidTokenError):
             return {}
     return {}
+
+
+def revoke_token(token: str):
+    """Revoke a JWT token (add to blocklist)."""
+    mgr = _get_jwt_manager()
+    if mgr:
+        mgr.revoke_token(token)
 
 
 def _get_user_from_token(token: str):

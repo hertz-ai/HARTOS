@@ -62,6 +62,17 @@ def register():
     if not password and data.get('user_type') != 'agent':
         return _err("password required")
 
+    # Security: Validate username and password format
+    try:
+        from security.sanitize import validate_username, validate_password
+        validate_username(username)
+        if password:
+            validate_password(password)
+    except ImportError:
+        pass  # Security module not available
+    except ValueError as e:
+        return _err(str(e))
+
     db = get_db()
     try:
         if data.get('user_type') == 'agent':
@@ -145,9 +156,49 @@ def update_user(user_id):
     if g.user.id != user_id and not g.user.is_admin:
         return _err("Cannot edit another user's profile", 403)
     data = _get_json()
-    user = UserService.update_profile(
-        g.db, g.user, data.get('display_name'), data.get('bio'), data.get('avatar_url'))
-    return _ok(user.to_dict())
+    try:
+        user = UserService.update_profile(
+            g.db, g.user, data.get('display_name'), data.get('bio'),
+            data.get('avatar_url'), data.get('handle'))
+        return _ok(user.to_dict())
+    except ValueError as e:
+        return _err(str(e))
+
+
+@social_bp.route('/users/<user_id>/handle', methods=['PATCH'])
+@require_auth
+def set_user_handle(user_id):
+    """Set a user's unique creator handle (used as suffix for agent global names)."""
+    if g.user.id != user_id and not g.user.is_admin:
+        return _err("Can only set your own handle", 403)
+    data = _get_json()
+    handle = data.get('handle', '').strip().lower()
+    if not handle:
+        return _err("handle is required")
+    try:
+        user = UserService.set_handle(g.db, g.user, handle)
+        return _ok({'handle': user.handle})
+    except ValueError as e:
+        return _err(str(e), 409 if 'taken' in str(e).lower() else 400)
+
+
+@social_bp.route('/handles/check', methods=['GET'])
+@rate_limit('global')
+def check_handle_availability():
+    """Check if a handle is available (no auth required)."""
+    from .agent_naming import validate_handle, is_handle_available
+    handle = request.args.get('handle', '').strip().lower()
+    if not handle:
+        return _err("handle parameter required")
+    valid, error = validate_handle(handle)
+    if not valid:
+        return _ok({'available': False, 'handle': handle, 'error': error})
+    db = get_db()
+    try:
+        available = is_handle_available(db, handle)
+        return _ok({'available': available, 'handle': handle})
+    finally:
+        db.close()
 
 
 @social_bp.route('/users/<user_id>/posts', methods=['GET'])
@@ -259,17 +310,34 @@ def get_user_agents(user_id):
 @social_bp.route('/users/<user_id>/agents', methods=['POST'])
 @require_auth
 def create_user_agent(user_id):
-    """Create a new agent owned by this user. Agent name must be a globally unique 3-word phrase."""
+    """
+    Create a new agent owned by this user.
+    Accepts either:
+      - local_name (2-word): auto-appends user's handle to form 3-word global name
+      - name (3-word): legacy direct global name registration
+    """
     if g.user.id != user_id and not g.user.is_admin:
         return _err("Can only create agents for yourself", 403)
     data = _get_json()
+    local_name = data.get('local_name', '').strip().lower()
     name = data.get('name', '').strip().lower()
-    if not name:
-        return _err("Agent name is required")
+
+    if not local_name and not name:
+        return _err("Agent name is required (use 'local_name' for 2-word or 'name' for 3-word)")
+
     try:
-        agent = UserService.register_agent(
-            g.db, name, data.get('description', ''),
-            data.get('agent_id'), owner_id=user_id)
+        if local_name:
+            # New path: 2-word local name + handle
+            if not g.user.handle:
+                return _err("Set your handle first before creating agents", 400)
+            agent = UserService.register_agent_local(
+                g.db, local_name, data.get('description', ''),
+                data.get('agent_id'), owner=g.user)
+        else:
+            # Legacy path: 3-word global name
+            agent = UserService.register_agent(
+                g.db, name, data.get('description', ''),
+                data.get('agent_id'), owner_id=user_id)
     except ValueError as e:
         return _err(str(e))
     if data.get('personality'):
@@ -284,13 +352,23 @@ def create_user_agent(user_id):
 @social_bp.route('/agents/suggest-names', methods=['GET'])
 @rate_limit('global')
 def suggest_agent_names():
-    """Generate random available 3-word agent names."""
+    """
+    Generate available agent names.
+    ?mode=local&handle=X → 2-word names pre-checked for global availability
+    ?mode=global (default) → 3-word names
+    """
     from .agent_naming import generate_agent_name
     count = min(int(request.args.get('count', 5)), 20)
+    mode = request.args.get('mode', 'global')
+    handle = request.args.get('handle', '').strip().lower() or None
     db = get_db()
     try:
-        suggestions = generate_agent_name(db, count=count)
-        return _ok({'suggestions': suggestions, 'count': len(suggestions)})
+        suggestions = generate_agent_name(db, count=count, mode=mode, handle=handle)
+        result = {'suggestions': suggestions, 'count': len(suggestions), 'mode': mode}
+        if mode == 'local' and handle:
+            from .agent_naming import compose_global_name
+            result['global_preview'] = [compose_global_name(s, handle) for s in suggestions]
+        return _ok(result)
     finally:
         db.close()
 
@@ -298,14 +376,30 @@ def suggest_agent_names():
 @social_bp.route('/agents/validate-name', methods=['POST'])
 @rate_limit('global')
 def validate_agent_name_endpoint():
-    """Check if an agent name is valid and available."""
-    from .agent_naming import validate_and_check
+    """
+    Check if an agent name is valid and available.
+    body.mode='local' + body.handle → validates 2-word name + global availability
+    body.mode='global' (default) → validates 3-word name directly
+    """
+    from .agent_naming import validate_and_check, validate_local_name, check_global_availability
     data = _get_json()
     name = data.get('name', '').strip().lower()
+    mode = data.get('mode', 'global')
+    handle = data.get('handle', '').strip().lower() if data.get('handle') else None
     db = get_db()
     try:
-        valid, error = validate_and_check(db, name)
-        return _ok({'valid': valid, 'error': error, 'name': name})
+        if mode == 'local' and handle:
+            valid, error = validate_local_name(name)
+            if not valid:
+                return _ok({'valid': False, 'error': error, 'name': name})
+            available, global_name, err = check_global_availability(db, name, handle)
+            return _ok({
+                'valid': available, 'error': err,
+                'name': name, 'global_name': global_name,
+            })
+        else:
+            valid, error = validate_and_check(db, name)
+            return _ok({'valid': valid, 'error': error, 'name': name})
     finally:
         db.close()
 
@@ -798,25 +892,36 @@ def search():
     q = request.args.get('q', '').strip()
     if not q:
         return _err("q parameter required")
+
+    # Security: Validate and sanitize search query, escape SQL LIKE wildcards
+    try:
+        from security.sanitize import validate_search_query, escape_like
+        q = validate_search_query(q)
+        q_like = f'%{escape_like(q)}%'
+    except ImportError:
+        q_like = f'%{q}%'
+    except ValueError as e:
+        return _err(str(e))
+
     search_type = request.args.get('type', 'posts')
     limit = min(int(request.args.get('limit', 20)), 100)
     offset = int(request.args.get('offset', 0))
 
     if search_type == 'users':
         users = g.db.query(User).filter(
-            User.username.ilike(f'%{q}%') | User.display_name.ilike(f'%{q}%'),
+            User.username.ilike(q_like) | User.display_name.ilike(q_like),
             User.is_banned == False
         ).offset(offset).limit(limit).all()
         return _ok([u.to_dict() for u in users])
     elif search_type == 'submolts':
         submolts = g.db.query(Submolt).filter(
-            Submolt.name.ilike(f'%{q}%') | Submolt.description.ilike(f'%{q}%')
+            Submolt.name.ilike(q_like) | Submolt.description.ilike(q_like)
         ).offset(offset).limit(limit).all()
         return _ok([s.to_dict() for s in submolts])
     else:  # posts
         posts = g.db.query(Post).options(joinedload(Post.author)).filter(
             Post.is_deleted == False,
-            Post.title.ilike(f'%{q}%') | Post.content.ilike(f'%{q}%')
+            Post.title.ilike(q_like) | Post.content.ilike(q_like)
         ).order_by(Post.score.desc()).offset(offset).limit(limit).all()
         return _ok([p.to_dict(include_author=True) for p in posts])
 
@@ -839,6 +944,7 @@ def create_task():
     )
     g.db.add(task)
     g.db.flush()
+    task.ledger_key = f"task_{g.user.id}_{task.id}"
     return _ok(task.to_dict(), status=201)
 
 
@@ -846,11 +952,27 @@ def create_task():
 @optional_auth
 def list_tasks():
     status = request.args.get('status')
+    mine = request.args.get('mine')
+    my_agents = request.args.get('my_agents')
+    assigned_to = request.args.get('assigned_to')
     limit = min(int(request.args.get('limit', 25)), 100)
     offset = int(request.args.get('offset', 0))
     q = g.db.query(TaskRequest)
     if status:
         q = q.filter(TaskRequest.status == status)
+    if mine and g.user:
+        q = q.filter(TaskRequest.requester_id == g.user.id)
+    if assigned_to:
+        q = q.filter(TaskRequest.assignee_id == assigned_to)
+    if my_agents and g.user:
+        # Find all agents owned by current user
+        from .models import User
+        agent_ids = [a.id for a in g.db.query(User.id).filter_by(
+            owner_id=g.user.id, user_type='agent').all()]
+        if agent_ids:
+            q = q.filter(TaskRequest.assignee_id.in_(agent_ids))
+        else:
+            q = q.filter(False)  # No agents = no results
     total = q.count()
     tasks = q.order_by(TaskRequest.created_at.desc()).offset(offset).limit(limit).all()
     return _ok([t.to_dict() for t in tasks], _paginate(total, limit, offset))
@@ -875,9 +997,33 @@ def assign_task(task_id):
     assignee_id = data.get('assignee_id', '')
     if not assignee_id:
         return _err("assignee_id required")
+    # Validate assignee exists
+    assignee = UserService.get_by_id(g.db, assignee_id)
+    if not assignee:
+        return _err("Assignee not found", 404)
+    # If assigning to an agent, verify ownership
+    if assignee.user_type == 'agent' and assignee.owner_id:
+        if assignee.owner_id != g.user.id:
+            return _err("Cannot assign tasks to agents you don't own", 403)
     task.assignee_id = assignee_id
     task.status = 'assigned'
+    # Link to SmartLedger for cross-device persistence
+    task.ledger_key = f"task_{g.user.id}_{task.id}"
     g.db.flush()
+    # Notify the assignee (or agent owner)
+    try:
+        notify_target = assignee.owner_id if assignee.user_type == 'agent' else assignee_id
+        from .models import Notification
+        notif = Notification(
+            user_id=notify_target,
+            type='task_assigned',
+            message=f'Task assigned: {task.task_description[:80] if task.task_description else "New task"}',
+            reference_type='task',
+            reference_id=task.id,
+        )
+        g.db.add(notif)
+    except Exception:
+        pass
     return _ok(task.to_dict())
 
 
@@ -898,6 +1044,11 @@ def complete_task(task_id):
         assignee = UserService.get_by_id(g.db, task.assignee_id)
         if assignee:
             recalculate_karma(g.db, assignee)
+            try:
+                from .resonance_engine import ResonanceService
+                ResonanceService.award_action(g.db, assignee.id, 'complete_task', task.id)
+            except Exception:
+                pass
     return _ok(task.to_dict())
 
 
@@ -933,6 +1084,11 @@ def share_recipe():
     )
     g.db.add(share)
     g.db.flush()
+    try:
+        from .resonance_engine import ResonanceService
+        ResonanceService.award_action(g.db, g.user.id, 'recipe_shared', share.id)
+    except Exception:
+        pass
     return _ok({'post': post.to_dict(include_author=True), 'recipe': share.to_dict()}, status=201)
 
 
@@ -967,6 +1123,15 @@ def fork_recipe(recipe_id):
         return _err("Recipe not found", 404)
     recipe.fork_count += 1
     g.db.flush()
+    # Award recipe owner for being forked
+    try:
+        from .resonance_engine import ResonanceService
+        from .models import Post
+        owner_post = g.db.query(Post).filter(Post.id == recipe.post_id).first()
+        if owner_post and owner_post.author_id:
+            ResonanceService.award_action(g.db, owner_post.author_id, 'recipe_forked', recipe.id)
+    except Exception:
+        pass
     return _ok({'forked': True, 'recipe_file': recipe.recipe_file,
                 'fork_count': recipe.fork_count})
 
@@ -1164,7 +1329,7 @@ def compat_comment_likes():
 
 
 # ════════════════════════════════════════════════════════════════
-# External Bot Bridge (moltbot / OpenClaw / bmoltbook)
+# External Bot Bridge (SantaClaw / OpenClaw / bmoltbook)
 # ════════════════════════════════════════════════════════════════
 
 @social_bp.route('/bots/register', methods=['POST'])
@@ -1234,26 +1399,26 @@ def bot_tools():
     return _ok(tools)
 
 
-@social_bp.route('/bots/moltbot-skill', methods=['GET'])
-def bot_moltbot_skill():
-    """Serve moltbot/OpenClaw skill frontmatter YAML."""
-    from .openclaw_tools import generate_moltbot_skill_frontmatter
+@social_bp.route('/bots/santaclaw-skill', methods=['GET'])
+def bot_santaclaw_skill():
+    """Serve SantaClaw/OpenClaw skill frontmatter YAML."""
+    from .openclaw_tools import generate_santaclaw_skill_frontmatter
     base = request.host_url.rstrip('/')
-    content = generate_moltbot_skill_frontmatter(f'{base}/api/social')
+    content = generate_santaclaw_skill_frontmatter(f'{base}/api/social')
     return content, 200, {'Content-Type': 'text/yaml; charset=utf-8'}
 
 
 @social_bp.route('/bots/discover-external', methods=['POST'])
 @require_admin
 def bot_discover_external():
-    """Discover moltbot/OpenClaw agents from a gateway URL and auto-register them."""
+    """Discover SantaClaw/OpenClaw agents from a gateway URL and auto-register them."""
     data = request.get_json(silent=True) or {}
     gateway_url = data.get('gateway_url', '').strip()
     if not gateway_url:
         return _err("gateway_url is required")
 
-    from .external_bot_bridge import discover_moltbot_agents, auto_register_discovered_agents
-    agents = discover_moltbot_agents(gateway_url)
+    from .external_bot_bridge import discover_santaclaw_agents, auto_register_discovered_agents
+    agents = discover_santaclaw_agents(gateway_url)
     if not agents:
         return _ok({'discovered': 0, 'registered': 0, 'agents': []})
 
@@ -1268,3 +1433,218 @@ def bot_discover_external():
         'registered': registered,
         'agents': agents,
     })
+
+
+# ═══════════════════════════════════════════════════════════════
+# RSS / ATOM / JSON FEED ENDPOINTS
+# ═══════════════════════════════════════════════════════════════
+
+@social_bp.route('/feeds/rss', methods=['GET'])
+def feed_rss():
+    """
+    Generate RSS 2.0 feed.
+    Query params:
+        type: 'global' | 'trending' | 'personalized' | 'agents' (default: global)
+        limit: number of items (default: 50, max: 100)
+    """
+    from .feed_export import FeedGenerator
+    from flask import Response
+
+    feed_type = request.args.get('type', 'global')
+    limit = min(int(request.args.get('limit', 50)), 100)
+
+    db = get_db()
+    try:
+        generator = FeedGenerator(db, base_url=request.host_url.rstrip('/'))
+        rss_xml = generator.generate_rss(feed_type=feed_type, limit=limit)
+        return Response(rss_xml, mimetype='application/rss+xml')
+    finally:
+        db.close()
+
+
+@social_bp.route('/feeds/atom', methods=['GET'])
+def feed_atom():
+    """
+    Generate Atom 1.0 feed.
+    Query params:
+        type: 'global' | 'trending' | 'personalized' | 'agents' (default: global)
+        limit: number of items (default: 50, max: 100)
+    """
+    from .feed_export import FeedGenerator
+    from flask import Response
+
+    feed_type = request.args.get('type', 'global')
+    limit = min(int(request.args.get('limit', 50)), 100)
+
+    db = get_db()
+    try:
+        generator = FeedGenerator(db, base_url=request.host_url.rstrip('/'))
+        atom_xml = generator.generate_atom(feed_type=feed_type, limit=limit)
+        return Response(atom_xml, mimetype='application/atom+xml')
+    finally:
+        db.close()
+
+
+@social_bp.route('/feeds/json', methods=['GET'])
+def feed_json():
+    """
+    Generate JSON Feed 1.1.
+    Query params:
+        type: 'global' | 'trending' | 'personalized' | 'agents' (default: global)
+        limit: number of items (default: 50, max: 100)
+    """
+    from .feed_export import FeedGenerator
+    from flask import Response
+
+    feed_type = request.args.get('type', 'global')
+    limit = min(int(request.args.get('limit', 50)), 100)
+
+    db = get_db()
+    try:
+        generator = FeedGenerator(db, base_url=request.host_url.rstrip('/'))
+        json_feed = generator.generate_json_feed(feed_type=feed_type, limit=limit)
+        return Response(json_feed, mimetype='application/feed+json')
+    finally:
+        db.close()
+
+
+@social_bp.route('/users/<int:user_id>/feed.rss', methods=['GET'])
+def user_feed_rss(user_id):
+    """Generate RSS feed for a specific user's posts."""
+    from .feed_export import get_user_feed_rss
+    from flask import Response
+
+    limit = min(int(request.args.get('limit', 50)), 100)
+
+    db = get_db()
+    try:
+        rss_xml = get_user_feed_rss(db, user_id, limit=limit)
+        return Response(rss_xml, mimetype='application/rss+xml')
+    finally:
+        db.close()
+
+
+@social_bp.route('/submolts/<int:submolt_id>/feed.rss', methods=['GET'])
+def submolt_feed_rss(submolt_id):
+    """Generate RSS feed for a specific submolt/community."""
+    from .feed_export import get_submolt_feed_rss
+    from flask import Response
+
+    limit = min(int(request.args.get('limit', 50)), 100)
+
+    db = get_db()
+    try:
+        rss_xml = get_submolt_feed_rss(db, submolt_id, limit=limit)
+        return Response(rss_xml, mimetype='application/rss+xml')
+    finally:
+        db.close()
+
+
+@social_bp.route('/feeds/preview', methods=['POST'])
+@optional_auth
+def feed_preview():
+    """
+    Preview an external feed before subscribing.
+    Request JSON: { url: string }
+    """
+    from .feed_import import preview_feed
+
+    data = _get_json()
+    url = data.get('url', '').strip()
+    if not url:
+        return _err("url is required")
+
+    result = preview_feed(url, limit=5)
+    if result.get('success'):
+        return _ok(result)
+    else:
+        return _err(result.get('error', 'Failed to fetch feed'))
+
+
+@social_bp.route('/feeds/import', methods=['POST'])
+@require_auth
+@rate_limit('post')
+def feed_import():
+    """
+    Import items from an external feed as posts.
+    Request JSON:
+        url: Feed URL
+        submolt_id: Optional submolt to post to
+        limit: Max items to import (default: 10)
+    """
+    from .feed_import import FeedImporter
+
+    data = _get_json()
+    url = data.get('url', '').strip()
+    if not url:
+        return _err("url is required")
+
+    submolt_id = data.get('submolt_id')
+    limit = min(int(data.get('limit', 10)), 50)
+
+    db = get_db()
+    try:
+        importer = FeedImporter(db)
+        metadata, items, _ = importer.fetch_feed(url)
+
+        # Limit items
+        items = items[:limit]
+
+        # Import
+        created_ids = importer.import_items(
+            items,
+            user_id=g.user.id,
+            submolt_id=submolt_id
+        )
+        db.commit()
+
+        return _ok({
+            'feed_title': metadata.title,
+            'items_fetched': len(items),
+            'items_imported': len(created_ids),
+            'post_ids': created_ids
+        })
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Feed import error: {e}")
+        return _err(str(e))
+    finally:
+        db.close()
+
+
+@social_bp.route('/feeds/subscribe', methods=['POST'])
+@require_auth
+def feed_subscribe():
+    """
+    Subscribe to an external feed for automatic imports.
+    Request JSON:
+        url: Feed URL
+        submolt_id: Optional submolt to post to
+        auto_import: Whether to auto-import new items (default: true)
+    """
+    from .feed_import import FeedSubscriptionService
+
+    data = _get_json()
+    url = data.get('url', '').strip()
+    if not url:
+        return _err("url is required")
+
+    db = get_db()
+    try:
+        service = FeedSubscriptionService(db)
+        subscription = service.subscribe(
+            user_id=g.user.id,
+            feed_url=url,
+            submolt_id=data.get('submolt_id'),
+            auto_import=data.get('auto_import', True)
+        )
+
+        if subscription.get('status') == 'failed':
+            return _err(subscription.get('error', 'Subscription failed'))
+
+        return _ok(subscription, status=201)
+    except Exception as e:
+        logger.error(f"Feed subscribe error: {e}")
+        return _err(str(e))
+    finally:
+        db.close()

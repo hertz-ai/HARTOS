@@ -15,6 +15,7 @@ import json
 import logging
 import requests
 from typing import List, Dict, Any, Optional, Callable
+from core.http_pool import pooled_get, pooled_post
 from datetime import datetime
 import os
 
@@ -52,7 +53,7 @@ class MCPServerConnector:
                 headers['Authorization'] = f'Bearer {self.api_key}'
 
             # Try health endpoint first
-            response = requests.get(
+            response = pooled_get(
                 f"{self.server_url}/health",
                 headers=headers,
                 timeout=5
@@ -86,7 +87,7 @@ class MCPServerConnector:
             if self.api_key:
                 headers['Authorization'] = f'Bearer {self.api_key}'
 
-            response = requests.get(
+            response = pooled_get(
                 f"{self.server_url}/tools/list",
                 headers=headers,
                 timeout=10
@@ -123,6 +124,20 @@ class MCPServerConnector:
             }
 
         try:
+            # Security: MCP sandbox — validate tool call before execution
+            try:
+                from security.mcp_sandbox import MCPSandbox
+                sandbox = MCPSandbox()
+                if not sandbox.validate_server_url(self.server_url):
+                    logger.warning(f"MCP sandbox rejected server URL: {self.server_url}")
+                    return {'success': False, 'error': f'Server URL not allowed: {self.server_url}'}
+                is_valid, rejection = sandbox.validate_tool_call(tool_name, arguments)
+                if not is_valid:
+                    logger.warning(f"MCP sandbox rejected tool call: {rejection}")
+                    return {'success': False, 'error': f'Tool call rejected: {rejection}'}
+            except ImportError:
+                pass  # Security module not available
+
             headers = {'Content-Type': 'application/json'}
             if self.api_key:
                 headers['Authorization'] = f'Bearer {self.api_key}'
@@ -132,7 +147,7 @@ class MCPServerConnector:
                 'arguments': arguments
             }
 
-            response = requests.post(
+            response = pooled_post(
                 f"{self.server_url}/tools/execute",
                 headers=headers,
                 json=payload,
@@ -140,7 +155,18 @@ class MCPServerConnector:
             )
 
             if response.status_code == 200:
-                return response.json()
+                result = response.json()
+                # Security: Validate response for data exfiltration
+                try:
+                    from security.mcp_sandbox import MCPSandbox
+                    sandbox = MCPSandbox()
+                    resp_safe, resp_reason = sandbox.validate_response(result)
+                    if not resp_safe:
+                        logger.warning(f"MCP response validation failed: {resp_reason}")
+                        return {'success': False, 'error': f'Response rejected: {resp_reason}'}
+                except ImportError:
+                    pass
+                return result
             else:
                 logger.error(f"Tool execution failed on {self.server_name}: {response.status_code}")
                 return {

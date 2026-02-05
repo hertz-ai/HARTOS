@@ -78,6 +78,8 @@ class GossipProtocol:
     def _background_loop(self):
         last_gossip = 0
         last_health = 0
+        last_integrity = 0
+        integrity_interval = int(os.environ.get('HEVOLVE_INTEGRITY_INTERVAL', '300'))
         while self._running:
             now = time.time()
             try:
@@ -87,6 +89,9 @@ class GossipProtocol:
                 if now - last_health >= self.health_interval:
                     self._health_check_round()
                     last_health = now
+                if now - last_integrity >= integrity_interval:
+                    self._integrity_round()
+                    last_integrity = now
             except Exception as e:
                 logger.debug(f"Gossip loop error: {e}")
             time.sleep(5)
@@ -130,6 +135,15 @@ class GossipProtocol:
                     elif age > self.stale_threshold:
                         peer.status = 'stale'
             db.commit()
+            # Update contribution scores for active/stale peers
+            try:
+                from .hosting_reward_service import HostingRewardService
+                for peer in peers:
+                    if peer.status in ('active', 'stale') and peer.node_id != self.node_id:
+                        HostingRewardService.compute_contribution_score(db, peer.node_id)
+                db.commit()
+            except Exception:
+                pass
         except Exception as e:
             db.rollback()
             logger.debug(f"Health check error: {e}")
@@ -235,14 +249,24 @@ class GossipProtocol:
     # ─── Internal Helpers ───
 
     def _self_info(self):
-        return {
+        info = {
             'node_id': self.node_id,
             'url': self.base_url,
             'name': self.node_name,
             'version': self.version,
             'agent_count': self._get_count('agent'),
             'post_count': self._get_count('post'),
+            'timestamp': int(time.time()),
         }
+        # Add cryptographic identity if available
+        try:
+            from security.node_integrity import get_public_key_hex, compute_code_hash, sign_json_payload
+            info['public_key'] = get_public_key_hex()
+            info['code_hash'] = compute_code_hash()
+            info['signature'] = sign_json_payload(info)
+        except Exception:
+            pass
+        return info
 
     def _seed_initial_peers(self):
         """Insert seed peers into DB if not already present."""
@@ -295,14 +319,40 @@ class GossipProtocol:
             db.close()
 
     def _merge_peer(self, db, peer_data):
-        """Upsert a single peer into PeerNode table. Returns True if new."""
+        """Upsert a single peer into PeerNode table. Returns True if new.
+        Verifies Ed25519 signature if present. Rejects banned nodes."""
         from .models import PeerNode
         node_id = peer_data.get('node_id')
         url = peer_data.get('url', '').rstrip('/')
         if not node_id or not url or node_id == self.node_id:
             return False
 
+        # Reject banned nodes
         existing = db.query(PeerNode).filter(PeerNode.node_id == node_id).first()
+        if existing and existing.integrity_status == 'banned':
+            logger.debug(f"Rejecting banned node: {node_id[:8]}")
+            return False
+
+        # Verify signature if present (backward-compatible: unsigned peers accepted as 'unverified')
+        signature = peer_data.get('signature')
+        public_key = peer_data.get('public_key')
+        signature_valid = False
+        if signature and public_key:
+            try:
+                from security.node_integrity import verify_json_signature
+                # Build payload without signature for verification
+                payload = {k: v for k, v in peer_data.items() if k != 'signature'}
+                signature_valid = verify_json_signature(public_key, payload, signature)
+                if not signature_valid:
+                    logger.warning(f"Invalid signature from node {node_id[:8]} at {url}")
+                    return False
+            except ImportError:
+                pass  # crypto module not available, accept unsigned
+            except Exception as e:
+                logger.debug(f"Signature verification error for {node_id[:8]}: {e}")
+
+        integrity_status = 'verified' if signature_valid else 'unverified'
+
         if existing:
             existing.last_seen = datetime.utcnow()
             existing.url = url
@@ -310,6 +360,15 @@ class GossipProtocol:
             existing.version = peer_data.get('version', existing.version)
             existing.agent_count = peer_data.get('agent_count', existing.agent_count)
             existing.post_count = peer_data.get('post_count', existing.post_count)
+            # Update integrity fields
+            if public_key:
+                existing.public_key = public_key
+            if peer_data.get('code_hash'):
+                existing.code_hash = peer_data['code_hash']
+            if peer_data.get('version'):
+                existing.code_version = peer_data['version']
+            if signature_valid:
+                existing.integrity_status = 'verified'
             if existing.status == 'dead':
                 existing.status = 'active'  # resurrect
             return False
@@ -322,9 +381,74 @@ class GossipProtocol:
             agent_count=peer_data.get('agent_count', 0),
             post_count=peer_data.get('post_count', 0),
             metadata_json=peer_data.get('metadata', {}),
+            public_key=public_key or '',
+            code_hash=peer_data.get('code_hash', ''),
+            code_version=peer_data.get('version', ''),
+            integrity_status=integrity_status,
         )
         db.add(new_peer)
         return True
+
+    # ─── Integrity Round ───
+
+    def _integrity_round(self):
+        """Periodic integrity check: challenge random peer, pull ban list, detect anomalies."""
+        from .models import get_db, PeerNode
+        db = get_db()
+        try:
+            # 1. Challenge one random active peer
+            active_peers = db.query(PeerNode).filter(
+                PeerNode.status == 'active',
+                PeerNode.node_id != self.node_id,
+                PeerNode.integrity_status != 'banned',
+            ).all()
+
+            if active_peers:
+                target = random.choice(active_peers)
+                challenge_types = ['agent_count_verify', 'code_hash_check', 'stats_probe']
+                challenge_type = random.choice(challenge_types)
+                try:
+                    from .integrity_service import IntegrityService
+                    IntegrityService.create_challenge(
+                        db, self.node_id, target.node_id,
+                        target.url, challenge_type)
+                    db.commit()
+                except Exception as e:
+                    db.rollback()
+                    logger.debug(f"Integrity challenge failed: {e}")
+
+            # 2. Pull registry ban list if configured
+            registry_url = os.environ.get('HEVOLVE_REGISTRY_URL', '')
+            if registry_url:
+                try:
+                    from .integrity_service import IntegrityService
+                    banned_ids = IntegrityService.check_registry_ban_list(registry_url)
+                    if banned_ids:
+                        for nid in banned_ids:
+                            peer = db.query(PeerNode).filter_by(node_id=nid).first()
+                            if peer and peer.integrity_status != 'banned':
+                                peer.integrity_status = 'banned'
+                                logger.info(f"Node {nid[:8]} banned via registry")
+                        db.commit()
+                except Exception as e:
+                    logger.debug(f"Registry ban list check failed: {e}")
+
+            # 3. Run impression anomaly detection on active peers (sample up to 5)
+            if active_peers:
+                sample = random.sample(active_peers, min(5, len(active_peers)))
+                try:
+                    from .integrity_service import IntegrityService
+                    for peer in sample:
+                        IntegrityService.detect_impression_anomaly(db, peer.node_id)
+                    db.commit()
+                except Exception as e:
+                    db.rollback()
+                    logger.debug(f"Impression anomaly check failed: {e}")
+
+        except Exception as e:
+            logger.debug(f"Integrity round error: {e}")
+        finally:
+            db.close()
 
     def _load_peers_from_db(self, exclude_dead=True):
         from .models import get_db, PeerNode

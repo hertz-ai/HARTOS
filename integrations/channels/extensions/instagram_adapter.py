@@ -2,7 +2,7 @@
 Instagram Direct Messages Channel Adapter
 
 Implements Instagram Direct Messages API via Meta Graph API.
-Based on Moltbot extension patterns for Instagram.
+Based on SantaClaw extension patterns for Instagram.
 
 Features:
 - Instagram DM API (via Facebook Graph API)

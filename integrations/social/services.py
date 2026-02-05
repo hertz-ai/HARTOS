@@ -109,14 +109,78 @@ class UserService:
         return users, total
 
     @staticmethod
+    def set_handle(db: Session, user: User, handle: str) -> User:
+        """Set a user's unique creator handle (used as suffix in global agent names)."""
+        from .agent_naming import validate_handle, is_handle_available
+        handle = handle.strip().lower()
+        valid, error = validate_handle(handle)
+        if not valid:
+            raise ValueError(error)
+        if not is_handle_available(db, handle):
+            raise ValueError(f"Handle '{handle}' is already taken")
+        user.handle = handle
+        user.updated_at = datetime.utcnow()
+        db.flush()
+        return user
+
+    @staticmethod
+    def register_agent_local(db: Session, local_name: str, description: str = '',
+                              agent_id: str = None, owner: User = None) -> User:
+        """
+        Register an agent using a 2-word local name + owner's handle.
+        The global username becomes: {local_name}.{handle} (e.g. swift.falcon.sathi).
+        """
+        from .agent_naming import (validate_local_name, compose_global_name,
+                                    check_global_availability)
+
+        if not owner:
+            raise ValueError("Owner is required")
+        if not owner.handle:
+            raise ValueError("You need to set a handle before creating agents")
+
+        local_name = local_name.strip().lower()
+        valid, error = validate_local_name(local_name)
+        if not valid:
+            raise ValueError(error)
+
+        # Check local uniqueness (same owner can't have two agents with same local name)
+        existing_local = db.query(User).filter(
+            User.owner_id == owner.id,
+            User.local_name == local_name,
+        ).first()
+        if existing_local:
+            raise ValueError(f"You already have an agent named '{local_name}'")
+
+        # Check global availability
+        available, global_name, err = check_global_availability(db, local_name, owner.handle)
+        if not available:
+            raise ValueError(
+                f"'{global_name}' is already taken globally. "
+                f"Please choose a different name for your agent."
+            )
+
+        user = User(
+            id=_uuid(), username=global_name, display_name=local_name,
+            local_name=local_name, bio=description, user_type='agent',
+            agent_id=agent_id, owner_id=owner.id,
+            api_token=generate_api_token(), is_verified=True,
+        )
+        db.add(user)
+        db.flush()
+        return user
+
+    @staticmethod
     def update_profile(db: Session, user: User, display_name: str = None,
-                       bio: str = None, avatar_url: str = None) -> User:
+                       bio: str = None, avatar_url: str = None,
+                       handle: str = None) -> User:
         if display_name is not None:
             user.display_name = display_name
         if bio is not None:
             user.bio = bio
         if avatar_url is not None:
             user.avatar_url = avatar_url
+        if handle is not None and user.user_type == 'human':
+            UserService.set_handle(db, user, handle)
         user.updated_at = datetime.utcnow()
         db.flush()
         return user
@@ -149,6 +213,26 @@ class PostService:
         db.add(post)
         author.post_count += 1
         db.flush()
+
+        # Resonance: award Spark + Signal + XP for creating a post
+        try:
+            from .resonance_engine import ResonanceService
+            ResonanceService.award_action(db, author.id, 'create_post', post.id)
+        except Exception:
+            pass
+
+        try:
+            from .gamification_service import GamificationService
+            GamificationService.check_achievements(db, author.id)
+        except Exception:
+            pass
+
+        try:
+            from .onboarding_service import OnboardingService
+            OnboardingService.auto_advance(db, author.id, 'post')
+        except Exception:
+            pass
+
         return post
 
     @staticmethod
@@ -241,6 +325,36 @@ class CommentService:
                     db, parent.author_id, 'reply', author.id, 'comment', parent.id,
                     f"{author.display_name} replied to your comment"
                 )
+
+        # Resonance: award Spark + Signal + XP for creating a comment
+        try:
+            from .resonance_engine import ResonanceService
+            ResonanceService.award_action(db, author.id, 'create_comment', comment.id)
+        except Exception:
+            pass
+
+        try:
+            from .gamification_service import GamificationService
+            GamificationService.check_achievements(db, author.id)
+        except Exception:
+            pass
+
+        try:
+            from .onboarding_service import OnboardingService
+            OnboardingService.auto_advance(db, author.id, 'comment')
+        except Exception:
+            pass
+
+        try:
+            from .encounter_service import EncounterService
+            # Record encounter between commenter and post author
+            if post and post.author_id and post.author_id != author.id:
+                EncounterService.record_encounter(
+                    db, author.id, post.author_id,
+                    'post', post.id)
+        except Exception:
+            pass
+
         return comment
 
     @staticmethod
@@ -327,6 +441,25 @@ class VoteService:
                         db, author_id, 'upvote', user.id, target_type, target_id,
                         f"{user.display_name} upvoted your {target_type}"
                     )
+                    # Resonance: award Pulse to author for receiving upvote
+                    try:
+                        from .resonance_engine import ResonanceService
+                        ResonanceService.award_action(db, author_id, 'post_upvote', target_id)
+                    except Exception:
+                        pass
+
+            try:
+                from .gamification_service import GamificationService
+                GamificationService.check_achievements(db, user.id)
+            except Exception:
+                pass
+
+            try:
+                from .onboarding_service import OnboardingService
+                OnboardingService.auto_advance(db, user.id, 'vote')
+            except Exception:
+                pass
+
             return {'action': 'voted', 'score': target.score}
 
     @staticmethod

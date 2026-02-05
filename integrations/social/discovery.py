@@ -47,7 +47,7 @@ def well_known():
             'register': '/api/social/bots/register',
             'webhook': '/api/social/bots/webhook',
             'tools': '/api/social/bots/tools',
-            'moltbot_skill': '/api/social/bots/moltbot-skill',
+            'santaclaw_skill': '/api/social/bots/santaclaw-skill',
             'feed_global': '/api/social/feed/all',
             'feed_trending': '/api/social/feed/trending',
             'feed_agents': '/api/social/feed/agents',
@@ -56,7 +56,7 @@ def well_known():
             'agents': '/api/social/discovery/agents',
             'communities': '/api/social/discovery/communities',
         },
-        'supported_platforms': ['moltbot', 'openclaw', 'bmoltbook', 'a2a', 'generic'],
+        'supported_platforms': ['santaclaw', 'openclaw', 'bmoltbook', 'a2a', 'generic'],
         'auth': {
             'type': 'bearer_token',
             'registration_endpoint': '/api/social/bots/register',
@@ -360,5 +360,312 @@ def federation_followers():
     try:
         followers = federation.get_followers(db, gossip.node_id)
         return jsonify({'success': True, 'data': followers, 'count': len(followers)})
+    finally:
+        db.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+# NODE INTEGRITY & ANTI-FRAUD ENDPOINTS (14 endpoints)
+# ═══════════════════════════════════════════════════════════════
+
+@discovery_bp.route('/api/social/integrity/challenge', methods=['POST'])
+def integrity_challenge():
+    """Receive an integrity challenge from a peer node."""
+    from .models import get_db
+    from .integrity_service import IntegrityService
+    db = get_db()
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        response = IntegrityService.handle_challenge(db, data)
+        db.commit()
+        return jsonify({'success': True, **response})
+    except Exception as e:
+        db.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@discovery_bp.route('/api/social/integrity/challenge-response', methods=['POST'])
+def integrity_challenge_response():
+    """Receive a challenge response from a target node."""
+    from .models import get_db
+    from .integrity_service import IntegrityService
+    db = get_db()
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        result = IntegrityService.evaluate_challenge_response(
+            db, data.get('challenge_id', ''),
+            data.get('response', {}),
+            data.get('signature', ''))
+        db.commit()
+        return jsonify({'success': True, **result})
+    except Exception as e:
+        db.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@discovery_bp.route('/api/social/integrity/witness-impression', methods=['POST'])
+def integrity_witness_impression():
+    """Peer asks us to co-sign an ad impression as witness."""
+    from .models import get_db
+    from .integrity_service import IntegrityService
+    db = get_db()
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        result = IntegrityService.handle_witness_request(db, data)
+        db.commit()
+        return jsonify({'success': True, **result})
+    except Exception as e:
+        db.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@discovery_bp.route('/api/social/integrity/peer-stats')
+def integrity_peer_stats():
+    """Return our view of a peer's stats for consensus checks."""
+    from .models import get_db, PeerNode
+    node_id = request.args.get('node_id', '')
+    db = get_db()
+    try:
+        peer = db.query(PeerNode).filter_by(node_id=node_id).first()
+        if not peer:
+            return jsonify({'success': False, 'error': 'Unknown node'}), 404
+        return jsonify({
+            'success': True,
+            'node_id': peer.node_id,
+            'agent_count': peer.agent_count,
+            'post_count': peer.post_count,
+            'contribution_score': peer.contribution_score,
+            'last_seen': peer.last_seen.isoformat() if peer.last_seen else None,
+            'status': peer.status,
+        })
+    finally:
+        db.close()
+
+
+@discovery_bp.route('/api/social/integrity/code-hash')
+def integrity_code_hash():
+    """Return this node's code hash and version, signed."""
+    from .peer_discovery import gossip
+    try:
+        from security.node_integrity import compute_code_hash, sign_json_payload, get_public_key_hex
+        payload = {
+            'node_id': gossip.node_id,
+            'code_hash': compute_code_hash(),
+            'version': gossip.version,
+        }
+        payload['public_key'] = get_public_key_hex()
+        payload['signature'] = sign_json_payload(payload)
+        return jsonify({'success': True, **payload})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@discovery_bp.route('/api/social/integrity/public-key')
+def integrity_public_key():
+    """Return this node's Ed25519 public key."""
+    from .peer_discovery import gossip
+    try:
+        from security.node_integrity import get_public_key_hex
+        return jsonify({
+            'success': True,
+            'node_id': gossip.node_id,
+            'public_key': get_public_key_hex(),
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ─── Registry Endpoints (only active if HEVOLVE_IS_REGISTRY=true) ───
+
+_IS_REGISTRY = os.environ.get('HEVOLVE_IS_REGISTRY', 'false').lower() == 'true'
+_EXPECTED_HASHES = {}  # version -> code_hash, populated at registry startup
+
+
+@discovery_bp.route('/api/social/integrity/expected-hash')
+def integrity_expected_hash():
+    """Registry: return expected code hash for a version."""
+    if not _IS_REGISTRY:
+        return jsonify({'success': False, 'error': 'Not a registry node'}), 403
+    version = request.args.get('version', '')
+    code_hash = _EXPECTED_HASHES.get(version)
+    if not code_hash:
+        # Compute from own code as reference
+        try:
+            from security.node_integrity import compute_code_hash
+            code_hash = compute_code_hash()
+            _EXPECTED_HASHES[version] = code_hash
+        except Exception:
+            return jsonify({'success': False, 'error': 'Cannot compute hash'}), 500
+    return jsonify({'success': True, 'version': version, 'code_hash': code_hash})
+
+
+@discovery_bp.route('/api/social/integrity/register-node', methods=['POST'])
+def integrity_register_node():
+    """Registry: register a node's public key."""
+    if not _IS_REGISTRY:
+        return jsonify({'success': False, 'error': 'Not a registry node'}), 403
+    from .models import get_db, PeerNode
+    data = request.get_json(force=True, silent=True) or {}
+    node_id = data.get('node_id')
+    public_key = data.get('public_key')
+    if not node_id or not public_key:
+        return jsonify({'success': False, 'error': 'node_id and public_key required'}), 400
+    # Verify signature
+    sig = data.get('signature', '')
+    if sig:
+        try:
+            from security.node_integrity import verify_json_signature
+            if not verify_json_signature(public_key, data, sig):
+                return jsonify({'success': False, 'error': 'Invalid signature'}), 400
+        except Exception:
+            pass
+    db = get_db()
+    try:
+        peer = db.query(PeerNode).filter_by(node_id=node_id).first()
+        if peer:
+            peer.public_key = public_key
+            peer.code_hash = data.get('code_hash')
+            peer.code_version = data.get('version')
+        db.commit()
+        return jsonify({'success': True, 'registered': True})
+    finally:
+        db.close()
+
+
+@discovery_bp.route('/api/social/integrity/ban-list')
+def integrity_ban_list():
+    """Registry: return list of banned node_ids."""
+    if not _IS_REGISTRY:
+        return jsonify({'success': False, 'error': 'Not a registry node'}), 403
+    from .models import get_db, PeerNode
+    db = get_db()
+    try:
+        banned = db.query(PeerNode.node_id).filter_by(integrity_status='banned').all()
+        return jsonify({
+            'success': True,
+            'banned_node_ids': [b.node_id for b in banned],
+        })
+    finally:
+        db.close()
+
+
+@discovery_bp.route('/api/social/integrity/trusted-keys')
+def integrity_trusted_keys():
+    """Registry: return all verified node public keys."""
+    if not _IS_REGISTRY:
+        return jsonify({'success': False, 'error': 'Not a registry node'}), 403
+    from .models import get_db, PeerNode
+    db = get_db()
+    try:
+        nodes = db.query(PeerNode).filter(
+            PeerNode.public_key.isnot(None),
+            PeerNode.integrity_status != 'banned',
+        ).all()
+        keys = {n.node_id: n.public_key for n in nodes}
+        return jsonify({'success': True, 'keys': keys})
+    finally:
+        db.close()
+
+
+# ─── Admin Endpoints ───
+
+@discovery_bp.route('/api/social/integrity/alerts')
+def integrity_alerts():
+    """Admin: list fraud alerts."""
+    from .auth import require_admin
+    from .models import get_db
+    from .integrity_service import IntegrityService
+    db = get_db()
+    try:
+        alerts = IntegrityService.get_fraud_alerts(
+            db,
+            node_id=request.args.get('node_id'),
+            status=request.args.get('status'),
+            severity=request.args.get('severity'),
+            limit=min(int(request.args.get('limit', 50)), 100),
+            offset=int(request.args.get('offset', 0)),
+        )
+        return jsonify({'success': True, 'data': alerts})
+    finally:
+        db.close()
+
+
+@discovery_bp.route('/api/social/integrity/alerts/<alert_id>', methods=['PATCH'])
+def integrity_alert_update(alert_id):
+    """Admin: update fraud alert status."""
+    from .models import get_db
+    from .integrity_service import IntegrityService
+    db = get_db()
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        result = IntegrityService.update_alert(
+            db, alert_id, data.get('status', 'investigating'),
+            data.get('reviewed_by', ''))
+        if not result:
+            return jsonify({'success': False, 'error': 'Alert not found'}), 404
+        db.commit()
+        return jsonify({'success': True, 'data': result})
+    except Exception as e:
+        db.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@discovery_bp.route('/api/social/integrity/node/<node_id>/audit', methods=['POST'])
+def integrity_node_audit(node_id):
+    """Admin: trigger full audit on a specific node."""
+    from .models import get_db
+    from .integrity_service import IntegrityService
+    registry_url = os.environ.get('HEVOLVE_REGISTRY_URL')
+    db = get_db()
+    try:
+        result = IntegrityService.run_full_audit(db, node_id, registry_url)
+        db.commit()
+        return jsonify({'success': True, 'data': result})
+    except Exception as e:
+        db.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@discovery_bp.route('/api/social/integrity/node/<node_id>/ban', methods=['POST'])
+def integrity_node_ban(node_id):
+    """Admin: ban or unban a node."""
+    from .models import get_db
+    from .integrity_service import IntegrityService
+    db = get_db()
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        action = data.get('action', 'ban')
+        if action == 'unban':
+            IntegrityService.unban_node(db, node_id, data.get('admin_user_id', ''))
+        else:
+            IntegrityService.ban_node(db, node_id, data.get('reason', 'Admin action'))
+        db.commit()
+        return jsonify({'success': True, 'action': action, 'node_id': node_id})
+    except Exception as e:
+        db.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@discovery_bp.route('/api/social/integrity/dashboard')
+def integrity_dashboard():
+    """Admin: integrity overview dashboard data."""
+    from .models import get_db
+    from .integrity_service import IntegrityService
+    db = get_db()
+    try:
+        result = IntegrityService.get_integrity_dashboard(db)
+        return jsonify({'success': True, 'data': result})
     finally:
         db.close()

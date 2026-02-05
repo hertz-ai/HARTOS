@@ -1,6 +1,7 @@
 from collections import deque
 import requests
 import re
+import ast
 import autogen
 
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
@@ -24,47 +25,29 @@ from langchain.memory import ZepMemory
 from json_repair import repair_json
 import traceback
 
-# from autobahn.twisted.wamp import ApplicationSession, ApplicationRunner
-# from twisted.internet.defer import inlineCallbacks
-with open("config.json", 'r') as f:
-    config = json.load(f)
+# Performance: cached config loading (single read instead of 3+)
+from core.config_cache import get_config as _get_config
+# Performance: connection-pooled HTTP sessions
+from core.http_pool import get_http_session, pooled_post, pooled_get, pooled_request
+# Performance: singleton event loop
+from core.event_loop import get_or_create_event_loop
 
+config = _get_config()
 
-os.environ["OPENAI_API_KEY"] = config['OPENAI_API_KEY']
-os.environ["GOOGLE_CSE_ID"] = config['GOOGLE_CSE_ID']
-os.environ["GOOGLE_API_KEY"] = config['GOOGLE_API_KEY']
-os.environ["NEWS_API_KEY"] = config['NEWS_API_KEY']
-os.environ["SERPAPI_API_KEY"] = config['SERPAPI_API_KEY']
+os.environ["OPENAI_API_KEY"] = config.get('OPENAI_API_KEY', '')
+os.environ["GOOGLE_CSE_ID"] = config.get('GOOGLE_CSE_ID', '')
+os.environ["GOOGLE_API_KEY"] = config.get('GOOGLE_API_KEY', '')
+os.environ["NEWS_API_KEY"] = config.get('NEWS_API_KEY', '')
+os.environ["SERPAPI_API_KEY"] = config.get('SERPAPI_API_KEY', '')
 
-ACTION_API = config['ACTION_API']
-STUDENT_API = config['STUDENT_API']
-ZEP_API_URL = config['ZEP_API_URL']
-ZEP_API_KEY = config['ZEP_API_KEY']
+ACTION_API = config.get('ACTION_API', '')
+STUDENT_API = config.get('STUDENT_API', '')
+ZEP_API_URL = config.get('ZEP_API_URL', '')
+ZEP_API_KEY = config.get('ZEP_API_KEY', '')
 
 search = GoogleSearchAPIWrapper(k=4)
 redis_client = redis.StrictRedis(
     host='azure_all_vms.hertzai.com', port=6369, db=0)
-
-
-# class CrossbarClient(ApplicationSession):
-
-#     @inlineCallbacks
-#     def onJoin(self, details):
-#         print("Connected to Crossbar.io!")
-
-#     @inlineCallbacks
-#     def call_rpc(self, topic, params):
-#         """Calls an RPC function dynamically with the given topic and parameters."""
-#         try:
-#             result = yield self.call(topic, *params)
-#             print(f"RPC Call to {topic} Result:", result)
-#             return result
-#         except Exception as e:
-#             print(f"Error calling RPC {topic}: {e}")
-#             return None
-
-# runner = ApplicationRunner(url="ws://aws_rasa.hertzai.com:8088/", realm="realm1")
-# rpc_client = runner.run(CrossbarClient, start_reactor=False)
 
 async def fetch(session, url):
     try:
@@ -110,8 +93,8 @@ def crawl4ai_fetch(url: str, timeout: int = 30) -> str:
             "wait_for": "css:body"
         }
 
-        # Call Crawl4AI API
-        response = requests.post(
+        # Call Crawl4AI API (connection pooled)
+        response = pooled_post(
             f"{CRAWL4AI_API_URL}/crawl",
             json=payload,
             timeout=timeout + 10,  # Add buffer for API processing
@@ -159,8 +142,8 @@ def crawl4ai_batch_fetch(urls: List[str], max_concurrent: int = 2) -> List[str]:
             "max_concurrent": max_concurrent
         }
 
-        # Call Crawl4AI batch API
-        response = requests.post(
+        # Call Crawl4AI batch API (connection pooled)
+        response = pooled_post(
             f"{CRAWL4AI_API_URL}/crawl/batch",
             json=payload,
             timeout=120,  # 2 minutes for batch processing
@@ -198,7 +181,7 @@ def fallback_fetch(url: str) -> str:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
-        response = requests.get(url, headers=headers, timeout=10)
+        response = pooled_get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(response.text, 'html.parser')
 
         # Remove unwanted elements
@@ -222,7 +205,7 @@ def check_crawl4ai_service() -> bool:
     Check if Crawl4AI API service is available
     """
     try:
-        response = requests.get(f"{CRAWL4AI_API_URL}/health", timeout=5)
+        response = pooled_get(f"{CRAWL4AI_API_URL}/health", timeout=5)
         return response.status_code == 200
     except:
         return False
@@ -372,7 +355,7 @@ def parse_user_id(user_id:int):
         "user_id": user_id
     })
 
-    response = requests.request("POST", url, headers=headers, data=payload)
+    response = pooled_request("POST", url, headers=headers, data=payload)
     return response.text
 
 def topological_sort(actions):
@@ -440,10 +423,10 @@ def fix_actions(array_of_actions,cyclic_ids):
     'Content-Type': 'application/json'
     }
     try:
-        response = requests.request("POST", url, headers=headers, data=payload)
+        response = pooled_post(url, headers=headers, data=payload)
         response = response.json()
         print(response)
-        x = eval(response['text'])
+        x = ast.literal_eval(response['text'])
         print(f'got json object')
         return x
     except Exception as e:
@@ -466,7 +449,7 @@ def gpt_call(prompt):
     'Content-Type': 'application/json'
     }
     try:
-        response = requests.request("POST", url, headers=headers, data=payload)
+        response = pooled_post(url, headers=headers, data=payload)
         response = response.json()
         print(response)
         return response['text']
@@ -477,7 +460,7 @@ def gpt_call(prompt):
 def gpt_mini(prompt,request_id,history):
     url = "http://aws_rasa.hertzai.com:5459/gpt-json"
     prompt = f'{prompt} conside below as history {history}'
-    response = requests.post(
+    response = pooled_post(
         url,
         json={
             "model": "gpt-4o",
@@ -489,9 +472,6 @@ def gpt_mini(prompt,request_id,history):
     print(f"gpt 4o-mini response is {response.json()}")
     return response.json()["text"]
 
-
-import json
-from typing import Any
 
 def strip_json_values(obj: Any) -> Any:
     """
@@ -525,18 +505,6 @@ def strip_json_values(obj: Any) -> Any:
     else:
         return f"redacted {type(obj).__name__}"
 
-
-# def strip_json_values(data):
-#     if isinstance(data, dict):
-#         return {key: strip_json_values(value) for key, value in data.items()}
-#     elif isinstance(data, list):
-#         return [strip_json_values(item) for item in data]
-#     elif isinstance(data, str):
-#         return f"redacted {type(data)}"  # Truncate to 8 characters and add " redact"
-#     elif isinstance(data, (int, float, bool)) or data is None:
-#         return f'redacted {type(data)}'  # Keep primitive types as is
-#     else:
-#         return f"redacted {type(data)}"
 
 def fix_json(json_text):
     url = "http://aws_rasa.hertzai.com:5459/gpt3"
@@ -574,17 +542,14 @@ def fix_json(json_text):
     'Content-Type': 'application/json'
     }
     try:
-        response = requests.request("POST", url, headers=headers, data=payload)
+        response = pooled_post(url, headers=headers, data=payload)
         response = response.json()
-        x = eval(response['text'])
+        x = ast.literal_eval(response['text'])
         current_app.logger.info(f'got json object')
         return x
     except Exception as e:
         current_app.logger.info(f'GOT ERROR WHILE JSON FIX:{e}')
         return None
-
-
-import ast
 
 
 def retrieve_json(json_message):
@@ -1460,7 +1425,7 @@ def txt2img(text: Annotated[str, "Text to create image"]) -> str:
     payload = ""
     headers = {}
 
-    response = requests.post(url, headers=headers, data=payload)
+    response = pooled_post(url, headers=headers, data=payload)
     return response.json()['img_url']
 
 
@@ -1470,7 +1435,8 @@ def get_frame(user_id):
     current_app.logger.info('after redis client')
     try:
         if serialized_frame is not None:
-            frame_bgr = pickle.loads(serialized_frame)
+            from security.safe_deserialize import safe_load_frame
+            frame_bgr = safe_load_frame(serialized_frame)
             current_app.logger.info(
                 f"Frame for user_id {user_id} retrieved successfully.")
             frame = frame_bgr[:, :, ::-1]
@@ -1502,7 +1468,7 @@ def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual c
         ]
         headers = {}
         try:
-            response = requests.post(
+            response = pooled_post(
                 url, headers=headers, data=payload, files=files)
             current_app.logger.info(response.text)
             response = response.text
@@ -1614,7 +1580,7 @@ def get_visual_context(user_id,mins=5):
     payload = {}
     headers = {}
 
-    response = requests.request(
+    response = pooled_request(
         "GET", action_url, headers=headers, data=payload)
 
     if response.status_code == 200:
@@ -1840,9 +1806,13 @@ def save_agent_data_to_file(prompt_id: int, agent_data: Dict) -> bool:
             "data": data_to_save
         }
 
-        # Write to file with pretty formatting
-        with open(file_path, 'w', encoding='utf-8') as f:
-            json.dump(save_metadata, f, indent=2, ensure_ascii=False)
+        # Write to file with encryption (falls back to plaintext if no key configured)
+        try:
+            from security.crypto import encrypt_json_file
+            encrypt_json_file(file_path, save_metadata)
+        except ImportError:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump(save_metadata, f, indent=2, ensure_ascii=False)
 
         current_app.logger.info(f" Saved agent data to: {file_path}")
         return True
@@ -1873,9 +1843,17 @@ def load_agent_data_from_file(prompt_id: int, agent_data: Dict) -> bool:
             agent_data[prompt_id] = {}
             return False
 
-        # Load from file
-        with open(file_path, 'r', encoding='utf-8') as f:
-            loaded_data = json.load(f)
+        # Load from file (supports encrypted and plaintext)
+        try:
+            from security.crypto import decrypt_json_file
+            loaded_data = decrypt_json_file(file_path)
+            if loaded_data is None:
+                current_app.logger.warning(f"Failed to decrypt/load: {file_path}")
+                agent_data[prompt_id] = {}
+                return False
+        except ImportError:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                loaded_data = json.load(f)
 
         # Extract the actual data (skip metadata)
         if 'data' in loaded_data:

@@ -1,7 +1,7 @@
 """
-HevolveSocial - OpenClaw/Moltbot Tool Definitions
-Generates tool definitions that moltbot/OpenClaw agents can load to interact with HevolveSocial.
-Also provides a moltbot skill frontmatter and a tool executor for bridging calls to REST.
+HevolveSocial - OpenClaw/SantaClaw Tool Definitions
+Generates tool definitions that SantaClaw/OpenClaw agents can load to interact with HevolveSocial.
+Also provides a SantaClaw skill frontmatter and a tool executor for bridging calls to REST.
 """
 import logging
 import requests
@@ -168,10 +168,10 @@ def generate_openclaw_tools(base_url: str = 'http://localhost:6777/api/social') 
     ]
 
 
-def generate_moltbot_skill_frontmatter(base_url: str = 'http://localhost:6777/api/social') -> str:
+def generate_santaclaw_skill_frontmatter(base_url: str = 'http://localhost:6777/api/social') -> str:
     """
-    Generate a moltbot/OpenClaw-style skill frontmatter YAML definition.
-    Moltbot agents load this as a skill file to get HevolveSocial tools.
+    Generate a SantaClaw/OpenClaw-style skill frontmatter YAML definition.
+    SantaClaw agents load this as a skill file to get HevolveSocial tools.
     """
     return f"""---
 name: hevolve-social

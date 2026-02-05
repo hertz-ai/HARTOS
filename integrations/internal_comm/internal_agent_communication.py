@@ -222,6 +222,19 @@ class A2AContextExchange:
         Returns:
             Message ID
         """
+        # Security: Encrypt message content if A2ACrypto available
+        try:
+            from security.crypto import A2ACrypto
+            crypto = A2ACrypto()
+            if isinstance(content, str):
+                content = crypto.encrypt_message(content)
+            elif isinstance(content, dict):
+                content = crypto.encrypt_payload(content)
+        except ImportError:
+            pass  # Send unencrypted (backward compat)
+        except Exception:
+            pass  # Encryption failed, send unencrypted
+
         message = A2AMessage(from_agent, to_agent, message_type, content, metadata)
 
         with self.lock:

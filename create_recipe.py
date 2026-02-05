@@ -282,24 +282,29 @@ config_list = [{
 #         "api_version": "2024-12-01-preview",
 #         "price": [0.0025, 0.01]
 #     }]
-with open("config.json", 'r') as f:
-    config = json.load(f)
-STUDENT_API = config['STUDENT_API']
-ACTION_API = config['ACTION_API']
+# Performance: cached config loading (shared with helper.py, reuse_recipe.py)
+from core.config_cache import get_config as _get_config
+from core.http_pool import pooled_post, pooled_get, pooled_request
+from core.event_loop import get_or_create_event_loop
+from core.session_cache import TTLCache
+
+config = _get_config()
+STUDENT_API = config.get('STUDENT_API', '')
+ACTION_API = config.get('ACTION_API', '')
 redis_client = redis.StrictRedis(
     host='azure_all_vms.hertzai.com', port=6369, db=0)
 
 
-
+# Performance: TTL caches replace unbounded global dicts (auto-expire after 2 hours)
 agent_data = {}
-user_simplemem = {}  # {user_prompt: SimpleMemStore} for long-term memory
-task_time = {}
-agent_metadata = {}
-final_recipe = {}
-individual_json = {}
-time_actions = {}
-scheduler_check = {}
-vlm_recipes = {}
+user_simplemem = TTLCache(ttl_seconds=7200, max_size=500, name='user_simplemem')
+task_time = TTLCache(ttl_seconds=7200, max_size=500, name='task_time')
+agent_metadata = TTLCache(ttl_seconds=7200, max_size=500, name='agent_metadata')
+final_recipe = TTLCache(ttl_seconds=7200, max_size=500, name='final_recipe')
+individual_json = TTLCache(ttl_seconds=7200, max_size=500, name='individual_json')
+time_actions = TTLCache(ttl_seconds=7200, max_size=500, name='time_actions')
+scheduler_check = TTLCache(ttl_seconds=7200, max_size=500, name='scheduler_check')
+vlm_recipes = TTLCache(ttl_seconds=7200, max_size=500, name='vlm_recipes')
 # Initialize persistent storage
 helper_fun.initialize_persistent_storage(agent_data)
 
@@ -446,9 +451,9 @@ def get_frame(user_id):
     serialized_frame = redis_client.get(user_id)
     try:
         if serialized_frame is not None:
-            frame_bgr = pickle.loads(serialized_frame)
+            from security.safe_deserialize import safe_load_frame
+            frame_bgr = safe_load_frame(serialized_frame)
             current_app.logger.info(
-
                 f"Frame for user_id {user_id} retrieved successfully.")
             frame = frame_bgr[:, :, ::-1]
             return frame
@@ -1307,9 +1312,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         ) -> str:
             """Search compressed long-term memory using semantic retrieval."""
             try:
-                loop = asyncio.new_event_loop()
+                loop = get_or_create_event_loop()
                 results = loop.run_until_complete(simplemem_store.search(query))
-                loop.close()
                 if results:
                     return results[0].content
                 return "No relevant memories found."
@@ -1330,13 +1334,12 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         ) -> str:
             """Save important information to compressed long-term memory."""
             try:
-                loop = asyncio.new_event_loop()
+                loop = get_or_create_event_loop()
                 loop.run_until_complete(simplemem_store.add(content, {
                     "sender_name": speaker,
                     "user_id": user_id,
                     "prompt_id": prompt_id,
                 }))
-                loop.close()
                 return "Saved to long-term memory."
             except Exception as e:
                 tool_logger.info(f"SimpleMem save error: {e}")
@@ -2439,13 +2442,12 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                 content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
                 speaker = msg.get("name", "Agent") if isinstance(msg, dict) else "Agent"
                 if content and len(content.strip()) > 5:
-                    loop = asyncio.new_event_loop()
+                    loop = get_or_create_event_loop()
                     loop.run_until_complete(simplemem_store.add(content, {
                         "sender_name": speaker,
                         "user_id": user_id,
                         "prompt_id": prompt_id,
                     }))
-                    loop.close()
             except Exception:
                 pass  # Non-blocking
         group_chat.messages.append = _simplemem_ingest_hook
@@ -2905,9 +2907,8 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         ) -> str:
             """Search compressed long-term memory using semantic retrieval."""
             try:
-                loop = asyncio.new_event_loop()
+                loop = get_or_create_event_loop()
                 results = loop.run_until_complete(simplemem_store.search(query))
-                loop.close()
                 if results:
                     return results[0].content
                 return "No relevant memories found."
@@ -2928,13 +2929,12 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         ) -> str:
             """Save important information to compressed long-term memory."""
             try:
-                loop = asyncio.new_event_loop()
+                loop = get_or_create_event_loop()
                 loop.run_until_complete(simplemem_store.add(content, {
                     "sender_name": speaker,
                     "user_id": user_id,
                     "prompt_id": prompt_id,
                 }))
-                loop.close()
                 return "Saved to long-term memory."
             except Exception as e:
                 tool_logger.info(f"SimpleMem save error: {e}")

@@ -1,3 +1,13 @@
+# Security - never commit these
+config.json
+secrets.enc
+secrets.salt
+*.key
+*.pem
+*.p12
+.env
+agent_data/social.db
+
 prompt/
 prompt/*
 logs/

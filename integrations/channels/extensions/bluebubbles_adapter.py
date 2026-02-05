@@ -2,7 +2,7 @@
 BlueBubbles Channel Adapter
 
 Implements BlueBubbles iMessage bridge integration.
-Based on Moltbot extension patterns for cross-platform messaging.
+Based on SantaClaw extension patterns for cross-platform messaging.
 
 Features:
 - iMessage sending/receiving via BlueBubbles server

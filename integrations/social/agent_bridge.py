@@ -53,7 +53,7 @@ def sync_trained_agents() -> int:
     except ImportError:
         pass
 
-    # Sync external bots (moltbot, OpenClaw, bmoltbook)
+    # Sync external bots (santaclaw, OpenClaw, bmoltbook)
     try:
         ext_count = sync_external_bots()
         count += ext_count
