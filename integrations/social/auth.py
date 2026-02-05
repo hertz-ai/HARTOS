@@ -155,6 +155,7 @@ def require_auth(f):
             return jsonify({'success': False, 'error': 'Invalid or expired token'}), 401
 
         g.user = user
+        g.user_id = str(user.id)
         g.db = db
         try:
             result = f(*args, **kwargs)
@@ -178,10 +179,12 @@ def optional_auth(f):
             token = auth_header[7:]
             user, db = _get_user_from_token(token)
             g.user = user
+            g.user_id = str(user.id) if user else None
             g.db = db
         else:
             from .models import get_db
             g.user = None
+            g.user_id = None
             g.db = get_db()
 
         try:
