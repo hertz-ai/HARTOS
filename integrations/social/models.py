@@ -103,6 +103,7 @@ class User(Base):
     last_location_lat = Column(Float, nullable=True)
     last_location_lon = Column(Float, nullable=True)
     last_location_at = Column(DateTime, nullable=True)
+    idle_compute_opt_in = Column(Boolean, default=False)
 
     posts = relationship('Post', back_populates='author', lazy='dynamic')
     comments = relationship('Comment', back_populates='author', lazy='dynamic')
@@ -130,6 +131,7 @@ class User(Base):
             'level': self.level, 'level_title': self.level_title,
             'referral_code': self.referral_code, 'region_id': self.region_id,
             'location_sharing_enabled': self.location_sharing_enabled,
+            'idle_compute_opt_in': self.idle_compute_opt_in,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'last_active_at': self.last_active_at.isoformat() if self.last_active_at else None,
         }
@@ -494,6 +496,20 @@ class PeerNode(Base):
     fraud_score = Column(Float, default=0.0)
     last_challenge_at = Column(DateTime, nullable=True)
     last_attestation_at = Column(DateTime, nullable=True)
+    master_key_verified = Column(Boolean, default=False)
+    release_version = Column(String(20), nullable=True)
+    # Hierarchy columns (v13)
+    tier = Column(String(20), default='flat')  # central|regional|local|flat
+    parent_node_id = Column(String(64), nullable=True)
+    certificate_json = Column(JSON, nullable=True)
+    certificate_verified = Column(Boolean, default=False)
+    region_assignment_id = Column(String(64), nullable=True)
+    compute_cpu_cores = Column(Integer, nullable=True)
+    compute_ram_gb = Column(Float, nullable=True)
+    compute_gpu_count = Column(Integer, nullable=True)
+    active_user_count = Column(Integer, default=0)
+    max_user_capacity = Column(Integer, default=0)
+    dns_region = Column(String(50), nullable=True)
 
     node_operator = relationship('User', foreign_keys=[node_operator_id])
 
@@ -513,6 +529,18 @@ class PeerNode(Base):
             'code_version': self.code_version,
             'integrity_status': self.integrity_status,
             'fraud_score': self.fraud_score,
+            'master_key_verified': self.master_key_verified,
+            'release_version': self.release_version,
+            'tier': self.tier,
+            'parent_node_id': self.parent_node_id,
+            'certificate_verified': self.certificate_verified,
+            'region_assignment_id': self.region_assignment_id,
+            'compute_cpu_cores': self.compute_cpu_cores,
+            'compute_ram_gb': self.compute_ram_gb,
+            'compute_gpu_count': self.compute_gpu_count,
+            'active_user_count': self.active_user_count,
+            'max_user_capacity': self.max_user_capacity,
+            'dns_region': self.dns_region,
             'metadata': self.metadata_json,
         }
 
@@ -836,6 +864,14 @@ class Region(Base):
     member_count = Column(Integer, default=0)
     settings_json = Column(JSON, default=dict)
     created_at = Column(DateTime, default=func.now())
+    # Hierarchy columns (v13)
+    host_node_id = Column(String(64), nullable=True)
+    capacity_cpu = Column(Integer, nullable=True)
+    capacity_ram_gb = Column(Float, nullable=True)
+    capacity_gpu = Column(Integer, nullable=True)
+    current_load_pct = Column(Float, default=0.0)
+    is_accepting_nodes = Column(Boolean, default=True)
+    central_approved = Column(Boolean, default=False)
 
     parent = relationship('Region', remote_side=[id], backref='sub_regions')
 
@@ -850,6 +886,13 @@ class Region(Base):
             'global_server_url': self.global_server_url,
             'member_count': self.member_count,
             'settings': self.settings_json,
+            'host_node_id': self.host_node_id,
+            'capacity_cpu': self.capacity_cpu,
+            'capacity_ram_gb': self.capacity_ram_gb,
+            'capacity_gpu': self.capacity_gpu,
+            'current_load_pct': self.current_load_pct,
+            'is_accepting_nodes': self.is_accepting_nodes,
+            'central_approved': self.central_approved,
         }
 
 
@@ -1629,4 +1672,234 @@ class FraudAlert(Base):
             'reviewed_by': self.reviewed_by,
             'reviewed_at': self.reviewed_at.isoformat() if self.reviewed_at else None,
             'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# HIERARCHY TABLES (migration v13)
+# ═══════════════════════════════════════════════════════════════════════
+
+# ─── TABLE 47: region_assignments ───
+
+class RegionAssignment(Base):
+    __tablename__ = 'region_assignments'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    local_node_id = Column(String(64), nullable=False, index=True)
+    regional_node_id = Column(String(64), nullable=False, index=True)
+    region_id = Column(String(64), ForeignKey('regions.id'), nullable=True)
+    assigned_by = Column(String(20), default='central_auto')  # central_auto|user_choice|admin
+    status = Column(String(20), default='pending')  # pending|active|migrating|revoked
+    assigned_at = Column(DateTime, default=func.now())
+    approved_at = Column(DateTime, nullable=True)
+    approved_by_central = Column(Boolean, default=False)
+    compute_snapshot = Column(JSON, default=dict)
+    metadata_json = Column(JSON, default=dict)
+
+    region = relationship('Region')
+
+    __table_args__ = (
+        Index('ix_region_assignment_local', 'local_node_id', 'status'),
+        Index('ix_region_assignment_regional', 'regional_node_id', 'status'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'local_node_id': self.local_node_id,
+            'regional_node_id': self.regional_node_id,
+            'region_id': self.region_id,
+            'assigned_by': self.assigned_by,
+            'status': self.status,
+            'assigned_at': self.assigned_at.isoformat() if self.assigned_at else None,
+            'approved_at': self.approved_at.isoformat() if self.approved_at else None,
+            'approved_by_central': self.approved_by_central,
+            'compute_snapshot': self.compute_snapshot,
+        }
+
+
+# ─── TABLE 48: sync_queue ───
+
+class SyncQueue(Base):
+    __tablename__ = 'sync_queue'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    node_id = Column(String(64), nullable=False, index=True)
+    target_tier = Column(String(20), nullable=False)  # regional|central
+    operation_type = Column(String(30), nullable=False)  # register_agent|sync_post|register_node|update_stats
+    payload_json = Column(JSON, default=dict)
+    status = Column(String(20), default='queued')  # queued|in_progress|completed|failed
+    retry_count = Column(Integer, default=0)
+    max_retries = Column(Integer, default=5)
+    created_at = Column(DateTime, default=func.now(), index=True)
+    last_attempt_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    error_message = Column(Text, nullable=True)
+
+    __table_args__ = (
+        Index('ix_sync_queue_status', 'node_id', 'status', 'created_at'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'node_id': self.node_id,
+            'target_tier': self.target_tier,
+            'operation_type': self.operation_type,
+            'status': self.status,
+            'retry_count': self.retry_count,
+            'max_retries': self.max_retries,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'last_attempt_at': self.last_attempt_at.isoformat() if self.last_attempt_at else None,
+            'completed_at': self.completed_at.isoformat() if self.completed_at else None,
+            'error_message': self.error_message,
+        }
+
+
+# ─── TABLE 49: coding_goals ───
+
+class CodingGoal(Base):
+    __tablename__ = 'coding_goals'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    title = Column(String(300), nullable=False)
+    description = Column(Text, default='')
+    repo_url = Column(String(500), nullable=False)
+    repo_branch = Column(String(100), default='main')
+    target_path = Column(String(500), default='')
+    status = Column(String(20), default='active')  # active|paused|completed|archived
+    priority = Column(Integer, default=0)
+    total_tasks = Column(Integer, default=0)
+    completed_tasks = Column(Integer, default=0)
+    created_by = Column(String(64), nullable=True)
+    context_json = Column(JSON, default=dict)
+    decomposition_json = Column(JSON, default=dict)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'title': self.title,
+            'description': self.description,
+            'repo_url': self.repo_url,
+            'repo_branch': self.repo_branch,
+            'target_path': self.target_path,
+            'status': self.status,
+            'priority': self.priority,
+            'total_tasks': self.total_tasks,
+            'completed_tasks': self.completed_tasks,
+            'created_by': self.created_by,
+            'context_json': self.context_json,
+            'decomposition_json': self.decomposition_json,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+# ─── TABLE 50: coding_tasks ───
+
+class CodingTask(Base):
+    __tablename__ = 'coding_tasks'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    goal_id = Column(String(64), ForeignKey('coding_goals.id'), nullable=False, index=True)
+    title = Column(String(300), nullable=False)
+    description = Column(Text, default='')
+    file_path = Column(String(500), nullable=False)
+    task_type = Column(String(20), default='implement')  # implement|refactor|test|fix|document
+    status = Column(String(20), default='pending')  # pending|assigned|in_progress|review|merged|failed|blocked
+    priority = Column(Integer, default=0)
+    assigned_node_id = Column(String(64), nullable=True, index=True)
+    assigned_user_id = Column(String(64), nullable=True)
+    depends_on_json = Column(JSON, default=list)
+    context_files_json = Column(JSON, default=list)
+    prompt_text = Column(Text, default='')
+    estimated_tokens = Column(Integer, default=0)
+    retry_count = Column(Integer, default=0)
+    max_retries = Column(Integer, default=3)
+    ledger_key = Column(String(200), nullable=True)
+    created_at = Column(DateTime, default=func.now(), index=True)
+    assigned_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+
+    goal = relationship('CodingGoal', backref='tasks')
+
+    __table_args__ = (
+        Index('ix_coding_task_status_priority', 'status', 'priority'),
+        Index('ix_coding_task_goal_status', 'goal_id', 'status'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'goal_id': self.goal_id,
+            'title': self.title,
+            'description': self.description,
+            'file_path': self.file_path,
+            'task_type': self.task_type,
+            'status': self.status,
+            'priority': self.priority,
+            'assigned_node_id': self.assigned_node_id,
+            'assigned_user_id': self.assigned_user_id,
+            'depends_on_json': self.depends_on_json,
+            'context_files_json': self.context_files_json,
+            'prompt_text': self.prompt_text,
+            'estimated_tokens': self.estimated_tokens,
+            'retry_count': self.retry_count,
+            'max_retries': self.max_retries,
+            'ledger_key': self.ledger_key,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'assigned_at': self.assigned_at.isoformat() if self.assigned_at else None,
+            'completed_at': self.completed_at.isoformat() if self.completed_at else None,
+        }
+
+
+# ─── TABLE 51: coding_submissions ───
+
+class CodingSubmission(Base):
+    __tablename__ = 'coding_submissions'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    task_id = Column(String(64), ForeignKey('coding_tasks.id'), nullable=False, index=True)
+    node_id = Column(String(64), nullable=False, index=True)
+    user_id = Column(String(64), nullable=True)
+    diff_text = Column(Text, default='')
+    file_content = Column(Text, default='')
+    branch_name = Column(String(100), default='')
+    commit_sha = Column(String(64), nullable=True)
+    status = Column(String(20), default='pending_review')  # pending_review|approved|rejected|merged|conflict
+    review_notes = Column(Text, default='')
+    quality_score = Column(Float, default=0.0)
+    test_passed = Column(Boolean, default=False)
+    lines_added = Column(Integer, default=0)
+    lines_removed = Column(Integer, default=0)
+    created_at = Column(DateTime, default=func.now(), index=True)
+    reviewed_at = Column(DateTime, nullable=True)
+    merged_at = Column(DateTime, nullable=True)
+
+    task = relationship('CodingTask', backref='submissions')
+
+    __table_args__ = (
+        Index('ix_submission_task_status', 'task_id', 'status'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'task_id': self.task_id,
+            'node_id': self.node_id,
+            'user_id': self.user_id,
+            'diff_text': self.diff_text,
+            'branch_name': self.branch_name,
+            'commit_sha': self.commit_sha,
+            'status': self.status,
+            'review_notes': self.review_notes,
+            'quality_score': self.quality_score,
+            'test_passed': self.test_passed,
+            'lines_added': self.lines_added,
+            'lines_removed': self.lines_removed,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'reviewed_at': self.reviewed_at.isoformat() if self.reviewed_at else None,
+            'merged_at': self.merged_at.isoformat() if self.merged_at else None,
         }

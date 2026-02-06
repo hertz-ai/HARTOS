@@ -78,19 +78,73 @@ def init_social(app):
     except Exception as e:
         logger.debug(f"HevolveSocial keypair init skipped: {e}")
 
-    # Start decentralized gossip peer discovery (background thread)
+    # ── Master Key Boot Verification ──
+    _boot_verified = False
+    _boot_manifest = None
     try:
-        from .peer_discovery import gossip
-        gossip.start()
-        logger.info(f"HevolveSocial gossip started: node={gossip.node_id[:8]}, "
-                    f"seeds={len(gossip.seed_peers)}")
+        from security.master_key import full_boot_verification, is_dev_mode, get_enforcement_mode
+        verification = full_boot_verification()
+        enforcement = get_enforcement_mode()
+        _boot_verified = verification['passed'] or is_dev_mode() or enforcement in ('off', 'warn')
+        _boot_manifest = verification.get('manifest')
+        if verification['passed']:
+            logger.info(f"HevolveSocial boot verification PASSED: {verification['details']}")
+        elif _boot_verified:
+            logger.warning(f"HevolveSocial boot verification not passed but allowed "
+                          f"(enforcement={enforcement}): {verification['details']}")
+        else:
+            logger.critical(f"HevolveSocial boot verification FAILED: {verification['details']}")
     except Exception as e:
-        logger.debug(f"HevolveSocial gossip start skipped: {e}")
+        _boot_verified = True  # Allow if master_key module unavailable
+        logger.debug(f"HevolveSocial boot verification skipped: {e}")
+
+    # Start decentralized gossip peer discovery (background thread)
+    if _boot_verified:
+        try:
+            from .peer_discovery import gossip
+            gossip.start()
+            logger.info(f"HevolveSocial gossip started: node={gossip.node_id[:8]}, "
+                        f"seeds={len(gossip.seed_peers)}")
+        except Exception as e:
+            logger.debug(f"HevolveSocial gossip start skipped: {e}")
+
+        # Start runtime integrity monitor if we have a signed manifest
+        if _boot_manifest:
+            try:
+                from security.runtime_monitor import start_monitor
+                start_monitor(_boot_manifest)
+                logger.info("HevolveSocial runtime integrity monitor started")
+            except Exception as e:
+                logger.debug(f"HevolveSocial runtime monitor start skipped: {e}")
+    else:
+        logger.critical("HevolveSocial: gossip NOT started — boot verification failed (hard mode)")
+
+    # Start sync engine for regional/local tiers
+    if _boot_verified:
+        try:
+            from security.key_delegation import get_node_tier
+            node_tier = get_node_tier()
+            if node_tier in ('regional', 'local'):
+                from .sync_engine import sync_engine
+                sync_engine.start_background_sync()
+                logger.info(f"HevolveSocial sync engine started (tier={node_tier})")
+        except Exception as e:
+            logger.debug(f"HevolveSocial sync engine start skipped: {e}")
+
+    # Start distributed coding agent if enabled
+    import os as _os2
+    if _os2.environ.get('HEVOLVE_CODING_AGENT_ENABLED', 'false').lower() == 'true':
+        try:
+            from integrations.coding_agent import init_coding_agent
+            init_coding_agent(app)
+            logger.info("HevolveSocial distributed coding agent initialized")
+        except Exception as e:
+            logger.debug(f"HevolveSocial coding agent init skipped: {e}")
 
     # Register with central registry if configured
     import os
     registry_url = os.environ.get('HEVOLVE_REGISTRY_URL', '')
-    if registry_url:
+    if registry_url and _boot_verified:
         try:
             from .integrity_service import IntegrityService
             from .peer_discovery import gossip as _gossip

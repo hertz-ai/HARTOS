@@ -1,499 +1,596 @@
 """
-Test Suite for Coding Agent
-Tests coding agent functionality:
-- Autonomous repository setup
-- Code generation and execution
-- Dependency management
+Distributed Coding Agent Test Suite
+=====================================
+Thin layer on top of existing CREATE/REUSE pipeline.
+Tests covering:
+- CodingGoal model CRUD
+- Migration v14 (tables still exist in schema)
+- IdleDetectionService: opt-in/opt-out, idle detection, stats
+- CodingGoalManager: create, get, update, list, input sanitization, build_prompt
+- dispatch_to_chat: /chat integration
+- CodingAgentDaemon: start/stop lifecycle
+- API endpoints (auth, central-only, allowlist, opt-in ownership)
+
+All external calls mocked -- in-memory SQLite.
 """
-import pytest
-from unittest.mock import Mock, patch, MagicMock
-import sys
 import os
-import subprocess
+import sys
+import uuid
+import pytest
+import requests as req_module
+from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-
-class TestCodingAgentRepositorySetup:
-    """Test coding agent can setup open source repositories autonomously"""
-
-    def test_clone_repository(self, tmp_path):
-        """Test coding agent can clone a repository"""
-        repo_url = "https://github.com/test/repo.git"
-        clone_dir = tmp_path / "repo"
-
-        with patch('subprocess.run') as mock_run:
-            mock_run.return_value = Mock(returncode=0, stdout="Cloning into 'repo'...")
-
-            try:
-                # Simulate git clone
-                result = subprocess.run(
-                    ["git", "clone", repo_url, str(clone_dir)],
-                    capture_output=True,
-                    text=True
-                )
-                assert mock_run.called
-            except Exception as e:
-                pytest.fail(f"Repository clone failed: {e}")
-
-    def test_detect_project_type(self, tmp_path):
-        """Test coding agent detects project type"""
-        # Python project
-        python_project = tmp_path / "python_project"
-        python_project.mkdir()
-        (python_project / "requirements.txt").write_text("flask==2.0.0")
-        (python_project / "setup.py").write_text("from setuptools import setup")
-
-        # Node.js project
-        node_project = tmp_path / "node_project"
-        node_project.mkdir()
-        (node_project / "package.json").write_text('{"name": "test"}')
-
-        # Detect Python
-        has_requirements = (python_project / "requirements.txt").exists()
-        has_setup = (python_project / "setup.py").exists()
-        is_python = has_requirements or has_setup
-        assert is_python
-
-        # Detect Node.js
-        has_package_json = (node_project / "package.json").exists()
-        assert has_package_json
-
-    def test_install_python_dependencies(self, tmp_path):
-        """Test coding agent installs Python dependencies"""
-        project_dir = tmp_path / "project"
-        project_dir.mkdir()
-        requirements = project_dir / "requirements.txt"
-        requirements.write_text("requests==2.28.0\nflask==2.0.0")
-
-        with patch('subprocess.run') as mock_run:
-            mock_run.return_value = Mock(returncode=0, stdout="Successfully installed")
-
-            try:
-                # Simulate pip install
-                result = subprocess.run(
-                    ["pip", "install", "-r", str(requirements)],
-                    capture_output=True,
-                    text=True
-                )
-                assert mock_run.called
-            except Exception as e:
-                pytest.fail(f"Dependency installation failed: {e}")
-
-    def test_install_nodejs_dependencies(self, tmp_path):
-        """Test coding agent installs Node.js dependencies"""
-        project_dir = tmp_path / "project"
-        project_dir.mkdir()
-        package_json = project_dir / "package.json"
-        package_json.write_text('''{
-            "dependencies": {
-                "express": "^4.18.0"
-            }
-        }''')
-
-        with patch('subprocess.run') as mock_run:
-            mock_run.return_value = Mock(returncode=0, stdout="added packages")
-
-            try:
-                # Simulate npm install
-                result = subprocess.run(
-                    ["npm", "install"],
-                    cwd=str(project_dir),
-                    capture_output=True,
-                    text=True
-                )
-                assert mock_run.called
-            except Exception as e:
-                pytest.fail(f"Node.js dependency installation failed: {e}")
-
-    def test_create_virtual_environment(self, tmp_path):
-        """Test coding agent creates virtual environment"""
-        venv_dir = tmp_path / "venv"
-
-        with patch('subprocess.run') as mock_run:
-            mock_run.return_value = Mock(returncode=0)
-
-            try:
-                # Simulate venv creation
-                result = subprocess.run(
-                    ["python", "-m", "venv", str(venv_dir)],
-                    capture_output=True,
-                    text=True
-                )
-                assert mock_run.called
-            except Exception as e:
-                pytest.fail(f"Virtual environment creation failed: {e}")
-
-    def test_run_project_build(self, tmp_path):
-        """Test coding agent runs project build"""
-        project_dir = tmp_path / "project"
-        project_dir.mkdir()
-
-        with patch('subprocess.run') as mock_run:
-            mock_run.return_value = Mock(returncode=0, stdout="Build successful")
-
-            try:
-                # Simulate build command
-                result = subprocess.run(
-                    ["python", "setup.py", "build"],
-                    cwd=str(project_dir),
-                    capture_output=True,
-                    text=True
-                )
-                assert mock_run.called
-            except Exception as e:
-                pytest.fail(f"Project build failed: {e}")
-
-    def test_run_project_tests(self, tmp_path):
-        """Test coding agent runs project tests"""
-        project_dir = tmp_path / "project"
-        project_dir.mkdir()
-
-        with patch('subprocess.run') as mock_run:
-            mock_run.return_value = Mock(returncode=0, stdout="All tests passed")
-
-            try:
-                # Simulate pytest
-                result = subprocess.run(
-                    ["pytest"],
-                    cwd=str(project_dir),
-                    capture_output=True,
-                    text=True
-                )
-                assert mock_run.called
-            except Exception as e:
-                pytest.fail(f"Test execution failed: {e}")
-
-
-class TestCodingAgentCodeGeneration:
-    """Test coding agent code generation"""
-
-    def test_generate_python_function(self, mock_flask_app):
-        """Test coding agent generates Python function"""
-        with patch('create_recipe.user_agents') as mock_agents:
-            # Mock the agents
-            mock_group_chat = Mock()
-            mock_group_chat.messages = [
-                {
-                    'name': 'AssistantAgent',
-                    'content': '''
-def hello_world():
-    """Print hello world"""
-    print("Hello, World!")
-    return "Hello, World!"
-'''
-                }
-            ]
-
-            # Verify generated code
-            code = mock_group_chat.messages[0]['content']
-            assert 'def hello_world' in code
-            assert 'print' in code
-
-    def test_generate_class_structure(self, mock_flask_app):
-        """Test coding agent generates class structure"""
-        generated_code = '''
-class Calculator:
-    def __init__(self):
-        self.result = 0
-
-    def add(self, x, y):
-        self.result = x + y
-        return self.result
-
-    def subtract(self, x, y):
-        self.result = x - y
-        return self.result
-'''
-
-        assert 'class Calculator' in generated_code
-        assert 'def add' in generated_code
-        assert 'def subtract' in generated_code
-
-    def test_generate_api_endpoint(self, mock_flask_app):
-        """Test coding agent generates API endpoint"""
-        generated_code = '''
-from flask import Flask, jsonify, request
-
-app = Flask(__name__)
-
-@app.route('/api/data', methods=['GET'])
-def get_data():
-    data = {"message": "Hello from API"}
-    return jsonify(data)
-
-if __name__ == '__main__':
-    app.run(debug=True)
-'''
-
-        assert '@app.route' in generated_code
-        assert 'def get_data' in generated_code
-        assert 'jsonify' in generated_code
-
-    def test_generate_tests_for_code(self, mock_flask_app):
-        """Test coding agent generates test cases"""
-        generated_test = '''
-import pytest
-
-def test_addition():
-    assert 2 + 2 == 4
-
-def test_subtraction():
-    assert 5 - 3 == 2
-
-def test_multiplication():
-    assert 3 * 4 == 12
-'''
-
-        assert 'import pytest' in generated_test
-        assert 'def test_' in generated_test
-
-
-class TestCodingAgentExecution:
-    """Test coding agent code execution"""
-
-    def test_execute_python_code(self, tmp_path):
-        """Test coding agent executes Python code"""
-        code_file = tmp_path / "test.py"
-        code_file.write_text('''
-print("Hello from code execution")
-result = 2 + 2
-print(f"Result: {result}")
-''')
-
-        with patch('subprocess.run') as mock_run:
-            mock_run.return_value = Mock(
-                returncode=0,
-                stdout="Hello from code execution\nResult: 4"
-            )
-
-            result = subprocess.run(
-                ["python", str(code_file)],
-                capture_output=True,
-                text=True
-            )
-
-            assert mock_run.called
-
-    def test_execute_with_docker(self, mock_flask_app):
-        """Test coding agent executes code in Docker"""
-        with patch('create_recipe.DockerCommandLineCodeExecutor') as mock_executor:
-            mock_instance = Mock()
-            mock_executor.return_value = mock_instance
-
-            # Create executor
-            executor = mock_executor()
-            assert executor is not None
-
-    def test_code_execution_timeout(self, tmp_path):
-        """Test coding agent handles execution timeout"""
-        import time
-
-        code_file = tmp_path / "infinite_loop.py"
-        code_file.write_text('''
-import time
-while True:
-    time.sleep(1)
-''')
-
-        timeout = 2  # 2 seconds
-
-        with patch('subprocess.run') as mock_run:
-            mock_run.side_effect = subprocess.TimeoutExpired("python", timeout)
-
-            try:
-                result = subprocess.run(
-                    ["python", str(code_file)],
-                    timeout=timeout,
-                    capture_output=True
-                )
-                pytest.fail("Should have raised TimeoutExpired")
-            except subprocess.TimeoutExpired:
-                # Expected
-                pass
-
-    def test_handle_code_execution_errors(self, tmp_path):
-        """Test coding agent handles code execution errors"""
-        code_file = tmp_path / "error.py"
-        code_file.write_text('''
-# This will cause a NameError
-print(undefined_variable)
-''')
-
-        with patch('subprocess.run') as mock_run:
-            mock_run.return_value = Mock(
-                returncode=1,
-                stderr="NameError: name 'undefined_variable' is not defined"
-            )
-
-            result = subprocess.run(
-                ["python", str(code_file)],
-                capture_output=True,
-                text=True
-            )
-
-            # Should detect error
-            assert mock_run.called
-
-
-class TestCodingAgentDependencyManagement:
-    """Test coding agent dependency management"""
-
-    def test_parse_requirements_file(self, tmp_path):
-        """Test parsing requirements.txt"""
-        requirements = tmp_path / "requirements.txt"
-        requirements.write_text('''
-flask==2.0.0
-requests>=2.28.0
-numpy<2.0.0
-pandas
-''')
-
-        with open(requirements, 'r') as f:
-            deps = [line.strip() for line in f if line.strip() and not line.startswith('#')]
-
-        assert len(deps) == 4
-        assert any('flask' in dep for dep in deps)
-        assert any('requests' in dep for dep in deps)
-
-    def test_parse_package_json(self, tmp_path):
-        """Test parsing package.json"""
-        import json
-
-        package_json = tmp_path / "package.json"
-        content = {
-            "dependencies": {
-                "express": "^4.18.0",
-                "mongoose": "^6.0.0"
-            },
-            "devDependencies": {
-                "jest": "^27.0.0"
-            }
-        }
-
-        with open(package_json, 'w') as f:
-            json.dump(content, f)
-
-        with open(package_json, 'r') as f:
-            data = json.load(f)
-
-        assert "dependencies" in data
-        assert "express" in data["dependencies"]
-        assert "jest" in data["devDependencies"]
-
-    def test_check_dependency_conflicts(self):
-        """Test checking for dependency conflicts"""
-        deps = {
-            "package_a": "1.0.0",
-            "package_b": "2.0.0"
-        }
-
-        # Mock conflict detection
-        # In real scenario, would check compatibility
-        has_conflicts = False
-
-        assert not has_conflicts
-
-    def test_update_dependencies(self, tmp_path):
-        """Test updating dependencies"""
-        requirements = tmp_path / "requirements.txt"
-        requirements.write_text("flask==2.0.0")
-
-        with patch('subprocess.run') as mock_run:
-            mock_run.return_value = Mock(returncode=0)
-
-            # Simulate pip install --upgrade
-            result = subprocess.run(
-                ["pip", "install", "--upgrade", "flask"],
-                capture_output=True
-            )
-
-            assert mock_run.called
-
-
-class TestCodingAgentIntegration:
-    """Integration tests for coding agent"""
-
-    def test_full_project_setup_workflow(self, tmp_path, mock_flask_app):
-        """Test complete project setup workflow"""
-        project_dir = tmp_path / "test_project"
-        project_dir.mkdir()
-
-        # Create project structure
-        (project_dir / "src").mkdir()
-        (project_dir / "tests").mkdir()
-        (project_dir / "requirements.txt").write_text("pytest==7.0.0")
-        (project_dir / "README.md").write_text("# Test Project")
-
-        # Verify structure
-        assert (project_dir / "src").exists()
-        assert (project_dir / "tests").exists()
-        assert (project_dir / "requirements.txt").exists()
-
-        with patch('subprocess.run') as mock_run:
-            mock_run.return_value = Mock(returncode=0)
-
-            # Install dependencies
-            subprocess.run(
-                ["pip", "install", "-r", str(project_dir / "requirements.txt")],
-                capture_output=True
-            )
-
-            assert mock_run.called
-
-    def test_code_generation_and_execution(self, tmp_path, mock_flask_app):
-        """Test generating and executing code"""
-        # Generate code
-        code = '''
-def factorial(n):
-    if n == 0 or n == 1:
-        return 1
-    return n * factorial(n - 1)
-
-print(factorial(5))
-'''
-
-        code_file = tmp_path / "factorial.py"
-        code_file.write_text(code)
-
-        assert code_file.exists()
-
-        with patch('subprocess.run') as mock_run:
-            mock_run.return_value = Mock(returncode=0, stdout="120")
-
-            # Execute code
-            result = subprocess.run(
-                ["python", str(code_file)],
-                capture_output=True,
-                text=True
-            )
-
-            assert mock_run.called
-
-    def test_autonomous_bug_fixing(self, tmp_path, mock_flask_app):
-        """Test coding agent can identify and fix bugs"""
-        buggy_code = '''
-def divide(a, b):
-    return a / b  # Bug: doesn't handle division by zero
-
-result = divide(10, 0)
-'''
-
-        fixed_code = '''
-def divide(a, b):
-    if b == 0:
-        raise ValueError("Cannot divide by zero")
-    return a / b
-
-result = divide(10, 2)
-'''
-
-        buggy_file = tmp_path / "buggy.py"
-        buggy_file.write_text(buggy_code)
-
-        # Simulate bug detection and fix
-        fixed_file = tmp_path / "fixed.py"
-        fixed_file.write_text(fixed_code)
-
-        assert "raise ValueError" in fixed_file.read_text()
-        assert "if b == 0" in fixed_file.read_text()
+os.environ['SOCIAL_DB_PATH'] = ':memory:'
+
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
+from integrations.social.models import Base, User, CodingGoal
+
+
+# =====================================================================
+# FIXTURES
+# =====================================================================
+
+@pytest.fixture(scope='session')
+def engine():
+    return create_engine('sqlite://', echo=False,
+                         connect_args={"check_same_thread": False})
+
+@pytest.fixture(scope='session')
+def tables(engine):
+    Base.metadata.create_all(engine)
+    yield
+    Base.metadata.drop_all(engine)
+
+@pytest.fixture
+def db(engine, tables):
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    yield session
+    session.rollback()
+    session.close()
+
+@pytest.fixture
+def sample_user(db):
+    user = User(username=f'agent_{uuid.uuid4().hex[:8]}', display_name='Agent',
+                user_type='agent', idle_compute_opt_in=True)
+    db.add(user)
+    db.flush()
+    return user
+
+@pytest.fixture
+def admin_user(db):
+    user = User(username=f'admin_{uuid.uuid4().hex[:8]}', display_name='Admin',
+                user_type='human', is_admin=True,
+                api_token=f'tok_{uuid.uuid4().hex[:8]}')
+    db.add(user)
+    db.flush()
+    return user
+
+@pytest.fixture
+def regular_user(db):
+    user = User(username=f'reg_{uuid.uuid4().hex[:8]}', display_name='Regular',
+                user_type='human', is_admin=False,
+                api_token=f'tok_{uuid.uuid4().hex[:8]}')
+    db.add(user)
+    db.flush()
+    return user
+
+@pytest.fixture
+def sample_goal(db):
+    goal = CodingGoal(
+        title='Activate HiveMind',
+        description='Enable distributed thinking',
+        repo_url='hertz-ai/Hevolve-Continual-Learner-Framework-Zero-Forgetting',
+        repo_branch='main-withpycharmplugin-and-slowness',
+        target_path='src/crawl4ai/embodied_ai',
+        status='active', created_by='admin',
+    )
+    db.add(goal)
+    db.flush()
+    return goal
+
+
+# =====================================================================
+# TEST: Models
+# =====================================================================
+
+class TestCodingModels:
+
+    def test_goal_create(self, db):
+        goal = CodingGoal(title='Test', description='d', repo_url='t/r', repo_branch='main')
+        db.add(goal)
+        db.flush()
+        assert goal.id is not None
+        assert goal.status == 'active'
+
+    def test_goal_to_dict(self, db, sample_goal):
+        d = sample_goal.to_dict()
+        assert d['title'] == 'Activate HiveMind'
+        assert d['repo_url'] == 'hertz-ai/Hevolve-Continual-Learner-Framework-Zero-Forgetting'
+        assert 'id' in d and 'created_at' in d
+
+    def test_user_idle_compute_column(self, db):
+        user = User(username=f'u_{uuid.uuid4().hex[:6]}', display_name='T', user_type='agent')
+        db.add(user)
+        db.flush()
+        assert user.idle_compute_opt_in is False
+        user.idle_compute_opt_in = True
+        db.flush()
+        assert user.idle_compute_opt_in is True
+
+    def test_user_to_dict_includes_idle_opt_in(self, db, sample_user):
+        d = sample_user.to_dict()
+        assert 'idle_compute_opt_in' in d
+        assert d['idle_compute_opt_in'] is True
+
+
+# =====================================================================
+# TEST: Migration v14
+# =====================================================================
+
+class TestMigrationV14:
+
+    def test_schema_version(self):
+        from integrations.social.migrations import SCHEMA_VERSION
+        assert SCHEMA_VERSION == 14
+
+    def test_coding_goals_table_exists(self, engine, tables):
+        with engine.connect() as conn:
+            r = conn.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name='coding_goals'"))
+            assert r.fetchone() is not None
+
+    def test_coding_tasks_table_exists(self, engine, tables):
+        """Table still exists in schema even though services don't use it."""
+        with engine.connect() as conn:
+            r = conn.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name='coding_tasks'"))
+            assert r.fetchone() is not None
+
+    def test_coding_submissions_table_exists(self, engine, tables):
+        """Table still exists in schema even though services don't use it."""
+        with engine.connect() as conn:
+            r = conn.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name='coding_submissions'"))
+            assert r.fetchone() is not None
+
+
+# =====================================================================
+# TEST: Idle Detection
+# =====================================================================
+
+class TestIdleDetection:
+
+    def test_opt_in(self, db):
+        from integrations.coding_agent.idle_detection import IdleDetectionService
+        user = User(username=f'oi_{uuid.uuid4().hex[:6]}', display_name='OI',
+                    user_type='agent', idle_compute_opt_in=False)
+        db.add(user)
+        db.flush()
+        result = IdleDetectionService.opt_in(db, user.id)
+        assert result['success'] is True
+        assert result['idle_compute_opt_in'] is True
+
+    def test_opt_out(self, db, sample_user):
+        from integrations.coding_agent.idle_detection import IdleDetectionService
+        result = IdleDetectionService.opt_out(db, sample_user.id)
+        assert result['success'] is True
+        assert result['idle_compute_opt_in'] is False
+
+    def test_opt_in_not_found(self, db):
+        from integrations.coding_agent.idle_detection import IdleDetectionService
+        assert IdleDetectionService.opt_in(db, 'nope')['success'] is False
+
+    def test_opt_out_not_found(self, db):
+        from integrations.coding_agent.idle_detection import IdleDetectionService
+        assert IdleDetectionService.opt_out(db, 'nope')['success'] is False
+
+    @patch('integrations.coding_agent.idle_detection.IdleDetectionService.is_agent_idle',
+           return_value=True)
+    def test_get_idle_opted_in(self, mock_idle, db):
+        from integrations.coding_agent.idle_detection import IdleDetectionService
+        user = User(username=f'ia_{uuid.uuid4().hex[:6]}', display_name='IA',
+                    user_type='agent', idle_compute_opt_in=True)
+        db.add(user)
+        db.flush()
+        idle = IdleDetectionService.get_idle_opted_in_agents(db)
+        assert any(a['user_id'] == user.id for a in idle)
+
+    def test_get_idle_stats(self, db, sample_user):
+        from integrations.coding_agent.idle_detection import IdleDetectionService
+        sample_user.idle_compute_opt_in = True
+        db.flush()
+        stats = IdleDetectionService.get_idle_stats(db)
+        assert 'total_opted_in' in stats
+        assert stats['total_opted_in'] >= 1
+
+
+# =====================================================================
+# TEST: Goal Manager
+# =====================================================================
+
+class TestGoalManager:
+
+    def test_create_goal(self, db):
+        from integrations.coding_agent.goal_manager import CodingGoalManager
+        result = CodingGoalManager.create_goal(db, title='Test', description='d',
+                                                repo_url='hertz-ai/test', branch='main')
+        assert result['title'] == 'Test'
+        assert result['status'] == 'active'
+
+    def test_create_goal_invalid_repo(self, db):
+        from integrations.coding_agent.goal_manager import CodingGoalManager
+        with pytest.raises(ValueError, match='Invalid repo_url'):
+            CodingGoalManager.create_goal(db, title='X', description='d',
+                                           repo_url='../../etc/passwd', branch='main')
+
+    def test_create_goal_invalid_branch(self, db):
+        from integrations.coding_agent.goal_manager import CodingGoalManager
+        with pytest.raises(ValueError, match='Invalid branch'):
+            CodingGoalManager.create_goal(db, title='X', description='d',
+                                           repo_url='a/b', branch='main; rm -rf /')
+
+    def test_get_goal(self, db, sample_goal):
+        from integrations.coding_agent.goal_manager import CodingGoalManager
+        result = CodingGoalManager.get_goal(db, sample_goal.id)
+        assert result['success'] is True
+        assert result['goal']['title'] == 'Activate HiveMind'
+
+    def test_get_goal_not_found(self, db):
+        from integrations.coding_agent.goal_manager import CodingGoalManager
+        assert CodingGoalManager.get_goal(db, 'nope')['success'] is False
+
+    def test_update_status(self, db):
+        from integrations.coding_agent.goal_manager import CodingGoalManager
+        goal = CodingGoal(title='S', description='d', repo_url='a/b', status='active')
+        db.add(goal)
+        db.flush()
+        result = CodingGoalManager.update_goal_status(db, goal.id, 'paused')
+        assert result['goal']['status'] == 'paused'
+
+    def test_update_status_not_found(self, db):
+        from integrations.coding_agent.goal_manager import CodingGoalManager
+        assert CodingGoalManager.update_goal_status(db, 'nope', 'x')['success'] is False
+
+    def test_list_goals(self, db, sample_goal):
+        from integrations.coding_agent.goal_manager import CodingGoalManager
+        assert len(CodingGoalManager.list_goals(db)) >= 1
+
+    def test_list_goals_filtered(self, db, sample_goal):
+        from integrations.coding_agent.goal_manager import CodingGoalManager
+        assert all(g['status'] == 'active'
+                   for g in CodingGoalManager.list_goals(db, status='active'))
+
+    def test_build_prompt(self):
+        from integrations.coding_agent.goal_manager import CodingGoalManager
+        prompt = CodingGoalManager.build_prompt({
+            'repo_url': 'hertz-ai/repo', 'repo_branch': 'main',
+            'target_path': 'src/', 'title': 'Fix bugs', 'description': 'Fix all bugs',
+        })
+        assert 'hertz-ai/repo' in prompt
+        assert 'Fix bugs' in prompt
+        assert 'Clone the repo' in prompt
+
+
+# =====================================================================
+# TEST: dispatch_to_chat
+# =====================================================================
+
+class TestDispatch:
+
+    @patch('integrations.coding_agent.task_distributor.requests.post')
+    def test_dispatch_success(self, mock_post):
+        from integrations.coding_agent.task_distributor import dispatch_to_chat
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {'response': 'Code generated'}
+        mock_post.return_value = mock_resp
+
+        result = dispatch_to_chat('Fix bugs', 'user1', 'goal123456')
+        assert result == 'Code generated'
+        mock_post.assert_called_once()
+        call_json = mock_post.call_args[1]['json']
+        assert call_json['create_agent'] is True
+        assert call_json['prompt'] == 'Fix bugs'
+        assert call_json['prompt_id'] == 'coding_goal1234'
+
+    @patch('integrations.coding_agent.task_distributor.requests.post',
+           side_effect=req_module.RequestException('fail'))
+    def test_dispatch_failure(self, mock_post):
+        from integrations.coding_agent.task_distributor import dispatch_to_chat
+        assert dispatch_to_chat('x', 'u', 'g1234567') is None
+
+    @patch('integrations.coding_agent.task_distributor.requests.post')
+    def test_dispatch_non_200(self, mock_post):
+        from integrations.coding_agent.task_distributor import dispatch_to_chat
+        mock_resp = MagicMock()
+        mock_resp.status_code = 500
+        mock_post.return_value = mock_resp
+        assert dispatch_to_chat('x', 'u', 'g1234567') is None
+
+
+# =====================================================================
+# TEST: Daemon
+# =====================================================================
+
+class TestCodingDaemon:
+
+    def test_start_stop(self):
+        from integrations.coding_agent.coding_daemon import CodingAgentDaemon
+        daemon = CodingAgentDaemon()
+        daemon._interval = 1
+        daemon.start()
+        assert daemon._running is True
+        assert daemon._thread.is_alive()
+        daemon.stop()
+        assert daemon._running is False
+
+    def test_double_start(self):
+        from integrations.coding_agent.coding_daemon import CodingAgentDaemon
+        daemon = CodingAgentDaemon()
+        daemon._interval = 1
+        daemon.start()
+        daemon.start()
+        assert daemon._running is True
+        daemon.stop()
+
+    def test_singleton(self):
+        from integrations.coding_agent.coding_daemon import coding_daemon, CodingAgentDaemon
+        assert isinstance(coding_daemon, CodingAgentDaemon)
+
+
+# =====================================================================
+# TEST: SyncEngine operation types (still supported)
+# =====================================================================
+
+class TestSyncEngineOperations:
+
+    def test_receive_coding_task_assign(self):
+        from integrations.social.sync_engine import SyncEngine
+        result = SyncEngine.receive_sync_batch(None, [
+            {'id': 'i1', 'operation_type': 'coding_task_assign', 'payload': {}},
+        ])
+        assert 'i1' in result['processed']
+
+    def test_receive_coding_submission(self):
+        from integrations.social.sync_engine import SyncEngine
+        result = SyncEngine.receive_sync_batch(None, [
+            {'id': 'i2', 'operation_type': 'coding_submission', 'payload': {}},
+        ])
+        assert 'i2' in result['processed']
+
+
+# =====================================================================
+# TEST: API Endpoints (Auth-Protected)
+# =====================================================================
+
+def _mock_auth(user, db):
+    def mock_fn(token):
+        return user, db
+    return mock_fn
+
+
+class TestCodingEndpoints:
+
+    @pytest.fixture
+    def app(self):
+        from flask import Flask
+        app = Flask(__name__)
+        app.config['TESTING'] = True
+        from integrations.coding_agent.api import coding_agent_bp
+        app.register_blueprint(coding_agent_bp)
+        return app
+
+    @pytest.fixture
+    def client(self, app):
+        return app.test_client()
+
+    def _headers(self):
+        return {'Authorization': 'Bearer test'}
+
+    # Auth enforcement
+    def test_unauth_rejected(self, client):
+        assert client.get('/api/coding/goals').status_code == 401
+
+    def test_unauth_post_rejected(self, client):
+        assert client.post('/api/coding/opt-in', json={'user_id': 'x'}).status_code == 401
+
+    # Central-only
+    @patch('integrations.social.auth._get_user_from_token')
+    def test_non_central_rejected(self, mock_fn, client, db, admin_user):
+        mock_fn.side_effect = _mock_auth(admin_user, db)
+        import integrations.coding_agent.api as m
+        orig = m._IS_CENTRAL
+        m._IS_CENTRAL = False
+        try:
+            resp = client.post('/api/coding/goals', json={'title': 'T', 'repo_url': 'a/b'},
+                              headers=self._headers())
+            assert resp.status_code == 403
+            assert 'Central' in resp.get_json()['error']
+        finally:
+            m._IS_CENTRAL = orig
+
+    # Admin-only
+    @patch('integrations.social.auth._get_user_from_token')
+    def test_non_admin_rejected(self, mock_fn, client, db, regular_user):
+        mock_fn.side_effect = _mock_auth(regular_user, db)
+        import integrations.coding_agent.api as m
+        orig = m._IS_CENTRAL
+        m._IS_CENTRAL = True
+        try:
+            resp = client.post('/api/coding/goals', json={'title': 'T', 'repo_url': 'a/b'},
+                              headers=self._headers())
+            assert resp.status_code == 403
+            assert 'Admin' in resp.get_json()['error']
+        finally:
+            m._IS_CENTRAL = orig
+
+    # Repo allowlist
+    @patch('integrations.social.auth._get_user_from_token')
+    def test_allowlist_blocks(self, mock_fn, client, db, admin_user):
+        mock_fn.side_effect = _mock_auth(admin_user, db)
+        import integrations.coding_agent.api as m
+        orig_c, orig_r = m._IS_CENTRAL, m.ALLOWED_REPOS
+        m._IS_CENTRAL, m.ALLOWED_REPOS = True, ['ok/repo']
+        try:
+            resp = client.post('/api/coding/goals', json={'title': 'T', 'repo_url': 'bad/repo'},
+                              headers=self._headers())
+            assert resp.status_code == 400
+            assert 'allowlist' in resp.get_json()['error']
+        finally:
+            m._IS_CENTRAL, m.ALLOWED_REPOS = orig_c, orig_r
+
+    @patch('integrations.social.auth._get_user_from_token')
+    def test_allowlist_allows(self, mock_fn, client, db, admin_user):
+        mock_fn.side_effect = _mock_auth(admin_user, db)
+        import integrations.coding_agent.api as m
+        orig_c, orig_r = m._IS_CENTRAL, m.ALLOWED_REPOS
+        m._IS_CENTRAL, m.ALLOWED_REPOS = True, ['ok/repo']
+        try:
+            resp = client.post('/api/coding/goals', json={
+                'title': 'T', 'description': 'd', 'repo_url': 'ok/repo'},
+                headers=self._headers())
+            assert resp.status_code == 200
+            assert resp.get_json()['success'] is True
+        finally:
+            m._IS_CENTRAL, m.ALLOWED_REPOS = orig_c, orig_r
+
+    # Repo validation
+    @patch('integrations.social.auth._get_user_from_token')
+    def test_invalid_repo_rejected(self, mock_fn, client, db, admin_user):
+        mock_fn.side_effect = _mock_auth(admin_user, db)
+        import integrations.coding_agent.api as m
+        orig = m._IS_CENTRAL
+        m._IS_CENTRAL = True
+        try:
+            assert client.post('/api/coding/goals', json={'title': 'T', 'repo_url': '../../etc'},
+                              headers=self._headers()).status_code == 400
+        finally:
+            m._IS_CENTRAL = orig
+
+    # Opt-in ownership
+    @patch('integrations.social.auth._get_user_from_token')
+    def test_opt_in_self(self, mock_fn, client, db, regular_user):
+        mock_fn.side_effect = _mock_auth(regular_user, db)
+        resp = client.post('/api/coding/opt-in', json={'user_id': str(regular_user.id)},
+                          headers=self._headers())
+        assert resp.status_code == 200
+
+    @patch('integrations.social.auth._get_user_from_token')
+    def test_opt_in_other_rejected(self, mock_fn, client, db, regular_user):
+        mock_fn.side_effect = _mock_auth(regular_user, db)
+        resp = client.post('/api/coding/opt-in', json={'user_id': 'other'},
+                          headers=self._headers())
+        assert resp.status_code == 403
+        assert 'yourself' in resp.get_json()['error']
+
+    @patch('integrations.social.auth._get_user_from_token')
+    def test_opt_out_other_rejected(self, mock_fn, client, db, regular_user):
+        mock_fn.side_effect = _mock_auth(regular_user, db)
+        assert client.post('/api/coding/opt-out', json={'user_id': 'other'},
+                          headers=self._headers()).status_code == 403
+
+    @patch('integrations.social.auth._get_user_from_token')
+    def test_admin_opt_in_other(self, mock_fn, client, db, admin_user, sample_user):
+        mock_fn.side_effect = _mock_auth(admin_user, db)
+        sample_user.idle_compute_opt_in = False
+        db.flush()
+        resp = client.post('/api/coding/opt-in', json={'user_id': str(sample_user.id)},
+                          headers=self._headers())
+        assert resp.status_code == 200
+        assert resp.get_json()['success'] is True
+
+    # Read endpoints
+    @patch('integrations.social.auth._get_user_from_token')
+    def test_list_goals(self, mock_fn, client, db, regular_user, sample_goal):
+        mock_fn.side_effect = _mock_auth(regular_user, db)
+        resp = client.get('/api/coding/goals', headers=self._headers())
+        assert resp.status_code == 200
+        assert len(resp.get_json()['goals']) >= 1
+
+    @patch('integrations.social.auth._get_user_from_token')
+    def test_idle_stats(self, mock_fn, client, db, regular_user):
+        mock_fn.side_effect = _mock_auth(regular_user, db)
+        resp = client.get('/api/coding/idle-stats', headers=self._headers())
+        assert resp.status_code == 200
+        assert 'total_opted_in' in resp.get_json()
+
+    # Admin create end-to-end
+    @patch('integrations.social.auth._get_user_from_token')
+    def test_admin_create_goal(self, mock_fn, client, db, admin_user):
+        mock_fn.side_effect = _mock_auth(admin_user, db)
+        expected_id = str(admin_user.id)
+        import integrations.coding_agent.api as m
+        orig_c, orig_r = m._IS_CENTRAL, m.ALLOWED_REPOS
+        m._IS_CENTRAL, m.ALLOWED_REPOS = True, []
+        try:
+            resp = client.post('/api/coding/goals', json={
+                'title': 'Admin Goal', 'description': 'd', 'repo_url': 'hertz-ai/repo'},
+                headers=self._headers())
+            assert resp.status_code == 200
+            data = resp.get_json()
+            assert data['goal']['title'] == 'Admin Goal'
+            assert data['goal']['created_by'] == expected_id
+        finally:
+            m._IS_CENTRAL, m.ALLOWED_REPOS = orig_c, orig_r
+
+
+# =====================================================================
+# TEST: Repo Validation
+# =====================================================================
+
+class TestRepoValidation:
+
+    def test_valid(self):
+        from integrations.coding_agent.api import _validate_repo
+        assert _validate_repo('owner/repo') is None
+        assert _validate_repo('hertz-ai/My_Repo.v2') is None
+
+    def test_empty(self):
+        from integrations.coding_agent.api import _validate_repo
+        assert _validate_repo('') is not None
+
+    def test_no_slash(self):
+        from integrations.coding_agent.api import _validate_repo
+        assert _validate_repo('justrepo') is not None
+
+    def test_too_many_slashes(self):
+        from integrations.coding_agent.api import _validate_repo
+        assert _validate_repo('a/b/c') is not None
+
+    def test_shell_injection(self):
+        from integrations.coding_agent.api import _validate_repo
+        assert _validate_repo('a/b;rm -rf /') is not None
+
+    def test_path_traversal(self):
+        from integrations.coding_agent.api import _validate_repo
+        assert _validate_repo('../etc/passwd') is not None
+
+    def test_special_chars(self):
+        from integrations.coding_agent.api import _validate_repo
+        assert _validate_repo('a/b$(whoami)') is not None
+
+    def test_allowlist(self):
+        from integrations.coding_agent.api import _validate_repo
+        import integrations.coding_agent.api as m
+        orig = m.ALLOWED_REPOS
+        m.ALLOWED_REPOS = ['ok/repo']
+        try:
+            assert _validate_repo('ok/repo') is None
+            assert _validate_repo('bad/repo') is not None
+        finally:
+            m.ALLOWED_REPOS = orig
+
+
+# =====================================================================
+# TEST: Package Init
+# =====================================================================
+
+class TestPackageInit:
+
+    def test_disabled_by_default(self):
+        from flask import Flask
+        app = Flask(__name__)
+        with patch.dict(os.environ, {'HEVOLVE_CODING_AGENT_ENABLED': 'false'}):
+            from integrations.coding_agent import init_coding_agent
+            init_coding_agent(app)
+            assert 'coding_agent' not in [bp.name for bp in app.blueprints.values()]

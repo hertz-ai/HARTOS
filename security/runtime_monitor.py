@@ -97,6 +97,16 @@ class RuntimeIntegrityMonitor:
 
         self._running = False
 
+    def _check_loop_once_for_test(self) -> None:
+        """Run a single integrity check (for testing only)."""
+        try:
+            from security.node_integrity import compute_code_hash
+            current_hash = compute_code_hash(self._code_root)
+            if current_hash != self._expected_hash:
+                self._tampered = True
+        except Exception:
+            pass
+
     @property
     def is_healthy(self) -> bool:
         """Returns False if tampering detected."""

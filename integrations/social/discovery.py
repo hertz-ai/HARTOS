@@ -56,6 +56,11 @@ def well_known():
             'agents': '/api/social/discovery/agents',
             'communities': '/api/social/discovery/communities',
         },
+        'hierarchy': {
+            'tier': os.environ.get('HEVOLVE_NODE_TIER', 'flat'),
+            'central_url': os.environ.get('HEVOLVE_CENTRAL_URL', ''),
+            'regional_url': os.environ.get('HEVOLVE_REGIONAL_URL', ''),
+        },
         'supported_platforms': ['santaclaw', 'openclaw', 'bmoltbook', 'a2a', 'generic'],
         'auth': {
             'type': 'bearer_token',
@@ -489,13 +494,25 @@ _EXPECTED_HASHES = {}  # version -> code_hash, populated at registry startup
 
 @discovery_bp.route('/api/social/integrity/expected-hash')
 def integrity_expected_hash():
-    """Registry: return expected code hash for a version."""
+    """Registry: return expected code hash for a version.
+    Prefers master-signed manifest hash over self-computed hash."""
     if not _IS_REGISTRY:
         return jsonify({'success': False, 'error': 'Not a registry node'}), 403
     version = request.args.get('version', '')
     code_hash = _EXPECTED_HASHES.get(version)
     if not code_hash:
-        # Compute from own code as reference
+        # Prefer master-signed manifest hash
+        try:
+            from security.master_key import load_release_manifest, verify_release_manifest
+            manifest = load_release_manifest()
+            if manifest and verify_release_manifest(manifest):
+                code_hash = manifest.get('code_hash', '')
+                if code_hash:
+                    _EXPECTED_HASHES[version] = code_hash
+        except Exception:
+            pass
+    if not code_hash:
+        # Fallback: compute from own code
         try:
             from security.node_integrity import compute_code_hash
             code_hash = compute_code_hash()
@@ -507,7 +524,8 @@ def integrity_expected_hash():
 
 @discovery_bp.route('/api/social/integrity/register-node', methods=['POST'])
 def integrity_register_node():
-    """Registry: register a node's public key."""
+    """Registry: register a node's public key.
+    In soft/hard enforcement mode, rejects nodes with mismatched code hash."""
     if not _IS_REGISTRY:
         return jsonify({'success': False, 'error': 'Not a registry node'}), 403
     from .models import get_db, PeerNode
@@ -525,6 +543,23 @@ def integrity_register_node():
                 return jsonify({'success': False, 'error': 'Invalid signature'}), 400
         except Exception:
             pass
+    # Verify code hash against master-signed manifest
+    peer_code_hash = data.get('code_hash', '')
+    try:
+        from security.master_key import load_release_manifest, verify_release_manifest, get_enforcement_mode
+        manifest = load_release_manifest()
+        enforcement = get_enforcement_mode()
+        if manifest and verify_release_manifest(manifest) and peer_code_hash:
+            expected = manifest.get('code_hash', '')
+            if expected and peer_code_hash != expected and enforcement in ('soft', 'hard'):
+                logger.warning(f"Registry: rejecting node {node_id[:8]} - code hash mismatch "
+                              f"(enforcement={enforcement})")
+                return jsonify({
+                    'success': False,
+                    'error': 'Code hash does not match signed release manifest',
+                }), 403
+    except Exception:
+        pass
     db = get_db()
     try:
         peer = db.query(PeerNode).filter_by(node_id=node_id).first()
@@ -669,3 +704,251 @@ def integrity_dashboard():
         return jsonify({'success': True, 'data': result})
     finally:
         db.close()
+
+
+@discovery_bp.route('/api/social/integrity/boot-status')
+def integrity_boot_status():
+    """Return boot verification status, enforcement mode, and runtime health."""
+    from security.master_key import get_enforcement_mode, is_dev_mode, load_release_manifest
+    from security.runtime_monitor import is_code_healthy, get_monitor
+    manifest = load_release_manifest()
+    monitor = get_monitor()
+    return jsonify({
+        'success': True,
+        'enforcement_mode': get_enforcement_mode(),
+        'dev_mode': is_dev_mode(),
+        'runtime_healthy': is_code_healthy(),
+        'monitor_active': monitor is not None and monitor._running if monitor else False,
+        'release_version': manifest.get('version', '') if manifest else None,
+        'manifest_present': manifest is not None,
+    })
+
+
+# ═══════════════════════════════════════════════════════════════
+# 3-TIER HIERARCHY ENDPOINTS
+# ═══════════════════════════════════════════════════════════════
+
+_IS_CENTRAL = os.environ.get('HEVOLVE_NODE_TIER', 'flat').lower() == 'central'
+
+
+@discovery_bp.route('/api/social/hierarchy/register-regional', methods=['POST'])
+def hierarchy_register_regional():
+    """Central-only: register a regional host with its signed certificate."""
+    if not _IS_CENTRAL:
+        return jsonify({'success': False, 'error': 'Only central nodes can register regional hosts'}), 403
+    from .models import get_db
+    from .hierarchy_service import HierarchyService
+    data = request.get_json(force=True, silent=True) or {}
+    required = ['node_id', 'public_key', 'region_name', 'certificate']
+    missing = [f for f in required if not data.get(f)]
+    if missing:
+        return jsonify({'success': False, 'error': f'Missing fields: {missing}'}), 400
+    db = get_db()
+    try:
+        result = HierarchyService.register_regional_host(
+            db,
+            node_id=data['node_id'],
+            public_key_hex=data['public_key'],
+            region_name=data['region_name'],
+            compute_info=data.get('compute_info', {}),
+            certificate=data['certificate'],
+        )
+        if result.get('registered'):
+            db.commit()
+        return jsonify({'success': result.get('registered', False), **result})
+    except Exception as e:
+        db.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@discovery_bp.route('/api/social/hierarchy/register-local', methods=['POST'])
+def hierarchy_register_local():
+    """Central-only: register a local node, returns region assignment."""
+    if not _IS_CENTRAL:
+        return jsonify({'success': False, 'error': 'Only central nodes can register local nodes'}), 403
+    from .models import get_db
+    from .hierarchy_service import HierarchyService
+    data = request.get_json(force=True, silent=True) or {}
+    if not data.get('node_id') or not data.get('public_key'):
+        return jsonify({'success': False, 'error': 'node_id and public_key required'}), 400
+    db = get_db()
+    try:
+        result = HierarchyService.register_local_node(
+            db,
+            node_id=data['node_id'],
+            public_key_hex=data['public_key'],
+            compute_info=data.get('compute_info', {}),
+            geo_info=data.get('geo_info', {}),
+        )
+        if result.get('registered'):
+            db.commit()
+        return jsonify({'success': result.get('registered', False), **result})
+    except Exception as e:
+        db.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@discovery_bp.route('/api/social/hierarchy/assign-region', methods=['POST'])
+def hierarchy_assign_region():
+    """Central-only: manually assign a local node to a region."""
+    if not _IS_CENTRAL:
+        return jsonify({'success': False, 'error': 'Central-only endpoint'}), 403
+    from .models import get_db
+    from .hierarchy_service import HierarchyService
+    data = request.get_json(force=True, silent=True) or {}
+    if not data.get('local_node_id'):
+        return jsonify({'success': False, 'error': 'local_node_id required'}), 400
+    db = get_db()
+    try:
+        result = HierarchyService.assign_to_region(
+            db,
+            local_node_id=data['local_node_id'],
+            compute_info=data.get('compute_info', {}),
+            geo_info=data.get('geo_info', {}),
+        )
+        if result.get('assigned'):
+            db.commit()
+        return jsonify({'success': result.get('assigned', False), **result})
+    except Exception as e:
+        db.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@discovery_bp.route('/api/social/hierarchy/switch-region', methods=['POST'])
+def hierarchy_switch_region():
+    """Switch a local node to a different region."""
+    from .models import get_db
+    from .hierarchy_service import HierarchyService
+    data = request.get_json(force=True, silent=True) or {}
+    if not data.get('local_node_id') or not data.get('new_region_id'):
+        return jsonify({'success': False, 'error': 'local_node_id and new_region_id required'}), 400
+    db = get_db()
+    try:
+        result = HierarchyService.switch_region(
+            db,
+            local_node_id=data['local_node_id'],
+            new_region_id=data['new_region_id'],
+            requester=data.get('requester', 'user_choice'),
+        )
+        if result.get('switched'):
+            db.commit()
+        return jsonify({'success': result.get('switched', False), **result})
+    except Exception as e:
+        db.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@discovery_bp.route('/api/social/hierarchy/regions')
+def hierarchy_regions():
+    """List all regions with capacity info."""
+    from .models import get_db, Region
+    db = get_db()
+    try:
+        regions = db.query(Region).all()
+        return jsonify({
+            'success': True,
+            'data': [r.to_dict() for r in regions],
+            'count': len(regions),
+        })
+    finally:
+        db.close()
+
+
+@discovery_bp.route('/api/social/hierarchy/region/<region_id>/health')
+def hierarchy_region_health(region_id):
+    """Get health/load info for a specific region."""
+    from .models import get_db
+    from .hierarchy_service import HierarchyService
+    db = get_db()
+    try:
+        health = HierarchyService.get_region_health(db, region_id)
+        if not health:
+            return jsonify({'success': False, 'error': 'Region not found'}), 404
+        return jsonify({'success': True, 'data': health})
+    finally:
+        db.close()
+
+
+@discovery_bp.route('/api/social/hierarchy/node/<node_id>/assignment')
+def hierarchy_node_assignment(node_id):
+    """Get a node's current region assignment."""
+    from .models import get_db, RegionAssignment
+    db = get_db()
+    try:
+        assignment = db.query(RegionAssignment).filter_by(
+            local_node_id=node_id, status='active').first()
+        if not assignment:
+            return jsonify({'success': False, 'error': 'No active assignment'}), 404
+        return jsonify({'success': True, 'data': assignment.to_dict()})
+    finally:
+        db.close()
+
+
+@discovery_bp.route('/api/social/hierarchy/sync', methods=['POST'])
+def hierarchy_sync():
+    """Receive sync batch from a child node."""
+    from .models import get_db
+    from .sync_engine import SyncEngine
+    data = request.get_json(force=True, silent=True) or {}
+    items = data.get('items', [])
+    if not items:
+        return jsonify({'success': True, 'processed': [], 'errors': []})
+    db = get_db()
+    try:
+        result = SyncEngine.receive_sync_batch(db, items)
+        db.commit()
+        return jsonify({'success': True, **result})
+    except Exception as e:
+        db.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@discovery_bp.route('/api/social/hierarchy/report-capacity', methods=['POST'])
+def hierarchy_report_capacity():
+    """Node reports its compute capacity."""
+    from .models import get_db
+    from .hierarchy_service import HierarchyService
+    data = request.get_json(force=True, silent=True) or {}
+    if not data.get('node_id'):
+        return jsonify({'success': False, 'error': 'node_id required'}), 400
+    db = get_db()
+    try:
+        result = HierarchyService.report_node_capacity(
+            db, data['node_id'], data.get('compute_info', {}))
+        if result.get('updated'):
+            db.commit()
+        return jsonify({'success': result.get('updated', False), **result})
+    except Exception as e:
+        db.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@discovery_bp.route('/api/social/hierarchy/tier-info')
+def hierarchy_tier_info():
+    """Return this node's tier, parent info, and authorization status."""
+    from security.key_delegation import get_node_tier, verify_tier_authorization, load_node_certificate
+    tier = get_node_tier()
+    auth_result = verify_tier_authorization()
+    cert = load_node_certificate()
+    return jsonify({
+        'success': True,
+        'tier': tier,
+        'authorized': auth_result['authorized'],
+        'authorization_details': auth_result['details'],
+        'central_url': os.environ.get('HEVOLVE_CENTRAL_URL', ''),
+        'regional_url': os.environ.get('HEVOLVE_REGIONAL_URL', ''),
+        'has_certificate': cert is not None,
+        'certificate_tier': cert.get('tier') if cert else None,
+    })

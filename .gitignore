@@ -7,6 +7,8 @@ secrets.salt
 *.p12
 .env
 agent_data/social.db
+master_private_key.pem
+master_private_key.hex
 
 prompt/
 prompt/*
@@ -15,6 +17,12 @@ log/
 langchain.log
 __pycache__/
 venv_old/*
+
+# Build artifacts (setuptools / pip)
+*.egg-info/
+dist/
+build/
+hevolve_version.py
 
 /venv310/Include/site/python3.10/greenlet/greenlet.h
 /venv310/Lib/site-packages/_distutils_hack/__init__.py

@@ -35,6 +35,15 @@ class GossipProtocol:
         self.dead_threshold = int(os.environ.get('HEVOLVE_DEAD_THRESHOLD', '900'))
         self.gossip_fanout = int(os.environ.get('HEVOLVE_GOSSIP_FANOUT', '3'))
 
+        # Hierarchy configuration
+        try:
+            from security.key_delegation import get_node_tier
+            self.tier = get_node_tier()
+        except ImportError:
+            self.tier = 'flat'
+        self.central_url = os.environ.get('HEVOLVE_CENTRAL_URL', '').rstrip('/')
+        self.regional_url = os.environ.get('HEVOLVE_REGIONAL_URL', '').rstrip('/')
+
         # Parse seed peers
         seed_str = os.environ.get('HEVOLVE_SEED_PEERS', '')
         self.seed_peers = [
@@ -99,7 +108,12 @@ class GossipProtocol:
     # ─── Gossip Round ───
 
     def _gossip_round(self):
-        peers = self._load_peers_from_db(exclude_dead=True)
+        # Tier-aware gossip: scope targets by tier
+        if self.tier == 'flat':
+            peers = self._load_peers_from_db(exclude_dead=True)
+        else:
+            peers = self._load_peers_by_tier()
+
         if not peers:
             # Retry seeds if we have no peers
             for url in self.seed_peers:
@@ -257,12 +271,30 @@ class GossipProtocol:
             'agent_count': self._get_count('agent'),
             'post_count': self._get_count('post'),
             'timestamp': int(time.time()),
+            'tier': self.tier,
         }
         # Add cryptographic identity if available
         try:
             from security.node_integrity import get_public_key_hex, compute_code_hash, sign_json_payload
             info['public_key'] = get_public_key_hex()
             info['code_hash'] = compute_code_hash()
+            # Include release manifest info if available
+            try:
+                from security.master_key import load_release_manifest
+                manifest = load_release_manifest()
+                if manifest:
+                    info['release_version'] = manifest.get('version', '')
+                    info['release_manifest_signature'] = manifest.get('master_signature', '')
+            except Exception:
+                pass
+            # Include certificate for regional/central nodes
+            try:
+                from security.key_delegation import load_node_certificate
+                cert = load_node_certificate()
+                if cert:
+                    info['certificate'] = cert
+            except Exception:
+                pass
             info['signature'] = sign_json_payload(info)
         except Exception:
             pass
@@ -353,6 +385,49 @@ class GossipProtocol:
 
         integrity_status = 'verified' if signature_valid else 'unverified'
 
+        # Master key verification: check peer's code_hash against our signed manifest
+        master_key_verified = False
+        try:
+            from security.master_key import load_release_manifest, get_enforcement_mode
+            manifest = load_release_manifest()
+            enforcement = get_enforcement_mode()
+            peer_code_hash = peer_data.get('code_hash', '')
+            if manifest and peer_code_hash:
+                expected_hash = manifest.get('code_hash', '')
+                if peer_code_hash == expected_hash:
+                    master_key_verified = True
+                elif enforcement == 'hard' and expected_hash:
+                    logger.warning(f"Rejecting peer {node_id[:8]}: code hash mismatch "
+                                  f"(enforcement=hard)")
+                    return False
+                elif enforcement == 'soft' and expected_hash:
+                    logger.warning(f"Peer {node_id[:8]} code hash mismatch "
+                                  f"(enforcement=soft, allowing)")
+        except Exception:
+            pass
+
+        # Certificate verification for peers claiming regional/central tier
+        peer_tier = peer_data.get('tier', 'flat')
+        certificate = peer_data.get('certificate')
+        certificate_verified = False
+        if peer_tier in ('regional', 'central') and certificate:
+            try:
+                from security.key_delegation import verify_certificate_chain
+                from security.master_key import get_enforcement_mode
+                chain_result = verify_certificate_chain(certificate)
+                certificate_verified = chain_result['valid']
+                enforcement = get_enforcement_mode()
+                if not certificate_verified:
+                    if enforcement == 'hard':
+                        logger.warning(f"Rejecting peer {node_id[:8]}: invalid certificate "
+                                      f"for tier={peer_tier} (enforcement=hard)")
+                        return False
+                    else:
+                        logger.warning(f"Peer {node_id[:8]} has invalid certificate "
+                                      f"for tier={peer_tier} (enforcement={enforcement})")
+            except Exception as e:
+                logger.debug(f"Certificate verification error for {node_id[:8]}: {e}")
+
         if existing:
             existing.last_seen = datetime.utcnow()
             existing.url = url
@@ -369,6 +444,14 @@ class GossipProtocol:
                 existing.code_version = peer_data['version']
             if signature_valid:
                 existing.integrity_status = 'verified'
+            existing.master_key_verified = master_key_verified
+            if peer_data.get('release_version'):
+                existing.release_version = peer_data['release_version']
+            # Update tier/certificate fields
+            existing.tier = peer_tier
+            if certificate:
+                existing.certificate_json = certificate
+                existing.certificate_verified = certificate_verified
             if existing.status == 'dead':
                 existing.status = 'active'  # resurrect
             return False
@@ -385,6 +468,11 @@ class GossipProtocol:
             code_hash=peer_data.get('code_hash', ''),
             code_version=peer_data.get('version', ''),
             integrity_status=integrity_status,
+            master_key_verified=master_key_verified,
+            release_version=peer_data.get('release_version', ''),
+            tier=peer_tier,
+            certificate_json=certificate,
+            certificate_verified=certificate_verified,
         )
         db.add(new_peer)
         return True
@@ -393,6 +481,16 @@ class GossipProtocol:
 
     def _integrity_round(self):
         """Periodic integrity check: challenge random peer, pull ban list, detect anomalies."""
+        # Self-check: verify own code integrity before challenging others
+        try:
+            from security.runtime_monitor import is_code_healthy
+            if not is_code_healthy():
+                logger.critical("Integrity round: local code tampered, stopping gossip")
+                self.stop()
+                return
+        except Exception:
+            pass
+
         from .models import get_db, PeerNode
         db = get_db()
         try:
@@ -447,6 +545,18 @@ class GossipProtocol:
 
         except Exception as e:
             logger.debug(f"Integrity round error: {e}")
+        finally:
+            db.close()
+
+    def _load_peers_by_tier(self):
+        """Load gossip targets scoped to this node's tier."""
+        from .models import get_db
+        db = get_db()
+        try:
+            from .hierarchy_service import HierarchyService
+            return HierarchyService.get_gossip_targets(db, self.node_id, self.tier)
+        except Exception:
+            return []
         finally:
             db.close()
 

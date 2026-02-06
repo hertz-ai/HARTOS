@@ -9,7 +9,10 @@ import logging
 from pathlib import Path
 from typing import Optional, Dict
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey, Ed25519PublicKey,
+)
+from cryptography.hazmat.primitives import serialization
 from cryptography.exceptions import InvalidSignature
 
 logger = logging.getLogger('hevolve_security')
@@ -91,6 +94,32 @@ def get_enforcement_mode() -> str:
     if mode in ('off', 'warn', 'soft', 'hard'):
         return mode
     return 'warn'
+
+
+def get_master_private_key() -> Ed25519PrivateKey:
+    """Load master private key from env var. Only available on central nodes.
+
+    Raises RuntimeError if HEVOLVE_MASTER_PRIVATE_KEY is not set.
+    """
+    hex_key = os.environ.get('HEVOLVE_MASTER_PRIVATE_KEY', '')
+    if not hex_key:
+        raise RuntimeError(
+            'HEVOLVE_MASTER_PRIVATE_KEY not set. '
+            'Only central nodes with the master private key can sign certificates.')
+    raw = bytes.fromhex(hex_key)
+    return Ed25519PrivateKey.from_private_bytes(raw)
+
+
+def sign_child_certificate(payload: dict) -> str:
+    """Sign a certificate payload with the master private key.
+
+    Only works on central where HEVOLVE_MASTER_PRIVATE_KEY env var is set.
+    Returns hex-encoded signature.
+    """
+    priv = get_master_private_key()
+    canonical = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+    sig = priv.sign(canonical.encode('utf-8'))
+    return sig.hex()
 
 
 def full_boot_verification(code_root: str = None) -> dict:

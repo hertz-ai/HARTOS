@@ -125,7 +125,8 @@ extras_require = {
 
 setup(
     name="hevolve-backend",
-    version="1.0.0",
+    # version derived from git tags via setuptools-scm (configured in pyproject.toml)
+    setup_requires=["setuptools-scm>=8.0"],
     author="Hevolve Team",
     author_email="contact@hevolve.ai",
     description="LangChain-based AI Agent Server with multi-agent orchestration",
@@ -158,6 +159,7 @@ setup(
 
     # Include main modules at root level
     py_modules=[
+        "hevolve_version",
         "langchain_gpt_api",
         "helper",
         "helper_func",

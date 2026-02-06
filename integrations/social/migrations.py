@@ -8,7 +8,7 @@ from .models import get_engine, Base
 
 logger = logging.getLogger('hevolve_social')
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 14
 
 
 def get_schema_version(engine) -> int:
@@ -265,3 +265,71 @@ def run_migrations():
                     pass
             conn.commit()
         set_schema_version(engine, 11)
+
+    if current < 12:
+        logger.info("HevolveSocial: migrating to v12 (Master Key Verification)")
+        with engine.connect() as conn:
+            for stmt in [
+                "ALTER TABLE peer_nodes ADD COLUMN master_key_verified BOOLEAN DEFAULT 0",
+                "ALTER TABLE peer_nodes ADD COLUMN release_version VARCHAR(20)",
+            ]:
+                try:
+                    conn.execute(text(stmt))
+                except Exception:
+                    pass
+            conn.commit()
+        set_schema_version(engine, 12)
+
+    if current < 13:
+        logger.info("HevolveSocial: migrating to v13 (3-Tier Hierarchy)")
+        from .models import RegionAssignment, SyncQueue
+        for tbl in [RegionAssignment.__table__, SyncQueue.__table__]:
+            tbl.create(engine, checkfirst=True)
+        # Add hierarchy columns to peer_nodes
+        with engine.connect() as conn:
+            for stmt in [
+                "ALTER TABLE peer_nodes ADD COLUMN tier VARCHAR(20) DEFAULT 'flat'",
+                "ALTER TABLE peer_nodes ADD COLUMN parent_node_id VARCHAR(64)",
+                "ALTER TABLE peer_nodes ADD COLUMN certificate_json JSON",
+                "ALTER TABLE peer_nodes ADD COLUMN certificate_verified BOOLEAN DEFAULT 0",
+                "ALTER TABLE peer_nodes ADD COLUMN region_assignment_id VARCHAR(64)",
+                "ALTER TABLE peer_nodes ADD COLUMN compute_cpu_cores INTEGER",
+                "ALTER TABLE peer_nodes ADD COLUMN compute_ram_gb REAL",
+                "ALTER TABLE peer_nodes ADD COLUMN compute_gpu_count INTEGER",
+                "ALTER TABLE peer_nodes ADD COLUMN active_user_count INTEGER DEFAULT 0",
+                "ALTER TABLE peer_nodes ADD COLUMN max_user_capacity INTEGER DEFAULT 0",
+                "ALTER TABLE peer_nodes ADD COLUMN dns_region VARCHAR(50)",
+            ]:
+                try:
+                    conn.execute(text(stmt))
+                except Exception:
+                    pass
+            # Add hierarchy columns to regions
+            for stmt in [
+                "ALTER TABLE regions ADD COLUMN host_node_id VARCHAR(64)",
+                "ALTER TABLE regions ADD COLUMN capacity_cpu INTEGER",
+                "ALTER TABLE regions ADD COLUMN capacity_ram_gb REAL",
+                "ALTER TABLE regions ADD COLUMN capacity_gpu INTEGER",
+                "ALTER TABLE regions ADD COLUMN current_load_pct REAL DEFAULT 0.0",
+                "ALTER TABLE regions ADD COLUMN is_accepting_nodes BOOLEAN DEFAULT 1",
+                "ALTER TABLE regions ADD COLUMN central_approved BOOLEAN DEFAULT 0",
+            ]:
+                try:
+                    conn.execute(text(stmt))
+                except Exception:
+                    pass
+            conn.commit()
+        set_schema_version(engine, 13)
+
+    if current < 14:
+        logger.info("HevolveSocial: migrating to v14 (Distributed Coding Agent)")
+        from .models import CodingGoal, CodingTask, CodingSubmission
+        for tbl in [CodingGoal.__table__, CodingTask.__table__, CodingSubmission.__table__]:
+            tbl.create(engine, checkfirst=True)
+        with engine.connect() as conn:
+            try:
+                conn.execute(text("ALTER TABLE users ADD COLUMN idle_compute_opt_in BOOLEAN DEFAULT 0"))
+            except Exception:
+                pass
+            conn.commit()
+        set_schema_version(engine, 14)

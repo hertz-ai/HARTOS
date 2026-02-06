@@ -31,7 +31,7 @@ _public_key: Optional[Ed25519PublicKey] = None
 _EXCLUDE_DIRS = {
     '__pycache__', 'venv310', 'venv', '.venv', '.git', '.idea',
     'agent_data', 'tests', 'node_modules', 'hevolve_backend.egg-info',
-    'autogen-0.2.37', '.pycharm_plugin',
+    'autogen-0.2.37', '.pycharm_plugin', 'scripts',
 }
 
 
@@ -177,6 +177,27 @@ def _hash_file(file_path: Path) -> str:
     except (IOError, OSError):
         pass
     return h.hexdigest()
+
+
+def get_node_identity(code_root: str = None) -> dict:
+    """Return consolidated node identity info.
+
+    Returns dict with node_id (public key hex), public_key, tier, certificate,
+    and code_hash. Consolidates identity info for gossip and registration.
+    """
+    from security.key_delegation import get_node_tier, load_node_certificate
+
+    pub_hex = get_public_key_hex()
+    cert = load_node_certificate()
+    code_hash = compute_code_hash(code_root)
+
+    return {
+        'node_id': pub_hex[:16],
+        'public_key': pub_hex,
+        'tier': get_node_tier(),
+        'certificate': cert,
+        'code_hash': code_hash,
+    }
 
 
 def reset_keypair():

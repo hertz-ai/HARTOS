@@ -49,18 +49,30 @@ class IntegrityService:
     @staticmethod
     def verify_code_hash(db: Session, node_id: str,
                          registry_url: str = None) -> Dict:
-        """Check if node's code_hash matches expected hash from registry or self."""
+        """Check if node's code_hash matches expected hash.
+        Priority: master-signed manifest > registry > local computation."""
         peer = db.query(PeerNode).filter_by(node_id=node_id).first()
         if not peer or not peer.code_hash:
             return {'verified': False, 'details': 'No code hash available'}
 
         expected = None
-        if registry_url:
+
+        # Primary: check against master-signed manifest
+        try:
+            from security.master_key import load_release_manifest, verify_release_manifest
+            manifest = load_release_manifest()
+            if manifest and verify_release_manifest(manifest):
+                expected = manifest.get('code_hash', '')
+        except Exception:
+            pass
+
+        # Fallback: registry
+        if not expected and registry_url:
             expected = IntegrityService.fetch_expected_hash(
                 registry_url, peer.code_version or peer.version)
 
         if not expected:
-            # Compare against own code hash as fallback
+            # Last resort: compare against own code hash
             try:
                 from security.node_integrity import compute_code_hash
                 expected = compute_code_hash()
@@ -703,6 +715,15 @@ class IntegrityService:
                 'version': version,
                 'code_hash': compute_code_hash(),
             }
+            # Include release manifest info if available
+            try:
+                from security.master_key import load_release_manifest
+                manifest = load_release_manifest()
+                if manifest:
+                    payload['release_version'] = manifest.get('version', '')
+                    payload['release_manifest_signature'] = manifest.get('master_signature', '')
+            except Exception:
+                pass
             payload['signature'] = sign_json_payload(payload)
             resp = requests.post(
                 f"{registry_url}/api/social/integrity/register-node",
