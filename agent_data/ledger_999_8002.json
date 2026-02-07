@@ -1,7 +1,7 @@
 {
   "agent_id": 999,
   "session_id": 8002,
-  "last_updated": "2025-12-30T21:53:52.859456",
+  "last_updated": "2026-02-06T16:08:08.780395",
   "task_order": [
     "seq_task_1",
     "seq_task_2",
@@ -3593,6 +3593,1167 @@
           "completed_at": "2025-12-30T21:53:52.859456",
           "timestamp": "2025-12-30T21:53:52.859456",
           "received_at": "2025-12-30T21:53:52.859456"
+        }
+      ],
+      "blocked_by": [],
+      "blocked_reason": null,
+      "failure_reason": null,
+      "pending_reason": null,
+      "delegated_to": null,
+      "delegated_at": null,
+      "delegation_type": null,
+      "delegation_result": null,
+      "deferred_at": null,
+      "deferred_until": null,
+      "deferred_reason": null,
+      "scheduled_at": null,
+      "retry_count": 0,
+      "max_retries": 3,
+      "last_retry_at": null,
+      "retry_errors": [],
+      "progress_pct": 0.0,
+      "checkpoints": [],
+      "rolled_back_at": null,
+      "rollback_reason": null,
+      "original_result": null
+    },
+    "seq_task_45": {
+      "task_id": "seq_task_45",
+      "description": "Step 1: Initialize",
+      "task_type": "pre_assigned",
+      "execution_mode": "sequential",
+      "status": "completed",
+      "prerequisites": [],
+      "context": {},
+      "priority": 50,
+      "parent_task_id": null,
+      "created_at": "2026-02-02T01:24:00.183141",
+      "updated_at": "2026-02-02T01:24:00.206729",
+      "completed_at": "2026-02-02T01:24:00.206729",
+      "error_message": null,
+      "result": {
+        "data": "initialized",
+        "status": "success"
+      },
+      "state_history": [
+        {
+          "status": "pending",
+          "timestamp": "2026-02-02T01:24:00.183141",
+          "reason": "Task created"
+        },
+        {
+          "status": "in_progress",
+          "timestamp": "2026-02-02T01:24:00.206729",
+          "reason": "Begin step 1",
+          "previous_status": "pending"
+        }
+      ],
+      "paused_at": null,
+      "resumed_at": null,
+      "pause_count": 0,
+      "stop_reason": null,
+      "termination_reason": null,
+      "child_task_ids": [],
+      "sibling_task_ids": [],
+      "dependent_task_ids": [
+        "seq_task_46"
+      ],
+      "messages_to_dependents": [
+        {
+          "message_type": "result",
+          "data": {
+            "data": "initialized",
+            "status": "success"
+          },
+          "from_task_id": "seq_task_45",
+          "status": "completed",
+          "timestamp": "2026-02-02T01:24:00.206729",
+          "received_at": "2026-02-02T01:24:00.206729"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_45",
+          "completed_at": "2026-02-02T01:24:00.206729",
+          "timestamp": "2026-02-02T01:24:00.206729",
+          "received_at": "2026-02-02T01:24:00.206729"
+        }
+      ],
+      "received_messages": [],
+      "blocked_by": [],
+      "blocked_reason": null,
+      "failure_reason": null,
+      "pending_reason": null,
+      "delegated_to": null,
+      "delegated_at": null,
+      "delegation_type": null,
+      "delegation_result": null,
+      "deferred_at": null,
+      "deferred_until": null,
+      "deferred_reason": null,
+      "scheduled_at": null,
+      "retry_count": 0,
+      "max_retries": 3,
+      "last_retry_at": null,
+      "retry_errors": [],
+      "progress_pct": 0.0,
+      "checkpoints": [],
+      "rolled_back_at": null,
+      "rollback_reason": null,
+      "original_result": null
+    },
+    "seq_task_46": {
+      "task_id": "seq_task_46",
+      "description": "Step 2: Process data",
+      "task_type": "pre_assigned",
+      "execution_mode": "sequential",
+      "status": "completed",
+      "prerequisites": [
+        "seq_task_45"
+      ],
+      "context": {},
+      "priority": 50,
+      "parent_task_id": null,
+      "created_at": "2026-02-02T01:24:00.183141",
+      "updated_at": "2026-02-02T01:24:00.562076",
+      "completed_at": "2026-02-02T01:24:00.562076",
+      "error_message": null,
+      "result": {
+        "processed": 100
+      },
+      "state_history": [
+        {
+          "status": "pending",
+          "timestamp": "2026-02-02T01:24:00.183141",
+          "reason": "Task created"
+        },
+        {
+          "status": "resuming",
+          "timestamp": "2026-02-02T01:24:00.206729",
+          "reason": "Auto-resume: dependency seq_task_45 completed",
+          "previous_status": "blocked"
+        },
+        {
+          "status": "in_progress",
+          "timestamp": "2026-02-02T01:24:00.206729",
+          "reason": "Resumed to active execution",
+          "previous_status": "resuming"
+        }
+      ],
+      "paused_at": null,
+      "resumed_at": "2026-02-02T01:24:00.206729",
+      "pause_count": 0,
+      "stop_reason": null,
+      "termination_reason": null,
+      "child_task_ids": [],
+      "sibling_task_ids": [],
+      "dependent_task_ids": [
+        "seq_task_47"
+      ],
+      "messages_to_dependents": [
+        {
+          "message_type": "result",
+          "data": {
+            "processed": 100
+          },
+          "from_task_id": "seq_task_46",
+          "status": "completed",
+          "timestamp": "2026-02-02T01:24:00.562076",
+          "received_at": "2026-02-02T01:24:00.562076"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_46",
+          "completed_at": "2026-02-02T01:24:00.562076",
+          "timestamp": "2026-02-02T01:24:00.562076",
+          "received_at": "2026-02-02T01:24:00.562076"
+        }
+      ],
+      "received_messages": [
+        {
+          "message_type": "result",
+          "data": {
+            "data": "initialized",
+            "status": "success"
+          },
+          "from_task_id": "seq_task_45",
+          "status": "completed",
+          "timestamp": "2026-02-02T01:24:00.206729",
+          "received_at": "2026-02-02T01:24:00.206729"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_45",
+          "completed_at": "2026-02-02T01:24:00.206729",
+          "timestamp": "2026-02-02T01:24:00.206729",
+          "received_at": "2026-02-02T01:24:00.206729"
+        }
+      ],
+      "blocked_by": [],
+      "blocked_reason": null,
+      "failure_reason": null,
+      "pending_reason": null,
+      "delegated_to": null,
+      "delegated_at": null,
+      "delegation_type": null,
+      "delegation_result": null,
+      "deferred_at": null,
+      "deferred_until": null,
+      "deferred_reason": null,
+      "scheduled_at": null,
+      "retry_count": 0,
+      "max_retries": 3,
+      "last_retry_at": null,
+      "retry_errors": [],
+      "progress_pct": 0.0,
+      "checkpoints": [],
+      "rolled_back_at": null,
+      "rollback_reason": null,
+      "original_result": null
+    },
+    "seq_task_47": {
+      "task_id": "seq_task_47",
+      "description": "Step 3: Generate report",
+      "task_type": "pre_assigned",
+      "execution_mode": "sequential",
+      "status": "completed",
+      "prerequisites": [
+        "seq_task_46"
+      ],
+      "context": {},
+      "priority": 50,
+      "parent_task_id": null,
+      "created_at": "2026-02-02T01:24:00.183141",
+      "updated_at": "2026-02-02T01:24:00.716692",
+      "completed_at": "2026-02-02T01:24:00.716692",
+      "error_message": null,
+      "result": {
+        "report": "generated"
+      },
+      "state_history": [
+        {
+          "status": "pending",
+          "timestamp": "2026-02-02T01:24:00.183141",
+          "reason": "Task created"
+        },
+        {
+          "status": "resuming",
+          "timestamp": "2026-02-02T01:24:00.562076",
+          "reason": "Auto-resume: dependency seq_task_46 completed",
+          "previous_status": "blocked"
+        },
+        {
+          "status": "in_progress",
+          "timestamp": "2026-02-02T01:24:00.562076",
+          "reason": "Resumed to active execution",
+          "previous_status": "resuming"
+        }
+      ],
+      "paused_at": null,
+      "resumed_at": "2026-02-02T01:24:00.562076",
+      "pause_count": 0,
+      "stop_reason": null,
+      "termination_reason": null,
+      "child_task_ids": [],
+      "sibling_task_ids": [],
+      "dependent_task_ids": [
+        "seq_task_48"
+      ],
+      "messages_to_dependents": [
+        {
+          "message_type": "result",
+          "data": {
+            "report": "generated"
+          },
+          "from_task_id": "seq_task_47",
+          "status": "completed",
+          "timestamp": "2026-02-02T01:24:00.716692",
+          "received_at": "2026-02-02T01:24:00.716692"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_47",
+          "completed_at": "2026-02-02T01:24:00.716692",
+          "timestamp": "2026-02-02T01:24:00.716692",
+          "received_at": "2026-02-02T01:24:00.716692"
+        }
+      ],
+      "received_messages": [
+        {
+          "message_type": "result",
+          "data": {
+            "processed": 100
+          },
+          "from_task_id": "seq_task_46",
+          "status": "completed",
+          "timestamp": "2026-02-02T01:24:00.562076",
+          "received_at": "2026-02-02T01:24:00.562076"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_46",
+          "completed_at": "2026-02-02T01:24:00.562076",
+          "timestamp": "2026-02-02T01:24:00.562076",
+          "received_at": "2026-02-02T01:24:00.562076"
+        }
+      ],
+      "blocked_by": [],
+      "blocked_reason": null,
+      "failure_reason": null,
+      "pending_reason": null,
+      "delegated_to": null,
+      "delegated_at": null,
+      "delegation_type": null,
+      "delegation_result": null,
+      "deferred_at": null,
+      "deferred_until": null,
+      "deferred_reason": null,
+      "scheduled_at": null,
+      "retry_count": 0,
+      "max_retries": 3,
+      "last_retry_at": null,
+      "retry_errors": [],
+      "progress_pct": 0.0,
+      "checkpoints": [],
+      "rolled_back_at": null,
+      "rollback_reason": null,
+      "original_result": null
+    },
+    "seq_task_48": {
+      "task_id": "seq_task_48",
+      "description": "Step 4: Send notification",
+      "task_type": "pre_assigned",
+      "execution_mode": "sequential",
+      "status": "in_progress",
+      "prerequisites": [
+        "seq_task_47"
+      ],
+      "context": {},
+      "priority": 50,
+      "parent_task_id": null,
+      "created_at": "2026-02-02T01:24:00.183141",
+      "updated_at": "2026-02-02T01:24:00.716692",
+      "completed_at": null,
+      "error_message": null,
+      "result": null,
+      "state_history": [
+        {
+          "status": "pending",
+          "timestamp": "2026-02-02T01:24:00.183141",
+          "reason": "Task created"
+        },
+        {
+          "status": "resuming",
+          "timestamp": "2026-02-02T01:24:00.716692",
+          "reason": "Auto-resume: dependency seq_task_47 completed",
+          "previous_status": "blocked"
+        },
+        {
+          "status": "in_progress",
+          "timestamp": "2026-02-02T01:24:00.716692",
+          "reason": "Resumed to active execution",
+          "previous_status": "resuming"
+        }
+      ],
+      "paused_at": null,
+      "resumed_at": "2026-02-02T01:24:00.716692",
+      "pause_count": 0,
+      "stop_reason": null,
+      "termination_reason": null,
+      "child_task_ids": [],
+      "sibling_task_ids": [],
+      "dependent_task_ids": [],
+      "messages_to_dependents": [],
+      "received_messages": [
+        {
+          "message_type": "result",
+          "data": {
+            "report": "generated"
+          },
+          "from_task_id": "seq_task_47",
+          "status": "completed",
+          "timestamp": "2026-02-02T01:24:00.716692",
+          "received_at": "2026-02-02T01:24:00.716692"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_47",
+          "completed_at": "2026-02-02T01:24:00.716692",
+          "timestamp": "2026-02-02T01:24:00.716692",
+          "received_at": "2026-02-02T01:24:00.716692"
+        }
+      ],
+      "blocked_by": [],
+      "blocked_reason": null,
+      "failure_reason": null,
+      "pending_reason": null,
+      "delegated_to": null,
+      "delegated_at": null,
+      "delegation_type": null,
+      "delegation_result": null,
+      "deferred_at": null,
+      "deferred_until": null,
+      "deferred_reason": null,
+      "scheduled_at": null,
+      "retry_count": 0,
+      "max_retries": 3,
+      "last_retry_at": null,
+      "retry_errors": [],
+      "progress_pct": 0.0,
+      "checkpoints": [],
+      "rolled_back_at": null,
+      "rollback_reason": null,
+      "original_result": null
+    },
+    "seq_task_49": {
+      "task_id": "seq_task_49",
+      "description": "Step 1: Initialize",
+      "task_type": "pre_assigned",
+      "execution_mode": "sequential",
+      "status": "completed",
+      "prerequisites": [],
+      "context": {},
+      "priority": 50,
+      "parent_task_id": null,
+      "created_at": "2026-02-06T12:33:19.497463",
+      "updated_at": "2026-02-06T12:33:19.507581",
+      "completed_at": "2026-02-06T12:33:19.507581",
+      "error_message": null,
+      "result": {
+        "data": "initialized",
+        "status": "success"
+      },
+      "state_history": [
+        {
+          "status": "pending",
+          "timestamp": "2026-02-06T12:33:19.497463",
+          "reason": "Task created"
+        },
+        {
+          "status": "in_progress",
+          "timestamp": "2026-02-06T12:33:19.507581",
+          "reason": "Begin step 1",
+          "previous_status": "pending"
+        }
+      ],
+      "paused_at": null,
+      "resumed_at": null,
+      "pause_count": 0,
+      "stop_reason": null,
+      "termination_reason": null,
+      "child_task_ids": [],
+      "sibling_task_ids": [],
+      "dependent_task_ids": [
+        "seq_task_50"
+      ],
+      "messages_to_dependents": [
+        {
+          "message_type": "result",
+          "data": {
+            "data": "initialized",
+            "status": "success"
+          },
+          "from_task_id": "seq_task_49",
+          "status": "completed",
+          "timestamp": "2026-02-06T12:33:19.507581",
+          "received_at": "2026-02-06T12:33:19.507581"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_49",
+          "completed_at": "2026-02-06T12:33:19.507581",
+          "timestamp": "2026-02-06T12:33:19.507581",
+          "received_at": "2026-02-06T12:33:19.507581"
+        }
+      ],
+      "received_messages": [],
+      "blocked_by": [],
+      "blocked_reason": null,
+      "failure_reason": null,
+      "pending_reason": null,
+      "delegated_to": null,
+      "delegated_at": null,
+      "delegation_type": null,
+      "delegation_result": null,
+      "deferred_at": null,
+      "deferred_until": null,
+      "deferred_reason": null,
+      "scheduled_at": null,
+      "retry_count": 0,
+      "max_retries": 3,
+      "last_retry_at": null,
+      "retry_errors": [],
+      "progress_pct": 0.0,
+      "checkpoints": [],
+      "rolled_back_at": null,
+      "rollback_reason": null,
+      "original_result": null
+    },
+    "seq_task_50": {
+      "task_id": "seq_task_50",
+      "description": "Step 2: Process data",
+      "task_type": "pre_assigned",
+      "execution_mode": "sequential",
+      "status": "completed",
+      "prerequisites": [
+        "seq_task_49"
+      ],
+      "context": {},
+      "priority": 50,
+      "parent_task_id": null,
+      "created_at": "2026-02-06T12:33:19.497463",
+      "updated_at": "2026-02-06T12:33:19.842165",
+      "completed_at": "2026-02-06T12:33:19.842165",
+      "error_message": null,
+      "result": {
+        "processed": 100
+      },
+      "state_history": [
+        {
+          "status": "pending",
+          "timestamp": "2026-02-06T12:33:19.497463",
+          "reason": "Task created"
+        },
+        {
+          "status": "resuming",
+          "timestamp": "2026-02-06T12:33:19.507581",
+          "reason": "Auto-resume: dependency seq_task_49 completed",
+          "previous_status": "blocked"
+        },
+        {
+          "status": "in_progress",
+          "timestamp": "2026-02-06T12:33:19.507581",
+          "reason": "Resumed to active execution",
+          "previous_status": "resuming"
+        }
+      ],
+      "paused_at": null,
+      "resumed_at": "2026-02-06T12:33:19.507581",
+      "pause_count": 0,
+      "stop_reason": null,
+      "termination_reason": null,
+      "child_task_ids": [],
+      "sibling_task_ids": [],
+      "dependent_task_ids": [
+        "seq_task_51"
+      ],
+      "messages_to_dependents": [
+        {
+          "message_type": "result",
+          "data": {
+            "processed": 100
+          },
+          "from_task_id": "seq_task_50",
+          "status": "completed",
+          "timestamp": "2026-02-06T12:33:19.842165",
+          "received_at": "2026-02-06T12:33:19.842165"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_50",
+          "completed_at": "2026-02-06T12:33:19.842165",
+          "timestamp": "2026-02-06T12:33:19.842165",
+          "received_at": "2026-02-06T12:33:19.842165"
+        }
+      ],
+      "received_messages": [
+        {
+          "message_type": "result",
+          "data": {
+            "data": "initialized",
+            "status": "success"
+          },
+          "from_task_id": "seq_task_49",
+          "status": "completed",
+          "timestamp": "2026-02-06T12:33:19.507581",
+          "received_at": "2026-02-06T12:33:19.507581"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_49",
+          "completed_at": "2026-02-06T12:33:19.507581",
+          "timestamp": "2026-02-06T12:33:19.507581",
+          "received_at": "2026-02-06T12:33:19.507581"
+        }
+      ],
+      "blocked_by": [],
+      "blocked_reason": null,
+      "failure_reason": null,
+      "pending_reason": null,
+      "delegated_to": null,
+      "delegated_at": null,
+      "delegation_type": null,
+      "delegation_result": null,
+      "deferred_at": null,
+      "deferred_until": null,
+      "deferred_reason": null,
+      "scheduled_at": null,
+      "retry_count": 0,
+      "max_retries": 3,
+      "last_retry_at": null,
+      "retry_errors": [],
+      "progress_pct": 0.0,
+      "checkpoints": [],
+      "rolled_back_at": null,
+      "rollback_reason": null,
+      "original_result": null
+    },
+    "seq_task_51": {
+      "task_id": "seq_task_51",
+      "description": "Step 3: Generate report",
+      "task_type": "pre_assigned",
+      "execution_mode": "sequential",
+      "status": "completed",
+      "prerequisites": [
+        "seq_task_50"
+      ],
+      "context": {},
+      "priority": 50,
+      "parent_task_id": null,
+      "created_at": "2026-02-06T12:33:19.497463",
+      "updated_at": "2026-02-06T12:33:19.968676",
+      "completed_at": "2026-02-06T12:33:19.968676",
+      "error_message": null,
+      "result": {
+        "report": "generated"
+      },
+      "state_history": [
+        {
+          "status": "pending",
+          "timestamp": "2026-02-06T12:33:19.497463",
+          "reason": "Task created"
+        },
+        {
+          "status": "resuming",
+          "timestamp": "2026-02-06T12:33:19.842165",
+          "reason": "Auto-resume: dependency seq_task_50 completed",
+          "previous_status": "blocked"
+        },
+        {
+          "status": "in_progress",
+          "timestamp": "2026-02-06T12:33:19.842165",
+          "reason": "Resumed to active execution",
+          "previous_status": "resuming"
+        }
+      ],
+      "paused_at": null,
+      "resumed_at": "2026-02-06T12:33:19.842165",
+      "pause_count": 0,
+      "stop_reason": null,
+      "termination_reason": null,
+      "child_task_ids": [],
+      "sibling_task_ids": [],
+      "dependent_task_ids": [
+        "seq_task_52"
+      ],
+      "messages_to_dependents": [
+        {
+          "message_type": "result",
+          "data": {
+            "report": "generated"
+          },
+          "from_task_id": "seq_task_51",
+          "status": "completed",
+          "timestamp": "2026-02-06T12:33:19.968676",
+          "received_at": "2026-02-06T12:33:19.968676"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_51",
+          "completed_at": "2026-02-06T12:33:19.968676",
+          "timestamp": "2026-02-06T12:33:19.968676",
+          "received_at": "2026-02-06T12:33:19.968676"
+        }
+      ],
+      "received_messages": [
+        {
+          "message_type": "result",
+          "data": {
+            "processed": 100
+          },
+          "from_task_id": "seq_task_50",
+          "status": "completed",
+          "timestamp": "2026-02-06T12:33:19.842165",
+          "received_at": "2026-02-06T12:33:19.842165"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_50",
+          "completed_at": "2026-02-06T12:33:19.842165",
+          "timestamp": "2026-02-06T12:33:19.842165",
+          "received_at": "2026-02-06T12:33:19.842165"
+        }
+      ],
+      "blocked_by": [],
+      "blocked_reason": null,
+      "failure_reason": null,
+      "pending_reason": null,
+      "delegated_to": null,
+      "delegated_at": null,
+      "delegation_type": null,
+      "delegation_result": null,
+      "deferred_at": null,
+      "deferred_until": null,
+      "deferred_reason": null,
+      "scheduled_at": null,
+      "retry_count": 0,
+      "max_retries": 3,
+      "last_retry_at": null,
+      "retry_errors": [],
+      "progress_pct": 0.0,
+      "checkpoints": [],
+      "rolled_back_at": null,
+      "rollback_reason": null,
+      "original_result": null
+    },
+    "seq_task_52": {
+      "task_id": "seq_task_52",
+      "description": "Step 4: Send notification",
+      "task_type": "pre_assigned",
+      "execution_mode": "sequential",
+      "status": "in_progress",
+      "prerequisites": [
+        "seq_task_51"
+      ],
+      "context": {},
+      "priority": 50,
+      "parent_task_id": null,
+      "created_at": "2026-02-06T12:33:19.497463",
+      "updated_at": "2026-02-06T12:33:19.968676",
+      "completed_at": null,
+      "error_message": null,
+      "result": null,
+      "state_history": [
+        {
+          "status": "pending",
+          "timestamp": "2026-02-06T12:33:19.497463",
+          "reason": "Task created"
+        },
+        {
+          "status": "resuming",
+          "timestamp": "2026-02-06T12:33:19.968676",
+          "reason": "Auto-resume: dependency seq_task_51 completed",
+          "previous_status": "blocked"
+        },
+        {
+          "status": "in_progress",
+          "timestamp": "2026-02-06T12:33:19.968676",
+          "reason": "Resumed to active execution",
+          "previous_status": "resuming"
+        }
+      ],
+      "paused_at": null,
+      "resumed_at": "2026-02-06T12:33:19.968676",
+      "pause_count": 0,
+      "stop_reason": null,
+      "termination_reason": null,
+      "child_task_ids": [],
+      "sibling_task_ids": [],
+      "dependent_task_ids": [],
+      "messages_to_dependents": [],
+      "received_messages": [
+        {
+          "message_type": "result",
+          "data": {
+            "report": "generated"
+          },
+          "from_task_id": "seq_task_51",
+          "status": "completed",
+          "timestamp": "2026-02-06T12:33:19.968676",
+          "received_at": "2026-02-06T12:33:19.968676"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_51",
+          "completed_at": "2026-02-06T12:33:19.968676",
+          "timestamp": "2026-02-06T12:33:19.968676",
+          "received_at": "2026-02-06T12:33:19.968676"
+        }
+      ],
+      "blocked_by": [],
+      "blocked_reason": null,
+      "failure_reason": null,
+      "pending_reason": null,
+      "delegated_to": null,
+      "delegated_at": null,
+      "delegation_type": null,
+      "delegation_result": null,
+      "deferred_at": null,
+      "deferred_until": null,
+      "deferred_reason": null,
+      "scheduled_at": null,
+      "retry_count": 0,
+      "max_retries": 3,
+      "last_retry_at": null,
+      "retry_errors": [],
+      "progress_pct": 0.0,
+      "checkpoints": [],
+      "rolled_back_at": null,
+      "rollback_reason": null,
+      "original_result": null
+    },
+    "seq_task_53": {
+      "task_id": "seq_task_53",
+      "description": "Step 1: Initialize",
+      "task_type": "pre_assigned",
+      "execution_mode": "sequential",
+      "status": "completed",
+      "prerequisites": [],
+      "context": {},
+      "priority": 50,
+      "parent_task_id": null,
+      "created_at": "2026-02-06T16:08:08.336378",
+      "updated_at": "2026-02-06T16:08:08.349969",
+      "completed_at": "2026-02-06T16:08:08.349969",
+      "error_message": null,
+      "result": {
+        "data": "initialized",
+        "status": "success"
+      },
+      "state_history": [
+        {
+          "status": "pending",
+          "timestamp": "2026-02-06T16:08:08.336378",
+          "reason": "Task created"
+        },
+        {
+          "status": "in_progress",
+          "timestamp": "2026-02-06T16:08:08.349969",
+          "reason": "Begin step 1",
+          "previous_status": "pending"
+        }
+      ],
+      "paused_at": null,
+      "resumed_at": null,
+      "pause_count": 0,
+      "stop_reason": null,
+      "termination_reason": null,
+      "child_task_ids": [],
+      "sibling_task_ids": [],
+      "dependent_task_ids": [
+        "seq_task_54"
+      ],
+      "messages_to_dependents": [
+        {
+          "message_type": "result",
+          "data": {
+            "data": "initialized",
+            "status": "success"
+          },
+          "from_task_id": "seq_task_53",
+          "status": "completed",
+          "timestamp": "2026-02-06T16:08:08.349969",
+          "received_at": "2026-02-06T16:08:08.349969"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_53",
+          "completed_at": "2026-02-06T16:08:08.349969",
+          "timestamp": "2026-02-06T16:08:08.349969",
+          "received_at": "2026-02-06T16:08:08.349969"
+        }
+      ],
+      "received_messages": [],
+      "blocked_by": [],
+      "blocked_reason": null,
+      "failure_reason": null,
+      "pending_reason": null,
+      "delegated_to": null,
+      "delegated_at": null,
+      "delegation_type": null,
+      "delegation_result": null,
+      "deferred_at": null,
+      "deferred_until": null,
+      "deferred_reason": null,
+      "scheduled_at": null,
+      "retry_count": 0,
+      "max_retries": 3,
+      "last_retry_at": null,
+      "retry_errors": [],
+      "progress_pct": 0.0,
+      "checkpoints": [],
+      "rolled_back_at": null,
+      "rollback_reason": null,
+      "original_result": null
+    },
+    "seq_task_54": {
+      "task_id": "seq_task_54",
+      "description": "Step 2: Process data",
+      "task_type": "pre_assigned",
+      "execution_mode": "sequential",
+      "status": "completed",
+      "prerequisites": [
+        "seq_task_53"
+      ],
+      "context": {},
+      "priority": 50,
+      "parent_task_id": null,
+      "created_at": "2026-02-06T16:08:08.336378",
+      "updated_at": "2026-02-06T16:08:08.668241",
+      "completed_at": "2026-02-06T16:08:08.668241",
+      "error_message": null,
+      "result": {
+        "processed": 100
+      },
+      "state_history": [
+        {
+          "status": "pending",
+          "timestamp": "2026-02-06T16:08:08.336378",
+          "reason": "Task created"
+        },
+        {
+          "status": "resuming",
+          "timestamp": "2026-02-06T16:08:08.349969",
+          "reason": "Auto-resume: dependency seq_task_53 completed",
+          "previous_status": "blocked"
+        },
+        {
+          "status": "in_progress",
+          "timestamp": "2026-02-06T16:08:08.349969",
+          "reason": "Resumed to active execution",
+          "previous_status": "resuming"
+        }
+      ],
+      "paused_at": null,
+      "resumed_at": "2026-02-06T16:08:08.349969",
+      "pause_count": 0,
+      "stop_reason": null,
+      "termination_reason": null,
+      "child_task_ids": [],
+      "sibling_task_ids": [],
+      "dependent_task_ids": [
+        "seq_task_55"
+      ],
+      "messages_to_dependents": [
+        {
+          "message_type": "result",
+          "data": {
+            "processed": 100
+          },
+          "from_task_id": "seq_task_54",
+          "status": "completed",
+          "timestamp": "2026-02-06T16:08:08.668241",
+          "received_at": "2026-02-06T16:08:08.668241"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_54",
+          "completed_at": "2026-02-06T16:08:08.668241",
+          "timestamp": "2026-02-06T16:08:08.668241",
+          "received_at": "2026-02-06T16:08:08.668241"
+        }
+      ],
+      "received_messages": [
+        {
+          "message_type": "result",
+          "data": {
+            "data": "initialized",
+            "status": "success"
+          },
+          "from_task_id": "seq_task_53",
+          "status": "completed",
+          "timestamp": "2026-02-06T16:08:08.349969",
+          "received_at": "2026-02-06T16:08:08.349969"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_53",
+          "completed_at": "2026-02-06T16:08:08.349969",
+          "timestamp": "2026-02-06T16:08:08.349969",
+          "received_at": "2026-02-06T16:08:08.349969"
+        }
+      ],
+      "blocked_by": [],
+      "blocked_reason": null,
+      "failure_reason": null,
+      "pending_reason": null,
+      "delegated_to": null,
+      "delegated_at": null,
+      "delegation_type": null,
+      "delegation_result": null,
+      "deferred_at": null,
+      "deferred_until": null,
+      "deferred_reason": null,
+      "scheduled_at": null,
+      "retry_count": 0,
+      "max_retries": 3,
+      "last_retry_at": null,
+      "retry_errors": [],
+      "progress_pct": 0.0,
+      "checkpoints": [],
+      "rolled_back_at": null,
+      "rollback_reason": null,
+      "original_result": null
+    },
+    "seq_task_55": {
+      "task_id": "seq_task_55",
+      "description": "Step 3: Generate report",
+      "task_type": "pre_assigned",
+      "execution_mode": "sequential",
+      "status": "completed",
+      "prerequisites": [
+        "seq_task_54"
+      ],
+      "context": {},
+      "priority": 50,
+      "parent_task_id": null,
+      "created_at": "2026-02-06T16:08:08.336378",
+      "updated_at": "2026-02-06T16:08:08.780395",
+      "completed_at": "2026-02-06T16:08:08.780395",
+      "error_message": null,
+      "result": {
+        "report": "generated"
+      },
+      "state_history": [
+        {
+          "status": "pending",
+          "timestamp": "2026-02-06T16:08:08.336378",
+          "reason": "Task created"
+        },
+        {
+          "status": "resuming",
+          "timestamp": "2026-02-06T16:08:08.668241",
+          "reason": "Auto-resume: dependency seq_task_54 completed",
+          "previous_status": "blocked"
+        },
+        {
+          "status": "in_progress",
+          "timestamp": "2026-02-06T16:08:08.668241",
+          "reason": "Resumed to active execution",
+          "previous_status": "resuming"
+        }
+      ],
+      "paused_at": null,
+      "resumed_at": "2026-02-06T16:08:08.668241",
+      "pause_count": 0,
+      "stop_reason": null,
+      "termination_reason": null,
+      "child_task_ids": [],
+      "sibling_task_ids": [],
+      "dependent_task_ids": [
+        "seq_task_56"
+      ],
+      "messages_to_dependents": [
+        {
+          "message_type": "result",
+          "data": {
+            "report": "generated"
+          },
+          "from_task_id": "seq_task_55",
+          "status": "completed",
+          "timestamp": "2026-02-06T16:08:08.780395",
+          "received_at": "2026-02-06T16:08:08.780395"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_55",
+          "completed_at": "2026-02-06T16:08:08.780395",
+          "timestamp": "2026-02-06T16:08:08.780395",
+          "received_at": "2026-02-06T16:08:08.780395"
+        }
+      ],
+      "received_messages": [
+        {
+          "message_type": "result",
+          "data": {
+            "processed": 100
+          },
+          "from_task_id": "seq_task_54",
+          "status": "completed",
+          "timestamp": "2026-02-06T16:08:08.668241",
+          "received_at": "2026-02-06T16:08:08.668241"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_54",
+          "completed_at": "2026-02-06T16:08:08.668241",
+          "timestamp": "2026-02-06T16:08:08.668241",
+          "received_at": "2026-02-06T16:08:08.668241"
+        }
+      ],
+      "blocked_by": [],
+      "blocked_reason": null,
+      "failure_reason": null,
+      "pending_reason": null,
+      "delegated_to": null,
+      "delegated_at": null,
+      "delegation_type": null,
+      "delegation_result": null,
+      "deferred_at": null,
+      "deferred_until": null,
+      "deferred_reason": null,
+      "scheduled_at": null,
+      "retry_count": 0,
+      "max_retries": 3,
+      "last_retry_at": null,
+      "retry_errors": [],
+      "progress_pct": 0.0,
+      "checkpoints": [],
+      "rolled_back_at": null,
+      "rollback_reason": null,
+      "original_result": null
+    },
+    "seq_task_56": {
+      "task_id": "seq_task_56",
+      "description": "Step 4: Send notification",
+      "task_type": "pre_assigned",
+      "execution_mode": "sequential",
+      "status": "in_progress",
+      "prerequisites": [
+        "seq_task_55"
+      ],
+      "context": {},
+      "priority": 50,
+      "parent_task_id": null,
+      "created_at": "2026-02-06T16:08:08.336378",
+      "updated_at": "2026-02-06T16:08:08.780395",
+      "completed_at": null,
+      "error_message": null,
+      "result": null,
+      "state_history": [
+        {
+          "status": "pending",
+          "timestamp": "2026-02-06T16:08:08.336378",
+          "reason": "Task created"
+        },
+        {
+          "status": "resuming",
+          "timestamp": "2026-02-06T16:08:08.780395",
+          "reason": "Auto-resume: dependency seq_task_55 completed",
+          "previous_status": "blocked"
+        },
+        {
+          "status": "in_progress",
+          "timestamp": "2026-02-06T16:08:08.780395",
+          "reason": "Resumed to active execution",
+          "previous_status": "resuming"
+        }
+      ],
+      "paused_at": null,
+      "resumed_at": "2026-02-06T16:08:08.780395",
+      "pause_count": 0,
+      "stop_reason": null,
+      "termination_reason": null,
+      "child_task_ids": [],
+      "sibling_task_ids": [],
+      "dependent_task_ids": [],
+      "messages_to_dependents": [],
+      "received_messages": [
+        {
+          "message_type": "result",
+          "data": {
+            "report": "generated"
+          },
+          "from_task_id": "seq_task_55",
+          "status": "completed",
+          "timestamp": "2026-02-06T16:08:08.780395",
+          "received_at": "2026-02-06T16:08:08.780395"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_55",
+          "completed_at": "2026-02-06T16:08:08.780395",
+          "timestamp": "2026-02-06T16:08:08.780395",
+          "received_at": "2026-02-06T16:08:08.780395"
         }
       ],
       "blocked_by": [],

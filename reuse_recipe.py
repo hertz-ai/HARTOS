@@ -1082,6 +1082,12 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         15. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
 
 
+        16. **Agent Creation**: If the user asks to create, build, or set up a new AI agent, assistant, or bot,
+            OR if you determine that the current task requires capabilities beyond your scope and a specialized
+            agent would be needed, ask @Helper to use the `create_new_agent` tool with a description of what
+            the new agent should do. If the user wants it done autonomously (e.g., "automatically", "do it for me"),
+            include "autonomous" in the description.
+
         Actions: <actionsStart>{role_actions}<actionEnd>
         Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{individual_recipe}<generalized_functionsEnd><recipeEnd>
         When writing code, always print the final response just before returning it.
@@ -2044,6 +2050,31 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     def google_search(text: Annotated[str, "Text which you want to search"]) -> str:
         current_app.logger.info('INSIDE google search')
         return helper_fun.top5_results(text)
+
+    @assistant.register_for_execution()
+    @helper.register_for_llm(api_style="function",
+                             description="Signal that the user's request requires creating a new specialized AI agent. "
+                                         "Use this when the user asks to create, build, set up, or deploy a new agent, "
+                                         "or when the current agent's capabilities are insufficient for the task. "
+                                         "Input should describe what the new agent should do. "
+                                         "If the user wants autonomous creation, include 'autonomous' in the description.")
+    def create_new_agent(description: Annotated[str, "Description of the agent to create"]) -> str:
+        """Signal that a new agent needs to be created. Sets a thread-local flag
+        that the /chat handler checks after chat_agent() returns."""
+        current_app.logger.info(f'AUTOGEN create_new_agent tool called: {description}')
+        lower = description.lower()
+        autonomous = any(w in lower for w in [
+            'autonomous', 'automatic', 'automatically', 'do it for me',
+            'handle it', 'just create', 'auto',
+        ])
+        # Store in a module-level dict keyed by user_prompt so /chat can check it
+        creation_signals[user_prompt] = {
+            'description': description,
+            'autonomous': autonomous,
+        }
+        if autonomous:
+            return f"New agent creation initiated autonomously for: {description}. The system will handle all details automatically."
+        return f"New agent creation initiated for: {description}. The system will guide through the creation process."
 
     time_agent = autogen.AssistantAgent(
         name='time_agent',
@@ -3114,6 +3145,10 @@ request_id_list_sent_intermediate = {}
 
 time_actions = {}
 final_recipe = {}
+
+# Signals from autogen agents that a new agent creation is needed
+# Keyed by user_prompt (f'{user_id}_{prompt_id}'), set by create_new_agent tool
+creation_signals = {}
 
 
 # =============================================================================

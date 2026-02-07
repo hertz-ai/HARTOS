@@ -62,8 +62,30 @@ class ThreadLocalData:
         self._local.prompt_id = prompt_id
 
     def get_prompt_id(self):
-        return getattr(self._local, 'prompt_id', None) 
-        
+        return getattr(self._local, 'prompt_id', None)
+
+    # --- Agent creation signals (set by LangChain Create_Agent tool) ---
+
+    def set_creation_requested(self, description=None, autonomous=False):
+        """Signal that the LLM decided the user wants to create an agent."""
+        self._local.creation_requested = True
+        self._local.creation_description = description
+        self._local.creation_autonomous = autonomous
+
+    def get_creation_requested(self):
+        return getattr(self._local, 'creation_requested', False)
+
+    def get_creation_description(self):
+        return getattr(self._local, 'creation_description', None)
+
+    def get_creation_autonomous(self):
+        return getattr(self._local, 'creation_autonomous', False)
+
+    def clear_creation_flags(self):
+        self._local.creation_requested = False
+        self._local.creation_description = None
+        self._local.creation_autonomous = False
+
 
 thread_local_data = ThreadLocalData()
 
