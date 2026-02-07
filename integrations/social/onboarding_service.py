@@ -94,7 +94,7 @@ class OnboardingService:
             'first_comment': 'first_comment_at',
             'first_vote': 'first_vote_at',
             'first_follow': 'first_follow_at',
-            'join_community': 'first_submolt_join_at',
+            'join_community': 'first_community_join_at',
         }
         attr = timestamp_map.get(step_key)
         if attr and hasattr(progress, attr) and not getattr(progress, attr):
@@ -175,7 +175,7 @@ class OnboardingService:
         Called by service hooks after relevant actions."""
         action_to_step = {
             'follow': 'first_follow',
-            'join_submolt': 'join_community',
+            'join_community': 'join_community',
             'vote': 'first_vote',
             'comment': 'first_comment',
             'post': 'first_post',

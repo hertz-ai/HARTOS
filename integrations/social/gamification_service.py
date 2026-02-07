@@ -104,8 +104,8 @@ SEED_ACHIEVEMENTS = [
      'criteria_json': json.dumps({'type': 'level', 'threshold': 50})},
 
     # Community
-    {'slug': 'community_creator', 'name': 'Community Builder', 'description': 'Create a submolt', 'category': 'community', 'rarity': 'uncommon', 'pulse_reward': 50, 'spark_reward': 50, 'xp_reward': 75,
-     'criteria_json': json.dumps({'type': 'submolt_created', 'threshold': 1})},
+    {'slug': 'community_creator', 'name': 'Community Builder', 'description': 'Create a community', 'category': 'community', 'rarity': 'uncommon', 'pulse_reward': 50, 'spark_reward': 50, 'xp_reward': 75,
+     'criteria_json': json.dumps({'type': 'community_created', 'threshold': 1})},
     {'slug': 'region_pioneer', 'name': 'Regional Pioneer', 'description': 'Join a region', 'category': 'community', 'rarity': 'common', 'pulse_reward': 15, 'xp_reward': 20,
      'criteria_json': json.dumps({'type': 'region_joined', 'threshold': 1})},
     {'slug': 'governor', 'name': 'Governor', 'description': 'Become a region moderator', 'category': 'community', 'rarity': 'rare', 'pulse_reward': 100, 'spark_reward': 100, 'xp_reward': 150,

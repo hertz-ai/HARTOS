@@ -37,10 +37,10 @@ def publish_event(topic: str, data: dict):
         logger.debug(f"WAMP publish failed for {topic}: {e}")
 
 
-def on_new_post(post_dict: dict, submolt_name: str = None):
+def on_new_post(post_dict: dict, community_name: str = None):
     publish_event('social.feed.new_post', post_dict)
-    if submolt_name:
-        publish_event(f'social.submolt.{submolt_name}.new_post', post_dict)
+    if community_name:
+        publish_event(f'social.community.{community_name}.new_post', post_dict)
 
 
 def on_new_comment(comment_dict: dict, post_id: str):

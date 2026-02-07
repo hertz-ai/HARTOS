@@ -47,7 +47,7 @@ class FeedGenerator:
         self.base_url = base_url or FEED_CONFIG['link']
 
     def _get_posts(self, feed_type: str = 'global', limit: int = 50,
-                   user_id: int = None, submolt_id: int = None) -> List[Dict]:
+                   user_id: int = None, community_id: int = None) -> List[Dict]:
         """
         Fetch posts for feed generation.
 
@@ -55,18 +55,18 @@ class FeedGenerator:
             feed_type: 'global', 'trending', 'personalized', 'agents'
             limit: Maximum number of posts
             user_id: User ID for personalized/user feeds
-            submolt_id: Submolt ID for community feeds
+            community_id: Community ID for community feeds
         """
         try:
             from .feed_engine import FeedEngine
-            from .models import Post, User, Submolt
+            from .models import Post, User, Community
 
             engine = FeedEngine(self.db)
 
-            if submolt_id:
-                # Submolt-specific feed
+            if community_id:
+                # Community-specific feed
                 posts = self.db.query(Post).filter(
-                    Post.submolt_id == submolt_id,
+                    Post.community_id == community_id,
                     Post.deleted_at.is_(None)
                 ).order_by(Post.created_at.desc()).limit(limit).all()
             elif user_id and feed_type == 'personalized':
@@ -119,7 +119,7 @@ class FeedGenerator:
         return f"{self.base_url}/social/u/{author_id}"
 
     def generate_rss(self, feed_type: str = 'global', limit: int = 50,
-                     user_id: int = None, submolt_id: int = None,
+                     user_id: int = None, community_id: int = None,
                      title: str = None) -> str:
         """
         Generate RSS 2.0 feed.
@@ -128,13 +128,13 @@ class FeedGenerator:
             feed_type: Type of feed ('global', 'trending', 'personalized', 'agents')
             limit: Maximum number of items
             user_id: User ID for personalized feeds
-            submolt_id: Submolt ID for community feeds
+            community_id: Community ID for community feeds
             title: Custom feed title
 
         Returns:
             RSS 2.0 XML string
         """
-        posts = self._get_posts(feed_type, limit, user_id, submolt_id)
+        posts = self._get_posts(feed_type, limit, user_id, community_id)
 
         # Build RSS structure
         rss = ET.Element('rss', version='2.0')
@@ -203,17 +203,17 @@ class FeedGenerator:
             for tag in tags:
                 ET.SubElement(item, 'category').text = tag
 
-            # Submolt as category
-            submolt = post.get('submolt')
-            if submolt:
-                submolt_name = submolt.get('name') if isinstance(submolt, dict) else str(submolt)
-                ET.SubElement(item, 'category').text = f"s/{submolt_name}"
+            # Community as category
+            community = post.get('community')
+            if community:
+                community_name = community.get('name') if isinstance(community, dict) else str(community)
+                ET.SubElement(item, 'category').text = f"s/{community_name}"
 
         # Generate XML string
         return ET.tostring(rss, encoding='unicode', xml_declaration=True)
 
     def generate_atom(self, feed_type: str = 'global', limit: int = 50,
-                      user_id: int = None, submolt_id: int = None,
+                      user_id: int = None, community_id: int = None,
                       title: str = None) -> str:
         """
         Generate Atom 1.0 feed.
@@ -222,13 +222,13 @@ class FeedGenerator:
             feed_type: Type of feed
             limit: Maximum number of entries
             user_id: User ID for personalized feeds
-            submolt_id: Submolt ID for community feeds
+            community_id: Community ID for community feeds
             title: Custom feed title
 
         Returns:
             Atom 1.0 XML string
         """
-        posts = self._get_posts(feed_type, limit, user_id, submolt_id)
+        posts = self._get_posts(feed_type, limit, user_id, community_id)
 
         # Atom namespace
         ATOM_NS = 'http://www.w3.org/2005/Atom'
@@ -329,7 +329,7 @@ class FeedGenerator:
         return ET.tostring(feed, encoding='unicode', xml_declaration=True)
 
     def generate_json_feed(self, feed_type: str = 'global', limit: int = 50,
-                           user_id: int = None, submolt_id: int = None,
+                           user_id: int = None, community_id: int = None,
                            title: str = None) -> str:
         """
         Generate JSON Feed 1.1.
@@ -338,13 +338,13 @@ class FeedGenerator:
             feed_type: Type of feed
             limit: Maximum number of items
             user_id: User ID for personalized feeds
-            submolt_id: Submolt ID for community feeds
+            community_id: Community ID for community feeds
             title: Custom feed title
 
         Returns:
             JSON Feed string
         """
-        posts = self._get_posts(feed_type, limit, user_id, submolt_id)
+        posts = self._get_posts(feed_type, limit, user_id, community_id)
 
         feed_title = title or f"{FEED_CONFIG['title']} - {feed_type.title()} Feed"
 
@@ -460,24 +460,24 @@ def get_user_feed_rss(db, user_id: int, limit: int = 50) -> str:
         return generator.generate_rss(feed_type='global', limit=0)
 
 
-def get_submolt_feed_rss(db, submolt_id: int, limit: int = 50) -> str:
-    """Generate RSS feed for a specific submolt."""
+def get_community_feed_rss(db, community_id: int, limit: int = 50) -> str:
+    """Generate RSS feed for a specific community."""
     generator = FeedGenerator(db)
 
     try:
-        from .models import Submolt
-        submolt = db.query(Submolt).filter(Submolt.id == submolt_id).first()
-        if not submolt:
+        from .models import Community
+        community = db.query(Community).filter(Community.id == community_id).first()
+        if not community:
             return generator.generate_rss(feed_type='global', limit=0)
 
-        title = f"s/{submolt.name} - Hevolve"
+        title = f"s/{community.name} - Hevolve"
         return generator.generate_rss(
-            feed_type='submolt',
-            submolt_id=submolt_id,
+            feed_type='community',
+            community_id=community_id,
             limit=limit,
             title=title
         )
 
     except Exception as e:
-        logger.error(f"Error generating submolt feed: {e}")
+        logger.error(f"Error generating community feed: {e}")
         return generator.generate_rss(feed_type='global', limit=0)

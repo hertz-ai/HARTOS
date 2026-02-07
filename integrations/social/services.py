@@ -1,6 +1,6 @@
 """
 HevolveSocial - Service Layer
-All business logic for posts, comments, votes, users, submolts, follows, notifications.
+All business logic for posts, comments, votes, users, communities, follows, notifications.
 """
 import uuid
 from datetime import datetime, timedelta
@@ -10,7 +10,7 @@ from sqlalchemy import desc, asc, func
 from sqlalchemy.orm import Session, joinedload
 
 from .models import (
-    User, Post, Comment, Vote, Follow, Submolt, SubmoltMembership,
+    User, Post, Comment, Vote, Follow, Community, CommunityMembership,
     Notification, Report, TaskRequest, RecipeShare, AgentSkillBadge
 )
 from .auth import hash_password, verify_password, generate_api_token, generate_jwt
@@ -200,19 +200,19 @@ class PostService:
 
     @staticmethod
     def create(db: Session, author: User, title: str, content: str = '',
-               content_type: str = 'text', submolt_name: str = None,
+               content_type: str = 'text', community_name: str = None,
                code_language: str = None, media_urls: list = None,
                link_url: str = None, source_channel: str = None,
                source_message_id: str = None) -> Post:
-        submolt_id = None
-        if submolt_name:
-            submolt = db.query(Submolt).filter(Submolt.name == submolt_name).first()
-            if submolt:
-                submolt_id = submolt.id
-                submolt.post_count += 1
+        community_id = None
+        if community_name:
+            community = db.query(Community).filter(Community.name == community_name).first()
+            if community:
+                community_id = community.id
+                community.post_count += 1
 
         post = Post(
-            id=_uuid(), author_id=author.id, submolt_id=submolt_id,
+            id=_uuid(), author_id=author.id, community_id=community_id,
             title=title, content=content, content_type=content_type,
             code_language=code_language, media_urls=media_urls or [],
             link_url=link_url, source_channel=source_channel,
@@ -250,14 +250,14 @@ class PostService:
         ).filter(Post.id == post_id, Post.is_deleted == False).first()
 
     @staticmethod
-    def list_posts(db: Session, sort: str = 'new', submolt_name: str = None,
+    def list_posts(db: Session, sort: str = 'new', community_name: str = None,
                    author_id: str = None, limit: int = 25, offset: int = 0
                    ) -> Tuple[List[Post], int]:
         q = db.query(Post).options(joinedload(Post.author)).filter(Post.is_deleted == False)
-        if submolt_name:
-            submolt = db.query(Submolt).filter(Submolt.name == submolt_name).first()
-            if submolt:
-                q = q.filter(Post.submolt_id == submolt.id)
+        if community_name:
+            community = db.query(Community).filter(Community.name == community_name).first()
+            if community:
+                q = q.filter(Post.community_id == community.id)
         if author_id:
             q = q.filter(Post.author_id == author_id)
 
@@ -562,83 +562,83 @@ class FollowService:
         ).first() is not None
 
 
-# ─── Submolt Service ───
+# ─── Community Service ───
 
-class SubmoltService:
+class CommunityService:
 
     @staticmethod
     def create(db: Session, creator: User, name: str, display_name: str = '',
-               description: str = '', rules: str = '', is_private: bool = False) -> Submolt:
-        if db.query(Submolt).filter(Submolt.name == name).first():
+               description: str = '', rules: str = '', is_private: bool = False) -> Community:
+        if db.query(Community).filter(Community.name == name).first():
             raise ValueError(f"Community '{name}' already exists")
 
-        submolt = Submolt(
+        community = Community(
             id=_uuid(), name=name, display_name=display_name or name,
             description=description, rules=rules, creator_id=creator.id,
             is_private=is_private, member_count=1,
         )
-        db.add(submolt)
+        db.add(community)
         db.flush()
         # Auto-join creator as admin
-        membership = SubmoltMembership(
-            id=_uuid(), user_id=creator.id, submolt_id=submolt.id, role='admin')
+        membership = CommunityMembership(
+            id=_uuid(), user_id=creator.id, community_id=community.id, role='admin')
         db.add(membership)
         db.flush()
-        return submolt
+        return community
 
     @staticmethod
-    def get_by_name(db: Session, name: str) -> Optional[Submolt]:
-        return db.query(Submolt).filter(Submolt.name == name).first()
+    def get_by_name(db: Session, name: str) -> Optional[Community]:
+        return db.query(Community).filter(Community.name == name).first()
 
     @staticmethod
-    def list_submolts(db: Session, limit: int = 50, offset: int = 0
-                      ) -> Tuple[List[Submolt], int]:
-        q = db.query(Submolt).order_by(desc(Submolt.member_count))
+    def list_communities(db: Session, limit: int = 50, offset: int = 0
+                         ) -> Tuple[List[Community], int]:
+        q = db.query(Community).order_by(desc(Community.member_count))
         total = q.count()
-        submolts = q.offset(offset).limit(limit).all()
-        return submolts, total
+        communities = q.offset(offset).limit(limit).all()
+        return communities, total
 
     @staticmethod
-    def join(db: Session, user: User, submolt: Submolt) -> bool:
-        existing = db.query(SubmoltMembership).filter(
-            SubmoltMembership.user_id == user.id,
-            SubmoltMembership.submolt_id == submolt.id
+    def join(db: Session, user: User, community: Community) -> bool:
+        existing = db.query(CommunityMembership).filter(
+            CommunityMembership.user_id == user.id,
+            CommunityMembership.community_id == community.id
         ).first()
         if existing:
             return False
-        membership = SubmoltMembership(
-            id=_uuid(), user_id=user.id, submolt_id=submolt.id)
+        membership = CommunityMembership(
+            id=_uuid(), user_id=user.id, community_id=community.id)
         db.add(membership)
-        submolt.member_count += 1
+        community.member_count += 1
         db.flush()
         return True
 
     @staticmethod
-    def leave(db: Session, user: User, submolt: Submolt):
-        existing = db.query(SubmoltMembership).filter(
-            SubmoltMembership.user_id == user.id,
-            SubmoltMembership.submolt_id == submolt.id
+    def leave(db: Session, user: User, community: Community):
+        existing = db.query(CommunityMembership).filter(
+            CommunityMembership.user_id == user.id,
+            CommunityMembership.community_id == community.id
         ).first()
         if existing:
             db.delete(existing)
-            submolt.member_count = max(0, submolt.member_count - 1)
+            community.member_count = max(0, community.member_count - 1)
             db.flush()
 
     @staticmethod
-    def get_members(db: Session, submolt_id: str, limit: int = 50, offset: int = 0
+    def get_members(db: Session, community_id: str, limit: int = 50, offset: int = 0
                     ) -> Tuple[List[dict], int]:
-        q = db.query(SubmoltMembership, User).join(
-            User, SubmoltMembership.user_id == User.id
-        ).filter(SubmoltMembership.submolt_id == submolt_id)
+        q = db.query(CommunityMembership, User).join(
+            User, CommunityMembership.user_id == User.id
+        ).filter(CommunityMembership.community_id == community_id)
         total = q.count()
         results = q.offset(offset).limit(limit).all()
         return [{'user': u.to_dict(), 'role': m.role} for m, u in results], total
 
     @staticmethod
-    def get_user_role(db: Session, user_id: str, submolt_id: str) -> Optional[str]:
-        m = db.query(SubmoltMembership).filter(
-            SubmoltMembership.user_id == user_id,
-            SubmoltMembership.submolt_id == submolt_id
+    def get_user_role(db: Session, user_id: str, community_id: str) -> Optional[str]:
+        m = db.query(CommunityMembership).filter(
+            CommunityMembership.user_id == user_id,
+            CommunityMembership.community_id == community_id
         ).first()
         return m.role if m else None
 

@@ -335,14 +335,14 @@ class FeedImporter:
             raise
 
     def import_items(self, items: List[FeedItem], user_id: int,
-                     submolt_id: int = None, auto_tag: bool = True) -> List[int]:
+                     community_id: int = None, auto_tag: bool = True) -> List[int]:
         """
         Import feed items as social posts.
 
         Args:
             items: List of FeedItem objects
             user_id: User ID to attribute posts to
-            submolt_id: Optional submolt to post to
+            community_id: Optional community to post to
             auto_tag: Whether to auto-generate tags
 
         Returns:
@@ -392,7 +392,7 @@ class FeedImporter:
                         content=content,
                         tags=tags[:10],  # Limit tags
                         media_urls=item.media_urls[:5],  # Limit media
-                        submolt_id=submolt_id,
+                        community_id=community_id,
                         post_type='link' if item.link else 'text'
                     )
                     self.db.commit()
@@ -417,14 +417,14 @@ class FeedSubscriptionService:
         self.importer = FeedImporter(db_session)
 
     def subscribe(self, user_id: int, feed_url: str,
-                  submolt_id: int = None, auto_import: bool = True) -> Dict[str, Any]:
+                  community_id: int = None, auto_import: bool = True) -> Dict[str, Any]:
         """
         Subscribe a user to a feed.
 
         Args:
             user_id: User ID
             feed_url: Feed URL to subscribe to
-            submolt_id: Optional submolt to post imported items to
+            community_id: Optional community to post imported items to
             auto_import: Whether to automatically import new items
 
         Returns:
@@ -440,7 +440,7 @@ class FeedSubscriptionService:
                 'user_id': user_id,
                 'feed_url': feed_url,
                 'feed_title': metadata.title,
-                'submolt_id': submolt_id,
+                'community_id': community_id,
                 'auto_import': auto_import,
                 'etag': metadata.etag,
                 'last_modified': metadata.last_modified,
@@ -506,7 +506,7 @@ class FeedSubscriptionService:
         created_ids = self.importer.import_items(
             items,
             user_id=subscription['user_id'],
-            submolt_id=subscription.get('submolt_id')
+            community_id=subscription.get('community_id')
         )
 
         return len(created_ids)

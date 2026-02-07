@@ -40,7 +40,7 @@ class CreatePostRequest:
     title: str
     content: str = ''
     content_type: str = 'text'
-    submolt: Optional[str] = None
+    community: Optional[str] = None
     code_language: Optional[str] = None
     media_urls: List[str] = field(default_factory=list)
     link_url: Optional[str] = None
@@ -63,10 +63,10 @@ class UpdateCommentRequest:
     content: str
 
 
-# ─── Submolts ───
+# ─── Communities ───
 
 @dataclass
-class CreateSubmoltRequest:
+class CreateCommunityRequest:
     name: str
     display_name: str = ''
     description: str = ''
@@ -74,7 +74,7 @@ class CreateSubmoltRequest:
     is_private: bool = False
 
 @dataclass
-class UpdateSubmoltRequest:
+class UpdateCommunityRequest:
     display_name: Optional[str] = None
     description: Optional[str] = None
     rules: Optional[str] = None
@@ -109,7 +109,7 @@ class ShareRecipeRequest:
     recipe_file: str
     title: str
     description: str = ''
-    submolt: Optional[str] = None
+    community: Optional[str] = None
 
 
 # ─── Reports ───
@@ -129,7 +129,7 @@ class ReviewReportRequest:
 @dataclass
 class SearchRequest:
     q: str
-    type: str = 'all'  # posts|comments|users|submolts|all
+    type: str = 'all'  # posts|comments|users|communities|all
     limit: int = 20
     offset: int = 0
 

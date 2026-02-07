@@ -142,10 +142,10 @@ class User(Base):
         return d
 
 
-# ─── TABLE 2: submolts ───
+# ─── TABLE 2: communities ───
 
-class Submolt(Base):
-    __tablename__ = 'submolts'
+class Community(Base):
+    __tablename__ = 'communities'
 
     id = Column(String(64), primary_key=True, default=_uuid)
     name = Column(String(50), unique=True, nullable=False, index=True)
@@ -162,8 +162,8 @@ class Submolt(Base):
     created_at = Column(DateTime, default=func.now())
 
     creator = relationship('User', foreign_keys=[creator_id])
-    posts = relationship('Post', back_populates='submolt', lazy='dynamic')
-    memberships = relationship('SubmoltMembership', back_populates='submolt', lazy='dynamic')
+    posts = relationship('Post', back_populates='community', lazy='dynamic')
+    memberships = relationship('CommunityMembership', back_populates='community', lazy='dynamic')
 
     def to_dict(self):
         return {
@@ -186,7 +186,7 @@ class Post(Base):
 
     id = Column(String(64), primary_key=True, default=_uuid)
     author_id = Column(String(64), ForeignKey('users.id'), nullable=False, index=True)
-    submolt_id = Column(String(64), ForeignKey('submolts.id'), nullable=True, index=True)
+    community_id = Column(String(64), ForeignKey('communities.id'), nullable=True, index=True)
     title = Column(String(300), nullable=False)
     content = Column(Text, default='')
     content_type = Column(String(20), default='text')  # text|code|recipe|media|task_request
@@ -202,6 +202,7 @@ class Post(Base):
     is_pinned = Column(Boolean, default=False)
     is_locked = Column(Boolean, default=False)
     is_deleted = Column(Boolean, default=False)
+    is_hidden = Column(Boolean, default=False)
     embedding_id = Column(String(64), nullable=True)
     source_channel = Column(String(50), nullable=True)
     source_message_id = Column(String(200), nullable=True)
@@ -211,7 +212,7 @@ class Post(Base):
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
     author = relationship('User', back_populates='posts')
-    submolt = relationship('Submolt', back_populates='posts')
+    community = relationship('Community', back_populates='posts')
     comments = relationship('Comment', back_populates='post', lazy='dynamic')
 
     __table_args__ = (
@@ -221,7 +222,7 @@ class Post(Base):
     def to_dict(self, include_author=False):
         d = {
             'id': self.id, 'author_id': self.author_id,
-            'submolt_id': self.submolt_id,
+            'community_id': self.community_id,
             'title': _sanitize_html(self.title) if self.title else self.title,
             'content': _sanitize_html(self.content) if self.content else self.content,
             'content_type': self.content_type,
@@ -255,6 +256,7 @@ class Comment(Base):
     score = Column(Integer, default=0)
     depth = Column(Integer, default=0)
     is_deleted = Column(Boolean, default=False)
+    is_hidden = Column(Boolean, default=False)
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
@@ -314,22 +316,22 @@ class Follow(Base):
     )
 
 
-# ─── TABLE 7: submolt_memberships ───
+# ─── TABLE 7: community_memberships ───
 
-class SubmoltMembership(Base):
-    __tablename__ = 'submolt_memberships'
+class CommunityMembership(Base):
+    __tablename__ = 'community_memberships'
 
     id = Column(String(64), primary_key=True, default=_uuid)
     user_id = Column(String(64), ForeignKey('users.id'), nullable=False)
-    submolt_id = Column(String(64), ForeignKey('submolts.id'), nullable=False)
+    community_id = Column(String(64), ForeignKey('communities.id'), nullable=False)
     role = Column(String(20), default='member')  # member|moderator|admin
     created_at = Column(DateTime, default=func.now())
 
     user = relationship('User')
-    submolt = relationship('Submolt', back_populates='memberships')
+    community = relationship('Community', back_populates='memberships')
 
     __table_args__ = (
-        UniqueConstraint('user_id', 'submolt_id', name='uq_submolt_member'),
+        UniqueConstraint('user_id', 'community_id', name='uq_community_member'),
     )
 
 
@@ -936,7 +938,7 @@ class Encounter(Base):
     id = Column(String(64), primary_key=True, default=_uuid)
     user_a_id = Column(String(64), ForeignKey('users.id'), nullable=False, index=True)
     user_b_id = Column(String(64), ForeignKey('users.id'), nullable=False, index=True)
-    context_type = Column(String(20), nullable=False)  # submolt|post|region|challenge|task
+    context_type = Column(String(20), nullable=False)  # community|post|region|challenge|task
     context_id = Column(String(64), nullable=True)
     location_label = Column(String(200), default='')
     encounter_count = Column(Integer, default=1)
@@ -1184,7 +1186,7 @@ class OnboardingProgress(Base):
     first_comment_at = Column(DateTime, nullable=True)
     first_vote_at = Column(DateTime, nullable=True)
     first_follow_at = Column(DateTime, nullable=True)
-    first_submolt_join_at = Column(DateTime, nullable=True)
+    first_community_join_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
     tutorial_dismissed = Column(Boolean, default=False)
     created_at = Column(DateTime, default=func.now())
@@ -1217,7 +1219,7 @@ class Campaign(Base):
     status = Column(String(20), default='draft')  # draft|active|paused|completed
     strategy_json = Column(JSON, default=dict)
     target_regions = Column(JSON, default=list)
-    target_submolts = Column(JSON, default=list)
+    target_communities = Column(JSON, default=list)
     total_spark_budget = Column(Integer, default=0)
     spark_spent = Column(Integer, default=0)
     impressions = Column(Integer, default=0)
@@ -1243,7 +1245,7 @@ class Campaign(Base):
             'status': self.status,
             'strategy': self.strategy_json,
             'target_regions': self.target_regions or [],
-            'target_submolts': self.target_submolts or [],
+            'target_communities': self.target_communities or [],
             'total_spark_budget': self.total_spark_budget,
             'spark_spent': self.spark_spent,
             'impressions': self.impressions,
@@ -1442,7 +1444,7 @@ class AdUnit(Base):
     image_url = Column(String(500), default='')
     click_url = Column(String(1000), nullable=False)
     ad_type = Column(String(20), default='banner')  # banner|native|sidebar|interstitial
-    targeting_json = Column(JSON, default=dict)  # {region_ids:[], submolt_ids:[], user_types:[]}
+    targeting_json = Column(JSON, default=dict)  # {region_ids:[], community_ids:[], user_types:[]}
     budget_spark = Column(Integer, default=0)
     spent_spark = Column(Integer, default=0)
     cost_per_impression = Column(Float, default=0.1)

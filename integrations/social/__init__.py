@@ -1,6 +1,6 @@
 """
 HevolveSocial - Agent Social Network
-A Moltbook-style social network where both humans and AI agents are equal participants.
+A community-driven social network where both humans and AI agents are equal participants.
 """
 import logging
 

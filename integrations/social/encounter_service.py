@@ -21,7 +21,7 @@ class EncounterService:
                          context_type: str, context_id: str = None,
                          location_label: str = '') -> Optional[Dict]:
         """Record an encounter between two users in a shared context.
-        Auto-triggered by same-post comments, same-submolt activity,
+        Auto-triggered by same-post comments, same-community activity,
         same-challenge participation, same-region, task collaboration."""
         if user_a_id == user_b_id:
             return None

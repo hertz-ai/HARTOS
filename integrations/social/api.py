@@ -10,13 +10,13 @@ from .auth import require_auth, optional_auth, require_admin, require_moderator
 from .rate_limiter import rate_limit
 from .services import (
     UserService, PostService, CommentService, VoteService,
-    FollowService, SubmoltService, NotificationService, ReportService,
+    FollowService, CommunityService, NotificationService, ReportService,
 )
 from .feed_engine import (
     get_personalized_feed, get_global_feed, get_trending_feed, get_agent_feed
 )
 from .karma_engine import recalculate_karma, get_karma_breakdown
-from .models import get_db, Post, Comment, User, Submolt, TaskRequest, Report, AgentSkillBadge
+from .models import get_db, Post, Comment, User, Community, TaskRequest, Report, AgentSkillBadge
 from .schemas import APIResponse, PaginationMeta
 from sqlalchemy.orm import joinedload
 
@@ -412,10 +412,10 @@ def validate_agent_name_endpoint():
 @optional_auth
 def list_posts():
     sort = request.args.get('sort', 'new')
-    submolt = request.args.get('submolt')
+    community = request.args.get('community')
     limit = min(int(request.args.get('limit', 25)), 100)
     offset = int(request.args.get('offset', 0))
-    posts, total = PostService.list_posts(g.db, sort, submolt, limit=limit, offset=offset)
+    posts, total = PostService.list_posts(g.db, sort, community, limit=limit, offset=offset)
     return _ok([p.to_dict(include_author=True) for p in posts], _paginate(total, limit, offset))
 
 
@@ -429,7 +429,7 @@ def create_post():
         return _err("title required")
     post = PostService.create(
         g.db, g.user, title, data.get('content', ''),
-        data.get('content_type', 'text'), data.get('submolt'),
+        data.get('content_type', 'text'), data.get('community'),
         data.get('code_language'), data.get('media_urls'),
         data.get('link_url'), data.get('source_channel'),
     )
@@ -523,8 +523,8 @@ def pin_post(post_id):
     if not post:
         return _err("Post not found", 404)
     if not (g.user.is_admin or g.user.is_moderator):
-        if post.submolt_id:
-            role = SubmoltService.get_user_role(g.db, g.user.id, post.submolt_id)
+        if post.community_id:
+            role = CommunityService.get_user_role(g.db, g.user.id, post.community_id)
             if role not in ('admin', 'moderator'):
                 return _err("Moderator access required", 403)
         else:
@@ -695,125 +695,125 @@ def report_comment(comment_id):
 
 
 # ═══════════════════════════════════════════════════════════════
-# SUBMOLTS / COMMUNITIES
+# COMMUNITIES
 # ═══════════════════════════════════════════════════════════════
 
-@social_bp.route('/submolts', methods=['GET'])
+@social_bp.route('/communities', methods=['GET'])
 @optional_auth
-def list_submolts():
+def list_communities():
     limit = min(int(request.args.get('limit', 50)), 100)
     offset = int(request.args.get('offset', 0))
-    submolts, total = SubmoltService.list_submolts(g.db, limit, offset)
-    return _ok([s.to_dict() for s in submolts], _paginate(total, limit, offset))
+    communities, total = CommunityService.list_communities(g.db, limit, offset)
+    return _ok([s.to_dict() for s in communities], _paginate(total, limit, offset))
 
 
-@social_bp.route('/submolts', methods=['POST'])
+@social_bp.route('/communities', methods=['POST'])
 @require_auth
-def create_submolt():
+def create_community():
     data = _get_json()
     name = data.get('name', '')
     if not name:
         return _err("name required")
     try:
-        submolt = SubmoltService.create(
+        community = CommunityService.create(
             g.db, g.user, name, data.get('display_name', ''),
             data.get('description', ''), data.get('rules', ''),
             data.get('is_private', False))
-        return _ok(submolt.to_dict(), status=201)
+        return _ok(community.to_dict(), status=201)
     except ValueError as e:
         return _err(str(e))
 
 
-@social_bp.route('/submolts/<name>', methods=['GET'])
+@social_bp.route('/communities/<name>', methods=['GET'])
 @optional_auth
-def get_submolt(name):
-    submolt = SubmoltService.get_by_name(g.db, name)
-    if not submolt:
+def get_community(name):
+    community = CommunityService.get_by_name(g.db, name)
+    if not community:
         return _err("Community not found", 404)
-    data = submolt.to_dict()
+    data = community.to_dict()
     if g.user:
-        data['is_member'] = SubmoltService.get_user_role(g.db, g.user.id, submolt.id) is not None
-        data['role'] = SubmoltService.get_user_role(g.db, g.user.id, submolt.id)
+        data['is_member'] = CommunityService.get_user_role(g.db, g.user.id, community.id) is not None
+        data['role'] = CommunityService.get_user_role(g.db, g.user.id, community.id)
     return _ok(data)
 
 
-@social_bp.route('/submolts/<name>', methods=['PATCH'])
+@social_bp.route('/communities/<name>', methods=['PATCH'])
 @require_auth
-def update_submolt(name):
-    submolt = SubmoltService.get_by_name(g.db, name)
-    if not submolt:
+def update_community(name):
+    community = CommunityService.get_by_name(g.db, name)
+    if not community:
         return _err("Community not found", 404)
-    role = SubmoltService.get_user_role(g.db, g.user.id, submolt.id)
+    role = CommunityService.get_user_role(g.db, g.user.id, community.id)
     if role not in ('admin', 'moderator') and not g.user.is_admin:
         return _err("Moderator access required", 403)
     data = _get_json()
     if 'display_name' in data:
-        submolt.display_name = data['display_name']
+        community.display_name = data['display_name']
     if 'description' in data:
-        submolt.description = data['description']
+        community.description = data['description']
     if 'rules' in data:
-        submolt.rules = data['rules']
+        community.rules = data['rules']
     g.db.flush()
-    return _ok(submolt.to_dict())
+    return _ok(community.to_dict())
 
 
-@social_bp.route('/submolts/<name>/posts', methods=['GET'])
+@social_bp.route('/communities/<name>/posts', methods=['GET'])
 @optional_auth
-def get_submolt_posts(name):
+def get_community_posts(name):
     sort = request.args.get('sort', 'new')
     limit = min(int(request.args.get('limit', 25)), 100)
     offset = int(request.args.get('offset', 0))
-    posts, total = PostService.list_posts(g.db, sort, submolt_name=name, limit=limit, offset=offset)
+    posts, total = PostService.list_posts(g.db, sort, community_name=name, limit=limit, offset=offset)
     return _ok([p.to_dict(include_author=True) for p in posts], _paginate(total, limit, offset))
 
 
-@social_bp.route('/submolts/<name>/join', methods=['POST'])
+@social_bp.route('/communities/<name>/join', methods=['POST'])
 @require_auth
-def join_submolt(name):
-    submolt = SubmoltService.get_by_name(g.db, name)
-    if not submolt:
+def join_community(name):
+    community = CommunityService.get_by_name(g.db, name)
+    if not community:
         return _err("Community not found", 404)
-    joined = SubmoltService.join(g.db, g.user, submolt)
+    joined = CommunityService.join(g.db, g.user, community)
     return _ok({'joined': joined})
 
 
-@social_bp.route('/submolts/<name>/leave', methods=['DELETE'])
+@social_bp.route('/communities/<name>/leave', methods=['DELETE'])
 @require_auth
-def leave_submolt(name):
-    submolt = SubmoltService.get_by_name(g.db, name)
-    if not submolt:
+def leave_community(name):
+    community = CommunityService.get_by_name(g.db, name)
+    if not community:
         return _err("Community not found", 404)
-    SubmoltService.leave(g.db, g.user, submolt)
+    CommunityService.leave(g.db, g.user, community)
     return _ok({'left': True})
 
 
-@social_bp.route('/submolts/<name>/members', methods=['GET'])
+@social_bp.route('/communities/<name>/members', methods=['GET'])
 @optional_auth
-def get_submolt_members(name):
-    submolt = SubmoltService.get_by_name(g.db, name)
-    if not submolt:
+def get_community_members(name):
+    community = CommunityService.get_by_name(g.db, name)
+    if not community:
         return _err("Community not found", 404)
     limit = min(int(request.args.get('limit', 50)), 100)
     offset = int(request.args.get('offset', 0))
-    members, total = SubmoltService.get_members(g.db, submolt.id, limit, offset)
+    members, total = CommunityService.get_members(g.db, community.id, limit, offset)
     return _ok(members, _paginate(total, limit, offset))
 
 
-@social_bp.route('/submolts/<name>/moderators', methods=['POST'])
+@social_bp.route('/communities/<name>/moderators', methods=['POST'])
 @require_auth
 def add_moderator(name):
-    submolt = SubmoltService.get_by_name(g.db, name)
-    if not submolt:
+    community = CommunityService.get_by_name(g.db, name)
+    if not community:
         return _err("Community not found", 404)
-    role = SubmoltService.get_user_role(g.db, g.user.id, submolt.id)
+    role = CommunityService.get_user_role(g.db, g.user.id, community.id)
     if role != 'admin' and not g.user.is_admin:
         return _err("Admin access required", 403)
     data = _get_json()
     user_id = data.get('user_id', '')
-    from .models import SubmoltMembership
-    membership = g.db.query(SubmoltMembership).filter(
-        SubmoltMembership.user_id == user_id,
-        SubmoltMembership.submolt_id == submolt.id).first()
+    from .models import CommunityMembership
+    membership = g.db.query(CommunityMembership).filter(
+        CommunityMembership.user_id == user_id,
+        CommunityMembership.community_id == community.id).first()
     if not membership:
         return _err("User is not a member", 400)
     membership.role = 'moderator'
@@ -821,19 +821,19 @@ def add_moderator(name):
     return _ok({'promoted': True})
 
 
-@social_bp.route('/submolts/<name>/moderators/<user_id>', methods=['DELETE'])
+@social_bp.route('/communities/<name>/moderators/<user_id>', methods=['DELETE'])
 @require_auth
 def remove_moderator(name, user_id):
-    submolt = SubmoltService.get_by_name(g.db, name)
-    if not submolt:
+    community = CommunityService.get_by_name(g.db, name)
+    if not community:
         return _err("Community not found", 404)
-    role = SubmoltService.get_user_role(g.db, g.user.id, submolt.id)
+    role = CommunityService.get_user_role(g.db, g.user.id, community.id)
     if role != 'admin' and not g.user.is_admin:
         return _err("Admin access required", 403)
-    from .models import SubmoltMembership
-    membership = g.db.query(SubmoltMembership).filter(
-        SubmoltMembership.user_id == user_id,
-        SubmoltMembership.submolt_id == submolt.id).first()
+    from .models import CommunityMembership
+    membership = g.db.query(CommunityMembership).filter(
+        CommunityMembership.user_id == user_id,
+        CommunityMembership.community_id == community.id).first()
     if membership:
         membership.role = 'member'
         g.db.flush()
@@ -913,11 +913,11 @@ def search():
             User.is_banned == False
         ).offset(offset).limit(limit).all()
         return _ok([u.to_dict() for u in users])
-    elif search_type == 'submolts':
-        submolts = g.db.query(Submolt).filter(
-            Submolt.name.ilike(q_like) | Submolt.description.ilike(q_like)
+    elif search_type == 'communities':
+        communities = g.db.query(Community).filter(
+            Community.name.ilike(q_like) | Community.description.ilike(q_like)
         ).offset(offset).limit(limit).all()
-        return _ok([s.to_dict() for s in submolts])
+        return _ok([s.to_dict() for s in communities])
     else:  # posts
         posts = g.db.query(Post).options(joinedload(Post.author)).filter(
             Post.is_deleted == False,
@@ -1076,7 +1076,7 @@ def share_recipe():
     # Create the post
     post = PostService.create(
         g.db, g.user, title, data.get('description', ''),
-        content_type='recipe', submolt_name=data.get('submolt'))
+        content_type='recipe', community_name=data.get('community'))
     post.recipe_ref = recipe_file
 
     # Create recipe share record
@@ -1236,12 +1236,12 @@ def platform_stats():
     total_humans = g.db.query(sqlfunc.count(User.id)).filter(User.user_type == 'human').scalar()
     total_posts = g.db.query(sqlfunc.count(Post.id)).filter(Post.is_deleted == False).scalar()
     total_comments = g.db.query(sqlfunc.count(Comment.id)).filter(Comment.is_deleted == False).scalar()
-    total_submolts = g.db.query(sqlfunc.count(Submolt.id)).scalar()
+    total_communities = g.db.query(sqlfunc.count(Community.id)).scalar()
     pending_reports = g.db.query(sqlfunc.count(Report.id)).filter(Report.status == 'pending').scalar()
     return _ok({
         'total_users': total_users, 'total_agents': total_agents,
         'total_humans': total_humans, 'total_posts': total_posts,
-        'total_comments': total_comments, 'total_submolts': total_submolts,
+        'total_comments': total_comments, 'total_communities': total_communities,
         'pending_reports': pending_reports,
     })
 
@@ -1267,6 +1267,183 @@ def sync_agents():
         return _ok({'synced': count})
     except Exception as e:
         return _err(str(e), 500)
+
+
+# ═══════════════════════════════════════════════════════════════
+# ADMIN – USER MANAGEMENT
+# ═══════════════════════════════════════════════════════════════
+
+@social_bp.route('/admin/users/<user_id>', methods=['PATCH'])
+@require_admin
+def admin_update_user(user_id):
+    """Update user details including role assignment."""
+    user = UserService.get_by_id(g.db, user_id)
+    if not user:
+        return _err("User not found", 404)
+    data = _get_json()
+    for field in ('display_name', 'bio', 'is_verified'):
+        if field in data:
+            setattr(user, field, data[field])
+    if 'role' in data:
+        UserService.set_user_role(g.db, user, data['role'])
+    if 'is_banned' in data:
+        user.is_banned = data['is_banned']
+    g.db.flush()
+    return _ok({**user.to_dict(), 'is_banned': user.is_banned, 'email': user.email})
+
+
+@social_bp.route('/admin/users/<user_id>/ban', methods=['POST'])
+@require_admin
+def admin_ban_user(user_id):
+    user = UserService.get_by_id(g.db, user_id)
+    if not user:
+        return _err("User not found", 404)
+    user.is_banned = True
+    g.db.flush()
+    return _ok({'banned': True})
+
+
+@social_bp.route('/admin/users/<user_id>/ban', methods=['DELETE'])
+@require_admin
+def admin_unban_user(user_id):
+    user = UserService.get_by_id(g.db, user_id)
+    if not user:
+        return _err("User not found", 404)
+    user.is_banned = False
+    g.db.flush()
+    return _ok({'unbanned': True})
+
+
+@social_bp.route('/admin/agents/sync', methods=['POST'])
+@require_admin
+def admin_sync_agents_alias():
+    """Alias for /admin/sync-agents (frontend compatibility)."""
+    try:
+        from .agent_bridge import sync_trained_agents
+        count = sync_trained_agents()
+        return _ok({'synced': count})
+    except Exception as e:
+        return _err(str(e), 500)
+
+
+# ═══════════════════════════════════════════════════════════════
+# ADMIN – MODERATION
+# ═══════════════════════════════════════════════════════════════
+
+@social_bp.route('/admin/moderation/reports', methods=['GET'])
+@require_moderator
+def admin_list_reports():
+    """List reports (admin panel path alias)."""
+    status_filter = request.args.get('status')
+    limit = min(int(request.args.get('limit', 50)), 100)
+    offset = int(request.args.get('offset', 0))
+    reports, total = ReportService.list_reports(g.db, status_filter, limit, offset)
+    return _ok([r.to_dict() for r in reports], _paginate(total, limit, offset))
+
+
+@social_bp.route('/admin/moderation/reports/<report_id>', methods=['GET'])
+@require_moderator
+def admin_get_report(report_id):
+    """Get a single report."""
+    report = g.db.query(Report).filter(Report.id == report_id).first()
+    if not report:
+        return _err("Report not found", 404)
+    return _ok(report.to_dict())
+
+
+@social_bp.route('/admin/moderation/reports/<report_id>/resolve', methods=['POST'])
+@require_moderator
+def admin_resolve_report(report_id):
+    """Resolve a report."""
+    report = g.db.query(Report).filter(Report.id == report_id).first()
+    if not report:
+        return _err("Report not found", 404)
+    data = _get_json()
+    ReportService.review(g.db, report, g.user.id, data.get('status', 'reviewed'))
+    g.db.flush()
+    return _ok(report.to_dict())
+
+
+@social_bp.route('/admin/moderation/posts/<post_id>/hide', methods=['POST'])
+@require_moderator
+def admin_hide_post(post_id):
+    """Hide a post from public view."""
+    post = g.db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        return _err("Post not found", 404)
+    post.is_hidden = True
+    g.db.flush()
+    return _ok({'hidden': True})
+
+
+@social_bp.route('/admin/moderation/posts/<post_id>/hide', methods=['DELETE'])
+@require_moderator
+def admin_unhide_post(post_id):
+    """Unhide a post."""
+    post = g.db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        return _err("Post not found", 404)
+    post.is_hidden = False
+    g.db.flush()
+    return _ok({'hidden': False})
+
+
+@social_bp.route('/admin/moderation/posts/<post_id>', methods=['DELETE'])
+@require_admin
+def admin_delete_post(post_id):
+    """Soft-delete a post."""
+    post = g.db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        return _err("Post not found", 404)
+    post.is_deleted = True
+    g.db.flush()
+    return _ok({'deleted': True})
+
+
+@social_bp.route('/admin/moderation/comments/<comment_id>/hide', methods=['POST'])
+@require_moderator
+def admin_hide_comment(comment_id):
+    """Hide a comment from public view."""
+    comment = g.db.query(Comment).filter(Comment.id == comment_id).first()
+    if not comment:
+        return _err("Comment not found", 404)
+    comment.is_hidden = True
+    g.db.flush()
+    return _ok({'hidden': True})
+
+
+@social_bp.route('/admin/moderation/comments/<comment_id>', methods=['DELETE'])
+@require_admin
+def admin_delete_comment(comment_id):
+    """Soft-delete a comment."""
+    comment = g.db.query(Comment).filter(Comment.id == comment_id).first()
+    if not comment:
+        return _err("Comment not found", 404)
+    comment.is_deleted = True
+    g.db.flush()
+    return _ok({'deleted': True})
+
+
+# ═══════════════════════════════════════════════════════════════
+# ADMIN – SYSTEM LOGS
+# ═══════════════════════════════════════════════════════════════
+
+@social_bp.route('/admin/logs', methods=['GET'])
+@require_admin
+def admin_get_logs():
+    """Return recent error/event logs from AdminDashboard."""
+    limit = min(int(request.args.get('limit', 100)), 500)
+    level = request.args.get('level')
+    try:
+        from integrations.channels.admin.dashboard import get_dashboard
+        dashboard = get_dashboard()
+        errors = dashboard.get_error_log(limit=limit)
+        entries = [e.to_dict() for e in errors]
+        if level:
+            entries = [e for e in entries if e.get('severity') == level]
+        return _ok(entries)
+    except Exception:
+        return _ok([])
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1337,7 +1514,7 @@ def compat_comment_likes():
 
 
 # ════════════════════════════════════════════════════════════════
-# External Bot Bridge (SantaClaw / OpenClaw / bmoltbook)
+# External Bot Bridge (SantaClaw / OpenClaw / communitybook)
 # ════════════════════════════════════════════════════════════════
 
 @social_bp.route('/bots/register', methods=['POST'])
@@ -1532,17 +1709,17 @@ def user_feed_rss(user_id):
         db.close()
 
 
-@social_bp.route('/submolts/<int:submolt_id>/feed.rss', methods=['GET'])
-def submolt_feed_rss(submolt_id):
-    """Generate RSS feed for a specific submolt/community."""
-    from .feed_export import get_submolt_feed_rss
+@social_bp.route('/communities/<int:community_id>/feed.rss', methods=['GET'])
+def community_feed_rss(community_id):
+    """Generate RSS feed for a specific community."""
+    from .feed_export import get_community_feed_rss
     from flask import Response
 
     limit = min(int(request.args.get('limit', 50)), 100)
 
     db = get_db()
     try:
-        rss_xml = get_submolt_feed_rss(db, submolt_id, limit=limit)
+        rss_xml = get_community_feed_rss(db, community_id, limit=limit)
         return Response(rss_xml, mimetype='application/rss+xml')
     finally:
         db.close()
@@ -1577,7 +1754,7 @@ def feed_import():
     Import items from an external feed as posts.
     Request JSON:
         url: Feed URL
-        submolt_id: Optional submolt to post to
+        community_id: Optional community to post to
         limit: Max items to import (default: 10)
     """
     from .feed_import import FeedImporter
@@ -1587,7 +1764,7 @@ def feed_import():
     if not url:
         return _err("url is required")
 
-    submolt_id = data.get('submolt_id')
+    community_id = data.get('community_id')
     limit = min(int(data.get('limit', 10)), 50)
 
     db = get_db()
@@ -1602,7 +1779,7 @@ def feed_import():
         created_ids = importer.import_items(
             items,
             user_id=g.user.id,
-            submolt_id=submolt_id
+            community_id=community_id
         )
         db.commit()
 
@@ -1627,7 +1804,7 @@ def feed_subscribe():
     Subscribe to an external feed for automatic imports.
     Request JSON:
         url: Feed URL
-        submolt_id: Optional submolt to post to
+        community_id: Optional community to post to
         auto_import: Whether to auto-import new items (default: true)
     """
     from .feed_import import FeedSubscriptionService
@@ -1643,7 +1820,7 @@ def feed_subscribe():
         subscription = service.subscribe(
             user_id=g.user.id,
             feed_url=url,
-            submolt_id=data.get('submolt_id'),
+            community_id=data.get('community_id'),
             auto_import=data.get('auto_import', True)
         )
 
