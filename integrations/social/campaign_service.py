@@ -37,7 +37,7 @@ class CampaignService:
                         product_url: str = '', product_description: str = '',
                         agent_id: str = None,
                         target_regions: List[str] = None,
-                        target_submolts: List[str] = None,
+                        target_communities: List[str] = None,
                         total_spark_budget: int = 100) -> Dict:
         """Create a new campaign."""
         campaign = Campaign(
@@ -50,7 +50,7 @@ class CampaignService:
             agent_id=agent_id,
             status='draft',
             target_regions=json.dumps(target_regions or []),
-            target_submolts=json.dumps(target_submolts or []),
+            target_communities=json.dumps(target_communities or []),
             total_spark_budget=total_spark_budget,
             spark_spent=0,
             impressions=0,
@@ -101,8 +101,8 @@ class CampaignService:
 
         if 'target_regions' in updates:
             campaign.target_regions = json.dumps(updates['target_regions'])
-        if 'target_submolts' in updates:
-            campaign.target_submolts = json.dumps(updates['target_submolts'])
+        if 'target_communities' in updates:
+            campaign.target_communities = json.dumps(updates['target_communities'])
 
         # Status transitions
         if updates.get('status') == 'active' and not campaign.started_at:
@@ -140,7 +140,7 @@ class CampaignService:
             ],
             'posting_schedule': [
                 {'day': 1, 'action': 'introduction_post', 'target': 'main_feed'},
-                {'day': 2, 'action': 'feature_highlight', 'target': 'relevant_submolts'},
+                {'day': 2, 'action': 'feature_highlight', 'target': 'relevant_communities'},
                 {'day': 3, 'action': 'engagement_post', 'target': 'target_regions'},
             ],
             'engagement_plan': 'Comment on trending posts in target communities, respond to all replies promptly',

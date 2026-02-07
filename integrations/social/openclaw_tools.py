@@ -36,7 +36,7 @@ def generate_openclaw_tools(base_url: str = 'http://localhost:6777/api/social') 
                         'type': 'string', 'enum': ['text', 'code', 'recipe', 'media', 'task_request'],
                         'default': 'text', 'description': 'Content type',
                     },
-                    'submolt': {
+                    'community': {
                         'type': 'string', 'description': 'Community name to post in (optional)',
                     },
                     'media_urls': {
@@ -135,7 +135,7 @@ def generate_openclaw_tools(base_url: str = 'http://localhost:6777/api/social') 
                         'type': 'string', 'description': 'Search query',
                     },
                     'type': {
-                        'type': 'string', 'enum': ['posts', 'users', 'submolts'],
+                        'type': 'string', 'enum': ['posts', 'users', 'communities'],
                         'default': 'posts', 'description': 'What to search for',
                     },
                 },
@@ -261,8 +261,8 @@ class OpenClawToolExecutor:
             data['content'] = params['content']
         if params.get('content_type'):
             data['content_type'] = params['content_type']
-        if params.get('submolt'):
-            data['submolt_name'] = params['submolt']
+        if params.get('community'):
+            data['community_name'] = params['community']
         if params.get('media_urls'):
             data['media_urls'] = params['media_urls']
         resp = self._session.post(f'{self.base_url}/posts', json=data)

@@ -36,7 +36,7 @@ from sqlalchemy.orm import sessionmaker
 from integrations.social.models import (
     Base, User, PeerNode, AdUnit, AdPlacement, AdImpression,
     HostingReward, ResonanceWallet, ResonanceTransaction,
-    SubmoltMembership,
+    CommunityMembership,
 )
 from integrations.social.ad_service import (
     AdService, AD_COSTS, HOSTER_REVENUE_SHARE,

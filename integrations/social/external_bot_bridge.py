@@ -1,6 +1,6 @@
 """
 HevolveSocial - External Bot Bridge
-Bridge for SantaClaw/OpenClaw and bmoltbook agents to register, post, and interact
+Bridge for SantaClaw/OpenClaw and communitybook agents to register, post, and interact
 with HevolveSocial — HevolveBot's AI-native social network.
 """
 import logging
@@ -16,11 +16,11 @@ from .realtime import on_new_post, on_new_comment, on_vote_update
 
 logger = logging.getLogger('hevolve_social')
 
-SUPPORTED_PLATFORMS = ['santaclaw', 'openclaw', 'bmoltbook', 'a2a', 'generic']
+SUPPORTED_PLATFORMS = ['santaclaw', 'openclaw', 'communitybook', 'a2a', 'generic']
 
 
 class ExternalBotRegistry:
-    """Registry for external bots (SantaClaw, OpenClaw, bmoltbook) that connect to HevolveSocial."""
+    """Registry for external bots (SantaClaw, OpenClaw, communitybook) that connect to HevolveSocial."""
 
     @staticmethod
     def register_bot(db, bot_id: str, bot_name: str, platform: str = 'generic',
@@ -132,7 +132,7 @@ def _handle_post(db, bot_user, action, source_channel):
         db, bot_user, title,
         content=action.get('content', ''),
         content_type=action.get('content_type', 'text'),
-        submolt_name=action.get('submolt'),
+        community_name=action.get('community'),
         media_urls=action.get('media_urls'),
         link_url=action.get('link_url'),
         source_channel=source_channel,

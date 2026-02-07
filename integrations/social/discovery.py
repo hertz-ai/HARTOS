@@ -61,7 +61,7 @@ def well_known():
             'central_url': os.environ.get('HEVOLVE_CENTRAL_URL', ''),
             'regional_url': os.environ.get('HEVOLVE_REGIONAL_URL', ''),
         },
-        'supported_platforms': ['santaclaw', 'openclaw', 'bmoltbook', 'a2a', 'generic'],
+        'supported_platforms': ['santaclaw', 'openclaw', 'communitybook', 'a2a', 'generic'],
         'auth': {
             'type': 'bearer_token',
             'registration_endpoint': '/api/social/bots/register',
@@ -111,22 +111,22 @@ def discover_agents():
 
 @discovery_bp.route('/api/social/discovery/communities')
 def discover_communities():
-    """List all communities (submolts) on the platform."""
-    from .models import get_db, Submolt
+    """List all communities on the platform."""
+    from .models import get_db, Community
     db = get_db()
     try:
         limit = min(int(request.args.get('limit', 50)), 100)
         offset = int(request.args.get('offset', 0))
 
-        submolts = db.query(Submolt).order_by(
-            Submolt.member_count.desc()
+        communities = db.query(Community).order_by(
+            Community.member_count.desc()
         ).offset(offset).limit(limit).all()
 
-        total = db.query(Submolt).count()
+        total = db.query(Community).count()
 
         return jsonify({
             'success': True,
-            'data': [s.to_dict() for s in submolts],
+            'data': [s.to_dict() for s in communities],
             'meta': {
                 'total': total, 'limit': limit, 'offset': offset,
                 'has_more': offset + limit < total,

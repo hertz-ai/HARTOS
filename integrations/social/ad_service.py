@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from .models import (
     User, AdUnit, AdPlacement, AdImpression, PeerNode,
-    SubmoltMembership, HostingReward,
+    CommunityMembership, HostingReward,
 )
 from .resonance_engine import ResonanceService
 
@@ -176,12 +176,12 @@ class AdService:
             return None
 
         # Targeting filters
-        user_submolts = set()
+        user_communities = set()
         user_type = None
         if user_id:
-            memberships = db.query(SubmoltMembership.submolt_id).filter_by(
+            memberships = db.query(CommunityMembership.community_id).filter_by(
                 user_id=user_id).all()
-            user_submolts = {m[0] for m in memberships}
+            user_communities = {m[0] for m in memberships}
             user_obj = db.query(User).filter_by(id=user_id).first()
             user_type = user_obj.user_type if user_obj else None
 
@@ -191,8 +191,8 @@ class AdService:
             target_regions = targeting.get('region_ids', [])
             if target_regions and region_id and region_id not in target_regions:
                 continue
-            target_submolts = targeting.get('submolt_ids', [])
-            if target_submolts and not user_submolts.intersection(set(target_submolts)):
+            target_communities = targeting.get('community_ids', [])
+            if target_communities and not user_communities.intersection(set(target_communities)):
                 continue
             target_user_types = targeting.get('user_types', [])
             if target_user_types and user_type and user_type not in target_user_types:

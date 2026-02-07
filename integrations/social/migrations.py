@@ -8,7 +8,7 @@ from .models import get_engine, Base
 
 logger = logging.getLogger('hevolve_social')
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 17
 
 
 def get_schema_version(engine) -> int:
@@ -349,3 +349,34 @@ def run_migrations():
                 pass
             conn.commit()
         set_schema_version(engine, 15)
+
+    if current < 16:
+        logger.info("HevolveSocial: migrating to v16 (is_hidden column for posts & comments)")
+        with engine.connect() as conn:
+            try:
+                conn.execute(text("ALTER TABLE posts ADD COLUMN is_hidden BOOLEAN DEFAULT 0"))
+            except Exception:
+                pass  # Column may already exist
+            try:
+                conn.execute(text("ALTER TABLE comments ADD COLUMN is_hidden BOOLEAN DEFAULT 0"))
+            except Exception:
+                pass  # Column may already exist
+            conn.commit()
+        set_schema_version(engine, 16)
+
+    if current < 17:
+        logger.info("HevolveSocial: migrating to v17 (submolt -> community rename)")
+        with engine.connect() as conn:
+            for stmt in [
+                "ALTER TABLE submolts RENAME TO communities",
+                "ALTER TABLE submolt_memberships RENAME TO community_memberships",
+                "ALTER TABLE posts RENAME COLUMN submolt_id TO community_id",
+                "ALTER TABLE campaigns RENAME COLUMN target_submolts TO target_communities",
+                "ALTER TABLE onboarding_progress RENAME COLUMN first_submolt_join_at TO first_community_join_at",
+            ]:
+                try:
+                    conn.execute(text(stmt))
+                except Exception:
+                    pass
+            conn.commit()
+        set_schema_version(engine, 17)

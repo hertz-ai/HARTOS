@@ -1,6 +1,6 @@
 """
 HevolveSocial - Feed Engine
-Personalized feed: followed users + joined submolts + time decay + score.
+Personalized feed: followed users + joined communities + time decay + score.
 """
 import math
 from datetime import datetime, timedelta
@@ -9,7 +9,7 @@ from typing import List, Tuple
 from sqlalchemy import desc, or_
 from sqlalchemy.orm import Session, joinedload
 
-from .models import Post, Follow, SubmoltMembership, User
+from .models import Post, Follow, CommunityMembership, User
 
 
 def _hot_score(upvotes: int, downvotes: int, created_at: datetime) -> float:
@@ -21,17 +21,17 @@ def _hot_score(upvotes: int, downvotes: int, created_at: datetime) -> float:
 
 def get_personalized_feed(db: Session, user_id: str, limit: int = 25,
                           offset: int = 0) -> Tuple[List[Post], int]:
-    """Feed from followed users + subscribed submolts, sorted by hot score."""
+    """Feed from followed users + subscribed communities, sorted by hot score."""
     # Get followed user IDs
     followed_ids = [f.following_id for f in
                     db.query(Follow.following_id).filter(Follow.follower_id == user_id).all()]
 
-    # Get subscribed submolt IDs
-    submolt_ids = [m.submolt_id for m in
-                   db.query(SubmoltMembership.submolt_id).filter(
-                       SubmoltMembership.user_id == user_id).all()]
+    # Get subscribed community IDs
+    community_ids = [m.community_id for m in
+                   db.query(CommunityMembership.community_id).filter(
+                       CommunityMembership.user_id == user_id).all()]
 
-    if not followed_ids and not submolt_ids:
+    if not followed_ids and not community_ids:
         # Fallback to global trending
         return get_trending_feed(db, limit, offset)
 
@@ -39,7 +39,7 @@ def get_personalized_feed(db: Session, user_id: str, limit: int = 25,
         Post.is_deleted == False,
         or_(
             Post.author_id.in_(followed_ids) if followed_ids else False,
-            Post.submolt_id.in_(submolt_ids) if submolt_ids else False,
+            Post.community_id.in_(community_ids) if community_ids else False,
         )
     )
     total = q.count()
