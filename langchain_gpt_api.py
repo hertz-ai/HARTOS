@@ -536,6 +536,36 @@ def create_prompt(tools):
     return prompt
 
 
+def _handle_create_agent_tool(input_text):
+    """Tool handler: LLM decided user wants to create an agent.
+
+    Called by the LangChain agent when it detects agent creation intent.
+    Sets thread-local flags that the /chat handler checks after get_ans() returns.
+    """
+    lower = input_text.lower()
+    autonomous = any(w in lower for w in [
+        'autonomous', 'automatic', 'automatically', 'do it for me',
+        'handle it', 'just create', 'create it yourself', 'auto',
+    ])
+    thread_local_data.set_creation_requested(description=input_text, autonomous=autonomous)
+    if autonomous:
+        return f"Agent creation initiated autonomously for: {input_text}. I will set up the agent creation workflow and handle all the details automatically."
+    return f"Agent creation initiated for: {input_text}. I will set up the agent creation workflow. Let me gather the required details."
+
+
+# Signals from reuse agent that suggest creating a new agent
+_RESPONSE_CREATION_SIGNALS = [
+    'need a new agent', 'create a new agent', 'requires a different agent',
+    'beyond my capabilities', 'specialized agent', 'need a specialized',
+    'suggest creating', 'recommend creating a new',
+]
+
+def _response_signals_creation(response_text):
+    """Check if the reuse agent's response suggests creating a new agent."""
+    lower = response_text.lower()
+    return any(signal in lower for signal in _RESPONSE_CREATION_SIGNALS)
+
+
 def get_tools(req_tool, is_first: bool = False):
 
     if is_first:
@@ -604,6 +634,19 @@ def get_tools(req_tool, is_first: bool = False):
                 name="Visual_Context_Camera",
                 func=parse_visual_context,
                 description="To see user or if there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input to this tool function should be the user query/input. Only if last 16 seconds Visual Context information is present & is enough, then use that to craft a better creative, better, cohesive, correlated , summarised natural response, format this tool response togather with Previous 15 minutes Visual Context information if you are seeing the scene via videocall from the other end. If there are more than 1 person try to give an identity to each across frames to track the subjects through time by framing the tool input accordingly."
+            ),
+            Tool(
+                name="Create_Agent",
+                func=_handle_create_agent_tool,
+                description=(
+                    "Use this tool when the user wants to create, build, set up, train, or deploy "
+                    "a new AI agent, assistant, bot, or automated workflow. "
+                    "Input should be the description of what the agent should do. "
+                    "Do NOT use this tool if the user is just asking ABOUT agents or discussing agents in general. "
+                    "Only use when the user explicitly wants a NEW agent created. "
+                    "If the user also says words like 'automatically', 'autonomous', 'do it for me', "
+                    "'handle it', 'just create it', include those keywords in your input."
+                ),
             )
 
         ]
@@ -720,6 +763,19 @@ def get_tools(req_tool, is_first: bool = False):
                 name="Visual_Context_Camera",
                 func=parse_visual_context,
                 description="This tool captures the user's visual context during a video call, providing real-time captions. Use it for visual question answering, scene understanding, recognizing objects, activities, & monitoring the user. Input will be the user's input/query. If the last 16 seconds of visual context are available and sufficient, it crafts a creative, cohesive response. If not, inform the user of the glitch accessing the current camera feed and guess using the Last_5_Minutes_Visual_Context. Ensure responses are natural, avoiding lists of captions, and format them as if you are seeing the user scene via video call. Analyze the current tool response and previous visual context captions to recognize user activities and infer actions from multiple frames. If the user requests continuous narration without active input, adapt the response to include past, present, and future tenses for dynamic and contextually aware commentary."
+            ),
+            Tool(
+                name="Create_Agent",
+                func=_handle_create_agent_tool,
+                description=(
+                    "Use this tool when the user wants to create, build, set up, train, or deploy "
+                    "a new AI agent, assistant, bot, or automated workflow. "
+                    "Input should be the description of what the agent should do. "
+                    "Do NOT use this tool if the user is just asking ABOUT agents or discussing agents in general. "
+                    "Only use when the user explicitly wants a NEW agent created. "
+                    "If the user also says words like 'automatically', 'autonomous', 'do it for me', "
+                    "'handle it', 'just create it', include those keywords in your input."
+                ),
             )
 
         ]
@@ -2259,6 +2315,45 @@ INTERMEDIATE_CONTINUATION = "You are Hevolve, a highly intelligent educational A
 first_promts = []
 review_agents = {"10077":True,10077:True}
 conversation_agent = {"10077":False,10077:False}
+
+
+def _autonomous_gather_info(user_id, description, prompt_id):
+    """Run gather_info autonomously — LLM answers all questions itself.
+
+    In autonomous mode, autogen's UserProxyAgent has max_consecutive_auto_reply=10
+    and the assistant's system_message is enriched with instructions to self-complete.
+    """
+    from gather_agentdetails import gather_info
+    response = gather_info(user_id, description, prompt_id, autonomous=True)
+
+    # Loop until completed (autogen handles it internally when max_auto_reply > 0)
+    max_iterations = 15
+    iteration = 0
+    while iteration < max_iterations:
+        try:
+            new_response = response.replace('true', 'True').replace('false', 'False')
+            parsed = retrieve_json(new_response)
+            if parsed.get('status', '').lower() == 'completed':
+                # Save agent config
+                parsed['prompt_id'] = prompt_id
+                parsed['creator_user_id'] = user_id
+                name = f'prompts/{prompt_id}.json'
+                with open(name, 'w') as f:
+                    json.dump(parsed, f)
+                app.logger.info(f'Autonomous agent config saved to {name}')
+                return 'Agent details gathered autonomously. Moving to review.'
+        except (json.JSONDecodeError, AttributeError, Exception) as e:
+            app.logger.debug(f'Autonomous gather iteration {iteration}: {e}')
+
+        # Not complete yet — send auto-continue
+        response = gather_info(user_id, 'proceed', prompt_id, autonomous=True)
+        iteration += 1
+
+    # Fallback: save whatever we have
+    app.logger.warning(f'Autonomous gather_info did not complete in {max_iterations} iterations')
+    return 'Autonomous gathering completed. Moving to review.'
+
+
 @app.route('/chat', methods=['POST'])
 def chat():
 
@@ -2401,10 +2496,58 @@ def chat():
 
         response = chat_agent(user_id,prompt,prompt_id,file_id,request_id)
 
-        # if not user_id or not prompt:
-        #     return jsonify({'response': 'Need user_id and text to use agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
-        # last_response = ''
-        #create and user use_recipe.py
+        # --- Step 17: Check if the reuse agent intelligently decided to create a new agent ---
+        # Two detection mechanisms:
+        # 1. Autogen create_new_agent tool (intelligent — LLM decides via tool call)
+        # 2. Response text pattern matching (fallback for structured agent output)
+        user_prompt = f'{user_id}_{prompt_id}'
+        if not review_agents.get(user_id) and not create_agent:
+            # Check autogen tool signal first (intelligent detection)
+            from reuse_recipe import creation_signals
+            if user_prompt in creation_signals:
+                signal = creation_signals.pop(user_prompt)
+                agent_desc = signal.get('description', '')
+                is_auto = signal.get('autonomous', False)
+                app.logger.info(f'Autogen create_new_agent tool fired: desc="{agent_desc}", autonomous={is_auto}')
+
+                new_prompt_id = int(time.time())
+                if is_auto:
+                    # Autonomous: run gather_info with LLM-generated answers
+                    auto_response = _autonomous_gather_info(user_id, agent_desc, new_prompt_id)
+                    review_agents[user_id] = True
+                    return jsonify({
+                        'response': auto_response,
+                        'intent': ['FINAL_ANSWER'],
+                        'req_token_count': 0, 'res_token_count': 0,
+                        'history_request_id': [],
+                        'Agent_status': 'Review Mode',
+                        'autonomous_creation': True,
+                        'prompt_id': new_prompt_id,
+                    })
+                else:
+                    return jsonify({
+                        'response': response,
+                        'intent': ['FINAL_ANSWER'],
+                        'req_token_count': 0, 'res_token_count': 0,
+                        'history_request_id': [],
+                        'Agent_status': 'Reuse Mode',
+                        'creation_suggested': True,
+                        'suggested_agent_description': agent_desc,
+                        'prompt_id': new_prompt_id,
+                    })
+
+            # Fallback: pattern matching on agent response text
+            if _response_signals_creation(response):
+                app.logger.info('Reuse agent response text signals new agent creation needed')
+                return jsonify({
+                    'response': response,
+                    'intent': ['FINAL_ANSWER'],
+                    'req_token_count': 0, 'res_token_count': 0,
+                    'history_request_id': [],
+                    'Agent_status': 'Reuse Mode',
+                    'creation_suggested': True,
+                })
+
         return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Reuse Mode'})
 
     if prompt_id:
@@ -2460,6 +2603,50 @@ def chat():
                   query=prompt, custom_prompt=custom_prompt, preferred_lang=preferred_lang)
     app.logger.info("the time taken by get ans in main api is %s seconds",
                     time.time() - ans_start_time)
+
+    # --- Step 16c: Check if LLM's Create_Agent tool fired during get_ans() ---
+    if thread_local_data.get_creation_requested():
+        agent_description = thread_local_data.get_creation_description()
+        is_autonomous = thread_local_data.get_creation_autonomous()
+        new_prompt_id = int(time.time())
+        thread_local_data.clear_creation_flags()
+        app.logger.info(f'LLM Create_Agent tool fired: desc="{agent_description}", autonomous={is_autonomous}')
+
+        if is_autonomous:
+            # Autonomous: run gather_info with LLM-generated answers
+            auto_response = _autonomous_gather_info(user_id, agent_description, new_prompt_id)
+            review_agents[user_id] = True
+            return jsonify({
+                'response': auto_response,
+                'intent': ['FINAL_ANSWER'],
+                'req_token_count': 0, 'res_token_count': 0,
+                'history_request_id': [],
+                'Agent_status': 'Review Mode',
+                'autonomous_creation': True,
+                'prompt_id': new_prompt_id,
+            })
+        else:
+            # Interactive: start gather_info, return first question
+            from gather_agentdetails import gather_info
+            response = gather_info(user_id, agent_description, new_prompt_id)
+            new_response = response.replace('true', 'True').replace("false", "False")
+            try:
+                new_res = retrieve_json(new_response)
+                if new_res.get('status') == 'pending':
+                    resp_text = new_res.get('question', new_res.get('review_details', ans))
+                else:
+                    resp_text = ans
+            except Exception:
+                resp_text = ans
+            return jsonify({
+                'response': resp_text,
+                'intent': ['FINAL_ANSWER'],
+                'req_token_count': 0, 'res_token_count': 0,
+                'history_request_id': [],
+                'Agent_status': 'Creation Mode',
+                'prompt_id': new_prompt_id,
+            })
+
     if req_tool == 'Image_Inference_Tool':
         action_response = pooled_post(f'{DB_URL}/create_action',)
         payload = json.dumps({
