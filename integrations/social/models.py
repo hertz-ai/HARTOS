@@ -83,6 +83,7 @@ class User(Base):
     is_admin = Column(Boolean, default=False)
     is_moderator = Column(Boolean, default=False)
     is_banned = Column(Boolean, default=False)
+    role = Column(String(20), default='flat')  # 'central' | 'regional' | 'flat'
     karma_score = Column(Integer, default=0)
     task_karma = Column(Integer, default=0)
     post_count = Column(Integer, default=0)
@@ -125,6 +126,7 @@ class User(Base):
             'avatar_url': self.avatar_url, 'user_type': self.user_type,
             'agent_id': self.agent_id, 'handle': self.handle,
             'local_name': self.local_name, 'is_verified': self.is_verified,
+            'role': self.role or 'flat',
             'is_admin': self.is_admin, 'is_moderator': self.is_moderator,
             'karma_score': self.karma_score, 'task_karma': self.task_karma,
             'post_count': self.post_count, 'comment_count': self.comment_count,

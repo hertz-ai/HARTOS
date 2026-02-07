@@ -60,6 +60,46 @@ logger = logging.getLogger(__name__)
 admin_bp = Blueprint("admin", __name__, url_prefix="/api/admin")
 
 
+@admin_bp.before_request
+def _admin_auth_gate():
+    """Require admin Bearer token for ALL admin endpoints."""
+    from integrations.social.auth import _get_user_from_token
+    from flask import g
+
+    auth_header = request.headers.get('Authorization', '')
+    if not auth_header.startswith('Bearer '):
+        return jsonify({'success': False, 'error': 'Admin authentication required'}), 401
+
+    token = auth_header[7:]
+    user, db = _get_user_from_token(token)
+    if user is None:
+        if db:
+            db.close()
+        return jsonify({'success': False, 'error': 'Invalid or expired token'}), 401
+
+    if not user.is_admin:
+        db.close()
+        return jsonify({'success': False, 'error': 'Admin access required'}), 403
+
+    g.user = user
+    g.user_id = str(user.id)
+    g.db = db
+
+
+@admin_bp.teardown_request
+def _admin_teardown(exc):
+    """Clean up db session after each admin request."""
+    db = getattr(g, 'db', None)
+    if db:
+        try:
+            if exc:
+                db.rollback()
+            else:
+                db.commit()
+        finally:
+            db.close()
+
+
 class AdminAPI:
     """
     Admin API controller.

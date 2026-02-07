@@ -69,6 +69,14 @@ def init_social(app):
     except Exception as e:
         logger.debug(f"HevolveSocial discovery blueprint skipped: {e}")
 
+    # Register admin API blueprint (channels management, requires admin auth)
+    try:
+        from integrations.channels.admin.api import admin_bp
+        app.register_blueprint(admin_bp)
+        logger.info("HevolveSocial admin API registered at /api/admin")
+    except Exception as e:
+        logger.debug(f"HevolveSocial admin blueprint skipped: {e}")
+
     # Initialize node keypair for integrity verification
     try:
         from security.node_integrity import get_or_create_keypair, get_public_key_hex

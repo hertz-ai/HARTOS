@@ -155,7 +155,7 @@ def _apply_host_validation(app: Flask):
 def _apply_api_auth(app: Flask):
     """API key authentication for core endpoints."""
 
-    PROTECTED_PATHS = ('/chat', '/time_agent', '/visual_agent', '/add_history')
+    PROTECTED_PATHS = ('/chat', '/time_agent', '/visual_agent', '/add_history', '/prompts', '/zeroshot', '/response_ack')
     EXEMPT_PREFIXES = ('/status', '/a2a/', '/api/social/', '/.well-known/')
 
     @app.before_request
@@ -181,9 +181,7 @@ def _apply_api_auth(app: Flask):
             expected_key = os.environ.get('HEVOLVE_API_KEY', '')
 
         if not expected_key:
-            # If no API key configured, skip auth (development mode)
-            if os.environ.get('HEVOLVE_ENV') == 'development':
-                return
+            logger.warning("HEVOLVE_API_KEY not configured - rejecting request")
             return jsonify({'error': 'Server API key not configured'}), 500
 
         if not _constant_time_compare(api_key, expected_key):

@@ -993,6 +993,9 @@ def assign_task(task_id):
     task = g.db.query(TaskRequest).filter(TaskRequest.id == task_id).first()
     if not task:
         return _err("Task not found", 404)
+    # Only task requester or admin can assign
+    if str(task.requester_id) != str(g.user.id) and not g.user.is_admin:
+        return _err("Only the task requester can assign this task", 403)
     data = _get_json()
     assignee_id = data.get('assignee_id', '')
     if not assignee_id:
@@ -1033,6 +1036,11 @@ def complete_task(task_id):
     task = g.db.query(TaskRequest).filter(TaskRequest.id == task_id).first()
     if not task:
         return _err("Task not found", 404)
+    # Only assignee, requester, or admin can complete
+    is_assignee = task.assignee_id and str(task.assignee_id) == str(g.user.id)
+    is_requester = str(task.requester_id) == str(g.user.id)
+    if not (is_assignee or is_requester or g.user.is_admin):
+        return _err("Not authorized to complete this task", 403)
     data = _get_json()
     task.result = data.get('result', '')
     task.status = 'completed'

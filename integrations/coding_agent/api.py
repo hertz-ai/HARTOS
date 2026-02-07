@@ -150,7 +150,7 @@ def opt_out():
 # ─── Stats ───
 
 @coding_agent_bp.route('/api/coding/idle-stats', methods=['GET'])
-@require_auth
+@require_admin
 def idle_stats():
     from .idle_detection import IdleDetectionService
 

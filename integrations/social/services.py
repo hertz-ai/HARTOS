@@ -84,11 +84,19 @@ class UserService:
             raise ValueError("Invalid username or password")
         if user.is_banned:
             raise ValueError("Account is banned")
-        token = generate_jwt(user.id, user.username)
+        token = generate_jwt(user.id, user.username, getattr(user, 'role', None) or 'flat')
         user.api_token = token
         user.last_active_at = datetime.utcnow()
         db.flush()
         return user, token
+
+    @staticmethod
+    def set_user_role(db: Session, user, role: str):
+        """Set user role and sync legacy boolean flags."""
+        user.role = role
+        user.is_admin = (role == 'central')
+        user.is_moderator = (role in ('central', 'regional'))
+        db.flush()
 
     @staticmethod
     def get_by_id(db: Session, user_id: str) -> Optional[User]:

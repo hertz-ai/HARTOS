@@ -1573,14 +1573,14 @@ def serve_ad():
 
 
 @gamification_bp.route('/ads/<ad_id>/impression', methods=['POST'])
-@optional_auth
+@require_auth
 def record_ad_impression(ad_id):
     from .ad_service import AdService
     import hashlib
     db = get_db()
     try:
         data = _get_json()
-        user_id = g.user_id if hasattr(g, 'user_id') and g.user_id else data.get('user_id')
+        user_id = g.user_id
         node_id = data.get('node_id')
         region_id = data.get('region_id')
         placement_id = data.get('placement_id')
@@ -1602,14 +1602,14 @@ def record_ad_impression(ad_id):
 
 
 @gamification_bp.route('/ads/<ad_id>/click', methods=['POST'])
-@optional_auth
+@require_auth
 def record_ad_click(ad_id):
     from .ad_service import AdService
     import hashlib
     db = get_db()
     try:
         data = _get_json()
-        user_id = g.user_id if hasattr(g, 'user_id') and g.user_id else data.get('user_id')
+        user_id = g.user_id
         node_id = data.get('node_id')
         ip_raw = request.remote_addr or ''
         ip_hash = hashlib.sha256(ip_raw.encode()).hexdigest()[:16]

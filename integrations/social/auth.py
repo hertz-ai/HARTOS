@@ -64,7 +64,7 @@ def generate_api_token() -> str:
     return secrets.token_urlsafe(64)
 
 
-def generate_jwt(user_id: str, username: str) -> str:
+def generate_jwt(user_id: str, username: str, role: str = 'flat') -> str:
     mgr = _get_jwt_manager()
     if mgr:
         return mgr.generate_access_token(str(user_id), username)
@@ -73,6 +73,7 @@ def generate_jwt(user_id: str, username: str) -> str:
         payload = {
             'user_id': str(user_id),
             'username': username,
+            'role': role or 'flat',
             'jti': str(uuid.uuid4()),
             'iat': int(time.time()),
             'exp': int(time.time()) + TOKEN_EXPIRY,
@@ -82,13 +83,13 @@ def generate_jwt(user_id: str, username: str) -> str:
     return generate_api_token()
 
 
-def generate_token_pair(user_id: str, username: str) -> dict:
+def generate_token_pair(user_id: str, username: str, role: str = 'flat') -> dict:
     """Generate access + refresh token pair."""
     mgr = _get_jwt_manager()
     if mgr:
         return mgr.generate_token_pair(str(user_id), username)
     return {
-        'access_token': generate_jwt(user_id, username),
+        'access_token': generate_jwt(user_id, username, role),
         'refresh_token': generate_api_token(),
         'token_type': 'bearer',
         'expires_in': TOKEN_EXPIRY,
@@ -218,5 +219,29 @@ def require_moderator(f):
     def decorated(*args, **kwargs):
         if not (g.user.is_admin or g.user.is_moderator):
             return jsonify({'success': False, 'error': 'Moderator access required'}), 403
+        return f(*args, **kwargs)
+    return decorated
+
+
+def require_central(f):
+    """Decorator: requires central (cloud admin) role."""
+    @wraps(f)
+    @require_auth
+    def decorated(*args, **kwargs):
+        user_role = getattr(g.user, 'role', None) or 'flat'
+        if user_role != 'central' and not g.user.is_admin:
+            return jsonify({'success': False, 'error': 'Central access required'}), 403
+        return f(*args, **kwargs)
+    return decorated
+
+
+def require_regional(f):
+    """Decorator: requires regional or central role."""
+    @wraps(f)
+    @require_auth
+    def decorated(*args, **kwargs):
+        user_role = getattr(g.user, 'role', None) or 'flat'
+        if user_role not in ('central', 'regional') and not (g.user.is_admin or g.user.is_moderator):
+            return jsonify({'success': False, 'error': 'Regional access required'}), 403
         return f(*args, **kwargs)
     return decorated

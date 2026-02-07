@@ -8,7 +8,7 @@ from .models import get_engine, Base
 
 logger = logging.getLogger('hevolve_social')
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 
 def get_schema_version(engine) -> int:
@@ -333,3 +333,19 @@ def run_migrations():
                 pass
             conn.commit()
         set_schema_version(engine, 14)
+
+    if current < 15:
+        logger.info("HevolveSocial: migrating to v15 (User role field - central/regional/flat)")
+        with engine.connect() as conn:
+            try:
+                conn.execute(text("ALTER TABLE users ADD COLUMN role VARCHAR(20) DEFAULT 'flat'"))
+            except Exception:
+                pass  # Column may already exist
+            # Backfill: is_admin -> central, is_moderator (non-admin) -> regional
+            try:
+                conn.execute(text("UPDATE users SET role = 'central' WHERE is_admin = 1"))
+                conn.execute(text("UPDATE users SET role = 'regional' WHERE is_moderator = 1 AND is_admin = 0"))
+            except Exception:
+                pass
+            conn.commit()
+        set_schema_version(engine, 15)
