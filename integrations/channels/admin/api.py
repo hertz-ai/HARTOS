@@ -1165,6 +1165,32 @@ def execute_workflow(workflow_id: str):
     }
 
 
+@admin_bp.route("/automation/workflows/<workflow_id>/enable", methods=["POST"])
+@api_response
+def enable_workflow(workflow_id: str):
+    """Enable a workflow."""
+    api = get_api()
+    if workflow_id not in api._workflows:
+        raise FileNotFoundError(f"Workflow {workflow_id} not found")
+
+    api._workflows[workflow_id].enabled = True
+    api._save_config()
+    return {"workflow": workflow_id, "enabled": True}
+
+
+@admin_bp.route("/automation/workflows/<workflow_id>/disable", methods=["POST"])
+@api_response
+def disable_workflow(workflow_id: str):
+    """Disable a workflow."""
+    api = get_api()
+    if workflow_id not in api._workflows:
+        raise FileNotFoundError(f"Workflow {workflow_id} not found")
+
+    api._workflows[workflow_id].enabled = False
+    api._save_config()
+    return {"workflow": workflow_id, "enabled": False}
+
+
 # Scheduled Messages
 @admin_bp.route("/automation/scheduled-messages", methods=["GET"])
 @api_response
@@ -1345,6 +1371,21 @@ def delete_avatar(avatar_id: str):
     del api._avatars[avatar_id]
     api._save_config()
     return {"deleted": avatar_id}
+
+
+@admin_bp.route("/identity/avatars/<avatar_id>/default", methods=["POST"])
+@api_response
+def set_default_avatar(avatar_id: str):
+    """Set an avatar as the default."""
+    api = get_api()
+    if avatar_id not in api._avatars:
+        raise FileNotFoundError(f"Avatar {avatar_id} not found")
+
+    for a in api._avatars.values():
+        a.is_default = False
+    api._avatars[avatar_id].is_default = True
+    api._save_config()
+    return api._avatars[avatar_id].to_dict()
 
 
 @admin_bp.route("/identity/sender-mappings", methods=["GET"])

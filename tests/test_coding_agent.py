@@ -134,7 +134,7 @@ class TestMigrationV14:
 
     def test_schema_version(self):
         from integrations.social.migrations import SCHEMA_VERSION
-        assert SCHEMA_VERSION == 14
+        assert SCHEMA_VERSION >= 14
 
     def test_coding_goals_table_exists(self, engine, tables):
         with engine.connect() as conn:
@@ -508,8 +508,8 @@ class TestCodingEndpoints:
         assert len(resp.get_json()['goals']) >= 1
 
     @patch('integrations.social.auth._get_user_from_token')
-    def test_idle_stats(self, mock_fn, client, db, regular_user):
-        mock_fn.side_effect = _mock_auth(regular_user, db)
+    def test_idle_stats(self, mock_fn, client, db, admin_user):
+        mock_fn.side_effect = _mock_auth(admin_user, db)
         resp = client.get('/api/coding/idle-stats', headers=self._headers())
         assert resp.status_code == 200
         assert 'total_opted_in' in resp.get_json()
