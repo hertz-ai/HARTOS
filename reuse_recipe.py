@@ -793,15 +793,7 @@ def get_frame(user_id):
 
 # TODO Reset action order after it reaches end.
 def create_agents_for_role(user_id: str, prompt_id):
-
-    config_list = [{
-        "model": 'gpt-4.1',
-        "api_type": "azure",
-        "api_key": '8MMPerfdfcpx63VfIVtg2lpAK7Crv7O5JKiKwhusVhgJNkC8Ql6FJQQJ99BAACHYHv6XJ3w3AAABACOGdxWW',
-        "base_url": 'https://hertzai-gpt4.openai.azure.com/openai/deployments/gpt-4.1/chat/completions?api-version=2025-01-01-preview',
-        "api_version": "2024-12-01-preview",
-        "price": [0.0025, 0.01]
-    }]
+    # Uses module-level config_list (localhost:8080 for local, Azure for cloud)
     current_app.logger.info('INSIDE create_agents_for_role')
 
     # Create a basic function calling config
