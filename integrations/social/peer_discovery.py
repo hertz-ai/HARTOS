@@ -411,6 +411,9 @@ class GossipProtocol:
         peer_tier = peer_data.get('tier', 'flat')
         certificate = peer_data.get('certificate')
         certificate_verified = False
+        if peer_tier in ('regional', 'central') and not certificate:
+            logger.warning(f"Rejecting {node_id[:8]}: {peer_tier} tier requires certificate")
+            return False
         if peer_tier in ('regional', 'central') and certificate:
             try:
                 from security.key_delegation import verify_certificate_chain
@@ -458,7 +461,9 @@ class GossipProtocol:
                 existing.certificate_json = certificate
                 existing.certificate_verified = certificate_verified
             if existing.status == 'dead':
-                existing.status = 'active'  # resurrect
+                # Only resurrect if announcement is recent (not stale gossip)
+                if (datetime.utcnow() - existing.last_seen).total_seconds() < 60:
+                    existing.status = 'active'
             return False
 
         new_peer = PeerNode(

@@ -410,14 +410,15 @@ class IntegrityService:
             except (ValueError, TypeError):
                 pass
 
-        # Verify signature if available
-        if signature and public_key:
-            try:
-                from security.node_integrity import verify_json_signature
-                if not verify_json_signature(public_key, witness_data, signature):
-                    return {'witnessed': False, 'reason': 'Invalid signature'}
-            except Exception:
-                pass
+        # Verify signature (required — omitting signature is not allowed)
+        if not signature or not public_key:
+            return {'witnessed': False, 'reason': 'Missing signature or public key'}
+        try:
+            from security.node_integrity import verify_json_signature
+            if not verify_json_signature(public_key, witness_data, signature):
+                return {'witnessed': False, 'reason': 'Invalid signature'}
+        except Exception:
+            return {'witnessed': False, 'reason': 'Signature verification failed'}
 
         # Co-sign the witness
         try:

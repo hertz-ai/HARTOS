@@ -45,7 +45,7 @@ class IdleDetectionService:
             # Idle if ALL actions are TERMINATED or COMPLETED
             for key, state in states.items():
                 if state not in (ActionState.TERMINATED, ActionState.COMPLETED,
-                                 ActionState.ERROR, ActionState.RECIPE_RECEIVED):
+                                 ActionState.ERROR):
                     return False
             return True
         except ImportError:

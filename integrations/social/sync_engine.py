@@ -135,10 +135,10 @@ class SyncEngine:
                 item.error_message = str(e)
                 failed += 1
 
-        # Drop items that exceeded max retries
+        # Mark items that exceeded max retries as dead (stop retrying)
         for item in items:
             if item.status == 'failed' and (item.retry_count or 0) >= (item.max_retries or 5):
-                item.status = 'failed'
+                item.status = 'dead'
                 item.error_message = f'Max retries exceeded: {item.error_message}'
 
         db.flush()
@@ -161,6 +161,14 @@ class SyncEngine:
             op = item.get('operation_type', '')
             payload = item.get('payload', {})
             item_id = item.get('id', '')
+
+            # Idempotency: skip already-processed items
+            if item_id and db:
+                from .models import SyncQueue
+                existing = db.query(SyncQueue).filter_by(id=item_id).first()
+                if existing and existing.status in ('completed', 'dead'):
+                    processed.append(item_id)
+                    continue
 
             try:
                 if op == 'register_agent':

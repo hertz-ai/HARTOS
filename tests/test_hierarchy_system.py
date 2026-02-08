@@ -781,7 +781,7 @@ class TestTierAwareGossip:
         assert info['tier'] == 'central'
 
     def test_merge_peer_stores_tier(self, db):
-        """When merging a peer with tier info, it should be stored."""
+        """When merging a peer with tier info and certificate, it should be stored."""
         from integrations.social.peer_discovery import GossipProtocol
         g = GossipProtocol()
         peer_data = {
@@ -790,8 +790,17 @@ class TestTierAwareGossip:
             'name': 'tier-test',
             'version': '1.0.0',
             'tier': 'regional',
+            'certificate': {
+                'node_id': f'tier-merge-test',
+                'tier': 'regional',
+                'parent_public_key': 'abc123',
+                'signature': 'sig123',
+                'expires_at': (datetime.utcnow().replace(year=datetime.utcnow().year + 1)).isoformat(),
+            },
         }
-        is_new = g._merge_peer(db, peer_data)
+        with patch('security.key_delegation.verify_certificate_chain', return_value={'valid': True}), \
+             patch('security.master_key.get_enforcement_mode', return_value='hard'):
+            is_new = g._merge_peer(db, peer_data)
         assert is_new is True
         stored = db.query(PeerNode).filter_by(node_id=peer_data['node_id']).first()
         assert stored.tier == 'regional'

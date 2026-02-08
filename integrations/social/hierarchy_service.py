@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Optional, Dict, List
 
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 
 logger = logging.getLogger('hevolve_social')
 
@@ -228,8 +229,10 @@ class HierarchyService:
             peer.region_assignment_id = assignment.id
             peer.parent_node_id = best_regional.node_id
 
-        # Increment user count on regional
-        best_regional.active_user_count = (best_regional.active_user_count or 0) + 1
+        # Atomic increment — prevents race when multiple nodes assigned concurrently
+        db.query(PeerNode).filter_by(node_id=best_regional.node_id).update(
+            {PeerNode.active_user_count: func.coalesce(PeerNode.active_user_count, 0) + 1}
+        )
         db.flush()
 
         return {

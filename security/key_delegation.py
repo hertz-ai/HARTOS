@@ -146,11 +146,14 @@ def verify_certificate_chain(
     except Exception as e:
         chain_details = f'Chain verification error: {e}'
 
-    # Check expiry
+    # Check expiry (expires_at is mandatory — perpetual certs are rejected)
     if chain_valid:
         try:
             expires_str = certificate.get('expires_at', '')
-            if expires_str:
+            if not expires_str:
+                chain_valid = False
+                chain_details = 'Certificate missing expires_at field'
+            elif expires_str:
                 expires = datetime.fromisoformat(expires_str)
                 if expires.tzinfo is None:
                     expires = expires.replace(tzinfo=timezone.utc)

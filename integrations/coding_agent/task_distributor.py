@@ -38,6 +38,6 @@ def dispatch_to_chat(prompt: str, user_id: str, goal_id: str) -> Optional[str]:
             result = resp.json()
             return result.get('response', '')
     except requests.RequestException as e:
-        logger.debug(f"Chat dispatch failed for goal {goal_id}: {e}")
+        logger.warning(f"Chat dispatch failed for goal {goal_id}: {e}")
 
     return None

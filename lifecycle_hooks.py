@@ -9,21 +9,27 @@ It also provides functions to sync ActionState with SmartLedger TaskStatus.
 from enum import Enum
 import logging
 import os
+import threading
 from typing import Dict, Optional, Any
 
 logger = logging.getLogger(__name__)
+
+# Lock protecting _ledger_registry and action_states (accessed by multiple Waitress/Gunicorn threads)
+_state_lock = threading.RLock()
 
 # Global ledger registry for auto-sync
 _ledger_registry: Dict[str, Any] = {}
 
 def register_ledger_for_session(user_prompt: str, ledger: Any):
     """Register a ledger instance for a session to enable auto-sync."""
-    _ledger_registry[user_prompt] = ledger
+    with _state_lock:
+        _ledger_registry[user_prompt] = ledger
     logger.debug(f"Registered ledger for {user_prompt}")
 
 def get_registered_ledger(user_prompt: str) -> Optional[Any]:
     """Get the registered ledger for a session."""
-    return _ledger_registry.get(user_prompt)
+    with _state_lock:
+        return _ledger_registry.get(user_prompt)
 
 def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState'):
     """Auto-sync state change to ledger if registered."""
@@ -173,10 +179,11 @@ def set_action_state(user_prompt: str, action_id: int, state: ActionState, reaso
         raise StateTransitionError(
             f"Invalid transition: Action {action_id} cannot go from {current_state.value} to {state.value}")
 
-    # Perform transition
-    if user_prompt not in action_states:
-        action_states[user_prompt] = {}
-    action_states[user_prompt][action_id] = state
+    # Perform transition (lock protects check-then-act on shared dict)
+    with _state_lock:
+        if user_prompt not in action_states:
+            action_states[user_prompt] = {}
+        action_states[user_prompt][action_id] = state
     logger.info(f"[TARGET] Action {action_id}: {current_state.value} → {state.value} ({reason})")
 
     # Auto-sync to ledger if registered
@@ -273,7 +280,8 @@ action_states = {}  # {user_prompt: {action_id: current_state}}
 
 def get_action_state(user_prompt: str, action_id: int) -> ActionState:
     """Get current state of an action."""
-    return action_states.get(user_prompt, {}).get(action_id, ActionState.ASSIGNED)
+    with _state_lock:
+        return action_states.get(user_prompt, {}).get(action_id, ActionState.ASSIGNED)
 
 
 def validate_state_transition(user_prompt: str, action_id: int, new_state: ActionState) -> bool:

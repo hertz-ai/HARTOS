@@ -65,11 +65,16 @@ class CodingAgentDaemon:
                 return
 
             dispatched = 0
+            used_agents = set()
             max_concurrent = int(os.environ.get('HEVOLVE_CODING_MAX_CONCURRENT', '10'))
             for goal in goals:
                 if dispatched >= len(idle_agents) or dispatched >= max_concurrent:
                     break
                 agent = idle_agents[dispatched]
+                if agent['user_id'] in used_agents:
+                    dispatched += 1
+                    continue
+                used_agents.add(agent['user_id'])
                 prompt = CodingGoalManager.build_prompt(goal.to_dict())
                 dispatch_to_chat(prompt, str(agent['user_id']), goal.id)
                 dispatched += 1

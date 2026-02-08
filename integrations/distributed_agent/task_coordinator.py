@@ -153,12 +153,15 @@ class DistributedTaskCoordinator:
         self._ledger.complete_task(task_id, result=result)
         self._lock.release_task(task_id, agent_id)
 
+        # Store result_hash so verify_result() can compare later
+        task = self._ledger.get_task(task_id)
+        if task:
+            task.context["result_hash"] = result_hash
+            self._ledger.save()
+
         # Publish verification request if pubsub is enabled
         if hasattr(self._ledger, '_pubsub') and self._ledger._pubsub:
             self._ledger._pubsub.publish_verification_request(task_id, result_hash)
-
-        # Notify the agent owner about the contribution
-        task = self._ledger.get_task(task_id)
         self._notify_goal_contribution(
             task_id, agent_id,
             task.description if task else "a task",

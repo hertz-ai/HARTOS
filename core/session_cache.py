@@ -89,6 +89,14 @@ class TTLCache:
         except KeyError:
             return default
 
+    def setdefault(self, key, default=None):
+        with self._lock:
+            if key in self._data and not self._is_expired(key):
+                return self._data[key]
+            self._data[key] = default
+            self._timestamps[key] = time.monotonic()
+            return default
+
     def pop(self, key, *args):
         with self._lock:
             if key in self._data:

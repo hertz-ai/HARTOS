@@ -1,7 +1,7 @@
 {
   "agent_id": 999,
   "session_id": 8001,
-  "last_updated": "2026-02-06T16:08:08.336378",
+  "last_updated": "2026-02-08T18:10:48.097636",
   "task_order": [
     "parent_1",
     "parent_1_child_1",
@@ -9,6 +9,7 @@
     "parent_1_sibling_1",
     "parent_1_sibling_2",
     "parent_1_sibling_3",
+    "parent_1",
     "parent_1",
     "parent_1",
     "parent_1",
@@ -25,15 +26,15 @@
       "context": {},
       "priority": 50,
       "parent_task_id": null,
-      "created_at": "2026-02-06T16:08:08.336378",
-      "updated_at": "2026-02-06T16:08:08.336378",
+      "created_at": "2026-02-08T18:10:48.090119",
+      "updated_at": "2026-02-08T18:10:48.097636",
       "completed_at": null,
       "error_message": null,
       "result": null,
       "state_history": [
         {
           "status": "pending",
-          "timestamp": "2026-02-06T16:08:08.336378",
+          "timestamp": "2026-02-08T18:10:48.090119",
           "reason": "Task created"
         }
       ],
@@ -85,15 +86,15 @@
       "context": {},
       "priority": 50,
       "parent_task_id": "parent_1",
-      "created_at": "2026-02-06T16:08:08.336378",
-      "updated_at": "2026-02-06T16:08:08.336378",
+      "created_at": "2026-02-08T18:10:48.090119",
+      "updated_at": "2026-02-08T18:10:48.090119",
       "completed_at": null,
       "error_message": null,
       "result": null,
       "state_history": [
         {
           "status": "pending",
-          "timestamp": "2026-02-06T16:08:08.336378",
+          "timestamp": "2026-02-08T18:10:48.090119",
           "reason": "Task created"
         }
       ],
@@ -139,15 +140,15 @@
       "context": {},
       "priority": 50,
       "parent_task_id": "parent_1",
-      "created_at": "2026-02-06T16:08:08.336378",
-      "updated_at": "2026-02-06T16:08:08.336378",
+      "created_at": "2026-02-08T18:10:48.097636",
+      "updated_at": "2026-02-08T18:10:48.097636",
       "completed_at": null,
       "error_message": null,
       "result": null,
       "state_history": [
         {
           "status": "pending",
-          "timestamp": "2026-02-06T16:08:08.336378",
+          "timestamp": "2026-02-08T18:10:48.097636",
           "reason": "Task created"
         }
       ],
@@ -193,15 +194,15 @@
       "context": {},
       "priority": 50,
       "parent_task_id": "parent_1",
-      "created_at": "2026-02-06T16:08:08.336378",
-      "updated_at": "2026-02-06T16:08:08.336378",
+      "created_at": "2026-02-08T18:10:48.097636",
+      "updated_at": "2026-02-08T18:10:48.097636",
       "completed_at": null,
       "error_message": null,
       "result": null,
       "state_history": [
         {
           "status": "pending",
-          "timestamp": "2026-02-06T16:08:08.336378",
+          "timestamp": "2026-02-08T18:10:48.097636",
           "reason": "Task created"
         }
       ],
@@ -250,15 +251,15 @@
       "context": {},
       "priority": 50,
       "parent_task_id": "parent_1",
-      "created_at": "2026-02-06T16:08:08.336378",
-      "updated_at": "2026-02-06T16:08:08.336378",
+      "created_at": "2026-02-08T18:10:48.097636",
+      "updated_at": "2026-02-08T18:10:48.097636",
       "completed_at": null,
       "error_message": null,
       "result": null,
       "state_history": [
         {
           "status": "pending",
-          "timestamp": "2026-02-06T16:08:08.336378",
+          "timestamp": "2026-02-08T18:10:48.097636",
           "reason": "Task created"
         }
       ],
@@ -307,15 +308,15 @@
       "context": {},
       "priority": 50,
       "parent_task_id": "parent_1",
-      "created_at": "2026-02-06T16:08:08.336378",
-      "updated_at": "2026-02-06T16:08:08.336378",
+      "created_at": "2026-02-08T18:10:48.097636",
+      "updated_at": "2026-02-08T18:10:48.097636",
       "completed_at": null,
       "error_message": null,
       "result": null,
       "state_history": [
         {
           "status": "pending",
-          "timestamp": "2026-02-06T16:08:08.336378",
+          "timestamp": "2026-02-08T18:10:48.097636",
           "reason": "Task created"
         }
       ],

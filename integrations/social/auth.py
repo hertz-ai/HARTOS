@@ -110,7 +110,10 @@ def decode_jwt(token: str) -> dict:
         return result or {}
     if HAS_JWT:
         try:
-            return pyjwt.decode(token, SECRET_KEY, algorithms=['HS256'])
+            payload = pyjwt.decode(token, SECRET_KEY, algorithms=['HS256'])
+            if payload.get('type') not in ('access', None):
+                return {}  # Reject non-access tokens (e.g. refresh tokens)
+            return payload
         except (pyjwt.ExpiredSignatureError, pyjwt.InvalidTokenError):
             return {}
     return {}

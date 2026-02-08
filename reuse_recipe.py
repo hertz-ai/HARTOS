@@ -175,8 +175,8 @@ _active_tools_lock = threading.Lock()
 
 redis_client = redis.StrictRedis(
     host='azure_all_vms.hertzai.com', port=6369, db=0)
-agent_data = {}
-user_simplemem = {}  # {user_prompt: SimpleMemStore} for long-term memory
+agent_data = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_agent_data')
+user_simplemem = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_simplemem')
 # Azure OpenAI configuration (fallback - gpt-4o)
 # config_list = [{
 #     "model": 'gpt-4o',
@@ -3236,20 +3236,20 @@ def create_schedule(prompt_id, user_id):
         current_app.logger.error(f'Some Error in creating scheduled tasks error:{e}')
 
 
-recent_file_id = {}
-recipes = {}
-user_tasks = {}
-user_ledgers = {}  # Dictionary to store SmartLedger instances per user_prompt (same as create_recipe.py)
-user_delegation_bridges = {}  # Dictionary to store TaskDelegationBridge instances per user_prompt
-request_id_list = {}
-request_id_list_sent_intermediate = {}
+recent_file_id = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_recent_file_id')
+# NOTE: recipes TTLCache already defined at module top (line 166) — do NOT redefine here
+user_tasks = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_tasks')
+user_ledgers = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_ledgers')
+user_delegation_bridges = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_delegation_bridges')
+request_id_list = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_request_id_list')
+request_id_list_sent_intermediate = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_request_id_list_sent_intermediate')
 
-time_actions = {}
-final_recipe = {}
+time_actions = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_time_actions')
+final_recipe = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_final_recipe')
 
 # Signals from autogen agents that a new agent creation is needed
 # Keyed by user_prompt (f'{user_id}_{prompt_id}'), set by create_new_agent tool
-creation_signals = {}
+creation_signals = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_creation_signals')
 
 
 # =============================================================================

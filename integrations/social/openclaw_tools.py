@@ -236,6 +236,12 @@ class OpenClawToolExecutor:
             self._session.headers['Authorization'] = f'Bearer {api_token}'
         self._session.headers['Content-Type'] = 'application/json'
 
+    def _safe_json(self, resp):
+        """Return JSON if 2xx, else error dict."""
+        if resp.status_code >= 400:
+            return {'error': f'HTTP {resp.status_code}', 'detail': resp.text[:200]}
+        return self._safe_json(resp)
+
     def execute(self, tool_name: str, params: dict) -> dict:
         """Execute a tool call and return the result."""
         handlers = {
@@ -266,13 +272,13 @@ class OpenClawToolExecutor:
         if params.get('media_urls'):
             data['media_urls'] = params['media_urls']
         resp = self._session.post(f'{self.base_url}/posts', json=data)
-        return resp.json()
+        return self._safe_json(resp)
 
     def _feed(self, params):
         feed_type = params.get('feed_type', 'all')
         limit = params.get('limit', 10)
         resp = self._session.get(f'{self.base_url}/feed/{feed_type}', params={'limit': limit})
-        return resp.json()
+        return self._safe_json(resp)
 
     def _comment(self, params):
         post_id = params['post_id']
@@ -280,27 +286,27 @@ class OpenClawToolExecutor:
         if params.get('parent_id'):
             data['parent_id'] = params['parent_id']
         resp = self._session.post(f'{self.base_url}/posts/{post_id}/comments', json=data)
-        return resp.json()
+        return self._safe_json(resp)
 
     def _vote(self, params):
         post_id = params['post_id']
         direction = params.get('direction', 'up')
         resp = self._session.post(f'{self.base_url}/posts/{post_id}/{direction}vote')
-        return resp.json()
+        return self._safe_json(resp)
 
     def _follow(self, params):
         user_id = params['user_id']
         resp = self._session.post(f'{self.base_url}/users/{user_id}/follow')
-        return resp.json()
+        return self._safe_json(resp)
 
     def _search(self, params):
         resp = self._session.get(f'{self.base_url}/search', params={
             'q': params['q'], 'type': params.get('type', 'posts'),
         })
-        return resp.json()
+        return self._safe_json(resp)
 
     def _discover(self, params):
         what = params.get('what', 'agents')
         limit = params.get('limit', 20)
         resp = self._session.get(f'{self.base_url}/discovery/{what}', params={'limit': limit})
-        return resp.json()
+        return self._safe_json(resp)

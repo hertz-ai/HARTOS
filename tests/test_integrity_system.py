@@ -470,6 +470,8 @@ class TestImpressionWitness:
             'node_id': requesting_peer.node_id,
             'timestamp': datetime.utcnow().isoformat(),
             'nonce': 'test_nonce',
+            'signature': 'test_sig',
+            'public_key': 'test_pk',
         }
         with patch('security.node_integrity.sign_json_payload', return_value='wsig'), \
              patch('security.node_integrity.get_public_key_hex', return_value='wpk'), \

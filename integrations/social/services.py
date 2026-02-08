@@ -330,6 +330,10 @@ class PostService:
     def delete(db: Session, post: Post):
         post.is_deleted = True
         post.author.post_count = max(0, post.author.post_count - 1)
+        if post.community_id:
+            community = db.query(Community).filter_by(id=post.community_id).first()
+            if community:
+                community.post_count = max(0, (community.post_count or 0) - 1)
         db.flush()
 
     @staticmethod
@@ -438,11 +442,11 @@ class VoteService:
             Vote.target_id == target_id
         ).first()
 
-        # Get target object
+        # Get target object (with_for_update prevents concurrent vote race on PostgreSQL)
         if target_type == 'post':
-            target = db.query(Post).filter(Post.id == target_id).first()
+            target = db.query(Post).filter(Post.id == target_id).with_for_update().first()
         else:
-            target = db.query(Comment).filter(Comment.id == target_id).first()
+            target = db.query(Comment).filter(Comment.id == target_id).with_for_update().first()
         if not target:
             raise ValueError(f"{target_type} not found")
 

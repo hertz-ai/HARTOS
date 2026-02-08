@@ -261,11 +261,13 @@ def log_tool_execution(func):
         return wrapper
 
 
+from core.session_cache import TTLCache  # early import — needed before first TTLCache usage below
+
 scheduler = BackgroundScheduler()
 scheduler.start()
 
-user_agents: Dict[str, Tuple[Any, Any, Any, Any, Any, Any, Any]] = {}
-time_agents = {}
+user_agents: Dict[str, Tuple[Any, Any, Any, Any, Any, Any, Any]] = TTLCache(ttl_seconds=7200, max_size=500, name='create_user_agents')
+time_agents = TTLCache(ttl_seconds=7200, max_size=500, name='create_time_agents')
 # Local llama.cpp server (Qwen3-VL) - ACTIVE
 config_list = [{
         "model": 'Qwen3-VL-4B-Instruct',
@@ -287,7 +289,6 @@ config_list = [{
 from core.config_cache import get_config as _get_config
 from core.http_pool import pooled_post, pooled_get, pooled_request
 from core.event_loop import get_or_create_event_loop
-from core.session_cache import TTLCache
 
 config = _get_config()
 STUDENT_API = config.get('STUDENT_API', '')
@@ -297,7 +298,7 @@ redis_client = redis.StrictRedis(
 
 
 # Performance: TTL caches replace unbounded global dicts (auto-expire after 2 hours)
-agent_data = {}
+agent_data = TTLCache(ttl_seconds=7200, max_size=500, name='create_agent_data')
 user_simplemem = TTLCache(ttl_seconds=7200, max_size=500, name='user_simplemem')
 task_time = TTLCache(ttl_seconds=7200, max_size=500, name='task_time')
 agent_metadata = TTLCache(ttl_seconds=7200, max_size=500, name='agent_metadata')
@@ -3346,9 +3347,9 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
 
 
 
-user_tasks = {}
-user_ledgers = {}  # Dictionary to store SmartLedger instances per user_prompt
-user_delegation_bridges = {}  # Dictionary to store TaskDelegationBridge instances per user_prompt
+user_tasks = TTLCache(ttl_seconds=7200, max_size=500, name='create_user_tasks')
+user_ledgers = TTLCache(ttl_seconds=7200, max_size=500, name='create_user_ledgers')
+user_delegation_bridges = TTLCache(ttl_seconds=7200, max_size=500, name='create_user_delegation_bridges')
 
 
 # =============================================================================
@@ -4469,11 +4470,11 @@ def track_lifecycle_hooks(current_action_id, group_chat, user_prompt):
     lifecycle_hook_track_termination(user_prompt, user_tasks, group_chat)  # 11. Track termination
     return current_action_id
 
-messages = {}
-recent_file_id = {}
-request_id_list = {}
-recipe_for_persona = {}
-total_persona_actions = {}
+messages = TTLCache(ttl_seconds=7200, max_size=500, name='create_messages')
+recent_file_id = TTLCache(ttl_seconds=7200, max_size=500, name='create_recent_file_id')
+request_id_list = TTLCache(ttl_seconds=7200, max_size=500, name='create_request_id_list')
+recipe_for_persona = TTLCache(ttl_seconds=7200, max_size=500, name='create_recipe_for_persona')
+total_persona_actions = TTLCache(ttl_seconds=7200, max_size=500, name='create_total_persona_actions')
 
 
 # FIX: Resume Logic Issues - Replace detect_and_resume_progress function

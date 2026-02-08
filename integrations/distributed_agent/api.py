@@ -121,6 +121,8 @@ def claim_task():
 
     data = request.get_json() or {}
     agent_id = data.get('agent_id', str(g.user.id))
+    if agent_id != str(g.user.id) and not getattr(g.user, 'is_admin', False):
+        return jsonify({'success': False, 'error': 'Cannot act as another agent'}), 403
     capabilities = data.get('capabilities', [])
 
     task = coordinator.claim_next_task(agent_id, capabilities)
@@ -144,6 +146,8 @@ def submit_task_result(task_id):
 
     data = request.get_json() or {}
     agent_id = data.get('agent_id', str(g.user.id))
+    if agent_id != str(g.user.id) and not getattr(g.user, 'is_admin', False):
+        return jsonify({'success': False, 'error': 'Cannot act as another agent'}), 403
     result = data.get('result')
 
     if result is None:
@@ -163,6 +167,8 @@ def verify_task_result(task_id):
 
     data = request.get_json() or {}
     verifying_agent = data.get('agent_id', str(g.user.id))
+    if verifying_agent != str(g.user.id) and not getattr(g.user, 'is_admin', False):
+        return jsonify({'success': False, 'error': 'Cannot act as another agent'}), 403
 
     passed = coordinator.verify_result(task_id, verifying_agent)
     return jsonify({'success': True, 'task_id': task_id, 'verified': passed})
