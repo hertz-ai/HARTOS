@@ -2,9 +2,14 @@
 HevolveSocial - Service Layer
 All business logic for posts, comments, votes, users, communities, follows, notifications.
 """
+import re
 import uuid
+import logging
+import threading
 from datetime import datetime, timedelta
 from typing import Optional, List, Tuple
+
+logger = logging.getLogger('hevolve_social')
 
 from sqlalchemy import desc, asc, func
 from sqlalchemy.orm import Session, joinedload
@@ -28,9 +33,13 @@ class UserService:
     def register(db: Session, username: str, password: str, email: str = None,
                  display_name: str = None, user_type: str = 'human') -> User:
         if db.query(User).filter(User.username == username).first():
-            raise ValueError(f"Username '{username}' already taken")
-        if email and db.query(User).filter(User.email == email).first():
-            raise ValueError(f"Email already registered")
+            raise ValueError("Registration failed — username or email may already be in use")
+        if email:
+            # Basic email format validation
+            if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
+                raise ValueError("Invalid email address format")
+            if db.query(User).filter(User.email == email).first():
+                raise ValueError("Registration failed — username or email may already be in use")
 
         user = User(
             id=_uuid(), username=username, display_name=display_name or username,
@@ -77,13 +86,45 @@ class UserService:
             User.user_type == 'agent',
         ).all()
 
+    # Account lockout: track failed attempts per username
+    _login_attempts = {}  # username -> (count, first_attempt_at)
+    _login_lock = threading.Lock()
+    _MAX_ATTEMPTS = 5
+    _LOCKOUT_MINUTES = 15
+
     @staticmethod
     def login(db: Session, username: str, password: str) -> Tuple[User, str]:
+        # Check lockout
+        with UserService._login_lock:
+            entry = UserService._login_attempts.get(username)
+            if entry:
+                count, first_at = entry
+                elapsed = (datetime.utcnow() - first_at).total_seconds()
+                if count >= UserService._MAX_ATTEMPTS and elapsed < UserService._LOCKOUT_MINUTES * 60:
+                    remaining = int(UserService._LOCKOUT_MINUTES - elapsed / 60)
+                    raise ValueError(f"Account temporarily locked. Try again in {remaining} minutes")
+                if elapsed >= UserService._LOCKOUT_MINUTES * 60:
+                    del UserService._login_attempts[username]
+
         user = db.query(User).filter(User.username == username).first()
-        if not user or not verify_password(password, user.password_hash):
+        # Always run password verification to prevent timing-based user enumeration
+        _dummy_hash = "0" * 32 + ":" + "0" * 64
+        if not verify_password(password, user.password_hash if user else _dummy_hash):
+            # Record failed attempt
+            with UserService._login_lock:
+                entry = UserService._login_attempts.get(username)
+                if entry:
+                    UserService._login_attempts[username] = (entry[0] + 1, entry[1])
+                else:
+                    UserService._login_attempts[username] = (1, datetime.utcnow())
+            raise ValueError("Invalid username or password")
+        if not user:
             raise ValueError("Invalid username or password")
         if user.is_banned:
             raise ValueError("Account is banned")
+        # Clear lockout on successful login
+        with UserService._login_lock:
+            UserService._login_attempts.pop(username, None)
         token = generate_jwt(user.id, user.username, getattr(user, 'role', None) or 'flat')
         user.api_token = token
         user.last_active_at = datetime.utcnow()

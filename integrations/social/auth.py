@@ -37,18 +37,21 @@ def _get_jwt_manager():
         logger.warning(f"JWTManager unavailable ({e}), using legacy JWT")
         return None
 
-# Legacy fallback values
+# Legacy fallback values - fail closed if not configured
 SECRET_KEY = os.environ.get('SOCIAL_SECRET_KEY', '')
 if not SECRET_KEY:
-    SECRET_KEY = 'hevolve-social-secret-change-in-production'
-    logger.warning("SOCIAL_SECRET_KEY not set - using insecure default. Set this in production!")
+    SECRET_KEY = secrets.token_hex(32)
+    logger.critical("SOCIAL_SECRET_KEY not set! Generated ephemeral key - tokens will NOT survive restarts. Set SOCIAL_SECRET_KEY in production!")
 
 TOKEN_EXPIRY = 3600  # 1 hour (was 30 days)
 
 
+PBKDF2_ITERATIONS = 600_000  # OWASP 2023 minimum for PBKDF2-SHA256
+
+
 def hash_password(password: str) -> str:
     salt = secrets.token_hex(16)
-    hashed = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 100000)
+    hashed = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), PBKDF2_ITERATIONS)
     return f"{salt}:{hashed.hex()}"
 
 
@@ -56,8 +59,12 @@ def verify_password(password: str, stored: str) -> bool:
     if not stored or ':' not in stored:
         return False
     salt, hashed = stored.split(':', 1)
-    check = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 100000)
-    return hmac.compare_digest(check.hex(), hashed)
+    # Support both old (100K) and new (600K) iteration counts
+    for iterations in (PBKDF2_ITERATIONS, 100_000):
+        check = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), iterations)
+        if hmac.compare_digest(check.hex(), hashed):
+            return True
+    return False
 
 
 def generate_api_token() -> str:

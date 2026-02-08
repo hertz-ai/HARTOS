@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-ledger"
-version = "1.1.0"
-description = "A framework-agnostic task tracking system for AI agents with persistent memory, 15 task states, delegation, and rollback support"
+version = "1.2.0"
+description = "A framework-agnostic task tracking system for AI agents with persistent memory, 15 task states, delegation, distributed verification, and rollback support"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
@@ -49,6 +49,7 @@ dependencies = []  # Zero core dependencies!
 redis = ["redis>=4.0.0"]
 mongodb = ["pymongo>=4.0.0"]
 postgres = ["psycopg2-binary>=2.9.0"]
+distributed = ["redis>=4.0.0"]  # PubSub, heartbeat, distributed locking
 all = [
     "redis>=4.0.0",
     "pymongo>=4.0.0",

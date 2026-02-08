@@ -31,7 +31,7 @@ _public_key: Optional[Ed25519PublicKey] = None
 _EXCLUDE_DIRS = {
     '__pycache__', 'venv310', 'venv', '.venv', '.git', '.idea',
     'agent_data', 'tests', 'node_modules', 'hevolve_backend.egg-info',
-    'autogen-0.2.37', '.pycharm_plugin', 'scripts',
+    'autogen-0.2.37', '.pycharm_plugin',
 }
 
 

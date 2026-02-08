@@ -129,6 +129,10 @@ def full_boot_verification(code_root: str = None) -> dict:
     enforcement = get_enforcement_mode()
 
     if is_dev_mode():
+        import sys
+        msg = "WARNING: HEVOLVE_DEV_MODE=true — ALL security verification is BYPASSED. Do NOT use in production!"
+        print(f"\n{'='*70}\n{msg}\n{'='*70}\n", file=sys.stderr)
+        logger.critical(msg)
         return {'passed': True, 'enforcement': enforcement,
                 'details': 'Dev mode - verification bypassed', 'manifest': None}
 

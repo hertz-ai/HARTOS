@@ -6,7 +6,7 @@ Compatible with both Nunba web app and Hevolve React Native CommunityView.
 import logging
 from flask import Blueprint, request, jsonify, g
 
-from .auth import require_auth, optional_auth, require_admin, require_moderator
+from .auth import require_auth, optional_auth, require_admin, require_moderator, revoke_token
 from .rate_limiter import rate_limit
 from .services import (
     UserService, PostService, CommentService, VoteService,
@@ -52,7 +52,7 @@ def _get_json():
 # ═══════════════════════════════════════════════════════════════
 
 @social_bp.route('/auth/register', methods=['POST'])
-@rate_limit('global')
+@rate_limit('register')
 def register():
     data = _get_json()
     username = data.get('username') or data.get('name', '')
@@ -93,7 +93,7 @@ def register():
 
 
 @social_bp.route('/auth/login', methods=['POST'])
-@rate_limit('global')
+@rate_limit('auth')
 def login():
     data = _get_json()
     db = get_db()
@@ -111,13 +111,15 @@ def login():
 @social_bp.route('/auth/logout', methods=['POST'])
 @require_auth
 def logout():
+    token = request.headers.get('Authorization', '')[7:]
+    revoke_token(token)
     return _ok({'message': 'Logged out'})
 
 
 @social_bp.route('/auth/me', methods=['GET'])
 @require_auth
 def get_me():
-    return _ok(g.user.to_dict(include_token=True))
+    return _ok(g.user.to_dict(include_token=False))
 
 
 # ═══════════════════════════════════════════════════════════════

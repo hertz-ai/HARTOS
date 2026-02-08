@@ -1,4 +1,5 @@
 """create_recipe.py"""
+import ast
 import autogen
 import os
 from typing import Annotated, Optional, Dict, Tuple, List, Any
@@ -1634,7 +1635,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                         def format_action_text(text):
                             if text.strip().startswith("{") and "action" in text:
                                 try:
-                                    action_data = eval(text.strip())
+                                    action_data = ast.literal_eval(text.strip())
                                     action_type = action_data.get("action", "")
 
                                     if action_type == "mouse_move":
@@ -4181,7 +4182,7 @@ def after_all_actions_terminated(assistant_agent, chat_instructor, group_chat, j
                 if match:
                     break
             if match:
-                action_ids = eval(match.group())
+                action_ids = ast.literal_eval(match.group())
 
                 file_path = f'prompts/{prompt_id}_{flow}_{num}.json'
                 with open(file_path, 'r') as f:
@@ -4196,7 +4197,7 @@ def after_all_actions_terminated(assistant_agent, chat_instructor, group_chat, j
                 data['actions_this_action_depends_on'] = []
                 with open(file_path, 'w') as f:
                     json.dump(data, f, indent=4)
-        except Exception as e:
+        except (ValueError, SyntaxError) as e:
             current_app.logger.info(f'GOT ERROR AT EVAL OF LIST :{e}')
             file_path = f'prompts/{prompt_id}_{flow}_{num}.json'
             with open(file_path, 'r') as f:
@@ -4240,7 +4241,10 @@ def after_all_actions_terminated_from_exception(assistant_agent, chat_instructor
             if match:
                 break
         if match:
-            action_ids = eval(match.group())
+            try:
+                action_ids = ast.literal_eval(match.group())
+            except (ValueError, SyntaxError):
+                action_ids = []
             file_path = f'prompts/{prompt_id}_{flow}_{num}.json'
             with open(file_path, 'r') as f:
                 data = json.load(f)

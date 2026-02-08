@@ -341,10 +341,11 @@ def run_migrations():
                 conn.execute(text("ALTER TABLE users ADD COLUMN role VARCHAR(20) DEFAULT 'flat'"))
             except Exception:
                 pass  # Column may already exist
-            # Backfill: is_admin -> central, is_moderator (non-admin) -> regional
+            # Backfill: is_admin -> central, is_moderator (non-admin) -> regional, NULL -> flat
             try:
                 conn.execute(text("UPDATE users SET role = 'central' WHERE is_admin = 1"))
                 conn.execute(text("UPDATE users SET role = 'regional' WHERE is_moderator = 1 AND is_admin = 0"))
+                conn.execute(text("UPDATE users SET role = 'flat' WHERE role IS NULL"))
             except Exception:
                 pass
             conn.commit()

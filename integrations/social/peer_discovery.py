@@ -381,7 +381,8 @@ class GossipProtocol:
             except ImportError:
                 pass  # crypto module not available, accept unsigned
             except Exception as e:
-                logger.debug(f"Signature verification error for {node_id[:8]}: {e}")
+                logger.warning(f"Unexpected error verifying signature for {node_id[:8]}: {e}")
+                return False  # Reject on unexpected verification errors
 
         integrity_status = 'verified' if signature_valid else 'unverified'
 
@@ -418,6 +419,10 @@ class GossipProtocol:
                 certificate_verified = chain_result['valid']
                 enforcement = get_enforcement_mode()
                 if not certificate_verified:
+                    # Always reject invalid certificates for regional/central tiers
+                    if peer_tier in ('regional', 'central'):
+                        logger.warning(f"Rejecting peer {node_id[:8]}: {peer_tier} tier requires valid certificate")
+                        return False
                     if enforcement == 'hard':
                         logger.warning(f"Rejecting peer {node_id[:8]}: invalid certificate "
                                       f"for tier={peer_tier} (enforcement=hard)")

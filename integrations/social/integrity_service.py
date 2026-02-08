@@ -226,6 +226,9 @@ class IntegrityService:
         challenge = db.query(IntegrityChallenge).filter_by(id=challenge_id).first()
         if not challenge:
             return {'passed': False, 'details': 'Challenge not found'}
+        # Prevent replay: reject already-evaluated challenges
+        if challenge.status != 'pending':
+            return {'passed': False, 'details': f'Challenge already processed (status={challenge.status})'}
 
         challenge.response_data = response_data
         challenge.response_signature = response_signature
@@ -302,10 +305,29 @@ class IntegrityService:
 
     # ─── Impression Witnessing ───
 
+    # Rate limit: max witness requests per node per hour
+    _witness_request_counts = {}  # node_id -> (count, window_start)
+    _WITNESS_MAX_PER_HOUR = 100
+
     @staticmethod
     def request_nearest_witness(db: Session, impression_id: str,
                                  ad_id: str, requesting_node_id: str) -> Optional[Dict]:
         """Find nearest active non-banned peer and request a witness attestation."""
+        # Rate limit witness requests per node
+        now = datetime.utcnow()
+        counts = IntegrityService._witness_request_counts
+        entry = counts.get(requesting_node_id)
+        if entry:
+            count, window_start = entry
+            if (now - window_start).total_seconds() > 3600:
+                counts[requesting_node_id] = (1, now)
+            elif count >= IntegrityService._WITNESS_MAX_PER_HOUR:
+                return None  # Rate limited
+            else:
+                counts[requesting_node_id] = (count + 1, window_start)
+        else:
+            counts[requesting_node_id] = (1, now)
+
         peers = db.query(PeerNode).filter(
             PeerNode.status == 'active',
             PeerNode.integrity_status != 'banned',

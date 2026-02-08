@@ -53,7 +53,10 @@ from flask import Flask, jsonify, request
 import json
 import os
 import re
+import secrets
 import logging
+import threading
+import atexit
 import requests
 import pytz
 from core.http_pool import pooled_get, pooled_post
@@ -286,6 +289,7 @@ handler.setFormatter(formatter)
 stream_handler.setFormatter(formatter)
 
 app = Flask(__name__)
+app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
 
 app.logger.addHandler(stream_handler)
 app.logger.addHandler(handler)
@@ -434,6 +438,7 @@ client = crossbarhttp.Client('http://aws_rasa.hertzai.com:8088/publish')
 
 # Create thread pool executor for async Crossbar publishing
 crossbar_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='crossbar_publish')
+atexit.register(lambda: crossbar_executor.shutdown(wait=False))
 
 def publish_async(topic, message, timeout=2.0):
     """
@@ -650,6 +655,14 @@ def get_tools(req_tool, is_first: bool = False):
             )
 
         ]
+
+        # Service Tools: Add HTTP microservice tools (Crawl4AI, AceStep, etc.)
+        try:
+            from integrations.service_tools import service_tool_registry
+            tool += service_tool_registry.get_langchain_tools()
+        except ImportError:
+            pass
+
         tools += tool
         return tools
 
@@ -2000,7 +2013,7 @@ if autogen is not None:
         config_list = [{
             "model": 'hertzai-4o',
             "api_type": "azure",
-            "api_key": '4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf',
+            "api_key": os.environ.get('AZURE_OPENAI_API_KEY', ''),
             "base_url": 'https://hertzai-gpt4.openai.azure.com/',
             "api_version": "2024-02-15-preview"
         }]
@@ -2090,7 +2103,7 @@ if autogen is not None:
             "config_list": [{
             "model": 'hertzai-4o',
             "api_type": "azure",
-            "api_key": '4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf',
+            "api_key": os.environ.get('AZURE_OPENAI_API_KEY', ''),
             "base_url": 'https://hertzai-gpt4.openai.azure.com/',
             "api_version": "2024-02-15-preview"
         }],
@@ -2315,6 +2328,7 @@ INTERMEDIATE_CONTINUATION = "You are Hevolve, a highly intelligent educational A
 first_promts = []
 review_agents = {"10077":True,10077:True}
 conversation_agent = {"10077":False,10077:False}
+_state_lock = threading.Lock()  # Protects review_agents, conversation_agent, first_promts
 
 
 def _autonomous_gather_info(user_id, description, prompt_id):
@@ -2371,6 +2385,12 @@ def chat():
     intermediate = data.get('intermediate', None)
     app.logger.info(f"casual_conv type {casual_conv}")
 
+    # Security: sanitize prompt_id to prevent path traversal
+    if prompt_id is not None:
+        prompt_id = str(prompt_id)
+        if not re.match(r'^[a-zA-Z0-9_-]+$', prompt_id):
+            return jsonify({'error': 'Invalid prompt_id format'}), 400
+
     # return ""
     thread_local_data.set_request_id(request_id=request_id)
     prompt = data.get('prompt', None)
@@ -2387,33 +2407,34 @@ def chat():
             pass  # Degrade gracefully
 
     if prompt_id:
-        if os.path.exists(f'prompts/{prompt_id}.json'):
-            app.logger.info('GATHER JSON EXISTS')
-            if os.path.exists(f'prompts/{prompt_id}_0_recipe.json'):
-                app.logger.info('0 Recipe JSON EXISTS')
-                file_path = f'prompts/{prompt_id}.json'
-                with open(file_path, 'r') as f:
-                    data = json.load(f)
-                    no_of_flow = len(data['flows'])-1
-                    app.logger.info(f'GOT LEN OF FLOW AS {no_of_flow}')
-                if os.path.exists(f'prompts/{prompt_id}_{no_of_flow}_recipe.json'):
-                    create_agent = set_flags_to_enter_review_mode(no_of_flow, user_id) #returns false
+        with _state_lock:
+            if os.path.exists(f'prompts/{prompt_id}.json'):
+                app.logger.info('GATHER JSON EXISTS')
+                if os.path.exists(f'prompts/{prompt_id}_0_recipe.json'):
+                    app.logger.info('0 Recipe JSON EXISTS')
+                    file_path = f'prompts/{prompt_id}.json'
+                    with open(file_path, 'r') as f:
+                        data = json.load(f)
+                        no_of_flow = len(data['flows'])-1
+                        app.logger.info(f'GOT LEN OF FLOW AS {no_of_flow}')
+                    if os.path.exists(f'prompts/{prompt_id}_{no_of_flow}_recipe.json'):
+                        create_agent = set_flags_to_enter_review_mode(no_of_flow, user_id) #returns false
+                    else:
+                        app.logger.info(f'{no_of_flow} Recipe JSON doesnot EXISTS')
+                        create_agent = True
+                        review_agents[user_id] = True
+                        conversation_agent[user_id] = False
                 else:
-                    app.logger.info(f'{no_of_flow} Recipe JSON doesnot EXISTS')
+                    app.logger.info('0 Recipe JSON doesnot EXISTS')
                     create_agent = True
                     review_agents[user_id] = True
                     conversation_agent[user_id] = False
-            else:
-                app.logger.info('0 Recipe JSON doesnot EXISTS')
-                create_agent = True
-                review_agents[user_id] = True
-                conversation_agent[user_id] = False
 
-        else:
-            app.logger.info('GATHER JSON doesnot EXISTS')
-            create_agent = True
-            review_agents[user_id] = False
-            conversation_agent[user_id] = True
+            else:
+                app.logger.info('GATHER JSON doesnot EXISTS')
+                create_agent = True
+                review_agents[user_id] = False
+                conversation_agent[user_id] = True
 
     if create_agent:
         # Phase 1: Gather Requirements

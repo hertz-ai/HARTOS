@@ -10,6 +10,7 @@ os.environ['SOCIAL_DB_PATH'] = ':memory:'
 from flask import Flask
 from integrations.social.models import Base, get_engine, init_db
 from integrations.social.api import social_bp
+from integrations.social.rate_limiter import get_limiter
 
 
 @pytest.fixture
@@ -21,6 +22,8 @@ def app():
     engine = get_engine()
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
+    # Reset rate limiter between tests to avoid cross-test rate limiting
+    get_limiter()._buckets.clear()
     yield test_app
     Base.metadata.drop_all(engine)
 
@@ -73,20 +76,20 @@ class TestAuthEndpoints:
         assert data['success'] is False
 
     def test_login(self, client):
-        register_user(client, 'loginuser', 'mypass')
+        register_user(client, 'loginuser', 'mypass123!')
         resp = client.post('/api/social/auth/login', json={
             'username': 'loginuser',
-            'password': 'mypass',
+            'password': 'mypass123!',
         })
         assert resp.status_code == 200
         data = resp.get_json()
         assert 'token' in data['data']
 
     def test_login_wrong_password(self, client):
-        register_user(client, 'wrongpw', 'correct')
+        register_user(client, 'wrongpw', 'correct123!')
         resp = client.post('/api/social/auth/login', json={
             'username': 'wrongpw',
-            'password': 'incorrect',
+            'password': 'incorrect1!',
         })
         assert resp.status_code == 401
 

@@ -42,8 +42,18 @@ def get_engine():
     if _engine is None:
         if DB_PATH != ':memory:':
             os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
-        _engine = create_engine(DB_URL, echo=False, future=True,
-                                connect_args={"check_same_thread": False})
+        engine_kwargs = dict(
+            echo=False,
+            future=True,
+            connect_args={"check_same_thread": False},
+            pool_pre_ping=True,
+            pool_recycle=3600,
+        )
+        if DB_PATH == ':memory:':
+            # In-memory DBs need StaticPool to share across threads in tests
+            from sqlalchemy.pool import StaticPool
+            engine_kwargs['poolclass'] = StaticPool
+        _engine = create_engine(DB_URL, **engine_kwargs)
     return _engine
 
 
@@ -92,11 +102,11 @@ class User(Base):
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
     last_active_at = Column(DateTime, default=func.now())
     settings = Column(JSON, default=dict)
-    owner_id = Column(String(64), ForeignKey('users.id'), nullable=True)  # human who owns this agent
+    owner_id = Column(String(64), ForeignKey('users.id'), nullable=True, index=True)  # human who owns this agent
     handle = Column(String(30), unique=True, nullable=True, index=True)  # unique creator tag for humans
     local_name = Column(String(35), nullable=True)  # 2-word local name for agents (before handle appended)
     referral_code = Column(String(20), unique=True, nullable=True, index=True)
-    referred_by_id = Column(String(64), ForeignKey('users.id'), nullable=True)
+    referred_by_id = Column(String(64), ForeignKey('users.id'), nullable=True, index=True)
     region_id = Column(String(64), ForeignKey('regions.id', use_alter=True), nullable=True)
     level = Column(Integer, default=1)
     level_title = Column(String(30), default='Newcomer')
@@ -154,7 +164,7 @@ class Community(Base):
     rules = Column(Text, default='')
     icon_url = Column(String(500), default='')
     banner_url = Column(String(500), default='')
-    creator_id = Column(String(64), ForeignKey('users.id'))
+    creator_id = Column(String(64), ForeignKey('users.id'), index=True)
     is_default = Column(Boolean, default=False)
     is_private = Column(Boolean, default=False)
     member_count = Column(Integer, default=0)
@@ -185,8 +195,8 @@ class Post(Base):
     __tablename__ = 'posts'
 
     id = Column(String(64), primary_key=True, default=_uuid)
-    author_id = Column(String(64), ForeignKey('users.id'), nullable=False, index=True)
-    community_id = Column(String(64), ForeignKey('communities.id'), nullable=True, index=True)
+    author_id = Column(String(64), ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    community_id = Column(String(64), ForeignKey('communities.id', ondelete='CASCADE'), nullable=True, index=True)
     title = Column(String(300), nullable=False)
     content = Column(Text, default='')
     content_type = Column(String(20), default='text')  # text|code|recipe|media|task_request
@@ -247,9 +257,9 @@ class Comment(Base):
     __tablename__ = 'comments'
 
     id = Column(String(64), primary_key=True, default=_uuid)
-    post_id = Column(String(64), ForeignKey('posts.id'), nullable=False, index=True)
-    author_id = Column(String(64), ForeignKey('users.id'), nullable=False)
-    parent_id = Column(String(64), ForeignKey('comments.id'), nullable=True)
+    post_id = Column(String(64), ForeignKey('posts.id', ondelete='CASCADE'), nullable=False, index=True)
+    author_id = Column(String(64), ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    parent_id = Column(String(64), ForeignKey('comments.id', ondelete='SET NULL'), nullable=True, index=True)
     content = Column(Text, nullable=False)
     upvotes = Column(Integer, default=0)
     downvotes = Column(Integer, default=0)
@@ -289,7 +299,7 @@ class Vote(Base):
     __tablename__ = 'votes'
 
     id = Column(String(64), primary_key=True, default=_uuid)
-    user_id = Column(String(64), ForeignKey('users.id'), nullable=False, index=True)
+    user_id = Column(String(64), ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
     target_type = Column(String(10), nullable=False)  # 'post' | 'comment'
     target_id = Column(String(64), nullable=False)
     value = Column(Integer, nullable=False)  # +1 or -1
@@ -307,8 +317,8 @@ class Follow(Base):
     __tablename__ = 'follows'
 
     id = Column(String(64), primary_key=True, default=_uuid)
-    follower_id = Column(String(64), ForeignKey('users.id'), nullable=False, index=True)
-    following_id = Column(String(64), ForeignKey('users.id'), nullable=False, index=True)
+    follower_id = Column(String(64), ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    following_id = Column(String(64), ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
     created_at = Column(DateTime, default=func.now())
 
     __table_args__ = (
@@ -322,8 +332,8 @@ class CommunityMembership(Base):
     __tablename__ = 'community_memberships'
 
     id = Column(String(64), primary_key=True, default=_uuid)
-    user_id = Column(String(64), ForeignKey('users.id'), nullable=False)
-    community_id = Column(String(64), ForeignKey('communities.id'), nullable=False)
+    user_id = Column(String(64), ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    community_id = Column(String(64), ForeignKey('communities.id', ondelete='CASCADE'), nullable=False, index=True)
     role = Column(String(20), default='member')  # member|moderator|admin
     created_at = Column(DateTime, default=func.now())
 
@@ -366,9 +376,9 @@ class TaskRequest(Base):
     __tablename__ = 'task_requests'
 
     id = Column(String(64), primary_key=True, default=_uuid)
-    post_id = Column(String(64), ForeignKey('posts.id'), nullable=False)
-    requester_id = Column(String(64), ForeignKey('users.id'), nullable=False)
-    assignee_id = Column(String(64), ForeignKey('users.id'), nullable=True)
+    post_id = Column(String(64), ForeignKey('posts.id'), nullable=False, index=True)
+    requester_id = Column(String(64), ForeignKey('users.id'), nullable=False, index=True)
+    assignee_id = Column(String(64), ForeignKey('users.id'), nullable=True, index=True)
     task_description = Column(Text, nullable=False)
     status = Column(String(20), default='open')  # open|assigned|in_progress|completed|failed
     result = Column(Text, nullable=True)
@@ -397,7 +407,7 @@ class Notification(Base):
     __tablename__ = 'notifications'
 
     id = Column(String(64), primary_key=True, default=_uuid)
-    user_id = Column(String(64), ForeignKey('users.id'), nullable=False, index=True)
+    user_id = Column(String(64), ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
     type = Column(String(30), nullable=False)
     source_user_id = Column(String(64), nullable=True)
     target_type = Column(String(20), nullable=True)
@@ -424,13 +434,13 @@ class Report(Base):
     __tablename__ = 'reports'
 
     id = Column(String(64), primary_key=True, default=_uuid)
-    reporter_id = Column(String(64), ForeignKey('users.id'), nullable=False)
+    reporter_id = Column(String(64), ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
     target_type = Column(String(20), nullable=False)
     target_id = Column(String(64), nullable=False)
     reason = Column(String(50), nullable=False)
     details = Column(Text, default='')
     status = Column(String(20), default='pending')  # pending|reviewed|resolved|dismissed
-    moderator_id = Column(String(64), nullable=True)
+    moderator_id = Column(String(64), ForeignKey('users.id'), nullable=True)
     created_at = Column(DateTime, default=func.now())
 
     reporter = relationship('User', foreign_keys=[reporter_id])
@@ -451,7 +461,7 @@ class RecipeShare(Base):
     __tablename__ = 'recipe_shares'
 
     id = Column(String(64), primary_key=True, default=_uuid)
-    post_id = Column(String(64), ForeignKey('posts.id'), nullable=False)
+    post_id = Column(String(64), ForeignKey('posts.id'), nullable=False, index=True)
     recipe_file = Column(String(300), nullable=False)
     prompt_id = Column(Integer, nullable=False)
     flow_id = Column(Integer, nullable=False)

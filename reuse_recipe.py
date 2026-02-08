@@ -2399,6 +2399,28 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         current_app.logger.warning(f"MCP integration error (non-critical): {e}")
         # Continue with default tools if MCP fails
 
+    # Service Tools: Register HTTP microservice tools (Crawl4AI, AceStep, etc.)
+    # Follows same pattern as MCP block above — register tools, get functions, wire to agents
+    try:
+        from integrations.service_tools import service_tool_registry, Crawl4AITool, AceStepTool
+
+        Crawl4AITool.register()   # port 11235
+        AceStepTool.register()    # port 8001
+        service_tool_registry.load_config()  # load any user-added tools from service_tools.json
+
+        svc_tools = service_tool_registry.get_all_tool_functions()
+        svc_defs = service_tool_registry.get_tool_definitions()
+
+        for tool_name, tool_func in svc_tools.items():
+            tool_def = next((d for d in svc_defs if d['name'] == tool_name), None)
+            if tool_def:
+                description = tool_def.get('description', f'Service tool: {tool_name}')
+                helper.register_for_llm(name=tool_name, description=description)(tool_func)
+                assistant.register_for_execution(name=tool_name)(tool_func)
+                current_app.logger.info(f"Registered service tool: {tool_name}")
+    except Exception as e:
+        current_app.logger.warning(f"Service tools integration error (non-critical): {e}")
+
     # Internal Agent Communication: Register agents and their skills for in-process communication
     try:
         current_app.logger.info("Initializing Internal Agent Communication (skill-based delegation)...")

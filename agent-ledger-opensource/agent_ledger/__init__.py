@@ -76,7 +76,13 @@ from .factory import (
     clear_ledger_cache,
 )
 
-__version__ = "1.1.0"
+# Distributed features (optional — require Redis at runtime, not import time)
+from .verification import TaskVerification, TaskBaseline
+from .pubsub import LedgerPubSub
+from .heartbeat import AgentHeartbeat
+from .distributed import DistributedTaskLock
+
+__version__ = "1.2.0"
 __author__ = "Agent Ledger Contributors"
 __license__ = "MIT"
 
@@ -119,4 +125,11 @@ __all__ = [
     "get_or_create_ledger",
     "migrate_ledger_to_redis",
     "clear_ledger_cache",
+
+    # Distributed features (optional — require Redis)
+    "TaskVerification",
+    "TaskBaseline",
+    "LedgerPubSub",
+    "AgentHeartbeat",
+    "DistributedTaskLock",
 ]

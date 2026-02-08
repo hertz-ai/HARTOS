@@ -59,6 +59,9 @@ def create_child_certificate(
 
     Used by central to certify regional hosts, or by regional to certify locals.
     """
+    MAX_CERT_VALIDITY_DAYS = 365
+    validity_days = min(validity_days, MAX_CERT_VALIDITY_DAYS)
+
     parent_pub_bytes = parent_private_key.public_key().public_bytes(
         encoding=serialization.Encoding.Raw,
         format=serialization.PublicFormat.Raw,
@@ -155,7 +158,8 @@ def verify_certificate_chain(
                     chain_valid = False
                     chain_details = 'Certificate expired'
         except (ValueError, TypeError):
-            pass
+            chain_valid = False
+            chain_details = 'Malformed certificate expiry date'
 
     # Path 2: Registry lookup (fallback)
     registry_valid = False

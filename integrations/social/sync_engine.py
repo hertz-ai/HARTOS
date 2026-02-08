@@ -25,8 +25,10 @@ class SyncEngine:
         self._thread = None
         self._lock = threading.Lock()
 
+    MAX_QUEUE_SIZE = 10000
+
     @staticmethod
-    def queue(db, target_tier: str, operation_type: str, payload: dict) -> str:
+    def queue(db, target_tier: str, operation_type: str, payload: dict) -> Optional[str]:
         """Queue a sync operation for later delivery."""
         from .models import SyncQueue
         from security.node_integrity import get_public_key_hex
@@ -35,6 +37,15 @@ class SyncEngine:
             node_id = get_public_key_hex()[:16]
         except Exception:
             node_id = 'unknown'
+
+        # Backpressure: reject if queue is too large for this node
+        current_count = db.query(SyncQueue).filter(
+            SyncQueue.node_id == node_id,
+            SyncQueue.status.in_(['queued', 'failed']),
+        ).count()
+        if current_count >= SyncEngine.MAX_QUEUE_SIZE:
+            logger.warning(f"Sync queue backpressure: {current_count} items for node {node_id}, skipping insertion")
+            return None
 
         item = SyncQueue(
             node_id=node_id,
@@ -60,18 +71,34 @@ class SyncEngine:
         if not items:
             return {'sent': 0, 'failed': 0, 'remaining': 0}
 
+        # Optimistic locking: atomically update status to 'in_progress' only for items still 'queued'/'failed'
+        item_ids = [item.id for item in items]
+        updated_count = db.query(SyncQueue).filter(
+            SyncQueue.id.in_(item_ids),
+            SyncQueue.status.in_(['queued', 'failed']),
+        ).update({'status': 'in_progress', 'last_attempt_at': datetime.utcnow()}, synchronize_session='fetch')
+        db.flush()
+
+        if updated_count == 0:
+            return {'sent': 0, 'failed': 0, 'remaining': 0}
+
+        # Re-fetch only items that were successfully claimed
+        items = db.query(SyncQueue).filter(
+            SyncQueue.id.in_(item_ids),
+            SyncQueue.status == 'in_progress',
+        ).all()
+
+        if not items:
+            return {'sent': 0, 'failed': 0, 'remaining': 0}
+
         # Build batch payload
         batch = []
         for item in items:
-            item.status = 'in_progress'
-            item.last_attempt_at = datetime.utcnow()
             batch.append({
                 'id': item.id,
                 'operation_type': item.operation_type,
                 'payload': item.payload_json,
             })
-
-        db.flush()
 
         # Send batch
         sent = 0

@@ -56,6 +56,8 @@ _limiter = TokenBucket()
 # Rate limit configurations
 LIMITS = {
     'global':   {'max_tokens': 100, 'refill_rate': 100 / 60},     # 100 req/min
+    'auth':     {'max_tokens': 5,   'refill_rate': 5 / 300},      # 5 attempts/5min
+    'register': {'max_tokens': 3,   'refill_rate': 3 / 3600},     # 3 registrations/hr
     'post':     {'max_tokens': 1,   'refill_rate': 1 / 1800},     # 1 post/30min
     'comment':  {'max_tokens': 50,  'refill_rate': 50 / 3600},    # 50 comments/hr
     'vote':     {'max_tokens': 60,  'refill_rate': 60 / 60},      # 60 votes/min

@@ -914,6 +914,10 @@ class SmartLedger:
         else:
             self.backend = backend
 
+        # Optional distributed features (activated via enable_pubsub/enable_heartbeat)
+        self._pubsub = None
+        self._heartbeat = None
+
         self.load()
 
     def load(self):
@@ -951,6 +955,19 @@ class SmartLedger:
             logger.info(f"Saved {len(self.tasks)} tasks to ledger")
         except Exception as e:
             logger.error(f"Failed to save ledger: {e}")
+
+    def enable_pubsub(self, redis_client) -> None:
+        """Enable distributed notifications via Redis PUBSUB."""
+        from agent_ledger.pubsub import LedgerPubSub
+        self._pubsub = LedgerPubSub(redis_client, self.agent_id)
+        logger.info(f"PubSub enabled for ledger {self.agent_id}")
+
+    def enable_heartbeat(self, redis_client, host_info: Optional[Dict] = None) -> None:
+        """Enable agent liveness tracking via Redis heartbeat."""
+        from agent_ledger.heartbeat import AgentHeartbeat
+        self._heartbeat = AgentHeartbeat(redis_client, self.agent_id, host_info)
+        self._heartbeat.start()
+        logger.info(f"Heartbeat enabled for ledger {self.agent_id}")
 
     def add_task(self, task: Task) -> bool:
         """Add a new task to ledger."""
@@ -1212,6 +1229,13 @@ class SmartLedger:
             return False
         success = task.complete(result)
         if success:
+            # Auto-compute result hash for distributed verification
+            if result is not None:
+                try:
+                    from agent_ledger.verification import TaskVerification
+                    task.context["result_hash"] = TaskVerification.compute_result_hash(result)
+                except Exception:
+                    pass  # verification module not available or result not serializable
             self._handle_task_completion(task)
             self.save()
         return success
@@ -1511,7 +1535,7 @@ class SmartLedger:
         self.save()
 
     def _generate_event(self, event_type: str, event_data: Dict[str, Any]):
-        """Generate an event for observation."""
+        """Generate an event for observation. Broadcasts via PubSub if enabled."""
         event = {
             "type": event_type,
             "timestamp": datetime.now().isoformat(),
@@ -1528,6 +1552,26 @@ class SmartLedger:
 
         if len(self.events) > 100:
             self.events = self.events[-100:]
+
+        # Broadcast to distributed listeners via Redis PubSub
+        if hasattr(self, '_pubsub') and self._pubsub:
+            try:
+                if event_type == "task_completed":
+                    task_id = event_data.get("task_id", "")
+                    result_hash = None
+                    task = self.get_task(task_id)
+                    if task and hasattr(task, 'context'):
+                        result_hash = task.context.get("result_hash")
+                    self._pubsub.publish_task_update(task_id, "IN_PROGRESS", "COMPLETED", result_hash)
+                elif event_type == "task_delegated":
+                    self._pubsub.publish_delegation(
+                        task_id=event_data.get("task_id", ""),
+                        from_agent=self.agent_id,
+                        to_agent=event_data.get("to_agent", ""),
+                        description=event_data.get("reason", ""),
+                    )
+            except Exception as e:
+                logger.debug(f"PubSub broadcast error (non-critical): {e}")
 
     def get_events(self, event_type: Optional[str] = None, since: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get events from the ledger."""
