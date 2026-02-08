@@ -1,11 +1,13 @@
 """
-Memory System for Phase 10 - File Tracking, Embeddings, and Search.
+Memory System — File Tracking, Embeddings, Search, and Memory Graph.
 
 This module provides:
+- MemoryStore: SQLite FTS5 + embeddings storage
+- MemoryGraph: Provenance-aware memory graph with backtrace
+- Agent Memory Tools: Framework-agnostic tools + adapters (autogen, LangChain)
 - FileTracker: Monitor and index file changes
 - EmbeddingCache: Cache embeddings with TTL
 - MemorySearch: Unified search across memory sources
-- MemoryStore: SQLite FTS5 + embeddings storage
 """
 
 from .memory_store import MemoryStore, MemoryItem, SearchResult
@@ -25,9 +27,18 @@ from .embeddings import (
 from .search import (
     MemorySearch,
     MemorySource,
+    MemoryGraphSource,
     SearchResults,
     ContextResults,
     SearchConfig,
+)
+
+# Memory Graph (provenance + backtrace)
+from .memory_graph import MemoryGraph, MemoryNode
+from .agent_memory_tools import (
+    create_memory_tools,
+    register_autogen_tools,
+    create_langchain_tools,
 )
 
 # SimpleMem (optional - requires simplemem package)
@@ -56,9 +67,16 @@ __all__ = [
     # Search
     "MemorySearch",
     "MemorySource",
+    "MemoryGraphSource",
     "SearchResults",
     "ContextResults",
     "SearchConfig",
+    # Memory Graph
+    "MemoryGraph",
+    "MemoryNode",
+    "create_memory_tools",
+    "register_autogen_tools",
+    "create_langchain_tools",
     # SimpleMem (optional)
     "SimpleMemStore",
     "SimpleMemConfig",

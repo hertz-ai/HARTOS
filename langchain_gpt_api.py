@@ -168,6 +168,50 @@ groq_api_key = os.environ['GROQ_API_KEY']
 
 
 # ============================================================================
+# MemoryGraph — Framework-agnostic provenance-aware memory layer
+# ============================================================================
+_memory_graphs = {}  # Cache: "user_id_prompt_id" → MemoryGraph instance
+_memory_graph_lock = threading.Lock()
+
+
+def _get_or_create_graph(user_id, prompt_id=None):
+    """Get or create a MemoryGraph instance for a user/prompt session."""
+    try:
+        from integrations.channels.memory.memory_graph import MemoryGraph
+        session_key = f"{user_id}_{prompt_id}" if prompt_id else str(user_id)
+        with _memory_graph_lock:
+            if session_key not in _memory_graphs:
+                db_path = os.path.join(
+                    os.path.expanduser("~"), "Documents", "Nunba", "data", "memory_graph", session_key
+                )
+                _memory_graphs[session_key] = MemoryGraph(
+                    db_path=db_path,
+                    user_id=str(user_id),
+                )
+            return _memory_graphs[session_key]
+    except Exception as e:
+        logging.getLogger(__name__).debug(f"MemoryGraph init skipped: {e}")
+        return None
+
+
+def _record_lifecycle(status, user_id, prompt_id, details=''):
+    """Record agent lifecycle event in MemoryGraph (fire-and-forget, zero latency)."""
+    def _bg():
+        try:
+            graph = _get_or_create_graph(user_id, prompt_id)
+            if graph:
+                graph.register_lifecycle(
+                    event=status,
+                    agent_id=str(user_id),
+                    session_id=f"{user_id}_{prompt_id}",
+                    details=details,
+                )
+        except Exception:
+            pass
+    threading.Thread(target=_bg, daemon=True).start()
+
+
+# ============================================================================
 # Custom Qwen3-VL LangChain Wrapper
 # ============================================================================
 class ChatQwen3VL(LLM):
@@ -662,6 +706,22 @@ def get_tools(req_tool, is_first: bool = False):
             tool += service_tool_registry.get_langchain_tools()
         except ImportError:
             pass
+
+        # Memory Tools: Add MemoryGraph-backed tools (remember, recall, backtrace)
+        try:
+            user_id = thread_local_data.get_user_id()
+            prompt_id = thread_local_data.get_prompt_id()
+            graph = _get_or_create_graph(user_id, prompt_id)
+            if graph:
+                from integrations.channels.memory.agent_memory_tools import (
+                    create_memory_tools, create_langchain_tools,
+                )
+                session_id = f"{user_id}_{prompt_id}" if prompt_id else str(user_id)
+                mem_tools_dict = create_memory_tools(graph, str(user_id), session_id)
+                lc_mem_tools = create_langchain_tools(mem_tools_dict)
+                tool += lc_mem_tools
+        except Exception:
+            pass  # Non-blocking — memory tools are optional
 
         tools += tool
         return tools
@@ -1176,6 +1236,24 @@ class CustomAgentExecutor(AgentExecutor):
             except Exception as e:
                 app.logger.error(f"Failed to save memory (Zep server may be down): {e}")
                 # Continue without crashing - memory save is not critical
+
+            # Register conversation turn in MemoryGraph (fire-and-forget, no latency)
+            try:
+                user_id = thread_local_data.get_user_id()
+                graph = _get_or_create_graph(user_id, prom_id)
+                if graph:
+                    user_input = inputs.get('input', '')
+                    ai_output = outputs.get('output', '')
+                    session_key = f"{user_id}_{prom_id}" if prom_id else str(user_id)
+                    def _bg_register(g=graph, ui=user_input, ao=ai_output, sk=session_key):
+                        try:
+                            g.register_conversation('user', ui, sk)
+                            g.register_conversation('langchain', ao, sk)
+                        except Exception:
+                            pass
+                    threading.Thread(target=_bg_register, daemon=True).start()
+            except Exception:
+                pass  # Non-blocking
         else:
             app.logger.info(
                 f"Memory object is None, skipping save")
@@ -2475,6 +2553,7 @@ def chat():
                 if new_res['status'] == 'pending':
                     app.logger.info('PENDING STATUS')
                     ans = new_res['question'] if 'question' in new_res else new_res['review_details']
+                    _record_lifecycle('Creation Mode', user_id, prompt_id, 'Agent creation started via gather_info')
                     return jsonify({'response': ans, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Creation Mode'})
                 else:
                     app.logger.info('COMPLETED STATUS')
@@ -2488,10 +2567,12 @@ def chat():
                         json.dump(new_res, json_file)
                     app.logger.info(f"Dictionary saved to {name}")
                     review_agents[user_id] = True
+                    _record_lifecycle('Review Mode', user_id, prompt_id, 'Agent details gathered, entering review')
                     return jsonify({'response': 'Got Agent details successfully lets move on to review them one at a time', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Review Mode'})
             except Exception as e:
                 app.logger.error('GOT some error while eval and returning the response')
                 app.logger.error(e)
+                _record_lifecycle('Creation Mode', user_id, prompt_id, f'Creation continuing after parse error: {e}')
                 return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Creation Mode'})
         # Phase 2: Review Phase
         if review_agents[user_id] and not conversation_agent[user_id]:
@@ -2503,7 +2584,9 @@ def chat():
                     _create_social_agent_from_prompt(user_id, prompt_id)
                 except Exception as e:
                     app.logger.debug(f"Social agent bridge skipped: {e}")
+                _record_lifecycle('completed', user_id, prompt_id, 'Agent creation completed successfully')
                 return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'completed'})
+            _record_lifecycle('Review Mode', user_id, prompt_id, 'Agent details being reviewed')
             return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Review Mode'})
         # Phase 3: Evaluation Phase
         if review_agents[user_id] and conversation_agent[user_id]:
@@ -2536,6 +2619,7 @@ def chat():
                     # Autonomous: run gather_info with LLM-generated answers
                     auto_response = _autonomous_gather_info(user_id, agent_desc, new_prompt_id)
                     review_agents[user_id] = True
+                    _record_lifecycle('Review Mode', user_id, new_prompt_id, f'Autonomous creation from reuse: {agent_desc[:100]}')
                     return jsonify({
                         'response': auto_response,
                         'intent': ['FINAL_ANSWER'],
@@ -2546,6 +2630,7 @@ def chat():
                         'prompt_id': new_prompt_id,
                     })
                 else:
+                    _record_lifecycle('Reuse Mode', user_id, new_prompt_id, f'Creation suggested from reuse: {agent_desc[:100]}')
                     return jsonify({
                         'response': response,
                         'intent': ['FINAL_ANSWER'],
@@ -2560,6 +2645,7 @@ def chat():
             # Fallback: pattern matching on agent response text
             if _response_signals_creation(response):
                 app.logger.info('Reuse agent response text signals new agent creation needed')
+                _record_lifecycle('Reuse Mode', user_id, prompt_id, 'Creation suggested via response pattern')
                 return jsonify({
                     'response': response,
                     'intent': ['FINAL_ANSWER'],
@@ -2569,6 +2655,7 @@ def chat():
                     'creation_suggested': True,
                 })
 
+        _record_lifecycle('Reuse Mode', user_id, prompt_id, 'Agent reused for conversation')
         return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Reuse Mode'})
 
     if prompt_id:
@@ -2637,6 +2724,7 @@ def chat():
             # Autonomous: run gather_info with LLM-generated answers
             auto_response = _autonomous_gather_info(user_id, agent_description, new_prompt_id)
             review_agents[user_id] = True
+            _record_lifecycle('Review Mode', user_id, new_prompt_id, f'Autonomous creation via LLM tool: {agent_description[:100]}')
             return jsonify({
                 'response': auto_response,
                 'intent': ['FINAL_ANSWER'],
@@ -2659,6 +2747,7 @@ def chat():
                     resp_text = ans
             except Exception:
                 resp_text = ans
+            _record_lifecycle('Creation Mode', user_id, new_prompt_id, f'Interactive creation via LLM tool: {agent_description[:100]}')
             return jsonify({
                 'response': resp_text,
                 'intent': ['FINAL_ANSWER'],
@@ -2699,6 +2788,7 @@ def chat():
 
 def evaluate_agent_after_creation_in_review(file_id, prompt, prompt_id, request_id, user_id):
     response = chat_agent(user_id, prompt, prompt_id, file_id, request_id)
+    _record_lifecycle('Evaluation Mode', user_id, prompt_id, 'Agent being evaluated after creation')
     return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0,
                     'history_request_id': [], 'Agent_status': 'Evaluation Mode'})
 

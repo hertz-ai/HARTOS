@@ -760,6 +760,19 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         except Exception as e:
             tool_logger.warning(f"[SIMPLEMEM] Init failed: {e}")
 
+    # Initialize MemoryGraph for provenance-aware memory
+    memory_graph = None
+    try:
+        from integrations.channels.memory.memory_graph import MemoryGraph
+        import os
+        graph_db_path = os.path.join(
+            os.path.expanduser("~"), "Documents", "Nunba", "data", "memory_graph", user_prompt
+        )
+        memory_graph = MemoryGraph(db_path=graph_db_path, user_id=str(user_id))
+        tool_logger.info(f"MemoryGraph initialized for {user_prompt}")
+    except Exception as e:
+        tool_logger.warning(f"MemoryGraph init failed: {e}")
+
     custom_agents = []
     agents_object = {}
     with open(f"prompts/{prompt_id}.json", 'r') as f:
@@ -1351,6 +1364,16 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             description="Save important facts or information to long-term memory for future retrieval across sessions."
         )(save_to_long_term_memory)
         assistant.register_for_execution(name="save_to_long_term_memory")(save_to_long_term_memory)
+
+    # --- MemoryGraph provenance tools (remember, recall, backtrace) ---
+    if memory_graph is not None:
+        try:
+            from integrations.channels.memory.agent_memory_tools import create_memory_tools, register_autogen_tools
+            mem_tools = create_memory_tools(memory_graph, str(user_id), user_prompt)
+            register_autogen_tools(mem_tools, assistant, helper)
+            tool_logger.info(f"MemoryGraph tools registered for {user_prompt}")
+        except Exception as e:
+            tool_logger.warning(f"MemoryGraph tools registration failed: {e}")
 
     @log_tool_execution
     def google_search(text: Annotated[str, "Text/Query which you want to search"]) -> str:
@@ -2452,6 +2475,20 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             except Exception:
                 pass  # Non-blocking
         group_chat.messages.append = _simplemem_ingest_hook
+
+    # Auto-ingest group_chat messages into MemoryGraph (provenance tracking)
+    if memory_graph is not None:
+        _prev_append = group_chat.messages.append
+        def _graph_ingest_hook(msg):
+            _prev_append(msg)
+            try:
+                content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+                speaker = msg.get("name", "Agent") if isinstance(msg, dict) else "Agent"
+                if content and len(content.strip()) > 5:
+                    memory_graph.register_conversation(speaker, content, user_prompt)
+            except Exception:
+                pass  # Non-blocking
+        group_chat.messages.append = _graph_ingest_hook
 
     return author, assistant, executor, group_chat, manager, chat_instructor, agents_object
 

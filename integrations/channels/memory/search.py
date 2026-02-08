@@ -306,6 +306,82 @@ class MemoryStoreSource(MemorySource):
         ]
 
 
+class MemoryGraphSource(MemorySource):
+    """Memory source backed by MemoryGraph — adds backtrace context to search results."""
+
+    def __init__(self, graph, source_name: str = "memory_graph"):
+        self._graph = graph
+        self._source_name = source_name
+
+    @property
+    def name(self) -> str:
+        return self._source_name
+
+    async def search(
+        self,
+        query: str,
+        max_results: int = 10,
+        min_score: float = 0.0,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> List[SearchMatch]:
+        nodes = self._graph.recall(query, mode='text', top_k=max_results)
+        return [
+            SearchMatch(
+                source=self.name,
+                content=n.content,
+                score=1.0,
+                match_type="fts",
+                snippet=n.content[:200],
+                metadata={"memory_type": n.memory_type, "source_agent": n.source_agent, "session_id": n.session_id},
+                timestamp=datetime.fromtimestamp(n.created_at),
+                item_id=n.id,
+            )
+            for n in nodes
+        ]
+
+    async def search_semantic(
+        self,
+        query: str,
+        embedding: List[float],
+        max_results: int = 10,
+        min_score: float = 0.0,
+    ) -> List[SearchMatch]:
+        nodes = self._graph.recall(query, mode='hybrid', top_k=max_results)
+        return [
+            SearchMatch(
+                source=self.name,
+                content=n.content,
+                score=1.0,
+                match_type="semantic",
+                snippet=n.content[:200],
+                metadata={"memory_type": n.memory_type, "source_agent": n.source_agent, "session_id": n.session_id},
+                timestamp=datetime.fromtimestamp(n.created_at),
+                item_id=n.id,
+            )
+            for n in nodes
+        ]
+
+    async def get_context(
+        self,
+        item_id: str,
+        window: int = 5,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Use backtrace for 'before' context (parent chain) and children for 'after'."""
+        chain_data = self._graph.get_memory_chain(item_id)
+        if "error" in chain_data:
+            return [], []
+
+        before = [
+            {"id": p["id"], "role": p.get("source_agent", ""), "content": p["content"], "timestamp": p.get("created_at", 0)}
+            for p in chain_data.get("parents", [])[-window:]
+        ]
+        after = [
+            {"id": c["id"], "role": c.get("source_agent", ""), "content": c["content"], "timestamp": c.get("created_at", 0)}
+            for c in chain_data.get("children", [])[:window]
+        ]
+        return before, after
+
+
 class SessionHistorySource(MemorySource):
     """Memory source for session/conversation history."""
 

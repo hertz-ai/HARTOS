@@ -956,6 +956,19 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         except Exception as e:
             current_app.logger.warning(f"SimpleMem init failed: {e}")
 
+    # Initialize MemoryGraph for provenance-aware memory
+    memory_graph = None
+    try:
+        from integrations.channels.memory.memory_graph import MemoryGraph
+        import os
+        graph_db_path = os.path.join(
+            os.path.expanduser("~"), "Documents", "Nunba", "data", "memory_graph", user_prompt
+        )
+        memory_graph = MemoryGraph(db_path=graph_db_path, user_id=str(user_id))
+        current_app.logger.info(f"MemoryGraph initialized for {user_prompt}")
+    except Exception as e:
+        current_app.logger.warning(f"MemoryGraph init failed: {e}")
+
     personas = []
     # role = get_role(user_id,prompt_id)
     role_number, role = get_flow_number(user_id, prompt_id)
@@ -1346,6 +1359,17 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             current_app.logger.info(f"VALUES STORED IN AGENT DATA: {validated_value}")
             current_app.logger.info(f"FULL AGENT DATA AT KEY: {d}")
 
+            # Mirror to MemoryGraph for persistence (fire-and-forget)
+            if memory_graph is not None:
+                try:
+                    import threading as _t
+                    _t.Thread(target=lambda: memory_graph.register(
+                        f"[KV] {key} = {json.dumps(validated_value)[:200]}",
+                        {'memory_type': 'fact', 'source_agent': 'helper', 'session_id': user_prompt, 'kv_key': key},
+                    ), daemon=True).start()
+                except Exception:
+                    pass
+
             # Step 4: Verify storage was successful
             try:
                 # Attempt to read back the data to verify it was stored correctly
@@ -1394,6 +1418,14 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                 d = d[k]
             return f'{d}'
         except KeyError:
+            # Fallback: check MemoryGraph for persisted KV data
+            if memory_graph is not None:
+                try:
+                    results = memory_graph.recall(f"[KV] {key}", mode='text', top_k=1)
+                    if results:
+                        return results[0].content
+                except Exception:
+                    pass
             return "Key not found in stored data."
 
     @assistant.register_for_execution()
@@ -1576,10 +1608,29 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                     "user_id": user_id,
                     "prompt_id": prompt_id,
                 }))
+                # Dual-write to MemoryGraph (fire-and-forget)
+                if memory_graph is not None:
+                    try:
+                        import threading as _t
+                        _t.Thread(target=lambda: memory_graph.register(
+                            content, {'memory_type': 'fact', 'source_agent': speaker, 'session_id': user_prompt, 'source': 'simplemem'},
+                        ), daemon=True).start()
+                    except Exception:
+                        pass
                 return "Saved to long-term memory."
             except Exception as e:
                 current_app.logger.info(f"SimpleMem save error: {e}")
                 return "Failed to save to long-term memory."
+
+    # --- MemoryGraph provenance tools (remember, recall, backtrace) ---
+    if memory_graph is not None:
+        try:
+            from integrations.channels.memory.agent_memory_tools import create_memory_tools, register_autogen_tools
+            mem_tools = create_memory_tools(memory_graph, str(user_id), user_prompt)
+            register_autogen_tools(mem_tools, assistant, helper)
+            current_app.logger.info(f"MemoryGraph tools registered for {user_prompt}")
+        except Exception as e:
+            current_app.logger.warning(f"MemoryGraph tools registration failed: {e}")
 
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",
@@ -2508,7 +2559,18 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                                       context_value: Annotated[Any, "Context data"]) -> str:
             """Share context information with other agents"""
             sharing_func = create_context_sharing_function('assistant')
-            return sharing_func(context_key, context_value)
+            result = sharing_func(context_key, context_value)
+            # Persist to MemoryGraph (fire-and-forget)
+            if memory_graph is not None:
+                try:
+                    import threading as _t
+                    _t.Thread(target=lambda: memory_graph.register(
+                        f"[SHARED] {context_key}: {json.dumps(context_value)[:200]}",
+                        {'memory_type': 'insight', 'source_agent': 'assistant', 'session_id': user_prompt, 'shared_key': context_key},
+                    ), daemon=True).start()
+                except Exception:
+                    pass
+            return result
 
         helper.register_for_llm(name="share_context_with_agents",
                                description="Share context information with other agents")(share_context_with_agents)
@@ -2921,6 +2983,23 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                         pass  # Non-blocking
                 return _simplemem_ingest_hook
             gc.messages.append = _make_hook(_original_append)
+
+    # Auto-ingest group_chat messages into MemoryGraph (provenance tracking)
+    if memory_graph is not None:
+        for gc in [group_chat, group_chat_1, group_chat_2]:
+            _prev_append = gc.messages.append
+            def _make_graph_hook(prev_append, graph=memory_graph, session=user_prompt):
+                def _graph_ingest_hook(msg):
+                    prev_append(msg)
+                    try:
+                        content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+                        speaker = msg.get("name", "Agent") if isinstance(msg, dict) else "Agent"
+                        if content and len(content.strip()) > 5:
+                            graph.register_conversation(speaker, content, session)
+                    except Exception:
+                        pass  # Non-blocking
+                return _graph_ingest_hook
+            gc.messages.append = _make_graph_hook(_prev_append)
 
     return assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group
 
