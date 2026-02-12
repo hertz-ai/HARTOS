@@ -24,9 +24,18 @@ logger = logging.getLogger(__name__)
 
 
 class AgentSkill:
-    """Represents a skill that an agent possesses"""
+    """Represents a skill that an agent possesses.
 
-    def __init__(self, name: str, description: str, proficiency: float = 1.0, metadata: Optional[Dict] = None):
+    Tracks multiple dimensions for intelligent agent selection:
+    - proficiency: accuracy/quality (0.0-1.0)
+    - avg_latency_ms: average execution time in milliseconds
+    - avg_cost_spark: average cost per execution in Spark
+    - success_rate: derived from usage_count / success_count
+    """
+
+    def __init__(self, name: str, description: str, proficiency: float = 1.0,
+                 avg_latency_ms: float = 0.0, avg_cost_spark: float = 0.0,
+                 metadata: Optional[Dict] = None):
         """
         Initialize an agent skill
 
@@ -34,20 +43,33 @@ class AgentSkill:
             name: Skill identifier
             description: Human-readable skill description
             proficiency: Skill proficiency level (0.0 to 1.0)
+            avg_latency_ms: Average execution time in milliseconds
+            avg_cost_spark: Average cost per execution in Spark currency
             metadata: Additional skill metadata
         """
         self.name = name
         self.description = description
         self.proficiency = max(0.0, min(1.0, proficiency))
+        self.avg_latency_ms = avg_latency_ms
+        self.avg_cost_spark = avg_cost_spark
         self.metadata = metadata or {}
         self.usage_count = 0
         self.success_count = 0
+        self._total_latency_ms = 0.0
+        self._total_cost_spark = 0.0
 
-    def record_usage(self, success: bool = True):
-        """Record skill usage for tracking"""
+    def record_usage(self, success: bool = True, latency_ms: float = 0.0,
+                     cost_spark: float = 0.0):
+        """Record skill usage with optional latency and cost tracking."""
         self.usage_count += 1
         if success:
             self.success_count += 1
+        if latency_ms > 0:
+            self._total_latency_ms += latency_ms
+            self.avg_latency_ms = self._total_latency_ms / self.usage_count
+        if cost_spark > 0:
+            self._total_cost_spark += cost_spark
+            self.avg_cost_spark = self._total_cost_spark / self.usage_count
 
     def get_success_rate(self) -> float:
         """Calculate skill success rate"""
@@ -61,8 +83,10 @@ class AgentSkill:
             'name': self.name,
             'description': self.description,
             'proficiency': self.proficiency,
+            'avg_latency_ms': round(self.avg_latency_ms, 1),
+            'avg_cost_spark': round(self.avg_cost_spark, 2),
             'usage_count': self.usage_count,
-            'success_rate': self.get_success_rate(),
+            'success_rate': round(self.get_success_rate(), 3),
             'metadata': self.metadata
         }
 
@@ -92,22 +116,30 @@ class AgentSkillRegistry:
                     name=skill_def.get('name'),
                     description=skill_def.get('description', ''),
                     proficiency=skill_def.get('proficiency', 1.0),
+                    avg_latency_ms=skill_def.get('avg_latency_ms', 0.0),
+                    avg_cost_spark=skill_def.get('avg_cost_spark', 0.0),
                     metadata=skill_def.get('metadata', {})
                 )
                 self.agents[agent_id][skill.name] = skill
 
             logger.info(f"Registered agent {agent_id} with {len(skills)} skills")
 
-    def find_agents_with_skill(self, skill_name: str, min_proficiency: float = 0.0) -> List[tuple]:
+    def find_agents_with_skill(self, skill_name: str, min_proficiency: float = 0.0,
+                               strategy: str = 'accuracy') -> List[tuple]:
         """
-        Find all agents that have a specific skill
+        Find all agents that have a specific skill, sorted by strategy.
 
         Args:
             skill_name: Name of the skill to find
             min_proficiency: Minimum proficiency level required
+            strategy: Selection strategy:
+                - 'accuracy': highest proficiency (default, best quality)
+                - 'speed': lowest avg_latency_ms (fastest response)
+                - 'efficiency': highest success_rate with lowest cost
+                - 'balanced': weighted composite of all dimensions
 
         Returns:
-            List of (agent_id, skill) tuples sorted by proficiency
+            List of (agent_id, skill) tuples sorted by strategy
         """
         with self.lock:
             matches = []
@@ -117,8 +149,35 @@ class AgentSkillRegistry:
                     if skill.proficiency >= min_proficiency:
                         matches.append((agent_id, skill))
 
-            # Sort by proficiency (highest first)
-            matches.sort(key=lambda x: x[1].proficiency, reverse=True)
+            if strategy == 'speed':
+                # Lowest latency first (0 = unknown, sort last)
+                matches.sort(key=lambda x: x[1].avg_latency_ms if x[1].avg_latency_ms > 0
+                             else float('inf'))
+            elif strategy == 'efficiency':
+                # Highest success_rate / lowest cost
+                def efficiency_score(item):
+                    s = item[1]
+                    rate = s.get_success_rate() if s.usage_count > 0 else s.proficiency
+                    cost_penalty = s.avg_cost_spark / 100.0 if s.avg_cost_spark > 0 else 0.0
+                    return rate - cost_penalty
+                matches.sort(key=efficiency_score, reverse=True)
+            elif strategy == 'balanced':
+                # Weighted composite: 40% proficiency, 25% success_rate,
+                # 20% speed (inverse latency), 15% cost (inverse)
+                def balanced_score(item):
+                    s = item[1]
+                    prof = s.proficiency
+                    rate = s.get_success_rate() if s.usage_count > 0 else prof
+                    # Normalize latency: lower is better, cap at 60s
+                    latency_norm = 1.0 - min(s.avg_latency_ms / 60000.0, 1.0) if s.avg_latency_ms > 0 else 0.5
+                    # Normalize cost: lower is better, cap at 100 spark
+                    cost_norm = 1.0 - min(s.avg_cost_spark / 100.0, 1.0) if s.avg_cost_spark > 0 else 0.5
+                    return (0.40 * prof) + (0.25 * rate) + (0.20 * latency_norm) + (0.15 * cost_norm)
+                matches.sort(key=balanced_score, reverse=True)
+            else:
+                # Default: accuracy — highest proficiency first
+                matches.sort(key=lambda x: x[1].proficiency, reverse=True)
+
             return matches
 
     def get_agent_skills(self, agent_id: str) -> Dict[str, AgentSkill]:
@@ -132,19 +191,21 @@ class AgentSkillRegistry:
             if agent_id in self.agents and skill_name in self.agents[agent_id]:
                 self.agents[agent_id][skill_name].record_usage(success)
 
-    def get_best_agent_for_skill(self, skill_name: str) -> Optional[str]:
+    def get_best_agent_for_skill(self, skill_name: str,
+                                strategy: str = 'accuracy') -> Optional[str]:
         """
-        Get the best agent for a specific skill
+        Get the best agent for a specific skill using the given strategy.
 
         Args:
             skill_name: Name of the skill
+            strategy: Selection strategy ('accuracy', 'speed', 'efficiency', 'balanced')
 
         Returns:
             Agent ID of the best agent, or None if no agent has the skill
         """
-        matches = self.find_agents_with_skill(skill_name)
+        matches = self.find_agents_with_skill(skill_name, strategy=strategy)
         if matches:
-            return matches[0][0]  # Return agent_id of highest proficiency
+            return matches[0][0]
         return None
 
 
@@ -304,20 +365,63 @@ class A2AContextExchange:
                 return context.get('value')
             return None
 
-    def delegate_task(self, from_agent: str, task: str, required_skills: List[str], context: Optional[Dict] = None) -> Optional[str]:
+    def _score_agent(self, agent_skills: Dict[str, 'AgentSkill'],
+                     required_skills: List[str], strategy: str) -> float:
         """
-        Delegate a task to the most suitable agent
+        Score an agent across all required skills using the given strategy.
+
+        Args:
+            agent_skills: Dict of skill_name -> AgentSkill for this agent
+            required_skills: Skills the agent must have
+            strategy: 'accuracy', 'speed', 'efficiency', or 'balanced'
+
+        Returns:
+            Composite score (higher is better)
+        """
+        scores = []
+        for skill_name in required_skills:
+            skill = agent_skills.get(skill_name)
+            if not skill:
+                return -1.0  # Missing required skill
+
+            if strategy == 'speed':
+                # Lower latency = higher score; unknown (0) gets middle score
+                if skill.avg_latency_ms > 0:
+                    scores.append(1.0 - min(skill.avg_latency_ms / 60000.0, 1.0))
+                else:
+                    scores.append(0.5)
+            elif strategy == 'efficiency':
+                rate = skill.get_success_rate() if skill.usage_count > 0 else skill.proficiency
+                cost_penalty = min(skill.avg_cost_spark / 100.0, 1.0) if skill.avg_cost_spark > 0 else 0.0
+                scores.append(rate - cost_penalty)
+            elif strategy == 'balanced':
+                prof = skill.proficiency
+                rate = skill.get_success_rate() if skill.usage_count > 0 else prof
+                latency_norm = (1.0 - min(skill.avg_latency_ms / 60000.0, 1.0)) if skill.avg_latency_ms > 0 else 0.5
+                cost_norm = (1.0 - min(skill.avg_cost_spark / 100.0, 1.0)) if skill.avg_cost_spark > 0 else 0.5
+                scores.append(0.40 * prof + 0.25 * rate + 0.20 * latency_norm + 0.15 * cost_norm)
+            else:
+                # accuracy (default)
+                scores.append(skill.proficiency)
+
+        return sum(scores) / len(scores) if scores else 0.0
+
+    def delegate_task(self, from_agent: str, task: str, required_skills: List[str],
+                      context: Optional[Dict] = None,
+                      strategy: str = 'accuracy') -> Optional[str]:
+        """
+        Delegate a task to the most suitable agent using the given strategy.
 
         Args:
             from_agent: Agent delegating the task
             task: Task description
             required_skills: List of required skills
             context: Optional task context
+            strategy: Selection strategy ('accuracy', 'speed', 'efficiency', 'balanced')
 
         Returns:
             Delegation ID or None if no suitable agent found
         """
-        # Find best agent for the first required skill
         if not required_skills:
             logger.warning("No required skills specified for task delegation")
             return None
@@ -325,8 +429,10 @@ class A2AContextExchange:
         # Find agents with all required skills
         suitable_agents = None
         for skill in required_skills:
-            agents_with_skill = set(agent_id for agent_id, _ in self.skill_registry.find_agents_with_skill(skill))
-
+            agents_with_skill = set(
+                agent_id for agent_id, _
+                in self.skill_registry.find_agents_with_skill(skill, strategy=strategy)
+            )
             if suitable_agents is None:
                 suitable_agents = agents_with_skill
             else:
@@ -336,25 +442,19 @@ class A2AContextExchange:
             logger.warning(f"No agents found with all required skills: {required_skills}")
             return None
 
-        # Get the best agent (highest average proficiency across required skills)
+        # Score each agent using the strategy across all required skills
         best_agent = None
-        best_proficiency = 0.0
+        best_score = -1.0
 
         for agent_id in suitable_agents:
-            if agent_id == from_agent:  # Don't delegate to self
+            if agent_id == from_agent:
                 continue
 
-            avg_proficiency = 0.0
             agent_skills = self.skill_registry.get_agent_skills(agent_id)
+            score = self._score_agent(agent_skills, required_skills, strategy)
 
-            for skill in required_skills:
-                if skill in agent_skills:
-                    avg_proficiency += agent_skills[skill].proficiency
-
-            avg_proficiency /= len(required_skills)
-
-            if avg_proficiency > best_proficiency:
-                best_proficiency = avg_proficiency
+            if score > best_score:
+                best_score = score
                 best_agent = agent_id
 
         if not best_agent:

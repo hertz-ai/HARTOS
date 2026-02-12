@@ -24,6 +24,7 @@ def main():
     parser.add_argument('--git-sha', required=True, help='Git commit SHA')
     parser.add_argument('--code-hash', required=True, help='SHA-256 code manifest hash')
     parser.add_argument('--manifest-hash', required=True, help='SHA-256 file manifest hash')
+    parser.add_argument('--guardrail-hash', default='', help='SHA-256 guardrail values hash')
     parser.add_argument('--output', default='release_manifest.json', help='Output file path')
     args = parser.parse_args()
 
@@ -46,11 +47,25 @@ def main():
         format=serialization.PublicFormat.Raw,
     )
 
+    # Compute guardrail hash if not provided
+    guardrail_hash = args.guardrail_hash
+    if not guardrail_hash:
+        try:
+            # Add project root to path so we can import security module
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            if project_root not in sys.path:
+                sys.path.insert(0, project_root)
+            from security.hive_guardrails import compute_guardrail_hash
+            guardrail_hash = compute_guardrail_hash()
+        except Exception as e:
+            print(f"WARNING: Could not compute guardrail hash: {e}", file=sys.stderr)
+
     manifest = {
         'version': args.version,
         'git_sha': args.git_sha,
         'code_hash': args.code_hash,
         'file_manifest_hash': args.manifest_hash,
+        'guardrail_hash': guardrail_hash,
         'built_at': datetime.now(timezone.utc).isoformat(),
         'master_public_key': pub_bytes.hex(),
     }
@@ -66,8 +81,10 @@ def main():
 
     print(f"Release manifest signed and written to {args.output}")
     print(f"  version:   {args.version}")
-    print(f"  code_hash: {args.code_hash[:16]}...")
-    print(f"  signature: {manifest['master_signature'][:32]}...")
+    print(f"  code_hash:      {args.code_hash[:16]}...")
+    if guardrail_hash:
+        print(f"  guardrail_hash: {guardrail_hash[:16]}...")
+    print(f"  signature:      {manifest['master_signature'][:32]}...")
 
 
 if __name__ == '__main__':

@@ -8,7 +8,7 @@ from .models import get_engine, Base
 
 logger = logging.getLogger('hevolve_social')
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 19
 
 
 def get_schema_version(engine) -> int:
@@ -381,3 +381,17 @@ def run_migrations():
                     pass
             conn.commit()
         set_schema_version(engine, 17)
+
+    if current < 18:
+        logger.info("HevolveSocial: migrating to v18 (Unified Agent Engine + Products)")
+        from .models import Product, AgentGoal
+        for tbl in [Product.__table__, AgentGoal.__table__]:
+            tbl.create(engine, checkfirst=True)
+        set_schema_version(engine, 18)
+
+    if current < 19:
+        logger.info("HevolveSocial: migrating to v19 (IP Protection Agent)")
+        from .models import IPPatent, IPInfringement
+        for tbl in [IPPatent.__table__, IPInfringement.__table__]:
+            tbl.create(engine, checkfirst=True)
+        set_schema_version(engine, 19)

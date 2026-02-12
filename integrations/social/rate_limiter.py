@@ -2,6 +2,7 @@
 HevolveSocial - Rate Limiter
 In-memory token bucket with Redis fallback.
 """
+import os
 import time
 import threading
 from functools import wraps
@@ -53,16 +54,28 @@ class TokenBucket:
 
 _limiter = TokenBucket()
 
-# Rate limit configurations
-LIMITS = {
-    'global':   {'max_tokens': 100, 'refill_rate': 100 / 60},     # 100 req/min
-    'auth':     {'max_tokens': 5,   'refill_rate': 5 / 300},      # 5 attempts/5min
-    'register': {'max_tokens': 3,   'refill_rate': 3 / 3600},     # 3 registrations/hr
-    'post':     {'max_tokens': 1,   'refill_rate': 1 / 1800},     # 1 post/30min
-    'comment':  {'max_tokens': 50,  'refill_rate': 50 / 3600},    # 50 comments/hr
-    'vote':     {'max_tokens': 60,  'refill_rate': 60 / 60},      # 60 votes/min
-    'search':   {'max_tokens': 30,  'refill_rate': 30 / 60},      # 30 searches/min
-}
+def _build_limits():
+    """Build rate limit config. Relaxed when SOCIAL_RATE_LIMIT_DISABLED=1 or FLASK_ENV=testing."""
+    disabled = os.environ.get('SOCIAL_RATE_LIMIT_DISABLED', '').strip() in ('1', 'true', 'yes')
+    testing = os.environ.get('FLASK_ENV', '').strip() in ('testing', 'test')
+
+    if disabled or testing:
+        _unlimited = {'max_tokens': 100000, 'refill_rate': 100000 / 60}
+        return {k: dict(_unlimited) for k in ('global', 'auth', 'register', 'post', 'comment', 'vote', 'search')}
+
+    # Production limits
+    return {
+        'global':   {'max_tokens': 100, 'refill_rate': 100 / 60},     # 100 req/min
+        'auth':     {'max_tokens': 5,   'refill_rate': 5 / 300},      # 5 attempts/5min
+        'register': {'max_tokens': 3,   'refill_rate': 3 / 3600},     # 3 registrations/hr
+        'post':     {'max_tokens': 1,   'refill_rate': 1 / 1800},     # 1 post/30min
+        'comment':  {'max_tokens': 50,  'refill_rate': 50 / 3600},    # 50 comments/hr
+        'vote':     {'max_tokens': 60,  'refill_rate': 60 / 60},      # 60 votes/min
+        'search':   {'max_tokens': 30,  'refill_rate': 30 / 60},      # 30 searches/min
+    }
+
+
+LIMITS = _build_limits()
 
 
 def rate_limit(action: str = 'global'):

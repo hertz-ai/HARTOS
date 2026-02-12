@@ -52,6 +52,7 @@ from .schemas import (
     MediaConfigSchema,
     ResponseConfigSchema,
     MemoryStoreConfigSchema,
+    EmbodiedAIConfigSchema,
 )
 
 logger = logging.getLogger(__name__)
@@ -1837,6 +1838,8 @@ def update_global_config():
         api._global_config.response = ResponseConfigSchema(**data["response"])
     if "memory" in data:
         api._global_config.memory = MemoryStoreConfigSchema(**data["memory"])
+    if "embodied_ai" in data:
+        api._global_config.embodied_ai = EmbodiedAIConfigSchema(**data["embodied_ai"])
 
     api._save_config()
     return api._global_config.to_dict()
@@ -1918,6 +1921,111 @@ def update_memory_config():
     return api._global_config.memory.to_dict()
 
 
+@admin_bp.route("/config/embodied", methods=["GET"])
+@api_response
+def get_embodied_config():
+    """Get embodied AI / crawl4ai feed configuration."""
+    api = get_api()
+    return api._global_config.embodied_ai.to_dict()
+
+
+@admin_bp.route("/config/embodied", methods=["PUT"])
+@api_response
+def update_embodied_config():
+    """Update embodied AI feed configuration and propagate to crawl4ai."""
+    api = get_api()
+    data = request.get_json()
+    if not data:
+        raise ValueError("Request body required")
+    api._global_config.embodied_ai = EmbodiedAIConfigSchema(**data)
+    api._save_config()
+
+    # Propagate to crawl4ai runtime if reachable
+    _propagate_embodied_config(api._global_config.embodied_ai)
+    return api._global_config.embodied_ai.to_dict()
+
+
+@admin_bp.route("/config/embodied/toggle", methods=["POST"])
+@api_response
+def toggle_embodied_feed():
+    """Toggle individual feeds on/off at runtime.
+
+    Body: {"feed": "screen"|"camera"|"audio"|"all", "enabled": true|false}
+    """
+    api = get_api()
+    data = request.get_json()
+    if not data or "feed" not in data:
+        raise ValueError("feed and enabled are required")
+
+    feed = data["feed"]
+    enabled = data.get("enabled", True)
+    cfg = api._global_config.embodied_ai
+
+    if feed == "screen":
+        cfg.screen_capture_enabled = enabled
+    elif feed == "camera":
+        cfg.camera_enabled = enabled
+    elif feed == "audio":
+        cfg.audio_enabled = enabled
+    elif feed == "all":
+        cfg.enabled = enabled
+        cfg.screen_capture_enabled = enabled
+        cfg.camera_enabled = enabled
+        cfg.audio_enabled = enabled
+    else:
+        raise ValueError(f"Unknown feed: {feed}. Use screen|camera|audio|all")
+
+    api._save_config()
+    _propagate_embodied_config(cfg)
+    return {"feed": feed, "enabled": enabled, "config": cfg.to_dict()}
+
+
+@admin_bp.route("/config/embodied/status", methods=["GET"])
+@api_response
+def get_embodied_status():
+    """Get live status of crawl4ai embodied AI system."""
+    import requests as req
+    api = get_api()
+    url = api._global_config.embodied_ai.crawl4ai_url
+
+    try:
+        resp = req.get(f"{url}/health", timeout=3)
+        health = resp.json() if resp.ok else {"status": "unreachable"}
+    except Exception:
+        health = {"status": "unreachable", "error": "Cannot connect to crawl4ai"}
+
+    try:
+        resp = req.get(f"{url}/v1/stats", timeout=3)
+        stats = resp.json() if resp.ok else {}
+    except Exception:
+        stats = {}
+
+    return {
+        "config": api._global_config.embodied_ai.to_dict(),
+        "crawl4ai_health": health,
+        "learning_stats": stats,
+    }
+
+
+def _propagate_embodied_config(cfg: EmbodiedAIConfigSchema):
+    """Push config changes to crawl4ai runtime (best-effort)."""
+    import requests as req
+    try:
+        # crawl4ai reads env vars at startup, but we can hit a
+        # runtime config endpoint if available, or set for next restart.
+        # For now, write to shared config file that crawl4ai watches.
+        config_path = os.path.join(
+            os.path.dirname(__file__), '..', '..', '..',
+            'agent_data', 'embodied_ai_config.json',
+        )
+        os.makedirs(os.path.dirname(config_path), exist_ok=True)
+        with open(config_path, 'w') as f:
+            json.dump(cfg.to_dict(), f, indent=2)
+        logger.info("Embodied AI config propagated to %s", config_path)
+    except Exception as e:
+        logger.warning("Failed to propagate embodied AI config: %s", e)
+
+
 @admin_bp.route("/config/export", methods=["GET"])
 @api_response
 def export_config():
@@ -1960,6 +2068,8 @@ def import_config():
             api._global_config.response = ResponseConfigSchema(**g["response"])
         if "memory" in g:
             api._global_config.memory = MemoryStoreConfigSchema(**g["memory"])
+        if "embodied_ai" in g:
+            api._global_config.embodied_ai = EmbodiedAIConfigSchema(**g["embodied_ai"])
 
     if "channels" in data:
         api._channels = data["channels"]

@@ -52,11 +52,19 @@ class RuntimeIntegrityMonitor:
             self._thread.join(timeout=10)
 
     def _check_loop(self) -> None:
-        """Background loop: periodic code hash verification."""
+        """Background loop: periodic code hash + guardrail hash verification."""
         while self._running:
             time.sleep(self._check_interval)
             if not self._running:
                 break
+            # Heartbeat to watchdog
+            try:
+                from security.node_watchdog import get_watchdog
+                wd = get_watchdog()
+                if wd:
+                    wd.heartbeat('runtime_monitor')
+            except Exception:
+                pass
             try:
                 from security.node_integrity import compute_code_hash
                 current_hash = compute_code_hash(self._code_root)
@@ -69,6 +77,18 @@ class RuntimeIntegrityMonitor:
                     return  # Stop checking after tamper
             except Exception as e:
                 logger.warning(f"Runtime integrity check error: {e}")
+
+            # Guardrail values integrity check
+            try:
+                from security.hive_guardrails import verify_guardrail_integrity
+                if not verify_guardrail_integrity():
+                    logger.critical(
+                        "GUARDRAIL TAMPERING DETECTED: frozen values hash changed")
+                    self._tampered = True
+                    self._on_tamper_detected()
+                    return
+            except Exception as e:
+                logger.warning(f"Guardrail integrity check error: {e}")
 
     def _on_tamper_detected(self) -> None:
         """Respond to tampering: stop gossip, log changed files."""

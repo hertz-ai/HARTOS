@@ -27,7 +27,7 @@ class TTLCache:
     - Drop-in replacement for dict (supports [] operator, .get(), etc.)
     """
 
-    def __init__(self, ttl_seconds: int = 7200, max_size: int = 1000, name: str = 'cache'):
+    def __init__(self, ttl_seconds: int = 7200, max_size: int = 1000, name: str = 'cache', loader=None):
         self._data = OrderedDict()
         self._timestamps = {}
         self._ttl = ttl_seconds
@@ -35,6 +35,7 @@ class TTLCache:
         self._name = name
         self._lock = threading.Lock()
         self._cleanup_counter = 0
+        self._loader = loader  # callable(key) → value or None
 
     def __setitem__(self, key, value):
         with self._lock:
@@ -58,21 +59,44 @@ class TTLCache:
 
     def __getitem__(self, key):
         with self._lock:
-            if key not in self._data:
-                raise KeyError(key)
-            if self._is_expired(key):
+            if key in self._data and not self._is_expired(key):
+                return self._data[key]
+            # Clean up expired entry if present
+            if key in self._data:
                 self._remove(key)
-                raise KeyError(key)
-            return self._data[key]
+            # Try loader before raising KeyError
+            if self._loader:
+                try:
+                    value = self._loader(key)
+                except Exception as e:
+                    logger.debug(f"[{self._name}] Loader error for {key}: {e}")
+                    raise KeyError(key)
+                if value is not None:
+                    self._data[key] = value
+                    self._timestamps[key] = time.monotonic()
+                    logger.debug(f"[{self._name}] Loaded {key} from persistent storage")
+                    return value
+            raise KeyError(key)
 
     def __contains__(self, key):
         with self._lock:
-            if key not in self._data:
-                return False
-            if self._is_expired(key):
+            if key in self._data and not self._is_expired(key):
+                return True
+            # Clean up expired entry if present
+            if key in self._data:
                 self._remove(key)
-                return False
-            return True
+            # Try loader
+            if self._loader:
+                try:
+                    value = self._loader(key)
+                except Exception:
+                    return False
+                if value is not None:
+                    self._data[key] = value
+                    self._timestamps[key] = time.monotonic()
+                    logger.debug(f"[{self._name}] Loaded {key} from persistent storage")
+                    return True
+            return False
 
     def __delitem__(self, key):
         with self._lock:
@@ -93,6 +117,19 @@ class TTLCache:
         with self._lock:
             if key in self._data and not self._is_expired(key):
                 return self._data[key]
+            # Clean up expired entry if present
+            if key in self._data:
+                self._remove(key)
+            # Try loader before using default
+            if self._loader:
+                try:
+                    value = self._loader(key)
+                except Exception:
+                    value = None
+                if value is not None:
+                    self._data[key] = value
+                    self._timestamps[key] = time.monotonic()
+                    return value
             self._data[key] = default
             self._timestamps[key] = time.monotonic()
             return default

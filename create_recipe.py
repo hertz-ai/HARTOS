@@ -262,6 +262,7 @@ def log_tool_execution(func):
 
 
 from core.session_cache import TTLCache  # early import — needed before first TTLCache usage below
+from core.cache_loaders import load_agent_data, load_user_ledger, load_user_simplemem
 
 scheduler = BackgroundScheduler()
 scheduler.start()
@@ -285,6 +286,14 @@ config_list = [{
 #         "api_version": "2024-12-01-preview",
 #         "price": [0.0025, 0.01]
 #     }]
+# Per-request model config override (speculative execution, hive compute routing)
+def get_llm_config():
+    """Get LLM config — checks thread-local override before falling back to global.
+    This enables per-dispatch model routing for speculative execution."""
+    from threadlocal import thread_local_data
+    override = thread_local_data.get_model_config_override()
+    return {"cache_seed": None, "config_list": override or config_list, "max_tokens": 1500}
+
 # Performance: cached config loading (shared with helper.py, reuse_recipe.py)
 from core.config_cache import get_config as _get_config
 from core.http_pool import pooled_post, pooled_get, pooled_request
@@ -298,8 +307,8 @@ redis_client = redis.StrictRedis(
 
 
 # Performance: TTL caches replace unbounded global dicts (auto-expire after 2 hours)
-agent_data = TTLCache(ttl_seconds=7200, max_size=500, name='create_agent_data')
-user_simplemem = TTLCache(ttl_seconds=7200, max_size=500, name='user_simplemem')
+agent_data = TTLCache(ttl_seconds=7200, max_size=500, name='create_agent_data', loader=load_agent_data)
+user_simplemem = TTLCache(ttl_seconds=7200, max_size=500, name='user_simplemem', loader=load_user_simplemem)
 task_time = TTLCache(ttl_seconds=7200, max_size=500, name='task_time')
 agent_metadata = TTLCache(ttl_seconds=7200, max_size=500, name='agent_metadata')
 final_recipe = TTLCache(ttl_seconds=7200, max_size=500, name='final_recipe')
@@ -2048,6 +2057,20 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         tool_logger.warning(f"AP2 Agentic Commerce error (non-critical): {e}")
         # Continue without payment capabilities if AP2 fails
 
+    # Goal-aware Tier 2 tool loading (marketing, coding, etc.)
+    try:
+        from integrations.agent_engine.marketing_tools import detect_goal_tags, register_marketing_tools
+        goal_tags = detect_goal_tags(task)
+        if 'marketing' in goal_tags:
+            register_marketing_tools(helper, assistant, user_id)
+            tool_logger.info("Marketing tools loaded (Tier 2) based on prompt content")
+        if 'ip_protection' in goal_tags:
+            from integrations.agent_engine.ip_protection_tools import register_ip_protection_tools
+            register_ip_protection_tools(helper, assistant, user_id)
+            tool_logger.info("IP protection tools loaded (Tier 2) based on prompt content")
+    except Exception as e:
+        tool_logger.debug(f"Goal-aware tool loading skipped: {e}")
+
     assistant.description = 'this is an assistant agent that coordinates & executes requested tasks & actions'
     executor.description = 'this is an executor agent that Specialized agent for code execution & response handling'
     author.description = 'this is an author/user agent that focused on user support, error resolution, contextual information. Contact this agent when you need any user based information or persona based information or if you want to say something to user'
@@ -3348,7 +3371,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
 
 
 user_tasks = TTLCache(ttl_seconds=7200, max_size=500, name='create_user_tasks')
-user_ledgers = TTLCache(ttl_seconds=7200, max_size=500, name='create_user_ledgers')
+user_ledgers = TTLCache(ttl_seconds=7200, max_size=500, name='create_user_ledgers', loader=load_user_ledger)
 user_delegation_bridges = TTLCache(ttl_seconds=7200, max_size=500, name='create_user_delegation_bridges')
 
 
