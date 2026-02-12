@@ -77,6 +77,14 @@ def init_social(app):
     except Exception as e:
         logger.debug(f"HevolveSocial admin blueprint skipped: {e}")
 
+    # Register agent dashboard blueprint (truth-grounded unified agent view)
+    try:
+        from .api_dashboard import dashboard_bp
+        app.register_blueprint(dashboard_bp)
+        logger.info("HevolveSocial dashboard registered at /api/social/dashboard/")
+    except Exception as e:
+        logger.debug(f"HevolveSocial dashboard blueprint skipped: {e}")
+
     # Initialize node keypair for integrity verification
     try:
         from security.node_integrity import get_or_create_keypair, get_public_key_hex
@@ -116,6 +124,17 @@ def init_social(app):
         except Exception as e:
             logger.debug(f"HevolveSocial gossip start skipped: {e}")
 
+        # Start zero-config LAN auto-discovery (additive to seed peers)
+        import os as _os_disc
+        if _os_disc.environ.get('HEVOLVE_AUTO_DISCOVERY', 'true').lower() != 'false':
+            try:
+                from .peer_discovery import auto_discovery
+                auto_discovery.start()
+                logger.info(f"HevolveSocial auto-discovery started "
+                            f"(UDP port {auto_discovery._port})")
+            except Exception as e:
+                logger.debug(f"HevolveSocial auto-discovery skipped: {e}")
+
         # Start runtime integrity monitor if we have a signed manifest
         if _boot_manifest:
             try:
@@ -149,6 +168,13 @@ def init_social(app):
         except Exception as e:
             logger.debug(f"HevolveSocial coding agent init skipped: {e}")
 
+    # Start unified agent engine (marketing, coding goals via unified daemon)
+    try:
+        from integrations.agent_engine import init_agent_engine
+        init_agent_engine(app)
+    except Exception as e:
+        logger.debug(f"HevolveSocial agent engine init skipped: {e}")
+
     # Register with central registry if configured
     import os
     registry_url = os.environ.get('HEVOLVE_REGISTRY_URL', '')
@@ -162,6 +188,80 @@ def init_social(app):
             logger.info(f"HevolveSocial registered with registry: {registry_url}")
         except Exception as e:
             logger.debug(f"HevolveSocial registry registration skipped: {e}")
+
+    # ── NodeWatchdog — start LAST, monitors all daemon threads ──
+    try:
+        from security.node_watchdog import start_watchdog
+        watchdog = start_watchdog()
+
+        # Register gossip
+        if _boot_verified:
+            try:
+                from .peer_discovery import gossip as _g
+                if _g._running:
+                    watchdog.register('gossip', expected_interval=10,
+                                      restart_fn=_g.start, stop_fn=_g.stop)
+            except Exception:
+                pass
+
+        # Register auto-discovery
+        try:
+            from .peer_discovery import auto_discovery as _ad
+            if _ad._running:
+                watchdog.register('auto_discovery',
+                                  expected_interval=_ad._beacon_interval,
+                                  restart_fn=_ad.start, stop_fn=_ad.stop)
+        except Exception:
+            pass
+
+        # Register runtime monitor
+        if _boot_manifest:
+            try:
+                from security.runtime_monitor import get_monitor
+                mon = get_monitor()
+                if mon and mon._running:
+                    watchdog.register('runtime_monitor',
+                                      expected_interval=mon._check_interval,
+                                      restart_fn=mon.start, stop_fn=mon.stop)
+            except Exception:
+                pass
+
+        # Register sync engine
+        try:
+            from .sync_engine import sync_engine as _se
+            if _se._running:
+                watchdog.register('sync_engine',
+                                  expected_interval=_se._interval,
+                                  restart_fn=_se.start_background_sync,
+                                  stop_fn=_se.stop_background_sync)
+        except Exception:
+            pass
+
+        # Register agent daemon
+        try:
+            from integrations.agent_engine.agent_daemon import agent_daemon as _agent_d
+            if _agent_d._running:
+                watchdog.register('agent_daemon',
+                                  expected_interval=_agent_d._interval,
+                                  restart_fn=_agent_d.start, stop_fn=_agent_d.stop)
+        except Exception:
+            pass
+
+        # Register coding daemon
+        try:
+            from integrations.coding_agent.coding_daemon import coding_daemon as _coding_d
+            if _coding_d._running:
+                watchdog.register('coding_daemon',
+                                  expected_interval=_coding_d._interval,
+                                  restart_fn=_coding_d.start, stop_fn=_coding_d.stop)
+        except Exception:
+            pass
+
+        watchdog.start()
+        logger.info(f"NodeWatchdog started: monitoring "
+                    f"{len(watchdog._threads)} threads")
+    except Exception as e:
+        logger.debug(f"NodeWatchdog start skipped: {e}")
 
     # Sync trained agents as social users on first request
     @app.before_request

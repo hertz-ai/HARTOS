@@ -21,7 +21,7 @@ from collections import deque
 import redis
 import pickle
 from PIL import Image
-from langchain.memory import ZepMemory
+
 from crossbarhttp import Client
 from flask import current_app
 from helper import ToolMessageHandler, strip_json_values, get_time_based_history, retrieve_json, load_vlm_agent_files
@@ -113,6 +113,7 @@ from core.config_cache import get_config as _get_config
 from core.http_pool import pooled_post, pooled_get, pooled_request
 from core.event_loop import get_or_create_event_loop
 from core.session_cache import TTLCache
+from core.cache_loaders import load_agent_data, load_user_ledger, load_recipe, load_user_simplemem
 
 config = _get_config()
 STUDENT_API = config.get('STUDENT_API', '')
@@ -163,7 +164,7 @@ scheduler.start()
 user_agents: Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]] = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_agents')
 role_agents: Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]] = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_role_agents')
 agents_session = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_agents_session')
-recipes = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_recipes')
+recipes = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_recipes', loader=load_recipe)
 user_journey = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_journey')
 temp_users = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_temp_users')
 chat_joinees = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_chat_joinees')
@@ -175,8 +176,8 @@ _active_tools_lock = threading.Lock()
 
 redis_client = redis.StrictRedis(
     host='azure_all_vms.hertzai.com', port=6369, db=0)
-agent_data = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_agent_data')
-user_simplemem = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_simplemem')
+agent_data = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_agent_data', loader=load_agent_data)
+user_simplemem = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_simplemem', loader=load_user_simplemem)
 # Azure OpenAI configuration (fallback - gpt-4o)
 # config_list = [{
 #     "model": 'gpt-4o',
@@ -204,6 +205,13 @@ config_list = [{
 #         "api_version": "2024-12-01-preview",
 #         "price": [0.0025, 0.01]
 #     }]
+
+# Per-request model config override (speculative execution, hive compute routing)
+def get_llm_config():
+    """Get LLM config — checks thread-local override before falling back to global."""
+    from threadlocal import thread_local_data
+    override = thread_local_data.get_model_config_override()
+    return {"cache_seed": None, "config_list": override or config_list, "max_tokens": 1500}
 
 message_tracking_lock = threading.Lock()
 
@@ -2618,6 +2626,20 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         current_app.logger.warning(f"AP2 Agentic Commerce error (non-critical): {e}")
         # Continue without payment capabilities if AP2 fails
 
+    # Goal-aware Tier 2 tool loading (marketing, coding, etc.)
+    try:
+        from integrations.agent_engine.marketing_tools import register_marketing_tools
+        # Detect goal type from prompt_id prefix (e.g. 'marketing_xxx', 'coding_xxx')
+        if str(prompt_id).startswith('marketing'):
+            register_marketing_tools(helper, assistant, user_id)
+            current_app.logger.info("Marketing tools loaded (Tier 2) for reuse agent")
+        if str(prompt_id).startswith('ip_protection'):
+            from integrations.agent_engine.ip_protection_tools import register_ip_protection_tools
+            register_ip_protection_tools(helper, assistant, user_id)
+            current_app.logger.info("IP protection tools loaded (Tier 2) for reuse agent")
+    except Exception as e:
+        current_app.logger.debug(f"Goal-aware tool loading skipped: {e}")
+
     assistant.description = 'Designed to handle specific tasks by interacting directly with other agents or the user. It acts as the primary orchestrator for task management and ensures tasks are completed efficiently'
     user_proxy.description = 'Acts as a user, performing tasks assigned by the Assistant Agent. It simulates user actions and provides results or feedback as required.'
     helper.description = 'this is a helper agent that calls tools, facilitates task completion & assists other agents it cal perform tools/function like [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, save_data_in_memory, search_long_term_memory and save_to_long_term_memory] calls and supporting backend processes. '
@@ -3239,7 +3261,7 @@ def create_schedule(prompt_id, user_id):
 recent_file_id = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_recent_file_id')
 # NOTE: recipes TTLCache already defined at module top (line 166) — do NOT redefine here
 user_tasks = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_tasks')
-user_ledgers = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_ledgers')
+user_ledgers = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_ledgers', loader=load_user_ledger)
 user_delegation_bridges = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_delegation_bridges')
 request_id_list = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_request_id_list')
 request_id_list_sent_intermediate = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_request_id_list_sent_intermediate')

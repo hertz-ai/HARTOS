@@ -430,6 +430,36 @@ class ResponseConfigSchema:
 
 
 @dataclass
+class EmbodiedAIConfigSchema:
+    """Embodied AI / crawl4ai feed configuration."""
+    enabled: bool = True
+    # Visual feeds
+    screen_capture_enabled: bool = True
+    screen_capture_fps: float = 0.5
+    camera_enabled: bool = True
+    camera_fps: float = 2.0
+    camera_id: int = 0
+    visual_source_mode: str = 'auto'  # auto|screen|camera
+    # Audio feed
+    audio_enabled: bool = True
+    audio_sample_rate: int = 16000
+    audio_chunk_duration: float = 1.0
+    # Learning
+    learning_mode: str = 'hybrid'  # passive|active|hybrid
+    observation_interval: float = 10.0
+    visual_min_change: float = 0.05
+    # Active exploration
+    exploration_safe_mode: bool = True
+    exploration_max_actions_per_min: int = 10
+    exploration_rate: float = 0.3
+    # crawl4ai connection
+    crawl4ai_url: str = 'http://localhost:8000'
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class GlobalConfigSchema:
     """Global system configuration."""
     queue: QueueConfigSchema = field(default_factory=QueueConfigSchema)
@@ -437,6 +467,7 @@ class GlobalConfigSchema:
     media: MediaConfigSchema = field(default_factory=MediaConfigSchema)
     response: ResponseConfigSchema = field(default_factory=ResponseConfigSchema)
     memory: MemoryStoreConfigSchema = field(default_factory=MemoryStoreConfigSchema)
+    embodied_ai: EmbodiedAIConfigSchema = field(default_factory=EmbodiedAIConfigSchema)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -445,6 +476,7 @@ class GlobalConfigSchema:
             "media": self.media.to_dict(),
             "response": self.response.to_dict(),
             "memory": self.memory.to_dict(),
+            "embodied_ai": self.embodied_ai.to_dict(),
         }
 
 

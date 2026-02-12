@@ -707,6 +707,63 @@ def initialize_minimal_lifecycle_hooks():
 
 
 # =============================================================================
+# LEDGER RESTORE FUNCTIONS (reverse sync: Ledger → ActionState)
+# =============================================================================
+
+def restore_action_states_from_ledger(user_prompt: str, ledger) -> int:
+    """
+    Restore action_states from SmartLedger task statuses.
+
+    This is the reverse of sync_action_state_to_ledger — when a user returns
+    after cache eviction/expiry, this rebuilds the in-memory action_states
+    from the persisted SmartLedger.
+
+    Args:
+        user_prompt: The user_prompt key (e.g., "123_456")
+        ledger: A SmartLedger instance with tasks loaded from Redis/JSON
+
+    Returns:
+        int: Number of action states restored
+    """
+    try:
+        LedgerTaskStatus = _get_ledger_task_status()
+    except Exception:
+        return 0
+
+    # Reverse mapping: LedgerTaskStatus → ActionState
+    REVERSE_MAP = {
+        LedgerTaskStatus.PENDING: ActionState.ASSIGNED,
+        LedgerTaskStatus.IN_PROGRESS: ActionState.IN_PROGRESS,
+        LedgerTaskStatus.COMPLETED: ActionState.TERMINATED,
+        LedgerTaskStatus.BLOCKED: ActionState.PENDING,
+        LedgerTaskStatus.FAILED: ActionState.ERROR,
+        LedgerTaskStatus.PAUSED: ActionState.FALLBACK_REQUESTED,
+        LedgerTaskStatus.DELEGATED: ActionState.IN_PROGRESS,
+        LedgerTaskStatus.TERMINATED: ActionState.TERMINATED,
+    }
+
+    restored = 0
+    with _state_lock:
+        for task_id, task in ledger.tasks.items():
+            if not task_id.startswith('action_'):
+                continue
+            try:
+                action_id = int(task_id.split('_')[1])
+            except (IndexError, ValueError):
+                continue
+
+            action_state = REVERSE_MAP.get(task.status, ActionState.ASSIGNED)
+            if user_prompt not in action_states:
+                action_states[user_prompt] = {}
+            action_states[user_prompt][action_id] = action_state
+            restored += 1
+
+    if restored > 0:
+        logger.info(f"Restored {restored} action states from ledger for {user_prompt}")
+    return restored
+
+
+# =============================================================================
 # LEDGER SYNC FUNCTIONS
 # =============================================================================
 

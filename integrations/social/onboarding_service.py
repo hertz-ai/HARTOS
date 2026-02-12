@@ -22,6 +22,7 @@ ONBOARDING_STEPS = [
     {'key': 'first_comment', 'title': 'Leave a Comment', 'reward_type': 'spark', 'reward_amount': 25},
     {'key': 'first_post', 'title': 'Create a Post', 'reward_type': 'xp', 'reward_amount': 100},
     {'key': 'explore_agents', 'title': 'Explore Agents', 'reward_type': 'xp', 'reward_amount': 100},
+    {'key': 'invite_friends', 'title': 'Invite Friends', 'reward_type': 'spark', 'reward_amount': 100},
 ]
 
 
@@ -180,6 +181,7 @@ class OnboardingService:
             'comment': 'first_comment',
             'post': 'first_post',
             'view_agents': 'explore_agents',
+            'share_referral': 'invite_friends',
         }
         step_key = action_to_step.get(action)
         if step_key:

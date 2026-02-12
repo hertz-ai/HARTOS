@@ -1,0 +1,236 @@
+"""
+Node Watchdog — Frozen Thread Auto-Detection and Restart
+
+Monitors all background daemon threads via heartbeat protocol.
+Detects frozen/crashed threads and auto-restarts them.
+
+Each daemon calls watchdog.heartbeat('name') every loop iteration.
+If a heartbeat is older than 2× the expected interval, the thread
+is considered frozen and gets auto-restarted.
+
+After 5 consecutive restart failures, the thread is marked 'dead'.
+"""
+import logging
+import threading
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Callable, Dict, List, Optional
+
+logger = logging.getLogger('hevolve_security')
+
+MAX_CONSECUTIVE_FAILURES = 5
+
+
+@dataclass
+class ThreadInfo:
+    """Tracked state for a single monitored daemon thread."""
+    name: str
+    expected_interval: float
+    restart_fn: Callable
+    stop_fn: Optional[Callable] = None
+    last_heartbeat: float = field(default_factory=time.time)
+    status: str = 'healthy'  # healthy | frozen | restarting | dead
+    restart_count: int = 0
+    last_restart_at: Optional[float] = None
+    consecutive_failures: int = 0
+
+
+class NodeWatchdog:
+    """Monitors background daemon threads via heartbeat protocol.
+
+    Usage:
+        watchdog = NodeWatchdog()
+        watchdog.register('gossip', expected_interval=60,
+                          restart_fn=gossip.start, stop_fn=gossip.stop)
+        watchdog.start()
+
+        # In daemon loops:
+        watchdog.heartbeat('gossip')
+    """
+
+    def __init__(self, check_interval: int = None, frozen_multiplier: float = 2.0):
+        import os
+        self._check_interval = check_interval or int(
+            os.environ.get('HEVOLVE_WATCHDOG_INTERVAL', '30'))
+        self._frozen_multiplier = frozen_multiplier
+        self._threads: Dict[str, ThreadInfo] = {}
+        self._lock = threading.Lock()
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._restart_log: List[Dict] = []
+        self._started_at: Optional[float] = None
+
+    def register(self, name: str, expected_interval: float,
+                 restart_fn: Callable, stop_fn: Callable = None) -> None:
+        """Register a daemon thread to be monitored."""
+        with self._lock:
+            self._threads[name] = ThreadInfo(
+                name=name,
+                expected_interval=expected_interval,
+                restart_fn=restart_fn,
+                stop_fn=stop_fn,
+                last_heartbeat=time.time(),
+            )
+        logger.info(f"Watchdog: registered thread '{name}' "
+                    f"(interval={expected_interval}s)")
+
+    def unregister(self, name: str) -> None:
+        """Remove a thread from monitoring."""
+        with self._lock:
+            self._threads.pop(name, None)
+
+    def heartbeat(self, name: str) -> None:
+        """Called by daemon threads each cycle to signal they are alive."""
+        with self._lock:
+            info = self._threads.get(name)
+            if info:
+                info.last_heartbeat = time.time()
+
+    def start(self) -> None:
+        """Start the watchdog background thread. Call LAST after all daemons."""
+        with self._lock:
+            if self._running:
+                return
+            self._running = True
+            self._started_at = time.time()
+        self._thread = threading.Thread(target=self._check_loop, daemon=True)
+        self._thread.start()
+        logger.info(f"NodeWatchdog started (interval={self._check_interval}s, "
+                    f"multiplier={self._frozen_multiplier}x)")
+
+    def stop(self) -> None:
+        """Stop the watchdog."""
+        with self._lock:
+            self._running = False
+        if self._thread:
+            self._thread.join(timeout=10)
+
+    def get_health(self) -> Dict:
+        """Return health status of all monitored threads."""
+        now = time.time()
+        threads = {}
+        with self._lock:
+            for name, info in self._threads.items():
+                age = now - info.last_heartbeat
+                threads[name] = {
+                    'status': info.status,
+                    'last_heartbeat_age_s': round(age, 1),
+                    'last_heartbeat_iso': datetime.fromtimestamp(
+                        info.last_heartbeat, tz=timezone.utc).isoformat(),
+                    'expected_interval': info.expected_interval,
+                    'restart_count': info.restart_count,
+                    'consecutive_failures': info.consecutive_failures,
+                }
+                if info.last_restart_at:
+                    threads[name]['last_restart_iso'] = datetime.fromtimestamp(
+                        info.last_restart_at, tz=timezone.utc).isoformat()
+
+        uptime = round(now - self._started_at, 1) if self._started_at else 0
+        return {
+            'watchdog': 'healthy' if self._running else 'stopped',
+            'uptime_seconds': uptime,
+            'threads': threads,
+            'restart_log': list(self._restart_log[-20:]),  # last 20 events
+        }
+
+    def _check_loop(self) -> None:
+        """Background loop: check heartbeats, restart frozen threads."""
+        while self._running:
+            time.sleep(self._check_interval)
+            if not self._running:
+                break
+            self._check_all()
+
+    def _check_all(self) -> None:
+        """Single check pass over all threads."""
+        now = time.time()
+        to_restart = []
+        with self._lock:
+            for name, info in self._threads.items():
+                if info.status == 'dead':
+                    continue
+                age = now - info.last_heartbeat
+                threshold = info.expected_interval * self._frozen_multiplier
+                if age > threshold and info.status in ('healthy', 'frozen'):
+                    logger.critical(
+                        f"Watchdog: thread '{name}' FROZEN — no heartbeat "
+                        f"for {age:.0f}s (threshold: {threshold:.0f}s)")
+                    info.status = 'frozen'
+                    to_restart.append(name)
+
+        # Restart outside the lock to avoid deadlocks
+        for name in to_restart:
+            self._restart_thread(name)
+
+    def _restart_thread(self, name: str) -> bool:
+        """Stop and restart a frozen thread. Returns True on success."""
+        with self._lock:
+            info = self._threads.get(name)
+            if not info:
+                return False
+            if info.consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                info.status = 'dead'
+                logger.critical(
+                    f"Watchdog: thread '{name}' marked DEAD after "
+                    f"{MAX_CONSECUTIVE_FAILURES} consecutive restart failures")
+                return False
+            info.status = 'restarting'
+            stop_fn = info.stop_fn
+            restart_fn = info.restart_fn
+
+        # Stop the frozen thread
+        if stop_fn:
+            try:
+                stop_fn()
+            except Exception as e:
+                logger.warning(f"Watchdog: error stopping '{name}': {e}")
+
+        # Restart it
+        try:
+            restart_fn()
+            with self._lock:
+                info = self._threads.get(name)
+                if info:
+                    info.status = 'healthy'
+                    info.last_heartbeat = time.time()
+                    info.restart_count += 1
+                    info.last_restart_at = time.time()
+                    info.consecutive_failures = 0
+                    self._restart_log.append({
+                        'name': name,
+                        'time': datetime.now(timezone.utc).isoformat(),
+                        'restart_count': info.restart_count,
+                    })
+            logger.critical(
+                f"Watchdog: thread '{name}' RESTARTED successfully "
+                f"(total restarts: {info.restart_count})")
+            return True
+        except Exception as e:
+            with self._lock:
+                info = self._threads.get(name)
+                if info:
+                    info.consecutive_failures += 1
+                    if info.consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                        info.status = 'dead'
+                    else:
+                        info.status = 'frozen'
+            logger.critical(f"Watchdog: FAILED to restart '{name}': {e}")
+            return False
+
+
+# ─── Module singleton ───
+
+_watchdog: Optional[NodeWatchdog] = None
+
+
+def start_watchdog(check_interval: int = None) -> NodeWatchdog:
+    """Create and return the global watchdog instance."""
+    global _watchdog
+    _watchdog = NodeWatchdog(check_interval=check_interval)
+    return _watchdog
+
+
+def get_watchdog() -> Optional[NodeWatchdog]:
+    """Get the current watchdog instance (or None)."""
+    return _watchdog

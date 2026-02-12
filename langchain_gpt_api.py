@@ -3,8 +3,10 @@ import sys
 import io
 if sys.platform == 'win32':
     # Force UTF-8 encoding for stdout/stderr to prevent crashes with non-ASCII characters
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+    if sys.stdout is not None:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    if sys.stderr is not None:
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 from bs4 import BeautifulSoup
 from enum import Enum
@@ -40,7 +42,7 @@ except (ImportError, ModuleNotFoundError):
 
 # LLM base class
 from langchain.llms.base import LLM
-from langchain.memory import ConversationBufferMemory, ReadOnlySharedMemory, ZepMemory
+from langchain.memory import ConversationBufferMemory, ReadOnlySharedMemory
 from langchain.schema import AgentAction, AgentFinish, OutputParserException, HumanMessage, AIMessage, SystemMessage
 from langchain.tools import OpenAPISpec, APIOperation, StructuredTool
 from langchain.utilities import GoogleSearchAPIWrapper
@@ -407,8 +409,8 @@ os.environ["GOOGLE_CSE_ID"] = config['GOOGLE_CSE_ID']
 os.environ["GOOGLE_API_KEY"] = config['GOOGLE_API_KEY']
 os.environ["NEWS_API_KEY"] = config['NEWS_API_KEY']
 os.environ["SERPAPI_API_KEY"] = config['SERPAPI_API_KEY']
-ZEP_API_URL = config['ZEP_API_URL']
-ZEP_API_KEY = config['ZEP_API_KEY']
+# Zep removed — replaced by SimpleMem (local, zero-latency)
+# ZEP_API_URL / ZEP_API_KEY no longer needed
 GPT_API = config['GPT_API']
 STUDENT_API = config['STUDENT_API']
 ACTION_API = config['ACTION_API']
@@ -647,7 +649,7 @@ def get_tools(req_tool, is_first: bool = False):
                 func=parsing_string,
                 description=f"""Utilize this tool exclusively when the information required predates the current day & pertains to the ongoing user query or when there is a need to recall certain things we spoke earlier. The necessary input for this tool comprises a list of values separated by commas.
                 The list should encompass a user-generated query, designated by user input text, a commencement date denoted as start_date, and an end date labeled as end_date. The start_date denotes the initiation date for the user information search and should consistently adhere to the ISO 8601 format. Meanwhile, the end_date, also conforming to the ISO 8601 format, signifies the conclusion date for the search.
-                In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what zep can do, 2023-07-12T10:19:56.00000Z, 2023-07-13T10:19:56.732291Z'. If query has any form of date or time by user, then start end datetime can be exact rather than till today for more accurate results. Remove any references to time based words (e.g. yesterday, today, datetimes, last year) since the date range you provide already accounts for that. e.g. if user has asked what did we discuss the day before yesterday then the text argument should just be empty since it does not have any named entity for fuzzy search followed by start and end datetime.
+                In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what we discussed about the project, 2023-07-12T10:19:56.00000Z, 2023-07-13T10:19:56.732291Z'. If query has any form of date or time by user, then start end datetime can be exact rather than till today for more accurate results. Remove any references to time based words (e.g. yesterday, today, datetimes, last year) since the date range you provide already accounts for that. e.g. if user has asked what did we discuss the day before yesterday then the text argument should just be empty since it does not have any named entity for fuzzy search followed by start and end datetime.
                 Strive to apply this tool judiciously for scenarios in which retrospective user information is imperative. If Full history tool response is present, forget other histories, the inputs should be meticulously arranged to facilitate the extraction of accurate and pertinent data within the specified timeframe. Never use this tool for what is the response to my last comment?
                 Remember whatever user query is regarding search history understand what user is asking about and rephrase it properly then send to tool. Before framing the final tool response from this tool consult corresponding created_at date time to give more accurate response"""
             ),
@@ -740,7 +742,7 @@ def get_tools(req_tool, is_first: bool = False):
                 Don't use this to create a custom curriculum for user''',
             'FULL_HISTORY': '''Utilize this tool exclusively when the information required predates the current day & pertains to the ongoing user query or when there is a need to recall certain things we spoke earlier. The necessary input for this tool comprises a list of values separated by commas.
                 The list should encompass a user-generated query, designated by user input text, a commencement date denoted as start_date, and an end date labeled as end_date. The start_date denotes the initiation date for the user information search and should consistently adhere to the ISO 8601 format. Meanwhile, the end_date, also conforming to the ISO 8601 format, signifies the conclusion date for the search.
-                In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what zep can do, 2023-07-12T10:19:56.00000Z, 2023-07-13T10:19:56.732291Z'. If query has any form of date or time by user, then start end datetime can be exact rather than till today for more accurate results. Remove any references to time based words (e.g. yesterday, today, datetimes, last year) since the date range you provide already accounts for that. e.g. if user has asked what did we discuss the day before yesterday then the text argument should just be empty since it does not have any named entity for fuzzy search followed by start and end datetime.
+                In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what we discussed about the project, 2023-07-12T10:19:56.00000Z, 2023-07-13T10:19:56.732291Z'. If query has any form of date or time by user, then start end datetime can be exact rather than till today for more accurate results. Remove any references to time based words (e.g. yesterday, today, datetimes, last year) since the date range you provide already accounts for that. e.g. if user has asked what did we discuss the day before yesterday then the text argument should just be empty since it does not have any named entity for fuzzy search followed by start and end datetime.
                 Strive to apply this tool judiciously for scenarios in which retrospective user information is imperative. If Full history tool response is present, forget other histories, the inputs should be meticulously arranged to facilitate the extraction of accurate and pertinent data within the specified timeframe. Never use this tool for what is the response to my last comment?
                 Remember whatever user query is regarding search history understand what user is asking about and rephrase it properly then send to tool. Before framing the final tool response from this tool consult corresponding created_at date time to give more accurate response''',
             'Text to image': '''Based on user query generate visual representation of text. Extract prompt from user query and use it as input for function''',
@@ -1234,7 +1236,7 @@ class CustomAgentExecutor(AgentExecutor):
                 app.logger.info(
                     f"After: memory saved successfully with metadata {metadata}")
             except Exception as e:
-                app.logger.error(f"Failed to save memory (Zep server may be down): {e}")
+                app.logger.error(f"Failed to save memory: {e}")
                 # Continue without crashing - memory save is not critical
 
             # Register conversation turn in MemoryGraph (fire-and-forget, no latency)
@@ -1293,21 +1295,9 @@ class CustomAgentExecutor(AgentExecutor):
         if self.memory is not None:
             try:
                 external_context = self.memory.load_memory_variables(inputs)
-
                 inputs = dict(inputs, **external_context)
-                filtered_messages = []
-                for msg in inputs['chat_history']:
-                    try:
-                        if msg.additional_kwargs['metadata']['prompt_id'] == thread_local_data.get_prompt_id():
-                            # If it does, append the message content to the filtered_messages list
-                            filtered_messages.append(msg)
-                    except:
-                        pass
-
-                inputs['chat_history'] = filtered_messages[-8:]
             except Exception as e:
-                # Handle empty Zep session or API errors gracefully
-                app.logger.warning(f"Could not load memory from Zep (likely empty session): {e}")
+                app.logger.warning(f"Could not load memory: {e}")
                 inputs['chat_history'] = []
 
             # time.sleep(4)
@@ -1318,18 +1308,10 @@ class CustomAgentExecutor(AgentExecutor):
 # helper functions
 def get_memory(user_id: int):
     '''
-        Get memory object from zep
+        Get memory object — SimpleMem-backed (local, zero-latency reads)
     '''
-    session_id = "user_"+str(user_id)
-    memory = ZepMemory(
-        session_id=session_id,
-        url=ZEP_API_URL,
-        memory_key="chat_history",
-        api_key=ZEP_API_KEY,
-        return_messages=True,
-        input_key="input"
-    )
-    return memory
+    from integrations.channels.memory.simplemem_langchain import SimpleMemChatMemory
+    return SimpleMemChatMemory.load_or_create(user_id)
 
 
 def get_action_user_details(user_id):
@@ -1474,97 +1456,32 @@ def get_action_user_details(user_id):
 
 def get_time_based_history(prompt: str, session_id: str, start_date: str, end_date: str):
     '''
-        This function help to extract messages till specified time
+        Semantic search through conversation history using SimpleMem.
         inputs:
             prompt: text from user from which we need to extract similar messages
             session_id: user_{user_id}
-            start_date: time of search start
-            end_date: time till search
+            start_date: time of search start (kept for API compat, not used by SimpleMem)
+            end_date: time till search (kept for API compat, not used by SimpleMem)
     '''
-
     start_time = time.time()
-    messages = []  # Initialize to prevent UnboundLocalError
-
-    memory = ZepMemory(
-        session_id=session_id,
-        url=ZEP_API_URL,
-        api_key=ZEP_API_KEY,
-        memory_key="chat_history",
-    )
 
     try:
+        user_id = int(session_id.replace("user_", ""))
+        memory = get_memory(user_id=user_id)
+        results = memory.semantic_search(prompt)
 
-        metadata = {
-            "start_date": start_date,
-            "end_date":  end_date
-        }
+        if results:
+            serialized = [{'message': {'content': r.get('content', ''), 'role': 'assistant'}} for r in results]
+            final_res = {'res_in_filter': serialized}
+        else:
+            final_res = {'res_in_filter': []}
 
-        try:
-            messages = memory.chat_memory.search(prompt, metadata=metadata)
-            app.logger.info(f'GOT THE messages from search {messages}')
-        except Exception as e:
-            app.logger.error(
-                    f"Error while data search in zep response: {e}")
-            post_dict = {'user_id': '', 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.GET_TIME_BASED_HISTORY.value, 'uid': thread_local_data.get_request_id(
-            ), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': 'Exception happend at zep api end memory object found none'}
-            publish_async('com.hertzai.longrunning.log', post_dict)
-            messages = []  # Set empty list if search fails
-        try:
-            extracted_metadata = [message.message['metadata']
-                                  for message in messages]
-            list_req_ids = [data.get('request_Id', None)
-                            for data in extracted_metadata]
-            app.logger.info(f'GOT THE EXTRACTED METADATA AS {extracted_metadata}')
-            thread_local_data.set_reqid_list(list_req_ids)
-        except Exception as e:
-            app.logger.error(f"Error while getting req ids {e}")
-
-        # messages = [message.dict() for message in messages]
-        serialized_results = []
-        for result in messages:
-            serialized_result = result.dict(exclude_unset=True)
-            # Process the 'message' field to include only specific subfields
-            if 'message' in serialized_result and isinstance(serialized_result['message'], dict):
-                message = serialized_result['message']
-                filtered_message = {
-                    'content': message.get('content'),
-                    'role': message.get('role'),
-                    'created_at': message.get('created_at'),
-                    'request_id': message.get('metadata', {}).get('request_id') if 'metadata' in message else None
-                }
-                # Replace the original message with the filtered message
-                serialized_result['message'] = filtered_message
-            serialized_results.append(serialized_result)
-        messages = serialized_results
-        final_res = {'res_in_filter': messages}
-        app.logger.info(f"final-->{final_res}")
-        end_time = time.time()
-        elapsed_time = end_time - start_time
+        elapsed = time.time() - start_time
+        app.logger.info(f"SimpleMem search took {elapsed:.3f}s, {len(results)} results")
         return json.dumps(final_res)
     except Exception as e:
-        app.logger.info(f"Exception {e}")
-        try:
-            messages = memory.chat_memory.search(prompt)
-        except Exception as search_error:
-            app.logger.error(f"Fallback search also failed: {search_error}")
-            post_dict = {'user_id': '', 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.GET_TIME_BASED_HISTORY.value, 'uid': thread_local_data.get_request_id(
-            ), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': 'Exception happend at zep api end memory object found none'}
-            publish_async('com.hertzai.longrunning.log', post_dict)
-            messages = []  # Set empty list if fallback search also fails
-
-        # app.logger.info(f"final messages in except-->{messages}")
-        try:
-            extracted_metadata = [message.message['metadata']
-                                  for message in messages]
-            list_req_ids = [data.get('request_Id', None)
-                            for data in extracted_metadata]
-            thread_local_data.set_reqid_list(list_req_ids)
-        except Exception as e:
-            app.logger.info(f"Error while getting req ids {e}")
-        end_time = time.time()
-        elapsed_time = end_time - start_time
-        app.logger.info(f"time taken for zep is {elapsed_time}")
-        return json.dumps({'res': [message.message['content'] for message in messages] if messages else []})
+        app.logger.warning(f"SimpleMem search failed: {e}")
+        return json.dumps({'res': []})
 
 
 def parsing_string(string):
@@ -2459,8 +2376,11 @@ def chat():
     prompt_id = data.get('prompt_id', None)
     create_agent = data.get('create_agent', None)
     casual_conv = data.get('casual_conv', True)
+    autonomous = data.get('autonomous', False)
     probe = data.get('probe', None)
     intermediate = data.get('intermediate', None)
+    speculative = data.get('speculative', False)
+    model_config = data.get('model_config', None)
     app.logger.info(f"casual_conv type {casual_conv}")
 
     # Security: sanitize prompt_id to prevent path traversal
@@ -2468,6 +2388,41 @@ def chat():
         prompt_id = str(prompt_id)
         if not re.match(r'^[a-zA-Z0-9_-]+$', prompt_id):
             return jsonify({'error': 'Invalid prompt_id format'}), 400
+
+    # Per-request model config override (speculative execution)
+    if model_config:
+        thread_local_data.set_model_config_override(model_config)
+    else:
+        thread_local_data.clear_model_config_override()
+
+    # GUARDRAIL: full pre-dispatch gate on every /chat call
+    if prompt:
+        try:
+            from security.hive_guardrails import GuardrailEnforcer
+            allowed, reason, prompt = GuardrailEnforcer.before_dispatch(prompt)
+            if not allowed:
+                return jsonify({'error': f'Guardrail: {reason}'}), 403
+        except ImportError:
+            pass
+
+    # Speculative dispatch: fast response + background expert
+    if speculative and prompt and user_id and prompt_id:
+        try:
+            from integrations.agent_engine.speculative_dispatcher import get_speculative_dispatcher
+            dispatcher = get_speculative_dispatcher()
+            if dispatcher.should_speculate(str(user_id), str(prompt_id), prompt):
+                result = dispatcher.dispatch_speculative(
+                    prompt, str(user_id), str(prompt_id))
+                return jsonify({
+                    'response': result['response'],
+                    'Agent_status': 'Speculative Mode',
+                    'speculation_id': result.get('speculation_id'),
+                    'expert_pending': result.get('expert_pending', False),
+                    'fast_model': result.get('fast_model'),
+                    'latency_ms': result.get('latency_ms'),
+                })
+        except ImportError:
+            pass
 
     # return ""
     thread_local_data.set_request_id(request_id=request_id)
@@ -2529,6 +2484,13 @@ def chat():
                     app.logger.error(f'GOT DB ERROR FOR PROMPTID:{prompt_id}')
             if not user_id or not prompt:
                 return jsonify({'response': 'Need user_id and text to create agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
+            if autonomous:
+                # Autonomous dispatch (from daemon or API): LLM self-generates agent config
+                auto_response = _autonomous_gather_info(user_id, prompt, prompt_id)
+                review_agents[user_id] = True
+                conversation_agent[user_id] = False
+                _record_lifecycle('Review Mode', user_id, prompt_id, f'Autonomous creation via dispatch: {prompt[:100]}')
+                return jsonify({'response': auto_response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [], 'Agent_status': 'Review Mode', 'autonomous_creation': True})
             from gather_agentdetails import gather_info
             response = gather_info(user_id,prompt,prompt_id)
             new_response = response.replace('true','True').replace("false", "False")
@@ -2856,15 +2818,13 @@ def history():
     except:
         return "Invalid user ID"
     if memory:
-        memory.chat_memory.add_message(
-            HumanMessage(content=human_msg),
-            metadata={'prompt_id': 0}
-        )
-        memory.chat_memory.add_message(
-            AIMessage(content=ai_msg),
-            metadata={'prompt_id': 0}
-        )
-        return jsonify({'response': "Messages are saved!!!"}), 200
+        try:
+            memory.chat_memory.add_message(HumanMessage(content=human_msg))
+            memory.chat_memory.add_message(AIMessage(content=ai_msg))
+            return jsonify({'response': "Messages are saved!!!"}), 200
+        except Exception as e:
+            app.logger.warning(f"History not saved: {e}")
+            return jsonify({'response': "Messages not saved (memory service unavailable)"}), 503
     else:
         return jsonify({'response': "Memory object not found"}), 400
 

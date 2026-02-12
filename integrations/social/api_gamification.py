@@ -969,6 +969,12 @@ def get_referral_code():
     db = get_db()
     try:
         result = DistributionService.get_or_create_referral_code(db, g.user_id)
+        # Trigger onboarding step when user first shares their referral code
+        try:
+            from .onboarding_service import OnboardingService
+            OnboardingService.auto_advance(db, g.user_id, 'share_referral')
+        except Exception:
+            pass
         db.commit()
         return _ok(result)
     except Exception as e:

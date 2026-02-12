@@ -91,6 +91,14 @@ class GossipProtocol:
         integrity_interval = int(os.environ.get('HEVOLVE_INTEGRITY_INTERVAL', '300'))
         while self._running:
             now = time.time()
+            # Heartbeat to watchdog
+            try:
+                from security.node_watchdog import get_watchdog
+                wd = get_watchdog()
+                if wd:
+                    wd.heartbeat('gossip')
+            except Exception:
+                pass
             try:
                 if now - last_gossip >= self.gossip_interval:
                     self._gossip_round()
@@ -228,6 +236,35 @@ class GossipProtocol:
         finally:
             db.close()
 
+    def broadcast(self, message: dict, targets: list = None) -> int:
+        """Broadcast a message to active peers via gossip.
+
+        Used by RALT skill distribution and skill queries.
+        Posts to /api/social/peers/broadcast on each target node.
+
+        Returns number of successfully contacted peers.
+        """
+        peers = self._load_peers_from_db(exclude_dead=True)
+        if targets:
+            target_set = set(targets)
+            peers = [p for p in peers if p.get('node_id') in target_set]
+
+        sent = 0
+        for peer in peers:
+            url = peer.get('url', '')
+            if not url or peer.get('node_id') == self.node_id:
+                continue
+            try:
+                requests.post(
+                    f"{url}/api/social/peers/broadcast",
+                    json=message,
+                    timeout=5,
+                )
+                sent += 1
+            except requests.RequestException:
+                pass
+        return sent
+
     def handle_exchange(self, their_peers):
         """Process incoming peer list, return our peer list."""
         if their_peers:
@@ -296,6 +333,12 @@ class GossipProtocol:
             except Exception:
                 pass
             info['signature'] = sign_json_payload(info)
+        except Exception:
+            pass
+        # Include guardrail hash for peer verification
+        try:
+            from security.hive_guardrails import get_guardrail_hash
+            info['guardrail_hash'] = get_guardrail_hash()
         except Exception:
             pass
         return info
@@ -385,6 +428,19 @@ class GossipProtocol:
                 return False  # Reject on unexpected verification errors
 
         integrity_status = 'verified' if signature_valid else 'unverified'
+
+        # Guardrail hash verification: reject peers with different guardrail values
+        peer_guardrail_hash = peer_data.get('guardrail_hash', '')
+        if peer_guardrail_hash:
+            try:
+                from security.hive_guardrails import get_guardrail_hash
+                local_guardrail_hash = get_guardrail_hash()
+                if peer_guardrail_hash != local_guardrail_hash:
+                    logger.warning(
+                        f"Rejecting peer {node_id[:8]}: guardrail hash mismatch")
+                    return False
+            except Exception:
+                pass
 
         # Master key verification: check peer's code_hash against our signed manifest
         master_key_verified = False
@@ -600,5 +656,204 @@ class GossipProtocol:
             return 0
 
 
-# Module-level singleton
+# ═══════════════════════════════════════════════════════════════════════
+# AutoDiscovery — Zero-Config LAN Peer Finding via UDP Broadcast
+# ═══════════════════════════════════════════════════════════════════════
+
+class AutoDiscovery:
+    """LAN-based zero-config peer discovery using UDP broadcast.
+
+    After boot verification, broadcasts a signed beacon every 30s on UDP port 6780.
+    Listens for beacons from other nodes on the same network.
+    Discovered peers are fed into GossipProtocol as additional seeds.
+
+    This is ADDITIVE — works alongside seed peers and registry.
+    """
+
+    BEACON_MAGIC = b'HEVOLVE_DISCO_V1'
+    MAX_PACKET_SIZE = 2048
+
+    def __init__(self, gossip_protocol: GossipProtocol,
+                 port: int = None, beacon_interval: int = None):
+        self._gossip = gossip_protocol
+        self._port = port or int(os.environ.get('HEVOLVE_DISCOVERY_PORT', '6780'))
+        self._beacon_interval = beacon_interval or int(
+            os.environ.get('HEVOLVE_DISCOVERY_INTERVAL', '30'))
+        self._running = False
+        self._send_thread = None
+        self._recv_thread = None
+        self._lock = threading.Lock()
+        self._discovered_nodes: set = set()
+        self._sock = None
+
+    def start(self) -> None:
+        """Start beacon sender and listener threads."""
+        import socket as _socket
+        with self._lock:
+            if self._running:
+                return
+            self._running = True
+
+        try:
+            self._sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+            self._sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_BROADCAST, 1)
+            self._sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+            self._sock.bind(('', self._port))
+            self._sock.settimeout(2.0)
+        except OSError as e:
+            logger.warning(f"AutoDiscovery: cannot bind UDP port {self._port}: {e}")
+            self._running = False
+            return
+
+        self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
+        self._recv_thread.start()
+        self._send_thread = threading.Thread(target=self._send_loop, daemon=True)
+        self._send_thread.start()
+        logger.info(f"AutoDiscovery started on UDP port {self._port} "
+                    f"(interval={self._beacon_interval}s)")
+
+    def stop(self) -> None:
+        """Stop discovery threads and close socket."""
+        with self._lock:
+            self._running = False
+        if self._sock:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+
+    def _build_beacon(self) -> bytes:
+        """Build a signed beacon packet: MAGIC + JSON payload."""
+        import json as _json
+        payload = {
+            'type': 'hevolve-discovery',
+            'node_id': self._gossip.node_id,
+            'url': self._gossip.base_url,
+            'name': self._gossip.node_name,
+            'version': self._gossip.version,
+            'tier': self._gossip.tier,
+            'timestamp': int(time.time()),
+        }
+        try:
+            from security.hive_guardrails import get_guardrail_hash
+            payload['guardrail_hash'] = get_guardrail_hash()
+        except Exception:
+            pass
+        try:
+            from security.node_integrity import get_public_key_hex, sign_json_payload
+            payload['public_key'] = get_public_key_hex()
+            payload['signature'] = sign_json_payload(payload)
+        except Exception:
+            pass
+
+        json_bytes = _json.dumps(payload, separators=(',', ':')).encode('utf-8')
+        return self.BEACON_MAGIC + json_bytes
+
+    def _parse_beacon(self, data: bytes) -> dict:
+        """Parse and verify a beacon packet. Returns payload dict or empty dict."""
+        import json as _json
+        if not data.startswith(self.BEACON_MAGIC):
+            return {}
+        try:
+            json_bytes = data[len(self.BEACON_MAGIC):]
+            payload = _json.loads(json_bytes.decode('utf-8'))
+        except (ValueError, UnicodeDecodeError):
+            return {}
+
+        if payload.get('type') != 'hevolve-discovery':
+            return {}
+        if payload.get('node_id') == self._gossip.node_id:
+            return {}
+
+        # Verify guardrail hash
+        peer_hash = payload.get('guardrail_hash', '')
+        if peer_hash:
+            try:
+                from security.hive_guardrails import get_guardrail_hash
+                if peer_hash != get_guardrail_hash():
+                    logger.debug(f"AutoDiscovery: rejecting beacon from "
+                                 f"{payload.get('node_id', '?')[:8]}: guardrail mismatch")
+                    return {}
+            except Exception:
+                pass
+
+        # Verify Ed25519 signature
+        sig = payload.get('signature')
+        pubkey = payload.get('public_key')
+        if sig and pubkey:
+            try:
+                from security.node_integrity import verify_json_signature
+                clean = {k: v for k, v in payload.items() if k != 'signature'}
+                if not verify_json_signature(pubkey, clean, sig):
+                    logger.warning(f"AutoDiscovery: invalid signature from "
+                                   f"{payload.get('node_id', '?')[:8]}")
+                    return {}
+            except Exception:
+                pass
+
+        # Reject stale beacons (> 5 minutes old)
+        ts = payload.get('timestamp', 0)
+        if abs(time.time() - ts) > 300:
+            return {}
+
+        return payload
+
+    def _send_loop(self) -> None:
+        """Periodically broadcast beacon on LAN."""
+        import socket as _socket
+        while self._running:
+            try:
+                beacon = self._build_beacon()
+                self._sock.sendto(beacon, ('<broadcast>', self._port))
+            except Exception as e:
+                logger.debug(f"AutoDiscovery send error: {e}")
+            # Heartbeat to watchdog
+            try:
+                from security.node_watchdog import get_watchdog
+                wd = get_watchdog()
+                if wd:
+                    wd.heartbeat('auto_discovery')
+            except Exception:
+                pass
+            time.sleep(self._beacon_interval)
+
+    def _recv_loop(self) -> None:
+        """Listen for beacons from other nodes on the network."""
+        import socket as _socket
+        while self._running:
+            try:
+                data, addr = self._sock.recvfrom(self.MAX_PACKET_SIZE)
+            except _socket.timeout:
+                continue
+            except OSError:
+                if not self._running:
+                    break
+                continue
+
+            payload = self._parse_beacon(data)
+            if not payload:
+                continue
+
+            node_id = payload.get('node_id')
+            if node_id in self._discovered_nodes:
+                continue
+
+            self._discovered_nodes.add(node_id)
+            url = payload.get('url', '')
+            logger.info(f"AutoDiscovery: found node "
+                        f"{payload.get('name', node_id[:8])} at {url} via LAN")
+
+            # Feed into gossip
+            try:
+                self._gossip.handle_announce(payload)
+            except Exception:
+                pass
+            try:
+                self._gossip._announce_to_peer(url)
+            except Exception:
+                pass
+
+
+# Module-level singletons
 gossip = GossipProtocol()
+auto_discovery = AutoDiscovery(gossip)

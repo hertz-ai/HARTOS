@@ -42,6 +42,14 @@ class CodingAgentDaemon:
             time.sleep(self._interval)
             if not self._running:
                 break
+            # Heartbeat to watchdog
+            try:
+                from security.node_watchdog import get_watchdog
+                wd = get_watchdog()
+                if wd:
+                    wd.heartbeat('coding_daemon')
+            except Exception:
+                pass
             try:
                 self._tick()
             except Exception as e:

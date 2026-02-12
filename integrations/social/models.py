@@ -1917,3 +1917,205 @@ class CodingSubmission(Base):
             'reviewed_at': self.reviewed_at.isoformat() if self.reviewed_at else None,
             'merged_at': self.merged_at.isoformat() if self.merged_at else None,
         }
+
+
+# ─── TABLE 52: products ───
+
+class Product(Base):
+    """A product that can be marketed by the autonomous marketing agent."""
+    __tablename__ = 'products'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    owner_id = Column(String(64), ForeignKey('users.id'), nullable=True, index=True)
+    name = Column(String(300), nullable=False)
+    description = Column(Text, default='')
+    tagline = Column(String(500), default='')
+    product_url = Column(String(500), default='')
+    logo_url = Column(String(500), default='')
+    category = Column(String(50), default='general')  # saas|ecommerce|content|service|platform|general
+    target_audience = Column(Text, default='')
+    unique_value_prop = Column(Text, default='')
+    keywords_json = Column(JSON, default=list)
+    is_platform_product = Column(Boolean, default=False)
+    status = Column(String(20), default='active')  # active|paused|archived
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'owner_id': self.owner_id,
+            'name': self.name,
+            'description': self.description,
+            'tagline': self.tagline,
+            'product_url': self.product_url,
+            'logo_url': self.logo_url,
+            'category': self.category,
+            'target_audience': self.target_audience,
+            'unique_value_prop': self.unique_value_prop,
+            'keywords': self.keywords_json or [],
+            'is_platform_product': self.is_platform_product,
+            'status': self.status,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+# ─── TABLE 53: agent_goals ───
+
+class AgentGoal(Base):
+    """Unified goal for any autonomous agent type (marketing, coding, analytics, etc.).
+
+    The goal_type field determines which prompt builder and tools are used.
+    config_json holds type-specific configuration. Adding a new agent type
+    is just a new goal_type value + prompt builder registration.
+    """
+    __tablename__ = 'agent_goals'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    owner_id = Column(String(64), ForeignKey('users.id'), nullable=True, index=True)
+    goal_type = Column(String(50), nullable=False, index=True)  # marketing|coding|analytics|support|...
+    title = Column(String(500), nullable=False)
+    description = Column(Text, default='')
+    status = Column(String(20), default='active', index=True)  # active|paused|completed|archived
+    priority = Column(Integer, default=0)
+
+    # Type-specific config (repo_url for coding, channels for marketing, etc.)
+    config_json = Column(JSON, default=dict)
+
+    # Marketing-specific (nullable for non-marketing goals)
+    product_id = Column(String(64), ForeignKey('products.id'), nullable=True, index=True)
+
+    # Budget
+    spark_budget = Column(Integer, default=200)
+    spark_spent = Column(Integer, default=0)
+
+    # Tracking
+    created_by = Column(String(64), nullable=True)
+    prompt_id = Column(String(100), nullable=True)  # Links to prompts/{prompt_id}.json
+    last_dispatched_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    product = relationship('Product', backref='goals')
+
+    __table_args__ = (
+        Index('ix_agent_goal_type_status', 'goal_type', 'status'),
+    )
+
+    def to_dict(self):
+        config = self.config_json or {}
+        result = {
+            'id': self.id,
+            'owner_id': self.owner_id,
+            'goal_type': self.goal_type,
+            'title': self.title,
+            'description': self.description,
+            'status': self.status,
+            'priority': self.priority,
+            'product_id': self.product_id,
+            'spark_budget': self.spark_budget,
+            'spark_spent': self.spark_spent,
+            'created_by': self.created_by,
+            'prompt_id': self.prompt_id,
+            'last_dispatched_at': self.last_dispatched_at.isoformat() if self.last_dispatched_at else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+        # Merge type-specific config into result
+        result.update(config)
+        return result
+
+
+# ─── TABLE 54: ip_patents ───
+
+class IPPatent(Base):
+    """Patent application tracking for autonomous IP protection agent."""
+    __tablename__ = 'ip_patents'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    title = Column(String(500), nullable=False)
+    status = Column(String(30), default='draft', index=True)  # draft|filed|provisional|granted|rejected
+    filing_type = Column(String(30), default='provisional')  # provisional|utility|pct
+
+    # Patent content
+    claims_json = Column(JSON, default=list)
+    abstract = Column(Text, default='')
+    description = Column(Text, default='')
+
+    # Filing details
+    filing_date = Column(DateTime, nullable=True)
+    application_number = Column(String(50), nullable=True)
+    patent_number = Column(String(50), nullable=True)
+
+    # Verification evidence (loop health snapshot at filing time)
+    verification_metrics = Column(JSON, default=dict)
+    evidence_json = Column(JSON, default=list)
+
+    # Tracking
+    created_by = Column(String(64), nullable=True)
+    goal_id = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'title': self.title,
+            'status': self.status,
+            'filing_type': self.filing_type,
+            'claims': self.claims_json or [],
+            'abstract': self.abstract,
+            'description': self.description,
+            'filing_date': self.filing_date.isoformat() if self.filing_date else None,
+            'application_number': self.application_number,
+            'patent_number': self.patent_number,
+            'verification_metrics': self.verification_metrics or {},
+            'evidence': self.evidence_json or [],
+            'created_by': self.created_by,
+            'goal_id': self.goal_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+# ─── TABLE 55: ip_infringements ───
+
+class IPInfringement(Base):
+    """Tracked infringement cases for IP enforcement agent."""
+    __tablename__ = 'ip_infringements'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    patent_id = Column(String(64), ForeignKey('ip_patents.id'), nullable=True)
+
+    infringer_name = Column(String(300), nullable=False)
+    infringer_url = Column(String(1000), nullable=True)
+    evidence_summary = Column(Text, default='')
+    risk_level = Column(String(20), default='low')  # low|medium|high
+    status = Column(String(30), default='detected', index=True)  # detected|reviewed|notice_sent|resolved|dismissed
+
+    # Actions taken
+    notice_sent_at = Column(DateTime, nullable=True)
+    notice_type = Column(String(30), nullable=True)  # cease_desist|dmca|licensing_offer
+    notice_text = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    patent = relationship('IPPatent', backref='infringements')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'patent_id': self.patent_id,
+            'infringer_name': self.infringer_name,
+            'infringer_url': self.infringer_url,
+            'evidence_summary': self.evidence_summary,
+            'risk_level': self.risk_level,
+            'status': self.status,
+            'notice_sent_at': self.notice_sent_at.isoformat() if self.notice_sent_at else None,
+            'notice_type': self.notice_type,
+            'notice_text': self.notice_text,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }

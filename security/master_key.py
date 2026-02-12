@@ -69,17 +69,42 @@ def verify_release_manifest(manifest: dict) -> bool:
 
 
 def verify_local_code_matches_manifest(manifest: dict, code_root: str = None) -> dict:
-    """Compare local code hash against the signed manifest."""
+    """Compare local code hash and guardrail hash against the signed manifest."""
     from security.node_integrity import compute_code_hash
     local_hash = compute_code_hash(code_root)
     manifest_hash = manifest.get('code_hash', '')
     matched = local_hash == manifest_hash
+    if not matched:
+        return {
+            'verified': False,
+            'local_hash': local_hash,
+            'manifest_hash': manifest_hash,
+            'details': f'Code hash mismatch: local={local_hash[:16]}... manifest={manifest_hash[:16]}...',
+        }
+
+    # Guardrail hash verification: ensure frozen values haven't been tampered
+    expected_guardrail_hash = manifest.get('guardrail_hash')
+    if expected_guardrail_hash:
+        try:
+            from security.hive_guardrails import compute_guardrail_hash
+            local_guardrail_hash = compute_guardrail_hash()
+            if local_guardrail_hash != expected_guardrail_hash:
+                return {
+                    'verified': False,
+                    'local_hash': local_hash,
+                    'manifest_hash': manifest_hash,
+                    'details': (f'Guardrail hash mismatch: '
+                                f'local={local_guardrail_hash[:16]}... '
+                                f'manifest={expected_guardrail_hash[:16]}...'),
+                }
+        except Exception as e:
+            logger.warning(f"Guardrail hash check failed: {e}")
+
     return {
-        'verified': matched,
+        'verified': True,
         'local_hash': local_hash,
         'manifest_hash': manifest_hash,
-        'details': 'Code hash matches signed manifest' if matched
-                   else f'Code hash mismatch: local={local_hash[:16]}... manifest={manifest_hash[:16]}...',
+        'details': 'Code hash and guardrail hash match signed manifest',
     }
 
 

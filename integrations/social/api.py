@@ -3,11 +3,12 @@ HevolveSocial - Flask Blueprint API
 ~82 REST endpoints at /api/social.
 Compatible with both Nunba web app and Hevolve React Native CommunityView.
 """
+import os
 import logging
 from flask import Blueprint, request, jsonify, g
 
 from .auth import require_auth, optional_auth, require_admin, require_moderator, revoke_token
-from .rate_limiter import rate_limit
+from .rate_limiter import rate_limit, get_limiter
 from .services import (
     UserService, PostService, CommentService, VoteService,
     FollowService, CommunityService, NotificationService, ReportService,
@@ -83,6 +84,16 @@ def register():
             user = UserService.register(
                 db, username, password, data.get('email'),
                 data.get('display_name'), data.get('user_type', 'human'))
+
+        # Apply referral code if provided (one-step signup)
+        referral_code = data.get('referral_code', '').strip()
+        if referral_code and user:
+            try:
+                from .distribution_service import DistributionService
+                DistributionService.use_referral_code(db, str(user.id), referral_code)
+            except Exception as e:
+                logger.debug(f"Referral code application skipped: {e}")
+
         db.commit()
         return _ok(user.to_dict(include_token=True), status=201)
     except ValueError as e:
@@ -1835,3 +1846,20 @@ def feed_subscribe():
         return _err(str(e))
     finally:
         db.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+# TEST HELPERS (only available when SOCIAL_RATE_LIMIT_DISABLED or FLASK_ENV=testing)
+# ═══════════════════════════════════════════════════════════════
+
+@social_bp.route('/test/reset-rate-limits', methods=['POST'])
+def reset_rate_limits():
+    """Reset all rate-limiter buckets. Only works in test/dev mode."""
+    disabled = os.environ.get('SOCIAL_RATE_LIMIT_DISABLED', '').strip() in ('1', 'true', 'yes')
+    testing = os.environ.get('FLASK_ENV', '').strip() in ('testing', 'test')
+    if not disabled and not testing:
+        return _err("Only available in test mode", 403)
+    limiter = get_limiter()
+    with limiter._lock:
+        limiter._buckets.clear()
+    return _ok({'reset': True})

@@ -86,6 +86,19 @@ class ThreadLocalData:
         self._local.creation_description = None
         self._local.creation_autonomous = False
 
+    # --- Per-request model config override (speculative execution) ---
+
+    def set_model_config_override(self, config_list):
+        """Override the global config_list for this thread/request only."""
+        self._local.model_config_override = config_list
+
+    def get_model_config_override(self):
+        """Get per-request model config override, or None to use global."""
+        return getattr(self._local, 'model_config_override', None)
+
+    def clear_model_config_override(self):
+        self._local.model_config_override = None
+
 
 thread_local_data = ThreadLocalData()
 
