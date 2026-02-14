@@ -322,7 +322,17 @@ class RequestLogRecord(logging.LogRecord):
 logging.setLogRecordFactory(RequestLogRecord)
 logging.basicConfig(level=logging.INFO)
 stream_handler = logging.StreamHandler(sys.stdout)
-handler = RotatingFileHandler('langchain.log', maxBytes=100000, backupCount=0)
+# In bundled/pip-installed mode (NUNBA_BUNDLED env set by main.py), redirect log
+# to the shared Nunba log directory; standalone keeps default behavior.
+
+if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
+    _nunba_log_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'logs')
+    os.makedirs(_nunba_log_dir, exist_ok=True)
+    _langchain_log_path = os.path.join(_nunba_log_dir, 'langchain.log')
+else:
+    _langchain_log_path = 'langchain.log'
+
+handler = RotatingFileHandler(_langchain_log_path, maxBytes=100000, backupCount=0)
 
 # Set the logging level for the file handler
 handler.setLevel(logging.ERROR)

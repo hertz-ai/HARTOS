@@ -10,6 +10,23 @@ from datetime import datetime
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+# ─── Exclude standalone scripts that crash pytest collection ───
+# These files have sys.exit() at module level or module-level assertions.
+# They are standalone test runners, not pytest test files.
+# Run them directly with: python tests/<filename>.py
+collect_ignore = [
+    os.path.join(os.path.dirname(__file__), 'test_nested_task_system.py'),
+    os.path.join(os.path.dirname(__file__), 'test_nested_tasks.py'),
+    os.path.join(os.path.dirname(__file__), 'test_master_suite.py'),
+    os.path.join(os.path.dirname(__file__), 'test_agent_lightning_standalone.py'),
+    os.path.join(os.path.dirname(__file__), 'run_integration_tests.py'),
+    os.path.join(os.path.dirname(__file__), 'run_manual_tests.py'),
+]
+collect_ignore_glob = [
+    # runtime_tests/ need a live API server — run via scripts/run_e2e_tests.bat
+    os.path.join(os.path.dirname(__file__), 'runtime_tests', '*.py'),
+]
+
 from lifecycle_hooks import (
     ActionState, FlowState,
     action_states, flow_lifecycle,

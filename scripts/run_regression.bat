@@ -1,14 +1,32 @@
 @echo off
 REM ============================================================
-REM HevolveBot LangChain Agent - Full Regression Test Runner
+REM HevolveBot — Master Regression Test Runner
 REM ============================================================
-REM Runs ALL unit and regression tests across the entire codebase.
-REM Covers: core, security, channels, social, performance, and
-REM integration tests (excluding tests that require live services).
+REM Runs ALL 2263 unit/integration tests across the codebase.
+REM
+REM Test groups:
+REM   P2P & Security       ~722 tests  (hierarchy, integrity, agent engine, etc.)
+REM   Social Platform       ~148 tests  (feed, search, karma, models, etc.)
+REM   Channel Infra         ~120 tests  (rate limit, dedupe, debounce, security)
+REM   Channel Adapters      ~200 tests  (discord, telegram, web, signal, etc.)
+REM   Channel E2E           ~172 tests  (regression, dashboard, gateway, metrics)
+REM   Agent & Recipe        ~200 tests  (create, reuse, recipe, scheduler, etc.)
+REM   Session & Messaging    ~90 tests  (session, queue, streaming, preferences)
+REM   Tools & AI            ~250 tests  (VLM, coding, embeddings, TTS, vision)
+REM   Core & Performance    ~150 tests  (core perf, naming, state, concurrency)
+REM   Integration            ~50 tests  (integration, redis ledger)
+REM
+REM Standalone scripts (not included — run directly with python):
+REM   test_nested_task_system.py, test_nested_tasks.py,
+REM   test_master_suite.py, test_agent_lightning_standalone.py,
+REM   run_integration_tests.py, run_manual_tests.py
+REM
+REM E2E tests requiring a live server: scripts/run_e2e_tests.bat
 REM ============================================================
 
 echo ========================================
-echo  HevolveBot Full Regression Suite
+echo  HevolveBot Master Regression Suite
+echo  2263 tests across 61 test files
 echo ========================================
 
 cd /d %~dp0..
@@ -29,102 +47,173 @@ echo.
 
 REM ===== DEFINE TEST GROUPS =====
 
-REM Group 1: Core performance modules (34 tests)
-set CORE_TESTS=tests/test_core_performance.py
+REM Group 1: P2P Network, Security, Agent Engine (~722 tests)
+set P2P_SECURITY_TESTS=^
+    tests/test_hierarchy_system.py ^
+    tests/test_integrity_system.py ^
+    tests/test_ad_hosting_rewards.py ^
+    tests/test_agent_network_resilience.py ^
+    tests/test_master_key_system.py ^
+    tests/test_coding_agent.py ^
+    tests/test_cache_restoration.py ^
+    tests/test_agent_engine.py ^
+    tests/test_node_watchdog.py ^
+    tests/test_auto_discovery.py ^
+    tests/test_agent_dashboard.py ^
+    tests/test_mode_aware_inference.py
 
-REM Group 2: State machine and lifecycle (12 tests)
-set STATE_TESTS=tests/test_state_management.py
+REM Group 2: Social Platform (~148 tests)
+set SOCIAL_TESTS=^
+    tests/test_social_regression.py ^
+    tests/test_social_models.py ^
+    tests/test_social_feed.py ^
+    tests/test_social_search.py ^
+    tests/test_social_karma.py ^
+    tests/test_social_api.py ^
+    tests/test_social_naming.py
 
-REM Group 3: Social naming and auth (90+ tests)
-set SOCIAL_TESTS=tests/test_social_naming.py
+REM Group 3: Channel Infrastructure (~120 tests)
+set CHANNEL_INFRA_TESTS=^
+    tests/test_rate_limit.py ^
+    tests/test_dedupe.py ^
+    tests/test_debounce.py ^
+    tests/test_retry.py ^
+    tests/test_channel_security.py ^
+    tests/test_channel_integration.py
 
-REM Group 4: Channel infrastructure (rate limit, dedupe, debounce, retry, security)
-set CHANNEL_INFRA_TESTS=tests/test_rate_limit.py tests/test_dedupe.py tests/test_debounce.py tests/test_retry.py tests/test_channel_security.py
+REM Group 4: Channel Adapters (~200 tests)
+set CHANNEL_ADAPTER_TESTS=^
+    tests/test_discord_adapter.py ^
+    tests/test_telegram_adapter.py ^
+    tests/test_web_adapter.py ^
+    tests/test_google_chat_adapter.py ^
+    tests/test_signal_adapter.py ^
+    tests/test_imessage_adapter.py ^
+    tests/test_mattermost_adapter.py ^
+    tests/test_nextcloud_adapter.py
 
-REM Group 5: Channel adapters
-set CHANNEL_ADAPTER_TESTS=tests/test_discord_adapter.py tests/test_telegram_adapter.py tests/test_web_adapter.py tests/test_google_chat_adapter.py tests/test_signal_adapter.py tests/test_imessage_adapter.py tests/test_mattermost_adapter.py tests/test_nextcloud_adapter.py
+REM Group 5: Channel E2E (~172 tests)
+set CHANNEL_E2E_TESTS=^
+    integrations/channels/tests/test_e2e_regression.py ^
+    integrations/channels/tests/test_admin_dashboard.py ^
+    integrations/channels/tests/test_gateway_protocol.py ^
+    integrations/channels/tests/test_metrics_collector.py
 
-REM Group 6: Session, queue, streaming, preferences
-set SESSION_TESTS=tests/test_session_manager.py tests/test_message_queue.py tests/test_response_streaming.py tests/test_preferences.py tests/test_builtin_commands.py
+REM Group 6: Agent and Recipe Pipeline (~200 tests)
+set AGENT_RECIPE_TESTS=^
+    tests/test_agent_creation.py ^
+    tests/test_recipe_generation.py ^
+    tests/test_reuse_mode.py ^
+    tests/test_action_execution.py ^
+    tests/test_scheduler_creation.py ^
+    tests/test_autonomous_agent_suite.py ^
+    tests/test_complex_agent_comprehensive.py ^
+    tests/test_dynamic_agents.py ^
+    tests/test_nested_tasks_direct.py ^
+    tests/test_complete_integration.py ^
+    tests/test_complete_e2e_integration.py
 
-REM Group 7: Agent and recipe tests
-set AGENT_TESTS=tests/test_agent_creation.py tests/test_recipe_generation.py tests/test_reuse_mode.py tests/test_action_execution.py tests/test_scheduler_creation.py
+REM Group 7: Session and Messaging (~90 tests)
+set SESSION_TESTS=^
+    tests/test_session_manager.py ^
+    tests/test_message_queue.py ^
+    tests/test_response_streaming.py ^
+    tests/test_preferences.py ^
+    tests/test_builtin_commands.py
 
-REM Group 8: VLM, coding, shell, file management
-set TOOL_TESTS=tests/test_vlm_agent.py tests/test_coding_agent.py tests/test_shell_execution.py tests/test_file_manager.py tests/test_file_tracker.py
+REM Group 8: Tools and AI (~250 tests)
+set TOOLS_AI_TESTS=^
+    tests/test_vlm_agent.py ^
+    tests/test_shell_execution.py ^
+    tests/test_file_manager.py ^
+    tests/test_file_tracker.py ^
+    tests/test_vision_sidecar.py ^
+    tests/test_embeddings.py ^
+    tests/test_memory_search.py ^
+    tests/test_image_gen.py ^
+    tests/test_tts.py
 
-REM Group 9: Embeddings, memory, image gen, TTS
-set AI_TESTS=tests/test_embeddings.py tests/test_memory_search.py tests/test_image_gen.py tests/test_tts.py
+REM Group 9: Core, Performance, and Concurrency (~150 tests)
+set CORE_PERF_TESTS=^
+    tests/test_core_performance.py ^
+    tests/test_state_management.py ^
+    tests/test_concurrency.py
 
-REM Group 10: Concurrency
-set CONCURRENCY_TESTS=tests/test_concurrency.py
-
-REM Group 11: Channel e2e regression
-set CHANNEL_E2E_TESTS=integrations/channels/tests/test_e2e_regression.py integrations/channels/tests/test_admin_dashboard.py integrations/channels/tests/test_gateway_protocol.py integrations/channels/tests/test_metrics_collector.py
+REM Group 10: Integration and Data (~50 tests)
+set INTEGRATION_TESTS=^
+    tests/test_integration.py ^
+    tests/test_redis_ledger.py
 
 echo Select regression scope:
-echo   1. FULL regression (all test groups)
-echo   2. Core + Security only (fast)
-echo   3. Channels only
-echo   4. Agent + Recipe only
-echo   5. Quick smoke test (core + state + social)
+echo.
+echo   1. FULL regression (all 2263 tests)
+echo   2. P2P Network + Security (722 tests - core infrastructure)
+echo   3. Social Platform (148 tests)
+echo   4. All Channels (infra + adapters + e2e)
+echo   5. Agent + Recipe Pipeline
+echo   6. Tools + AI (VLM, embeddings, TTS, vision)
+echo   7. Quick smoke (P2P security only - fastest)
+echo   8. Custom pytest pattern
 echo.
 
-set /p choice="Enter choice (1-5): "
+set /p choice="Enter choice (1-8): "
 
 if "%choice%"=="1" (
     echo.
-    echo Running FULL regression suite...
+    echo Running FULL regression suite [2263 tests]...
     echo ========================================
     "%PYTHON_EXE%" -m pytest ^
-        %CORE_TESTS% ^
-        %STATE_TESTS% ^
-        %SOCIAL_TESTS% ^
-        %CHANNEL_INFRA_TESTS% ^
-        %CHANNEL_ADAPTER_TESTS% ^
-        %SESSION_TESTS% ^
-        %AGENT_TESTS% ^
-        %TOOL_TESTS% ^
-        %AI_TESTS% ^
-        %CONCURRENCY_TESTS% ^
-        %CHANNEL_E2E_TESTS% ^
-        -v --tb=short --color=yes -q
+        tests/ ^
+        integrations/channels/tests/ ^
+        --tb=short --color=yes -q
 ) else if "%choice%"=="2" (
     echo.
-    echo Running Core + Security regression...
+    echo Running P2P Network + Security [~722 tests]...
     echo ========================================
     "%PYTHON_EXE%" -m pytest ^
-        %CORE_TESTS% ^
-        %STATE_TESTS% ^
-        %SOCIAL_TESTS% ^
-        -v --tb=short --color=yes
+        %P2P_SECURITY_TESTS% ^
+        --tb=short --color=yes -q
 ) else if "%choice%"=="3" (
     echo.
-    echo Running Channels regression...
+    echo Running Social Platform [~148 tests]...
+    echo ========================================
+    "%PYTHON_EXE%" -m pytest ^
+        %SOCIAL_TESTS% ^
+        --tb=short --color=yes -q
+) else if "%choice%"=="4" (
+    echo.
+    echo Running All Channels [~490 tests]...
     echo ========================================
     "%PYTHON_EXE%" -m pytest ^
         %CHANNEL_INFRA_TESTS% ^
         %CHANNEL_ADAPTER_TESTS% ^
-        %SESSION_TESTS% ^
         %CHANNEL_E2E_TESTS% ^
-        -v --tb=short --color=yes
-) else if "%choice%"=="4" (
-    echo.
-    echo Running Agent + Recipe regression...
-    echo ========================================
-    "%PYTHON_EXE%" -m pytest ^
-        %AGENT_TESTS% ^
-        %TOOL_TESTS% ^
-        -v --tb=short --color=yes
+        --tb=short --color=yes -q
 ) else if "%choice%"=="5" (
     echo.
-    echo Running Quick smoke test...
+    echo Running Agent + Recipe Pipeline...
     echo ========================================
     "%PYTHON_EXE%" -m pytest ^
-        %CORE_TESTS% ^
-        %STATE_TESTS% ^
-        %SOCIAL_TESTS% ^
-        -v --tb=short --color=yes -q
+        %AGENT_RECIPE_TESTS% ^
+        --tb=short --color=yes -q
+) else if "%choice%"=="6" (
+    echo.
+    echo Running Tools + AI...
+    echo ========================================
+    "%PYTHON_EXE%" -m pytest ^
+        %TOOLS_AI_TESTS% ^
+        --tb=short --color=yes -q
+) else if "%choice%"=="7" (
+    echo.
+    echo Running Quick smoke [P2P security]...
+    echo ========================================
+    "%PYTHON_EXE%" -m pytest ^
+        %P2P_SECURITY_TESTS% ^
+        --tb=short --color=yes -q --no-header
+) else if "%choice%"=="8" (
+    set /p pattern="Enter pytest pattern (e.g. tests/test_file.py -k test_name): "
+    echo Running custom pattern...
+    "%PYTHON_EXE%" -m pytest %pattern% --tb=short --color=yes
 ) else (
     echo Invalid choice
     pause
