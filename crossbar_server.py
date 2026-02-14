@@ -62,3 +62,15 @@ async def joined(session, details):
     except Exception as e:
         print(f"Could not subscribe to topic: {e}")
 
+
+def main():
+    """
+    Main entry point for hevolve-crossbar CLI command.
+    Starts the WAMP/Crossbar client.
+    """
+    run([component])
+
+
+if __name__ == '__main__':
+    main()
+

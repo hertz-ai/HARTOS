@@ -1,0 +1,167 @@
+{
+  "user_id": "test_user",
+  "prompt_id": "test_delegation",
+  "last_updated": "2025-11-02T23:54:39.636952",
+  "tasks": {
+    "task_3ca77add1feb": {
+      "task_id": "task_3ca77add1feb",
+      "description": "Process customer data",
+      "task_type": "pre_assigned",
+      "execution_mode": "sequential",
+      "status": "blocked",
+      "prerequisites": [],
+      "context": {},
+      "priority": 50,
+      "parent_task_id": null,
+      "created_at": "2025-11-02T23:52:58.227320",
+      "updated_at": "2025-11-02T23:52:58.229320",
+      "completed_at": null,
+      "error_message": "Waiting for delegated task: task_3ca77add1feb_child_1",
+      "result": null,
+      "state_history": [
+        {
+          "status": "pending",
+          "timestamp": "2025-11-02T23:52:58.227320",
+          "reason": "Task created"
+        }
+      ],
+      "paused_at": null,
+      "resumed_at": null,
+      "pause_count": 0,
+      "stop_reason": null,
+      "termination_reason": null,
+      "child_task_ids": [
+        "task_3ca77add1feb_child_1"
+      ],
+      "sibling_task_ids": [],
+      "dependent_task_ids": [],
+      "messages_to_dependents": [],
+      "received_messages": [],
+      "blocked_by": []
+    },
+    "task_3ca77add1feb_child_1": {
+      "task_id": "task_3ca77add1feb_child_1",
+      "description": "Analyze customer purchase patterns",
+      "task_type": "autonomous",
+      "execution_mode": "sequential",
+      "status": "pending",
+      "prerequisites": [],
+      "context": {
+        "delegation_id": "5ddc65ee-5b06-4b55-b1fc-54ae46bb91ee",
+        "delegated_by": "agent_a",
+        "delegated_to": "agent_b",
+        "required_skills": [
+          "data_analysis"
+        ],
+        "delegation_context": {
+          "data_source": "customers.csv"
+        }
+      },
+      "priority": 50,
+      "parent_task_id": "task_3ca77add1feb",
+      "created_at": "2025-11-02T23:52:58.229320",
+      "updated_at": "2025-11-02T23:52:58.229320",
+      "completed_at": null,
+      "error_message": null,
+      "result": null,
+      "state_history": [
+        {
+          "status": "pending",
+          "timestamp": "2025-11-02T23:52:58.229320",
+          "reason": "Task created"
+        }
+      ],
+      "paused_at": null,
+      "resumed_at": null,
+      "pause_count": 0,
+      "stop_reason": null,
+      "termination_reason": null,
+      "child_task_ids": [],
+      "sibling_task_ids": [],
+      "dependent_task_ids": [],
+      "messages_to_dependents": [],
+      "received_messages": [],
+      "blocked_by": []
+    },
+    "task_5cc7043cc7a4": {
+      "task_id": "task_5cc7043cc7a4",
+      "description": "Process customer data",
+      "task_type": "pre_assigned",
+      "execution_mode": "sequential",
+      "status": "blocked",
+      "prerequisites": [],
+      "context": {},
+      "priority": 50,
+      "parent_task_id": null,
+      "created_at": "2025-11-02T23:54:39.634952",
+      "updated_at": "2025-11-02T23:54:39.636952",
+      "completed_at": null,
+      "error_message": "Waiting for delegated task: task_5cc7043cc7a4_child_1",
+      "result": null,
+      "state_history": [
+        {
+          "status": "pending",
+          "timestamp": "2025-11-02T23:54:39.634952",
+          "reason": "Task created"
+        }
+      ],
+      "paused_at": null,
+      "resumed_at": null,
+      "pause_count": 0,
+      "stop_reason": null,
+      "termination_reason": null,
+      "child_task_ids": [
+        "task_5cc7043cc7a4_child_1"
+      ],
+      "sibling_task_ids": [],
+      "dependent_task_ids": [],
+      "messages_to_dependents": [],
+      "received_messages": [],
+      "blocked_by": []
+    },
+    "task_5cc7043cc7a4_child_1": {
+      "task_id": "task_5cc7043cc7a4_child_1",
+      "description": "Analyze customer purchase patterns",
+      "task_type": "autonomous",
+      "execution_mode": "sequential",
+      "status": "pending",
+      "prerequisites": [],
+      "context": {
+        "delegation_id": "46fed475-dc16-43ef-8beb-9448d0850a35",
+        "delegated_by": "agent_a",
+        "delegated_to": "agent_b",
+        "required_skills": [
+          "data_analysis"
+        ],
+        "delegation_context": {
+          "data_source": "customers.csv"
+        }
+      },
+      "priority": 50,
+      "parent_task_id": "task_5cc7043cc7a4",
+      "created_at": "2025-11-02T23:54:39.635952",
+      "updated_at": "2025-11-02T23:54:39.635952",
+      "completed_at": null,
+      "error_message": null,
+      "result": null,
+      "state_history": [
+        {
+          "status": "pending",
+          "timestamp": "2025-11-02T23:54:39.635952",
+          "reason": "Task created"
+        }
+      ],
+      "paused_at": null,
+      "resumed_at": null,
+      "pause_count": 0,
+      "stop_reason": null,
+      "termination_reason": null,
+      "child_task_ids": [],
+      "sibling_task_ids": [],
+      "dependent_task_ids": [],
+      "messages_to_dependents": [],
+      "received_messages": [],
+      "blocked_by": []
+    }
+  }
+}

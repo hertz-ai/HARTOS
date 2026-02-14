@@ -1,0 +1,87 @@
+{
+    "status": "done",
+    "action": "Store all 7 generated news videos under their corresponding conv_id, saving metadata including genre, assigned avatar, video URL, generation timestamp, and expiry timestamp (current time + 2 hours).",
+    "fallback_action": "If video metadata for any genre is missing or storage fails, attempt to retrieve the data again from the respective service or re-query existing records; if still unsuccessful, notify the user for manual entry or review.",
+    "persona": "News Curator",
+    "action_id": 6,
+    "recipe": [
+        {
+            "steps": "For each genre, prepare metadata including the genre, assigned avatar ID, video URL, generation timestamp, and calculate expiry timestamp by adding two hours to the generation time.",
+            "tool_name": "",
+            "generalized_functions": "def prepare_video_metadata(genre_list, avatar_dict, video_url_dict, gen_ts_dict):\n    \"\"\"\n    Prepare video metadata for each genre news video.\n    Args:\n        genre_list (list): List of news genres\n        avatar_dict (dict): Dictionary mapping genre to avatar ID\n        video_url_dict (dict): Dictionary mapping genre to video URL\n        gen_ts_dict (dict): Dictionary mapping genre to generation timestamp (ISO 8601 string)\n    Returns:\n        dict: Genre-keyed metadata with avatar, video URL, generation and expiry timestamps\n    \"\"\"\n    from datetime import datetime, timedelta\n    video_metadata = {}\n    for genre in genre_list:\n        gen_ts = datetime.fromisoformat(gen_ts_dict[genre])\n        expiry_ts = (gen_ts + timedelta(hours=2)).isoformat()\n        video_metadata[genre] = {\n            'avatar': avatar_dict[genre],\n            'video_url': video_url_dict[genre],\n            'generation_timestamp': gen_ts_dict[genre],\n            'expiry_timestamp': expiry_ts\n        }\n    return video_metadata\n",
+            "agent_to_perform_this_action": "Executor"
+        },
+        {
+            "steps": "For each video, store the metadata in memory under a generic key path that organizes records by conv_id.",
+            "tool_name": "save_data_in_memory",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [],
+    "metadata": {
+        "user_id": "redacted int",
+        "avatars": {
+            "teacher_avatar_ids": [
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int"
+            ]
+        },
+        "genres": {
+            "avatar_assignment": {
+                "Politics": "redacted int",
+                "Business": "redacted int",
+                "Sports": "redacted int",
+                "Breaking News": "redacted int",
+                "Science": "redacted int",
+                "AI": "redacted int",
+                "Weather": "redacted int"
+            }
+        },
+        "news_scripts": {
+            "latest_batch": {
+                "Politics": {
+                    "script": null,
+                    "timestamp": null
+                },
+                "Business": {
+                    "script": null,
+                    "timestamp": null
+                },
+                "Sports": {
+                    "script": null,
+                    "timestamp": null
+                },
+                "Breaking News": {
+                    "script": null,
+                    "timestamp": null
+                },
+                "Science": {
+                    "script": null,
+                    "timestamp": null
+                },
+                "AI": {
+                    "script": null,
+                    "timestamp": null
+                },
+                "Weather": {
+                    "script": null,
+                    "timestamp": null
+                }
+            }
+        }
+    },
+    "time_took_to_complete": 102.44193649291992,
+    "actions_this_action_depends_on": [
+        4,
+        5
+    ]
+}

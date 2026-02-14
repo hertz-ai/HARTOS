@@ -21,23 +21,76 @@ from collections import deque
 import redis
 import pickle
 from PIL import Image
-from langchain.memory import ZepMemory
+
 from crossbarhttp import Client
 from flask import current_app
-from helper import topological_sort, ToolMessageHandler, strip_json_values, get_time_based_history, retrieve_json
+from helper import ToolMessageHandler, strip_json_values, get_time_based_history, retrieve_json, load_vlm_agent_files
 import helper as helper_fun
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import traceback
-from autobahn.asyncio.component import Component, run
-from twisted.internet.defer import inlineCallbacks, returnValue, Deferred
-from twisted.internet import reactor
-import threading
+from autobahn.asyncio.component import Component
 
 from threadlocal import thread_local_data
 
+# MCP Integration
+from integrations.mcp import load_user_mcp_servers, get_mcp_tools_for_autogen, mcp_registry
 
-class TaskStatus(Enum):
+# Internal Agent Communication (formerly called A2A, now renamed to avoid confusion with Google's A2A protocol)
+from integrations.internal_comm import (
+    skill_registry, a2a_context, register_agent_with_skills,
+    create_delegation_function, create_context_sharing_function,
+    create_context_retrieval_function
+)
+
+# Task Delegation Bridge - Integrates A2A with task_ledger for proper state management
+from integrations.internal_comm.task_delegation_bridge import TaskDelegationBridge
+
+# AP2 (Agent Protocol 2) - Agentic Commerce
+from integrations.ap2 import (
+    payment_ledger, get_ap2_tools_for_autogen,
+    PaymentStatus, PaymentMethod, PaymentGateway
+)
+
+# Agent Lightning - Training and Optimization
+from integrations.agent_lightning import (
+    instrument_autogen_agent, is_enabled as is_agent_lightning_enabled
+)
+
+# SimpleMem - Long-term memory with semantic compression
+from integrations.channels.memory.simplemem_store import SimpleMemConfig, HAS_SIMPLEMEM
+if HAS_SIMPLEMEM:
+    from integrations.channels.memory.simplemem_store import SimpleMemStore
+
+# Expert Agents - Dream Fulfillment Network (96 specialized agents)
+from integrations.expert_agents import (
+    register_all_experts, get_expert_for_task,
+    create_autogen_expert_wrapper, recommend_experts_for_dream
+)
+
+# Add Smart Ledger for persistent task tracking in reuse mode - using agent_ledger package
+from agent_ledger import (
+    SmartLedger, Task, TaskType,
+    TaskStatus as LedgerTaskStatus,  # Agent ledger task status (PENDING, IN_PROGRESS, etc.)
+    ExecutionMode,
+    create_ledger_from_actions, get_production_backend
+)
+
+# Import helper_ledger functions for subtask management and ledger awareness
+from helper_ledger import (
+    add_subtasks_to_ledger,
+    check_and_unblock_parent,
+    get_pending_subtasks,
+    get_default_llm_client
+)
+
+# Import sync function from lifecycle_hooks
+from lifecycle_hooks import sync_action_state_to_ledger
+
+
+class ActionExecutionStatus(Enum):
+    """Status for background action execution (NOT the same as agent_ledger TaskStatus)"""
     INITIALIZED = "INITIALIZED"
     SCHEDULED = "SCHEDULED"
     EXECUTING = "EXECUTING"
@@ -55,37 +108,77 @@ class TaskNames(Enum):
     USER_ID_RETRIEVER = "USER_ID_RETRIEVER"
 
 
-with open("config.json", 'r') as f:
-    config = json.load(f)
+# Performance: cached config loading (shared singleton)
+from core.config_cache import get_config as _get_config
+from core.http_pool import pooled_post, pooled_get, pooled_request
+from core.event_loop import get_or_create_event_loop
+from core.session_cache import TTLCache
+from core.cache_loaders import load_agent_data, load_user_ledger, load_recipe, load_user_simplemem
 
-STUDENT_API = config['STUDENT_API']
-ACTION_API = config['ACTION_API']
+config = _get_config()
+STUDENT_API = config.get('STUDENT_API', '')
+ACTION_API = config.get('ACTION_API', '')
 
 def parse_date(date_str):
     return datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%S")
 
 
 client = Client('http://aws_rasa.hertzai.com:8088/publish')
+
+# Create thread pool executor for async Crossbar publishing
+crossbar_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='crossbar_publish')
+
+def publish_async(topic, message, timeout=2.0):
+    """
+    Publish to Crossbar in a background thread without blocking the main request.
+
+    Args:
+        topic: Crossbar topic to publish to
+        message: Message payload (dict or JSON string)
+        timeout: Maximum time to wait for publish (default: 2.0 seconds)
+    """
+    def _publish():
+        import socket
+        try:
+            # Set socket timeout to prevent long waits
+            original_timeout = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(timeout)
+
+            client.publish(topic, message)
+            current_app.logger.debug(f"Successfully published to {topic}")
+        except Exception as e:
+            current_app.logger.error(f"Error publishing to {topic}: {e}")
+        finally:
+            # Restore original timeout
+            if original_timeout is not None:
+                socket.setdefaulttimeout(original_timeout)
+
+    # Submit to executor without waiting for result
+    crossbar_executor.submit(_publish)
+
 scheduler = BackgroundScheduler()
 scheduler.start()
 # logging_session_id = runtime_logging.start(config={"dbname": "logs.db"})
 # Store user-specific agents & their chat history
-user_agents: Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]] = {}
-role_agents: Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]] = {}
-agents_session = {}
-recipes = {}
-user_journey = {}
-temp_users = {}
-chat_joinees = {}
-agents_roles = {}
-llm_call_track = {}
+# Performance: TTL caches replace unbounded global dicts (auto-expire after 2 hours)
+user_agents: Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]] = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_agents')
+role_agents: Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]] = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_role_agents')
+agents_session = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_agents_session')
+recipes = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_recipes', loader=load_recipe)
+user_journey = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_journey')
+temp_users = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_temp_users')
+chat_joinees = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_chat_joinees')
+agents_roles = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_agents_roles')
+llm_call_track = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_llm_call_track')
 
 _active_tools = {}
 _active_tools_lock = threading.Lock()
 
 redis_client = redis.StrictRedis(
     host='azure_all_vms.hertzai.com', port=6369, db=0)
-agent_data = {}
+agent_data = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_agent_data', loader=load_agent_data)
+user_simplemem = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_simplemem', loader=load_user_simplemem)
+# Azure OpenAI configuration (fallback - gpt-4o)
 # config_list = [{
 #     "model": 'gpt-4o',
 #     "api_type": "azure",
@@ -95,48 +188,44 @@ agent_data = {}
 #     "price": [0.0025, 0.01]
 # }]
 
+# Local llama.cpp server (Qwen3-VL) - ACTIVE
 config_list = [{
-        "model": 'gpt-4.1-mini',
-        "api_type": "azure",
-        "api_key": '8MMPerfdfcpx63VfIVtg2lpAK7Crv7O5JKiKwhusVhgJNkC8Ql6FJQQJ99BAACHYHv6XJ3w3AAABACOGdxWW',
-        "base_url": 'https://hertzai-gpt4.openai.azure.com/openai/deployments/gpt-4.1-mini/chat/completions?api-version=2025-01-01-preview',
-        "api_version": "2024-12-01-preview",
-        "price": [0.0025, 0.01]
+        "model": 'Qwen3-VL-4B-Instruct',
+        "api_key": 'dummy',
+        "base_url": 'http://localhost:8080/v1',
+        "price": [0, 0]
     }]
+
+# Azure OpenAI configuration (fallback - DISABLED)
+# config_list = [{
+#         "model": 'gpt-4.1-mini',
+#         "api_type": "azure",
+#         "api_key": '8MMPerfdfcpx63VfIVtg2lpAK7Crv7O5JKiKwhusVhgJNkC8Ql6FJQQJ99BAACHYHv6XJ3w3AAABACOGdxWW',
+#         "base_url": 'https://hertzai-gpt4.openai.azure.com/openai/deployments/gpt-4.1-mini/chat/completions?api-version=2025-01-01-preview',
+#         "api_version": "2024-12-01-preview",
+#         "price": [0.0025, 0.01]
+#     }]
+
+# Per-request model config override (speculative execution, hive compute routing)
+def get_llm_config():
+    """Get LLM config — checks thread-local override before falling back to global."""
+    from threadlocal import thread_local_data
+    override = thread_local_data.get_model_config_override()
+    return {"cache_seed": None, "config_list": override or config_list, "max_tokens": 1500}
 
 message_tracking_lock = threading.Lock()
 
+# Register 96 Expert Agents with skill registry for dream fulfillment
+try:
+    import logging
+    logger = logging.getLogger(__name__)
+    expert_agents = register_all_experts(skill_registry)
+    logger.info(f"Registered {len(expert_agents)} expert agents with skill registry")
+except Exception as e:
+    if 'logger' in dir():
+        logger.error(f"Failed to register expert agents: {e}")
+    expert_agents = {}
 
-def load_vlm_agent_files(prompt_id, role_number):
-    """Loads any VLM agent JSON files for the given prompt_id and role_number and integrates them with existing recipes."""
-    vlm_actions = []
-
-    # Look for existing VLM agent files
-    try:
-        for file in os.listdir("prompts"):
-            if file.startswith(f"{prompt_id}_{role_number}_") and file.endswith("_vlm_agent.json"):
-                file_path = os.path.join("prompts", file)
-                try:
-                    with open(file_path, 'r') as f:
-                        recipe_data = json.load(f)
-                        current_app.logger.info(f"Found VLM agent recipe: {file_path}")
-
-                        # Extract the action ID from the filename (assuming format: prompt_id_role_number_action_id_vlm_agent.json)
-                        parts = file.split('_')
-                        if len(parts) >= 4:
-                            try:
-                                action_id = int(parts[2]) # Get the action ID
-                                # Add or replace action in the actions list
-                                recipe_data["action_id"] = action_id
-                                vlm_actions.append(recipe_data)
-                            except (ValueError, IndexError):
-                                current_app.logger.error(f"Couldn't parse action ID from filename {file}")
-                except Exception as e:
-                    current_app.logger.error(f"Error reading VLM agent file {file_path}: {e}")
-    except Exception as e:
-        current_app.logger.error(f"Error listing files in prompts directory: {e}")
-
-    return vlm_actions
 
 class Action:
     def __init__(self, actions):
@@ -145,12 +234,18 @@ class Action:
         self.fallback = False
         self.new_json = []
         self.recipe = False
+        self.ledger = None  # Smart Ledger for persistent task tracking
 
     def get_action(self, current_action):
         try:
             return self.actions[current_action]
         except:
             raise IndexError("Custom message: Index is out of range!")
+
+    def set_ledger(self, ledger):
+        """Attach Smart Ledger to this Action instance"""
+        self.ledger = ledger
+        current_app.logger.info(f"Smart Ledger attached with {len(ledger.tasks)} tasks")
 
 
 # Updated subscribe_and_return function
@@ -384,7 +479,7 @@ def execute_python_file(task_description: str, user_id: int, prompt_id: int, act
     return 'done'
 
 
-def call_visual_task(task_description: str, user_id: int, prompt_id: int, data: list, date: datetime):
+def call_visual_task(task_description: str, user_id: int, prompt_id: int):
     headers = {'Content-Type': 'application/json'}
     url = 'http://localhost:6777/visual_agent'
 
@@ -530,10 +625,12 @@ def get_action_user_details(user_id):
         # Filter out unwanted actions
         filtered_data = [obj for obj in data if obj["action"]
                          not in unwanted_actions and obj["zeroshot_label"]
-                         not in ['Video Reasoning']]
+                         not in ['Video Reasoning', 'Screen Reasoning']]
 
         filtered_data_video = [
             obj for obj in data if obj["zeroshot_label"] == 'Video Reasoning']
+        filtered_data_screen = [
+            obj for obj in data if obj["zeroshot_label"] == 'Screen Reasoning']
         # Dictionary to store the first and last occurrence dates for each action
         action_occurrences = {}
 
@@ -584,6 +681,24 @@ def get_action_user_details(user_id):
             action_texts.append(
                 'If a person is identified in Visual_Context section that\'s most probably the user (me) & most likely not taking any selfie.')
 
+        # Process screen context data (shorter window — 2 minutes)
+        screen_context_texts = []
+        for obj in filtered_data_screen:
+            action = obj["action"]
+            date = parse_date(obj["created_date"])
+            now = datetime.now()
+            if (now - date) > timedelta(minutes=2):
+                continue
+            screen_text = f"{action} on {date.astimezone(india_tz).strftime('%Y-%m-%dT%H:%M:%S')}"
+            screen_context_texts.append(screen_text)
+
+        if screen_context_texts:
+            action_texts.append('<Last_2_Minutes_Screen_Context_Start>')
+            action_texts.extend(screen_context_texts)
+            action_texts.append('<Last_2_Minutes_Screen_Context_End>')
+            action_texts.append(
+                'Screen_Context shows what is currently displayed on the user\'s computer screen.')
+
         if len(action_texts) == 0:
             action_texts = ['user has not performed any actions yet.']
 
@@ -598,16 +713,12 @@ def get_action_user_details(user_id):
                   " in this format:'%Y-%m-%dT%H:%M:%S' \n Whenever user is asking about current date or current time at particular location then use this datetime format by asking what user's location is. Use the previous sentence datetime info to answer current time based questions coupled with google_search for current time or full_history for historical conversation based answers. Take a deep breath and think step by step.\n"
         # user detail api
     else:
-        post_dict = {'user_id': user_id, 'status': TaskStatus.ERROR.value,
+        post_dict = {'user_id': user_id, 'status': ActionExecutionStatus.ERROR.value,
                      'task_name': TaskNames.GET_ACTION_USER_DETAILS.value, 'uid': thread_local_data.get_request_id(
             ), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}",
                      'request_id': thread_local_data.get_request_id(),
                      'failure_reason': 'Exception happend at get action api end'}
-        try:
-            client.publish('com.hertzai.longrunning.log', post_dict)
-        except Exception as e:
-            current_app.logger.error(
-                "Error while publish at com.hertzai.longrunning.log topic")
+        publish_async('com.hertzai.longrunning.log', post_dict)
 
     url = STUDENT_API
     payload = json.dumps({
@@ -624,16 +735,12 @@ def get_action_user_details(user_id):
         user_name: {user_data["name"]} (Call the user by this name only when required and not always),gender: {user_data["gender"]}, who_pays_for_course: {user_data["who_pays_for_course"]}(Entity Responsible for Paying the Course Fees), preferred_language: {user_data["preferred_language"]}(User's Preferred Language), date_of_birth: {user_data["dob"]}, english_proficiency: {user_data["english_proficiency"]}(User's English Proficiency Level), created_date: {user_data["created_date"]}(user creation date), standard: {user_data["standard"]}(User's Standard in which user studying)
         '''
     else:
-        post_dict = {'user_id': user_id, 'status': TaskStatus.ERROR.value,
+        post_dict = {'user_id': user_id, 'status': ActionExecutionStatus.ERROR.value,
                      'task_name': TaskNames.GET_ACTION_USER_DETAILS.value, 'uid': thread_local_data.get_request_id(
             ), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}",
                      'request_id': thread_local_data.get_request_id(),
                      'failure_reason': 'Exception happend at get user detail api end'}
-        try:
-            client.publish('com.hertzai.longrunning.log', post_dict)
-        except Exception as e:
-            current_app.logger.error(
-                "Error while publish at com.hertzai.longrunning.log topic")
+        publish_async('com.hertzai.longrunning.log', post_dict)
     return user_details, actions
 
 
@@ -699,7 +806,8 @@ def get_frame(user_id):
 
     try:
         if serialized_frame is not None:
-            frame_bgr = pickle.loads(serialized_frame)
+            from security.safe_deserialize import safe_load_frame
+            frame_bgr = safe_load_frame(serialized_frame)
             current_app.logger.info(
                 f"Frame for user_id {user_id} retrieved successfully.")
             frame = frame_bgr[:, :, ::-1]
@@ -713,15 +821,7 @@ def get_frame(user_id):
 
 # TODO Reset action order after it reaches end.
 def create_agents_for_role(user_id: str, prompt_id):
-
-    config_list = [{
-        "model": 'gpt-4.1',
-        "api_type": "azure",
-        "api_key": '8MMPerfdfcpx63VfIVtg2lpAK7Crv7O5JKiKwhusVhgJNkC8Ql6FJQQJ99BAACHYHv6XJ3w3AAABACOGdxWW',
-        "base_url": 'https://hertzai-gpt4.openai.azure.com/openai/deployments/gpt-4.1/chat/completions?api-version=2025-01-01-preview',
-        "api_version": "2024-12-01-preview",
-        "price": [0.0025, 0.01]
-    }]
+    # Uses module-level config_list (localhost:8080 for local, Azure for cloud)
     current_app.logger.info('INSIDE create_agents_for_role')
 
     # Create a basic function calling config
@@ -871,6 +971,32 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         "cache_seed": None
     }
 
+    # Initialize SimpleMem for this session
+    simplemem_store = None
+    if HAS_SIMPLEMEM:
+        try:
+            sm_config = SimpleMemConfig.from_env()
+            if sm_config.enabled and sm_config.api_key:
+                sm_config.db_path = f"./simplemem_db/{user_prompt}"
+                simplemem_store = SimpleMemStore(sm_config)
+                user_simplemem[user_prompt] = simplemem_store
+                current_app.logger.info(f"SimpleMem initialized for {user_prompt}")
+        except Exception as e:
+            current_app.logger.warning(f"SimpleMem init failed: {e}")
+
+    # Initialize MemoryGraph for provenance-aware memory
+    memory_graph = None
+    try:
+        from integrations.channels.memory.memory_graph import MemoryGraph
+        import os
+        graph_db_path = os.path.join(
+            os.path.expanduser("~"), "Documents", "Nunba", "data", "memory_graph", user_prompt
+        )
+        memory_graph = MemoryGraph(db_path=graph_db_path, user_id=str(user_id))
+        current_app.logger.info(f"MemoryGraph initialized for {user_prompt}")
+    except Exception as e:
+        current_app.logger.warning(f"MemoryGraph init failed: {e}")
+
     personas = []
     # role = get_role(user_id,prompt_id)
     role_number, role = get_flow_number(user_id, prompt_id)
@@ -925,7 +1051,34 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
     # Perform topological sorting
     # sorted_actions = topological_sort(role_actions)
+
+    # Create Action with Smart Ledger integration for persistent task tracking
     user_tasks[user_prompt] = Action(role_actions)
+
+    # Initialize or load Smart Ledger for this user with production backend (Redis with JSON fallback)
+    if user_prompt not in user_ledgers:
+        current_app.logger.info(f"Creating new Smart Ledger for {user_prompt} in reuse mode")
+        backend = get_production_backend()  # Tries Redis, falls back to JSON (already imported from agent_ledger)
+        ledger = create_ledger_from_actions(user_id, prompt_id, role_actions, backend=backend)
+        user_ledgers[user_prompt] = ledger
+
+        # Create TaskDelegationBridge for this ledger
+        delegation_bridge = TaskDelegationBridge(a2a_context, ledger)
+        user_delegation_bridges[user_prompt] = delegation_bridge
+        current_app.logger.info(f"Created TaskDelegationBridge for {user_prompt}")
+    else:
+        current_app.logger.info(f"Reusing existing Smart Ledger for {user_prompt}")
+        ledger = user_ledgers[user_prompt]
+
+        # Ensure delegation bridge exists for existing ledger
+        if user_prompt not in user_delegation_bridges:
+            delegation_bridge = TaskDelegationBridge(a2a_context, ledger)
+            user_delegation_bridges[user_prompt] = delegation_bridge
+            current_app.logger.info(f"Created TaskDelegationBridge for existing ledger {user_prompt}")
+
+    # Attach ledger to Action instance
+    user_tasks[user_prompt].set_ledger(ledger)
+
     individual_recipe = []
     for i in range(1, (len(recipes[user_prompt]['actions']) + 1)):
         current_app.logger.info(f'checking for prompts/{prompt_id}_{role_number}_{i}.json')
@@ -947,11 +1100,13 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         7. **Scheduled, time-based, or continuous tasks should not be manually executed**—they are already handled by the system.
         8. **IMPORTANT CODING INSTRUCTION**: Avoid using `time.sleep` in any code.
         9. Tools Helper Agent can use:
-            1. The tools are: send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,execute_windows_or_android_command,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, google_search and save_data_in_memory.
+            1. The tools are: send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,execute_windows_or_android_command,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, google_search, save_data_in_memory, search_long_term_memory and save_to_long_term_memory.
             2. Create Scheduled Jobs: For tasks involving timer or time or periodically or scheduled jobs, ask Helper agent to use the create_scheduled_jobs tool.
             3. Data/Memory Management:
                 ➜If you want to save some data,understand the current data from get_saved_metadata & plan the datamodel and ask helper agent to use "save_data_in_memory" tool.
                 ➜If you want to get some data ask helper agent to use "get_data_by_key"  tool.
+                ➜For searching past conversations and recalling facts, use "search_long_term_memory" tool.
+                ➜For saving important facts for future sessions, use "save_to_long_term_memory" tool.
             4. If you want to send some message to user directly then ask helper agent to use send_message_to_user tool but if you want to send message after sometime then ask helper to use send_message_in_seconds tool.
             5. If you want to send some pre synthesized realistic videos to user then ask helper agent to use send_presynthesized_video_to_user tool.
             6. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the pre synthesized generated video if it is successful.
@@ -967,6 +1122,12 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         14. If `can_perform_without_user_input` is `yes`, execute the action automatically without requesting user confirmation.
         15. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
 
+
+        16. **Agent Creation**: If the user asks to create, build, or set up a new AI agent, assistant, or bot,
+            OR if you determine that the current task requires capabilities beyond your scope and a specialized
+            agent would be needed, ask @Helper to use the `create_new_agent` tool with a description of what
+            the new agent should do. If the user wants it done autonomously (e.g., "automatically", "do it for me"),
+            include "autonomous" in the description.
 
         Actions: <actionsStart>{role_actions}<actionEnd>
         Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{individual_recipe}<generalized_functionsEnd><recipeEnd>
@@ -985,6 +1146,19 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         code_execution_config={"work_dir": "coding", "use_docker": False},
         system_message=agent_prompt
     )
+
+    # Wrap assistant with Agent Lightning for training and optimization
+    if is_agent_lightning_enabled():
+        try:
+            assistant = instrument_autogen_agent(
+                agent=assistant,
+                agent_id=f'reuse_recipe_assistant_{user_prompt}',
+                track_rewards=True,
+                auto_trace=True
+            )
+            current_app.logger.info(f"Agent Lightning instrumentation applied to assistant for {user_prompt}")
+        except Exception as e:
+            current_app.logger.warning(f"Could not apply Agent Lightning: {e}. Continuing with standard agent.")
 
     # current_app.logger.info(f'creating agent with prompt {agent_prompt}')
 
@@ -1005,11 +1179,12 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
             3. Only use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
-            4. Tools you have [txt2img, img2txt, save_data_in_memory, get_data_from_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs, send_message_to_user,send_presynthesized_video_to_user] If a task cannot be completed using the available tools, first check the recipe. If no solution is found, create Python code to accomplish the task.
+            4. Tools you have [txt2img, img2txt, save_data_in_memory, get_data_from_memory, search_long_term_memory, save_to_long_term_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs, send_message_to_user,send_presynthesized_video_to_user] If a task cannot be completed using the available tools, first check the recipe. If no solution is found, create Python code to accomplish the task.
             5. Keep track of action and only ask for next action when the current action is completed successfully.
             6. Always use code from recipe given below.
             7. If there is any action which is like to perform a task continuously you should not do it.
             8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
+            8a. CRITICAL PATH INSTRUCTION: When creating file paths in code, ALWAYS use os.path.join(os.getcwd(), filename) or similar. NEVER use hardcoded absolute paths like '/home/user/path' or 'C:\\path'. All paths must be relative to the current working directory.
             9. If you want to send data proactively (on your own) to user use `@user {response_format}`. However, if you're responding to the user's request or instruction, use the send_message_to_user or send_message_in_seconds tool.
             10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
             11. Always request the next action from the @StatusVerifier agent—do not determine the next action on your own.
@@ -1031,11 +1206,12 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
             3. Ask @Helper to use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
-            4. Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory]
+            4. Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, save_data_in_memory, search_long_term_memory and save_to_long_term_memory]
             5. Keep track of action and only ask for next action when the current action is completed successfully.
             6. Always use code from recipe given below.
             7. If there is any action which is like to perform a task continuously you should not do it.
             8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
+            8a. CRITICAL PATH INSTRUCTION: When creating file paths in code, ALWAYS use os.path.join(os.getcwd(), filename) or similar. NEVER use hardcoded absolute paths like '/home/user/path' or 'C:\\path'. All paths must be relative to the current working directory.
             9. If you want to send data proactively (on your own) to user use `@user {response_format}`. However, if you're responding to the user's request or instruction, use the send_message_to_user or send_message_in_seconds tool.
             10. The response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
             11. Always request the next action from the @StatusVerifier agent—do not determine the next action on your own.
@@ -1044,7 +1220,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             Actions: <actionsStart>{role_actions}<actionEnd>
             Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{individual_recipe}<generalized_functionsEnd><recipeEnd>
 
-            Note: Your Working Directory is "/home/hertzai2019/newauto/coding" use this if you need,
+            Note: Your Working Directory is "{os.getcwd()}" - use this as the base path for all file operations. Always use absolute paths by joining with this directory,
             Add proper error handling, logging.
             Always provide clear execution results or error messages to the assistant.
             if you get any conversation which is not related to coding ask the manager to route this conversation to user
@@ -1069,12 +1245,14 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         Response formats:
             1. Action Completed Successfully: {"status": "completed","action": "current action","action_id": 1/2/3...,"message": "message here"}
             2. Action Error: {"status": "error","action": "current action","action_id": 1/2/3...,"message": "message here"}
-            2. Action Pending: {"status": "pending","action": "current action","action_id": 1/2/3...,"message": "pending actions here"}
+            3. Action Pending: {"status": "pending","action": "current action","action_id": 1/2/3...,"message": "pending actions here"}
+            4. Action Requires Breakdown: {"status": "requires_breakdown","action": "current action","action_id": 1/2/3...,"reason": "Why this action needs to be broken down","subtasks": [{"subtask_id": "1.1","description": "First subtask description","depends_on": [],"can_perform_autonomously": true},{"subtask_id": "1.2","description": "Second subtask","depends_on": ["1.1"],"can_perform_autonomously": true}]}
         Important Instructions:
             Only mark an action as "Completed" if the all the steps are successful completed. If any step is pending then mark the staus as pending and give the message.
             For pending tasks or ongoing actions, respond to helper to complete the task.
             Verify the action performed by assistant and make sure the action is performed correctly as per instructions. if action performed was not as per instructions give the pending actions to the helper agent.
             Report status only—do not perform actions yourself and do not try calling any functions/tools.
+            Use "requires_breakdown" when an action is too complex and needs to be split into smaller subtasks. Each subtask should have a unique subtask_id (e.g., "1.1", "1.2").
 
         """,
         is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
@@ -1209,6 +1387,17 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             current_app.logger.info(f"VALUES STORED IN AGENT DATA: {validated_value}")
             current_app.logger.info(f"FULL AGENT DATA AT KEY: {d}")
 
+            # Mirror to MemoryGraph for persistence (fire-and-forget)
+            if memory_graph is not None:
+                try:
+                    import threading as _t
+                    _t.Thread(target=lambda: memory_graph.register(
+                        f"[KV] {key} = {json.dumps(validated_value)[:200]}",
+                        {'memory_type': 'fact', 'source_agent': 'helper', 'session_id': user_prompt, 'kv_key': key},
+                    ), daemon=True).start()
+                except Exception:
+                    pass
+
             # Step 4: Verify storage was successful
             try:
                 # Attempt to read back the data to verify it was stored correctly
@@ -1257,6 +1446,14 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                 d = d[k]
             return f'{d}'
         except KeyError:
+            # Fallback: check MemoryGraph for persisted KV data
+            if memory_graph is not None:
+                try:
+                    results = memory_graph.recall(f"[KV] {key}", mode='text', top_k=1)
+                    if results:
+                        return results[0].content
+                except Exception:
+                    pass
             return "Key not found in stored data."
 
     @assistant.register_for_execution()
@@ -1404,6 +1601,77 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                          end: Annotated[str, "end date in format %Y-%m-%dT%H:%M:%S.%fZ"]) -> str:
         current_app.logger.info('INSIDE get_chat_history')
         return get_time_based_history(text, f'user_{user_id}', start, end)
+
+    @assistant.register_for_execution()
+    @helper.register_for_llm(api_style="function", description="Search past camera and screen descriptions by keyword and time range. Use for visual history queries.")
+    def search_visual_history(
+        query: Annotated[str, "What to search for in visual/screen descriptions"],
+        minutes_back: Annotated[int, "How many minutes back to search (default 30)"] = 30,
+        channel: Annotated[str, "Which feed: 'camera', 'screen', or 'both' (default)"] = "both",
+    ) -> str:
+        """Search past camera/screen descriptions for visual history queries."""
+        results = helper_fun.search_visual_history(user_id, query, mins=minutes_back, channel=channel)
+        if results:
+            return '\n'.join(results)
+        return "No matching visual/screen descriptions found in the given time range."
+
+    # --- SimpleMem long-term memory tools ---
+    if simplemem_store is not None:
+        @assistant.register_for_execution()
+        @helper.register_for_llm(api_style="function",
+                                 description="Search long-term memory for past conversations, facts, and context using natural language query. More powerful than get_chat_history for finding relevant information.")
+        def search_long_term_memory(
+            query: Annotated[str, "Natural language query to search long-term memory"]
+        ) -> str:
+            """Search compressed long-term memory using semantic retrieval."""
+            try:
+                loop = get_or_create_event_loop()
+                results = loop.run_until_complete(simplemem_store.search(query))
+                if results:
+                    return results[0].content
+                return "No relevant memories found."
+            except Exception as e:
+                current_app.logger.info(f"SimpleMem search error: {e}")
+                return "Memory search unavailable."
+
+        @assistant.register_for_execution()
+        @helper.register_for_llm(api_style="function",
+                                 description="Save important facts or information to long-term memory for future retrieval across sessions.")
+        def save_to_long_term_memory(
+            content: Annotated[str, "The information/fact to remember long-term"],
+            speaker: Annotated[str, "Who said this (e.g. 'User', 'Assistant', 'System')"] = "System"
+        ) -> str:
+            """Save important information to compressed long-term memory."""
+            try:
+                loop = get_or_create_event_loop()
+                loop.run_until_complete(simplemem_store.add(content, {
+                    "sender_name": speaker,
+                    "user_id": user_id,
+                    "prompt_id": prompt_id,
+                }))
+                # Dual-write to MemoryGraph (fire-and-forget)
+                if memory_graph is not None:
+                    try:
+                        import threading as _t
+                        _t.Thread(target=lambda: memory_graph.register(
+                            content, {'memory_type': 'fact', 'source_agent': speaker, 'session_id': user_prompt, 'source': 'simplemem'},
+                        ), daemon=True).start()
+                    except Exception:
+                        pass
+                return "Saved to long-term memory."
+            except Exception as e:
+                current_app.logger.info(f"SimpleMem save error: {e}")
+                return "Failed to save to long-term memory."
+
+    # --- MemoryGraph provenance tools (remember, recall, backtrace) ---
+    if memory_graph is not None:
+        try:
+            from integrations.channels.memory.agent_memory_tools import create_memory_tools, register_autogen_tools
+            mem_tools = create_memory_tools(memory_graph, str(user_id), user_prompt)
+            register_autogen_tools(mem_tools, assistant, helper)
+            current_app.logger.info(f"MemoryGraph tools registered for {user_prompt}")
+        except Exception as e:
+            current_app.logger.warning(f"MemoryGraph tools registration failed: {e}")
 
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",
@@ -1875,6 +2143,31 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         current_app.logger.info('INSIDE google search')
         return helper_fun.top5_results(text)
 
+    @assistant.register_for_execution()
+    @helper.register_for_llm(api_style="function",
+                             description="Signal that the user's request requires creating a new specialized AI agent. "
+                                         "Use this when the user asks to create, build, set up, or deploy a new agent, "
+                                         "or when the current agent's capabilities are insufficient for the task. "
+                                         "Input should describe what the new agent should do. "
+                                         "If the user wants autonomous creation, include 'autonomous' in the description.")
+    def create_new_agent(description: Annotated[str, "Description of the agent to create"]) -> str:
+        """Signal that a new agent needs to be created. Sets a thread-local flag
+        that the /chat handler checks after chat_agent() returns."""
+        current_app.logger.info(f'AUTOGEN create_new_agent tool called: {description}')
+        lower = description.lower()
+        autonomous = any(w in lower for w in [
+            'autonomous', 'automatic', 'automatically', 'do it for me',
+            'handle it', 'just create', 'auto',
+        ])
+        # Store in a module-level dict keyed by user_prompt so /chat can check it
+        creation_signals[user_prompt] = {
+            'description': description,
+            'autonomous': autonomous,
+        }
+        if autonomous:
+            return f"New agent creation initiated autonomously for: {description}. The system will handle all details automatically."
+        return f"New agent creation initiated for: {description}. The system will guide through the creation process."
+
     time_agent = autogen.AssistantAgent(
         name='time_agent',
         llm_config=llm_config,
@@ -1888,7 +2181,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
         """
                        f"When you want to communicate with {role} connect main agent using 'connect_time_main' tool."
-                       "Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory.]"
+                       "Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, save_data_in_memory, search_long_term_memory and save_to_long_term_memory.]"
                        "if you have any task which is not doable by these tool check recipe first else create python code to do so"
                        "the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video."
                        f"IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @user {response_format}"
@@ -1911,7 +2204,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
             3. Only use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
-            4. Tools you have [txt2img, img2txt, save_data_in_memory, get_data_from_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs] if you have any task which is not doable by these tool check recipe first else create python code to do so
+            4. Tools you have [txt2img, img2txt, save_data_in_memory, get_data_from_memory, search_long_term_memory, save_to_long_term_memory, get_user_id, get_prompt_id, Generate_video, get_user_uploaded_file, get_user_camera_inp, get_chat_history, create_scheduled_jobs] if you have any task which is not doable by these tool check recipe first else create python code to do so
             5. Keep track of action and only go to next action when the current action is completed successfully
             6. Always use code from recipe given below
             7. If there is any action which is like to perform a task continously you should not do it.
@@ -1934,7 +2227,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
             3. Only use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
-            4. Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory]
+            4. Tools Helper Agent can use [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, save_data_in_memory, search_long_term_memory and save_to_long_term_memory]
             5. Keep track of action and only go to next action when the current action is completed successfully
             6. Always use code from recipe given below
             7. If there is any action which is like to perform a task continously you should not do it.
@@ -1944,7 +2237,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             Actions: <actionsStart>{role_actions}<actionEnd>
             Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{individual_recipe}<generalized_functionsEnd><recipeEnd>
 
-            Note: Your Working Directory is "/home/hertzai2019/newauto/coding" use this if you need,
+            Note: Your Working Directory is "{os.getcwd()}" - use this as the base path for all file operations. Always use absolute paths by joining with this directory,
             Add proper error handling, logging.
             Always provide clear execution results or error messages to the assistant.
             if you get any conversation which is not related to coding ask the manager to route this conversation to user
@@ -2036,6 +2329,20 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     helper1.register_for_llm(name="get_chat_history", description="Get Chat history based on text & start & end date")(
         get_chat_history)
     time_agent.register_for_execution(name="get_chat_history")(get_chat_history)
+    helper1.register_for_llm(name="search_visual_history", description="Search past camera and screen descriptions by keyword and time range.")(search_visual_history)
+    time_agent.register_for_execution(name="search_visual_history")(search_visual_history)
+    # SimpleMem tools for time_agent
+    if simplemem_store is not None:
+        helper1.register_for_llm(
+            name="search_long_term_memory",
+            description="Search long-term memory for past conversations, facts, and context using natural language query."
+        )(search_long_term_memory)
+        time_agent.register_for_execution(name="search_long_term_memory")(search_long_term_memory)
+        helper1.register_for_llm(
+            name="save_to_long_term_memory",
+            description="Save important facts or information to long-term memory for future retrieval across sessions."
+        )(save_to_long_term_memory)
+        time_agent.register_for_execution(name="save_to_long_term_memory")(save_to_long_term_memory)
     helper1.register_for_llm(name="send_message_to_user", description="Send Message to User")(send_message_to_user)
     time_agent.register_for_execution(name="send_message_to_user")(send_message_to_user)
     helper1.register_for_llm(name="send_presynthesized_video_to_user",
@@ -2123,6 +2430,20 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     helper2.register_for_llm(name="get_chat_history", description="Get Chat history based on text & start & end date")(
         get_chat_history)
     visual_agent.register_for_execution(name="get_chat_history")(get_chat_history)
+    helper2.register_for_llm(name="search_visual_history", description="Search past camera and screen descriptions by keyword and time range.")(search_visual_history)
+    visual_agent.register_for_execution(name="search_visual_history")(search_visual_history)
+    # SimpleMem tools for visual_agent
+    if simplemem_store is not None:
+        helper2.register_for_llm(
+            name="search_long_term_memory",
+            description="Search long-term memory for past conversations, facts, and context using natural language query."
+        )(search_long_term_memory)
+        visual_agent.register_for_execution(name="search_long_term_memory")(search_long_term_memory)
+        helper2.register_for_llm(
+            name="save_to_long_term_memory",
+            description="Save important facts or information to long-term memory for future retrieval across sessions."
+        )(save_to_long_term_memory)
+        visual_agent.register_for_execution(name="save_to_long_term_memory")(save_to_long_term_memory)
     helper2.register_for_llm(name="send_message_to_user", description="Send Message to User")(send_message_to_user)
     visual_agent.register_for_execution(name="send_message_to_user")(send_message_to_user)
     helper2.register_for_llm(name="send_presynthesized_video_to_user",
@@ -2140,21 +2461,237 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     helper2.register_for_llm(name="google_search", description="Get google search response")(google_search)
     visual_agent.register_for_execution(name="google_search")(google_search)
 
+    # MCP Integration: Load and register user-provided MCP server tools
+    try:
+        current_app.logger.info("Loading user-provided MCP servers...")
+        num_servers = load_user_mcp_servers()
+
+        if num_servers > 0:
+            current_app.logger.info(f"Successfully loaded {num_servers} MCP servers")
+
+            # Get all MCP tool functions
+            mcp_tools = mcp_registry.get_all_tool_functions()
+            current_app.logger.info(f"Discovered {len(mcp_tools)} MCP tools")
+
+            # Register each MCP tool with the agents
+            for tool_name, tool_func in mcp_tools.items():
+                # Get tool definition for description
+                tool_defs = mcp_registry.get_tool_definitions()
+                tool_def = next((t for t in tool_defs if t['name'] == tool_name), None)
+
+                if tool_def:
+                    description = tool_def.get('description', f'MCP tool: {tool_name}')
+
+                    # Register for LLM (helper agent suggests tool use)
+                    helper.register_for_llm(name=tool_name, description=description)(tool_func)
+
+                    # Register for execution (assistant agent executes tool)
+                    assistant.register_for_execution(name=tool_name)(tool_func)
+
+                    current_app.logger.info(f"Registered MCP tool: {tool_name}")
+        else:
+            current_app.logger.info("No MCP servers configured - continuing with default tools")
+    except Exception as e:
+        current_app.logger.warning(f"MCP integration error (non-critical): {e}")
+        # Continue with default tools if MCP fails
+
+    # Service Tools: Register HTTP microservice tools (Crawl4AI, AceStep, etc.)
+    # Follows same pattern as MCP block above — register tools, get functions, wire to agents
+    try:
+        from integrations.service_tools import service_tool_registry, Crawl4AITool, AceStepTool
+
+        Crawl4AITool.register()   # port 11235
+        AceStepTool.register()    # port 8001
+        service_tool_registry.load_config()  # load any user-added tools from service_tools.json
+
+        svc_tools = service_tool_registry.get_all_tool_functions()
+        svc_defs = service_tool_registry.get_tool_definitions()
+
+        for tool_name, tool_func in svc_tools.items():
+            tool_def = next((d for d in svc_defs if d['name'] == tool_name), None)
+            if tool_def:
+                description = tool_def.get('description', f'Service tool: {tool_name}')
+                helper.register_for_llm(name=tool_name, description=description)(tool_func)
+                assistant.register_for_execution(name=tool_name)(tool_func)
+                current_app.logger.info(f"Registered service tool: {tool_name}")
+    except Exception as e:
+        current_app.logger.warning(f"Service tools integration error (non-critical): {e}")
+
+    # Internal Agent Communication: Register agents and their skills for in-process communication
+    try:
+        current_app.logger.info("Initializing Internal Agent Communication (skill-based delegation)...")
+
+        # Define agent skills (same as in create_recipe.py for consistency)
+        agent_skills = {
+            'assistant': [
+                {'name': 'task_coordination', 'description': 'Coordinating complex multi-step tasks', 'proficiency': 0.95},
+                {'name': 'decision_making', 'description': 'Making strategic decisions', 'proficiency': 0.9},
+                {'name': 'context_management', 'description': 'Managing conversation context', 'proficiency': 0.9}
+            ],
+            'helper': [
+                {'name': 'tool_execution', 'description': 'Executing various tools and functions', 'proficiency': 1.0},
+                {'name': 'data_processing', 'description': 'Processing and transforming data', 'proficiency': 0.95},
+                {'name': 'external_api', 'description': 'Interacting with external APIs', 'proficiency': 0.9}
+            ],
+            'executor': [
+                {'name': 'code_execution', 'description': 'Executing code safely', 'proficiency': 1.0},
+                {'name': 'computation', 'description': 'Performing complex computations', 'proficiency': 0.95},
+                {'name': 'data_analysis', 'description': 'Analyzing data and generating insights', 'proficiency': 0.9}
+            ],
+            'verify': [
+                {'name': 'status_verification', 'description': 'Verifying task completion status', 'proficiency': 0.95},
+                {'name': 'quality_assurance', 'description': 'Ensuring output quality', 'proficiency': 0.9},
+                {'name': 'validation', 'description': 'Validating results and outputs', 'proficiency': 0.9}
+            ]
+        }
+
+        # Register agents with their skills
+        for agent_name, skills in agent_skills.items():
+            register_agent_with_skills(agent_name, skills)
+            current_app.logger.info(f"Registered {agent_name} with {len(skills)} skills")
+
+        # Add A2A tools (similar to create_recipe.py)
+        def delegate_to_specialist(task: Annotated[str, "Description of the task to delegate"],
+                                  required_skills: Annotated[List[str], "List of skills required"],
+                                  context: Annotated[Optional[Dict], "Optional context"] = None) -> str:
+            """Delegate a task to a specialist agent with full task_ledger tracking"""
+
+            # Try to use TaskDelegationBridge for proper state management
+            if user_prompt in user_delegation_bridges and user_prompt in user_tasks:
+                bridge = user_delegation_bridges[user_prompt]
+                action_tracker = user_tasks[user_prompt]
+
+                try:
+                    # Get current task ID from action tracker
+                    current_action_idx = action_tracker.current_index if hasattr(action_tracker, 'current_index') else 0
+                    current_task_id = f"action_{current_action_idx + 1}"
+
+                    # Verify task exists in ledger
+                    ledger = user_ledgers[user_prompt]
+                    if ledger.get_task(current_task_id):
+                        # Use bridge for delegation with full tracking
+                        delegation_id = bridge.delegate_task_with_tracking(
+                            parent_task_id=current_task_id,
+                            from_agent='assistant',
+                            task_description=task,
+                            required_skills=required_skills,
+                            context=context
+                        )
+
+                        if delegation_id:
+                            status = bridge.get_delegation_status(delegation_id)
+                            return json.dumps({
+                                'success': True,
+                                'delegation_id': delegation_id,
+                                'message': f'Task delegated to {status["delegation"]["to_agent"]} with full tracking',
+                                'parent_task_blocked': True,
+                                'child_task_created': True,
+                                'status': status
+                            }, indent=2)
+
+                except Exception as e:
+                    current_app.logger.warning(f"Could not use TaskDelegationBridge: {e}. Falling back to standard delegation.")
+
+            # Fallback to standard delegation (backward compatible)
+            delegation_func = create_delegation_function('assistant')
+            return delegation_func(task, required_skills, context)
+
+        helper.register_for_llm(name="delegate_to_specialist",
+                               description="Delegate complex tasks to specialist agents based on required skills")(delegate_to_specialist)
+        assistant.register_for_execution(name="delegate_to_specialist")(delegate_to_specialist)
+
+        def share_context_with_agents(context_key: Annotated[str, "Context identifier"],
+                                      context_value: Annotated[Any, "Context data"]) -> str:
+            """Share context information with other agents"""
+            sharing_func = create_context_sharing_function('assistant')
+            result = sharing_func(context_key, context_value)
+            # Persist to MemoryGraph (fire-and-forget)
+            if memory_graph is not None:
+                try:
+                    import threading as _t
+                    _t.Thread(target=lambda: memory_graph.register(
+                        f"[SHARED] {context_key}: {json.dumps(context_value)[:200]}",
+                        {'memory_type': 'insight', 'source_agent': 'assistant', 'session_id': user_prompt, 'shared_key': context_key},
+                    ), daemon=True).start()
+                except Exception:
+                    pass
+            return result
+
+        helper.register_for_llm(name="share_context_with_agents",
+                               description="Share context information with other agents")(share_context_with_agents)
+        assistant.register_for_execution(name="share_context_with_agents")(share_context_with_agents)
+
+        def get_shared_context(context_key: Annotated[str, "Context identifier"]) -> str:
+            """Retrieve context information shared by other agents"""
+            retrieval_func = create_context_retrieval_function()
+            return retrieval_func(context_key)
+
+        helper.register_for_llm(name="get_shared_context",
+                               description="Retrieve context information shared by other agents")(get_shared_context)
+        assistant.register_for_execution(name="get_shared_context")(get_shared_context)
+
+        current_app.logger.info("Internal Agent Communication complete - agents can now delegate tasks and share context")
+
+    except Exception as e:
+        current_app.logger.warning(f"Internal Agent Communication error (non-critical): {e}")
+        # Continue without internal communication if it fails
+
+    # AP2 (Agent Protocol 2): Agentic Commerce - Payment workflows
+    try:
+        current_app.logger.info("Initializing AP2 (Agent Protocol 2) - Agentic Commerce...")
+
+        # Get AP2 payment tools for this agent
+        ap2_tools = get_ap2_tools_for_autogen('assistant')
+
+        # Register payment tools
+        for tool_def in ap2_tools:
+            tool_func = tool_def['function']
+            tool_name = tool_def['name']
+            tool_desc = tool_def['description']
+
+            # Register for LLM (helper agent suggests payment tools)
+            helper.register_for_llm(name=tool_name, description=tool_desc)(tool_func)
+
+            # Register for execution (assistant agent executes payment operations)
+            assistant.register_for_execution(name=tool_name)(tool_func)
+
+            current_app.logger.info(f"Registered AP2 payment tool: {tool_name}")
+
+        current_app.logger.info("AP2 Agentic Commerce integration complete - agents can now handle payment workflows")
+
+    except Exception as e:
+        current_app.logger.warning(f"AP2 Agentic Commerce error (non-critical): {e}")
+        # Continue without payment capabilities if AP2 fails
+
+    # Goal-aware Tier 2 tool loading (marketing, coding, etc.)
+    try:
+        from integrations.agent_engine.marketing_tools import register_marketing_tools
+        # Detect goal type from prompt_id prefix (e.g. 'marketing_xxx', 'coding_xxx')
+        if str(prompt_id).startswith('marketing'):
+            register_marketing_tools(helper, assistant, user_id)
+            current_app.logger.info("Marketing tools loaded (Tier 2) for reuse agent")
+        if str(prompt_id).startswith('ip_protection'):
+            from integrations.agent_engine.ip_protection_tools import register_ip_protection_tools
+            register_ip_protection_tools(helper, assistant, user_id)
+            current_app.logger.info("IP protection tools loaded (Tier 2) for reuse agent")
+    except Exception as e:
+        current_app.logger.debug(f"Goal-aware tool loading skipped: {e}")
+
     assistant.description = 'Designed to handle specific tasks by interacting directly with other agents or the user. It acts as the primary orchestrator for task management and ensures tasks are completed efficiently'
     user_proxy.description = 'Acts as a user, performing tasks assigned by the Assistant Agent. It simulates user actions and provides results or feedback as required.'
-    helper.description = 'this is a helper agent that calls tools, facilitates task completion & assists other agents it cal perform tools/function like [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory] calls and supporting backend processes. '
+    helper.description = 'this is a helper agent that calls tools, facilitates task completion & assists other agents it cal perform tools/function like [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, save_data_in_memory, search_long_term_memory and save_to_long_term_memory] calls and supporting backend processes. '
     multi_role_agent.description = 'Acts as an external agent with multi-functional capabilities. Note: This agent should never be directly invoked.'
     executor.description = 'A specialized agent responsible for executing code and handling response management. It ensures computational tasks are performed accurately and returns results effectively.'
     verify.description = 'this is a verify status agent. which will verify the status of current action.'
 
     time_agent.description = 'Designed to handle specific tasks by interacting directly with other agents or the user. It acts as the primary orchestrator for task management and ensures tasks are completed efficiently'
     time_user.description = 'Acts as a user, performing tasks assigned by the Assistant Agent. It simulates user actions and provides results or feedback as required.'
-    helper1.description = 'this is a helper agent that calls tools, facilitates task completion & assists other agents it cal perform tools/function like [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory] calls and supporting backend processes. '
+    helper1.description = 'this is a helper agent that calls tools, facilitates task completion & assists other agents it cal perform tools/function like [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, save_data_in_memory, search_long_term_memory and save_to_long_term_memory] calls and supporting backend processes. '
     executor1.description = 'A specialized agent responsible for executing code and handling response management. It ensures computational tasks are performed accurately and returns results effectively.'
 
     visual_agent.description = 'Designed to handle specific tasks by interacting directly with other agents or the user. It acts as the primary orchestrator for task management and ensures tasks are completed efficiently'
     visual_user.description = 'Acts as a user, performing tasks assigned by the Assistant Agent. It simulates user actions and provides results or feedback as required.'
-    helper2.description = 'this is a helper agent that calls tools, facilitates task completion & assists other agents it cal perform tools/function like [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata and save_data_in_memory] calls and supporting backend processes. '
+    helper2.description = 'this is a helper agent that calls tools, facilitates task completion & assists other agents it cal perform tools/function like [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, save_data_in_memory, search_long_term_memory and save_to_long_term_memory] calls and supporting backend processes. '
     executor2.description = 'A specialized agent responsible for executing code and handling response management. It ensures computational tasks are performed accurately and returns results effectively.'
 
     def state_transition(last_speaker, groupchat):
@@ -2414,7 +2951,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                                     "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
                         'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0},
                         'bottom_left': {'x': 0, 'y': 0}}}
-                client.publish(
+                publish_async(
                     f"com.hertzai.hevolve.chat.{user_id}", json.dumps(crossbar_message))
         except Exception as e:
             current_app.logger.error(f"Error publishing crossbar message: {e}")
@@ -2483,6 +3020,45 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     visual_agent_group['chat_instructor2'] = chat_instructor2
     visual_agent_group['group_chat_2'] = group_chat_2
     visual_agent_group['manager_2'] = manager_2
+
+    # Auto-ingest group_chat messages into SimpleMem
+    if simplemem_store is not None:
+        for gc in [group_chat, group_chat_1, group_chat_2]:
+            _original_append = gc.messages.append
+            def _make_hook(orig_append, store=simplemem_store):
+                def _simplemem_ingest_hook(msg):
+                    orig_append(msg)
+                    try:
+                        content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+                        speaker = msg.get("name", "Agent") if isinstance(msg, dict) else "Agent"
+                        if content and len(content.strip()) > 5:
+                            loop = get_or_create_event_loop()
+                            loop.run_until_complete(store.add(content, {
+                                "sender_name": speaker,
+                                "user_id": user_id,
+                                "prompt_id": prompt_id,
+                            }))
+                    except Exception:
+                        pass  # Non-blocking
+                return _simplemem_ingest_hook
+            gc.messages.append = _make_hook(_original_append)
+
+    # Auto-ingest group_chat messages into MemoryGraph (provenance tracking)
+    if memory_graph is not None:
+        for gc in [group_chat, group_chat_1, group_chat_2]:
+            _prev_append = gc.messages.append
+            def _make_graph_hook(prev_append, graph=memory_graph, session=user_prompt):
+                def _graph_ingest_hook(msg):
+                    prev_append(msg)
+                    try:
+                        content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+                        speaker = msg.get("name", "Agent") if isinstance(msg, dict) else "Agent"
+                        if content and len(content.strip()) > 5:
+                            graph.register_conversation(speaker, content, session)
+                    except Exception:
+                        pass  # Non-blocking
+                return _graph_ingest_hook
+            gc.messages.append = _make_graph_hook(_prev_append)
 
     return assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group
 
@@ -2702,13 +3278,12 @@ def create_schedule(prompt_id, user_id):
                     current_app.logger.info(f'Successfully created scheduler job {i["persona"]}')
 
         current_app.logger.info('Creating Visual scheduled tasks')
-        trigger = IntervalTrigger(seconds=int(10000))
+        trigger = IntervalTrigger(seconds=int(2))
         job_id = f"job_{int(time.time())}"
         scheduler.add_job(call_visual_task, trigger=trigger, id=job_id,
                           args=['get past 1 mins visual information', user_id, prompt_id])
         current_app.logger.info(f'Successfully created scheduler job')
         if 'visual_scheduled_tasks' in config and len(config['visual_scheduled_tasks']) > 0:
-            # current_app.logger.info('Creating Visual scheduled tasks')
             for i in config['visual_scheduled_tasks']:
                 if role and i['persona'].lower() == role.lower():
                     trigger = CronTrigger.from_crontab(i['cron_expression'])
@@ -2720,14 +3295,195 @@ def create_schedule(prompt_id, user_id):
         current_app.logger.error(f'Some Error in creating scheduled tasks error:{e}')
 
 
-recent_file_id = {}
-recipes = {}
-user_tasks = {}
-request_id_list = {}
-request_id_list_sent_intermediate = {}
+recent_file_id = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_recent_file_id')
+# NOTE: recipes TTLCache already defined at module top (line 166) — do NOT redefine here
+user_tasks = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_tasks')
+user_ledgers = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_ledgers', loader=load_user_ledger)
+user_delegation_bridges = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_delegation_bridges')
+request_id_list = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_request_id_list')
+request_id_list_sent_intermediate = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_request_id_list_sent_intermediate')
 
-time_actions = {}
-final_recipe = {}
+time_actions = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_time_actions')
+final_recipe = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_final_recipe')
+
+# Signals from autogen agents that a new agent creation is needed
+# Keyed by user_prompt (f'{user_id}_{prompt_id}'), set by create_new_agent tool
+creation_signals = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_creation_signals')
+
+
+# =============================================================================
+# SMART LEDGER INTEGRATION HELPERS (same as create_recipe.py)
+# =============================================================================
+
+def inject_ledger_awareness(message: str, user_prompt: str) -> str:
+    """
+    Inject ledger awareness context into an action message.
+
+    This gives the agent full visibility into:
+    - Previously executed tasks and their outcomes
+    - Currently executing tasks
+    - Next course of action
+
+    Args:
+        message: Original action message
+        user_prompt: User prompt identifier
+
+    Returns:
+        Message with ledger awareness injected
+    """
+    if user_prompt not in user_ledgers:
+        return message
+
+    ledger = user_ledgers[user_prompt]
+    try:
+        awareness_text = ledger.get_awareness_text()
+        # Inject awareness as context before the action
+        return f"{awareness_text}\n\nNOW EXECUTE:\n{message}"
+    except Exception as e:
+        current_app.logger.warning(f"Failed to inject ledger awareness: {e}")
+        return message
+
+
+def complete_action_and_route(user_prompt: str, action_id: int, outcome: str, result: any = None):
+    """
+    Complete an action in the ledger and determine next task.
+
+    Uses the smart routing to respect:
+    - Hierarchical relationships (parent/child)
+    - Prerequisites and dependencies
+    - Outcome-based conditional tasks
+    - Priority ordering
+
+    Args:
+        user_prompt: User prompt identifier
+        action_id: The action ID that completed
+        outcome: 'success' or 'failure'
+        result: Optional result data
+
+    Returns:
+        Next task to execute, or None
+    """
+    if user_prompt not in user_ledgers:
+        return None
+
+    ledger = user_ledgers[user_prompt]
+    task_id = f"action_{action_id}"
+
+    try:
+        next_task = ledger.complete_task_and_route(task_id, outcome, result)
+        if next_task:
+            current_app.logger.info(f"[Ledger Routing] Completed {task_id} -> Next: {next_task.task_id}: {next_task.description}")
+        else:
+            current_app.logger.info(f"[Ledger Routing] Completed {task_id} -> No next task available")
+        return next_task
+    except Exception as e:
+        current_app.logger.error(f"Error in complete_action_and_route: {e}")
+        return None
+
+
+def get_smart_next_task(user_prompt: str):
+    """
+    Get the next task using smart routing from the ledger.
+
+    This replaces simple get_ready_tasks with intelligent routing that considers:
+    - Task relationships and dependencies
+    - Outcome-based conditions
+    - Priority and execution mode
+
+    Args:
+        user_prompt: User prompt identifier
+
+    Returns:
+        Next executable Task, or None
+    """
+    if user_prompt not in user_ledgers:
+        return None
+
+    ledger = user_ledgers[user_prompt]
+    return ledger.get_next_executable_task()
+
+
+def detect_and_add_dynamic_tasks(user_prompt: str, json_response: dict, current_action_id: int, user_message: str = ""):
+    """
+    Detect dynamically discovered tasks from LLM response and add to ledger.
+
+    When the LLM identifies new tasks during execution, this function:
+    1. Detects task-like content in the response
+    2. Uses LLM classification to determine relationships
+    3. Adds tasks to the ledger with proper wiring
+
+    Args:
+        user_prompt: User prompt identifier
+        json_response: Parsed JSON response from LLM
+        current_action_id: Current action being executed
+        user_message: Latest user message for context
+
+    Returns:
+        List of created Task objects
+    """
+    if user_prompt not in user_ledgers:
+        return []
+
+    ledger = user_ledgers[user_prompt]
+    created_tasks = []
+
+    # Check for dynamic_tasks field in response
+    if 'dynamic_tasks' in json_response:
+        for task_desc in json_response['dynamic_tasks']:
+            context = {
+                'current_action_id': current_action_id,
+                'previous_outcome': None,
+                'user_message': user_message,
+                'discovered_by': 'llm_response'
+            }
+            try:
+                task = ledger.add_dynamic_task(task_desc, context)
+                if task:
+                    created_tasks.append(task)
+                    current_app.logger.info(f"[Dynamic Task] Added: {task.task_id}: {task_desc}")
+            except Exception as e:
+                current_app.logger.warning(f"Failed to add dynamic task: {e}")
+
+    # Check for follow_up_actions field
+    if 'follow_up_actions' in json_response:
+        for action in json_response['follow_up_actions']:
+            action_desc = action if isinstance(action, str) else action.get('description', str(action))
+            context = {
+                'current_action_id': current_action_id,
+                'previous_outcome': json_response.get('status', 'unknown'),
+                'user_message': user_message,
+                'discovered_by': 'follow_up'
+            }
+            try:
+                task = ledger.add_dynamic_task(action_desc, context)
+                if task:
+                    created_tasks.append(task)
+                    current_app.logger.info(f"[Follow-up Task] Added: {task.task_id}: {action_desc}")
+            except Exception as e:
+                current_app.logger.warning(f"Failed to add follow-up task: {e}")
+
+    return created_tasks
+
+
+def get_ledger_status_for_logging(user_prompt: str) -> str:
+    """
+    Get a compact ledger status string for logging.
+
+    Args:
+        user_prompt: User prompt identifier
+
+    Returns:
+        Status string like "Ledger: 5 tasks (2 done, 1 running, 2 pending)"
+    """
+    if user_prompt not in user_ledgers:
+        return "Ledger: not initialized"
+
+    ledger = user_ledgers[user_prompt]
+    try:
+        summary = ledger.get_execution_summary()
+        return f"Ledger: {summary['total']} tasks ({len(summary['completed'])} done, {len(summary['in_progress'])} running, {len(summary['pending'])} pending)"
+    except:
+        return "Ledger: status unavailable"
 
 
 def chat_agent(user_id, text, prompt_id, file_id, request_id):

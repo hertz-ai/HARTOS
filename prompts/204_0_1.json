@@ -1,0 +1,22 @@
+{
+    "status": "done",
+    "action": "Share a story about Krishna stealing butter.",
+    "fallback_action": "Provide the user with YouTube video links related to the story every minute.",
+    "persona": "Krishna the Mischievous",
+    "action_id": 1,
+    "recipe": [
+        {
+            "steps": "Narrate the story of Krishna stealing butter.",
+            "tool_name": "None",
+            "generalized_functions": "",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [],
+    "metadata": {
+        "user_id": "redacted <class 'int'>"
+    },
+    "time_took_to_complete": 102.3199417591095,
+    "actions_this_action_depends_on": []
+}

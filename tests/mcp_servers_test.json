@@ -1,0 +1,16 @@
+{
+  "servers": [
+    {
+      "name": "test_user_provider",
+      "url": "http://localhost:9000",
+      "api_key": null,
+      "enabled": true,
+      "description": "Test user provider MCP server"
+    }
+  ],
+  "settings": {
+    "auto_discover": true,
+    "connection_timeout": 5,
+    "execution_timeout": 30
+  }
+}

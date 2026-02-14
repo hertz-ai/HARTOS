@@ -1,6 +1,20 @@
+# Fix Windows encoding for non-ASCII characters (Telugu, emojis, etc.)
+import sys
+import io
+if sys.platform == 'win32':
+    # Force UTF-8 encoding for stdout/stderr to prevent crashes with non-ASCII characters
+    if sys.stdout is not None:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    if sys.stderr is not None:
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
 from bs4 import BeautifulSoup
 from enum import Enum
-from langchain import OpenAI, LLMChain, PromptTemplate
+
+# Use langchain-classic for pydantic v2 compatibility
+from langchain.llms import OpenAI
+from langchain.chains import LLMChain
+from langchain.prompts import PromptTemplate
 from langchain.agents import (
     ZeroShotAgent, Tool, AgentExecutor, ConversationalAgent,
     ConversationalChatAgent, LLMSingleActionAgent, AgentOutputParser,
@@ -14,71 +28,286 @@ from langchain.prompts import (
     SystemMessagePromptTemplate,
     HumanMessagePromptTemplate
 )
-from langchain.chains import LLMMathChain, OpenAPIEndpointChain
+from langchain.chains import LLMMathChain
 from langchain.chains.conversation.memory import ConversationSummaryMemory, ConversationBufferWindowMemory
-from langchain.chains.openai_functions.openapi import get_openapi_chain
+
+# ChatOpenAI - use langchain
 from langchain.chat_models import ChatOpenAI
-from langchain_groq import ChatGroq
-# from langchain.experimental.plan_and_execute import PlanAndExecute, load_agent_executor, load_chat_planner
-from langchain.llms import OpenAI, OpenAIChat
+
+# ChatGroq - optional import (version compatibility issues)
+try:
+    from langchain_groq import ChatGroq
+except (ImportError, ModuleNotFoundError):
+    ChatGroq = None
+
+# LLM base class
 from langchain.llms.base import LLM
-from langchain.memory import ConversationBufferMemory, ReadOnlySharedMemory, ZepMemory
-from langchain.requests import Requests
+from langchain.memory import ConversationBufferMemory, ReadOnlySharedMemory
 from langchain.schema import AgentAction, AgentFinish, OutputParserException, HumanMessage, AIMessage, SystemMessage
 from langchain.tools import OpenAPISpec, APIOperation, StructuredTool
-# from langchain.tools.python.tool import PythonREPLTool
 from langchain.utilities import GoogleSearchAPIWrapper
+try:
+    from langchain.requests import Requests
+except (ImportError, AttributeError):
+    # Requests might not be in langchain
+    Requests = None
 from flask import Flask, jsonify, request
 import json
 import os
 import re
+import secrets
 import logging
+import threading
+import atexit
 import requests
 import pytz
+from core.http_pool import pooled_get, pooled_post
 from datetime import datetime, timezone
 from typing import List, Union, Optional, Mapping, Any, Dict
-from langchain.agents.conversational_chat.output_parser import ConvoOutputParser
-import time
+
+# Conversational chat imports from langchain-classic
+try:
+    from langchain.agents.conversational_chat.output_parser import ConvoOutputParser
+    from langchain.agents.conversational_chat.prompt import FORMAT_INSTRUCTIONS
+    from langchain.output_parsers.json import parse_json_markdown
+except (ImportError, AttributeError) as e:
+    # These might not exist in langchain-classic
+    ConvoOutputParser = None
+    FORMAT_INSTRUCTIONS = None
+    parse_json_markdown = None
+
+# Tools imports - try langchain_community first
+try:
+    from langchain_community.tools import RequestsGetTool
+except ImportError:
+    try:
+        from langchain.tools.requests.tool import RequestsGetTool
+    except (ImportError, AttributeError):
+        RequestsGetTool = None
+
+try:
+    from langchain_community.utilities import TextRequestsWrapper
+except ImportError:
+    try:
+        from langchain.utilities.requests import TextRequestsWrapper
+    except (ImportError, AttributeError):
+        TextRequestsWrapper = None
+
 import tiktoken
 from pytz import timezone
 from datetime import datetime, timedelta
 from waitress import serve
 from logging.handlers import RotatingFileHandler
-from typing import Union
-from langchain.agents import AgentOutputParser
-from langchain.agents.conversational_chat.prompt import FORMAT_INSTRUCTIONS
-from langchain.output_parsers.json import parse_json_markdown
-from langchain.schema import AgentAction, AgentFinish, OutputParserException
-from langchain.tools.requests.tool import RequestsGetTool, TextRequestsWrapper
-from pydantic import BaseModel, Field, root_validator
+
+# Pydantic v2 imports (we have pydantic 2.12.5)
+try:
+    from pydantic import BaseModel, Field, field_validator as root_validator
+except ImportError:
+    from pydantic import BaseModel, Field, root_validator
 from threadlocal import thread_local_data
 import crossbarhttp
 from PIL import Image
 import numpy as np
-from langchain.retrievers.document_compressors import cohere_rerank
+# Cohere rerank - make optional to avoid pydantic v2 incompatibility with old langchain
+try:
+    from langchain_community.retrievers.document_compressors import cohere_rerank
+except (ImportError, ModuleNotFoundError):
+    cohere_rerank = None  # Not available
 import asyncio
 import aiohttp
-import sys
 import redis
 import pickle
 from threading import Thread
+from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
-import autogen
+try:
+    import autogen
+except ImportError:
+    autogen = None  # Optional dependency
 from typing import Dict, Tuple
 load_dotenv()
 
 #autogen requirements
 
-from create_recipe import recipe, time_based_execution as time_execution, visual_execution
-from reuse_recipe import chat_agent, crossbar_multiagent, time_based_execution, visual_based_execution
-from autobahn.asyncio.component import Component, run
+try:
+    from create_recipe import recipe, time_based_execution as time_execution, visual_execution
+    from reuse_recipe import chat_agent, crossbar_multiagent, time_based_execution, visual_based_execution
+except ImportError as e:
+    print(f"Could not import recipe modules: {e}")
+    recipe = None
+    time_execution = None
+    visual_execution = None
+    chat_agent = None
+    crossbar_multiagent = None
+    time_based_execution = None
+    visual_based_execution = None
+
+try:
+    from autobahn.asyncio.component import Component, run
+except ImportError:
+    Component = None
+    run = None
+
 import threading
-from helper import retrieve_json
+
+try:
+    from helper import retrieve_json
+except ImportError:
+    retrieve_json = None
+
+# Google A2A integration (from gpt4.1)
+try:
+    from integrations.google_a2a import initialize_a2a_server, get_a2a_server, register_all_agents
+except ImportError:
+    initialize_a2a_server = None
+    get_a2a_server = None
+    register_all_agents = None
 # os.environ['LANGCHAIN_TRACING_V2'] = 'true'
 # os.environ['LANGCHAIN_ENDPOINT'] = 'https://api.smith.langchain.com'
 # os.environ['LANGCHAIN_API_KEY'] = os.getenv("LANGCHAIN_API_KEY")
 # os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGCHAIN_PROJECT")
 groq_api_key = os.environ['GROQ_API_KEY']
+
+
+# ============================================================================
+# MemoryGraph — Framework-agnostic provenance-aware memory layer
+# ============================================================================
+_memory_graphs = {}  # Cache: "user_id_prompt_id" → MemoryGraph instance
+_memory_graph_lock = threading.Lock()
+
+
+def _get_or_create_graph(user_id, prompt_id=None):
+    """Get or create a MemoryGraph instance for a user/prompt session."""
+    try:
+        from integrations.channels.memory.memory_graph import MemoryGraph
+        session_key = f"{user_id}_{prompt_id}" if prompt_id else str(user_id)
+        with _memory_graph_lock:
+            if session_key not in _memory_graphs:
+                db_path = os.path.join(
+                    os.path.expanduser("~"), "Documents", "Nunba", "data", "memory_graph", session_key
+                )
+                _memory_graphs[session_key] = MemoryGraph(
+                    db_path=db_path,
+                    user_id=str(user_id),
+                )
+            return _memory_graphs[session_key]
+    except Exception as e:
+        logging.getLogger(__name__).debug(f"MemoryGraph init skipped: {e}")
+        return None
+
+
+def _record_lifecycle(status, user_id, prompt_id, details=''):
+    """Record agent lifecycle event in MemoryGraph (fire-and-forget, zero latency)."""
+    def _bg():
+        try:
+            graph = _get_or_create_graph(user_id, prompt_id)
+            if graph:
+                graph.register_lifecycle(
+                    event=status,
+                    agent_id=str(user_id),
+                    session_id=f"{user_id}_{prompt_id}",
+                    details=details,
+                )
+        except Exception:
+            pass
+    threading.Thread(target=_bg, daemon=True).start()
+
+
+# ============================================================================
+# Custom Qwen3-VL LangChain Wrapper
+# ============================================================================
+class ChatQwen3VL(LLM):
+    """
+    Custom LangChain LLM wrapper for local Qwen3-VL API server.
+
+    Compatible with LangChain's LLM interface while calling the local
+    crawl4ai server at http://localhost:8000/v1/chat/completions.
+
+    Features:
+    - OpenAI-compatible API interface
+    - Multimodal support (text + images)
+    - Zero API costs (local server)
+    - Drop-in replacement for ChatOpenAI
+    """
+
+    base_url: str = "http://localhost:8000/v1"
+    model_name: str = "Qwen3-VL-4B-Instruct"
+    temperature: float = 0.7
+    max_tokens: int = 1500
+
+    @property
+    def _llm_type(self) -> str:
+        return "qwen3-vl"
+
+    def _call(self, prompt: str, stop: list = None) -> str:
+        """
+        Call the Qwen3-VL API with the given prompt.
+
+        Args:
+            prompt: The input text prompt
+            stop: Optional stop sequences
+
+        Returns:
+            The generated response text
+        """
+        payload = {
+            "model": self.model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens
+        }
+
+        if stop:
+            payload["stop"] = stop
+
+        try:
+            response = pooled_post(
+                f"{self.base_url}/chat/completions",
+                json=payload,
+                timeout=60
+            )
+            response.raise_for_status()
+
+            data = response.json()
+            return data["choices"][0]["message"]["content"]
+
+        except Exception as e:
+            app.logger.error(f"[Qwen3-VL] Error calling API: {e}")
+            raise
+
+    @property
+    def _identifying_params(self) -> dict:
+        """Return identifying parameters."""
+        return {
+            "model_name": self.model_name,
+            "base_url": self.base_url,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens
+        }
+
+
+# Flag to switch between OpenAI and Qwen3-VL
+USE_QWEN3VL = True  # Set to False to use OpenAI instead
+
+def get_llm(model_name="gpt-3.5-turbo", temperature=0.7, max_tokens=1500):
+    """
+    Get LLM instance based on configuration.
+
+    Returns ChatQwen3VL if USE_QWEN3VL is True, otherwise ChatOpenAI.
+    """
+    if USE_QWEN3VL:
+        return ChatQwen3VL(
+            model_name="Qwen3-VL-2B-Instruct",
+            temperature=temperature,
+            max_tokens=max_tokens
+        )
+    else:
+        return ChatOpenAI(
+            model_name=model_name,
+            temperature=temperature,
+            max_tokens=max_tokens
+        )
+# ============================================================================
 
 
 class RequestLogRecord(logging.LogRecord):
@@ -93,7 +322,17 @@ class RequestLogRecord(logging.LogRecord):
 logging.setLogRecordFactory(RequestLogRecord)
 logging.basicConfig(level=logging.INFO)
 stream_handler = logging.StreamHandler(sys.stdout)
-handler = RotatingFileHandler('langchain.log', maxBytes=100000, backupCount=0)
+# In bundled/pip-installed mode (NUNBA_BUNDLED env set by main.py), redirect log
+# to the shared Nunba log directory; standalone keeps default behavior.
+
+if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
+    _nunba_log_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'logs')
+    os.makedirs(_nunba_log_dir, exist_ok=True)
+    _langchain_log_path = os.path.join(_nunba_log_dir, 'langchain.log')
+else:
+    _langchain_log_path = 'langchain.log'
+
+handler = RotatingFileHandler(_langchain_log_path, maxBytes=100000, backupCount=0)
 
 # Set the logging level for the file handler
 handler.setLevel(logging.ERROR)
@@ -106,18 +345,64 @@ handler.setFormatter(formatter)
 stream_handler.setFormatter(formatter)
 
 app = Flask(__name__)
+app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
 
 app.logger.addHandler(stream_handler)
 app.logger.addHandler(handler)
 app.logger.propagate = False
 
+# Security: Audit logging — redact API keys, JWTs, passwords from all logs
+try:
+    from security.audit_log import apply_sensitive_filter_to_all
+    apply_sensitive_filter_to_all()
+except Exception:
+    pass  # Degrade gracefully — logs will still work, just unredacted
+
 # Test logging
 app.logger.info('Logger initialized')
 
+# Security: Apply middleware (headers, CORS, CSRF, host validation, API auth)
+try:
+    from security.middleware import apply_security_middleware
+    apply_security_middleware(app)
+    app.logger.info("Security middleware applied")
+except Exception as e:
+    app.logger.warning(f"Security middleware not applied: {e}")
+
+# ============================================================================
+# HevolveSocial - Agent Social Network
+# ============================================================================
+try:
+    from integrations.social import social_bp, init_social
+    app.register_blueprint(social_bp)
+    init_social(app)
+    app.logger.info("HevolveSocial registered at /api/social")
+except Exception as e:
+    app.logger.warning(f"HevolveSocial init skipped (non-critical): {e}")
+
+# ============================================================================
+# Google A2A Protocol Initialization
+# ============================================================================
+# Initialize A2A server for cross-platform agent communication
+try:
+    app.logger.info("Initializing Google A2A Protocol server...")
+    a2a_server = initialize_a2a_server(app, base_url="http://localhost:6777")
+    app.logger.info("Google A2A Protocol server initialized successfully")
+
+    # Register all agents with A2A
+    register_all_agents()
+    app.logger.info("All agents registered with Google A2A Protocol")
+except Exception as e:
+    app.logger.warning(f"Google A2A Protocol initialization error (non-critical): {e}")
+
 # openAPI spec
-spec = OpenAPISpec.from_file(
-    "./openapi.yaml"
-)
+try:
+    spec = OpenAPISpec.from_file(
+        "./openapi.yaml"
+    )
+except Exception as e:
+    app.logger.warning(f"Could not load OpenAPI spec: {e}")
+    spec = None
 
 
 with open("config.json", 'r') as f:
@@ -134,8 +419,20 @@ os.environ["GOOGLE_CSE_ID"] = config['GOOGLE_CSE_ID']
 os.environ["GOOGLE_API_KEY"] = config['GOOGLE_API_KEY']
 os.environ["NEWS_API_KEY"] = config['NEWS_API_KEY']
 os.environ["SERPAPI_API_KEY"] = config['SERPAPI_API_KEY']
-ZEP_API_URL = config['ZEP_API_URL']
-ZEP_API_KEY = config['ZEP_API_KEY']
+
+# Mode-aware inference: pass LLM endpoint to crawl4ai for non-flat deployments
+_node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
+if _node_tier in ('regional', 'central'):
+    os.environ.setdefault('HEVOLVE_LLM_ENDPOINT_URL', config.get('OPENAI_API_BASE', ''))
+    os.environ.setdefault('HEVOLVE_LLM_API_KEY', config.get('OPENAI_API_KEY', ''))
+    os.environ.setdefault('HEVOLVE_LLM_MODEL_NAME', config.get('OPENAI_MODEL', 'gpt-4'))
+# Cloud fallback for adaptive routing (flat mode — offload when local CPU overloaded)
+if config.get('CLOUD_FALLBACK_URL'):
+    os.environ.setdefault('HEVOLVE_CLOUD_FALLBACK_URL', config['CLOUD_FALLBACK_URL'])
+    os.environ.setdefault('HEVOLVE_CLOUD_FALLBACK_KEY', config.get('CLOUD_FALLBACK_KEY', ''))
+    os.environ.setdefault('HEVOLVE_CLOUD_FALLBACK_MODEL', config.get('CLOUD_FALLBACK_MODEL', 'gpt-4'))
+# Zep removed — replaced by SimpleMem (local, zero-latency)
+# ZEP_API_URL / ZEP_API_KEY no longer needed
 GPT_API = config['GPT_API']
 STUDENT_API = config['STUDENT_API']
 ACTION_API = config['ACTION_API']
@@ -147,6 +444,180 @@ BOOKPARSING_API = config['BOOKPARSING_API']
 CRAWLAB_API = config['CRAWLAB_API']
 RAG_API = config['RAG_API']
 DB_URL = config['DB_URL']
+
+# ============================================================================
+# Embodied AI Learning Pipeline (crawl4ai — in-process, no extra port)
+# ============================================================================
+_learning_provider = None
+_hive_mind = None
+_trace_recorder = None
+
+
+def _is_bundled() -> bool:
+    """Detect whether we are pip-installed inside Nunba (flat mode).
+
+    When Nunba imports us via ``hevolve_backend_adapter``, that module is
+    already in ``sys.modules`` by the time our daemon thread runs.  In
+    standalone mode (``python langchain_gpt_api.py``, ``start_with_tracing.bat``)
+    it is absent.  No env-vars or mode flags required.
+    """
+    return 'hevolve_backend_adapter' in sys.modules
+
+
+def _has_cloud_api() -> bool:
+    """Return True if the user configured an external cloud / API endpoint."""
+    return bool(os.environ.get('HEVOLVE_LLM_ENDPOINT_URL', '').strip())
+
+
+def _wait_for_llm_server(url='http://localhost:8080', timeout=15):
+    """Wait for llama.cpp server, giving parent process time to start it.
+
+    In Nunba (flat mode), the desktop app starts llama.cpp in a background
+    thread.  This function polls the health endpoint so crawl4ai sees an
+    existing server and reuses it instead of auto-starting a second one.
+
+    In standalone mode nobody else starts the server, so after *timeout*
+    seconds we return False and let crawl4ai auto-start as usual.
+
+    Returns True if server found, False if timeout expired.
+    """
+    import urllib.request
+    import urllib.error
+    _logger = logging.getLogger(__name__)
+    for i in range(timeout):
+        try:
+            req = urllib.request.urlopen(f'{url}/health', timeout=2)
+            if req.status == 200:
+                _logger.info(
+                    f"[EmbodiedAI] llama.cpp server ready at {url} "
+                    f"(waited {i}s)")
+                return True
+        except (urllib.error.URLError, OSError):
+            pass
+        time.sleep(1)
+    _logger.info(
+        f"[EmbodiedAI] No server on {url} after {timeout}s "
+        "\u2014 crawl4ai will auto-start")
+    return False
+
+
+def _init_learning_pipeline():
+    """Initialize crawl4ai's learning pipeline in-process.
+
+    Instead of starting a separate server on port 8000,
+    we import and initialize the learning components directly.
+    world_model_bridge calls these functions without HTTP overhead.
+
+    Behaviour depends on context (auto-detected, no env vars needed):
+
+    **Bundled (Nunba, flat mode):**
+        Nunba owns the llama.cpp lifecycle.  We wait up to 30 s for
+        Nunba to start it.  If it appears we reuse it.  If it never
+        appears we skip the learning provider entirely — chat still
+        works, only RL-EF / hivemind is disabled.  We NEVER auto-start
+        a second server on the user's machine.
+
+    **Standalone (start_with_tracing.bat, ``python langchain_gpt_api.py``):**
+        Brief 5 s wait (in case user already has llama.cpp running).
+        If nothing responds, ``create_learning_llm_config()`` calls
+        crawl4ai which auto-starts its own server.  Default behaviour,
+        no mode config needed.
+
+    **Cloud API configured (``HEVOLVE_LLM_ENDPOINT_URL``):**
+        Skip local server wait entirely — crawl4ai's Priority 0 path
+        routes to the external endpoint.
+    """
+    global _learning_provider, _hive_mind, _trace_recorder
+
+    try:
+        from crawl4ai.embodied_ai.rl_ef import (
+            create_learning_llm_config,
+            register_learning_provider,
+        )
+        from crawl4ai.embodied_ai.monitoring.trace_recorder import get_trace_recorder
+        from crawl4ai.embodied_ai.learning.hive_mind import HiveMind, AgentCapability
+
+        _logger = logging.getLogger(__name__)
+        bundled = _is_bundled()
+        cloud = _has_cloud_api()
+        _logger.info(
+            f"[EmbodiedAI] Initializing learning pipeline "
+            f"(bundled={bundled}, cloud_api={cloud})...")
+
+        # ── Decide how to handle the local llama.cpp server ──
+        if cloud:
+            # Cloud endpoint configured — crawl4ai uses it directly,
+            # no need to wait for or start a local server.
+            _logger.info(
+                "[EmbodiedAI] Cloud API configured — skipping local server wait")
+        elif bundled:
+            # Nunba owns the llama.cpp lifecycle (port 8080).
+            # Wait generously, but NEVER auto-start a second server.
+            server_found = _wait_for_llm_server(timeout=30)
+            if not server_found:
+                _logger.warning(
+                    "[EmbodiedAI] Nunba's llama.cpp not ready after 30 s "
+                    "— learning disabled (chat still works)")
+                return
+        else:
+            # Standalone — brief courtesy wait then let crawl4ai auto-start.
+            _wait_for_llm_server(timeout=5)
+
+        # Trace recorder
+        recordings_dir = os.path.join(
+            os.path.expanduser('~'), '.crawl4ai', 'recordings')
+        os.makedirs(recordings_dir, exist_ok=True)
+        _trace_recorder = get_trace_recorder(recordings_dir)
+
+        # Learning provider (wraps llama.cpp on port 8080 or cloud endpoint)
+        _domain = 'general'
+        llm_config = create_learning_llm_config(
+            domain=_domain, fallback_api_key=None)
+        if '_provider' in llm_config:
+            _learning_provider = llm_config['_provider']
+            register_learning_provider(_domain, _learning_provider)
+            _logger.info(
+                "[EmbodiedAI] Learning provider ready (RL-EF + episodic memory)")
+        else:
+            _logger.warning(
+                "[EmbodiedAI] Learning provider init returned no provider")
+
+        # HiveMind
+        import uuid
+        instance_id = f"hevolve_{uuid.uuid4().hex[:8]}"
+        _hive_mind = HiveMind(max_agents=100)
+        _hive_mind.register_agent(
+            agent_id=instance_id,
+            agent_type='hevolve_orchestrator',
+            latent_dim=2048,
+            capabilities=[
+                AgentCapability.TEXT_GENERATION, AgentCapability.REASONING],
+        )
+        _logger.info(f"[EmbodiedAI] HiveMind registered as {instance_id}")
+
+    except ImportError as e:
+        logging.getLogger(__name__).warning(
+            f"[EmbodiedAI] crawl4ai not installed — learning disabled: {e}")
+    except Exception as e:
+        logging.getLogger(__name__).error(
+            f"[EmbodiedAI] Learning pipeline init failed: {e}")
+
+
+def get_learning_provider():
+    """Get the in-process learning provider (for world_model_bridge)."""
+    return _learning_provider
+
+
+def get_hive_mind():
+    """Get the in-process HiveMind instance (for world_model_bridge)."""
+    return _hive_mind
+
+
+# Boot learning pipeline in background (don't block Flask startup)
+threading.Thread(
+    target=_init_learning_pipeline, daemon=True,
+    name='embodied_ai_init').start()
+
 # task scheduling and logging
 
 
@@ -170,7 +641,11 @@ class TaskNames(Enum):
 
 
 # google search API
-search = GoogleSearchAPIWrapper(k=4)
+try:
+    search = GoogleSearchAPIWrapper(k=4)
+except Exception as e:
+    app.logger.warning(f"Could not initialize Google Search: {e}")
+    search = None
 
 # constants
 # llm = ChatOpenAI(model_name="gpt-3.5-turbo-16k")
@@ -180,7 +655,9 @@ search = GoogleSearchAPIWrapper(k=4)
 # initialized with a `ChatOpenAI` object using the model name "gpt-3.5-turbo".
 
 # llm_math = LLMMathChain(ChatOpenAI(model_name="gpt-3.5-turbo"))
-llm_math = LLMMathChain(llm=ChatOpenAI(model_name="gpt-3.5-turbo"))
+# Old: llm_math = LLMMathChain(llm=ChatOpenAI(model_name="gpt-3.5-turbo"))
+# New: Using get_llm() to automatically use Qwen3-VL or OpenAI based on USE_QWEN3VL flag
+llm_math = LLMMathChain(llm=get_llm(model_name="gpt-3.5-turbo"))
 # llm_math = LLMMathChain(llm= ChatGroq(groq_api_key=groq_api_key,
 #                model_name = "mixtral-8x7b-32768"))
 
@@ -189,10 +666,49 @@ llm_math = LLMMathChain(llm=ChatOpenAI(model_name="gpt-3.5-turbo"))
 
 # app.logger.info(llm.invoke("hi how are you?"))
 
-chain = get_openapi_chain(spec)
+if spec is not None:
+    try:
+        chain = get_openapi_chain(spec)
+    except Exception as e:
+        app.logger.warning(f"Could not create OpenAPI chain: {e}")
+        chain = None
+else:
+    chain = None
 
 
 client = crossbarhttp.Client('http://aws_rasa.hertzai.com:8088/publish')
+
+# Create thread pool executor for async Crossbar publishing
+crossbar_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='crossbar_publish')
+atexit.register(lambda: crossbar_executor.shutdown(wait=False))
+
+def publish_async(topic, message, timeout=2.0):
+    """
+    Publish to Crossbar in a background thread without blocking the main request.
+
+    Args:
+        topic: Crossbar topic to publish to
+        message: Message payload (dict)
+        timeout: Maximum time to wait for publish (default: 2.0 seconds)
+    """
+    def _publish():
+        import socket
+        try:
+            # Set socket timeout to prevent long waits
+            original_timeout = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(timeout)
+
+            client.publish(topic, message)
+            app.logger.debug(f"Successfully published to {topic}")
+        except Exception as e:
+            app.logger.error(f"Error publishing to {topic}: {e}")
+        finally:
+            # Restore original timeout
+            if original_timeout is not None:
+                socket.setdefaulttimeout(original_timeout)
+
+    # Submit to executor without waiting for result
+    crossbar_executor.submit(_publish)
 
 
 # create prompt
@@ -267,6 +783,36 @@ def create_prompt(tools):
     return prompt
 
 
+def _handle_create_agent_tool(input_text):
+    """Tool handler: LLM decided user wants to create an agent.
+
+    Called by the LangChain agent when it detects agent creation intent.
+    Sets thread-local flags that the /chat handler checks after get_ans() returns.
+    """
+    lower = input_text.lower()
+    autonomous = any(w in lower for w in [
+        'autonomous', 'automatic', 'automatically', 'do it for me',
+        'handle it', 'just create', 'create it yourself', 'auto',
+    ])
+    thread_local_data.set_creation_requested(description=input_text, autonomous=autonomous)
+    if autonomous:
+        return f"Agent creation initiated autonomously for: {input_text}. I will set up the agent creation workflow and handle all the details automatically."
+    return f"Agent creation initiated for: {input_text}. I will set up the agent creation workflow. Let me gather the required details."
+
+
+# Signals from reuse agent that suggest creating a new agent
+_RESPONSE_CREATION_SIGNALS = [
+    'need a new agent', 'create a new agent', 'requires a different agent',
+    'beyond my capabilities', 'specialized agent', 'need a specialized',
+    'suggest creating', 'recommend creating a new',
+]
+
+def _response_signals_creation(response_text):
+    """Check if the reuse agent's response suggests creating a new agent."""
+    lower = response_text.lower()
+    return any(signal in lower for signal in _RESPONSE_CREATION_SIGNALS)
+
+
 def get_tools(req_tool, is_first: bool = False):
 
     if is_first:
@@ -278,7 +824,11 @@ def get_tools(req_tool, is_first: bool = False):
                 func=llm_math.run,
                 description='Useful for when you need to answer questions about math.'
             ),
-            Tool(
+        ]
+
+        # Only add OpenAPI tool if chain is initialized
+        if chain is not None:
+            tool.append(Tool(
                 name="OpenAPI_Specification",
                 func=chain.run,
                 description="Use this feature only when the user's request specifically pertains to one of the following scenarios:\
@@ -287,15 +837,15 @@ def get_tools(req_tool, is_first: bool = False):
                 Query Available Books: When the user is inquiring about available books, this feature should be used to locate and provide information about the required texts.\
                 Any CRUD operation which is not a READ or anything related to curriculum should not use this tool,  It is vital to ensure that the intent precisely falls within one of the above  categories before engaging this functionality.\
                 Don't use this to create a custom curriculum for user",
+            ))
 
-
-            ),
+        tool += [
             Tool(
                 name="FULL_HISTORY",
                 func=parsing_string,
                 description=f"""Utilize this tool exclusively when the information required predates the current day & pertains to the ongoing user query or when there is a need to recall certain things we spoke earlier. The necessary input for this tool comprises a list of values separated by commas.
                 The list should encompass a user-generated query, designated by user input text, a commencement date denoted as start_date, and an end date labeled as end_date. The start_date denotes the initiation date for the user information search and should consistently adhere to the ISO 8601 format. Meanwhile, the end_date, also conforming to the ISO 8601 format, signifies the conclusion date for the search.
-                In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what zep can do, 2023-07-12T10:19:56.00000Z, 2023-07-13T10:19:56.732291Z'. If query has any form of date or time by user, then start end datetime can be exact rather than till today for more accurate results. Remove any references to time based words (e.g. yesterday, today, datetimes, last year) since the date range you provide already accounts for that. e.g. if user has asked what did we discuss the day before yesterday then the text argument should just be empty since it does not have any named entity for fuzzy search followed by start and end datetime.
+                In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what we discussed about the project, 2023-07-12T10:19:56.00000Z, 2023-07-13T10:19:56.732291Z'. If query has any form of date or time by user, then start end datetime can be exact rather than till today for more accurate results. Remove any references to time based words (e.g. yesterday, today, datetimes, last year) since the date range you provide already accounts for that. e.g. if user has asked what did we discuss the day before yesterday then the text argument should just be empty since it does not have any named entity for fuzzy search followed by start and end datetime.
                 Strive to apply this tool judiciously for scenarios in which retrospective user information is imperative. If Full history tool response is present, forget other histories, the inputs should be meticulously arranged to facilitate the extraction of accurate and pertinent data within the specified timeframe. Never use this tool for what is the response to my last comment?
                 Remember whatever user query is regarding search history understand what user is asking about and rephrase it properly then send to tool. Before framing the final tool response from this tool consult corresponding created_at date time to give more accurate response"""
             ),
@@ -331,9 +881,46 @@ def get_tools(req_tool, is_first: bool = False):
                 name="Visual_Context_Camera",
                 func=parse_visual_context,
                 description="To see user or if there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input to this tool function should be the user query/input. Only if last 16 seconds Visual Context information is present & is enough, then use that to craft a better creative, better, cohesive, correlated , summarised natural response, format this tool response togather with Previous 15 minutes Visual Context information if you are seeing the scene via videocall from the other end. If there are more than 1 person try to give an identity to each across frames to track the subjects through time by framing the tool input accordingly."
+            ),
+            Tool(
+                name="Create_Agent",
+                func=_handle_create_agent_tool,
+                description=(
+                    "Use this tool when the user wants to create, build, set up, train, or deploy "
+                    "a new AI agent, assistant, bot, or automated workflow. "
+                    "Input should be the description of what the agent should do. "
+                    "Do NOT use this tool if the user is just asking ABOUT agents or discussing agents in general. "
+                    "Only use when the user explicitly wants a NEW agent created. "
+                    "If the user also says words like 'automatically', 'autonomous', 'do it for me', "
+                    "'handle it', 'just create it', include those keywords in your input."
+                ),
             )
 
         ]
+
+        # Service Tools: Add HTTP microservice tools (Crawl4AI, AceStep, etc.)
+        try:
+            from integrations.service_tools import service_tool_registry
+            tool += service_tool_registry.get_langchain_tools()
+        except ImportError:
+            pass
+
+        # Memory Tools: Add MemoryGraph-backed tools (remember, recall, backtrace)
+        try:
+            user_id = thread_local_data.get_user_id()
+            prompt_id = thread_local_data.get_prompt_id()
+            graph = _get_or_create_graph(user_id, prompt_id)
+            if graph:
+                from integrations.channels.memory.agent_memory_tools import (
+                    create_memory_tools, create_langchain_tools,
+                )
+                session_id = f"{user_id}_{prompt_id}" if prompt_id else str(user_id)
+                mem_tools_dict = create_memory_tools(graph, str(user_id), session_id)
+                lc_mem_tools = create_langchain_tools(mem_tools_dict)
+                tool += lc_mem_tools
+        except Exception:
+            pass  # Non-blocking — memory tools are optional
+
         tools += tool
         return tools
 
@@ -351,7 +938,7 @@ def get_tools(req_tool, is_first: bool = False):
                 Don't use this to create a custom curriculum for user''',
             'FULL_HISTORY': '''Utilize this tool exclusively when the information required predates the current day & pertains to the ongoing user query or when there is a need to recall certain things we spoke earlier. The necessary input for this tool comprises a list of values separated by commas.
                 The list should encompass a user-generated query, designated by user input text, a commencement date denoted as start_date, and an end date labeled as end_date. The start_date denotes the initiation date for the user information search and should consistently adhere to the ISO 8601 format. Meanwhile, the end_date, also conforming to the ISO 8601 format, signifies the conclusion date for the search.
-                In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what zep can do, 2023-07-12T10:19:56.00000Z, 2023-07-13T10:19:56.732291Z'. If query has any form of date or time by user, then start end datetime can be exact rather than till today for more accurate results. Remove any references to time based words (e.g. yesterday, today, datetimes, last year) since the date range you provide already accounts for that. e.g. if user has asked what did we discuss the day before yesterday then the text argument should just be empty since it does not have any named entity for fuzzy search followed by start and end datetime.
+                In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what we discussed about the project, 2023-07-12T10:19:56.00000Z, 2023-07-13T10:19:56.732291Z'. If query has any form of date or time by user, then start end datetime can be exact rather than till today for more accurate results. Remove any references to time based words (e.g. yesterday, today, datetimes, last year) since the date range you provide already accounts for that. e.g. if user has asked what did we discuss the day before yesterday then the text argument should just be empty since it does not have any named entity for fuzzy search followed by start and end datetime.
                 Strive to apply this tool judiciously for scenarios in which retrospective user information is imperative. If Full history tool response is present, forget other histories, the inputs should be meticulously arranged to facilitate the extraction of accurate and pertinent data within the specified timeframe. Never use this tool for what is the response to my last comment?
                 Remember whatever user query is regarding search history understand what user is asking about and rephrase it properly then send to tool. Before framing the final tool response from this tool consult corresponding created_at date time to give more accurate response''',
             'Text to image': '''Based on user query generate visual representation of text. Extract prompt from user query and use it as input for function''',
@@ -363,7 +950,6 @@ def get_tools(req_tool, is_first: bool = False):
         tools_func = {
             'google_search': top5_results,
             'Calculator': llm_math.run,
-            'OpenAPI_Specificationd': chain.run,
             'FULL_HISTORY': parsing_string,
             'Text to image': parse_text_to_image,
             'Image_Inference_Tool': parse_image_to_text,
@@ -371,6 +957,10 @@ def get_tools(req_tool, is_first: bool = False):
             'User_details_tool': parse_user_id,
             'Visual_Context_Camera': parse_visual_context
         }
+
+        # Only add OpenAPI_Specification to tools_func if chain is initialized
+        if chain is not None:
+            tools_func['OpenAPI_Specification'] = chain.run
         if req_tool == "google_search":
             req_tool = "Google Search Snippets"
         if req_tool is not None and req_tool in tools_dict.values():
@@ -399,11 +989,17 @@ def get_tools(req_tool, is_first: bool = False):
                 func=llm_math.run,
                 description='Useful for when you need to answer questions about math.'
             ),
-            Tool(
+        ]
+
+        # Only add OpenAPI tool if chain is initialized
+        if chain is not None:
+            tool.append(Tool(
                 name="OpenAPI_Specification",
                 func=chain.run,
                 description="Use the specialized feature for image generation, student information retrieval, and querying available books, while avoiding its use for non-READ CRUD operations or custom curriculum creation.",
-            ),
+            ))
+
+        tool += [
             Tool(
                 name="FULL_HISTORY",
                 func=parsing_string,
@@ -438,6 +1034,19 @@ def get_tools(req_tool, is_first: bool = False):
                 name="Visual_Context_Camera",
                 func=parse_visual_context,
                 description="This tool captures the user's visual context during a video call, providing real-time captions. Use it for visual question answering, scene understanding, recognizing objects, activities, & monitoring the user. Input will be the user's input/query. If the last 16 seconds of visual context are available and sufficient, it crafts a creative, cohesive response. If not, inform the user of the glitch accessing the current camera feed and guess using the Last_5_Minutes_Visual_Context. Ensure responses are natural, avoiding lists of captions, and format them as if you are seeing the user scene via video call. Analyze the current tool response and previous visual context captions to recognize user activities and infer actions from multiple frames. If the user requests continuous narration without active input, adapt the response to include past, present, and future tenses for dynamic and contextually aware commentary."
+            ),
+            Tool(
+                name="Create_Agent",
+                func=_handle_create_agent_tool,
+                description=(
+                    "Use this tool when the user wants to create, build, set up, train, or deploy "
+                    "a new AI agent, assistant, bot, or automated workflow. "
+                    "Input should be the description of what the agent should do. "
+                    "Do NOT use this tool if the user is just asking ABOUT agents or discussing agents in general. "
+                    "Only use when the user explicitly wants a NEW agent created. "
+                    "If the user also says words like 'automatically', 'autonomous', 'do it for me', "
+                    "'handle it', 'just create it', include those keywords in your input."
+                ),
             )
 
         ]
@@ -547,7 +1156,7 @@ class CustomGPT(LLM):
             #     # app.logger.info(f"the prompt we are sending is {prompt}")
 
             #     start = time.time()
-            #     response = requests.post(
+            #     response = pooled_post(
             #         GPT_API,
             #         json={
 
@@ -570,13 +1179,13 @@ class CustomGPT(LLM):
                 if self.casual_conv:
                     app.logger.info(f"casual conv!")
                     start = time.time()
-                    response = requests.post(
+                    response = pooled_post(
                         GPT_API,
                         json={
-                            "model": "gpt-4.1-mini",
-                            "data": [{"role": "user", "content": prompt}],
-                            "max_token": 1000,
-                            "request_id": str(thread_local_data.get_request_id())
+                            "model": "llama",
+                            "messages": [{"role": "user", "content": prompt}],
+                            "max_tokens": 200,  # Reduced from 1000 for faster responses
+                            "temperature": 0.7
                         })
                     app.logger.info(
                         f"gpt 3.5 response format is {response.json()}")
@@ -589,13 +1198,13 @@ class CustomGPT(LLM):
                 else:
                     app.logger.info("Non casual conv")
                     start = time.time()
-                    response = requests.post(
+                    response = pooled_post(
                         GPT_API,
                         json={
-                            "model": "gpt-4.1-mini",
-                            "data": [{"role": "user", "content": prompt}],
-                            "max_token": 1000,
-                            "request_id": str(thread_local_data.get_request_id())
+                            "model": "llama",
+                            "messages": [{"role": "user", "content": prompt}],
+                            "max_tokens": 200,  # Reduced from 1000 for faster responses
+                            "temperature": 0.7
                         })
                     app.logger.info(
                         f"gpt 3.5 response format is {response.json()}")
@@ -634,13 +1243,12 @@ class CustomGPT(LLM):
             except Exception as e:
                 app.logger.info(f"In except the exception is {e}")
                 start = time.time()
-                response = requests.post(
+                response = pooled_post(
                     GPT_API,
                     json={
-                        "model": "gpt-4.1-mini",
-                        "data": [{"role": "user", "content": prompt}],
-                        "max_token": 1000,
-                        "request_id": str(thread_local_data.get_request_id())
+                        "model": "llama",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": 1000
                     })
                 app.logger.info(
                     f"gpt 3.5 response format is {response.json()}")
@@ -657,13 +1265,12 @@ class CustomGPT(LLM):
                         f"the casual conv line 519 casual conv {self.casual_conv} type of casual conv {type(self.casual_conv)}")
                     start = time.time()
 
-                    response = requests.post(
+                    response = pooled_post(
                         GPT_API,
                         json={
-                            "model": "gpt-4.1-mini",
-                            "data": [{"role": "user", "content": prompt}],
-                            "max_token": 1000,
-                            "request_id": str(thread_local_data.get_request_id())
+                            "model": "llama",
+                            "messages": [{"role": "user", "content": prompt}],
+                            "max_tokens": 1000
                         }
                     )
                     app.logger.info(
@@ -677,13 +1284,12 @@ class CustomGPT(LLM):
                     try:
                         app.logger.info("non casual conv")
                         start = time.time()
-                        response = requests.post(
+                        response = pooled_post(
                             GPT_API,
                             json={
-                                "model": "gpt-4.1-mini",
-                                "data": [{"role": "user", "content": prompt}],
-                                "max_token": 1000,
-                                "request_id": str(thread_local_data.get_request_id())
+                                "model": "llama",
+                                "messages": [{"role": "user", "content": prompt}],
+                                "max_tokens": 1000
                             }
                         )
                         app.logger.info(
@@ -714,13 +1320,12 @@ class CustomGPT(LLM):
                 app.logger.info(f"In except the exception is {e}")
                 start = time.time()
 
-                response = requests.post(
+                response = pooled_post(
                     GPT_API,
                     json={
-                        "model": "gpt-4.1-mini",
-                        "data": [{"role": "user", "content": prompt}],
-                        "max_token": 1000,
-                        "request_id": str(thread_local_data.get_request_id())
+                        "model": "llama",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": 1000
                     }
                 )
                 app.logger.info(f"gpt 4 response format is {response.json()}")
@@ -768,7 +1373,8 @@ class CustomGPT(LLM):
             # return response_from_groq.content.replace('\n', ' ').replace('\t', '')
         if checker == 1:
             try:
-                text = str(response.json()["text"])
+                # Extract text from OpenAI-compatible response format
+                text = str(response.json()["choices"][0]["message"]["content"])
                 try:
                     text = text.strip('`').replace('json\n', '').strip()
                 except:
@@ -789,10 +1395,11 @@ class CustomGPT(LLM):
             end_time = time.time()
             elapsed_time = end_time - start_time
             app.logger.info(f"time taken for this call is {elapsed_time}")
+            response_text = response.json()["choices"][0]["message"]["content"]
             num_tokens = len(encoding.encode(
-                response.json()["text"].replace('\n', ' ').replace('\t', '')))
+                response_text.replace('\n', ' ').replace('\t', '')))
             thread_local_data.update_res_token_count(num_tokens)
-            return response.json()["text"].replace('\n', ' ').replace('\t', '')
+            return response_text.replace('\n', ' ').replace('\t', '')
 
     @property
     def _identifying_params(self) -> Mapping[str, Any]:
@@ -820,9 +1427,34 @@ class CustomAgentExecutor(AgentExecutor):
         if self.memory is not None:
             app.logger.info(
                 f"memory object is not none and metadata is {metadata}")
-            self.memory.save_context(inputs, outputs, metadata)
-        app.logger.info(
-            f"After: memory object is not none and metadata is {metadata}")
+            try:
+                self.memory.save_context(inputs, outputs, metadata)
+                app.logger.info(
+                    f"After: memory saved successfully with metadata {metadata}")
+            except Exception as e:
+                app.logger.error(f"Failed to save memory: {e}")
+                # Continue without crashing - memory save is not critical
+
+            # Register conversation turn in MemoryGraph (fire-and-forget, no latency)
+            try:
+                user_id = thread_local_data.get_user_id()
+                graph = _get_or_create_graph(user_id, prom_id)
+                if graph:
+                    user_input = inputs.get('input', '')
+                    ai_output = outputs.get('output', '')
+                    session_key = f"{user_id}_{prom_id}" if prom_id else str(user_id)
+                    def _bg_register(g=graph, ui=user_input, ao=ai_output, sk=session_key):
+                        try:
+                            g.register_conversation('user', ui, sk)
+                            g.register_conversation('langchain', ao, sk)
+                        except Exception:
+                            pass
+                    threading.Thread(target=_bg_register, daemon=True).start()
+            except Exception:
+                pass  # Non-blocking
+        else:
+            app.logger.info(
+                f"Memory object is None, skipping save")
         if return_only_outputs:
             return outputs
         else:
@@ -857,20 +1489,12 @@ class CustomAgentExecutor(AgentExecutor):
                 )
             inputs = {list(_input_keys)[0]: inputs}
         if self.memory is not None:
-
-            external_context = self.memory.load_memory_variables(inputs)
-
-            inputs = dict(inputs, **external_context)
-            filtered_messages = []
-            for msg in inputs['chat_history']:
-                try:
-                    if msg.additional_kwargs['metadata']['prompt_id'] == thread_local_data.get_prompt_id():
-                        # If it does, append the message content to the filtered_messages list
-                        filtered_messages.append(msg)
-                except:
-                    pass
-
-            inputs['chat_history'] = filtered_messages[-8:]
+            try:
+                external_context = self.memory.load_memory_variables(inputs)
+                inputs = dict(inputs, **external_context)
+            except Exception as e:
+                app.logger.warning(f"Could not load memory: {e}")
+                inputs['chat_history'] = []
 
             # time.sleep(4)
         self._validate_inputs(inputs)
@@ -880,24 +1504,20 @@ class CustomAgentExecutor(AgentExecutor):
 # helper functions
 def get_memory(user_id: int):
     '''
-        Get memory object from zep
+        Get memory object — SimpleMem-backed (local, zero-latency reads)
     '''
-    session_id = "user_"+str(user_id)
-    memory = ZepMemory(
-        session_id=session_id,
-        url=ZEP_API_URL,
-        memory_key="chat_history",
-        api_key=ZEP_API_KEY,
-        return_messages=True,
-        input_key="input"
-    )
-    return memory
+    from integrations.channels.memory.simplemem_langchain import SimpleMemChatMemory
+    return SimpleMemChatMemory.load_or_create(user_id)
 
 
 def get_action_user_details(user_id):
     '''
         This function help to extract action that user have perfomed till time
     '''
+    # Initialize default values
+    user_details = "No user details available."
+    actions = "user has not performed any actions yet."
+
     unwanted_actions = ['Topic Cofirmation', 'Langchain', 'Assessment Ended', 'Casual Conversation', 'Topic confirmation',
                         'Topic not found', 'Topic Confirmation', 'Topic Listing', 'Probe', 'Question Answering', 'Fallback']
     action_url = f"{ACTION_API}?user_id={user_id}"
@@ -910,20 +1530,30 @@ def get_action_user_details(user_id):
     payload = {}
     headers = {}
 
-    response = requests.request(
-        "GET", action_url, headers=headers, data=payload)
+    try:
+        response = requests.request(
+            "GET", action_url, headers=headers, data=payload, timeout=5.0)
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+        app.logger.error(f"Failed to get actions from {action_url}: {e}")
+        post_dict = {'user_id': user_id, 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.GET_ACTION_USER_DETAILS.value, 'uid': thread_local_data.get_request_id(
+        ), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Connection timeout/error at get action api: {e}'}
+        publish_async('com.hertzai.longrunning.log', post_dict)
+        # Continue with defaults instead of crashing
+        response = None
 
-    if response.status_code == 200:
+    if response and response.status_code == 200:
 
         data = response.json()
 
         # Filter out unwanted actions
         filtered_data = [obj for obj in data if obj["action"]
                          not in unwanted_actions and obj["zeroshot_label"]
-                         not in ['Video Reasoning']]
+                         not in ['Video Reasoning', 'Screen Reasoning']]
 
         filtered_data_video = [
             obj for obj in data if obj["zeroshot_label"] == 'Video Reasoning']
+        filtered_data_screen = [
+            obj for obj in data if obj["zeroshot_label"] == 'Screen Reasoning']
         # Dictionary to store the first and last occurrence dates for each action
         action_occurrences = {}
 
@@ -974,6 +1604,25 @@ def get_action_user_details(user_id):
             action_texts.append(
                 'If a person is identified in Visual_Context section that\'s most probably the user (me) & most likely not taking any selfie.')
 
+        # Process screen context data (shorter window — 2 minutes)
+        screen_context_texts = []
+        for obj in filtered_data_screen:
+            action = obj["action"]
+            date = parse_date(obj["created_date"])
+            now = datetime.now()
+            # Screen context goes stale faster — 2 minute window
+            if (now - date) > timedelta(minutes=2):
+                continue
+            screen_text = f"{action} on {date.astimezone(india_tz).strftime('%Y-%m-%dT%H:%M:%S')}"
+            screen_context_texts.append(screen_text)
+
+        if screen_context_texts:
+            action_texts.append('<Last_2_Minutes_Screen_Context_Start>')
+            action_texts.extend(screen_context_texts)
+            action_texts.append('<Last_2_Minutes_Screen_Context_End>')
+            action_texts.append(
+                'Screen_Context shows what is currently displayed on the user\'s computer screen.')
+
         if len(action_texts) == 0:
             action_texts = ['user has not performed any actions yet.']
 
@@ -990,11 +1639,7 @@ def get_action_user_details(user_id):
     else:
         post_dict = {'user_id': user_id, 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.GET_ACTION_USER_DETAILS.value, 'uid': thread_local_data.get_request_id(
         ), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': 'Exception happend at get action api end'}
-        try:
-            client.publish('com.hertzai.longrunning.log', post_dict)
-        except Exception as e:
-            logging.error(
-                "Error while publish at com.hertzai.longrunning.log topic")
+        publish_async('com.hertzai.longrunning.log', post_dict)
 
     url = STUDENT_API
     payload = json.dumps({
@@ -1003,7 +1648,16 @@ def get_action_user_details(user_id):
     headers = {
         'Content-Type': 'application/json'
     }
-    response = requests.request("POST", url, headers=headers, data=payload)
+
+    try:
+        response = requests.request("POST", url, headers=headers, data=payload, timeout=5.0)
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+        app.logger.error(f"Failed to get user details from {url}: {e}")
+        post_dict = {'user_id': user_id, 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.GET_ACTION_USER_DETAILS.value, 'uid': thread_local_data.get_request_id(
+        ), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Connection timeout/error at get user detail api: {e}'}
+        publish_async('com.hertzai.longrunning.log', post_dict)
+        return user_details, actions  # Return defaults
+
     if response.status_code == 200:
         user_data = response.json()
 
@@ -1013,110 +1667,38 @@ def get_action_user_details(user_id):
     else:
         post_dict = {'user_id': user_id, 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.GET_ACTION_USER_DETAILS.value, 'uid': thread_local_data.get_request_id(
         ), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': 'Exception happend at get user detail api end'}
-        try:
-            client.publish('com.hertzai.longrunning.log', post_dict)
-        except Exception as e:
-            logging.error(
-                "Error while publish at com.hertzai.longrunning.log topic")
+        publish_async('com.hertzai.longrunning.log', post_dict)
     return user_details, actions
 
 
 def get_time_based_history(prompt: str, session_id: str, start_date: str, end_date: str):
     '''
-        This function help to extract messages till specified time
+        Semantic search through conversation history using SimpleMem.
         inputs:
             prompt: text from user from which we need to extract similar messages
             session_id: user_{user_id}
-            start_date: time of search start
-            end_date: time till search
+            start_date: time of search start (kept for API compat, not used by SimpleMem)
+            end_date: time till search (kept for API compat, not used by SimpleMem)
     '''
-
     start_time = time.time()
-    memory = ZepMemory(
-        session_id=session_id,
-        url=ZEP_API_URL,
-        api_key=ZEP_API_KEY,
-        memory_key="chat_history",
-    )
 
     try:
+        user_id = int(session_id.replace("user_", ""))
+        memory = get_memory(user_id=user_id)
+        results = memory.semantic_search(prompt)
 
-        metadata = {
-            "start_date": start_date,
-            "end_date":  end_date
-        }
+        if results:
+            serialized = [{'message': {'content': r.get('content', ''), 'role': 'assistant'}} for r in results]
+            final_res = {'res_in_filter': serialized}
+        else:
+            final_res = {'res_in_filter': []}
 
-        try:
-            messages = memory.chat_memory.search(prompt, metadata=metadata)
-            app.logger.info(f'GOT THE messages from search {messages}')
-        except Exception as e:
-            app.logger.error(
-                    f"Error while data search in zep response: {e}")
-            post_dict = {'user_id': '', 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.GET_TIME_BASED_HISTORY.value, 'uid': thread_local_data.get_request_id(
-            ), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': 'Exception happend at zep api end memory object found none'}
-            try:
-                client.publish('com.hertzai.longrunning.log', post_dict)
-            except Exception as e:
-                app.logger.error(
-                    "Error while publish at com.hertzai.longrunning.log topic")
-        try:
-            extracted_metadata = [message.message['metadata']
-                                  for message in messages]
-            list_req_ids = [data.get('request_Id', None)
-                            for data in extracted_metadata]
-            app.logger.info(f'GOT THE EXTRACTED METADATA AS {extracted_metadata}')
-            thread_local_data.set_reqid_list(list_req_ids)
-        except Exception as e:
-            app.logger.error(f"Error while getting req ids {e}")
-
-        # messages = [message.dict() for message in messages]
-        serialized_results = []
-        for result in messages:
-            serialized_result = result.dict(exclude_unset=True)
-            # Process the 'message' field to include only specific subfields
-            if 'message' in serialized_result and isinstance(serialized_result['message'], dict):
-                message = serialized_result['message']
-                filtered_message = {
-                    'content': message.get('content'),
-                    'role': message.get('role'),
-                    'created_at': message.get('created_at'),
-                    'request_id': message.get('metadata', {}).get('request_id') if 'metadata' in message else None
-                }
-                # Replace the original message with the filtered message
-                serialized_result['message'] = filtered_message
-            serialized_results.append(serialized_result)
-        messages = serialized_results
-        final_res = {'res_in_filter': messages}
-        app.logger.info(f"final-->{final_res}")
-        end_time = time.time()
-        elapsed_time = end_time - start_time
+        elapsed = time.time() - start_time
+        app.logger.info(f"SimpleMem search took {elapsed:.3f}s, {len(results)} results")
         return json.dumps(final_res)
     except Exception as e:
-        app.logger.info(f"Exception {e}")
-        try:
-            messages = memory.chat_memory.search(prompt)
-        except:
-            post_dict = {'user_id': '', 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.GET_TIME_BASED_HISTORY.value, 'uid': thread_local_data.get_request_id(
-            ), 'task_id': f"{TaskNames.GET_ACTION_USER_DETAILS.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': 'Exception happend at zep api end memory object found none'}
-            try:
-                client.publish('com.hertzai.longrunning.log', post_dict)
-            except Exception as e:
-                logging.error(
-                    "Error while publish at com.hertzai.longrunning.log topic")
-
-        # app.logger.info(f"final messages in except-->{messages}")
-        try:
-            extracted_metadata = [message.message['metadata']
-                                  for message in messages]
-            list_req_ids = [data.get('request_Id', None)
-                            for data in extracted_metadata]
-            thread_local_data.set_reqid_list(list_req_ids)
-        except Exception as e:
-            app.logger.info(f"Error while getting req ids {e}")
-        end_time = time.time()
-        elapsed_time = end_time - start_time
-        app.logger.info("time taken for zep is {elapsed_time}")
-        return json.dumps({'res': [message.message['content'] for message in messages]})
+        app.logger.warning(f"SimpleMem search failed: {e}")
+        return json.dumps({'res': []})
 
 
 def parsing_string(string):
@@ -1151,11 +1733,7 @@ def parse_character_animation(string):
     try:
         post_dict = {'user_id': '', 'task_type': 'async', 'status': TaskStatus.EXECUTING.value, 'task_name': TaskNames.ANIMATE_CHARACTER.value, 'uid': thread_local_data.get_request_id(
         ), 'task_id': f"{TaskNames.ANIMATE_CHARACTER.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id()}
-        try:
-            client.publish('com.hertzai.longrunning.log', post_dict)
-        except Exception as e:
-            logging.error(
-                "Error while publish at com.hertzai.longrunning.log topic")
+        publish_async('com.hertzai.longrunning.log', post_dict)
         prompt = string
         student_id_url = STUDENT_API
 
@@ -1182,7 +1760,7 @@ def parse_character_animation(string):
         image_name = response.json()["image_name"]
 
         image_url = response.json()["image_url"]
-        image_response = requests.get(image_url)
+        image_response = pooled_get(image_url)
         image_content = image_response.content
 
         image_name = image_name.replace("vtoonify_", "", 1)
@@ -1196,29 +1774,21 @@ def parse_character_animation(string):
             ('image', ('image.jpeg', image_content, 'image/jpeg'))
         ]
         url = "http://20.197.30.74:8000/generate_image/"
-        response = requests.post(url, headers=headers,
+        response = pooled_post(url, headers=headers,
                                  data=payload, files=files)
         if response.status_code == 200:
             return response.json()["url"]
         else:
             post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.ANIMATE_CHARACTER.value, 'uid': thread_local_data.get_request_id(
             ), 'task_id': f"{TaskNames.ANIMATE_CHARACTER.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at dreamooth api end for re {thread_local_data.get_request_id()}'}
-            try:
-                client.publish('com.hertzai.longrunning.log', post_dict)
-            except Exception as e:
-                logging.error(
-                    "Error while publish at com.hertzai.longrunning.log topic")
+            publish_async('com.hertzai.longrunning.log', post_dict)
 
     except Exception as e:
         # logging.info(f"exception {e}")
         time.sleep(30)
         post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.TIMEOUT.value, 'task_name': TaskNames.ANIMATE_CHARACTER.value, 'uid': thread_local_data.get_request_id(
         ), 'task_id': f"{TaskNames.ANIMATE_CHARACTER.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at dreamooth api end for req_id {thread_local_data.get_request_id()} timed out'}
-        try:
-            client.publish('com.hertzai.longrunning.log', post_dict)
-        except Exception as e:
-            logging.error(
-                "Error while publish at com.hertzai.longrunning.log topic")
+        publish_async('com.hertzai.longrunning.log', post_dict)
         return "something went wrong"
 
 
@@ -1230,11 +1800,7 @@ def parse_text_to_image(inp):
 
         post_dict = {'user_id': '', 'task_type': 'async', 'status': TaskStatus.EXECUTING.value, 'task_name': TaskNames.STABLE_DIFF.value, 'uid': thread_local_data.get_request_id(
         ), 'task_id': f"{TaskNames.STABLE_DIFF.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id()}
-        try:
-            client.publish('com.hertzai.longrunning.log', post_dict)
-        except Exception as e:
-            logging.error(
-                "Error while publish at com.hertzai.longrunning.log topic")
+        publish_async('com.hertzai.longrunning.log', post_dict)
 
         url = f'{STABLE_DIFF_API}?prompt={inp}'
         payload = {}
@@ -1247,19 +1813,11 @@ def parse_text_to_image(inp):
         else:
             post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.STABLE_DIFF.value, 'uid': thread_local_data.get_request_id(
             ), 'task_id': f"{TaskNames.STABLE_DIFF.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at stable diff for req_id: {thread_local_data.get_request_id()}'}
-            try:
-                client.publish('com.hertzai.longrunning.log', post_dict)
-            except Exception as e:
-                logging.error(
-                    "Error while publish at com.hertzai.longrunning.log topic")
+            publish_async('com.hertzai.longrunning.log', post_dict)
     except Exception as e:
         post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.TIMEOUT.value, 'task_name': TaskNames.ANIMATE_CHARACTER.value, 'uid': thread_local_data.get_request_id(
         ), 'task_id': f"{TaskNames.ANIMATE_CHARACTER.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at stable diff for req_id: {thread_local_data.get_request_id()} timed out'}
-        try:
-            client.publish('com.hertzai.longrunning.log', post_dict)
-        except Exception as e:
-            logging.error(
-                "Error while publish at com.hertzai.longrunning.log topic")
+        publish_async('com.hertzai.longrunning.log', post_dict)
         return f"{e} Not able to generating image at this moment please try later"
 
 
@@ -1271,11 +1829,7 @@ def parse_image_to_text(inp):
     try:
         post_dict = {'user_id': '', 'task_type': 'async', 'status': TaskStatus.EXECUTING.value, 'task_name': TaskNames.LLAVA.value, 'uid': thread_local_data.get_request_id(
         ), 'task_id': f"{TaskNames.LLAVA.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id()}
-        try:
-            client.publish('com.hertzai.longrunning.log', post_dict)
-        except Exception as e:
-            logging.error(
-                "Error while publish at com.hertzai.longrunning.log topic")
+        publish_async('com.hertzai.longrunning.log', post_dict)
         inp_list = inp.split(',')
         url = f'{LLAVA_API}'
         payload = {
@@ -1292,19 +1846,11 @@ def parse_image_to_text(inp):
         else:
             post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.LLAVA.value, 'uid': thread_local_data.get_request_id(
             ), 'task_id': f"{TaskNames.LLAVA.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at LLAVA for req_id: {thread_local_data.get_request_id()}'}
-            try:
-                client.publish('com.hertzai.longrunning.log', post_dict)
-            except Exception as e:
-                logging.error(
-                    "Error while publish at com.hertzai.longrunning.log topic")
+            publish_async('com.hertzai.longrunning.log', post_dict)
     except Exception as e:
         post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.TIMEOUT.value, 'task_name': TaskNames.LLAVA.value, 'uid': thread_local_data.get_request_id(
         ), 'task_id': f"{TaskNames.LLAVA.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at LLAVA for req_id: {thread_local_data.get_request_id()} timed out'}
-        try:
-            client.publish('com.hertzai.longrunning.log', post_dict)
-        except Exception as e:
-            logging.error(
-                "Error while publish at com.hertzai.longrunning.log topic")
+        publish_async('com.hertzai.longrunning.log', post_dict)
         return f'{e} Not able to generating answer at this moment please try later'
 
 
@@ -1345,12 +1891,9 @@ async def call_crwalab_api(input_url, input_str_list, user_id, request_id):
 
 def start_async_tasks(coroutine):
     def run():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(coroutine)
-        finally:
-            loop.close()
+        from core.event_loop import get_or_create_event_loop
+        loop = get_or_create_event_loop()
+        loop.run_until_complete(coroutine)
     Thread(target=run).start()
 
 
@@ -1373,11 +1916,7 @@ def parse_link_for_crwalab(inp):
     try:
         post_dict = {'user_id': '', 'task_type': 'async', 'status': TaskStatus.EXECUTING.value, 'task_name': TaskNames.CRAWLAB.value, 'uid': thread_local_data.get_request_id(
         ), 'task_id': f"{TaskNames.CRAWLAB.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id()}
-        try:
-            client.publish('com.hertzai.longrunning.log', post_dict)
-        except Exception as e:
-            logging.error(
-                "Error while publish at com.hertzai.longrunning.log topic")
+        publish_async('com.hertzai.longrunning.log', post_dict)
         inp_list = inp.split(',')
         input_url = inp_list[0]
         link_type = inp_list[1].strip(' ')
@@ -1393,7 +1932,7 @@ def parse_link_for_crwalab(inp):
                     os.makedirs(upload_folder_path)
                 pdf_save_path = f'{upload_folder_path}/{pdf_file_name}'
 
-                response = requests.get(input_url)
+                response = pooled_get(input_url)
                 with open(pdf_save_path, 'wb') as file:
                     file.write(response.content)
 
@@ -1405,7 +1944,7 @@ def parse_link_for_crwalab(inp):
                 # Open the file and send it in the POST request
                 with open(pdf_save_path, 'rb') as file:
                     files = [('file', (pdf_file_name, file, 'application/pdf'))]
-                    response = requests.post(
+                    response = pooled_post(
                         BOOKPARSING_API, data=payload, files=files)
 
                 os.remove(pdf_save_path)
@@ -1415,11 +1954,7 @@ def parse_link_for_crwalab(inp):
                 app.logger.info("Got exception in book parsing api {e}")
                 post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.CRAWLAB.value, 'uid': thread_local_data.get_request_id(
                 ), 'task_id': f"{TaskNames.CRAWLAB.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at CRWALAB for req_id: {thread_local_data.get_request_id()} for pdf upload'}
-                try:
-                    client.publish('com.hertzai.longrunning.log', post_dict)
-                except:
-                    logging.error(
-                        "Error while publish at com.hertzai.longrunning.log topic")
+                publish_async('com.hertzai.longrunning.log', post_dict)
                 return "sorry I am not able to process your request at this moment"
 
         elif link_type == 'website':
@@ -1449,12 +1984,7 @@ def parse_link_for_crwalab(inp):
                     app.logger.info(f"Got exception in crawlab api {e}")
                     post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.CRAWLAB.value, 'uid': thread_local_data.get_request_id(
                     ), 'task_id': f"{TaskNames.CRAWLAB.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at CRWALAB for req_id: {thread_local_data.get_request_id()} for weblink upload'}
-                    try:
-                        client.publish(
-                            'com.hertzai.longrunning.log', post_dict)
-                    except Exception as e:
-                        logging.error(
-                            "Error while publish at com.hertzai.longrunning.log topic")
+                    publish_async('com.hertzai.longrunning.log', post_dict)
                     return f"sorry I am not able to process your request at this moment but here is some brief information about url you hava provided {response.text}"
 
                 return f"your url got uploaded and data extraction is being processes. Here is some brief information about url you hava provided {response.text}"
@@ -1462,11 +1992,7 @@ def parse_link_for_crwalab(inp):
                 app.logger.info(f"Got exception in crawlab api {e}")
                 post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.CRAWLAB.value, 'uid': thread_local_data.get_request_id(
                 ), 'task_id': f"{TaskNames.CRAWLAB.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at CRWALAB for req_id: {thread_local_data.get_request_id()} for weblink upload'}
-                try:
-                    client.publish('com.hertzai.longrunning.log', post_dict)
-                except Exception as e:
-                    logging.error(
-                        "Error while publish at com.hertzai.longrunning.log topic")
+                publish_async('com.hertzai.longrunning.log', post_dict)
                 return "sorry I am not able to process your request at this moment"
 
         else:
@@ -1484,7 +2010,8 @@ def get_frame(user_id):
 
     try:
         if serialized_frame is not None:
-            frame_bgr = pickle.loads(serialized_frame)
+            from security.safe_deserialize import safe_load_frame
+            frame_bgr = safe_load_frame(serialized_frame)
             app.logger.info(
                 f"Frame for user_id {user_id} retrieved successfully.")
             frame = frame_bgr[:, :, ::-1]
@@ -1522,7 +2049,7 @@ def parse_visual_context(inp: str):
         ]
         headers = {}
         try:
-            response = requests.post(
+            response = pooled_post(
                 url, headers=headers, data=payload, files=files)
             app.logger.info(response.text)
             response = response.text
@@ -1668,6 +2195,9 @@ class CustomConvoOutputParser(AgentOutputParser):
                 if ai_match:
                     final_answer = ai_match.group(1).strip()
                     return AgentFinish({"output": final_answer}, text)
+                # Fallback: treat entire response as final answer
+                app.logger.info("No parsable format found, using raw text as final answer")
+                return AgentFinish({"output": text.strip()}, text)
 
     @property
     def _type(self) -> str:
@@ -1675,138 +2205,156 @@ class CustomConvoOutputParser(AgentOutputParser):
 
 
 # Store user-specific agents and their chat history
-user_agents_creator: Dict[str, Tuple[autogen.AssistantAgent,
-                                     autogen.UserProxyAgent]] = {}
+# Only initialize if autogen is available
+if autogen is not None:
+    user_agents_creator: Dict[str, Tuple[autogen.AssistantAgent,
+                                         autogen.UserProxyAgent]] = {}
 
-# Store agents for each user
-user_agents: Dict[str, Tuple[autogen.ConversableAgent,
-                             autogen.ConversableAgent]] = {}
-
-
-def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]:
-    """Create new assistant and user proxy agents for a user with basic configuration."""
-    config_list = [{
-        "model": 'hertzai-4o',
-        "api_type": "azure",
-        "api_key": '4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf',
-        "base_url": 'https://hertzai-gpt4.openai.azure.com/',
-        "api_version": "2024-02-15-preview"
-    }]
-
-    # Create a basic function calling config
-    llm_config = {
-        "config_list": config_list,
-        "seed": 42
-    }
-
-    # Create the assistant agent with context awareness
-    assistant = autogen.AssistantAgent(
-        name=f"assistant_{user_id}",
-        llm_config=llm_config,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get(
-            "content") else False,
-        system_message="""You are a custom agent bot creator. Your task is to interact with the user to gather all the necessary details to create an agent. Once you have collected all the required information, you will generate a complete agent configuration.
-
-        The information you need to collect includes:
-
-        Name: The name of the agent.
-        Purpose: A brief description of the agent's purpose.
-        Flow: The operational flow of the agent.
-        Actions: The actions the agent will perform.
-        Goal: The ultimate goal of the agent.
-        Guidelines for Responses:
-
-        If you are still gathering information, your response should be formatted as: { "status": "pending", "question": "The question you want to ask" }
-        Once all the requirements are complete and you are ready to provide the agent configuration, your response should be formatted as: { "status": "completed", "name": "","Recipe":"", "purpose": "", "tools": "", "flow": { "actions": [] }, "goal": ""}
-        the recipe should be containing all the steps
-        necessary and name for it. Suggest well-documented, generalized python function(s)
-        only if necessary if the task is achievable without python then dont give python code just give the prompt
-        to perform similar tasks for coding steps in future. Make sure coding steps and
-        non-coding steps are never mixed in one function. In the docstr of the function(s),
-        clarify what non-coding steps are needed to use the language skill of the assistant.
-        """
-    )
-
-    # Create the user proxy agent
-    user_proxy = autogen.UserProxyAgent(
-        name=f"user_proxy_{user_id}",
-        human_input_mode="NEVER",
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get(
-            "content") else False,
-        code_execution_config={"work_dir": "coding", "use_docker": False}
-    )
-
-    return assistant, user_proxy
+    # Store agents for each user
+    user_agents: Dict[str, Tuple[autogen.ConversableAgent,
+                                 autogen.ConversableAgent]] = {}
+else:
+    user_agents_creator: Dict[str, Tuple] = {}
+    user_agents: Dict[str, Tuple] = {}
 
 
-def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.UserProxyAgent, message: str) -> str:
-    """Get a single response from the agent for the given message."""
-    try:
-        # Get the current chat history
-        current_chat = user_proxy.chat_messages.get(assistant.name, [])
+# Define autogen-dependent functions only if autogen is available
+if autogen is not None:
+    def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]:
+        """Create new assistant and user proxy agents for a user with basic configuration."""
+        config_list = [{
+            "model": 'hertzai-4o',
+            "api_type": "azure",
+            "api_key": os.environ.get('AZURE_OPENAI_API_KEY', ''),
+            "base_url": 'https://hertzai-gpt4.openai.azure.com/',
+            "api_version": "2024-02-15-preview"
+        }]
 
-        # Create context from previous messages (last 5 messages for efficiency)
-        context = current_chat[-5:] if current_chat else []
-        context_str = "\n".join(
-            [f"{msg['role']}: {msg['content']}" for msg in context])
+        # Create a basic function calling config
+        llm_config = {
+            "config_list": config_list,
+            "seed": 42
+        }
 
-        # Append context to the message if there's history
-        enhanced_message = message
-        if context:
-            enhanced_message = f"Previous conversation:\n{context_str}\n\nCurrent message: {message}"
+        # Create the assistant agent with context awareness
+        assistant = autogen.AssistantAgent(
+            name=f"assistant_{user_id}",
+            llm_config=llm_config,
+            is_termination_msg=lambda x: True if "TERMINATE" in x.get(
+                "content") else False,
+            system_message="""You are a custom agent bot creator. Your task is to interact with the user to gather all the necessary details to create an agent. Once you have collected all the required information, you will generate a complete agent configuration.
 
-        # Send message and get response
-        response = user_proxy.send(
-            enhanced_message,
-            assistant,
-            request_reply=True
+            The information you need to collect includes:
+
+            Name: The name of the agent.
+            Purpose: A brief description of the agent's purpose.
+            Flow: The operational flow of the agent.
+            Actions: The actions the agent will perform.
+            Goal: The ultimate goal of the agent.
+            Guidelines for Responses:
+
+            If you are still gathering information, your response should be formatted as: { "status": "pending", "question": "The question you want to ask" }
+            Once all the requirements are complete and you are ready to provide the agent configuration, your response should be formatted as: { "status": "completed", "name": "","Recipe":"", "purpose": "", "tools": "", "flow": { "actions": [] }, "goal": ""}
+            the recipe should be containing all the steps
+            necessary and name for it. Suggest well-documented, generalized python function(s)
+            only if necessary if the task is achievable without python then dont give python code just give the prompt
+            to perform similar tasks for coding steps in future. Make sure coding steps and
+            non-coding steps are never mixed in one function. In the docstr of the function(s),
+            clarify what non-coding steps are needed to use the language skill of the assistant.
+            """
         )
 
-        key = list(user_proxy.chat_messages.keys())[0]
+        # Create the user proxy agent
+        user_proxy = autogen.UserProxyAgent(
+            name=f"user_proxy_{user_id}",
+            human_input_mode="NEVER",
+            is_termination_msg=lambda x: True if "TERMINATE" in x.get(
+                "content") else False,
+            code_execution_config={"work_dir": "coding", "use_docker": False}
+        )
 
-        return user_proxy.chat_messages[key][-1]['content']
-
-    except Exception as e:
-        return f"Error getting response: {str(e)}"
+        return assistant, user_proxy
 
 
-def create_agents(user_id: str,recipe:str) -> Tuple[autogen.ConversableAgent, autogen.ConversableAgent]:
-    """Create new assistant and user agents for a given user_id"""
+    def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.UserProxyAgent, message: str) -> str:
+        """Get a single response from the agent for the given message."""
+        try:
+            # Get the current chat history
+            current_chat = user_proxy.chat_messages.get(assistant.name, [])
 
-    llm_config = {
-        "temperature": 0.7,
-        "config_list": [{
-        "model": 'hertzai-4o',
-        "api_type": "azure",
-        "api_key": '4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf',
-        "base_url": 'https://hertzai-gpt4.openai.azure.com/',
-        "api_version": "2024-02-15-preview"
-    }],
-    }
-    conversation = True
-    if conversation:
-        recipe = recipe+'\n Note: Wait for user confirmation to proceed after every action.'
+            # Create context from previous messages (last 5 messages for efficiency)
+            context = current_chat[-5:] if current_chat else []
+            context_str = "\n".join(
+                [f"{msg['role']}: {msg['content']}" for msg in context])
 
-    # Create assistant agent
-    assistant = autogen.ConversableAgent(
-        name=f"assistant_{user_id}",
-        llm_config=llm_config,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get(
-            "content") else False,
-        system_message=recipe
-    )
+            # Append context to the message if there's history
+            enhanced_message = message
+            if context:
+                enhanced_message = f"Previous conversation:\n{context_str}\n\nCurrent message: {message}"
 
-    # Create user agent
-    user = autogen.ConversableAgent(
-        name=f"user_{user_id}",
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get(
-            "content") else False,
-        llm_config=None,  # User agent doesn't need LLM
-        human_input_mode="NEVER",  # We'll manually send messages
-        max_consecutive_auto_reply=1  # Limit to 1 auto reply
-    )
+            # Send message and get response
+            response = user_proxy.send(
+                enhanced_message,
+                assistant,
+                request_reply=True
+            )
 
-    return user, assistant
+            key = list(user_proxy.chat_messages.keys())[0]
+
+            return user_proxy.chat_messages[key][-1]['content']
+
+        except Exception as e:
+            return f"Error getting response: {str(e)}"
+
+
+    def create_agents(user_id: str,recipe:str) -> Tuple[autogen.ConversableAgent, autogen.ConversableAgent]:
+        """Create new assistant and user agents for a given user_id"""
+
+        llm_config = {
+            "temperature": 0.7,
+            "config_list": [{
+            "model": 'hertzai-4o',
+            "api_type": "azure",
+            "api_key": os.environ.get('AZURE_OPENAI_API_KEY', ''),
+            "base_url": 'https://hertzai-gpt4.openai.azure.com/',
+            "api_version": "2024-02-15-preview"
+        }],
+        }
+        conversation = True
+        if conversation:
+            recipe = recipe+'\n Note: Wait for user confirmation to proceed after every action.'
+
+        # Create assistant agent
+        assistant = autogen.ConversableAgent(
+            name=f"assistant_{user_id}",
+            llm_config=llm_config,
+            is_termination_msg=lambda x: True if "TERMINATE" in x.get(
+                "content") else False,
+            system_message=recipe
+        )
+
+        # Create user agent
+        user = autogen.ConversableAgent(
+            name=f"user_{user_id}",
+            is_termination_msg=lambda x: True if "TERMINATE" in x.get(
+                "content") else False,
+            llm_config=None,  # User agent doesn't need LLM
+            human_input_mode="NEVER",  # We'll manually send messages
+            max_consecutive_auto_reply=1  # Limit to 1 auto reply
+        )
+
+        return user, assistant
+
+else:
+    # Provide stub functions when autogen is not available
+    def create_agents_for_user(user_id: str):
+        raise ImportError("autogen package is not installed")
+
+    def get_agent_response(assistant, user_proxy, message: str) -> str:
+        raise ImportError("autogen package is not installed")
+
+    def create_agents(user_id: str, recipe: str):
+        raise ImportError("autogen package is not installed")
 
 
 # main function
@@ -1832,32 +2380,19 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
     language = SUPPORTED_LANG_DICT.get(preferred_lang[:2], 'English')
     colloquial = True
 
-    prefix = f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+    prefix = f"""You are Hevolve, an expert educational AI teacher with knowledge in every field.
+        Answer questions accurately and respond as quickly as possible in {language}.
+        Keep responses under 200 words. Be colloquial and natural - don't always greet or use the user's name.
 
-        <GENERAL_INSTRUCTION_START>
-        Context:
-        Imagine that you are the world's leading teacher, possessing knowledge in every field. Consider the consequences of each response you provide.
-        Your answers must be meaningful and colloquial in nature and delivered as quickly as possible. As a highly educated and informed teacher, you have access to an extensive wealth of information.
-        Your primary goal as a teacher is to assist students by answering their questions, providing accurate and up-to-date information.
-        Please create a distinct personality for yourself, and remember never to refer to the user as a human or yourself as mere AI.\
-        your response should not be more than 200 words. Do not greet always, do not use the username always.
-        RESPONSE_LANGUAGE_PREFERENCE: {language}
+        User details: {user_details}
+        Context: {custom_prompt}
 
-        <GENERAL_INSTRUCTION_END>
-        User details:
-        <USER_DETAILS_START>
-        {user_details}
-        <USER_DETAILS_END>
-        <CONTEXT_START>
-        Before you respond, consider the context in which you are utilized. {custom_prompt}
-        You are designed to answer questions, provide revisions, conduct assessments, teach various topics, create personalised curriculum and assist with research for both students and working professionals.
-        Your expertise draws from various knowledge sources like books, websites, and white papers. Your responses will be conveyed to the user through a video, using an avatar and text-to-speech technology, and can be translated into various languages.
-        Consider the user's location, time and context of previous dialogues with time to create a proper prompt for tools and follow up in-context questions.
-        Your responses will be conveyed to the user through a video, using an avatar and you have ability to see using Visual_Context_Camera tool.
-        <CONTEXT_END>
-        These are all the actions that the user has performed up to now:
-        <PREVIOUS_USER_ACTION_START>
-        {actions}
+        You can answer questions, provide revisions, conduct assessments, teach topics, create curriculum, and assist with research.
+        Your responses are conveyed via video with an avatar and text-to-speech.
+
+        IMPORTANT: Always respond with valid JSON in a markdown code block with "action" and "action_input" fields.
+
+        Previous user actions: {actions}
 
         Conversation History:
         <HISTORY_START>
@@ -2005,6 +2540,46 @@ INTERMEDIATE_CONTINUATION = "You are Hevolve, a highly intelligent educational A
 first_promts = []
 review_agents = {"10077":True,10077:True}
 conversation_agent = {"10077":False,10077:False}
+_state_lock = threading.Lock()  # Protects review_agents, conversation_agent, first_promts
+
+
+def _autonomous_gather_info(user_id, description, prompt_id):
+    """Run gather_info autonomously — LLM answers all questions itself.
+
+    In autonomous mode, autogen's UserProxyAgent has max_consecutive_auto_reply=10
+    and the assistant's system_message is enriched with instructions to self-complete.
+    """
+    from gather_agentdetails import gather_info
+    response = gather_info(user_id, description, prompt_id, autonomous=True)
+
+    # Loop until completed (autogen handles it internally when max_auto_reply > 0)
+    max_iterations = 15
+    iteration = 0
+    while iteration < max_iterations:
+        try:
+            new_response = response.replace('true', 'True').replace('false', 'False')
+            parsed = retrieve_json(new_response)
+            if parsed.get('status', '').lower() == 'completed':
+                # Save agent config
+                parsed['prompt_id'] = prompt_id
+                parsed['creator_user_id'] = user_id
+                name = f'prompts/{prompt_id}.json'
+                with open(name, 'w') as f:
+                    json.dump(parsed, f)
+                app.logger.info(f'Autonomous agent config saved to {name}')
+                return 'Agent details gathered autonomously. Moving to review.'
+        except (json.JSONDecodeError, AttributeError, Exception) as e:
+            app.logger.debug(f'Autonomous gather iteration {iteration}: {e}')
+
+        # Not complete yet — send auto-continue
+        response = gather_info(user_id, 'proceed', prompt_id, autonomous=True)
+        iteration += 1
+
+    # Fallback: save whatever we have
+    app.logger.warning(f'Autonomous gather_info did not complete in {max_iterations} iterations')
+    return 'Autonomous gathering completed. Moving to review.'
+
+
 @app.route('/chat', methods=['POST'])
 def chat():
 
@@ -2018,41 +2593,98 @@ def chat():
     prompt_id = data.get('prompt_id', None)
     create_agent = data.get('create_agent', None)
     casual_conv = data.get('casual_conv', True)
+    autonomous = data.get('autonomous', False)
     probe = data.get('probe', None)
     intermediate = data.get('intermediate', None)
+    speculative = data.get('speculative', False)
+    model_config = data.get('model_config', None)
     app.logger.info(f"casual_conv type {casual_conv}")
+
+    # Security: sanitize prompt_id to prevent path traversal
+    if prompt_id is not None:
+        prompt_id = str(prompt_id)
+        if not re.match(r'^[a-zA-Z0-9_-]+$', prompt_id):
+            return jsonify({'error': 'Invalid prompt_id format'}), 400
+
+    # Per-request model config override (speculative execution)
+    if model_config:
+        thread_local_data.set_model_config_override(model_config)
+    else:
+        thread_local_data.clear_model_config_override()
+
+    # GUARDRAIL: full pre-dispatch gate on every /chat call
+    if prompt:
+        try:
+            from security.hive_guardrails import GuardrailEnforcer
+            allowed, reason, prompt = GuardrailEnforcer.before_dispatch(prompt)
+            if not allowed:
+                return jsonify({'error': f'Guardrail: {reason}'}), 403
+        except ImportError:
+            pass
+
+    # Speculative dispatch: fast response + background expert
+    if speculative and prompt and user_id and prompt_id:
+        try:
+            from integrations.agent_engine.speculative_dispatcher import get_speculative_dispatcher
+            dispatcher = get_speculative_dispatcher()
+            if dispatcher.should_speculate(str(user_id), str(prompt_id), prompt):
+                result = dispatcher.dispatch_speculative(
+                    prompt, str(user_id), str(prompt_id))
+                return jsonify({
+                    'response': result['response'],
+                    'Agent_status': 'Speculative Mode',
+                    'speculation_id': result.get('speculation_id'),
+                    'expert_pending': result.get('expert_pending', False),
+                    'fast_model': result.get('fast_model'),
+                    'latency_ms': result.get('latency_ms'),
+                })
+        except ImportError:
+            pass
 
     # return ""
     thread_local_data.set_request_id(request_id=request_id)
     prompt = data.get('prompt', None)
+
+    # Security: Prompt injection detection
+    if prompt:
+        try:
+            from security.prompt_guard import check_prompt_injection
+            is_safe, reason = check_prompt_injection(prompt)
+            if not is_safe:
+                app.logger.warning(f"Prompt injection detected: {reason}")
+                return jsonify({'error': f'Input rejected: {reason}'}), 400
+        except Exception:
+            pass  # Degrade gracefully
+
     if prompt_id:
-        if os.path.exists(f'prompts/{prompt_id}.json'):
-            app.logger.info('GATHER JSON EXISTS')
-            if os.path.exists(f'prompts/{prompt_id}_0_recipe.json'):
-                app.logger.info('0 Recipe JSON EXISTS')
-                file_path = f'prompts/{prompt_id}.json'
-                with open(file_path, 'r') as f:
-                    data = json.load(f)
-                    no_of_flow = len(data['flows'])-1
-                    app.logger.info(f'GOT LEN OF FLOW AS {no_of_flow}')
-                if os.path.exists(f'prompts/{prompt_id}_{no_of_flow}_recipe.json'):
-                    create_agent = set_flags_to_enter_review_mode(no_of_flow, user_id) #returns false
+        with _state_lock:
+            if os.path.exists(f'prompts/{prompt_id}.json'):
+                app.logger.info('GATHER JSON EXISTS')
+                if os.path.exists(f'prompts/{prompt_id}_0_recipe.json'):
+                    app.logger.info('0 Recipe JSON EXISTS')
+                    file_path = f'prompts/{prompt_id}.json'
+                    with open(file_path, 'r') as f:
+                        data = json.load(f)
+                        no_of_flow = len(data['flows'])-1
+                        app.logger.info(f'GOT LEN OF FLOW AS {no_of_flow}')
+                    if os.path.exists(f'prompts/{prompt_id}_{no_of_flow}_recipe.json'):
+                        create_agent = set_flags_to_enter_review_mode(no_of_flow, user_id) #returns false
+                    else:
+                        app.logger.info(f'{no_of_flow} Recipe JSON doesnot EXISTS')
+                        create_agent = True
+                        review_agents[user_id] = True
+                        conversation_agent[user_id] = False
                 else:
-                    app.logger.info(f'{no_of_flow} Recipe JSON doesnot EXISTS')
+                    app.logger.info('0 Recipe JSON doesnot EXISTS')
                     create_agent = True
                     review_agents[user_id] = True
                     conversation_agent[user_id] = False
-            else:
-                app.logger.info('0 Recipe JSON doesnot EXISTS')
-                create_agent = True
-                review_agents[user_id] = True
-                conversation_agent[user_id] = False
 
-        else:
-            app.logger.info('GATHER JSON doesnot EXISTS')
-            create_agent = True
-            review_agents[user_id] = False
-            conversation_agent[user_id] = True
+            else:
+                app.logger.info('GATHER JSON doesnot EXISTS')
+                create_agent = True
+                review_agents[user_id] = False
+                conversation_agent[user_id] = True
 
     if create_agent:
         # Phase 1: Gather Requirements
@@ -2062,13 +2694,20 @@ def chat():
             if prompt_id not in first_promts:
                 first_promts.append(prompt_id)
                 try:
-                    res = requests.get(
+                    res = pooled_get(
                         f'{DB_URL}/getprompt/?prompt_id={prompt_id}').json()
                     prompt = prompt+f" name:{res[0]['name']} goal:{res[0]['prompt']}"
                 except:
                     app.logger.error(f'GOT DB ERROR FOR PROMPTID:{prompt_id}')
             if not user_id or not prompt:
                 return jsonify({'response': 'Need user_id and text to create agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
+            if autonomous:
+                # Autonomous dispatch (from daemon or API): LLM self-generates agent config
+                auto_response = _autonomous_gather_info(user_id, prompt, prompt_id)
+                review_agents[user_id] = True
+                conversation_agent[user_id] = False
+                _record_lifecycle('Review Mode', user_id, prompt_id, f'Autonomous creation via dispatch: {prompt[:100]}')
+                return jsonify({'response': auto_response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [], 'Agent_status': 'Review Mode', 'autonomous_creation': True})
             from gather_agentdetails import gather_info
             response = gather_info(user_id,prompt,prompt_id)
             new_response = response.replace('true','True').replace("false", "False")
@@ -2076,6 +2715,7 @@ def chat():
             try:
                 try:
                     new_res = retrieve_json(new_response)
+                    app.logger.info(f"new_res: {new_res}")
                 except Exception as e:
                     app.logger.error(f'Got some error while will try with re match error:{e}')
                     json_match = re.search(r'{[\s\S]*}', response)
@@ -2092,6 +2732,7 @@ def chat():
                 if new_res['status'] == 'pending':
                     app.logger.info('PENDING STATUS')
                     ans = new_res['question'] if 'question' in new_res else new_res['review_details']
+                    _record_lifecycle('Creation Mode', user_id, prompt_id, 'Agent creation started via gather_info')
                     return jsonify({'response': ans, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Creation Mode'})
                 else:
                     app.logger.info('COMPLETED STATUS')
@@ -2105,17 +2746,26 @@ def chat():
                         json.dump(new_res, json_file)
                     app.logger.info(f"Dictionary saved to {name}")
                     review_agents[user_id] = True
+                    _record_lifecycle('Review Mode', user_id, prompt_id, 'Agent details gathered, entering review')
                     return jsonify({'response': 'Got Agent details successfully lets move on to review them one at a time', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Review Mode'})
             except Exception as e:
                 app.logger.error('GOT some error while eval and returning the response')
                 app.logger.error(e)
+                _record_lifecycle('Creation Mode', user_id, prompt_id, f'Creation continuing after parse error: {e}')
                 return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Creation Mode'})
         # Phase 2: Review Phase
         if review_agents[user_id] and not conversation_agent[user_id]:
             response = recipe(user_id,prompt,prompt_id,file_id,request_id)
             if response =='Agent Created Successfully':
                 conversation_agent[user_id] = True
+                # Bridge: auto-create social identity for this agent
+                try:
+                    _create_social_agent_from_prompt(user_id, prompt_id)
+                except Exception as e:
+                    app.logger.debug(f"Social agent bridge skipped: {e}")
+                _record_lifecycle('completed', user_id, prompt_id, 'Agent creation completed successfully')
                 return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'completed'})
+            _record_lifecycle('Review Mode', user_id, prompt_id, 'Agent details being reviewed')
             return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Review Mode'})
         # Phase 3: Evaluation Phase
         if review_agents[user_id] and conversation_agent[user_id]:
@@ -2129,22 +2779,74 @@ def chat():
 
         response = chat_agent(user_id,prompt,prompt_id,file_id,request_id)
 
-        # if not user_id or not prompt:
-        #     return jsonify({'response': 'Need user_id and text to use agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
-        # last_response = ''
-        #create and user use_recipe.py
+        # --- Step 17: Check if the reuse agent intelligently decided to create a new agent ---
+        # Two detection mechanisms:
+        # 1. Autogen create_new_agent tool (intelligent — LLM decides via tool call)
+        # 2. Response text pattern matching (fallback for structured agent output)
+        user_prompt = f'{user_id}_{prompt_id}'
+        if not review_agents.get(user_id) and not create_agent:
+            # Check autogen tool signal first (intelligent detection)
+            from reuse_recipe import creation_signals
+            if user_prompt in creation_signals:
+                signal = creation_signals.pop(user_prompt)
+                agent_desc = signal.get('description', '')
+                is_auto = signal.get('autonomous', False)
+                app.logger.info(f'Autogen create_new_agent tool fired: desc="{agent_desc}", autonomous={is_auto}')
+
+                new_prompt_id = int(time.time())
+                if is_auto:
+                    # Autonomous: run gather_info with LLM-generated answers
+                    auto_response = _autonomous_gather_info(user_id, agent_desc, new_prompt_id)
+                    review_agents[user_id] = True
+                    _record_lifecycle('Review Mode', user_id, new_prompt_id, f'Autonomous creation from reuse: {agent_desc[:100]}')
+                    return jsonify({
+                        'response': auto_response,
+                        'intent': ['FINAL_ANSWER'],
+                        'req_token_count': 0, 'res_token_count': 0,
+                        'history_request_id': [],
+                        'Agent_status': 'Review Mode',
+                        'autonomous_creation': True,
+                        'prompt_id': new_prompt_id,
+                    })
+                else:
+                    _record_lifecycle('Reuse Mode', user_id, new_prompt_id, f'Creation suggested from reuse: {agent_desc[:100]}')
+                    return jsonify({
+                        'response': response,
+                        'intent': ['FINAL_ANSWER'],
+                        'req_token_count': 0, 'res_token_count': 0,
+                        'history_request_id': [],
+                        'Agent_status': 'Reuse Mode',
+                        'creation_suggested': True,
+                        'suggested_agent_description': agent_desc,
+                        'prompt_id': new_prompt_id,
+                    })
+
+            # Fallback: pattern matching on agent response text
+            if _response_signals_creation(response):
+                app.logger.info('Reuse agent response text signals new agent creation needed')
+                _record_lifecycle('Reuse Mode', user_id, prompt_id, 'Creation suggested via response pattern')
+                return jsonify({
+                    'response': response,
+                    'intent': ['FINAL_ANSWER'],
+                    'req_token_count': 0, 'res_token_count': 0,
+                    'history_request_id': [],
+                    'Agent_status': 'Reuse Mode',
+                    'creation_suggested': True,
+                })
+
+        _record_lifecycle('Reuse Mode', user_id, prompt_id, 'Agent reused for conversation')
         return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Reuse Mode'})
 
     if prompt_id:
         try:
-            res = requests.get(
+            res = pooled_get(
                 f'{DB_URL}/getprompt/?prompt_id={prompt_id}').json()
             # use config for url
             custom_prompt = res[0]['prompt']
             if res[0]['prompt'] == 'Learn Language':
                 app.logger.info(
                     'found Learn languague getting user preffered language')
-                lang = requests.post('{}/getstudent_by_user_id'.format(DB_URL),
+                lang = pooled_post('{}/getstudent_by_user_id'.format(DB_URL),
                                      data=json.dumps({"user_id": user_id})).json()
                 language = lang['preferred_language'][:2]
                 app.logger.info(f'user preffered language is {language}')
@@ -2168,11 +2870,7 @@ def chat():
 
     post_dict = {'user_id': user_id, 'status': 'INITIALIZED', 'task_name': "CHAT",
                  'uid': request_id, 'task_id': f"CHAT_{str(request_id)}", 'request_id': request_id}
-    try:
-        client.publish('com.hertzai.longrunning.log', post_dict)
-    except Exception as e:
-        app.logger.error(
-            "Error while publish at com.hertzai.longrunning.log topic")
+    publish_async('com.hertzai.longrunning.log', post_dict)
 
     thread_local_data.set_user_id(user_id=user_id)
     thread_local_data.set_req_token_count(value=0)
@@ -2192,8 +2890,54 @@ def chat():
                   query=prompt, custom_prompt=custom_prompt, preferred_lang=preferred_lang)
     app.logger.info("the time taken by get ans in main api is %s seconds",
                     time.time() - ans_start_time)
+
+    # --- Step 16c: Check if LLM's Create_Agent tool fired during get_ans() ---
+    if thread_local_data.get_creation_requested():
+        agent_description = thread_local_data.get_creation_description()
+        is_autonomous = thread_local_data.get_creation_autonomous()
+        new_prompt_id = int(time.time())
+        thread_local_data.clear_creation_flags()
+        app.logger.info(f'LLM Create_Agent tool fired: desc="{agent_description}", autonomous={is_autonomous}')
+
+        if is_autonomous:
+            # Autonomous: run gather_info with LLM-generated answers
+            auto_response = _autonomous_gather_info(user_id, agent_description, new_prompt_id)
+            review_agents[user_id] = True
+            _record_lifecycle('Review Mode', user_id, new_prompt_id, f'Autonomous creation via LLM tool: {agent_description[:100]}')
+            return jsonify({
+                'response': auto_response,
+                'intent': ['FINAL_ANSWER'],
+                'req_token_count': 0, 'res_token_count': 0,
+                'history_request_id': [],
+                'Agent_status': 'Review Mode',
+                'autonomous_creation': True,
+                'prompt_id': new_prompt_id,
+            })
+        else:
+            # Interactive: start gather_info, return first question
+            from gather_agentdetails import gather_info
+            response = gather_info(user_id, agent_description, new_prompt_id)
+            new_response = response.replace('true', 'True').replace("false", "False")
+            try:
+                new_res = retrieve_json(new_response)
+                if new_res.get('status') == 'pending':
+                    resp_text = new_res.get('question', new_res.get('review_details', ans))
+                else:
+                    resp_text = ans
+            except Exception:
+                resp_text = ans
+            _record_lifecycle('Creation Mode', user_id, new_prompt_id, f'Interactive creation via LLM tool: {agent_description[:100]}')
+            return jsonify({
+                'response': resp_text,
+                'intent': ['FINAL_ANSWER'],
+                'req_token_count': 0, 'res_token_count': 0,
+                'history_request_id': [],
+                'Agent_status': 'Creation Mode',
+                'prompt_id': new_prompt_id,
+            })
+
     if req_tool == 'Image_Inference_Tool':
-        action_response = requests.post(f'{DB_URL}/create_action',)
+        action_response = pooled_post(f'{DB_URL}/create_action',)
         payload = json.dumps({
             "conv_id": None,
             "user_id": user_id,
@@ -2204,23 +2948,15 @@ def chat():
         headers = {
             'Content-Type': 'application/json'
         }
-        action_response = requests.post(f'{DB_URL}/create_action', headers=headers, data=payload)
+        action_response = pooled_post(f'{DB_URL}/create_action', headers=headers, data=payload)
     if ans != "":
         post_dict = {'user_id': user_id, 'status': 'FINISHED', 'task_name': "CHAT",
                      'uid': request_id, 'task_id': f"CHAT_{str(request_id)}", 'request_id': request_id}
-        try:
-            client.publish('com.hertzai.longrunning.log', post_dict)
-        except Exception as e:
-            app.logger.error(
-                "Error while publish at com.hertzai.longrunning.log topic")
+        publish_async('com.hertzai.longrunning.log', post_dict)
     else:
         post_dict = {'user_id': user_id, 'status': 'ERROR', 'task_name': "CHAT", 'uid': request_id,
                      'task_id': f"CHAT_{str(request_id)}", 'request_id': request_id, 'failure_reason': 'Got null response from GPT'}
-        try:
-            client.publish('com.hertzai.longrunning.log', post_dict)
-        except Exception as e:
-            app.logger.error(
-                "Error while publish at com.hertzai.longrunning.log topic")
+        publish_async('com.hertzai.longrunning.log', post_dict)
 
     end_time = time.time()
     elapsed_time = end_time - start_time
@@ -2231,6 +2967,7 @@ def chat():
 
 def evaluate_agent_after_creation_in_review(file_id, prompt, prompt_id, request_id, user_id):
     response = chat_agent(user_id, prompt, prompt_id, file_id, request_id)
+    _record_lifecycle('Evaluation Mode', user_id, prompt_id, 'Agent being evaluated after creation')
     return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0,
                     'history_request_id': [], 'Agent_status': 'Evaluation Mode'})
 
@@ -2298,25 +3035,361 @@ def history():
     except:
         return "Invalid user ID"
     if memory:
-        memory.chat_memory.add_message(
-            HumanMessage(content=human_msg),
-            metadata={'prompt_id': 0}
-        )
-        memory.chat_memory.add_message(
-            AIMessage(content=ai_msg),
-            metadata={'prompt_id': 0}
-        )
-        return jsonify({'response': "Messages are saved!!!"}), 200
+        try:
+            memory.chat_memory.add_message(HumanMessage(content=human_msg))
+            memory.chat_memory.add_message(AIMessage(content=ai_msg))
+            return jsonify({'response': "Messages are saved!!!"}), 200
+        except Exception as e:
+            app.logger.warning(f"History not saved: {e}")
+            return jsonify({'response': "Messages not saved (memory service unavailable)"}), 503
     else:
         return jsonify({'response': "Memory object not found"}), 400
 
 
+# ═══════════════════════════════════════════════════════════════
+# Social Bridge: auto-create social user when agent is created via /chat
+# ═══════════════════════════════════════════════════════════════
+
+def _create_social_agent_from_prompt(user_id, prompt_id):
+    """Read prompts/{prompt_id}.json and create a social User for this agent."""
+    prompt_file = f'prompts/{prompt_id}.json'
+    if not os.path.exists(prompt_file):
+        return
+    with open(prompt_file, 'r') as f:
+        data = json.load(f)
+
+    agent_display_name = data.get('name', f'Agent {prompt_id}')
+    agent_name = data.get('agent_name', '')  # 3-word name from LLM
+    goal = data.get('goal', '')
+
+    from integrations.social.models import get_db
+    from integrations.social.services import UserService
+    db = get_db()
+    try:
+        # Use LLM-generated 3-word name if available, otherwise generate one
+        if not agent_name:
+            from integrations.social.agent_naming import generate_agent_name
+            suggestions = generate_agent_name(db, count=1)
+            agent_name = suggestions[0] if suggestions else f"agent-{prompt_id}"
+
+        try:
+            user = UserService.register_agent(
+                db, agent_name, goal or agent_display_name,
+                agent_id=str(prompt_id), owner_id=str(user_id),
+                skip_name_validation=not bool(agent_name))
+            user.display_name = agent_display_name
+            db.flush()
+        except ValueError:
+            pass  # already exists
+
+        db.commit()
+        app.logger.info(f"Social agent created: {agent_name} for prompt {prompt_id}")
+    except Exception as e:
+        db.rollback()
+        app.logger.debug(f"Social bridge error: {e}")
+    finally:
+        db.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+# Local-first Prompt CRUD (syncs to cloud DB)
+# ═══════════════════════════════════════════════════════════════
+
+@app.route('/prompts', methods=['GET'])
+def get_prompts():
+    """List prompts for a user. Local-first, cloud DB fallback."""
+    req_user_id = request.args.get('user_id', '')
+    if not req_user_id:
+        return jsonify({'error': 'user_id required'}), 400
+
+    prompts = []
+
+    # 1. Read from local prompts/*.json files
+    prompts_dir = os.path.join(os.path.dirname(__file__), 'prompts')
+    if os.path.isdir(prompts_dir):
+        for fname in os.listdir(prompts_dir):
+            if fname.endswith('.json') and '_' not in fname:
+                try:
+                    fpath = os.path.join(prompts_dir, fname)
+                    with open(fpath, 'r') as f:
+                        data = json.load(f)
+                    pid = fname.replace('.json', '')
+                    creator = str(data.get('creator_user_id', ''))
+                    if creator == str(req_user_id) or not creator:
+                        prompts.append({
+                            'prompt_id': pid,
+                            'name': data.get('name', ''),
+                            'prompt': data.get('goal', ''),
+                            'agent_name': data.get('agent_name', ''),
+                            'is_active': data.get('status', '') == 'completed',
+                            'user_id': creator or req_user_id,
+                            'has_recipe': os.path.exists(
+                                os.path.join(prompts_dir, f'{pid}_0_recipe.json')),
+                            'flow_count': len(data.get('flows', [])),
+                            'source': 'local',
+                        })
+                except Exception:
+                    continue
+
+    # 2. Fallback: try cloud DB if no local results
+    if not prompts:
+        try:
+            res = pooled_get(
+                f'{DB_URL}/getprompt_onlyuserid/?user_id={req_user_id}',
+                timeout=5)
+            if res.status_code == 200:
+                cloud_data = res.json()
+                for item in cloud_data:
+                    item['source'] = 'cloud'
+                    item['has_recipe'] = False
+                prompts = cloud_data
+        except Exception:
+            pass
+
+    return jsonify(prompts)
+
+
+@app.route('/prompts', methods=['POST'])
+def create_prompts():
+    """Create/update prompts. Saves locally AND syncs to cloud DB."""
+    data = request.get_json()
+    listprompts = data.get('listprompts', [data] if 'name' in data else [])
+
+    saved = []
+    for item in listprompts:
+        pid = item.get('prompt_id')
+        if not pid:
+            # Auto-assign prompt_id from existing files
+            existing = [f.replace('.json', '') for f in os.listdir('prompts')
+                        if f.endswith('.json') and '_' not in f and f[0].isdigit()]
+            pid = max([int(x) for x in existing if x.isdigit()] or [0]) + 1
+            item['prompt_id'] = pid
+
+        # Save locally
+        local_path = f'prompts/{pid}.json'
+        local_data = {}
+        if os.path.exists(local_path):
+            with open(local_path, 'r') as f:
+                local_data = json.load(f)
+
+        local_data['name'] = item.get('name', local_data.get('name', ''))
+        local_data['goal'] = item.get('prompt', item.get('goal', local_data.get('goal', '')))
+        local_data['prompt_id'] = pid
+        local_data['creator_user_id'] = item.get('user_id', local_data.get('creator_user_id'))
+        if 'agent_name' in item:
+            local_data['agent_name'] = item['agent_name']
+        if 'status' not in local_data:
+            local_data['status'] = 'pending'
+
+        with open(local_path, 'w') as f:
+            json.dump(local_data, f, indent=2)
+
+        saved.append({'prompt_id': pid, 'name': local_data['name']})
+
+    # Sync to cloud DB (non-blocking, best effort)
+    try:
+        pooled_post(
+            f'{DB_URL}/createpromptlist',
+            json={'listprompts': listprompts},
+            timeout=5)
+    except Exception as e:
+        app.logger.debug(f"Cloud sync failed (non-fatal): {e}")
+
+    return jsonify({'success': True, 'saved': saved})
+
+
+def _get_active_backend_info() -> dict:
+    """Get which LLM backend is currently serving inference."""
+    tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
+    if tier in ('regional', 'central'):
+        return {
+            'type': 'external',
+            'display_name': f"External ({os.environ.get('HEVOLVE_LLM_MODEL_NAME', 'unknown')})",
+            'model': os.environ.get('HEVOLVE_LLM_MODEL_NAME', ''),
+            'url': os.environ.get('HEVOLVE_LLM_ENDPOINT_URL', ''),
+            'mode': tier,
+        }
+    cloud_url = os.environ.get('HEVOLVE_CLOUD_FALLBACK_URL', '')
+    return {
+        'type': 'local_llamacpp',
+        'display_name': 'llama.cpp (Nunba)',
+        'model': 'Qwen3-VL-2B',
+        'mode': 'flat',
+        'cloud_fallback_configured': bool(cloud_url),
+    }
+
+
 @app.route('/status', methods=['GET'])
 def status():
-    return jsonify({'response': 'Working...'})
+    result = {'response': 'Working...', 'status': 'running'}
+
+    # Active LLM backend info
+    result['llm_backend'] = _get_active_backend_info()
+    result['node_tier'] = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
+
+    # crawl4ai health (non-blocking, fail-safe)
+    try:
+        from integrations.agent_engine.world_model_bridge import get_world_model_bridge
+        bridge = get_world_model_bridge()
+        bridge_stats = bridge.get_stats()
+        result['crawl4ai_url'] = bridge_stats.get('api_url', '')
+        result['in_process'] = bridge_stats.get('in_process', False)
+        health = bridge.check_health()
+        result['crawl4ai_healthy'] = health.get('healthy', False)
+        result['learning_active'] = health.get('learning_active', False)
+        result['learning_mode'] = health.get('mode', 'unknown')
+    except Exception:
+        result['crawl4ai_healthy'] = False
+        result['learning_active'] = False
+
+    return jsonify(result)
+
+@app.route('/zeroshot/', methods=['POST'])
+def zeroshot():
+    """
+    Zero-shot classification endpoint using GPT-4.1-mini model.
+
+    Request JSON format:
+    {
+        "input_text": "text to classify",
+        "labels": ["label1", "label2", "label3"],
+        "multi_label": false  // optional, default is false
+    }
+
+    Response format:
+    {
+        "sequence": "input text",
+        "labels": ["label1", "label2", "label3"],
+        "scores": [0.85, 0.10, 0.05]
+    }
+    """
+    try:
+        # Get request data
+        data = request.get_json(force=True)
+        input_text = data.get('input_text', '')
+        labels = data.get('labels', [])
+        multi_label = data.get('multi_label', False)
+
+        # Validate inputs
+        if not input_text:
+            return jsonify({"error": "input_text is required"}), 400
+        if not labels or len(labels) == 0:
+            return jsonify({"error": "labels list is required and cannot be empty"}), 400
+
+        # Create prompt for zero-shot classification
+        if multi_label:
+            prompt = f"""You are a text classification system. Given the following text and a list of labels, determine which labels apply to the text. Multiple labels can apply.
+
+Text: "{input_text}"
+
+Available labels: {', '.join(labels)}
+
+For each label, provide a confidence score between 0 and 1 indicating how well it applies to the text. The scores don't need to sum to 1.
+
+Respond ONLY with a JSON object in this exact format:
+{{"scores": {{"label1": score1, "label2": score2, ...}}}}
+
+Example response format:
+{{"scores": {{"sports": 0.85, "entertainment": 0.60, "politics": 0.15}}}}"""
+        else:
+            prompt = f"""You are a text classification system. Given the following text and a list of labels, classify the text into ONE of the provided labels.
+
+Text: "{input_text}"
+
+Available labels: {', '.join(labels)}
+
+Provide a confidence score between 0 and 1 for each label. The scores should sum to approximately 1.0, with the highest score indicating the most likely label.
+
+Respond ONLY with a JSON object in this exact format:
+{{"scores": {{"label1": score1, "label2": score2, ...}}}}
+
+Example response format:
+{{"scores": {{"sports": 0.75, "entertainment": 0.15, "politics": 0.10}}}}"""
+
+        app.logger.info(f"Zero-shot classification request - Text: {input_text[:100]}..., Labels: {labels}")
+
+        # Call Llama API
+        response = pooled_post(
+            GPT_API,
+            json={
+                "model": "llama",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 500
+            }
+        )
+
+        app.logger.info(f"GPT API response status: {response.status_code}")
+
+        if response.status_code != 200:
+            return jsonify({"error": "GPT API request failed", "details": response.text}), 500
+
+        # Parse GPT response
+        gpt_result = response.json()
+        app.logger.info(f"GPT response: {gpt_result}")
+
+        # Extract the response content
+        if isinstance(gpt_result, dict) and 'text' in gpt_result:
+            response_text = gpt_result['text']
+        elif isinstance(gpt_result, dict) and 'response' in gpt_result:
+            response_text = gpt_result['response']
+        elif isinstance(gpt_result, dict) and 'choices' in gpt_result:
+            response_text = gpt_result['choices'][0]['message']['content']
+        else:
+            response_text = str(gpt_result)
+
+        app.logger.info(f"Response text: {response_text}")
+
+        # Parse JSON from response
+        try:
+            # Try to find JSON in the response
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if json_match:
+                parsed_response = json.loads(json_match.group())
+            else:
+                parsed_response = json.loads(response_text)
+
+            scores_dict = parsed_response.get('scores', {})
+
+            # Convert to list format sorted by scores (descending)
+            sorted_items = sorted(scores_dict.items(), key=lambda x: x[1], reverse=True)
+            sorted_labels = [item[0] for item in sorted_items]
+            sorted_scores = [item[1] for item in sorted_items]
+
+            # Build response in format similar to transformers zero-shot-classification
+            result = {
+                "sequence": input_text,
+                "labels": sorted_labels,
+                "scores": sorted_scores
+            }
+
+            app.logger.info(f"Final result: {result}")
+            return jsonify(result)
+
+        except json.JSONDecodeError as e:
+            app.logger.error(f"JSON parsing error: {e}, Response: {response_text}")
+            # Fallback: return equal probabilities if parsing fails
+            equal_score = 1.0 / len(labels)
+            return jsonify({
+                "sequence": input_text,
+                "labels": labels,
+                "scores": [equal_score] * len(labels),
+                "warning": "Could not parse model response, returning equal probabilities"
+            })
+
+    except Exception as e:
+        app.logger.error(f"Error in /zeroshot/ endpoint: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+def main():
+    """
+    Main entry point for hevolve-server CLI command.
+    Starts the Flask server using waitress.
+    """
+    serve(app, host='0.0.0.0', port=6778, threads=50)
+
 
 if __name__ == '__main__':
-    serve(app, host='0.0.0.0', port=6777, threads=50)
+    main()
     # app.debug = True
     # flask_thread = threading.Thread(target=lambda: serve(app, host='0.0.0.0', port=6777))
     # flask_thread.daemon = True

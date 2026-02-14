@@ -1,0 +1,75 @@
+{
+    "status": "done",
+    "action": "Generate Videos (All at Once)",
+    "fallback_action": "Retrieve avatar IDs using the API: https://mailer.hertzai.com/all_teacher_only_avatars_id_user_id?user_id={user_id} and associate each genre with a unique avatar ID from the response, saving that info as well.",
+    "persona": "News Curator",
+    "action_id": 5,
+    "recipe": [
+        {
+            "steps": "Generate a video for the World News script",
+            "tool_name": "Generate_video",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Save the generated video conv_id for World News in memory",
+            "tool_name": "save_data_in_memory",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Generate a video for the Business News script",
+            "tool_name": "Generate_video",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Save the generated video conv_id for Business News in memory",
+            "tool_name": "save_data_in_memory",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Generate a video for the Health News script",
+            "tool_name": "Generate_video",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Save the generated video conv_id for Health News in memory",
+            "tool_name": "save_data_in_memory",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Generate a video for the Entertainment News script",
+            "tool_name": "Generate_video",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Save the generated video conv_id for Entertainment News in memory",
+            "tool_name": "save_data_in_memory",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [],
+    "metadata": {
+        "user_id": "redacted <class 'int'>",
+        "conversation": {
+            "conv_id": "redacted <class 'str'>"
+        },
+        "news": {
+            "genre": "redacted <class 'str'>",
+            "headlines": {
+                "by_genres": "redacted <class 'str'>"
+            }
+        },
+        "news_curator": {
+            "avatars": "redacted <class 'str'>",
+            "scripts": "redacted <class 'str'>",
+            "videos": {
+                "world_news": "redacted <class 'str'>",
+                "business_news": "redacted <class 'str'>",
+                "health_news": "redacted <class 'str'>",
+                "entertainment_news": "redacted <class 'str'>"
+            }
+        }
+    },
+    "time_took_to_complete": 154.52629017829895,
+    "actions_this_action_depends_on": []
+}

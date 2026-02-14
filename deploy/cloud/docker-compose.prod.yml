@@ -1,0 +1,205 @@
+version: '3.8'
+
+# Production overrides for docker-compose.yml
+# Usage: docker-compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+
+services:
+  # ============================================
+  # Backend - Production Settings
+  # ============================================
+  backend:
+    restart: always
+    environment:
+      - FLASK_ENV=production
+      - DEBUG=false
+      - WORKERS=4
+      - THREADS=4
+      - TIMEOUT=120
+      - LOG_LEVEL=INFO
+      # Security settings
+      - SECURE_COOKIES=true
+      - SESSION_COOKIE_SECURE=true
+      - SESSION_COOKIE_HTTPONLY=true
+      # Performance tuning
+      - GUNICORN_KEEP_ALIVE=5
+      - GUNICORN_MAX_REQUESTS=1000
+      - GUNICORN_MAX_REQUESTS_JITTER=50
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+        labels: "service,environment"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.backend.rule=Host(`api.yourdomain.com`)"
+      - "traefik.http.services.backend.loadbalancer.server.port=8000"
+
+  # ============================================
+  # PostgreSQL - Production Settings
+  # ============================================
+  postgres:
+    restart: always
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-chatbot}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB:-chatbot_db}
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=200"
+      - "-c"
+      - "shared_buffers=256MB"
+      - "-c"
+      - "effective_cache_size=768MB"
+      - "-c"
+      - "maintenance_work_mem=128MB"
+      - "-c"
+      - "checkpoint_completion_target=0.9"
+      - "-c"
+      - "wal_buffers=16MB"
+      - "-c"
+      - "default_statistics_target=100"
+      - "-c"
+      - "random_page_cost=1.1"
+      - "-c"
+      - "effective_io_concurrency=200"
+      - "-c"
+      - "work_mem=4MB"
+      - "-c"
+      - "min_wal_size=1GB"
+      - "-c"
+      - "max_wal_size=4GB"
+      - "-c"
+      - "max_worker_processes=4"
+      - "-c"
+      - "max_parallel_workers_per_gather=2"
+      - "-c"
+      - "max_parallel_workers=4"
+      - "-c"
+      - "log_statement=mod"
+      - "-c"
+      - "log_min_duration_statement=1000"
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2G
+        reservations:
+          cpus: '0.25'
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+    # Remove port exposure in production (access via internal network only)
+    ports: []
+
+  # ============================================
+  # Redis - Production Settings
+  # ============================================
+  redis:
+    restart: always
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --tcp-keepalive 300
+      --timeout 0
+      --tcp-backlog 511
+      --save 900 1
+      --save 300 10
+      --save 60 10000
+      --rdbcompression yes
+      --rdbchecksum yes
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 768M
+        reservations:
+          cpus: '0.1'
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
+    # Remove port exposure in production (access via internal network only)
+    ports: []
+
+  # ============================================
+  # Nginx - Production Settings (enabled by default in prod)
+  # ============================================
+  nginx:
+    restart: always
+    profiles: []  # Remove profile restriction, always run in prod
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.1'
+          memory: 64M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+# ============================================
+# Production Volume Configuration
+# ============================================
+volumes:
+  postgres-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/llm-chatbot/data/postgres
+  redis-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/llm-chatbot/data/redis
+  backend-logs:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/llm-chatbot/logs/backend
+  backend-media:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/llm-chatbot/data/media
+  backend-agent-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/llm-chatbot/data/agent
+  nginx-logs:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/llm-chatbot/logs/nginx

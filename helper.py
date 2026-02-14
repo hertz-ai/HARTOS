@@ -1,12 +1,13 @@
 from collections import deque
 import requests
 import re
+import ast
 import autogen
 
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
 import json
 from flask import current_app
-from typing import List, Dict, Tuple, Annotated, Set, FrozenSet
+from typing import List, Dict, Tuple, Annotated, Set, FrozenSet, Any
 import pickle
 from PIL import Image
 import uuid
@@ -24,47 +25,29 @@ from langchain.memory import ZepMemory
 from json_repair import repair_json
 import traceback
 
-# from autobahn.twisted.wamp import ApplicationSession, ApplicationRunner
-# from twisted.internet.defer import inlineCallbacks
-with open("config.json", 'r') as f:
-    config = json.load(f)
+# Performance: cached config loading (single read instead of 3+)
+from core.config_cache import get_config as _get_config
+# Performance: connection-pooled HTTP sessions
+from core.http_pool import get_http_session, pooled_post, pooled_get, pooled_request
+# Performance: singleton event loop
+from core.event_loop import get_or_create_event_loop
 
+config = _get_config()
 
-os.environ["OPENAI_API_KEY"] = config['OPENAI_API_KEY']
-os.environ["GOOGLE_CSE_ID"] = config['GOOGLE_CSE_ID']
-os.environ["GOOGLE_API_KEY"] = config['GOOGLE_API_KEY']
-os.environ["NEWS_API_KEY"] = config['NEWS_API_KEY']
-os.environ["SERPAPI_API_KEY"] = config['SERPAPI_API_KEY']
+os.environ["OPENAI_API_KEY"] = config.get('OPENAI_API_KEY', '')
+os.environ["GOOGLE_CSE_ID"] = config.get('GOOGLE_CSE_ID', '')
+os.environ["GOOGLE_API_KEY"] = config.get('GOOGLE_API_KEY', '')
+os.environ["NEWS_API_KEY"] = config.get('NEWS_API_KEY', '')
+os.environ["SERPAPI_API_KEY"] = config.get('SERPAPI_API_KEY', '')
 
-ACTION_API = config['ACTION_API']
-STUDENT_API = config['STUDENT_API']
-ZEP_API_URL = config['ZEP_API_URL']
-ZEP_API_KEY = config['ZEP_API_KEY']
+ACTION_API = config.get('ACTION_API', '')
+STUDENT_API = config.get('STUDENT_API', '')
+ZEP_API_URL = config.get('ZEP_API_URL', '')
+ZEP_API_KEY = config.get('ZEP_API_KEY', '')
 
 search = GoogleSearchAPIWrapper(k=4)
 redis_client = redis.StrictRedis(
     host='azure_all_vms.hertzai.com', port=6369, db=0)
-
-
-# class CrossbarClient(ApplicationSession):
-
-#     @inlineCallbacks
-#     def onJoin(self, details):
-#         print("Connected to Crossbar.io!")
-
-#     @inlineCallbacks
-#     def call_rpc(self, topic, params):
-#         """Calls an RPC function dynamically with the given topic and parameters."""
-#         try:
-#             result = yield self.call(topic, *params)
-#             print(f"RPC Call to {topic} Result:", result)
-#             return result
-#         except Exception as e:
-#             print(f"Error calling RPC {topic}: {e}")
-#             return None
-
-# runner = ApplicationRunner(url="ws://aws_rasa.hertzai.com:8088/", realm="realm1")
-# rpc_client = runner.run(CrossbarClient, start_reactor=False)
 
 async def fetch(session, url):
     try:
@@ -110,8 +93,8 @@ def crawl4ai_fetch(url: str, timeout: int = 30) -> str:
             "wait_for": "css:body"
         }
 
-        # Call Crawl4AI API
-        response = requests.post(
+        # Call Crawl4AI API (connection pooled)
+        response = pooled_post(
             f"{CRAWL4AI_API_URL}/crawl",
             json=payload,
             timeout=timeout + 10,  # Add buffer for API processing
@@ -159,8 +142,8 @@ def crawl4ai_batch_fetch(urls: List[str], max_concurrent: int = 2) -> List[str]:
             "max_concurrent": max_concurrent
         }
 
-        # Call Crawl4AI batch API
-        response = requests.post(
+        # Call Crawl4AI batch API (connection pooled)
+        response = pooled_post(
             f"{CRAWL4AI_API_URL}/crawl/batch",
             json=payload,
             timeout=120,  # 2 minutes for batch processing
@@ -198,7 +181,7 @@ def fallback_fetch(url: str) -> str:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
-        response = requests.get(url, headers=headers, timeout=10)
+        response = pooled_get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(response.text, 'html.parser')
 
         # Remove unwanted elements
@@ -222,7 +205,7 @@ def check_crawl4ai_service() -> bool:
     Check if Crawl4AI API service is available
     """
     try:
-        response = requests.get(f"{CRAWL4AI_API_URL}/health", timeout=5)
+        response = pooled_get(f"{CRAWL4AI_API_URL}/health", timeout=5)
         return response.status_code == 200
     except:
         return False
@@ -372,7 +355,7 @@ def parse_user_id(user_id:int):
         "user_id": user_id
     })
 
-    response = requests.request("POST", url, headers=headers, data=payload)
+    response = pooled_request("POST", url, headers=headers, data=payload)
     return response.text
 
 def topological_sort(actions):
@@ -440,10 +423,10 @@ def fix_actions(array_of_actions,cyclic_ids):
     'Content-Type': 'application/json'
     }
     try:
-        response = requests.request("POST", url, headers=headers, data=payload)
+        response = pooled_post(url, headers=headers, data=payload)
         response = response.json()
         print(response)
-        x = eval(response['text'])
+        x = ast.literal_eval(response['text'])
         print(f'got json object')
         return x
     except Exception as e:
@@ -466,7 +449,7 @@ def gpt_call(prompt):
     'Content-Type': 'application/json'
     }
     try:
-        response = requests.request("POST", url, headers=headers, data=payload)
+        response = pooled_post(url, headers=headers, data=payload)
         response = response.json()
         print(response)
         return response['text']
@@ -477,7 +460,7 @@ def gpt_call(prompt):
 def gpt_mini(prompt,request_id,history):
     url = "http://aws_rasa.hertzai.com:5459/gpt-json"
     prompt = f'{prompt} conside below as history {history}'
-    response = requests.post(
+    response = pooled_post(
         url,
         json={
             "model": "gpt-4o",
@@ -489,9 +472,6 @@ def gpt_mini(prompt,request_id,history):
     print(f"gpt 4o-mini response is {response.json()}")
     return response.json()["text"]
 
-
-import json
-from typing import Any
 
 def strip_json_values(obj: Any) -> Any:
     """
@@ -525,18 +505,6 @@ def strip_json_values(obj: Any) -> Any:
     else:
         return f"redacted {type(obj).__name__}"
 
-
-# def strip_json_values(data):
-#     if isinstance(data, dict):
-#         return {key: strip_json_values(value) for key, value in data.items()}
-#     elif isinstance(data, list):
-#         return [strip_json_values(item) for item in data]
-#     elif isinstance(data, str):
-#         return f"redacted {type(data)}"  # Truncate to 8 characters and add " redact"
-#     elif isinstance(data, (int, float, bool)) or data is None:
-#         return f'redacted {type(data)}'  # Keep primitive types as is
-#     else:
-#         return f"redacted {type(data)}"
 
 def fix_json(json_text):
     url = "http://aws_rasa.hertzai.com:5459/gpt3"
@@ -574,17 +542,14 @@ def fix_json(json_text):
     'Content-Type': 'application/json'
     }
     try:
-        response = requests.request("POST", url, headers=headers, data=payload)
+        response = pooled_post(url, headers=headers, data=payload)
         response = response.json()
-        x = eval(response['text'])
+        x = ast.literal_eval(response['text'])
         current_app.logger.info(f'got json object')
         return x
     except Exception as e:
         current_app.logger.info(f'GOT ERROR WHILE JSON FIX:{e}')
         return None
-
-
-import ast
 
 
 def retrieve_json(json_message):
@@ -1434,6 +1399,7 @@ class Action:
         self.fallback = False
         self.new_json = []
         self.recipe = False
+        self.ledger = None  # Smart Ledger for persistent task tracking
 
     def get_action(self, array_index):
         if array_index < 0 or array_index >= len(self.actions):
@@ -1447,6 +1413,11 @@ class Action:
                 return i
         return None
 
+    def set_ledger(self, ledger):
+        """Attach Smart Ledger to this Action instance"""
+        self.ledger = ledger
+        current_app.logger.info(f"Smart Ledger attached with {len(ledger.tasks)} tasks")
+
 def txt2img(text: Annotated[str, "Text to create image"]) -> str:
     current_app.logger.info('INSIDE txt2img')
     url = f"http://aws_rasa.hertzai.com:5459/txt2img?prompt={text}"
@@ -1454,7 +1425,7 @@ def txt2img(text: Annotated[str, "Text to create image"]) -> str:
     payload = ""
     headers = {}
 
-    response = requests.post(url, headers=headers, data=payload)
+    response = pooled_post(url, headers=headers, data=payload)
     return response.json()['img_url']
 
 
@@ -1464,7 +1435,8 @@ def get_frame(user_id):
     current_app.logger.info('after redis client')
     try:
         if serialized_frame is not None:
-            frame_bgr = pickle.loads(serialized_frame)
+            from security.safe_deserialize import safe_load_frame
+            frame_bgr = safe_load_frame(serialized_frame)
             current_app.logger.info(
                 f"Frame for user_id {user_id} retrieved successfully.")
             frame = frame_bgr[:, :, ::-1]
@@ -1496,7 +1468,7 @@ def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual c
         ]
         headers = {}
         try:
-            response = requests.post(
+            response = pooled_post(
                 url, headers=headers, data=payload, files=files)
             current_app.logger.info(response.text)
             response = response.text
@@ -1608,7 +1580,7 @@ def get_visual_context(user_id,mins=5):
     payload = {}
     headers = {}
 
-    response = requests.request(
+    response = pooled_request(
         "GET", action_url, headers=headers, data=payload)
 
     if response.status_code == 200:
@@ -1635,6 +1607,89 @@ def get_visual_context(user_id,mins=5):
             return None
     else:
         return None
+
+
+def get_screen_context(user_id, mins=2):
+    '''
+        Get recent screen understanding descriptions (shorter window than visual).
+        Screen context goes stale faster — default 2 minute window.
+    '''
+    action_url = f"https://mailer.hertzai.com/get_visual_bymins?user_id={user_id}&mins={mins}"
+    time_zone = "Asia/Kolkata"
+    india_tz = pytz.timezone(time_zone)
+
+    try:
+        response = pooled_request("GET", action_url, headers={}, data={})
+    except Exception:
+        return None
+
+    if response.status_code == 200:
+        data = response.json()
+        filtered_data_screen = [
+            obj for obj in data if obj["zeroshot_label"] == 'Screen Reasoning']
+        screen_context_texts = []
+        for obj in filtered_data_screen:
+            action = obj["action"]
+            date = parse_date(obj["created_date"])
+            now = datetime.now()
+            if (now - date) > timedelta(minutes=mins):
+                continue
+            screen_text = f"{action} on {date.astimezone(india_tz).strftime('%Y-%m-%dT%H:%M:%S')}"
+            screen_context_texts.append(screen_text)
+        if screen_context_texts:
+            return screen_context_texts[:10]
+        else:
+            return None
+    else:
+        return None
+
+def search_visual_history(user_id, query, mins=30, channel='both'):
+    '''
+        Search past camera/screen descriptions by substring match within a time window.
+        Reuses the same DB endpoint as get_visual_context/get_screen_context.
+        channel: 'camera', 'screen', or 'both'
+    '''
+    action_url = f"https://mailer.hertzai.com/get_visual_bymins?user_id={user_id}&mins={mins}"
+    time_zone = "Asia/Kolkata"
+    india_tz = pytz.timezone(time_zone)
+
+    try:
+        response = pooled_request("GET", action_url, headers={}, data={})
+    except Exception:
+        return None
+
+    if response.status_code != 200:
+        return None
+
+    data = response.json()
+    query_lower = query.lower()
+    results = []
+
+    for obj in data:
+        label = obj.get("zeroshot_label", "")
+        # Filter by channel
+        if channel == 'camera' and label != 'Video Reasoning':
+            continue
+        if channel == 'screen' and label != 'Screen Reasoning':
+            continue
+        if channel == 'both' and label not in ('Video Reasoning', 'Screen Reasoning'):
+            continue
+
+        action = obj.get("action", "")
+        # Substring match on query
+        if query_lower and query_lower not in action.lower():
+            continue
+
+        date = parse_date(obj["created_date"])
+        now = datetime.now()
+        if (now - date) > timedelta(minutes=mins):
+            continue
+
+        ch = 'camera' if label == 'Video Reasoning' else 'screen'
+        results.append(f"[{ch}] {action} at {date.astimezone(india_tz).strftime('%Y-%m-%dT%H:%M:%S')}")
+
+    return results[:20] if results else None
+
 
 def get_memory(user_id: int):
     '''
@@ -1672,19 +1727,20 @@ def history(user_id,prompt_id,role,message):
         return "Memory object not found"
 
 
+# Local llama.cpp server (Qwen3-VL)
 config_list = [{
-    "model": "gpt-4o-mini",
-    "api_type": "azure",
-    "api_key": "4xmi9X9pGCwRn2Pb0vldz6t6FQaAe29bUIkFjKRC7ytrVZ1Ni5cWJQQJ99BAACHYHv6XJ3w3AAABACOG99Zf",
-    "base_url": "https://hertzai-gpt4.openai.azure.com/",
-    "api_version": "2024-02-15-preview",
-    "price":[0.00015,0.0006]
+    "model": 'Qwen3-VL-4B-Instruct',
+    "api_key": 'dummy',
+    "base_url": 'http://localhost:8080/v1',
+    "price": [0, 0]
 }]
 
 llm_config = {
     "config_list": config_list,
     "cache_seed": None
 }
+
+
 def create_visual_agent(user_id,prompt_id):
     visual_agent = autogen.AssistantAgent(
         name='visual_agent',
@@ -1737,7 +1793,7 @@ def create_visual_agent(user_id,prompt_id):
             9. IMPORTANT instruction: If you want to ask something or send something to the user, always use this format: @user {{'message_2_user':'message here'}}
             10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
 
-            Note: Your Working Directory is "/home/hertzai2019/newauto/coding" use this if you need,
+            Note: Your Working Directory is "{os.getcwd()}" - CRITICAL: When writing code, ALWAYS use os.path.join(os.getcwd(), filename) for file paths. NEVER hardcode paths like '/home/user/path'.
             Add proper error handling, logging.
             Always provide clear execution results or error messages to the assistant.
             if you get any conversation which is not related to coding ask the manager to route this conversation to user
@@ -1761,12 +1817,14 @@ def create_visual_agent(user_id,prompt_id):
         Response formats:
             1. Action Completed Successfully: {"status": "completed","action": "current action","action_id": 1/2/3...,"message": "message here"}
             2. Action Error: {"status": "error","action": "current action","action_id": 1/2/3...,"message": "message here"}
-            2. Action Pending: {"status": "pending","action": "current action","action_id": 1/2/3...,"message": "pending actions here"}
+            3. Action Pending: {"status": "pending","action": "current action","action_id": 1/2/3...,"message": "pending actions here"}
+            4. Action Requires Breakdown: {"status": "requires_breakdown","action": "current action","action_id": 1/2/3...,"reason": "Why this action needs to be broken down","subtasks": [{"subtask_id": "1.1","description": "First subtask description","depends_on": [],"can_perform_autonomously": true},{"subtask_id": "1.2","description": "Second subtask","depends_on": ["1.1"],"can_perform_autonomously": true}]}
         Important Instructions:
             Only mark an action as "Completed" if the Assistant Agent confirms successful completion.
             For pending tasks or ongoing actions, respond to helper to complete the task.
             Verify the action performed by assistant and make sure the action is performed correctly as per instructions. if action performed was not as per instructions give the pending actions to the helper agent.
             Report status only—do not perform actions yourself.
+            Use "requires_breakdown" when an action is too complex and needs to be split into smaller subtasks.
 
         """,
         is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
@@ -1797,6 +1855,265 @@ def create_visual_agent(user_id,prompt_id):
     return visual_agent, visual_user, helper2, executor2, multi_role_agent2, verify2, chat_instructor2
 
 
+# Create agent_data directory if it doesn't exist
+AGENT_DATA_DIR = "agent_data"
+if not os.path.exists(AGENT_DATA_DIR):
+    os.makedirs(AGENT_DATA_DIR)
+
+
+def get_agent_data_file_path(prompt_id: int) -> str:
+    """Get the file path for storing agent data for a specific prompt_id"""
+    return os.path.join(AGENT_DATA_DIR, f"{prompt_id}_agent_data.json")
+
+
+def save_agent_data_to_file(prompt_id: int, agent_data: Dict) -> bool:
+    """
+    Save current agent_data[prompt_id] to a JSON file
+
+    Args:
+        prompt_id: The prompt ID to save data for
+        agent_data: The agent data dictionary
+    Returns:
+        bool: True if saved successfully, False otherwise
+    """
+    try:
+        file_path = get_agent_data_file_path(prompt_id)
+
+        # Get current agent data for this prompt_id
+        data_to_save = agent_data.get(prompt_id, {})
+
+        # Add metadata about when this was saved
+        save_metadata = {
+            "prompt_id": prompt_id,
+            "saved_at": datetime.now().isoformat(),
+            "data": data_to_save
+        }
+
+        # Write to file with encryption (falls back to plaintext if no key configured)
+        try:
+            from security.crypto import encrypt_json_file
+            encrypt_json_file(file_path, save_metadata)
+        except ImportError:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump(save_metadata, f, indent=2, ensure_ascii=False)
+
+        current_app.logger.info(f" Saved agent data to: {file_path}")
+        return True
+
+    except Exception as e:
+        current_app.logger.error(f" Error saving agent data for prompt_id {prompt_id}: {e}")
+        return False
+
+
+def load_agent_data_from_file(prompt_id: int, agent_data: Dict) -> bool:
+    """
+    Load agent_data[prompt_id] from JSON file
+
+    Args:
+        prompt_id: The prompt ID to load data for
+        agent_data: The agent data dictionary
+
+    Returns:
+        bool: True if loaded successfully, False otherwise
+    """
+    try:
+        file_path = get_agent_data_file_path(prompt_id)
+
+        # Check if file exists
+        if not os.path.exists(file_path):
+            current_app.logger.info(f"[FILE] No saved agent data found for prompt_id {prompt_id}")
+            # Initialize with default data
+            agent_data[prompt_id] = {}
+            return False
+
+        # Load from file (supports encrypted and plaintext)
+        try:
+            from security.crypto import decrypt_json_file
+            loaded_data = decrypt_json_file(file_path)
+            if loaded_data is None:
+                current_app.logger.warning(f"Failed to decrypt/load: {file_path}")
+                agent_data[prompt_id] = {}
+                return False
+        except ImportError:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                loaded_data = json.load(f)
+
+        # Extract the actual data (skip metadata)
+        if 'data' in loaded_data:
+            agent_data[prompt_id] = loaded_data['data']
+            current_app.logger.info(f" Loaded agent data from: {file_path}")
+            current_app.logger.info(f" Loaded data keys: {list(agent_data[prompt_id].keys())}")
+            return True
+        else:
+            # Handle old format (direct data)
+            agent_data[prompt_id] = loaded_data
+            current_app.logger.info(f" Loaded agent data (old format) from: {file_path}")
+            return True
+
+    except Exception as e:
+        current_app.logger.error(f" Error loading agent data for prompt_id {prompt_id}: {e}")
+        # Initialize with default data on error
+        agent_data[prompt_id] = {}
+        return False
+
+
+def schedule_periodic_backups(agent_data, scheduler):
+    """Schedule periodic backups of agent data"""
+
+    def backup_all_agent_data():
+        """Backup all active agent data"""
+        backup_count = 0
+        for prompt_id in agent_data.keys():
+            if agent_data[prompt_id]:  # Only backup if there's data
+                if backup_agent_data_file(prompt_id):
+                    backup_count += 1
+
+    # Schedule daily backups at 2 AM
+    if scheduler.running:
+        scheduler.add_job(
+            backup_all_agent_data,
+            'cron',
+            hour=2,
+            minute=0,
+            id='periodic_agent_data_backup'
+        )
+
+
+def initialize_persistent_storage(agent_data: Dict):
+    """
+    Initialize persistent storage and migrate existing data
+    Call this during application startup
+        Args:
+        agent_data: The agent data dictionary
+
+    """
+    try:
+        # Create agent_data directory if it doesn't exist
+        if not os.path.exists(AGENT_DATA_DIR):
+            os.makedirs(AGENT_DATA_DIR)
+
+        return True
+
+    except Exception as e:
+        return False
+
+
+def backup_agent_data_file(prompt_id: int) -> bool:
+    """
+    Create a backup of the current agent data file
+
+    Args:
+        prompt_id: The prompt ID to backup data for
+
+    Returns:
+        bool: True if backup created successfully, False otherwise
+    """
+    try:
+        file_path = get_agent_data_file_path(prompt_id)
+
+        if not os.path.exists(file_path):
+            return False
+
+        # Create backup with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = file_path.replace('.json', f'_backup_{timestamp}.json')
+
+        # Copy file
+        import shutil
+        shutil.copy2(file_path, backup_path)
+
+        current_app.logger.info(f" Created backup: {backup_path}")
+        return True
+
+    except Exception as e:
+        current_app.logger.error(f" Error creating backup for prompt_id {prompt_id}: {e}")
+        return False
+
+
+def cleanup_old_backups(prompt_id: int, keep_count: int = 5) -> int:
+    """
+    Clean up old backup files, keeping only the most recent ones
+
+    Args:
+        prompt_id: The prompt ID to clean backups for
+        keep_count: Number of backup files to keep
+
+    Returns:
+        int: Number of files deleted
+    """
+    try:
+        backup_pattern = f"{prompt_id}_agent_data_backup_"
+        backup_files = []
+
+        # Find all backup files for this prompt_id
+        for filename in os.listdir(AGENT_DATA_DIR):
+            if filename.startswith(backup_pattern) and filename.endswith('.json'):
+                file_path = os.path.join(AGENT_DATA_DIR, filename)
+                # Get file modification time
+                mtime = os.path.getmtime(file_path)
+                backup_files.append((mtime, file_path))
+
+        # Sort by modification time (newest first)
+        backup_files.sort(reverse=True)
+
+        # Delete old backups
+        deleted_count = 0
+        for i, (mtime, file_path) in enumerate(backup_files):
+            if i >= keep_count:  # Keep only the newest keep_count files
+                os.remove(file_path)
+                deleted_count += 1
+                current_app.logger.info(f" Deleted old backup: {file_path}")
+
+        return deleted_count
+
+    except Exception as e:
+        current_app.logger.error(f" Error cleaning up backups for prompt_id {prompt_id}: {e}")
+        return 0
+
+
+def get_agent_data_info(prompt_id: int) -> Dict[str, Any]:
+    """
+    Get information about saved agent data file
+
+    Args:
+        prompt_id: The prompt ID to get info for
+
+    Returns:
+        dict: Information about the file
+    """
+    try:
+        file_path = get_agent_data_file_path(prompt_id)
+
+        if not os.path.exists(file_path):
+            return {"exists": False, "path": file_path}
+
+        # Get file stats
+        stat = os.stat(file_path)
+
+        # Try to get save metadata
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            saved_at = data.get('saved_at', 'unknown')
+            data_keys = list(data.get('data', {}).keys()) if 'data' in data else list(data.keys())
+        except:
+            saved_at = 'unknown'
+            data_keys = []
+
+        return {
+            "exists": True,
+            "path": file_path,
+            "size_bytes": stat.st_size,
+            "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+            "saved_at": saved_at,
+            "data_keys": data_keys
+        }
+
+    except Exception as e:
+        current_app.logger.error(f" Error getting agent data info for prompt_id {prompt_id}: {e}")
+        return {"exists": False, "error": str(e)}
+
+
 # ========================================================================================
 # AUTOGEN JSON HANDLING ENHANCEMENT
 # ========================================================================================
@@ -1806,7 +2123,7 @@ def safe_function_call(func, arguments):
 
     logger = logging.getLogger("safe_function_call")
 
-    logger.info("🔍 SAFE_FUNCTION_CALL DEBUG:")
+    logger.info(" SAFE_FUNCTION_CALL DEBUG:")
     logger.info(f"   Function: {func.__name__ if hasattr(func, '__name__') else func}")
     logger.info(f"   Arguments type: {type(arguments)}")
     logger.info(f"   Arguments content: {arguments}")
@@ -1816,7 +2133,7 @@ def safe_function_call(func, arguments):
         if isinstance(arguments, dict):
             logger.info("   → Using **kwargs approach")
             result = func(**arguments)
-            logger.info("   ✅ Success with **kwargs")
+            logger.info("    Success with **kwargs")
             return result
 
         # Handle list case - FIXED LOGIC
@@ -1830,24 +2147,24 @@ def safe_function_call(func, arguments):
                 logger.info(f"   → Found dict in list[0]: {actual_args}")
                 logger.info("   → Using **kwargs approach on extracted dict")
                 result = func(**actual_args)
-                logger.info("   ✅ Success with **kwargs from list")
+                logger.info("    Success with **kwargs from list")
                 return result
             else:
                 # Fallback to treating as positional args
                 logger.info("   → Using *args approach")
                 result = func(*arguments)
-                logger.info("   ✅ Success with *args")
+                logger.info("    Success with *args")
                 return result
 
         # Handle single argument case
         else:
             logger.info("   → Using single argument approach")
             result = func(arguments)
-            logger.info("   ✅ Success with single arg")
+            logger.info("    Success with single arg")
             return result
 
     except TypeError as e:
-        logger.error(f"   ❌ TypeError: {e}")
+        logger.error(f"    TypeError: {e}")
         logger.error(f"   TypeError traceback:\n{traceback.format_exc()}")
 
         # Enhanced intelligent mapping for lists
@@ -1859,7 +2176,7 @@ def safe_function_call(func, arguments):
                 if len(arguments) >= 1 and isinstance(arguments[0], dict):
                     logger.info("   → Extracting dict from list and retrying")
                     result = func(**arguments[0])
-                    logger.info("   ✅ Success with extracted dict")
+                    logger.info("    Success with extracted dict")
                     return result
 
                 # If it's a simple list, try intelligent parameter mapping
@@ -1877,19 +2194,19 @@ def safe_function_call(func, arguments):
                         kwargs = dict(zip(param_names, clean_args))
                         logger.info(f"   → Mapped to kwargs: {kwargs}")
                         result = func(**kwargs)
-                        logger.info("   ✅ Success with intelligent mapping")
+                        logger.info("    Success with intelligent mapping")
                         return result
 
             except Exception as mapping_error:
-                logger.error(f"   ❌ Enhanced list handling failed: {mapping_error}")
+                logger.error(f"    Enhanced list handling failed: {mapping_error}")
                 logger.error(f"   Mapping traceback:\n{traceback.format_exc()}")
 
         # Re-raise if we can't handle it
-        logger.error("   ❌ Cannot handle - re-raising original TypeError")
+        logger.error("    Cannot handle - re-raising original TypeError")
         raise e
 
     except Exception as e:
-        logger.error(f"   ❌ Unexpected error: {e}")
+        logger.error(f"    Unexpected error: {e}")
         logger.error(f"   Unexpected error traceback:\n{traceback.format_exc()}")
         raise e
 
@@ -1922,19 +2239,19 @@ def force_apply_autogen_json_fix():
                 # Try original autogen approach first
                 formatted_string = self._format_json_str(input_string)
                 arguments = json.loads(formatted_string)
-                print(f"✅ ORIGINAL AUTOGEN: Successfully parsed arguments for {func_name}")
+                print(f" ORIGINAL AUTOGEN: Successfully parsed arguments for {func_name}")
             except (json.JSONDecodeError, Exception) as e:
                 # Only if original fails, fall back to our enhanced parsing
-                print(f"⚠️ ORIGINAL AUTOGEN FAILED: {e} - falling back to enhanced parsing for {func_name}")
+                print(f" ORIGINAL AUTOGEN FAILED: {e} - falling back to enhanced parsing for {func_name}")
                 try:
                     arguments = retrieve_json(input_string)
                     if arguments is None:
                         arguments = {}
                     elif isinstance(arguments, str):
                         arguments = json.loads(arguments)
-                    print(f"✅ FALLBACK SUCCESSFUL: Enhanced parsing worked for {func_name}")
+                    print(f" FALLBACK SUCCESSFUL: Enhanced parsing worked for {func_name}")
                 except Exception as fallback_error:
-                    print(f"❌ FALLBACK FAILED: {fallback_error}")
+                    print(f" FALLBACK FAILED: {fallback_error}")
                     arguments = None
                     content = f"Error: {e}\n The argument must be in JSON format."
 
@@ -1942,18 +2259,18 @@ def force_apply_autogen_json_fix():
             if arguments is not None:
                 iostream.print(f"\n>>>>>>>> EXECUTING FUNCTION {func_name}...", flush=True)
                 try:
-                    print("🔍 Function being called details:")
+                    print(" Function being called details:")
                     print(f"   Function: {func}")
                     print(f"   Function name: {getattr(func, '__name__', 'NO_NAME')}")
-                    print("🔍 Parsed arguments analysis:")
+                    print(" Parsed arguments analysis:")
                     print(f"   Arguments type: {type(arguments)}")
                     print(f"   Arguments content: {arguments}")
                     content = safe_function_call(func, arguments)  # Original autogen always uses **kwargs
                     is_exec_success = True
-                    print(f"✅ EXECUTED: Successfully executed {func_name}")
+                    print(f" EXECUTED: Successfully executed {func_name}")
                 except Exception as e:
                     content = f"Error: {e}"
-                    print(f"❌ EXECUTION FAILED: {func_name}: {e}")
+                    print(f" EXECUTION FAILED: {func_name}: {e}")
         else:
             content = f"Error: Function {func_name} not found."
 
@@ -1989,29 +2306,29 @@ def force_apply_autogen_json_fix():
                 # Try original autogen approach first
                 formatted_string = self._format_json_str(input_string)
                 arguments = json.loads(formatted_string)
-                print(f"✅ ORIGINAL AUTOGEN ASYNC: Successfully parsed arguments for {func_name}")
+                print(f" ORIGINAL AUTOGEN ASYNC: Successfully parsed arguments for {func_name}")
             except (json.JSONDecodeError, Exception) as e:
                 # Only if original fails, fall back to our enhanced parsing
-                print(f"⚠️ ORIGINAL AUTOGEN ASYNC FAILED: {e} - falling back to enhanced parsing for {func_name}")
+                print(f" ORIGINAL AUTOGEN ASYNC FAILED: {e} - falling back to enhanced parsing for {func_name}")
                 try:
                     arguments = retrieve_json(input_string)
                     if arguments is None:
                         arguments = {}
                     elif isinstance(arguments, str):
                         arguments = json.loads(arguments)
-                    print(f"✅ FALLBACK ASYNC SUCCESSFUL: Enhanced parsing worked for {func_name}")
+                    print(f" FALLBACK ASYNC SUCCESSFUL: Enhanced parsing worked for {func_name}")
                 except Exception as fallback_error:
-                    print(f"❌ FALLBACK ASYNC FAILED: {fallback_error}")
+                    print(f" FALLBACK ASYNC FAILED: {fallback_error}")
                     arguments = None
                     content = f"Error: {e}\n The argument must be in JSON format."
 
             if arguments is not None:
                 iostream.print(f"\n>>>>>>>> EXECUTING ASYNC FUNCTION {func_name}...", flush=True)
                 try:
-                    print("🔍 Function being called details:")
+                    print(" Function being called details:")
                     print(f"   Function: {func}")
                     print(f"   Function name: {getattr(func, '__name__', 'NO_NAME')}")
-                    print("🔍 Parsed arguments analysis:")
+                    print(" Parsed arguments analysis:")
                     print(f"   Arguments type: {type(arguments)}")
                     print(f"   Arguments content: {arguments}")
                     import inspect
@@ -2027,10 +2344,10 @@ def force_apply_autogen_json_fix():
                     else:
                         content = safe_function_call(func, arguments)
                     is_exec_success = True
-                    print(f"✅ EXECUTED ASYNC: Successfully executed {func_name}")
+                    print(f" EXECUTED ASYNC: Successfully executed {func_name}")
                 except Exception as e:
                     content = f"Error: {e}"
-                    print(f"❌ EXECUTION ASYNC FAILED: {func_name}: {e}")
+                    print(f" EXECUTION ASYNC FAILED: {func_name}: {e}")
         else:
             content = f"Error: Function {func_name} not found."
 
@@ -2058,23 +2375,23 @@ def force_apply_autogen_json_fix():
         new_a_execute = getattr(ConversableAgent, 'a_execute_function', None)
 
         if new_execute is not original_execute:
-            print("🎉 SUCCESS: Autogen sync execute_function has been patched!")
+            print(" SUCCESS: Autogen sync execute_function has been patched!")
         else:
-            print("❌ FAILED: Autogen sync execute_function patch was not applied")
+            print(" FAILED: Autogen sync execute_function patch was not applied")
 
         if new_a_execute is not original_a_execute:
-            print("🎉 SUCCESS: Autogen async execute_function has been patched!")
+            print(" SUCCESS: Autogen async execute_function has been patched!")
         else:
-            print("❌ FAILED: Autogen async execute_function patch was not applied")
+            print(" FAILED: Autogen async execute_function patch was not applied")
 
-        print("🔧 Autogen JSON handling enhanced - tool calls can now handle unlimited length!")
+        print(" Autogen JSON handling enhanced - tool calls can now handle unlimited length!")
         return True
 
     except ImportError as e:
-        print(f"❌ Could not import autogen for patching: {e}")
+        print(f" Could not import autogen for patching: {e}")
         return False
     except Exception as e:
-        print(f"❌ Error applying autogen patches: {e}")
+        print(f" Error applying autogen patches: {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -2084,9 +2401,39 @@ def force_apply_autogen_json_fix():
 # Also provide a manual trigger function for Flask startup
 def apply_autogen_fix_on_startup():
     """Manual function to call during Flask app startup if automatic patch fails."""
-    print("🔄 Manually applying autogen JSON fix...")
+    print("[INIT] Manually applying autogen JSON fix...")
     return force_apply_autogen_json_fix()
 
 # ========================================================================================
 # END AUTOGEN JSON HANDLING ENHANCEMENT
 # ========================================================================================
+def load_vlm_agent_files(prompt_id, role_number):
+    """Loads any VLM agent JSON files for the given prompt_id and role_number and integrates them with existing recipes."""
+    vlm_actions = []
+
+    # Look for existing VLM agent files
+    try:
+        for file in os.listdir("prompts"):
+            if file.startswith(f"{prompt_id}_{role_number}_") and file.endswith("_vlm_agent.json"):
+                file_path = os.path.join("prompts", file)
+                try:
+                    with open(file_path, 'r') as f:
+                        recipe_data = json.load(f)
+                        current_app.logger.info(f"Found VLM agent recipe: {file_path}")
+
+                        # Extract the action ID from the filename (assuming format: prompt_id_role_number_action_id_vlm_agent.json)
+                        parts = file.split('_')
+                        if len(parts) >= 4:
+                            try:
+                                action_id = int(parts[2]) # Get the action ID
+                                # Add or replace action in the actions list
+                                recipe_data["action_id"] = action_id
+                                vlm_actions.append(recipe_data)
+                            except (ValueError, IndexError):
+                                current_app.logger.error(f"Couldn't parse action ID from filename {file}")
+                except Exception as e:
+                    current_app.logger.error(f"Error reading VLM agent file {file_path}: {e}")
+    except Exception as e:
+        current_app.logger.error(f"Error listing files in prompts directory: {e}")
+
+    return vlm_actions

@@ -1,0 +1,39 @@
+{
+    "status": "done",
+    "action": "Check video generation status at: https://mailer.hertzai.com/get-video-conv_id/{{conv_id}} until all videos are marked successful.",
+    "fallback_action": "",
+    "persona": "News Curator",
+    "action_id": 6,
+    "recipe": [
+        {
+            "steps": "Retrieve the conv_id for each video from memory.",
+            "tool_name": "get_data_by_key",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Check the video generation status using the URL https://mailer.hertzai.com/get-video-conv_id/{{conv_id}}.",
+            "tool_name": "None",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Repeat the status check until all videos are marked successful.",
+            "tool_name": "None",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Save the successful status of each video in memory using a key structure such as 'videos.successful'.",
+            "tool_name": "save_data_in_memory",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [],
+    "metadata": {
+        "user_id": "redacted <class 'int'>",
+        "genre": {
+            "avatars": "redacted <class 'str'>"
+        }
+    },
+    "time_took_to_complete": 673.5465421676636,
+    "actions_this_action_depends_on": []
+}

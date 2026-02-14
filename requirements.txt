@@ -17,6 +17,7 @@ click==8.1.3
 clickhouse-connect==0.6.4
 cmake==3.26.4
 colorama==0.4.6
+cryptography>=41.0.0
 coloredlogs==15.0.1
 config==0.5.1
 crossbarhttp3==1.1
@@ -151,7 +152,18 @@ websockets==11.0.3
 Werkzeug==2.3.6
 xxhash==3.4.1
 yarl==1.9.2
-zep-python==0.32
+
 zipp==3.15.0
 zstandard==0.21.0
 #streamlit~=1.19.0
+
+# Agent Lightning - Custom implementation in integrations/agent_lightning/
+# No external package required - using our own implementation
+python-telegram-bot>=21.0
+discord.py>=2.3.0
+
+# SimpleMem - Lifelong memory for LLM agents (optional)
+simplemem>=0.1.0
+
+# RSS/Atom feed parsing and generation
+feedparser>=6.0.0

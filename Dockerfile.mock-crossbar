@@ -1,0 +1,26 @@
+# Mock Crossbar Server
+# Simulates Crossbar.io WAMP router for pub/sub testing
+
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Install dependencies
+RUN pip install --no-cache-dir \
+    flask==3.0.0 \
+    flask-cors==4.0.0 \
+    flask-socketio==5.3.5 \
+    python-socketio==5.10.0
+
+# Copy mock server code
+COPY tests/runtime_tests/mock_services/mock_crossbar_server.py .
+
+# Expose ports
+EXPOSE 8088
+
+# Health check
+HEALTHCHECK --interval=10s --timeout=5s --retries=3 \
+    CMD python -c "import requests; requests.get('http://localhost:8088/health')"
+
+# Run server
+CMD ["python", "mock_crossbar_server.py"]

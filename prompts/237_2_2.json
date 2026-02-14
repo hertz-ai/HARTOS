@@ -1,0 +1,28 @@
+{
+    "status": "done",
+    "action": "User asks a spiritual question and receives instant spiritual wisdom from the guru.",
+    "fallback_action": "If the user does not wish to proceed, acknowledge politely and offer assistance in the future.",
+    "persona": "User",
+    "action_id": 2,
+    "recipe": [
+        {
+            "steps": "Prompt the user to ask a spiritual question or let them know they can receive instant guidance from the guru if desired.",
+            "tool_name": "",
+            "agent_to_perform_this_action": "Assistant"
+        },
+        {
+            "steps": "Receive the user's spiritual question (if any) and provide an immediate, thoughtful response with spiritual wisdom.",
+            "tool_name": "",
+            "agent_to_perform_this_action": "Assistant"
+        }
+    ],
+    "can_perform_without_user_input": "no-i need the user's spiritual question in order to provide a response",
+    "scheduled_tasks": [],
+    "metadata": {
+        "user_id": "redacted int"
+    },
+    "time_took_to_complete": 20.418277978897095,
+    "actions_this_action_depends_on": [
+        1
+    ]
+}

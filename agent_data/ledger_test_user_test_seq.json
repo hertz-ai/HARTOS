@@ -1,0 +1,927 @@
+{
+  "user_id": "test_user",
+  "prompt_id": "test_seq",
+  "last_updated": "2025-10-25T10:28:08.457094",
+  "tasks": {
+    "seq_task_1": {
+      "task_id": "seq_task_1",
+      "description": "Phase 1: Setup repository",
+      "task_type": "pre_assigned",
+      "execution_mode": "sequential",
+      "status": "completed",
+      "prerequisites": [],
+      "context": {},
+      "priority": 50,
+      "parent_task_id": null,
+      "created_at": "2025-10-25T10:25:56.857044",
+      "updated_at": "2025-10-25T10:25:56.859047",
+      "completed_at": "2025-10-25T10:25:56.859047",
+      "error_message": null,
+      "result": {
+        "status": "repository_ready"
+      },
+      "state_history": [
+        {
+          "status": "pending",
+          "timestamp": "2025-10-25T10:25:56.857044",
+          "reason": "Task created"
+        },
+        {
+          "status": "in_progress",
+          "timestamp": "2025-10-25T10:25:56.859047",
+          "reason": "Task execution started",
+          "previous_status": "pending"
+        },
+        {
+          "status": "completed",
+          "timestamp": "2025-10-25T10:25:56.859047",
+          "reason": "Task completed successfully",
+          "previous_status": "in_progress"
+        }
+      ],
+      "paused_at": null,
+      "resumed_at": null,
+      "pause_count": 0,
+      "stop_reason": null,
+      "termination_reason": null,
+      "child_task_ids": [],
+      "sibling_task_ids": [],
+      "dependent_task_ids": [
+        "seq_task_2"
+      ],
+      "messages_to_dependents": [],
+      "received_messages": [],
+      "blocked_by": []
+    },
+    "seq_task_2": {
+      "task_id": "seq_task_2",
+      "description": "Phase 2: Design specification",
+      "task_type": "pre_assigned",
+      "execution_mode": "sequential",
+      "status": "blocked",
+      "prerequisites": [
+        "seq_task_1"
+      ],
+      "context": {},
+      "priority": 50,
+      "parent_task_id": null,
+      "created_at": "2025-10-25T10:25:56.857044",
+      "updated_at": "2025-10-25T10:25:56.857044",
+      "completed_at": null,
+      "error_message": null,
+      "result": null,
+      "state_history": [
+        {
+          "status": "pending",
+          "timestamp": "2025-10-25T10:25:56.857044",
+          "reason": "Task created"
+        }
+      ],
+      "paused_at": null,
+      "resumed_at": null,
+      "pause_count": 0,
+      "stop_reason": null,
+      "termination_reason": null,
+      "child_task_ids": [],
+      "sibling_task_ids": [],
+      "dependent_task_ids": [
+        "seq_task_3"
+      ],
+      "messages_to_dependents": [],
+      "received_messages": [],
+      "blocked_by": [
+        "seq_task_1"
+      ]
+    },
+    "seq_task_3": {
+      "task_id": "seq_task_3",
+      "description": "Phase 3: Implementation",
+      "task_type": "pre_assigned",
+      "execution_mode": "sequential",
+      "status": "blocked",
+      "prerequisites": [
+        "seq_task_2"
+      ],
+      "context": {},
+      "priority": 50,
+      "parent_task_id": null,
+      "created_at": "2025-10-25T10:25:56.857044",
+      "updated_at": "2025-10-25T10:25:56.857044",
+      "completed_at": null,
+      "error_message": null,
+      "result": null,
+      "state_history": [
+        {
+          "status": "pending",
+          "timestamp": "2025-10-25T10:25:56.857044",
+          "reason": "Task created"
+        }
+      ],
+      "paused_at": null,
+      "resumed_at": null,
+      "pause_count": 0,
+      "stop_reason": null,
+      "termination_reason": null,
+      "child_task_ids": [],
+      "sibling_task_ids": [],
+      "dependent_task_ids": [],
+      "messages_to_dependents": [],
+      "received_messages": [],
+      "blocked_by": [
+        "seq_task_2"
+      ]
+    },
+    "seq_task_4": {
+      "task_id": "seq_task_4",
+      "description": "Phase 1: Setup repository",
+      "task_type": "pre_assigned",
+      "execution_mode": "sequential",
+      "status": "completed",
+      "prerequisites": [],
+      "context": {},
+      "priority": 50,
+      "parent_task_id": null,
+      "created_at": "2025-10-25T10:26:49.483250",
+      "updated_at": "2025-10-25T10:26:49.483250",
+      "completed_at": "2025-10-25T10:26:49.483250",
+      "error_message": null,
+      "result": {
+        "status": "repository_ready"
+      },
+      "state_history": [
+        {
+          "status": "pending",
+          "timestamp": "2025-10-25T10:26:49.483250",
+          "reason": "Task created"
+        }
+      ],
+      "paused_at": null,
+      "resumed_at": null,
+      "pause_count": 0,
+      "stop_reason": null,
+      "termination_reason": null,
+      "child_task_ids": [],
+      "sibling_task_ids": [],
+      "dependent_task_ids": [
+        "seq_task_5"
+      ],
+      "messages_to_dependents": [
+        {
+          "message_type": "result",
+          "data": {
+            "status": "repository_ready"
+          },
+          "from_task_id": "seq_task_4",
+          "status": "completed",
+          "timestamp": "2025-10-25T10:26:49.483250",
+          "received_at": "2025-10-25T10:26:49.483250"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_4",
+          "completed_at": "2025-10-25T10:26:49.483250",
+          "timestamp": "2025-10-25T10:26:49.483250",
+          "received_at": "2025-10-25T10:26:49.483250"
+        }
+      ],
+      "received_messages": [],
+      "blocked_by": []
+    },
+    "seq_task_5": {
+      "task_id": "seq_task_5",
+      "description": "Phase 2: Design specification",
+      "task_type": "pre_assigned",
+      "execution_mode": "sequential",
+      "status": "in_progress",
+      "prerequisites": [
+        "seq_task_4"
+      ],
+      "context": {},
+      "priority": 50,
+      "parent_task_id": null,
+      "created_at": "2025-10-25T10:26:49.483250",
+      "updated_at": "2025-10-25T10:26:49.483250",
+      "completed_at": null,
+      "error_message": null,
+      "result": null,
+      "state_history": [
+        {
+          "status": "pending",
+          "timestamp": "2025-10-25T10:26:49.483250",
+          "reason": "Task created"
+        },
+        {
+          "status": "resuming",
+          "timestamp": "2025-10-25T10:26:49.483250",
+          "reason": "Auto-resume: dependency seq_task_4 completed",
+          "previous_status": "blocked"
+        },
+        {
+          "status": "in_progress",
+          "timestamp": "2025-10-25T10:26:49.483250",
+          "reason": "Resumed to active execution",
+          "previous_status": "resuming"
+        }
+      ],
+      "paused_at": null,
+      "resumed_at": "2025-10-25T10:26:49.483250",
+      "pause_count": 0,
+      "stop_reason": null,
+      "termination_reason": null,
+      "child_task_ids": [],
+      "sibling_task_ids": [],
+      "dependent_task_ids": [
+        "seq_task_6"
+      ],
+      "messages_to_dependents": [],
+      "received_messages": [
+        {
+          "message_type": "result",
+          "data": {
+            "status": "repository_ready"
+          },
+          "from_task_id": "seq_task_4",
+          "status": "completed",
+          "timestamp": "2025-10-25T10:26:49.483250",
+          "received_at": "2025-10-25T10:26:49.483250"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_4",
+          "completed_at": "2025-10-25T10:26:49.483250",
+          "timestamp": "2025-10-25T10:26:49.483250",
+          "received_at": "2025-10-25T10:26:49.483250"
+        }
+      ],
+      "blocked_by": []
+    },
+    "seq_task_6": {
+      "task_id": "seq_task_6",
+      "description": "Phase 3: Implementation",
+      "task_type": "pre_assigned",
+      "execution_mode": "sequential",
+      "status": "blocked",
+      "prerequisites": [
+        "seq_task_5"
+      ],
+      "context": {},
+      "priority": 50,
+      "parent_task_id": null,
+      "created_at": "2025-10-25T10:26:49.483250",
+      "updated_at": "2025-10-25T10:26:49.483250",
+      "completed_at": null,
+      "error_message": null,
+      "result": null,
+      "state_history": [
+        {
+          "status": "pending",
+          "timestamp": "2025-10-25T10:26:49.483250",
+          "reason": "Task created"
+        }
+      ],
+      "paused_at": null,
+      "resumed_at": null,
+      "pause_count": 0,
+      "stop_reason": null,
+      "termination_reason": null,
+      "child_task_ids": [],
+      "sibling_task_ids": [],
+      "dependent_task_ids": [],
+      "messages_to_dependents": [],
+      "received_messages": [],
+      "blocked_by": [
+        "seq_task_5"
+      ]
+    },
+    "seq_task_7": {
+      "task_id": "seq_task_7",
+      "description": "Phase 1: Setup repository",
+      "task_type": "pre_assigned",
+      "execution_mode": "sequential",
+      "status": "completed",
+      "prerequisites": [],
+      "context": {},
+      "priority": 50,
+      "parent_task_id": null,
+      "created_at": "2025-10-25T10:27:27.403060",
+      "updated_at": "2025-10-25T10:27:27.403060",
+      "completed_at": "2025-10-25T10:27:27.403060",
+      "error_message": null,
+      "result": {
+        "status": "repository_ready"
+      },
+      "state_history": [
+        {
+          "status": "pending",
+          "timestamp": "2025-10-25T10:27:27.403060",
+          "reason": "Task created"
+        }
+      ],
+      "paused_at": null,
+      "resumed_at": null,
+      "pause_count": 0,
+      "stop_reason": null,
+      "termination_reason": null,
+      "child_task_ids": [],
+      "sibling_task_ids": [],
+      "dependent_task_ids": [
+        "seq_task_8"
+      ],
+      "messages_to_dependents": [
+        {
+          "message_type": "result",
+          "data": {
+            "status": "repository_ready"
+          },
+          "from_task_id": "seq_task_7",
+          "status": "completed",
+          "timestamp": "2025-10-25T10:27:27.403060",
+          "received_at": "2025-10-25T10:27:27.403060"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_7",
+          "completed_at": "2025-10-25T10:27:27.403060",
+          "timestamp": "2025-10-25T10:27:27.403060",
+          "received_at": "2025-10-25T10:27:27.403060"
+        }
+      ],
+      "received_messages": [],
+      "blocked_by": []
+    },
+    "seq_task_8": {
+      "task_id": "seq_task_8",
+      "description": "Phase 2: Design specification",
+      "task_type": "pre_assigned",
+      "execution_mode": "sequential",
+      "status": "completed",
+      "prerequisites": [
+        "seq_task_7"
+      ],
+      "context": {},
+      "priority": 50,
+      "parent_task_id": null,
+      "created_at": "2025-10-25T10:27:27.403060",
+      "updated_at": "2025-10-25T10:27:27.403060",
+      "completed_at": "2025-10-25T10:27:27.403060",
+      "error_message": null,
+      "result": {
+        "status": "design_ready"
+      },
+      "state_history": [
+        {
+          "status": "pending",
+          "timestamp": "2025-10-25T10:27:27.403060",
+          "reason": "Task created"
+        },
+        {
+          "status": "resuming",
+          "timestamp": "2025-10-25T10:27:27.403060",
+          "reason": "Auto-resume: dependency seq_task_7 completed",
+          "previous_status": "blocked"
+        },
+        {
+          "status": "in_progress",
+          "timestamp": "2025-10-25T10:27:27.403060",
+          "reason": "Resumed to active execution",
+          "previous_status": "resuming"
+        }
+      ],
+      "paused_at": null,
+      "resumed_at": "2025-10-25T10:27:27.403060",
+      "pause_count": 0,
+      "stop_reason": null,
+      "termination_reason": null,
+      "child_task_ids": [],
+      "sibling_task_ids": [],
+      "dependent_task_ids": [
+        "seq_task_9"
+      ],
+      "messages_to_dependents": [
+        {
+          "message_type": "result",
+          "data": {
+            "status": "design_ready"
+          },
+          "from_task_id": "seq_task_8",
+          "status": "completed",
+          "timestamp": "2025-10-25T10:27:27.403060",
+          "received_at": "2025-10-25T10:27:27.403060"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_8",
+          "completed_at": "2025-10-25T10:27:27.403060",
+          "timestamp": "2025-10-25T10:27:27.403060",
+          "received_at": "2025-10-25T10:27:27.403060"
+        }
+      ],
+      "received_messages": [
+        {
+          "message_type": "result",
+          "data": {
+            "status": "repository_ready"
+          },
+          "from_task_id": "seq_task_7",
+          "status": "completed",
+          "timestamp": "2025-10-25T10:27:27.403060",
+          "received_at": "2025-10-25T10:27:27.403060"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_7",
+          "completed_at": "2025-10-25T10:27:27.403060",
+          "timestamp": "2025-10-25T10:27:27.403060",
+          "received_at": "2025-10-25T10:27:27.403060"
+        }
+      ],
+      "blocked_by": []
+    },
+    "seq_task_9": {
+      "task_id": "seq_task_9",
+      "description": "Phase 3: Implementation",
+      "task_type": "pre_assigned",
+      "execution_mode": "sequential",
+      "status": "in_progress",
+      "prerequisites": [
+        "seq_task_8"
+      ],
+      "context": {},
+      "priority": 50,
+      "parent_task_id": null,
+      "created_at": "2025-10-25T10:27:27.403060",
+      "updated_at": "2025-10-25T10:27:27.403060",
+      "completed_at": null,
+      "error_message": null,
+      "result": null,
+      "state_history": [
+        {
+          "status": "pending",
+          "timestamp": "2025-10-25T10:27:27.403060",
+          "reason": "Task created"
+        },
+        {
+          "status": "resuming",
+          "timestamp": "2025-10-25T10:27:27.403060",
+          "reason": "Auto-resume: dependency seq_task_8 completed",
+          "previous_status": "blocked"
+        },
+        {
+          "status": "in_progress",
+          "timestamp": "2025-10-25T10:27:27.403060",
+          "reason": "Resumed to active execution",
+          "previous_status": "resuming"
+        }
+      ],
+      "paused_at": null,
+      "resumed_at": "2025-10-25T10:27:27.403060",
+      "pause_count": 0,
+      "stop_reason": null,
+      "termination_reason": null,
+      "child_task_ids": [],
+      "sibling_task_ids": [],
+      "dependent_task_ids": [],
+      "messages_to_dependents": [],
+      "received_messages": [
+        {
+          "message_type": "result",
+          "data": {
+            "status": "design_ready"
+          },
+          "from_task_id": "seq_task_8",
+          "status": "completed",
+          "timestamp": "2025-10-25T10:27:27.403060",
+          "received_at": "2025-10-25T10:27:27.403060"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_8",
+          "completed_at": "2025-10-25T10:27:27.403060",
+          "timestamp": "2025-10-25T10:27:27.403060",
+          "received_at": "2025-10-25T10:27:27.403060"
+        }
+      ],
+      "blocked_by": []
+    },
+    "seq_task_10": {
+      "task_id": "seq_task_10",
+      "description": "Phase 1: Setup repository",
+      "task_type": "pre_assigned",
+      "execution_mode": "sequential",
+      "status": "completed",
+      "prerequisites": [],
+      "context": {},
+      "priority": 50,
+      "parent_task_id": null,
+      "created_at": "2025-10-25T10:27:36.361446",
+      "updated_at": "2025-10-25T10:27:36.361446",
+      "completed_at": "2025-10-25T10:27:36.361446",
+      "error_message": null,
+      "result": {
+        "status": "repository_ready"
+      },
+      "state_history": [
+        {
+          "status": "pending",
+          "timestamp": "2025-10-25T10:27:36.361446",
+          "reason": "Task created"
+        }
+      ],
+      "paused_at": null,
+      "resumed_at": null,
+      "pause_count": 0,
+      "stop_reason": null,
+      "termination_reason": null,
+      "child_task_ids": [],
+      "sibling_task_ids": [],
+      "dependent_task_ids": [
+        "seq_task_11"
+      ],
+      "messages_to_dependents": [
+        {
+          "message_type": "result",
+          "data": {
+            "status": "repository_ready"
+          },
+          "from_task_id": "seq_task_10",
+          "status": "completed",
+          "timestamp": "2025-10-25T10:27:36.361446",
+          "received_at": "2025-10-25T10:27:36.361446"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_10",
+          "completed_at": "2025-10-25T10:27:36.361446",
+          "timestamp": "2025-10-25T10:27:36.361446",
+          "received_at": "2025-10-25T10:27:36.361446"
+        }
+      ],
+      "received_messages": [],
+      "blocked_by": []
+    },
+    "seq_task_11": {
+      "task_id": "seq_task_11",
+      "description": "Phase 2: Design specification",
+      "task_type": "pre_assigned",
+      "execution_mode": "sequential",
+      "status": "completed",
+      "prerequisites": [
+        "seq_task_10"
+      ],
+      "context": {},
+      "priority": 50,
+      "parent_task_id": null,
+      "created_at": "2025-10-25T10:27:36.361446",
+      "updated_at": "2025-10-25T10:27:36.361446",
+      "completed_at": "2025-10-25T10:27:36.361446",
+      "error_message": null,
+      "result": {
+        "status": "design_ready"
+      },
+      "state_history": [
+        {
+          "status": "pending",
+          "timestamp": "2025-10-25T10:27:36.361446",
+          "reason": "Task created"
+        },
+        {
+          "status": "resuming",
+          "timestamp": "2025-10-25T10:27:36.361446",
+          "reason": "Auto-resume: dependency seq_task_10 completed",
+          "previous_status": "blocked"
+        },
+        {
+          "status": "in_progress",
+          "timestamp": "2025-10-25T10:27:36.361446",
+          "reason": "Resumed to active execution",
+          "previous_status": "resuming"
+        }
+      ],
+      "paused_at": null,
+      "resumed_at": "2025-10-25T10:27:36.361446",
+      "pause_count": 0,
+      "stop_reason": null,
+      "termination_reason": null,
+      "child_task_ids": [],
+      "sibling_task_ids": [],
+      "dependent_task_ids": [
+        "seq_task_12"
+      ],
+      "messages_to_dependents": [
+        {
+          "message_type": "result",
+          "data": {
+            "status": "design_ready"
+          },
+          "from_task_id": "seq_task_11",
+          "status": "completed",
+          "timestamp": "2025-10-25T10:27:36.361446",
+          "received_at": "2025-10-25T10:27:36.361446"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_11",
+          "completed_at": "2025-10-25T10:27:36.361446",
+          "timestamp": "2025-10-25T10:27:36.361446",
+          "received_at": "2025-10-25T10:27:36.361446"
+        }
+      ],
+      "received_messages": [
+        {
+          "message_type": "result",
+          "data": {
+            "status": "repository_ready"
+          },
+          "from_task_id": "seq_task_10",
+          "status": "completed",
+          "timestamp": "2025-10-25T10:27:36.361446",
+          "received_at": "2025-10-25T10:27:36.361446"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_10",
+          "completed_at": "2025-10-25T10:27:36.361446",
+          "timestamp": "2025-10-25T10:27:36.361446",
+          "received_at": "2025-10-25T10:27:36.361446"
+        }
+      ],
+      "blocked_by": []
+    },
+    "seq_task_12": {
+      "task_id": "seq_task_12",
+      "description": "Phase 3: Implementation",
+      "task_type": "pre_assigned",
+      "execution_mode": "sequential",
+      "status": "in_progress",
+      "prerequisites": [
+        "seq_task_11"
+      ],
+      "context": {},
+      "priority": 50,
+      "parent_task_id": null,
+      "created_at": "2025-10-25T10:27:36.361446",
+      "updated_at": "2025-10-25T10:27:36.361446",
+      "completed_at": null,
+      "error_message": null,
+      "result": null,
+      "state_history": [
+        {
+          "status": "pending",
+          "timestamp": "2025-10-25T10:27:36.361446",
+          "reason": "Task created"
+        },
+        {
+          "status": "resuming",
+          "timestamp": "2025-10-25T10:27:36.361446",
+          "reason": "Auto-resume: dependency seq_task_11 completed",
+          "previous_status": "blocked"
+        },
+        {
+          "status": "in_progress",
+          "timestamp": "2025-10-25T10:27:36.361446",
+          "reason": "Resumed to active execution",
+          "previous_status": "resuming"
+        }
+      ],
+      "paused_at": null,
+      "resumed_at": "2025-10-25T10:27:36.361446",
+      "pause_count": 0,
+      "stop_reason": null,
+      "termination_reason": null,
+      "child_task_ids": [],
+      "sibling_task_ids": [],
+      "dependent_task_ids": [],
+      "messages_to_dependents": [],
+      "received_messages": [
+        {
+          "message_type": "result",
+          "data": {
+            "status": "design_ready"
+          },
+          "from_task_id": "seq_task_11",
+          "status": "completed",
+          "timestamp": "2025-10-25T10:27:36.361446",
+          "received_at": "2025-10-25T10:27:36.361446"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_11",
+          "completed_at": "2025-10-25T10:27:36.361446",
+          "timestamp": "2025-10-25T10:27:36.361446",
+          "received_at": "2025-10-25T10:27:36.361446"
+        }
+      ],
+      "blocked_by": []
+    },
+    "seq_task_13": {
+      "task_id": "seq_task_13",
+      "description": "Phase 1: Setup repository",
+      "task_type": "pre_assigned",
+      "execution_mode": "sequential",
+      "status": "completed",
+      "prerequisites": [],
+      "context": {},
+      "priority": 50,
+      "parent_task_id": null,
+      "created_at": "2025-10-25T10:28:08.441102",
+      "updated_at": "2025-10-25T10:28:08.441102",
+      "completed_at": "2025-10-25T10:28:08.441102",
+      "error_message": null,
+      "result": {
+        "status": "repository_ready"
+      },
+      "state_history": [
+        {
+          "status": "pending",
+          "timestamp": "2025-10-25T10:28:08.441102",
+          "reason": "Task created"
+        }
+      ],
+      "paused_at": null,
+      "resumed_at": null,
+      "pause_count": 0,
+      "stop_reason": null,
+      "termination_reason": null,
+      "child_task_ids": [],
+      "sibling_task_ids": [],
+      "dependent_task_ids": [
+        "seq_task_14"
+      ],
+      "messages_to_dependents": [
+        {
+          "message_type": "result",
+          "data": {
+            "status": "repository_ready"
+          },
+          "from_task_id": "seq_task_13",
+          "status": "completed",
+          "timestamp": "2025-10-25T10:28:08.441102",
+          "received_at": "2025-10-25T10:28:08.441102"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_13",
+          "completed_at": "2025-10-25T10:28:08.441102",
+          "timestamp": "2025-10-25T10:28:08.441102",
+          "received_at": "2025-10-25T10:28:08.441102"
+        }
+      ],
+      "received_messages": [],
+      "blocked_by": []
+    },
+    "seq_task_14": {
+      "task_id": "seq_task_14",
+      "description": "Phase 2: Design specification",
+      "task_type": "pre_assigned",
+      "execution_mode": "sequential",
+      "status": "completed",
+      "prerequisites": [
+        "seq_task_13"
+      ],
+      "context": {},
+      "priority": 50,
+      "parent_task_id": null,
+      "created_at": "2025-10-25T10:28:08.441102",
+      "updated_at": "2025-10-25T10:28:08.441102",
+      "completed_at": "2025-10-25T10:28:08.441102",
+      "error_message": null,
+      "result": {
+        "status": "design_ready"
+      },
+      "state_history": [
+        {
+          "status": "pending",
+          "timestamp": "2025-10-25T10:28:08.441102",
+          "reason": "Task created"
+        },
+        {
+          "status": "resuming",
+          "timestamp": "2025-10-25T10:28:08.441102",
+          "reason": "Auto-resume: dependency seq_task_13 completed",
+          "previous_status": "blocked"
+        },
+        {
+          "status": "in_progress",
+          "timestamp": "2025-10-25T10:28:08.441102",
+          "reason": "Resumed to active execution",
+          "previous_status": "resuming"
+        }
+      ],
+      "paused_at": null,
+      "resumed_at": "2025-10-25T10:28:08.441102",
+      "pause_count": 0,
+      "stop_reason": null,
+      "termination_reason": null,
+      "child_task_ids": [],
+      "sibling_task_ids": [],
+      "dependent_task_ids": [
+        "seq_task_15"
+      ],
+      "messages_to_dependents": [
+        {
+          "message_type": "result",
+          "data": {
+            "status": "design_ready"
+          },
+          "from_task_id": "seq_task_14",
+          "status": "completed",
+          "timestamp": "2025-10-25T10:28:08.441102",
+          "received_at": "2025-10-25T10:28:08.441102"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_14",
+          "completed_at": "2025-10-25T10:28:08.441102",
+          "timestamp": "2025-10-25T10:28:08.441102",
+          "received_at": "2025-10-25T10:28:08.441102"
+        }
+      ],
+      "received_messages": [
+        {
+          "message_type": "result",
+          "data": {
+            "status": "repository_ready"
+          },
+          "from_task_id": "seq_task_13",
+          "status": "completed",
+          "timestamp": "2025-10-25T10:28:08.441102",
+          "received_at": "2025-10-25T10:28:08.441102"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_13",
+          "completed_at": "2025-10-25T10:28:08.441102",
+          "timestamp": "2025-10-25T10:28:08.441102",
+          "received_at": "2025-10-25T10:28:08.441102"
+        }
+      ],
+      "blocked_by": []
+    },
+    "seq_task_15": {
+      "task_id": "seq_task_15",
+      "description": "Phase 3: Implementation",
+      "task_type": "pre_assigned",
+      "execution_mode": "sequential",
+      "status": "in_progress",
+      "prerequisites": [
+        "seq_task_14"
+      ],
+      "context": {},
+      "priority": 50,
+      "parent_task_id": null,
+      "created_at": "2025-10-25T10:28:08.441102",
+      "updated_at": "2025-10-25T10:28:08.441102",
+      "completed_at": null,
+      "error_message": null,
+      "result": null,
+      "state_history": [
+        {
+          "status": "pending",
+          "timestamp": "2025-10-25T10:28:08.441102",
+          "reason": "Task created"
+        },
+        {
+          "status": "resuming",
+          "timestamp": "2025-10-25T10:28:08.441102",
+          "reason": "Auto-resume: dependency seq_task_14 completed",
+          "previous_status": "blocked"
+        },
+        {
+          "status": "in_progress",
+          "timestamp": "2025-10-25T10:28:08.441102",
+          "reason": "Resumed to active execution",
+          "previous_status": "resuming"
+        }
+      ],
+      "paused_at": null,
+      "resumed_at": "2025-10-25T10:28:08.441102",
+      "pause_count": 0,
+      "stop_reason": null,
+      "termination_reason": null,
+      "child_task_ids": [],
+      "sibling_task_ids": [],
+      "dependent_task_ids": [],
+      "messages_to_dependents": [],
+      "received_messages": [
+        {
+          "message_type": "result",
+          "data": {
+            "status": "design_ready"
+          },
+          "from_task_id": "seq_task_14",
+          "status": "completed",
+          "timestamp": "2025-10-25T10:28:08.441102",
+          "received_at": "2025-10-25T10:28:08.441102"
+        },
+        {
+          "message_type": "completion",
+          "from_task_id": "seq_task_14",
+          "completed_at": "2025-10-25T10:28:08.441102",
+          "timestamp": "2025-10-25T10:28:08.441102",
+          "received_at": "2025-10-25T10:28:08.441102"
+        }
+      ],
+      "blocked_by": []
+    }
+  }
+}

@@ -1,0 +1,98 @@
+{
+    "status": "done",
+    "action": "Periodically check video generation status via an API every one minute for each conv_id, and update the status to 'success' upon a successful response.",
+    "fallback_action": "If API status checks fail, retry automatically up to three times per video; if still failing, mark the status as 'error' and alert the user for intervention.",
+    "persona": "News Curator",
+    "action_id": 5,
+    "recipe": [
+        {
+            "steps": "Retrieve all conv_ids and their current statuses related to generated news videos from memory.",
+            "tool_name": "",
+            "agent_to_perform_this_action": "Assistant"
+        },
+        {
+            "steps": "For each conv_id with status 'pending', call the get-video-conv_id API using the provided endpoint: https://mailer.hertzai.com/get-video-conv_id/{{conv_id}}",
+            "tool_name": "",
+            "generalized_functions": "def check_video_status(conv_id):\n    \"\"\"\n    Call the video generation status API endpoint to get the status of a video.\n    Args:\n        conv_id (str): The video conversation ID to check.\n    Returns:\n        dict: A dictionary containing status details for the video.\n    \"\"\"\n    import requests\n    url = f\"https://mailer.hertzai.com/get-video-conv_id/{conv_id}\"\n    resp = requests.get(url)\n    resp.raise_for_status()\n    return resp.json()\n",
+            "agent_to_perform_this_action": "Executor"
+        },
+        {
+            "steps": "If the status response indicates 'success', update the corresponding status in memory. Otherwise, keep the status as 'pending'.",
+            "tool_name": "save_data_in_memory",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [
+        {
+            "cron_expression": "* * * * *",
+            "persona": "News Curator",
+            "action_entry_point": 5,
+            "job_description": "Periodically check the status of AI-generated news videos and update each conv_id's record in memory"
+        }
+    ],
+    "metadata": {
+        "user_id": "redacted int",
+        "avatars": {
+            "teacher_avatar_ids": [
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int",
+                "redacted int"
+            ]
+        },
+        "genres": {
+            "avatar_assignment": {
+                "Politics": "redacted int",
+                "Business": "redacted int",
+                "Sports": "redacted int",
+                "Breaking News": "redacted int",
+                "Science": "redacted int",
+                "AI": "redacted int",
+                "Weather": "redacted int"
+            }
+        },
+        "news_scripts": {
+            "latest_batch": {
+                "Politics": {
+                    "script": null,
+                    "timestamp": null
+                },
+                "Business": {
+                    "script": null,
+                    "timestamp": null
+                },
+                "Sports": {
+                    "script": null,
+                    "timestamp": null
+                },
+                "Breaking News": {
+                    "script": null,
+                    "timestamp": null
+                },
+                "Science": {
+                    "script": null,
+                    "timestamp": null
+                },
+                "AI": {
+                    "script": null,
+                    "timestamp": null
+                },
+                "Weather": {
+                    "script": null,
+                    "timestamp": null
+                }
+            }
+        }
+    },
+    "time_took_to_complete": 102.44193649291992,
+    "actions_this_action_depends_on": [
+        4
+    ]
+}

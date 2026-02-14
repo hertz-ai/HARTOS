@@ -1,0 +1,35 @@
+{
+    "status": "done",
+    "action": "Repeat the above steps",
+    "fallback_action": "If repeating the steps for sharing facts about Sunitha Williams fails in the future, the user will provide further guidance on the appropriate actions to take.",
+    "persona": "Spotlight",
+    "action_id": 4,
+    "recipe": [
+        {
+            "steps": "Search the internet for interesting facts about Sunitha Williams.",
+            "tool_name": "google_search",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Wait for 1 minute.",
+            "tool_name": "create_scheduled_jobs",
+            "agent_to_perform_this_action": "Helper"
+        },
+        {
+            "steps": "Send a message to the user with the found fact about Sunitha Williams.",
+            "tool_name": "send_message_to_user",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [],
+    "metadata": {
+        "user_id": "redacted <class 'int'>"
+    },
+    "time_took_to_complete": 75.60672545433044,
+    "actions_this_action_depends_on": [
+        1,
+        2,
+        3
+    ]
+}

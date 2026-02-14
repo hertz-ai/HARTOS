@@ -1,13 +1,76 @@
 """
 STATE MACHINE IMPLEMENTATION
 =====================================
+
+This module manages the ActionState state machine for tracking action lifecycle.
+It also provides functions to sync ActionState with SmartLedger TaskStatus.
 """
 
 from enum import Enum
 import logging
 import os
+import threading
+from typing import Dict, Optional, Any
 
 logger = logging.getLogger(__name__)
+
+# Lock protecting _ledger_registry and action_states (accessed by multiple Waitress/Gunicorn threads)
+_state_lock = threading.RLock()
+
+# Global ledger registry for auto-sync
+_ledger_registry: Dict[str, Any] = {}
+
+def register_ledger_for_session(user_prompt: str, ledger: Any):
+    """Register a ledger instance for a session to enable auto-sync."""
+    with _state_lock:
+        _ledger_registry[user_prompt] = ledger
+    logger.debug(f"Registered ledger for {user_prompt}")
+
+def get_registered_ledger(user_prompt: str) -> Optional[Any]:
+    """Get the registered ledger for a session."""
+    with _state_lock:
+        return _ledger_registry.get(user_prompt)
+
+def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState'):
+    """Auto-sync state change to ledger if registered."""
+    ledger = _ledger_registry.get(user_prompt)
+    if ledger is None:
+        return  # No ledger registered, skip sync
+
+    try:
+        LedgerTaskStatus = _get_ledger_task_status()
+        task_id = f"action_{action_id}"
+
+        if task_id not in ledger.tasks:
+            return  # Task doesn't exist in ledger
+
+        # Map ActionState to LedgerTaskStatus
+        STATE_MAP = {
+            ActionState.ASSIGNED: LedgerTaskStatus.PENDING,
+            ActionState.IN_PROGRESS: LedgerTaskStatus.IN_PROGRESS,
+            ActionState.STATUS_VERIFICATION_REQUESTED: LedgerTaskStatus.VALIDATING,
+            ActionState.COMPLETED: LedgerTaskStatus.COMPLETED,
+            ActionState.PENDING: LedgerTaskStatus.BLOCKED,
+            ActionState.ERROR: LedgerTaskStatus.FAILED,
+            ActionState.FALLBACK_REQUESTED: LedgerTaskStatus.BLOCKED,
+            ActionState.FALLBACK_RECEIVED: LedgerTaskStatus.IN_PROGRESS,
+            ActionState.RECIPE_REQUESTED: LedgerTaskStatus.IN_PROGRESS,
+            ActionState.RECIPE_RECEIVED: LedgerTaskStatus.COMPLETED,
+            ActionState.TERMINATED: LedgerTaskStatus.COMPLETED,
+        }
+
+        ledger_status = STATE_MAP.get(state)
+        if ledger_status:
+            ledger.update_task_status(task_id, ledger_status, reason=f"ActionState: {state.value}")
+            logger.info(f"📋 Auto-synced {task_id} → {ledger_status.value} (ActionState: {state.value})")
+    except Exception as e:
+        logger.error(f"Failed to auto-sync to ledger: {e}", exc_info=True)
+
+# Import ledger types for sync function (lazy import to avoid circular deps)
+def _get_ledger_task_status():
+    """Lazy import to avoid circular dependencies"""
+    from agent_ledger import TaskStatus as LedgerTaskStatus
+    return LedgerTaskStatus
 
 # Add new states to ActionState enum:
 class FlowState(Enum):
@@ -48,6 +111,38 @@ class FlowLifecycleState:
 flow_lifecycle = FlowLifecycleState()
 
 
+# Action retry tracking to prevent infinite loops
+class ActionRetryTracker:
+    """Track retry counts to force ERROR state after threshold"""
+
+    def __init__(self):
+        self.pending_counts = {}  # {(user_prompt, action_id): count}
+        self.MAX_PENDING_RETRIES = 3  # Force ERROR after 3 pending attempts
+
+    def increment_pending(self, user_prompt, action_id):
+        """Increment pending count and return True if threshold exceeded"""
+        key = (user_prompt, action_id)
+        count = self.pending_counts.get(key, 0) + 1
+        self.pending_counts[key] = count
+
+        if count > self.MAX_PENDING_RETRIES:
+            logger.warning(f"[RETRY LIMIT] Action {action_id} has been PENDING {count} times - forcing to ERROR state")
+            return True  # Exceeded threshold
+
+        logger.info(f"[RETRY TRACKING] Action {action_id} pending count: {count}/{self.MAX_PENDING_RETRIES}")
+        return False  # Still under threshold
+
+    def reset_count(self, user_prompt, action_id):
+        """Reset counter when action completes or errors"""
+        key = (user_prompt, action_id)
+        if key in self.pending_counts:
+            del self.pending_counts[key]
+            logger.info(f"[RETRY TRACKING] Reset pending count for action {action_id}")
+
+
+retry_tracker = ActionRetryTracker()
+
+
 # Enforcement functions
 def enforce_action_termination(user_prompt, current_action_id):
     """Ensure current action is TERMINATED before proceeding"""
@@ -84,11 +179,15 @@ def set_action_state(user_prompt: str, action_id: int, state: ActionState, reaso
         raise StateTransitionError(
             f"Invalid transition: Action {action_id} cannot go from {current_state.value} to {state.value}")
 
-    # Perform transition
-    if user_prompt not in action_states:
-        action_states[user_prompt] = {}
-    action_states[user_prompt][action_id] = state
-    logger.info(f"🎯 Action {action_id}: {current_state.value} → {state.value} ({reason})")
+    # Perform transition (lock protects check-then-act on shared dict)
+    with _state_lock:
+        if user_prompt not in action_states:
+            action_states[user_prompt] = {}
+        action_states[user_prompt][action_id] = state
+    logger.info(f"[TARGET] Action {action_id}: {current_state.value} → {state.value} ({reason})")
+
+    # Auto-sync to ledger if registered
+    _auto_sync_to_ledger(user_prompt, action_id, state)
 
 
 # 3. ADD these wrapper functions for safe state updates:
@@ -98,7 +197,7 @@ def safe_set_state(user_prompt: str, action_id: int, new_state: ActionState, rea
         set_action_state(user_prompt, action_id, new_state, reason)
         return True
     except StateTransitionError as e:
-        logger.error(f"❌ {e}")
+        logger.error(f"[ERROR] {e}")
         return False
 
 
@@ -167,11 +266,11 @@ def force_state_through_valid_path(user_prompt: str, action_id: int, target_stat
             try:
                 set_action_state(user_prompt, action_id, step_state, f"auto-path: {reason}")
             except StateTransitionError as e:
-                logger.error(f"❌ Auto-path failed at {step_state.value}: {e}")
+                logger.error(f"[ERROR] Auto-path failed at {step_state.value}: {e}")
                 return False
         return True
     else:
-        logger.error(f"❌ No valid path from {current_state.value} to {target_state.value}")
+        logger.error(f"[ERROR] No valid path from {current_state.value} to {target_state.value}")
         return False
 
 
@@ -181,7 +280,8 @@ action_states = {}  # {user_prompt: {action_id: current_state}}
 
 def get_action_state(user_prompt: str, action_id: int) -> ActionState:
     """Get current state of an action."""
-    return action_states.get(user_prompt, {}).get(action_id, ActionState.ASSIGNED)
+    with _state_lock:
+        return action_states.get(user_prompt, {}).get(action_id, ActionState.ASSIGNED)
 
 
 def validate_state_transition(user_prompt: str, action_id: int, new_state: ActionState) -> bool:
@@ -192,9 +292,10 @@ def validate_state_transition(user_prompt: str, action_id: int, new_state: Actio
         ActionState.ASSIGNED: [ActionState.IN_PROGRESS, ActionState.ASSIGNED],
         ActionState.IN_PROGRESS: [ActionState.STATUS_VERIFICATION_REQUESTED, ActionState.IN_PROGRESS],
         ActionState.STATUS_VERIFICATION_REQUESTED: [ActionState.COMPLETED, ActionState.PENDING, ActionState.ERROR, ActionState.STATUS_VERIFICATION_REQUESTED],
-        ActionState.COMPLETED: [ActionState.FALLBACK_REQUESTED, ActionState.COMPLETED],
+        ActionState.COMPLETED: [ActionState.FALLBACK_REQUESTED, ActionState.RECIPE_REQUESTED, ActionState.TERMINATED, ActionState.COMPLETED],  # Allow direct recipe request (autonomous) or termination
         ActionState.PENDING: [ActionState.COMPLETED, ActionState.ERROR, ActionState.PENDING],
-        ActionState.ERROR: [ActionState.IN_PROGRESS, ActionState.PENDING,ActionState.ERROR],  # Can retry or ask fallback
+        # FIX: Allow ERROR to reach TERMINATED via FALLBACK_REQUESTED/RECIPE_REQUESTED or directly
+        ActionState.ERROR: [ActionState.IN_PROGRESS, ActionState.PENDING, ActionState.ERROR, ActionState.FALLBACK_REQUESTED, ActionState.RECIPE_REQUESTED, ActionState.TERMINATED],
         ActionState.FALLBACK_REQUESTED: [ActionState.FALLBACK_RECEIVED, ActionState.FALLBACK_REQUESTED],
         ActionState.FALLBACK_RECEIVED: [ActionState.RECIPE_REQUESTED, ActionState.FALLBACK_RECEIVED],
         ActionState.RECIPE_REQUESTED: [ActionState.RECIPE_RECEIVED, ActionState.RECIPE_REQUESTED],
@@ -204,10 +305,10 @@ def validate_state_transition(user_prompt: str, action_id: int, new_state: Actio
 
     allowed = valid_transitions.get(current_state, [])
     if new_state not in allowed:
-        logger.error(f"❌ Invalid transition: {current_state.value} → {new_state.value}")
+        logger.error(f"[ERROR] Invalid transition: {current_state.value} → {new_state.value}")
         return False
 
-    logger.info(f"✅ Valid transition: {current_state.value} → {new_state.value}")
+    logger.info(f"[OK] Valid transition: {current_state.value} → {new_state.value}")
     return True
 
 
@@ -224,7 +325,7 @@ def lifecycle_hook_track_action_assignment(user_prompt: str, user_tasks, group_c
     current_state = get_action_state(user_prompt, current_action_id)
 
     if current_state not in [ActionState.ASSIGNED, ActionState.ERROR]:
-        logger.info(f"🔒 Action {current_action_id} in {current_state.value} - skipping assignment hook")
+        logger.info(f"[LOCKED] Action {current_action_id} in {current_state.value} - skipping assignment hook")
         return False
 
     # When ChatInstructor assigns action, move from ASSIGNED to IN_PROGRESS
@@ -280,6 +381,8 @@ def lifecycle_hook_process_verifier_response(user_prompt: str, json_obj: dict, u
         return {'action': 'allow', 'message': None}
 
     if status == 'completed':
+        # Reset retry counter on completion
+        retry_tracker.reset_count(user_prompt, current_action_id)
         if validate_state_transition(user_prompt, current_action_id, ActionState.COMPLETED):
             safe_set_state(user_prompt, current_action_id, ActionState.COMPLETED,"hook tracking lifecycle_hook_process_verifier_response")
             # Automatically request fallback after completion
@@ -289,19 +392,32 @@ def lifecycle_hook_process_verifier_response(user_prompt: str, json_obj: dict, u
             }
 
     elif status == 'pending':
-        if validate_state_transition(user_prompt, current_action_id, ActionState.PENDING):
-            safe_set_state(user_prompt, current_action_id, ActionState.PENDING,"hook tracking lifecycle_hook_process_verifier_response")
-            return {
-                'action': 'force_completion',
-                'message': f"Complete pending steps for action {current_action_id} and ask @StatusVerifier to verify completion"
-            }
+        # SAFETY NET: Check if pending count exceeded (prevents infinite retry loops)
+        if retry_tracker.increment_pending(user_prompt, current_action_id):
+            # Force transition to ERROR if pending too many times
+            logger.error(f"[SAFETY NET] Action {current_action_id} exceeded max pending retries - forcing ERROR state")
+            status = 'error'  # Override to error
+            json_obj['message'] = f"Action failed after {retry_tracker.MAX_PENDING_RETRIES} retry attempts. Original message: {json_obj.get('message', 'No details')}"
+            # Fall through to error handling below
 
-    elif status == 'error':
+        if status == 'pending':  # Still pending (not overridden)
+            if validate_state_transition(user_prompt, current_action_id, ActionState.PENDING):
+                safe_set_state(user_prompt, current_action_id, ActionState.PENDING,"hook tracking lifecycle_hook_process_verifier_response")
+                return {
+                    'action': 'force_completion',
+                    'message': f"Complete pending steps for action {current_action_id} and ask @StatusVerifier to verify completion"
+                }
+
+    if status == 'error':  # Separated to allow fall-through from pending override
+        # Reset retry counter on error (will start fresh if retried)
+        retry_tracker.reset_count(user_prompt, current_action_id)
         if validate_state_transition(user_prompt, current_action_id, ActionState.ERROR):
             safe_set_state(user_prompt, current_action_id, ActionState.ERROR,"hook tracking lifecycle_hook_process_verifier_response")
+            # FIX: Automatically request fallback for failed actions (like completed actions)
+            # This allows ERROR to progress toward TERMINATED instead of getting stuck
             return {
-                'action': 'force_retry',
-                'message': f"Error in action {current_action_id}: {json_obj.get('message', 'Unknown error')}. Please resolve and retry."
+                'action': 'force_fallback',
+                'message': f"Action {current_action_id} failed: {json_obj.get('message', 'Unknown error')}. Please provide fallback actions for future failures of this type, then we'll create the recipe and move forward."
             }
 
     return {'action': 'allow', 'message': None}
@@ -527,7 +643,7 @@ def lifecycle_hook_validate_final_agent_creation(user_prompt: str, user_tasks, p
 
     return {
         'action': 'allow',
-        'message': "✅ All validations passed - Agent creation ready"
+        'message': "[OK] All validations passed - Agent creation ready"
     }
 
 
@@ -542,13 +658,13 @@ def debug_action_flow(user_prompt: str, action_id: int):
 
     # Determine which of the 4 flows this matches
     if current_state == ActionState.TERMINATED:
-        logger.info(f"✅ Action {action_id}: COMPLETED one of the 4 flows")
+        logger.info(f"[OK] Action {action_id}: COMPLETED one of the 4 flows")
     elif current_state == ActionState.ERROR:
-        logger.info(f"🔄 Action {action_id}: In ERROR (Flow #2 or #3)")
+        logger.info(f"[PROCESSING] Action {action_id}: In ERROR (Flow #2 or #3)")
     elif current_state == ActionState.PENDING:
-        logger.info(f"🔄 Action {action_id}: In PENDING (Flow #3 or #4)")
+        logger.info(f"[PROCESSING] Action {action_id}: In PENDING (Flow #3 or #4)")
     else:
-        logger.info(f"🔄 Action {action_id}: In progress ({current_state.value})")
+        logger.info(f"[PROCESSING] Action {action_id}: In progress ({current_state.value})")
 
 
 # 6. ADD validation function for the 4 specific flows:
@@ -571,20 +687,218 @@ def validate_flow_pattern(user_prompt: str, action_id: int) -> str:
 def debug_lifecycle_status(user_prompt: str):
     """Debug function to show current lifecycle status"""
     states = action_states.get(user_prompt, {})
-    logger.info(f"\n🔍 Lifecycle Status for {user_prompt}:")
+    logger.info(f"\n[STATUS] Lifecycle Status for {user_prompt}:")
     logger.info("-" * 50)
 
     for action_id, state in states.items():
-        terminated = "✅ TERMINATED" if state == ActionState.TERMINATED else "🔄 IN PROGRESS"
+        terminated = "[OK] TERMINATED" if state == ActionState.TERMINATED else "[PROCESSING] IN PROGRESS"
         logger.info(f"Action {action_id}: {state.value} {terminated}")
 
 
 def initialize_deterministic_actions():
     """Initialize the state machine"""
-    logger.info("🎯 Deterministic action lifecycle initialized")
+    logger.info("[TARGET] Deterministic action lifecycle initialized")
     return True
 
 
 def initialize_minimal_lifecycle_hooks():
     """Alias for initialization"""
     return initialize_deterministic_actions()
+
+
+# =============================================================================
+# LEDGER RESTORE FUNCTIONS (reverse sync: Ledger → ActionState)
+# =============================================================================
+
+def restore_action_states_from_ledger(user_prompt: str, ledger) -> int:
+    """
+    Restore action_states from SmartLedger task statuses.
+
+    This is the reverse of sync_action_state_to_ledger — when a user returns
+    after cache eviction/expiry, this rebuilds the in-memory action_states
+    from the persisted SmartLedger.
+
+    Args:
+        user_prompt: The user_prompt key (e.g., "123_456")
+        ledger: A SmartLedger instance with tasks loaded from Redis/JSON
+
+    Returns:
+        int: Number of action states restored
+    """
+    try:
+        LedgerTaskStatus = _get_ledger_task_status()
+    except Exception:
+        return 0
+
+    # Reverse mapping: LedgerTaskStatus → ActionState
+    REVERSE_MAP = {
+        LedgerTaskStatus.PENDING: ActionState.ASSIGNED,
+        LedgerTaskStatus.IN_PROGRESS: ActionState.IN_PROGRESS,
+        LedgerTaskStatus.COMPLETED: ActionState.TERMINATED,
+        LedgerTaskStatus.BLOCKED: ActionState.PENDING,
+        LedgerTaskStatus.FAILED: ActionState.ERROR,
+        LedgerTaskStatus.PAUSED: ActionState.FALLBACK_REQUESTED,
+        LedgerTaskStatus.DELEGATED: ActionState.IN_PROGRESS,
+        LedgerTaskStatus.TERMINATED: ActionState.TERMINATED,
+    }
+
+    restored = 0
+    with _state_lock:
+        for task_id, task in ledger.tasks.items():
+            if not task_id.startswith('action_'):
+                continue
+            try:
+                action_id = int(task_id.split('_')[1])
+            except (IndexError, ValueError):
+                continue
+
+            action_state = REVERSE_MAP.get(task.status, ActionState.ASSIGNED)
+            if user_prompt not in action_states:
+                action_states[user_prompt] = {}
+            action_states[user_prompt][action_id] = action_state
+            restored += 1
+
+    if restored > 0:
+        logger.info(f"Restored {restored} action states from ledger for {user_prompt}")
+    return restored
+
+
+# =============================================================================
+# LEDGER SYNC FUNCTIONS
+# =============================================================================
+
+def sync_action_state_to_ledger(
+    user_prompt: str,
+    action_id: int,
+    state: ActionState,
+    user_ledgers: Dict[str, Any]
+) -> bool:
+    """
+    Sync ActionState changes to SmartLedger TaskStatus.
+
+    This function should be called after every ActionState change to keep
+    the ledger in sync. This ensures the ledger accurately reflects the
+    current state of all actions.
+
+    Args:
+        user_prompt: The user_prompt key (e.g., "123_456")
+        action_id: The action ID (1-based)
+        state: The new ActionState
+        user_ledgers: The global user_ledgers dictionary
+
+    Returns:
+        bool: True if sync was successful, False otherwise
+
+    State Mapping:
+        ActionState.ASSIGNED → LedgerTaskStatus.PENDING
+        ActionState.IN_PROGRESS → LedgerTaskStatus.IN_PROGRESS
+        ActionState.STATUS_VERIFICATION_REQUESTED → LedgerTaskStatus.IN_PROGRESS
+        ActionState.COMPLETED → LedgerTaskStatus.COMPLETED
+        ActionState.PENDING → LedgerTaskStatus.BLOCKED
+        ActionState.ERROR → LedgerTaskStatus.FAILED
+        ActionState.FALLBACK_REQUESTED → LedgerTaskStatus.PAUSED
+        ActionState.FALLBACK_RECEIVED → LedgerTaskStatus.IN_PROGRESS
+        ActionState.RECIPE_REQUESTED → LedgerTaskStatus.IN_PROGRESS
+        ActionState.RECIPE_RECEIVED → LedgerTaskStatus.IN_PROGRESS
+        ActionState.TERMINATED → LedgerTaskStatus.COMPLETED
+    """
+    if user_prompt not in user_ledgers:
+        logger.debug(f"No ledger found for {user_prompt}, skipping sync")
+        return False
+
+    ledger = user_ledgers[user_prompt]
+    task_id = f"action_{action_id}"
+
+    if task_id not in ledger.tasks:
+        logger.debug(f"Task {task_id} not found in ledger, skipping sync")
+        return False
+
+    try:
+        LedgerTaskStatus = _get_ledger_task_status()
+
+        # Map ActionState to LedgerTaskStatus
+        STATE_MAP = {
+            ActionState.ASSIGNED: LedgerTaskStatus.PENDING,
+            ActionState.IN_PROGRESS: LedgerTaskStatus.IN_PROGRESS,
+            ActionState.STATUS_VERIFICATION_REQUESTED: LedgerTaskStatus.IN_PROGRESS,
+            ActionState.COMPLETED: LedgerTaskStatus.COMPLETED,
+            ActionState.PENDING: LedgerTaskStatus.BLOCKED,
+            ActionState.ERROR: LedgerTaskStatus.FAILED,
+            ActionState.FALLBACK_REQUESTED: LedgerTaskStatus.PAUSED,
+            ActionState.FALLBACK_RECEIVED: LedgerTaskStatus.IN_PROGRESS,
+            ActionState.RECIPE_REQUESTED: LedgerTaskStatus.IN_PROGRESS,
+            ActionState.RECIPE_RECEIVED: LedgerTaskStatus.IN_PROGRESS,
+            ActionState.TERMINATED: LedgerTaskStatus.COMPLETED,
+        }
+
+        ledger_status = STATE_MAP.get(state)
+        if ledger_status is None:
+            logger.warning(f"No mapping for ActionState {state}")
+            return False
+
+        # Get current ledger status to avoid unnecessary updates
+        current_ledger_status = ledger.tasks[task_id].status
+        if current_ledger_status == ledger_status:
+            return True  # Already in correct state
+
+        # Update ledger
+        ledger.update_task_status(
+            task_id,
+            ledger_status,
+            reason=f"Synced from ActionState.{state.value}"
+        )
+        logger.debug(f"Synced {task_id}: ActionState.{state.value} → LedgerTaskStatus.{ledger_status.value}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Error syncing action state to ledger: {e}")
+        return False
+
+
+def sync_all_actions_to_ledger(user_prompt: str, user_ledgers: Dict[str, Any]) -> int:
+    """
+    Sync all current ActionStates to the ledger.
+
+    Useful for bulk sync after recovery or initialization.
+
+    Args:
+        user_prompt: The user_prompt key
+        user_ledgers: The global user_ledgers dictionary
+
+    Returns:
+        int: Number of actions successfully synced
+    """
+    if user_prompt not in action_states:
+        return 0
+
+    synced = 0
+    for action_id, state in action_states[user_prompt].items():
+        if sync_action_state_to_ledger(user_prompt, action_id, state, user_ledgers):
+            synced += 1
+
+    logger.info(f"Synced {synced} actions to ledger for {user_prompt}")
+    return synced
+
+
+def get_ledger_status_for_action(user_prompt: str, action_id: int, user_ledgers: Dict[str, Any]) -> Optional[str]:
+    """
+    Get the current ledger status for an action.
+
+    Args:
+        user_prompt: The user_prompt key
+        action_id: The action ID
+        user_ledgers: The global user_ledgers dictionary
+
+    Returns:
+        str: The current ledger status value, or None if not found
+    """
+    if user_prompt not in user_ledgers:
+        return None
+
+    ledger = user_ledgers[user_prompt]
+    task_id = f"action_{action_id}"
+
+    if task_id not in ledger.tasks:
+        return None
+
+    return ledger.tasks[task_id].status.value

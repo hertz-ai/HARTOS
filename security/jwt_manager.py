@@ -1,0 +1,213 @@
+"""
+Hardened JWT Manager
+Short-lived access tokens, refresh tokens, unique JTI claims, and token blocklist.
+Replaces the weak 30-day token system in auth.py.
+"""
+
+import os
+import time
+import uuid
+import logging
+import hashlib
+import hmac
+from typing import Optional, Tuple
+from functools import lru_cache
+
+logger = logging.getLogger('hevolve_security')
+
+try:
+    import jwt as pyjwt
+    HAS_JWT = True
+except ImportError:
+    HAS_JWT = False
+
+ACCESS_TOKEN_EXPIRY = 3600          # 1 hour
+REFRESH_TOKEN_EXPIRY = 86400 * 7    # 7 days
+GRACE_PERIOD_EXPIRY = 86400 * 30    # 30 days - accept old tokens during migration
+
+
+class TokenBlocklist:
+    """In-memory token blocklist with optional Redis backend."""
+
+    def __init__(self):
+        self._memory_blocklist: set = set()
+        self._redis = None
+        self._init_redis()
+
+    def _init_redis(self):
+        try:
+            import redis
+            redis_url = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
+            self._redis = redis.from_url(redis_url, decode_responses=True)
+            self._redis.ping()
+        except Exception:
+            self._redis = None
+
+    def add(self, jti: str, expires_in: int = ACCESS_TOKEN_EXPIRY):
+        """Add a token JTI to the blocklist."""
+        self._memory_blocklist.add(jti)
+        if self._redis:
+            try:
+                self._redis.setex(f"jwt_blocklist:{jti}", expires_in, "1")
+            except Exception:
+                pass
+
+    def is_blocked(self, jti: str) -> bool:
+        """Check if a token JTI is blocked."""
+        if jti in self._memory_blocklist:
+            return True
+        if self._redis:
+            try:
+                return self._redis.exists(f"jwt_blocklist:{jti}") > 0
+            except Exception:
+                pass
+        return False
+
+
+# Singleton blocklist
+_blocklist = TokenBlocklist()
+
+
+class JWTManager:
+    """Secure JWT token management."""
+
+    def __init__(self, secret_key: Optional[str] = None):
+        self._secret_key = secret_key or self._load_secret_key()
+        self._validate_secret_key()
+
+    @staticmethod
+    def _load_secret_key() -> str:
+        key = os.environ.get('SOCIAL_SECRET_KEY', '')
+        if not key:
+            try:
+                from security.secrets_manager import get_secret
+                key = get_secret('SOCIAL_SECRET_KEY')
+            except Exception:
+                pass
+        return key
+
+    def _validate_secret_key(self):
+        """Reject weak/default secrets."""
+        weak_defaults = [
+            'hevolve-social-secret-change-in-production',
+            'secret', 'changeme', 'password', '',
+        ]
+        if self._secret_key in weak_defaults:
+            raise RuntimeError(
+                "SOCIAL_SECRET_KEY is weak or default. "
+                "Set a strong secret via environment variable."
+            )
+        if len(self._secret_key) < 32:
+            logger.warning("SOCIAL_SECRET_KEY is shorter than 32 characters. Consider using a longer key.")
+
+    def generate_access_token(self, user_id: str, username: str) -> str:
+        """Generate a short-lived access token (1 hour)."""
+        return self._generate_token(
+            user_id, username, 'access', ACCESS_TOKEN_EXPIRY
+        )
+
+    def generate_refresh_token(self, user_id: str, username: str) -> str:
+        """Generate a refresh token (7 days)."""
+        return self._generate_token(
+            user_id, username, 'refresh', REFRESH_TOKEN_EXPIRY
+        )
+
+    def generate_token_pair(self, user_id: str, username: str) -> dict:
+        """Generate both access and refresh tokens."""
+        return {
+            'access_token': self.generate_access_token(user_id, username),
+            'refresh_token': self.generate_refresh_token(user_id, username),
+            'token_type': 'bearer',
+            'expires_in': ACCESS_TOKEN_EXPIRY,
+        }
+
+    def _generate_token(self, user_id: str, username: str,
+                        token_type: str, expiry: int) -> str:
+        if not HAS_JWT:
+            return self._generate_hmac_token(user_id, username)
+
+        payload = {
+            'user_id': user_id,
+            'username': username,
+            'jti': str(uuid.uuid4()),
+            'iat': int(time.time()),
+            'exp': int(time.time()) + expiry,
+            'type': token_type,
+        }
+        return pyjwt.encode(payload, self._secret_key, algorithm='HS256')
+
+    def _generate_hmac_token(self, user_id: str, username: str) -> str:
+        """Fallback token generation without PyJWT."""
+        raw = f"{user_id}:{username}:{time.time()}:{uuid.uuid4()}"
+        return hmac.new(
+            self._secret_key.encode(), raw.encode(), hashlib.sha256
+        ).hexdigest()
+
+    def decode_token(self, token: str, expected_type: str = 'access') -> Optional[dict]:
+        """
+        Decode and validate a JWT token.
+        Returns payload dict or None if invalid.
+        """
+        if not HAS_JWT:
+            return None
+
+        try:
+            payload = pyjwt.decode(
+                token, self._secret_key, algorithms=['HS256']
+            )
+
+            # Check token type
+            token_type = payload.get('type', 'access')
+            if token_type != expected_type:
+                logger.warning(f"Token type mismatch: expected {expected_type}, got {token_type}")
+                return None
+
+            # Check blocklist
+            jti = payload.get('jti')
+            if jti and _blocklist.is_blocked(jti):
+                logger.warning(f"Blocked token used: jti={jti}")
+                return None
+
+            return payload
+
+        except pyjwt.ExpiredSignatureError:
+            return None
+        except pyjwt.InvalidTokenError as e:
+            logger.warning(f"Invalid token: {e}")
+            return None
+
+    def revoke_token(self, token: str):
+        """Revoke a token by adding its JTI to the blocklist."""
+        if not HAS_JWT:
+            return
+
+        try:
+            # Decode without verification to get JTI (token may already be expired)
+            payload = pyjwt.decode(
+                token, self._secret_key, algorithms=['HS256'],
+                options={'verify_exp': False}
+            )
+            jti = payload.get('jti')
+            if jti:
+                exp = payload.get('exp', 0)
+                ttl = max(exp - int(time.time()), ACCESS_TOKEN_EXPIRY)
+                _blocklist.add(jti, ttl)
+                logger.info(f"Token revoked: jti={jti}")
+        except Exception:
+            pass
+
+    def refresh_access_token(self, refresh_token: str) -> Optional[dict]:
+        """
+        Use a refresh token to generate a new access token.
+        Returns new token pair or None if refresh token is invalid.
+        """
+        payload = self.decode_token(refresh_token, expected_type='refresh')
+        if not payload:
+            return None
+
+        # Revoke old refresh token (rotation)
+        self.revoke_token(refresh_token)
+
+        return self.generate_token_pair(
+            payload['user_id'], payload['username']
+        )

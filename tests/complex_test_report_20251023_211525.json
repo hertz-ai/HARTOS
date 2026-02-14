@@ -1,0 +1,78 @@
+{
+  "timestamp": "2025-10-23T21:15:25.560777",
+  "user_id": 10077,
+  "prompt_id": 8888,
+  "test_summary": {
+    "total": 12,
+    "passed": 1,
+    "failed": 11,
+    "pass_rate": 8.333333333333332
+  },
+  "test_results": {
+    "req1_agent_creation": true,
+    "req2_schedulers": false,
+    "req8_actions_executed": false,
+    "req9_json_generation": false,
+    "req10_flow_tracking": false,
+    "req11_flow_recipes": false,
+    "req13_completion_verified": false,
+    "generated_files": false,
+    "state_machine": false,
+    "multi_agent": false,
+    "req14_reuse_execution": false,
+    "req15_output_consistency": false
+  },
+  "issues_found": [
+    {
+      "issue": "Only 0/3 scheduled tasks found",
+      "severity": "ERROR",
+      "timestamp": "2025-10-23T21:15:20.546685"
+    },
+    {
+      "issue": "Only 0/14 actions executed",
+      "severity": "ERROR",
+      "timestamp": "2025-10-23T21:15:20.546685"
+    },
+    {
+      "issue": "JSON validation exception: local variable 'json_matches' referenced before assignment",
+      "severity": "ERROR",
+      "timestamp": "2025-10-23T21:15:20.548690"
+    },
+    {
+      "issue": "Only 0/4 flows tracked",
+      "severity": "ERROR",
+      "timestamp": "2025-10-23T21:15:20.548690"
+    },
+    {
+      "issue": "No flow recipe files found",
+      "severity": "ERROR",
+      "timestamp": "2025-10-23T21:15:20.548690"
+    },
+    {
+      "issue": "No completion verification found",
+      "severity": "ERROR",
+      "timestamp": "2025-10-23T21:15:20.548690"
+    },
+    {
+      "issue": "Only 0/11 files generated",
+      "severity": "ERROR",
+      "timestamp": "2025-10-23T21:15:20.548690"
+    },
+    {
+      "issue": "Only 0 states detected",
+      "severity": "ERROR",
+      "timestamp": "2025-10-23T21:15:20.548690"
+    },
+    {
+      "issue": "Only 0 agents detected",
+      "severity": "ERROR",
+      "timestamp": "2025-10-23T21:15:20.548690"
+    }
+  ],
+  "issues_fixed": [],
+  "execution_time": {
+    "start": "2025-10-23T21:04:57.953482",
+    "end": "2025-10-23T21:15:25.560777",
+    "duration_seconds": 627.607295
+  }
+}

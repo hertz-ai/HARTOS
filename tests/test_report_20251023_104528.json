@@ -1,0 +1,57 @@
+{
+  "timestamp": "2025-10-23T10:45:28.330626",
+  "user_id": 10077,
+  "total_tests": 3,
+  "passed": 0,
+  "failed": 3,
+  "results": [
+    {
+      "scenario": "Calculate Taylor Series",
+      "task": "write a code for calculating taylor series",
+      "success": false,
+      "create_mode": {
+        "success": false,
+        "time": 182.56247663497925
+      },
+      "reuse_mode": {
+        "success": false,
+        "time": 0
+      },
+      "errors": [
+        "Recipe not created in CREATE mode"
+      ]
+    },
+    {
+      "scenario": "Create Simple File",
+      "task": "create a file named test_output.txt and write 'Hello World' in it",
+      "success": false,
+      "create_mode": {
+        "success": false,
+        "time": 122.35574388504028
+      },
+      "reuse_mode": {
+        "success": false,
+        "time": 0
+      },
+      "errors": [
+        "Recipe not created in CREATE mode"
+      ]
+    },
+    {
+      "scenario": "Math Calculation",
+      "task": "calculate the sum of numbers from 1 to 100",
+      "success": false,
+      "create_mode": {
+        "success": false,
+        "time": 92.2710394859314
+      },
+      "reuse_mode": {
+        "success": false,
+        "time": 0
+      },
+      "errors": [
+        "Recipe not created in CREATE mode"
+      ]
+    }
+  ]
+}

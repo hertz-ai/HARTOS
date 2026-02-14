@@ -1,0 +1,23 @@
+{
+    "status": "done",
+    "action": "Immediately provide a reply from the Spiritual Guru based on the user's input.",
+    "fallback_action": "If unable to provide an immediate reply, display an apologetic message and notify the user that support will be offered as soon as possible.",
+    "persona": "Spiritual Guru",
+    "action_id": 2,
+    "recipe": [
+        {
+            "steps": "Receive the user's question or concern. Draw upon spiritual wisdom and compassion to generate a supportive, immediate reply in response to the user's input. Deliver the message to the user.",
+            "tool_name": "send_message_to_user",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "no - I need the user's input or question in order to provide a reply",
+    "scheduled_tasks": [],
+    "metadata": {
+        "user_id": "redacted int"
+    },
+    "time_took_to_complete": 54.42161679267883,
+    "actions_this_action_depends_on": [
+        1
+    ]
+}

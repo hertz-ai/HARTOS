@@ -1,0 +1,114 @@
+{
+    "status": "done",
+    "action": "News Cycle Resets Every 3 Hours.",
+    "fallback_action": "If the reset fails, retry the process automatically up to 3 times using exponential backoff (5s, 10s, 20s) to prevent excessive requests. If the system cannot generate a new conv_id, temporarily use the previous conv_id for user access, ensuring continuous service.",
+    "persona": "News Reactor",
+    "action_id": 5,
+    "recipe": [
+        {
+            "steps": "Create a scheduled job to reset the news cycle every 3 hours.",
+            "tool_name": "create_scheduled_jobs",
+            "agent_to_perform_this_action": "Helper"
+        }
+    ],
+    "can_perform_without_user_input": "yes",
+    "scheduled_tasks": [
+        {
+            "cron_expression": "0 */3 * * *",
+            "persona": "News Reactor",
+            "action_entry_point": 5,
+            "job_description": "Reset the news cycle to ensure fresh news briefings."
+        }
+    ],
+    "metadata": {
+        "user_id": "redacted <class 'int'>",
+        "news": {
+            "latest": {
+                "general": [
+                    {
+                        "title": "redacted <class 'str'>",
+                        "source": "redacted <class 'str'>",
+                        "url": "redacted <class 'str'>"
+                    },
+                    {
+                        "title": "redacted <class 'str'>",
+                        "source": "redacted <class 'str'>",
+                        "url": "redacted <class 'str'>"
+                    }
+                ],
+                "sports": {
+                    "team": "redacted <class 'str'>",
+                    "events": [
+                        {
+                            "event": "redacted <class 'str'>",
+                            "date": "redacted <class 'str'>",
+                            "venue": "redacted <class 'str'>"
+                        }
+                    ]
+                }
+            },
+            "briefing": "redacted <class 'str'>"
+        },
+        "avatars": {
+            "per_genre": {
+                "genres": [
+                    {
+                        "genre": "redacted <class 'str'>",
+                        "avatar_id": "redacted <class 'int'>"
+                    },
+                    {
+                        "genre": "redacted <class 'str'>",
+                        "avatar_id": "redacted <class 'int'>"
+                    },
+                    {
+                        "genre": "redacted <class 'str'>",
+                        "avatar_id": "redacted <class 'int'>"
+                    },
+                    {
+                        "genre": "redacted <class 'str'>",
+                        "avatar_id": "redacted <class 'int'>"
+                    },
+                    {
+                        "genre": "redacted <class 'str'>",
+                        "avatar_id": "redacted <class 'int'>"
+                    },
+                    {
+                        "genre": "redacted <class 'str'>",
+                        "avatar_id": "redacted <class 'int'>"
+                    },
+                    {
+                        "genre": "redacted <class 'str'>",
+                        "avatar_id": "redacted <class 'int'>"
+                    },
+                    {
+                        "genre": "redacted <class 'str'>",
+                        "avatar_id": "redacted <class 'int'>"
+                    },
+                    {
+                        "genre": "redacted <class 'str'>",
+                        "avatar_id": "redacted <class 'int'>"
+                    },
+                    {
+                        "genre": "redacted <class 'str'>",
+                        "avatar_id": "redacted <class 'int'>"
+                    }
+                ]
+            }
+        },
+        "videos": {
+            "data": "redacted <class 'str'>",
+            "statuses": "redacted <class 'str'>"
+        },
+        "synthnews": {
+            "conv_ids": {
+                "first_user": "redacted <class 'str'>"
+            },
+            "latest_videos": {
+                "general": "redacted <class 'str'>",
+                "conv_ids": "redacted <class 'str'>"
+            }
+        }
+    },
+    "time_took_to_complete": 10.311856269836426,
+    "actions_this_action_depends_on": []
+}
