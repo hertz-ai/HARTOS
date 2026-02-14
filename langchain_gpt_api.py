@@ -409,6 +409,18 @@ os.environ["GOOGLE_CSE_ID"] = config['GOOGLE_CSE_ID']
 os.environ["GOOGLE_API_KEY"] = config['GOOGLE_API_KEY']
 os.environ["NEWS_API_KEY"] = config['NEWS_API_KEY']
 os.environ["SERPAPI_API_KEY"] = config['SERPAPI_API_KEY']
+
+# Mode-aware inference: pass LLM endpoint to crawl4ai for non-flat deployments
+_node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
+if _node_tier in ('regional', 'central'):
+    os.environ.setdefault('HEVOLVE_LLM_ENDPOINT_URL', config.get('OPENAI_API_BASE', ''))
+    os.environ.setdefault('HEVOLVE_LLM_API_KEY', config.get('OPENAI_API_KEY', ''))
+    os.environ.setdefault('HEVOLVE_LLM_MODEL_NAME', config.get('OPENAI_MODEL', 'gpt-4'))
+# Cloud fallback for adaptive routing (flat mode — offload when local CPU overloaded)
+if config.get('CLOUD_FALLBACK_URL'):
+    os.environ.setdefault('HEVOLVE_CLOUD_FALLBACK_URL', config['CLOUD_FALLBACK_URL'])
+    os.environ.setdefault('HEVOLVE_CLOUD_FALLBACK_KEY', config.get('CLOUD_FALLBACK_KEY', ''))
+    os.environ.setdefault('HEVOLVE_CLOUD_FALLBACK_MODEL', config.get('CLOUD_FALLBACK_MODEL', 'gpt-4'))
 # Zep removed — replaced by SimpleMem (local, zero-latency)
 # ZEP_API_URL / ZEP_API_KEY no longer needed
 GPT_API = config['GPT_API']
@@ -422,6 +434,180 @@ BOOKPARSING_API = config['BOOKPARSING_API']
 CRAWLAB_API = config['CRAWLAB_API']
 RAG_API = config['RAG_API']
 DB_URL = config['DB_URL']
+
+# ============================================================================
+# Embodied AI Learning Pipeline (crawl4ai — in-process, no extra port)
+# ============================================================================
+_learning_provider = None
+_hive_mind = None
+_trace_recorder = None
+
+
+def _is_bundled() -> bool:
+    """Detect whether we are pip-installed inside Nunba (flat mode).
+
+    When Nunba imports us via ``hevolve_backend_adapter``, that module is
+    already in ``sys.modules`` by the time our daemon thread runs.  In
+    standalone mode (``python langchain_gpt_api.py``, ``start_with_tracing.bat``)
+    it is absent.  No env-vars or mode flags required.
+    """
+    return 'hevolve_backend_adapter' in sys.modules
+
+
+def _has_cloud_api() -> bool:
+    """Return True if the user configured an external cloud / API endpoint."""
+    return bool(os.environ.get('HEVOLVE_LLM_ENDPOINT_URL', '').strip())
+
+
+def _wait_for_llm_server(url='http://localhost:8080', timeout=15):
+    """Wait for llama.cpp server, giving parent process time to start it.
+
+    In Nunba (flat mode), the desktop app starts llama.cpp in a background
+    thread.  This function polls the health endpoint so crawl4ai sees an
+    existing server and reuses it instead of auto-starting a second one.
+
+    In standalone mode nobody else starts the server, so after *timeout*
+    seconds we return False and let crawl4ai auto-start as usual.
+
+    Returns True if server found, False if timeout expired.
+    """
+    import urllib.request
+    import urllib.error
+    _logger = logging.getLogger(__name__)
+    for i in range(timeout):
+        try:
+            req = urllib.request.urlopen(f'{url}/health', timeout=2)
+            if req.status == 200:
+                _logger.info(
+                    f"[EmbodiedAI] llama.cpp server ready at {url} "
+                    f"(waited {i}s)")
+                return True
+        except (urllib.error.URLError, OSError):
+            pass
+        time.sleep(1)
+    _logger.info(
+        f"[EmbodiedAI] No server on {url} after {timeout}s "
+        "\u2014 crawl4ai will auto-start")
+    return False
+
+
+def _init_learning_pipeline():
+    """Initialize crawl4ai's learning pipeline in-process.
+
+    Instead of starting a separate server on port 8000,
+    we import and initialize the learning components directly.
+    world_model_bridge calls these functions without HTTP overhead.
+
+    Behaviour depends on context (auto-detected, no env vars needed):
+
+    **Bundled (Nunba, flat mode):**
+        Nunba owns the llama.cpp lifecycle.  We wait up to 30 s for
+        Nunba to start it.  If it appears we reuse it.  If it never
+        appears we skip the learning provider entirely — chat still
+        works, only RL-EF / hivemind is disabled.  We NEVER auto-start
+        a second server on the user's machine.
+
+    **Standalone (start_with_tracing.bat, ``python langchain_gpt_api.py``):**
+        Brief 5 s wait (in case user already has llama.cpp running).
+        If nothing responds, ``create_learning_llm_config()`` calls
+        crawl4ai which auto-starts its own server.  Default behaviour,
+        no mode config needed.
+
+    **Cloud API configured (``HEVOLVE_LLM_ENDPOINT_URL``):**
+        Skip local server wait entirely — crawl4ai's Priority 0 path
+        routes to the external endpoint.
+    """
+    global _learning_provider, _hive_mind, _trace_recorder
+
+    try:
+        from crawl4ai.embodied_ai.rl_ef import (
+            create_learning_llm_config,
+            register_learning_provider,
+        )
+        from crawl4ai.embodied_ai.monitoring.trace_recorder import get_trace_recorder
+        from crawl4ai.embodied_ai.learning.hive_mind import HiveMind, AgentCapability
+
+        _logger = logging.getLogger(__name__)
+        bundled = _is_bundled()
+        cloud = _has_cloud_api()
+        _logger.info(
+            f"[EmbodiedAI] Initializing learning pipeline "
+            f"(bundled={bundled}, cloud_api={cloud})...")
+
+        # ── Decide how to handle the local llama.cpp server ──
+        if cloud:
+            # Cloud endpoint configured — crawl4ai uses it directly,
+            # no need to wait for or start a local server.
+            _logger.info(
+                "[EmbodiedAI] Cloud API configured — skipping local server wait")
+        elif bundled:
+            # Nunba owns the llama.cpp lifecycle (port 8080).
+            # Wait generously, but NEVER auto-start a second server.
+            server_found = _wait_for_llm_server(timeout=30)
+            if not server_found:
+                _logger.warning(
+                    "[EmbodiedAI] Nunba's llama.cpp not ready after 30 s "
+                    "— learning disabled (chat still works)")
+                return
+        else:
+            # Standalone — brief courtesy wait then let crawl4ai auto-start.
+            _wait_for_llm_server(timeout=5)
+
+        # Trace recorder
+        recordings_dir = os.path.join(
+            os.path.expanduser('~'), '.crawl4ai', 'recordings')
+        os.makedirs(recordings_dir, exist_ok=True)
+        _trace_recorder = get_trace_recorder(recordings_dir)
+
+        # Learning provider (wraps llama.cpp on port 8080 or cloud endpoint)
+        _domain = 'general'
+        llm_config = create_learning_llm_config(
+            domain=_domain, fallback_api_key=None)
+        if '_provider' in llm_config:
+            _learning_provider = llm_config['_provider']
+            register_learning_provider(_domain, _learning_provider)
+            _logger.info(
+                "[EmbodiedAI] Learning provider ready (RL-EF + episodic memory)")
+        else:
+            _logger.warning(
+                "[EmbodiedAI] Learning provider init returned no provider")
+
+        # HiveMind
+        import uuid
+        instance_id = f"hevolve_{uuid.uuid4().hex[:8]}"
+        _hive_mind = HiveMind(max_agents=100)
+        _hive_mind.register_agent(
+            agent_id=instance_id,
+            agent_type='hevolve_orchestrator',
+            latent_dim=2048,
+            capabilities=[
+                AgentCapability.TEXT_GENERATION, AgentCapability.REASONING],
+        )
+        _logger.info(f"[EmbodiedAI] HiveMind registered as {instance_id}")
+
+    except ImportError as e:
+        logging.getLogger(__name__).warning(
+            f"[EmbodiedAI] crawl4ai not installed — learning disabled: {e}")
+    except Exception as e:
+        logging.getLogger(__name__).error(
+            f"[EmbodiedAI] Learning pipeline init failed: {e}")
+
+
+def get_learning_provider():
+    """Get the in-process learning provider (for world_model_bridge)."""
+    return _learning_provider
+
+
+def get_hive_mind():
+    """Get the in-process HiveMind instance (for world_model_bridge)."""
+    return _hive_mind
+
+
+# Boot learning pipeline in background (don't block Flask startup)
+threading.Thread(
+    target=_init_learning_pipeline, daemon=True,
+    name='embodied_ai_init').start()
+
 # task scheduling and logging
 
 
@@ -1352,10 +1538,12 @@ def get_action_user_details(user_id):
         # Filter out unwanted actions
         filtered_data = [obj for obj in data if obj["action"]
                          not in unwanted_actions and obj["zeroshot_label"]
-                         not in ['Video Reasoning']]
+                         not in ['Video Reasoning', 'Screen Reasoning']]
 
         filtered_data_video = [
             obj for obj in data if obj["zeroshot_label"] == 'Video Reasoning']
+        filtered_data_screen = [
+            obj for obj in data if obj["zeroshot_label"] == 'Screen Reasoning']
         # Dictionary to store the first and last occurrence dates for each action
         action_occurrences = {}
 
@@ -1405,6 +1593,25 @@ def get_action_user_details(user_id):
             action_texts.append('<Last_5_Minutes_Visual_Context_End>')
             action_texts.append(
                 'If a person is identified in Visual_Context section that\'s most probably the user (me) & most likely not taking any selfie.')
+
+        # Process screen context data (shorter window — 2 minutes)
+        screen_context_texts = []
+        for obj in filtered_data_screen:
+            action = obj["action"]
+            date = parse_date(obj["created_date"])
+            now = datetime.now()
+            # Screen context goes stale faster — 2 minute window
+            if (now - date) > timedelta(minutes=2):
+                continue
+            screen_text = f"{action} on {date.astimezone(india_tz).strftime('%Y-%m-%dT%H:%M:%S')}"
+            screen_context_texts.append(screen_text)
+
+        if screen_context_texts:
+            action_texts.append('<Last_2_Minutes_Screen_Context_Start>')
+            action_texts.extend(screen_context_texts)
+            action_texts.append('<Last_2_Minutes_Screen_Context_End>')
+            action_texts.append(
+                'Screen_Context shows what is currently displayed on the user\'s computer screen.')
 
         if len(action_texts) == 0:
             action_texts = ['user has not performed any actions yet.']
@@ -2981,9 +3188,51 @@ def create_prompts():
     return jsonify({'success': True, 'saved': saved})
 
 
+def _get_active_backend_info() -> dict:
+    """Get which LLM backend is currently serving inference."""
+    tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
+    if tier in ('regional', 'central'):
+        return {
+            'type': 'external',
+            'display_name': f"External ({os.environ.get('HEVOLVE_LLM_MODEL_NAME', 'unknown')})",
+            'model': os.environ.get('HEVOLVE_LLM_MODEL_NAME', ''),
+            'url': os.environ.get('HEVOLVE_LLM_ENDPOINT_URL', ''),
+            'mode': tier,
+        }
+    cloud_url = os.environ.get('HEVOLVE_CLOUD_FALLBACK_URL', '')
+    return {
+        'type': 'local_llamacpp',
+        'display_name': 'llama.cpp (Nunba)',
+        'model': 'Qwen3-VL-2B',
+        'mode': 'flat',
+        'cloud_fallback_configured': bool(cloud_url),
+    }
+
+
 @app.route('/status', methods=['GET'])
 def status():
-    return jsonify({'response': 'Working...'})
+    result = {'response': 'Working...', 'status': 'running'}
+
+    # Active LLM backend info
+    result['llm_backend'] = _get_active_backend_info()
+    result['node_tier'] = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
+
+    # crawl4ai health (non-blocking, fail-safe)
+    try:
+        from integrations.agent_engine.world_model_bridge import get_world_model_bridge
+        bridge = get_world_model_bridge()
+        bridge_stats = bridge.get_stats()
+        result['crawl4ai_url'] = bridge_stats.get('api_url', '')
+        result['in_process'] = bridge_stats.get('in_process', False)
+        health = bridge.check_health()
+        result['crawl4ai_healthy'] = health.get('healthy', False)
+        result['learning_active'] = health.get('learning_active', False)
+        result['learning_mode'] = health.get('mode', 'unknown')
+    except Exception:
+        result['crawl4ai_healthy'] = False
+        result['learning_active'] = False
+
+    return jsonify(result)
 
 @app.route('/zeroshot/', methods=['POST'])
 def zeroshot():

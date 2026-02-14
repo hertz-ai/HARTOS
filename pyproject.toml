@@ -83,6 +83,9 @@ dependencies = [
     "tiktoken>=0.5.0",
     "transformers>=4.30.0",
 
+    # Embodied AI — learning pipeline, hivemind, distributed intelligence
+    "embodied-ai @ git+https://github.com/hertz-ai/crawl4ai.git@main",
+
     # Security
     "cryptography>=41.0.0",
     "PyJWT>=2.7.0",

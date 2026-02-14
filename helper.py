@@ -1608,6 +1608,89 @@ def get_visual_context(user_id,mins=5):
     else:
         return None
 
+
+def get_screen_context(user_id, mins=2):
+    '''
+        Get recent screen understanding descriptions (shorter window than visual).
+        Screen context goes stale faster — default 2 minute window.
+    '''
+    action_url = f"https://mailer.hertzai.com/get_visual_bymins?user_id={user_id}&mins={mins}"
+    time_zone = "Asia/Kolkata"
+    india_tz = pytz.timezone(time_zone)
+
+    try:
+        response = pooled_request("GET", action_url, headers={}, data={})
+    except Exception:
+        return None
+
+    if response.status_code == 200:
+        data = response.json()
+        filtered_data_screen = [
+            obj for obj in data if obj["zeroshot_label"] == 'Screen Reasoning']
+        screen_context_texts = []
+        for obj in filtered_data_screen:
+            action = obj["action"]
+            date = parse_date(obj["created_date"])
+            now = datetime.now()
+            if (now - date) > timedelta(minutes=mins):
+                continue
+            screen_text = f"{action} on {date.astimezone(india_tz).strftime('%Y-%m-%dT%H:%M:%S')}"
+            screen_context_texts.append(screen_text)
+        if screen_context_texts:
+            return screen_context_texts[:10]
+        else:
+            return None
+    else:
+        return None
+
+def search_visual_history(user_id, query, mins=30, channel='both'):
+    '''
+        Search past camera/screen descriptions by substring match within a time window.
+        Reuses the same DB endpoint as get_visual_context/get_screen_context.
+        channel: 'camera', 'screen', or 'both'
+    '''
+    action_url = f"https://mailer.hertzai.com/get_visual_bymins?user_id={user_id}&mins={mins}"
+    time_zone = "Asia/Kolkata"
+    india_tz = pytz.timezone(time_zone)
+
+    try:
+        response = pooled_request("GET", action_url, headers={}, data={})
+    except Exception:
+        return None
+
+    if response.status_code != 200:
+        return None
+
+    data = response.json()
+    query_lower = query.lower()
+    results = []
+
+    for obj in data:
+        label = obj.get("zeroshot_label", "")
+        # Filter by channel
+        if channel == 'camera' and label != 'Video Reasoning':
+            continue
+        if channel == 'screen' and label != 'Screen Reasoning':
+            continue
+        if channel == 'both' and label not in ('Video Reasoning', 'Screen Reasoning'):
+            continue
+
+        action = obj.get("action", "")
+        # Substring match on query
+        if query_lower and query_lower not in action.lower():
+            continue
+
+        date = parse_date(obj["created_date"])
+        now = datetime.now()
+        if (now - date) > timedelta(minutes=mins):
+            continue
+
+        ch = 'camera' if label == 'Video Reasoning' else 'screen'
+        results.append(f"[{ch}] {action} at {date.astimezone(india_tz).strftime('%Y-%m-%dT%H:%M:%S')}")
+
+    return results[:20] if results else None
+
+
 def get_memory(user_id: int):
     '''
         Get memory object from zep

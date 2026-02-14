@@ -24,6 +24,8 @@ class TriggerType(Enum):
     REGEX = "regex"
     SCHEDULE = "schedule"
     WEBHOOK = "webhook"
+    VISUAL_MATCH = "visual_match"
+    SCREEN_MATCH = "screen_match"
 
 
 class TriggerPriority(Enum):
@@ -416,6 +418,13 @@ class TriggerManager:
             mentioned_user = event_data.get("mentioned_user")
             if mentioned_user and mentioned_user not in mentions:
                 return False, "not_mentioned"
+
+        elif trigger.trigger_type in (TriggerType.VISUAL_MATCH, TriggerType.SCREEN_MATCH):
+            description = str(event_data.get("description", ""))
+            if trigger.keywords and not any(kw.lower() in description.lower() for kw in trigger.keywords):
+                return False, "visual_keyword_not_found"
+            if trigger.compiled_pattern and not trigger.compiled_pattern.search(description):
+                return False, "visual_pattern_not_matched"
 
         return True, "ok"
 

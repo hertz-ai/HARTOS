@@ -2318,11 +2318,11 @@ class TestIPProtectionAgent:
 class TestBootstrapGoals:
     """Tests for goal_seeding.py: bootstrap seeding and auto-remediation."""
 
-    def test_seed_creates_5_goals(self, db):
-        """First call creates 5 bootstrap goals."""
+    def test_seed_creates_6_goals(self, db):
+        """First call creates 6 bootstrap goals."""
         from integrations.agent_engine.goal_seeding import seed_bootstrap_goals
         count = seed_bootstrap_goals(db)
-        assert count == 5
+        assert count == 6
         goals = db.query(AgentGoal).filter(AgentGoal.status == 'active').all()
         slugs = set()
         for g in goals:
@@ -2335,6 +2335,7 @@ class TestBootstrapGoals:
         assert 'bootstrap_ip_monitor' in slugs
         assert 'bootstrap_growth_analytics' in slugs
         assert 'bootstrap_coding_health' in slugs
+        assert 'bootstrap_hive_embedding_audit' in slugs
 
     def test_seed_idempotent(self, db):
         """Second call creates 0 — idempotent."""
@@ -2347,14 +2348,15 @@ class TestBootstrapGoals:
         """Marketing goals get product_id, non-marketing do not."""
         from integrations.agent_engine.goal_seeding import seed_bootstrap_goals
         count = seed_bootstrap_goals(db, platform_product_id=str(test_product.id))
-        assert count == 5
+        assert count == 6
         for g in db.query(AgentGoal).filter(AgentGoal.status == 'active').all():
             cfg = g.config_json or {}
             slug = cfg.get('bootstrap_slug', '')
             if slug in ('bootstrap_marketing_awareness', 'bootstrap_referral_campaign',
                         'bootstrap_growth_analytics'):
                 assert g.product_id == str(test_product.id), f"{slug} should have product_id"
-            elif slug in ('bootstrap_ip_monitor', 'bootstrap_coding_health'):
+            elif slug in ('bootstrap_ip_monitor', 'bootstrap_coding_health',
+                          'bootstrap_hive_embedding_audit'):
                 assert g.product_id is None, f"{slug} should NOT have product_id"
 
     def test_system_agent_created(self, db):
@@ -2455,3 +2457,27 @@ class TestBootstrapGoals:
         d = AgentDaemon()
         assert d._tick_count == 0
         assert d._remediate_every == 10
+
+    def test_coding_prompt_contains_hive_embedding(self):
+        """Coding prompt must contain hive intelligence embedding instructions."""
+        from integrations.agent_engine.goal_manager import _build_coding_prompt
+        goal = {
+            'title': 'Test Coding Goal',
+            'description': 'Build a web app',
+            'repo_url': 'https://github.com/test/repo',
+            'repo_branch': 'main',
+            'target_path': 'src/',
+        }
+        prompt = _build_coding_prompt(goal)
+        assert 'HIVE INTELLIGENCE EMBEDDING' in prompt
+        assert 'hevolve-sdk' in prompt
+        assert 'verify_master_key' in prompt
+        assert 'verify_guardrail_integrity' in prompt
+        assert 'WorldModelBridge' in prompt
+        assert 'register_node' in prompt
+
+    def test_coding_tool_tags_include_hive_embedding(self):
+        """Coding goal type must have hive_embedding in tool tags."""
+        from integrations.agent_engine.goal_manager import _tool_tags
+        tags = _tool_tags.get('coding', [])
+        assert 'hive_embedding' in tags

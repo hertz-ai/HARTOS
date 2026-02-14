@@ -1,4 +1,4 @@
-import { Bell, Moon, Sun, Search, RefreshCw } from 'lucide-react';
+import { Bell, Moon, Sun, Search, RefreshCw, Cpu } from 'lucide-react';
 import { useState, useEffect } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import metricsApi from '../../api/endpoints/metrics';
@@ -60,6 +60,22 @@ export default function Header() {
             <RefreshCw className="w-3 h-3 text-slate-500" />
           </button>
         </div>
+
+        {/* LLM Backend indicator */}
+        {status?.llm_backend && (
+          <div className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium ${
+            status.llm_backend.type === 'local_llamacpp'
+              ? 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300'
+              : status.llm_backend.type === 'cloud_fallback'
+              ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300'
+              : status.llm_backend.type === 'external'
+              ? 'bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300'
+              : 'bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300'
+          }`}>
+            <Cpu className="w-3 h-3" />
+            <span>{status.llm_backend.display_name}</span>
+          </div>
+        )}
 
         {/* Notifications */}
         <button className="relative p-2 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-lg">

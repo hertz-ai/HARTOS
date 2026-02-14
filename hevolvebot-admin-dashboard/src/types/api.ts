@@ -348,6 +348,18 @@ export interface GlobalConfig {
   memory: MemoryConfig;
 }
 
+// LLM Backend Info
+export interface LLMBackend {
+  type: 'local_llamacpp' | 'cloud_fallback' | 'external' | 'local_transformers' | 'unknown';
+  display_name: string;
+  model: string;
+  mode: string;
+  url?: string;
+  tps?: number;
+  reason?: string;
+  cloud_fallback_configured?: boolean;
+}
+
 // Status Types
 export interface SystemStatus {
   status: 'running' | 'stopped' | 'error';
@@ -360,6 +372,11 @@ export interface SystemStatus {
   cron_jobs_count: number;
   triggers_count: number;
   workflows_count: number;
+  // LLM backend fields (from enriched /status endpoint)
+  node_tier?: string;
+  llm_backend?: LLMBackend;
+  crawl4ai_healthy?: boolean;
+  crawl4ai_url?: string;
 }
 
 export interface HealthCheck {

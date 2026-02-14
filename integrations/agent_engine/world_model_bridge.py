@@ -2,17 +2,14 @@
 Unified Agent Goal Engine - World Model Bridge
 
 Bridge between LLM-langchain orchestration and crawl4ai's embodied AI.
-Every agent interaction becomes training data via crawl4ai's real endpoints.
+Every agent interaction becomes training data for continuous learning.
 Skills distribute via gossip notification + local RALT ingestion.
 
-crawl4ai API (FastAPI on port 8000):
-  POST /v1/chat/completions  — OpenAI-compatible, auto-learns from every interaction
-  POST /v1/corrections       — Expert feedback (RL-EF), factual (kernel) or conceptual (LoRA)
-  POST /v1/hivemind/think    — Distributed collective thinking (tensor fusion)
-  GET  /v1/stats             — Learning statistics
-  GET  /v1/hivemind/stats    — Collective intelligence stats
-  GET  /v1/hivemind/agents   — Connected agents list
-  GET  /health               — Health check
+Dual-mode operation:
+  IN-PROCESS (flat/regional): Direct Python calls — zero HTTP overhead.
+    crawl4ai is pip-installed, learning functions called directly.
+  HTTP FALLBACK (central standalone): REST calls to remote crawl4ai.
+    Used when services run as separate processes on different ports.
 
 Bootstrap: crawl4ai uses llama.cpp (Qwen3-VL-2B, Q4_K_XL, ~1.5GB) locally.
 No external API key needed.  Learning is local-first, distributed via RALT + WAMP.
@@ -39,9 +36,8 @@ logger = logging.getLogger('hevolve_social')
 class WorldModelBridge:
     """Bridge between LLM-langchain orchestration and crawl4ai embodied AI.
 
-    Records every interaction as training data via /v1/chat/completions,
-    submits expert corrections via /v1/corrections, queries the hive
-    via /v1/hivemind/think, and monitors learning via /v1/stats.
+    Dual-mode: in-process direct Python calls when crawl4ai is co-located
+    (flat/regional), HTTP fallback when running as separate processes (central).
 
     Two-tier thinking model:
     - Agent-level: Hevolve dispatches coarse-grained goals (task delegation)
@@ -52,6 +48,7 @@ class WorldModelBridge:
     def __init__(self):
         self._api_url = os.environ.get(
             'CRAWL4AI_API_URL', 'http://localhost:8000')
+        self._node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
         self._experience_queue: deque = deque(maxlen=10000)
         self._flush_executor = ThreadPoolExecutor(
             max_workers=2, thread_name_prefix='wm_flush')
@@ -65,7 +62,37 @@ class WorldModelBridge:
             'total_hivemind_queries': 0,
             'total_skills_distributed': 0,
             'total_skills_blocked': 0,
+            'node_tier': self._node_tier,
         }
+
+        # In-process mode: direct Python calls (no HTTP overhead)
+        self._provider = None  # LearningLLMProvider
+        self._hive_mind = None  # HiveMind
+        self._in_process = False
+        self._init_in_process()
+
+    def _init_in_process(self):
+        """Try to connect to in-process learning pipeline (zero HTTP overhead).
+
+        When crawl4ai is pip-installed and _init_learning_pipeline() has run
+        in langchain_gpt_api.py, we get direct references to the provider
+        and hivemind instances. All subsequent calls bypass HTTP entirely.
+        """
+        try:
+            from langchain_gpt_api import get_learning_provider, get_hive_mind
+            provider = get_learning_provider()
+            hive = get_hive_mind()
+            if provider is not None:
+                self._provider = provider
+                self._hive_mind = hive
+                self._in_process = True
+                logger.info(
+                    "[WorldModelBridge] In-process mode: direct Python calls")
+                return
+        except ImportError:
+            pass
+        logger.info(
+            f"[WorldModelBridge] HTTP mode: {self._api_url}")
 
     # ─── Record interactions (auto-learn) ────────────────────────────
 
@@ -76,7 +103,7 @@ class WorldModelBridge:
         """Record every agent interaction as training data for crawl4ai.
 
         Called after EVERY /chat response.  Batches experiences and flushes
-        them to crawl4ai's POST /v1/chat/completions in OpenAI format.
+        them to crawl4ai (in-process or HTTP).
         crawl4ai auto-learns from every completion (3-priority queue:
         expert > reality > distillation).
 
@@ -117,14 +144,44 @@ class WorldModelBridge:
                 self._flush_executor.submit(self._flush_to_world_model, batch)
 
     def _flush_to_world_model(self, batch: list):
-        """Flush experience batch to crawl4ai via POST /v1/chat/completions.
+        """Flush experience batch to crawl4ai's learning provider.
 
-        Each experience is sent as an OpenAI-format chat completion.
-        crawl4ai's LearningLLMProvider auto-learns from every request:
-        - Records to trace_recorder (offline analysis)
-        - Feeds distillation queue (background Qwen teacher→student)
-        - Updates embodied agent's episodic memory
+        In-process mode: calls provider.create_chat_completion() directly.
+        HTTP mode: POST /v1/chat/completions (OpenAI format).
         """
+        if self._in_process and self._provider:
+            for exp in batch:
+                try:
+                    messages = [
+                        {
+                            'role': 'system',
+                            'content': json.dumps({
+                                'source': exp.get('source',
+                                                  'langchain_orchestration'),
+                                'user_id': exp.get('user_id'),
+                                'prompt_id': exp.get('prompt_id'),
+                                'goal_id': exp.get('goal_id'),
+                                'model_id': exp.get('model_id'),
+                                'latency_ms': exp.get('latency_ms'),
+                                'node_id': exp.get('node_id'),
+                            }),
+                        },
+                        {'role': 'user', 'content': exp['prompt']},
+                        {'role': 'assistant', 'content': exp['response']},
+                    ]
+                    self._provider.create_chat_completion(
+                        messages=messages,
+                        model='hevolve-interaction-replay',
+                        temperature=0,
+                        max_tokens=1,
+                    )
+                    with self._lock:
+                        self._stats['total_flushed'] += 1
+                except Exception as e:
+                    logger.debug(f"In-process flush error: {e}")
+            return
+
+        # HTTP fallback (central standalone or crawl4ai not in-process)
         for exp in batch:
             try:
                 body = {
@@ -133,7 +190,8 @@ class WorldModelBridge:
                         {
                             'role': 'system',
                             'content': json.dumps({
-                                'source': exp.get('source', 'langchain_orchestration'),
+                                'source': exp.get('source',
+                                                  'langchain_orchestration'),
                                 'user_id': exp.get('user_id'),
                                 'prompt_id': exp.get('prompt_id'),
                                 'goal_id': exp.get('goal_id'),
@@ -171,7 +229,10 @@ class WorldModelBridge:
                           valid_until: str = None) -> dict:
         """Submit an expert correction to crawl4ai's RL-EF system.
 
-        Calls POST /v1/corrections.  crawl4ai routes to:
+        In-process: calls send_expert_correction() directly.
+        HTTP: POST /v1/corrections.
+
+        crawl4ai routes to:
         - Kernel Continual Learner (instant, no gradient) for factual corrections
         - Orthogonal LoRA (gradient-based, forgetting-safe) for conceptual ones
 
@@ -185,6 +246,26 @@ class WorldModelBridge:
         except ImportError:
             pass
 
+        # In-process direct call
+        if self._in_process and self._provider:
+            try:
+                from crawl4ai.embodied_ai.rl_ef import send_expert_correction
+                result = send_expert_correction(
+                    domain='general',
+                    original_response=original_response[:5000],
+                    corrected_response=corrected_response[:5000],
+                    expert_id=expert_id,
+                    confidence=max(0.0, min(1.0, confidence)),
+                    explanation=explanation[:2000] if explanation else None,
+                    valid_until=valid_until,
+                )
+                with self._lock:
+                    self._stats['total_corrections'] += 1
+                return result if isinstance(result, dict) else {'success': True}
+            except Exception as e:
+                logger.debug(f"In-process correction failed: {e}")
+
+        # HTTP fallback
         body = {
             'original_response': original_response[:5000],
             'corrected_response': corrected_response[:5000],
@@ -219,7 +300,10 @@ class WorldModelBridge:
                        timeout_ms: int = 1000) -> Optional[dict]:
         """Query crawl4ai's HiveMind for distributed collective thinking.
 
-        Calls POST /v1/hivemind/think.  crawl4ai:
+        In-process: calls hive_mind.think_together_distributed() directly.
+        HTTP: POST /v1/hivemind/think.
+
+        crawl4ai:
         1. Encodes query via frozen Qwen alignment layer (2048-D)
         2. Publishes local thought to WAMP
         3. Waits for remote agent responses (timeout_ms)
@@ -237,6 +321,36 @@ class WorldModelBridge:
         except ImportError:
             pass
 
+        # In-process direct call
+        if self._in_process and self._hive_mind:
+            try:
+                import torch
+                # Encode query text as a thought tensor
+                thought = torch.randn(1, 2048)  # Placeholder encoding
+                # Use provider's encoder if available
+                if (self._provider and
+                        hasattr(self._provider, 'embodied_agent') and
+                        self._provider.embodied_agent and
+                        hasattr(self._provider.embodied_agent, 'encoder')):
+                    encoder = self._provider.embodied_agent.encoder
+                    thought = encoder.encode_text(query_text)
+
+                result = self._hive_mind.think_together_distributed(
+                    local_thought=thought,
+                    local_agent_id=getattr(
+                        self._hive_mind, '_local_agent_id', 'local'),
+                    timeout_ms=timeout_ms,
+                )
+                with self._lock:
+                    self._stats['total_hivemind_queries'] += 1
+                return {
+                    'thought': result.text if hasattr(result, 'text')
+                    else str(result)
+                }
+            except Exception as e:
+                logger.debug(f"In-process hivemind failed: {e}")
+
+        # HTTP fallback
         try:
             resp = requests.post(
                 f'{self._api_url}/v1/hivemind/think',
@@ -256,11 +370,26 @@ class WorldModelBridge:
     def get_learning_stats(self) -> dict:
         """Get merged learning + hivemind + bridge stats.
 
-        Calls GET /v1/stats (learning) and GET /v1/hivemind/stats (collective).
+        In-process: calls provider.get_stats() + hive_mind.get_stats().
+        HTTP: GET /v1/stats + GET /v1/hivemind/stats.
         Returns combined dict for dashboard consumption.
         """
         result = {'learning': {}, 'hivemind': {}, 'bridge': self.get_stats()}
 
+        if self._in_process:
+            if self._provider:
+                try:
+                    result['learning'] = self._provider.get_stats()
+                except Exception:
+                    pass
+            if self._hive_mind:
+                try:
+                    result['hivemind'] = self._hive_mind.get_stats()
+                except Exception:
+                    pass
+            return result
+
+        # HTTP fallback
         try:
             resp = requests.get(
                 f'{self._api_url}/v1/stats', timeout=10)
@@ -280,11 +409,19 @@ class WorldModelBridge:
         return result
 
     def get_hivemind_agents(self) -> list:
-        """Get list of connected HiveMind agents from crawl4ai.
+        """Get list of connected HiveMind agents.
 
-        Calls GET /v1/hivemind/agents.  Returns agent specs with
-        capabilities, modality, latent dimensions, accuracy.
+        In-process: calls hive_mind.get_all_agents().
+        HTTP: GET /v1/hivemind/agents.
+        Returns agent specs with capabilities, modality, latent dimensions.
         """
+        if self._in_process and self._hive_mind:
+            try:
+                return self._hive_mind.get_all_agents()
+            except Exception:
+                pass
+
+        # HTTP fallback
         try:
             resp = requests.get(
                 f'{self._api_url}/v1/hivemind/agents', timeout=10)
@@ -357,20 +494,48 @@ class WorldModelBridge:
     # ─── Health ──────────────────────────────────────────────────────
 
     def check_health(self) -> dict:
-        """Check crawl4ai API health.
+        """Check learning pipeline health.
 
-        Calls GET /health.  Returns {healthy: bool, details: {...}}.
+        In-process: returns healthy if provider is available.
+        HTTP: GET /health on crawl4ai API.
         """
+        if self._in_process and self._provider:
+            return {
+                'healthy': True,
+                'learning_active': True,
+                'mode': 'in_process',
+                'node_tier': self._node_tier,
+            }
+
+        # HTTP fallback
         try:
             resp = requests.get(
                 f'{self._api_url}/health', timeout=5)
             if resp.status_code == 200:
                 data = resp.json() if resp.headers.get(
                     'content-type', '').startswith('application/json') else {}
-                return {'healthy': True, 'details': data}
-            return {'healthy': False, 'details': {'status_code': resp.status_code}}
+                return {
+                    'healthy': True,
+                    'learning_active': True,
+                    'mode': 'http',
+                    'node_tier': self._node_tier,
+                    'details': data,
+                }
+            return {
+                'healthy': False,
+                'learning_active': False,
+                'mode': 'http',
+                'node_tier': self._node_tier,
+                'details': {'status_code': resp.status_code},
+            }
         except requests.RequestException as e:
-            return {'healthy': False, 'details': {'error': str(e)}}
+            return {
+                'healthy': False,
+                'learning_active': False,
+                'mode': 'http',
+                'node_tier': self._node_tier,
+                'details': {'error': str(e)},
+            }
 
     def get_stats(self) -> dict:
         """Get bridge-level statistics."""
@@ -378,6 +543,7 @@ class WorldModelBridge:
             return {
                 'queue_size': len(self._experience_queue),
                 'api_url': self._api_url,
+                'in_process': self._in_process,
                 **self._stats,
             }
 

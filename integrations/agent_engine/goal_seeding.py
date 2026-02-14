@@ -109,6 +109,26 @@ SEED_BOOTSTRAP_GOALS = [
         'spark_budget': 100,
         'use_product': False,
     },
+    {
+        'slug': 'bootstrap_hive_embedding_audit',
+        'goal_type': 'coding',
+        'title': 'Audit and Embed Hive Intelligence in All Repos',
+        'description': (
+            'Scan all repositories created by the coding agent. For each: '
+            '1) Verify hevolve-sdk is listed as a dependency, '
+            '2) Check master key verification exists in entry points, '
+            '3) Verify world model bridge wiring for learning feedback, '
+            '4) Ensure node identity registration is present. '
+            'Fix any repos missing these components.'
+        ),
+        'config': {
+            'repo_url': '',
+            'repo_branch': 'main',
+            'mode': 'audit',
+        },
+        'spark_budget': 200,
+        'use_product': False,
+    },
 ]
 
 # ─── Loophole → Remediation Goal Map ───

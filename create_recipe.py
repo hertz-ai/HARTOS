@@ -1328,6 +1328,20 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     helper.register_for_llm(name="get_chat_history", description="Get Chat history based on text & start & end date")(get_chat_history)
     assistant.register_for_execution(name="get_chat_history")(get_chat_history)
 
+    @log_tool_execution
+    def search_visual_history(
+        query: Annotated[str, "What to search for in visual/screen descriptions"],
+        minutes_back: Annotated[int, "How many minutes back to search (default 30)"] = 30,
+        channel: Annotated[str, "Which feed: 'camera', 'screen', or 'both' (default)"] = "both",
+    ) -> str:
+        """Search past camera/screen descriptions. Use for questions about what happened earlier visually."""
+        results = helper_fun.search_visual_history(user_id, query, mins=minutes_back, channel=channel)
+        if results:
+            return '\n'.join(results)
+        return "No matching visual/screen descriptions found in the given time range."
+    helper.register_for_llm(name="search_visual_history", description="Search past camera and screen descriptions by keyword and time range. Use for visual history queries.")(search_visual_history)
+    assistant.register_for_execution(name="search_visual_history")(search_visual_history)
+
     # --- SimpleMem long-term memory tools ---
     if simplemem_store is not None:
         @log_tool_execution
@@ -2959,6 +2973,8 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
 
     helper1.register_for_llm(name="get_data_by_key", description="Returns all data from the internal Memory")(get_data_by_key)
     time_agent.register_for_execution(name="get_data_by_key")(get_data_by_key)
+    helper1.register_for_llm(name="search_visual_history", description="Search past camera and screen descriptions by keyword and time range.")(search_visual_history)
+    time_agent.register_for_execution(name="search_visual_history")(search_visual_history)
 
     # --- SimpleMem long-term memory tools for time agents ---
     simplemem_store = user_simplemem.get(user_prompt)

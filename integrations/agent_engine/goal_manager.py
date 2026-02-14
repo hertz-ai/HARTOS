@@ -437,9 +437,15 @@ def _build_marketing_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None
 
 
 def _build_coding_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
-    """Build a coding agent prompt — mirrors CodingGoalManager.build_prompt()."""
+    """Build a coding agent prompt with hive intelligence embedding."""
+    from .hive_sdk_spec import get_hive_embedding_instructions
+
     config = goal_dict
+    platform_identity = _get_platform_identity()
+    hive_instructions = get_hive_embedding_instructions()
+
     return (
+        f"{platform_identity}\n\n"
         f"You are working on the GitHub repository {config.get('repo_url', '')} "
         f"(branch {config.get('repo_branch', 'main')}).\n"
         f"Target path: {config.get('target_path', '(entire repo)')}\n\n"
@@ -447,7 +453,8 @@ def _build_coding_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -
         f"Description: {goal_dict.get('description', '')}\n\n"
         f"Clone the repo, analyze the codebase, and make improvements "
         f"aligned with the goal above. Focus on code quality, bug fixes, "
-        f"and missing implementations."
+        f"and missing implementations.\n\n"
+        f"{hive_instructions}"
     )
 
 
@@ -533,5 +540,5 @@ def _build_ip_protection_prompt(goal_dict: Dict, product_dict: Optional[Dict] = 
 # ─── Auto-register built-in types ───
 
 register_goal_type('marketing', _build_marketing_prompt, tool_tags=['marketing'])
-register_goal_type('coding', _build_coding_prompt, tool_tags=['coding'])
+register_goal_type('coding', _build_coding_prompt, tool_tags=['coding', 'hive_embedding'])
 register_goal_type('ip_protection', _build_ip_protection_prompt, tool_tags=['ip_protection'])

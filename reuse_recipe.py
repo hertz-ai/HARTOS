@@ -625,10 +625,12 @@ def get_action_user_details(user_id):
         # Filter out unwanted actions
         filtered_data = [obj for obj in data if obj["action"]
                          not in unwanted_actions and obj["zeroshot_label"]
-                         not in ['Video Reasoning']]
+                         not in ['Video Reasoning', 'Screen Reasoning']]
 
         filtered_data_video = [
             obj for obj in data if obj["zeroshot_label"] == 'Video Reasoning']
+        filtered_data_screen = [
+            obj for obj in data if obj["zeroshot_label"] == 'Screen Reasoning']
         # Dictionary to store the first and last occurrence dates for each action
         action_occurrences = {}
 
@@ -678,6 +680,24 @@ def get_action_user_details(user_id):
             action_texts.append('<Last_5_Minutes_Visual_Context_End>')
             action_texts.append(
                 'If a person is identified in Visual_Context section that\'s most probably the user (me) & most likely not taking any selfie.')
+
+        # Process screen context data (shorter window — 2 minutes)
+        screen_context_texts = []
+        for obj in filtered_data_screen:
+            action = obj["action"]
+            date = parse_date(obj["created_date"])
+            now = datetime.now()
+            if (now - date) > timedelta(minutes=2):
+                continue
+            screen_text = f"{action} on {date.astimezone(india_tz).strftime('%Y-%m-%dT%H:%M:%S')}"
+            screen_context_texts.append(screen_text)
+
+        if screen_context_texts:
+            action_texts.append('<Last_2_Minutes_Screen_Context_Start>')
+            action_texts.extend(screen_context_texts)
+            action_texts.append('<Last_2_Minutes_Screen_Context_End>')
+            action_texts.append(
+                'Screen_Context shows what is currently displayed on the user\'s computer screen.')
 
         if len(action_texts) == 0:
             action_texts = ['user has not performed any actions yet.']
@@ -1582,6 +1602,19 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         current_app.logger.info('INSIDE get_chat_history')
         return get_time_based_history(text, f'user_{user_id}', start, end)
 
+    @assistant.register_for_execution()
+    @helper.register_for_llm(api_style="function", description="Search past camera and screen descriptions by keyword and time range. Use for visual history queries.")
+    def search_visual_history(
+        query: Annotated[str, "What to search for in visual/screen descriptions"],
+        minutes_back: Annotated[int, "How many minutes back to search (default 30)"] = 30,
+        channel: Annotated[str, "Which feed: 'camera', 'screen', or 'both' (default)"] = "both",
+    ) -> str:
+        """Search past camera/screen descriptions for visual history queries."""
+        results = helper_fun.search_visual_history(user_id, query, mins=minutes_back, channel=channel)
+        if results:
+            return '\n'.join(results)
+        return "No matching visual/screen descriptions found in the given time range."
+
     # --- SimpleMem long-term memory tools ---
     if simplemem_store is not None:
         @assistant.register_for_execution()
@@ -2296,6 +2329,8 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     helper1.register_for_llm(name="get_chat_history", description="Get Chat history based on text & start & end date")(
         get_chat_history)
     time_agent.register_for_execution(name="get_chat_history")(get_chat_history)
+    helper1.register_for_llm(name="search_visual_history", description="Search past camera and screen descriptions by keyword and time range.")(search_visual_history)
+    time_agent.register_for_execution(name="search_visual_history")(search_visual_history)
     # SimpleMem tools for time_agent
     if simplemem_store is not None:
         helper1.register_for_llm(
@@ -2395,6 +2430,8 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     helper2.register_for_llm(name="get_chat_history", description="Get Chat history based on text & start & end date")(
         get_chat_history)
     visual_agent.register_for_execution(name="get_chat_history")(get_chat_history)
+    helper2.register_for_llm(name="search_visual_history", description="Search past camera and screen descriptions by keyword and time range.")(search_visual_history)
+    visual_agent.register_for_execution(name="search_visual_history")(search_visual_history)
     # SimpleMem tools for visual_agent
     if simplemem_store is not None:
         helper2.register_for_llm(
