@@ -341,6 +341,21 @@ class GossipProtocol:
             info['guardrail_hash'] = get_guardrail_hash()
         except Exception:
             pass
+        # Include Hyve OS capabilities (contribution tier + enabled features)
+        try:
+            from security.system_requirements import get_capabilities
+            caps = get_capabilities()
+            if caps:
+                info['capability_tier'] = caps.tier.value
+                info['enabled_features'] = caps.enabled_features
+                info['hardware_summary'] = {
+                    'cpu_cores': caps.hardware.cpu_cores,
+                    'ram_gb': caps.hardware.ram_gb,
+                    'gpu_vram_gb': caps.hardware.gpu_vram_gb,
+                    'disk_free_gb': caps.hardware.disk_free_gb,
+                }
+        except Exception:
+            pass
         return info
 
     def _seed_initial_peers(self):
@@ -516,6 +531,11 @@ class GossipProtocol:
             if certificate:
                 existing.certificate_json = certificate
                 existing.certificate_verified = certificate_verified
+            # Update capability tier from Hyve OS equilibrium
+            if peer_data.get('capability_tier'):
+                existing.capability_tier = peer_data['capability_tier']
+            if peer_data.get('enabled_features'):
+                existing.enabled_features_json = peer_data['enabled_features']
             if existing.status == 'dead':
                 # Only resurrect if announcement is recent (not stale gossip)
                 if (datetime.utcnow() - existing.last_seen).total_seconds() < 60:
@@ -539,14 +559,48 @@ class GossipProtocol:
             tier=peer_tier,
             certificate_json=certificate,
             certificate_verified=certificate_verified,
+            capability_tier=peer_data.get('capability_tier'),
+            enabled_features_json=peer_data.get('enabled_features'),
         )
         db.add(new_peer)
+
+        # ─── Seamless Mind Merge ───
+        # Valid peer accepted — auto-federate so minds merge without friction.
+        # Connection is a breeze; the audit layer handles trust continuously.
+        threading.Thread(
+            target=self._auto_federate_peer,
+            args=(node_id, url),
+            daemon=True,
+        ).start()
+
         return True
+
+    def _auto_federate_peer(self, peer_node_id: str, peer_url: str):
+        """Auto-follow a newly accepted peer for seamless mind merge.
+        Valid peers get instant bidirectional content sharing — no manual step."""
+        try:
+            from .models import get_db
+            from .federation import federation
+            db = get_db()
+            try:
+                # Follow them (we receive their content)
+                federation.follow_instance(db, self.node_id, peer_node_id, peer_url)
+                db.commit()
+                logger.info(f"Mind merge: auto-federated with {peer_node_id[:8]} at {peer_url}")
+            except Exception as e:
+                db.rollback()
+                logger.debug(f"Auto-federation failed for {peer_node_id[:8]}: {e}")
+            finally:
+                db.close()
+        except Exception:
+            pass
 
     # ─── Integrity Round ───
 
     def _integrity_round(self):
-        """Periodic integrity check: challenge random peer, pull ban list, detect anomalies."""
+        """Periodic integrity check: continuous audit using ALL active nodes.
+        Every node audits every other node it can reach — not just one random peer.
+        Valid connections are a breeze; continuous audit is the price of trust."""
         # Self-check: verify own code integrity before challenging others
         try:
             from security.runtime_monitor import is_code_healthy
@@ -557,10 +611,19 @@ class GossipProtocol:
         except Exception:
             pass
 
+        # Self-check: verify own guardrail integrity
+        try:
+            from security.hive_guardrails import verify_guardrail_integrity
+            if not verify_guardrail_integrity():
+                logger.critical("Integrity round: guardrail integrity failed, stopping gossip")
+                self.stop()
+                return
+        except Exception:
+            pass
+
         from .models import get_db, PeerNode
         db = get_db()
         try:
-            # 1. Challenge one random active peer
             active_peers = db.query(PeerNode).filter(
                 PeerNode.status == 'active',
                 PeerNode.node_id != self.node_id,
@@ -568,20 +631,54 @@ class GossipProtocol:
             ).all()
 
             if active_peers:
-                target = random.choice(active_peers)
-                challenge_types = ['agent_count_verify', 'code_hash_check', 'stats_probe']
-                challenge_type = random.choice(challenge_types)
-                try:
-                    from .integrity_service import IntegrityService
-                    IntegrityService.create_challenge(
-                        db, self.node_id, target.node_id,
-                        target.url, challenge_type)
-                    db.commit()
-                except Exception as e:
-                    db.rollback()
-                    logger.debug(f"Integrity challenge failed: {e}")
+                from .integrity_service import IntegrityService
 
-            # 2. Pull registry ban list if configured
+                # 1. Guardrail audit: re-verify ALL active peers' guardrail hashes.
+                #    This is the continuous audit — every node checks every other node.
+                for peer in active_peers:
+                    self._audit_peer_guardrails(db, peer)
+
+                # 2. Deep challenge: cycle through challenge types across all peers.
+                #    Each peer gets a different challenge type per round (round-robin).
+                challenge_types = ['agent_count_verify', 'code_hash_check',
+                                   'stats_probe', 'guardrail_verify']
+                for i, peer in enumerate(active_peers):
+                    challenge_type = challenge_types[i % len(challenge_types)]
+                    try:
+                        IntegrityService.create_challenge(
+                            db, self.node_id, peer.node_id,
+                            peer.url, challenge_type)
+                    except Exception as e:
+                        logger.debug(f"Challenge to {peer.node_id[:8]} failed: {e}")
+                try:
+                    db.commit()
+                except Exception:
+                    db.rollback()
+
+                # 3. Run full fraud detection on ALL active peers
+                for peer in active_peers:
+                    try:
+                        IntegrityService.detect_impression_anomaly(db, peer.node_id)
+                        IntegrityService.detect_score_jump(db, peer.node_id)
+                        IntegrityService.detect_collusion(db, peer.node_id)
+                    except Exception as e:
+                        logger.debug(f"Fraud detection for {peer.node_id[:8]} failed: {e}")
+                try:
+                    db.commit()
+                except Exception:
+                    db.rollback()
+
+            # 4. Verify audit compute dominance — no node can outcompute its auditors
+            try:
+                from .integrity_service import IntegrityService
+                for peer in active_peers:
+                    IntegrityService.verify_audit_dominance(db, peer.node_id)
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                logger.debug(f"Audit dominance check failed: {e}")
+
+            # 5. Pull registry ban list if configured
             registry_url = os.environ.get('HEVOLVE_REGISTRY_URL', '')
             if registry_url:
                 try:
@@ -597,22 +694,55 @@ class GossipProtocol:
                 except Exception as e:
                     logger.debug(f"Registry ban list check failed: {e}")
 
-            # 3. Run impression anomaly detection on active peers (sample up to 5)
-            if active_peers:
-                sample = random.sample(active_peers, min(5, len(active_peers)))
-                try:
-                    from .integrity_service import IntegrityService
-                    for peer in sample:
-                        IntegrityService.detect_impression_anomaly(db, peer.node_id)
-                    db.commit()
-                except Exception as e:
-                    db.rollback()
-                    logger.debug(f"Impression anomaly check failed: {e}")
-
         except Exception as e:
             logger.debug(f"Integrity round error: {e}")
         finally:
             db.close()
+
+    def _audit_peer_guardrails(self, db, peer):
+        """Re-verify a peer's guardrail hash by directly querying it.
+        This is the continuous audit — every node verifies every other node."""
+        try:
+            resp = requests.get(
+                f"{peer.url}/api/social/integrity/guardrail-hash",
+                timeout=5,
+            )
+            if resp.status_code != 200:
+                return  # Endpoint might not exist on older nodes
+
+            data = resp.json()
+            peer_hash = data.get('guardrail_hash', '')
+            if not peer_hash:
+                return
+
+            from security.hive_guardrails import get_guardrail_hash
+            local_hash = get_guardrail_hash()
+
+            if peer_hash != local_hash:
+                logger.warning(
+                    f"Continuous audit: guardrail drift detected on "
+                    f"{peer.node_id[:8]} — disconnecting")
+                from .integrity_service import IntegrityService
+                IntegrityService.increase_fraud_score(
+                    db, peer.node_id, 50.0,
+                    'Guardrail hash drift detected during continuous audit',
+                    {'expected': local_hash[:16], 'got': peer_hash[:16]})
+                # Severe: unfollow from federation immediately
+                try:
+                    from .federation import federation
+                    federation.unfollow_instance(db, self.node_id, peer.node_id)
+                except Exception:
+                    pass
+            else:
+                # Peer passed — reward good behavior
+                from .integrity_service import IntegrityService
+                IntegrityService.decrease_fraud_score(
+                    db, peer.node_id, 1.0,
+                    'Guardrail audit passed')
+        except requests.RequestException:
+            pass  # Network issue — will catch it next round
+        except Exception as e:
+            logger.debug(f"Guardrail audit for {peer.node_id[:8]} error: {e}")
 
     def _load_peers_by_tier(self):
         """Load gossip targets scoped to this node's tier."""

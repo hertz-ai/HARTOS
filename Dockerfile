@@ -1,4 +1,4 @@
-FROM python:3.10
+dockerfile in llm langchain has this FROM python:3.10
 
 WORKDIR /app
 

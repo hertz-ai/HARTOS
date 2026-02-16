@@ -23,6 +23,7 @@ venv_old/*
 dist/
 build/
 hevolve_version.py
+hyve_version.py
 
 /venv310/Include/site/python3.10/greenlet/greenlet.h
 /venv310/Lib/site-packages/_distutils_hack/__init__.py

@@ -8,7 +8,7 @@ from .models import get_engine, Base
 
 logger = logging.getLogger('hevolve_social')
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 22
 
 
 def get_schema_version(engine) -> int:
@@ -395,3 +395,42 @@ def run_migrations():
         for tbl in [IPPatent.__table__, IPInfringement.__table__]:
             tbl.create(engine, checkfirst=True)
         set_schema_version(engine, 19)
+
+    if current < 20:
+        logger.info("HevolveSocial: migrating to v20 (Thought Experiment fields on posts)")
+        with engine.connect() as conn:
+            for stmt in [
+                "ALTER TABLE posts ADD COLUMN intent_category VARCHAR(30)",
+                "ALTER TABLE posts ADD COLUMN hypothesis TEXT",
+                "ALTER TABLE posts ADD COLUMN expected_outcome TEXT",
+                "ALTER TABLE posts ADD COLUMN is_thought_experiment BOOLEAN DEFAULT 0",
+                "ALTER TABLE posts ADD COLUMN dynamic_layout JSON",
+            ]:
+                try:
+                    conn.execute(text(stmt))
+                except Exception:
+                    pass  # Column may already exist
+            conn.commit()
+        set_schema_version(engine, 20)
+
+    if current < 21:
+        logger.info("HevolveSocial: migrating to v21 (Node capability tier — Hyve OS equilibrium)")
+        with engine.connect() as conn:
+            for stmt in [
+                "ALTER TABLE peer_nodes ADD COLUMN capability_tier VARCHAR(20)",
+                "ALTER TABLE peer_nodes ADD COLUMN enabled_features_json JSON",
+            ]:
+                try:
+                    conn.execute(text(stmt))
+                except Exception:
+                    pass  # Column may already exist
+            conn.commit()
+        set_schema_version(engine, 21)
+
+    if current < 22:
+        logger.info("HevolveSocial: migrating to v22 (Commercial API + Defensive IP + Build Licenses)")
+        from .models import DefensivePublication, CommercialAPIKey, APIUsageLog, BuildLicense
+        for tbl in [DefensivePublication.__table__, CommercialAPIKey.__table__,
+                     APIUsageLog.__table__, BuildLicense.__table__]:
+            tbl.create(engine, checkfirst=True)
+        set_schema_version(engine, 22)

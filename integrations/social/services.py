@@ -244,7 +244,10 @@ class PostService:
                content_type: str = 'text', community_name: str = None,
                code_language: str = None, media_urls: list = None,
                link_url: str = None, source_channel: str = None,
-               source_message_id: str = None) -> Post:
+               source_message_id: str = None,
+               intent_category: str = None, hypothesis: str = None,
+               expected_outcome: str = None, is_thought_experiment: bool = False,
+               dynamic_layout: dict = None) -> Post:
         community_id = None
         if community_name:
             community = db.query(Community).filter(Community.name == community_name).first()
@@ -258,6 +261,10 @@ class PostService:
             code_language=code_language, media_urls=media_urls or [],
             link_url=link_url, source_channel=source_channel,
             source_message_id=source_message_id,
+            intent_category=intent_category, hypothesis=hypothesis,
+            expected_outcome=expected_outcome,
+            is_thought_experiment=is_thought_experiment or False,
+            dynamic_layout=dynamic_layout,
         )
         db.add(post)
         author.post_count += 1
@@ -317,11 +324,24 @@ class PostService:
         return posts, total
 
     @staticmethod
-    def update(db: Session, post: Post, title: str = None, content: str = None) -> Post:
+    def update(db: Session, post: Post, title: str = None, content: str = None,
+               intent_category: str = None, hypothesis: str = None,
+               expected_outcome: str = None, is_thought_experiment: bool = None,
+               dynamic_layout: dict = None) -> Post:
         if title is not None:
             post.title = title
         if content is not None:
             post.content = content
+        if intent_category is not None:
+            post.intent_category = intent_category
+        if hypothesis is not None:
+            post.hypothesis = hypothesis
+        if expected_outcome is not None:
+            post.expected_outcome = expected_outcome
+        if is_thought_experiment is not None:
+            post.is_thought_experiment = is_thought_experiment
+        if dynamic_layout is not None:
+            post.dynamic_layout = dynamic_layout
         post.updated_at = datetime.utcnow()
         db.flush()
         return post

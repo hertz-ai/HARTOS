@@ -187,6 +187,17 @@ console_handler.setFormatter(formatter)
 # Add handlers to logger
 tool_logger.addHandler(file_handler)
 tool_logger.addHandler(console_handler)
+
+
+def _record_exception(exc, module, function, user_prompt='', action_id=0, **ctx):
+    """Fire-and-forget exception recording to centralized collector. Never raises."""
+    try:
+        from exception_collector import ExceptionCollector
+        ExceptionCollector.get_instance().record(
+            exc, module=module, function=function,
+            user_prompt=user_prompt, action_id=action_id, context=ctx)
+    except Exception:
+        pass
 tool_logger.propagate = False  # Prevent double logging
 
 # Decorator for logging tool execution
@@ -271,10 +282,11 @@ scheduler.start()
 user_agents: Dict[str, Tuple[Any, Any, Any, Any, Any, Any, Any]] = TTLCache(ttl_seconds=7200, max_size=500, name='create_user_agents')
 time_agents = TTLCache(ttl_seconds=7200, max_size=500, name='create_time_agents')
 # Local llama.cpp server (Qwen3-VL) - ACTIVE
+_llama_port = os.environ.get('LLAMA_CPP_PORT', '8080')
 config_list = [{
         "model": 'Qwen3-VL-4B-Instruct',
         "api_key": 'dummy',
-        "base_url": 'http://localhost:8080/v1',
+        "base_url": f'http://localhost:{_llama_port}/v1',
         "price": [0, 0]
     }]
 
@@ -1216,6 +1228,13 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     helper.register_for_llm(name="Generate_video", description="Generate video with text. Use model='ltx2' for AI text-to-video generation, or model='avatar' (default) for avatar-based video with voice synthesis.")(Generate_video)
     assistant.register_for_execution(name="Generate_video")(Generate_video)
 
+    # Unified media generation tools (image, audio, video — one tool for all)
+    try:
+        from integrations.service_tools.media_agent import register_media_tools
+        register_media_tools(helper, assistant)
+    except Exception as e:
+        tool_logger.debug(f"Media tools registration skipped: {e}")
+
     @log_tool_execution
     def get_user_uploaded_file() -> str:
         tool_logger.info('INSIDE get_user_uploaded_file')
@@ -1566,7 +1585,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             tool_logger.info(f'Response from call of {topic}: {response}')
 
             if not response:
-                return 'Ask UserProxy to go to hevolve.ai login and start the windows companion app'
+                return 'Ask UserProxy to go to hevolve.ai login and start the Hyve companion app'
 
             # Prepare crossbar message
             crossbar_message = {
@@ -1874,10 +1893,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     OS: {os_to_control}
     Task: {instructions}
 
-    The Hevolve AI Companion App is not running on your {os_to_control} device.
+    The Hyve Companion App is not running on your {os_to_control} device.
 
     STEPS TO RESOLVE:
-    1. Open the Hevolve AI Companion App
+    1. Open the Hyve Companion App
     2. Ensure it's connected and running
     3. Try the command again
 
@@ -2449,6 +2468,13 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         flow = get_current_flow(user_prompt)
         create_final_recipe_for_current_flow(flow, merged_dict, prompt_id)
         current_app.logger.info('Flow Recipe Created & saved successfully')
+
+        # Merge accumulated experience data into the saved recipe
+        try:
+            from recipe_experience import RecipeExperienceRecorder
+            RecipeExperienceRecorder.merge_experience_into_recipe(prompt_id, flow, user_prompt)
+        except Exception:
+            pass
 
         force_state_through_valid_path(user_prompt, current_action_id, ActionState.TERMINATED,
                                        "Recipe Created And Terminated")

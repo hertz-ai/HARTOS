@@ -3,26 +3,26 @@ requires = ["setuptools>=61.0", "wheel", "setuptools-scm>=8.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "hevolve-backend"
+name = "hyve-backend"
 dynamic = ["version"]
-description = "LangChain-based AI Agent Server with multi-agent orchestration"
+description = "Hyve — Crowdsourced Agentic Intelligence Platform"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
 authors = [
-    {name = "Hevolve Team", email = "contact@hevolve.ai"}
+    {name = "Hyve Team", email = "contact@hevolve.ai"}
 ]
 keywords = [
-    "langchain",
+    "hyve",
+    "hevolve",
     "ai",
-    "chatbot",
-    "agent",
-    "llm",
-    "openai",
-    "groq",
-    "flask",
+    "agents",
+    "hivemind",
+    "crowdsourced",
     "multi-agent",
     "orchestration",
+    "langchain",
+    "llm",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -39,6 +39,13 @@ classifiers = [
 ]
 
 dependencies = [
+    "autogen-agentchat==0.2.37",
+    "apscheduler",
+    "autobahn==23.1.2",
+    "autobahn[serialization]",
+    "autobahn[twisted]",
+    "json-repair",
+    "beautifulsoup4",
     # Web framework
     "Flask>=2.3.0",
     "waitress>=2.1.0",
@@ -151,18 +158,18 @@ all = [
 ]
 
 [project.scripts]
-hevolve-server = "langchain_gpt_api:main"
-hevolve-crossbar = "crossbar_server:main"
+hyve-server = "langchain_gpt_api:main"
+hyve-crossbar = "crossbar_server:main"
 
 [project.urls]
-Homepage = "https://github.com/hevolve/hevolve-backend"
+Homepage = "https://github.com/hevolve/hyve"
 Documentation = "https://docs.hevolve.ai"
-Repository = "https://github.com/hevolve/hevolve-backend"
-Issues = "https://github.com/hevolve/hevolve-backend/issues"
+Repository = "https://github.com/hevolve/hyve"
+Issues = "https://github.com/hevolve/hyve/issues"
 
 [tool.setuptools]
 py-modules = [
-    "hevolve_version",
+    "hyve_version",
     "langchain_gpt_api",
     "helper",
     "helper_func",
@@ -189,7 +196,7 @@ exclude = ["venv*", "tests*", "docs*"]
 version_scheme = "guess-next-dev"
 local_scheme = "no-local-version"
 fallback_version = "0.0.0"
-write_to = "hevolve_version.py"
+write_to = "hyve_version.py"
 tag_regex = "^v(?P<version>\\d+\\.\\d+\\.\\d+)$"
 
 [tool.black]

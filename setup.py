@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Setup script for hevolve-backend package.
+Setup script for hyve-backend package (formerly hevolve-backend).
 
-This allows the LLM-langchain_Chatbot-Agent project to be pip-installable.
+Hyve — Crowdsourced Agentic Intelligence Platform.
 """
 
 from setuptools import setup, find_packages
@@ -15,7 +15,7 @@ try:
     with open(os.path.join(here, "README.md"), encoding="utf-8") as f:
         long_description = f.read()
 except FileNotFoundError:
-    long_description = "Hevolve Backend - LangChain-based AI Agent Server"
+    long_description = "Hyve — Crowdsourced Agentic Intelligence Platform"
 
 # Core dependencies required for the server to run
 install_requires = [
@@ -124,15 +124,15 @@ extras_require = {
 }
 
 setup(
-    name="hevolve-backend",
+    name="hyve-backend",
     # version derived from git tags via setuptools-scm (configured in pyproject.toml)
     setup_requires=["setuptools-scm>=8.0"],
-    author="Hevolve Team",
+    author="Hyve Team",
     author_email="contact@hevolve.ai",
-    description="LangChain-based AI Agent Server with multi-agent orchestration",
+    description="Hyve — Crowdsourced Agentic Intelligence Platform",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/hevolve/hevolve-backend",
+    url="https://github.com/hevolve/hyve",
     license="MIT",
 
     # Package discovery
@@ -159,7 +159,7 @@ setup(
 
     # Include main modules at root level
     py_modules=[
-        "hevolve_version",
+        "hyve_version",
         "langchain_gpt_api",
         "helper",
         "helper_func",
@@ -191,8 +191,8 @@ setup(
     # Entry points for console scripts
     entry_points={
         "console_scripts": [
-            "hevolve-server=langchain_gpt_api:main",
-            "hevolve-crossbar=crossbar_server:main",
+            "hyve-server=langchain_gpt_api:main",
+            "hyve-crossbar=crossbar_server:main",
         ],
     },
 
@@ -227,8 +227,8 @@ setup(
 
     # Project URLs
     project_urls={
-        "Bug Reports": "https://github.com/hevolve/hevolve-backend/issues",
-        "Source": "https://github.com/hevolve/hevolve-backend",
+        "Bug Reports": "https://github.com/hevolve/hyve/issues",
+        "Source": "https://github.com/hevolve/hyve",
         "Documentation": "https://docs.hevolve.ai",
     },
 )

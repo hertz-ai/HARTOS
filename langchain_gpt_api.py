@@ -38,7 +38,7 @@ from langchain.chat_models import ChatOpenAI
 # ChatGroq - optional import (version compatibility issues)
 try:
     from langchain_groq import ChatGroq
-except (ImportError, ModuleNotFoundError):
+except Exception:
     ChatGroq = None
 
 # LLM base class
@@ -80,7 +80,7 @@ except (ImportError, AttributeError) as e:
 # Tools imports - try langchain_community first
 try:
     from langchain_community.tools import RequestsGetTool
-except ImportError:
+except Exception:
     try:
         from langchain.tools.requests.tool import RequestsGetTool
     except (ImportError, AttributeError):
@@ -88,7 +88,7 @@ except ImportError:
 
 try:
     from langchain_community.utilities import TextRequestsWrapper
-except ImportError:
+except Exception:
     try:
         from langchain.utilities.requests import TextRequestsWrapper
     except (ImportError, AttributeError):
@@ -112,7 +112,7 @@ import numpy as np
 # Cohere rerank - make optional to avoid pydantic v2 incompatibility with old langchain
 try:
     from langchain_community.retrievers.document_compressors import cohere_rerank
-except (ImportError, ModuleNotFoundError):
+except Exception:
     cohere_rerank = None  # Not available
 import asyncio
 import aiohttp
@@ -478,7 +478,10 @@ def _has_cloud_api() -> bool:
     return bool(os.environ.get('HEVOLVE_LLM_ENDPOINT_URL', '').strip())
 
 
-def _wait_for_llm_server(url='http://localhost:8080', timeout=15):
+def _wait_for_llm_server(url=None, timeout=15):
+    if url is None:
+        _port = os.environ.get('LLAMA_CPP_PORT', '8080')
+        url = f'http://localhost:{_port}'
     """Wait for llama.cpp server, giving parent process time to start it.
 
     In Nunba (flat mode), the desktop app starts llama.cpp in a background
@@ -912,6 +915,13 @@ def get_tools(req_tool, is_first: bool = False):
         try:
             from integrations.service_tools import service_tool_registry
             tool += service_tool_registry.get_langchain_tools()
+        except ImportError:
+            pass
+
+        # Hyve Skills: Ingest agent skills (Claude Code, Markdown, GitHub)
+        try:
+            from integrations.skills import skill_registry
+            tool += skill_registry.get_langchain_tools()
         except ImportError:
             pass
 
@@ -3159,6 +3169,57 @@ def get_prompts():
     return jsonify(prompts)
 
 
+@app.route('/prompts/public', methods=['GET'])
+def get_public_prompts():
+    """Return all public prompts/agents. Local-first, cloud DB fallback.
+    Equivalent to the legacy /getprompt_all/ cloud endpoint."""
+    prompts = []
+
+    # 1. Read ALL prompts from local files (no user filter)
+    prompts_dir = os.path.join(os.path.dirname(__file__), 'prompts')
+    if os.path.isdir(prompts_dir):
+        for fname in os.listdir(prompts_dir):
+            if fname.endswith('.json') and '_' not in fname:
+                try:
+                    fpath = os.path.join(prompts_dir, fname)
+                    with open(fpath, 'r') as f:
+                        data = json.load(f)
+                    pid = fname.replace('.json', '')
+                    prompts.append({
+                        'prompt_id': pid,
+                        'name': data.get('name', ''),
+                        'prompt': data.get('goal', ''),
+                        'agent_name': data.get('agent_name', ''),
+                        'is_active': data.get('status', '') == 'completed',
+                        'is_public': True,
+                        'user_id': data.get('creator_user_id', ''),
+                        'teacher_image_url': data.get('teacher_image_url', ''),
+                        'image_url': data.get('image_url', ''),
+                        'video_text': data.get('video_text', ''),
+                        'has_recipe': os.path.exists(
+                            os.path.join(prompts_dir, f'{pid}_0_recipe.json')),
+                        'flow_count': len(data.get('flows', [])),
+                        'source': 'local',
+                    })
+                except Exception:
+                    continue
+
+    # 2. Also fetch from cloud DB to get remote-only agents
+    try:
+        res = pooled_get(f'{DB_URL}/getprompt_all/', timeout=5)
+        if res.status_code == 200:
+            cloud_data = res.json()
+            local_ids = {str(p['prompt_id']) for p in prompts}
+            for item in cloud_data:
+                if str(item.get('prompt_id', '')) not in local_ids:
+                    item['source'] = 'cloud'
+                    prompts.append(item)
+    except Exception:
+        pass
+
+    return jsonify(prompts)
+
+
 @app.route('/prompts', methods=['POST'])
 def create_prompts():
     """Create/update prompts. Saves locally AND syncs to cloud DB."""
@@ -3390,11 +3451,253 @@ Example response format:
         app.logger.error(f"Error in /zeroshot/ endpoint: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
+# ─── Runtime Media Tools API ──────────────────────────────────────────
+# Endpoints for managing runtime media tools (Wan2GP, TTS-Audio-Suite,
+# Whisper, OmniParser). Tools are downloaded, started, and registered
+# dynamically. See integrations/service_tools/runtime_manager.py.
+
+@app.route('/api/tools/status', methods=['GET'])
+def tools_status():
+    """Get status of all runtime media tools."""
+    try:
+        from integrations.service_tools.runtime_manager import runtime_tool_manager
+        return jsonify(runtime_tool_manager.get_all_status())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/tools/<tool_name>/setup', methods=['POST'])
+def tools_setup(tool_name):
+    """Download + start + register a runtime tool."""
+    try:
+        from integrations.service_tools.runtime_manager import runtime_tool_manager
+        result = runtime_tool_manager.setup_tool(tool_name)
+        code = 500 if 'error' in result else 200
+        return jsonify(result), code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/tools/<tool_name>/start', methods=['POST'])
+def tools_start(tool_name):
+    """Start an already-downloaded runtime tool."""
+    try:
+        from integrations.service_tools.runtime_manager import runtime_tool_manager
+        result = runtime_tool_manager.start_tool(tool_name)
+        code = 500 if 'error' in result else 200
+        return jsonify(result), code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/tools/<tool_name>/stop', methods=['POST'])
+def tools_stop(tool_name):
+    """Stop a running runtime tool and free VRAM."""
+    try:
+        from integrations.service_tools.runtime_manager import runtime_tool_manager
+        return jsonify(runtime_tool_manager.stop_tool(tool_name))
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/tools/<tool_name>/unload', methods=['POST'])
+def tools_unload(tool_name):
+    """Stop + deregister a runtime tool."""
+    try:
+        from integrations.service_tools.runtime_manager import runtime_tool_manager
+        return jsonify(runtime_tool_manager.unload_tool(tool_name))
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/tools/vram', methods=['GET'])
+def tools_vram():
+    """Get VRAM usage dashboard."""
+    try:
+        from integrations.service_tools.vram_manager import vram_manager
+        return jsonify(vram_manager.get_status())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/voice/transcribe', methods=['POST'])
+def voice_transcribe():
+    """Transcribe audio to text using Whisper STT.
+
+    Accepts multipart/form-data with 'audio' file or JSON with 'audio_path'.
+    """
+    try:
+        from integrations.service_tools.whisper_tool import whisper_transcribe
+        import tempfile
+        import json as _json
+
+        if request.content_type and 'multipart' in request.content_type:
+            audio_file = request.files.get('audio')
+            if not audio_file:
+                return jsonify({'error': 'No audio file provided'}), 400
+            # Save to temp file
+            suffix = os.path.splitext(audio_file.filename)[1] or '.wav'
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                audio_file.save(tmp)
+                tmp_path = tmp.name
+            try:
+                result = whisper_transcribe(tmp_path)
+                return jsonify(_json.loads(result))
+            finally:
+                os.unlink(tmp_path)
+        else:
+            data = request.get_json() or {}
+            audio_path = data.get('audio_path', '')
+            if not audio_path:
+                return jsonify({'error': 'audio_path is required'}), 400
+            language = data.get('language')
+            result = whisper_transcribe(audio_path, language)
+            return jsonify(_json.loads(result))
+
+    except ImportError as e:
+        return jsonify({'error': f'Whisper not available: {e}'}), 503
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Hyve Skills API — ingest, list, and manage agent skills
+# ---------------------------------------------------------------------------
+
+@app.route('/api/skills/list', methods=['GET'])
+def skills_list():
+    """List all registered Hyve skills."""
+    try:
+        from integrations.skills import skill_registry
+        return jsonify({
+            'success': True,
+            'skills': skill_registry.list_skills(),
+            'count': skill_registry.count,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/skills/ingest', methods=['POST'])
+def skills_ingest():
+    """Ingest a skill from Markdown content (with optional YAML frontmatter)."""
+    try:
+        from integrations.skills import skill_registry
+        data = request.get_json()
+        name = data.get('name', '')
+        content = data.get('content', '')
+        description = data.get('description', '')
+        tags = data.get('tags', [])
+
+        if not content:
+            return jsonify({'error': 'content is required'}), 400
+
+        skill_registry.ingest_markdown(name, content, description, tags)
+        skill_registry.save_config()
+        return jsonify({'success': True, 'message': f'Skill "{name}" ingested'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/skills/discover/local', methods=['POST'])
+def skills_discover_local():
+    """Discover skills from local filesystem paths."""
+    try:
+        from integrations.skills import skill_registry
+        data = request.get_json() or {}
+        paths = data.get('paths')  # None = default paths
+        count = skill_registry.discover_local(paths)
+        skill_registry.save_config()
+        return jsonify({'success': True, 'discovered': count})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/skills/discover/github', methods=['POST'])
+def skills_discover_github():
+    """Discover skills from a GitHub repository."""
+    try:
+        from integrations.skills import skill_registry
+        data = request.get_json()
+        repo_url = data.get('repo_url', '')
+        branch = data.get('branch', 'main')
+        skills_path = data.get('skills_path', '.claude/skills')
+
+        if not repo_url:
+            return jsonify({'error': 'repo_url is required'}), 400
+
+        count = skill_registry.discover_github(repo_url, branch, skills_path)
+        skill_registry.save_config()
+        return jsonify({'success': True, 'discovered': count})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/skills/<skill_name>', methods=['GET'])
+def skills_get(skill_name):
+    """Get a specific skill's full details."""
+    try:
+        from integrations.skills import skill_registry
+        skill = skill_registry.get_skill(skill_name)
+        if not skill:
+            return jsonify({'error': f'Skill "{skill_name}" not found'}), 404
+        return jsonify({'success': True, 'skill': skill.to_dict()})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/skills/<skill_name>', methods=['DELETE'])
+def skills_delete(skill_name):
+    """Remove a skill from the registry."""
+    try:
+        from integrations.skills import skill_registry
+        if skill_registry.unregister_skill(skill_name):
+            skill_registry.save_config()
+            return jsonify({'success': True, 'message': f'Skill "{skill_name}" removed'})
+        return jsonify({'error': f'Skill "{skill_name}" not found'}), 404
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+def _init_skills():
+    """Initialize skill registry — load persisted skills + discover local."""
+    try:
+        from integrations.skills import skill_registry
+        skill_registry.load_config()
+        skill_registry.discover_local()
+        if skill_registry.count > 0:
+            app.logger.info(f"Hyve skills ready: {skill_registry.count} skills loaded")
+    except Exception as e:
+        logger.debug(f"Skill init skipped: {e}")
+
+
+def _init_runtime_tools():
+    """Initialize runtime tools in a background thread.
+
+    Restores previously-running tools from state file.
+    Called from main() on startup.
+    """
+    try:
+        from integrations.service_tools.runtime_manager import runtime_tool_manager
+        runtime_tool_manager.load_state()
+    except Exception as e:
+        logger.warning(f"Runtime tool init failed: {e}")
+
+
 def main():
     """
     Main entry point for hevolve-server CLI command.
     Starts the Flask server using waitress.
     """
+    # Start runtime tools restoration in background
+    import threading
+    tools_thread = threading.Thread(target=_init_runtime_tools, daemon=True)
+    tools_thread.start()
+
+    # Initialize Hyve skill registry (load persisted + discover local)
+    skills_thread = threading.Thread(target=_init_skills, daemon=True)
+    skills_thread.start()
+
     serve(app, host='0.0.0.0', port=6778, threads=50)
 
 
