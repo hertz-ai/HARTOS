@@ -15,6 +15,53 @@ from datetime import datetime
 
 logger = logging.getLogger('hevolve_social')
 
+# Track which tasks we've already sent HITL notifications for (avoid spam)
+_hitl_notified: set = set()
+
+
+def _get_blocked_hitl_tasks(ledger, goal_id):
+    """Get tasks blocked with APPROVAL_REQUIRED under a goal."""
+    try:
+        parent = ledger.get_task(goal_id)
+        if not parent:
+            return []
+        blocked = []
+        for child_id in (parent.child_task_ids or []):
+            task = ledger.get_task(child_id)
+            if task and str(task.blocked_reason) == 'APPROVAL_REQUIRED':
+                blocked.append(task)
+        return blocked
+    except Exception:
+        return []
+
+
+def _send_hitl_notification(db, goal, task):
+    """Send a one-time HITL notification for an approval-blocked task."""
+    notif_key = f"{goal.id}:{task.id}"
+    if notif_key in _hitl_notified:
+        return
+    _hitl_notified.add(notif_key)
+
+    try:
+        from integrations.social.services import NotificationService
+        from integrations.social.realtime import on_notification
+        owner_id = goal.created_by or goal.owner_id
+        if not owner_id:
+            return
+        desc_preview = (task.description or '')[:100]
+        notif = NotificationService.create(
+            db, str(owner_id), 'approval_required',
+            target_type='thought_experiment',
+            target_id=str(task.id),
+            message=f'Agent needs your review: {desc_preview}',
+        )
+        on_notification(str(owner_id), notif.to_dict() if hasattr(notif, 'to_dict') else {
+            'type': 'approval_required', 'message': f'Agent needs your review: {desc_preview}',
+        })
+        logger.info(f"HITL notification sent for goal={goal.id} task={task.id}")
+    except Exception as e:
+        logger.debug(f"HITL notification failed: {e}")
+
 
 class AgentDaemon:
     """Background daemon: active goals (any type) + idle agents → /chat dispatch."""
@@ -170,6 +217,19 @@ class AgentDaemon:
 
                 dispatch_goal(prompt, str(agent['user_id']), goal.id, goal.goal_type)
                 dispatched += 1
+
+            # ── HITL: notify owners of APPROVAL_REQUIRED tasks ──
+            try:
+                from agent_ledger.core import SmartLedger
+                ledger = SmartLedger()
+                for goal in goals:
+                    if goal.goal_type != 'thought_experiment':
+                        continue
+                    ledger_tasks = _get_blocked_hitl_tasks(ledger, goal.id)
+                    for task in ledger_tasks:
+                        _send_hitl_notification(db, goal, task)
+            except Exception as e:
+                logger.debug(f"HITL notification check: {e}")
 
             if dispatched > 0:
                 logger.info(f"Agent daemon: dispatched {dispatched} goal(s) to idle agents")

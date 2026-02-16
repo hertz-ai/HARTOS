@@ -53,14 +53,23 @@ def create_agents_for_user(user_id: str, autonomous=False, initial_description=N
         autonomous: If True, the LLM answers its own questions (no human input)
         initial_description: When autonomous, the user's description of the desired agent
     """
-    # Local llama.cpp server (Qwen3-VL)
-    _llama_port = os.environ.get('LLAMA_CPP_PORT', '8080')
-    config_list = [{
-        "model": 'Qwen3-VL-4B-Instruct',
-        "api_key": 'dummy',
-        "base_url": f'http://localhost:{_llama_port}/v1',
-        "price": [0, 0]
-    }]
+    # Mode-aware config_list: cloud/regional use external LLM, flat uses local llama.cpp
+    _node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
+    if _node_tier in ('regional', 'central') and os.environ.get('HEVOLVE_LLM_ENDPOINT_URL'):
+        config_list = [{
+            "model": os.environ.get('HEVOLVE_LLM_MODEL_NAME', 'gpt-4.1-mini'),
+            "api_key": os.environ.get('HEVOLVE_LLM_API_KEY', 'dummy'),
+            "base_url": os.environ['HEVOLVE_LLM_ENDPOINT_URL'],
+            "price": [0.0025, 0.01]
+        }]
+    else:
+        _llama_port = os.environ.get('LLAMA_CPP_PORT', '8080')
+        config_list = [{
+            "model": 'Qwen3-VL-4B-Instruct',
+            "api_key": 'dummy',
+            "base_url": f'http://localhost:{_llama_port}/v1',
+            "price": [0, 0]
+        }]
 
     # Create a basic function calling config
     llm_config = {
