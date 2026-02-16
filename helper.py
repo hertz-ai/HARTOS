@@ -74,6 +74,41 @@ async def async_main(urls):
 # Configuration for Crawl4AI API service
 CRAWL4AI_API_URL = "http://localhost:8094"  # Update this to your actual service URL
 
+# --- Path traversal protection for prompt file access ---
+PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
+
+
+def sanitize_path_component(value):
+    """Reject any value containing path separators or traversal sequences.
+
+    Accepts alphanumeric characters, underscores, and hyphens only.
+    Returns the value unchanged if safe, raises ValueError otherwise.
+    """
+    s = str(value)
+    if not re.match(r'^[a-zA-Z0-9_\-]+$', s):
+        raise ValueError(f"Invalid path component: {s!r}")
+    return s
+
+
+def safe_prompt_path(*parts, ext='.json'):
+    """Build a path under prompts/ safely.
+
+    Usage:
+        safe_prompt_path(prompt_id)                    -> prompts/{prompt_id}.json
+        safe_prompt_path(prompt_id, flow)              -> prompts/{prompt_id}_{flow}.json
+        safe_prompt_path(prompt_id, flow, action)      -> prompts/{prompt_id}_{flow}_{action}.json
+        safe_prompt_path(prompt_id, flow, 'recipe')    -> prompts/{prompt_id}_{flow}_recipe.json
+
+    Raises ValueError if any component contains path traversal characters.
+    """
+    sanitized = [sanitize_path_component(p) for p in parts]
+    filename = '_'.join(sanitized) + ext
+    full = os.path.join(PROMPTS_DIR, filename)
+    # Belt-and-suspenders: verify the resolved path is under PROMPTS_DIR
+    if not os.path.abspath(full).startswith(PROMPTS_DIR):
+        raise ValueError(f"Path escapes prompts directory: {full}")
+    return full
+
 
 
 def crawl4ai_fetch(url: str, timeout: int = 30) -> str:
