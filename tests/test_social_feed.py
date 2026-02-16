@@ -5,7 +5,7 @@ import pytest
 from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ['SOCIAL_DB_PATH'] = ':memory:'
+os.environ['HEVOLVE_DB_PATH'] = ':memory:'
 
 from integrations.social.models import (
     Base, get_engine, get_db, User, Post, Community,

@@ -85,6 +85,14 @@ def init_social(app):
     except Exception as e:
         logger.debug(f"HevolveSocial dashboard blueprint skipped: {e}")
 
+    # Register thought experiment tracker blueprint
+    try:
+        from .api_tracker import tracker_bp
+        app.register_blueprint(tracker_bp)
+        logger.info("HevolveSocial tracker registered at /api/social/tracker/")
+    except Exception as e:
+        logger.debug(f"HevolveSocial tracker blueprint skipped: {e}")
+
     # Initialize node keypair for integrity verification
     try:
         from security.node_integrity import get_or_create_keypair, get_public_key_hex

@@ -223,7 +223,7 @@ class CommercialAPIService:
 # ═══════════════════════════════════════════════════════════════
 
 import threading as _bf_threading
-from lifecycle_hooks import TTLCache as _BFTTLCache
+from core.session_cache import TTLCache as _BFTTLCache
 
 _failed_attempts_lock = _bf_threading.Lock()
 _failed_attempts = _BFTTLCache(ttl_seconds=900, max_size=10000, name='api_brute_force')

@@ -26,7 +26,7 @@ from unittest.mock import patch, MagicMock
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 # Force in-memory SQLite before importing models
-os.environ['SOCIAL_DB_PATH'] = ':memory:'
+os.environ['HEVOLVE_DB_PATH'] = ':memory:'
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives import serialization

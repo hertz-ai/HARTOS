@@ -5,7 +5,7 @@ import json
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ['SOCIAL_DB_PATH'] = ':memory:'
+os.environ['HEVOLVE_DB_PATH'] = ':memory:'
 
 from flask import Flask
 from integrations.social.models import Base, get_engine, init_db

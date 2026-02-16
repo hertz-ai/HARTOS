@@ -280,24 +280,23 @@ scheduler.start()
 
 user_agents: Dict[str, Tuple[Any, Any, Any, Any, Any, Any, Any]] = TTLCache(ttl_seconds=7200, max_size=500, name='create_user_agents')
 time_agents = TTLCache(ttl_seconds=7200, max_size=500, name='create_time_agents')
-# Local llama.cpp server (Qwen3-VL) - ACTIVE
-_llama_port = os.environ.get('LLAMA_CPP_PORT', '8080')
-config_list = [{
+# Mode-aware config_list: cloud/regional use external LLM, flat uses local llama.cpp
+_node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
+if _node_tier in ('regional', 'central') and os.environ.get('HEVOLVE_LLM_ENDPOINT_URL'):
+    config_list = [{
+        "model": os.environ.get('HEVOLVE_LLM_MODEL_NAME', 'gpt-4.1-mini'),
+        "api_key": os.environ.get('HEVOLVE_LLM_API_KEY', 'dummy'),
+        "base_url": os.environ['HEVOLVE_LLM_ENDPOINT_URL'],
+        "price": [0.0025, 0.01]
+    }]
+else:
+    _llama_port = os.environ.get('LLAMA_CPP_PORT', '8080')
+    config_list = [{
         "model": 'Qwen3-VL-4B-Instruct',
         "api_key": 'dummy',
         "base_url": f'http://localhost:{_llama_port}/v1',
         "price": [0, 0]
     }]
-
-# Azure OpenAI configuration (fallback - DISABLED)
-# config_list = [{
-#         "model": 'gpt-4.1',
-#         "api_type": "azure",
-#         "api_key": '8MMPerfdfcpx63VfIVtg2lpAK7Crv7O5JKiKwhusVhgJNkC8Ql6FJQQJ99BAACHYHv6XJ3w3AAABACOGdxWW',
-#         "base_url": 'https://hertzai-gpt4.openai.azure.com/openai/deployments/gpt-4.1/chat/completions?api-version=2025-01-01-preview',
-#         "api_version": "2024-12-01-preview",
-#         "price": [0.0025, 0.01]
-#     }]
 # Per-request model config override (speculative execution, hive compute routing)
 def get_llm_config():
     """Get LLM config — checks thread-local override before falling back to global.

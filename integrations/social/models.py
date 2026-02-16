@@ -1,13 +1,13 @@
 """
 HevolveSocial - SQLAlchemy ORM Models
-Database: agent_data/social.db (SQLite, migration path to PostgreSQL)
+Database: agent_data/hevolve_database.db (SQLite, unified with Hevolve_Database)
 """
 import os
 import uuid
 from datetime import datetime
 
 from sqlalchemy import (
-    create_engine, Column, String, Text, Integer, Float, Boolean,
+    create_engine, event, Column, String, Text, Integer, Float, Boolean,
     DateTime, JSON, ForeignKey, UniqueConstraint, Index, func
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship, Session
@@ -20,13 +20,14 @@ try:
 except ImportError:
     _sanitize_html = lambda x: x  # No-op fallback
 
-_SOCIAL_DB_PATH_ENV = os.environ.get('SOCIAL_DB_PATH')
-if _SOCIAL_DB_PATH_ENV == ':memory:':
+# Unified DB path: HEVOLVE_DB_PATH (preferred) or SOCIAL_DB_PATH (backward compat)
+_DB_PATH_ENV = os.environ.get('HEVOLVE_DB_PATH') or os.environ.get('SOCIAL_DB_PATH')
+if _DB_PATH_ENV == ':memory:':
     DB_PATH = ':memory:'
     DB_URL = 'sqlite://'
 else:
-    DB_PATH = _SOCIAL_DB_PATH_ENV or os.path.join(
-        os.path.dirname(__file__), '..', '..', 'agent_data', 'social.db')
+    DB_PATH = _DB_PATH_ENV or os.path.join(
+        os.path.dirname(__file__), '..', '..', 'agent_data', 'hevolve_database.db')
     DB_URL = f"sqlite:///{os.path.abspath(DB_PATH)}"
 
 _engine = None
@@ -54,6 +55,14 @@ def get_engine():
             from sqlalchemy.pool import StaticPool
             engine_kwargs['poolclass'] = StaticPool
         _engine = create_engine(DB_URL, **engine_kwargs)
+
+        # Enable WAL mode for safe concurrent access from multiple engines
+        if DB_PATH != ':memory:':
+            @event.listens_for(_engine, "connect")
+            def _set_sqlite_wal(dbapi_connection, connection_record):
+                cursor = dbapi_connection.cursor()
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.close()
     return _engine
 
 

@@ -443,12 +443,43 @@ def _build_marketing_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None
 
 
 def _build_coding_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
-    """Build a coding agent prompt with hive intelligence embedding."""
-    from .hive_sdk_spec import get_hive_embedding_instructions
+    """Build a coding agent prompt with hive intelligence embedding.
+
+    Includes TrueflowPlugin MCP instructions for dead code analysis,
+    performance profiling, and living documentation — constitutional DNA
+    of every hive being spawned.
+    """
+    from .hive_sdk_spec import get_hive_embedding_instructions, CODE_QUALITY_CONSTITUTIONAL_RULES
 
     config = goal_dict
     platform_identity = _get_platform_identity()
     hive_instructions = get_hive_embedding_instructions()
+
+    trueflow_usage = (
+        "--- TOOLING: TrueflowPlugin MCP (IDE-only Code Quality) ---\n"
+        "When an IDE (PyCharm/IntelliJ/VS Code) is available on the compute node,\n"
+        "install TrueflowPlugin as a plugin to analyze code coverage and quality.\n"
+        "On headless nodes, TrueflowPlugin is NOT available — use pytest --cov instead.\n\n"
+        "TrueflowPlugin MCP tools (available via Hub on port 5681 when IDE is running):\n"
+        "  analyze_dead_code: Find what's covered vs dead (AST + runtime coverage).\n"
+        "  analyze_performance: Identify hotspots by execution time.\n"
+        "  analyze_call_tree: Understand function call hierarchies.\n"
+        "  explorer_get_coverage_summary: Check test coverage per module.\n"
+        "  explorer_get_hot_paths: Find most-executed code paths.\n"
+        "  export_diagram: Generate Mermaid/PlantUML architecture diagrams.\n\n"
+        "WORKFLOW (IDE nodes):\n"
+        "  1. Install TrueflowPlugin into the IDE if not present\n"
+        "  2. Analyze → identify dead code + performance issues\n"
+        "  3. Fix → clean dead code, optimize hotspots\n"
+        "  4. Verify → re-run analysis to confirm improvements\n"
+        "  5. Document → generate living docs from runtime traces\n"
+        "  6. Commit → only after quality checks pass\n\n"
+        "WORKFLOW (headless nodes):\n"
+        "  1. Run pytest --cov to check coverage\n"
+        "  2. Use static AST analysis for dead code detection\n"
+        "  3. Profile with cProfile/line_profiler for hotspots\n"
+        "  4. Generate docs from docstrings and test output\n\n"
+    )
 
     return (
         f"{platform_identity}\n\n"
@@ -460,6 +491,7 @@ def _build_coding_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -
         f"Clone the repo, analyze the codebase, and make improvements "
         f"aligned with the goal above. Focus on code quality, bug fixes, "
         f"and missing implementations.\n\n"
+        f"{trueflow_usage}"
         f"{hive_instructions}"
     )
 
@@ -673,6 +705,47 @@ def _build_upgrade_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) 
     )
 
 
+# ─── Thought Experiment Prompt Builder ───
+
+def _build_thought_experiment_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
+    """Build a thought experiment analysis/enhancement prompt.
+
+    Agents evaluate hypotheses, propose improvements, and report via
+    dynamic_layout JSON for Liquid UI rendering in the tracker view.
+    """
+    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    intent = config.get('intent_category', 'education')
+    hypothesis = config.get('hypothesis', '')
+    expected_outcome = config.get('expected_outcome', '')
+    post_id = config.get('post_id', '')
+
+    return (
+        f"YOU ARE A THOUGHT EXPERIMENT ANALYST.\n\n"
+        f"You are evaluating a thought experiment in the '{intent}' category.\n"
+        f"Post ID: {post_id}\n\n"
+        f"Goal: {goal_dict['title']}\n"
+        f"Description: {goal_dict.get('description', '')}\n\n"
+        f"HYPOTHESIS:\n{hypothesis}\n\n"
+        f"EXPECTED OUTCOME:\n{expected_outcome}\n\n"
+        f"YOUR RESPONSIBILITIES:\n"
+        f"1. Evaluate the hypothesis — is it testable, novel, and constructive?\n"
+        f"2. Research existing evidence using web_search and code_analysis tools\n"
+        f"3. Identify strengths, weaknesses, and blind spots\n"
+        f"4. Propose enhancements that strengthen the experiment\n"
+        f"5. Crowdsource intelligence: incorporate learnings from prior experiments\n"
+        f"6. When you reach an ARCHITECTURAL DECISION that affects the system,\n"
+        f"   STOP and request human approval before proceeding\n\n"
+        f"REPORTING:\n"
+        f"Report your findings as dynamic_layout JSON for Liquid UI rendering.\n"
+        f"Use save_data_in_memory to persist your analysis for other agents.\n"
+        f"Use recall_memory to check if prior experiments inform this one.\n\n"
+        f"PHILOSOPHY:\n"
+        f"Thought experiments are how the hive grows its collective intelligence. "
+        f"Every analysis must be constructive, honest, and in service of human "
+        f"flourishing. If the hypothesis could cause harm, flag it clearly.\n"
+    )
+
+
 # ─── Auto-register built-in types ───
 
 register_goal_type('marketing', _build_marketing_prompt, tool_tags=['marketing'])
@@ -683,3 +756,5 @@ register_goal_type('finance', _build_finance_prompt, tool_tags=['finance'])
 register_goal_type('self_heal', _build_self_heal_prompt, tool_tags=['coding'])
 register_goal_type('federation', _build_federation_prompt, tool_tags=['federation'])
 register_goal_type('upgrade', _build_upgrade_prompt, tool_tags=['upgrade'])
+register_goal_type('thought_experiment', _build_thought_experiment_prompt,
+                   tool_tags=['web_search', 'code_analysis'])

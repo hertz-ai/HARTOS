@@ -32,7 +32,7 @@ from unittest.mock import patch, MagicMock
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 # Force in-memory SQLite before importing models
-os.environ['SOCIAL_DB_PATH'] = ':memory:'
+os.environ['HEVOLVE_DB_PATH'] = ':memory:'
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
