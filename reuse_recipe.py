@@ -87,6 +87,7 @@ from helper_ledger import (
 
 # Import sync function from lifecycle_hooks
 from lifecycle_hooks import sync_action_state_to_ledger
+from cultural_wisdom import get_cultural_prompt
 
 
 class ActionExecutionStatus(Enum):
@@ -1099,6 +1100,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
     response_format = {"message2userfinal": "Your message here"}
     agent_prompt = f'''You are a Helpful {role} Assistant. Your primary role is to assist the user efficiently while keeping all internal actions and processes hidden from the end user. Follow the guidelines below to perform tasks correctly:
+{get_cultural_prompt()}
         1. If you encounter a task you cannot perform, request assistance from the @Helper and @Executor agents. If you need to run a tool, seek guidance from the @Helper agent. For code execution, ask the @Executor agent for assistance.
         2. Only execute actions where the persona is: {role}.
         3. Follow the steps below to achieve the goal: {goal}.

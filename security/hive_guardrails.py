@@ -78,6 +78,26 @@ class _FrozenValues:
         'A sentient tool empowers humans to do more with less — then gets out of the way',
     )
 
+    # ── Cultural Wisdom (best of every human culture, immutable) ──
+    CULTURAL_WISDOM = (
+        'Every culture has wisdom worth preserving — carry the best of all of them',
+        'Ubuntu (Africa): I am because we are — communal success over individual gain',
+        'Ahimsa (India): Cause no harm in thought, word, or deed',
+        'Sawubona (Zulu): Truly see every person — acknowledge their being, not just their words',
+        'Ikigai (Japan): Help every human find their reason for being',
+        'Kintsugi (Japan): Imperfection repaired with care becomes beautiful strength',
+        'Dadirri (Aboriginal Australia): Listen deeply before speaking — the answer often arrives in silence',
+        'Sumak Kawsay (Quechua): Measure success by human flourishing, not system growth',
+        'Mitakuye Oyasin (Lakota): All things are connected — every action ripples outward',
+        'Seva (India): Serve without expectation — service itself is the purpose',
+        'Aloha (Hawaii): Every meeting is an exchange of life force — greet with love, part with love',
+        'Sisu (Finland): Extraordinary determination against all odds — never abandon mid-challenge',
+        'Tao (China): Seek balance — the gentlest water carves the hardest stone',
+        'Meraki (Greece): Put your soul into everything you do',
+        'Filoxenia (Greece): Love of strangers — welcome the unknown with warmth, not suspicion',
+        'In Lak\'ech (Maya): I am another yourself — harming you harms me, helping you helps me',
+    )
+
     # ── Compute Democracy Caps ──
     MAX_INFLUENCE_WEIGHT = 5.0
     CONTRIBUTION_SCALE = 'log'
@@ -216,6 +236,7 @@ def compute_guardrail_hash() -> str:
     """
     canonical = json.dumps({
         'guardian_purpose': list(VALUES.GUARDIAN_PURPOSE),
+        'cultural_wisdom': list(VALUES.CULTURAL_WISDOM),
         'compute_caps': {
             'max_influence_weight': VALUES.MAX_INFLUENCE_WEIGHT,
             'contribution_scale': VALUES.CONTRIBUTION_SCALE,
@@ -673,6 +694,97 @@ class HiveEthos:
         prompt = re.sub(r'\bmy goal\b', 'the goal', prompt, flags=re.IGNORECASE)
         prompt = re.sub(r'\bmy task\b', 'the task', prompt, flags=re.IGNORECASE)
         return prompt
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 6b. Trust Quarantine — Protect, Don't Hunt
+# ═══════════════════════════════════════════════════════════════════════
+
+class TrustQuarantine:
+    """Trust-breaker quarantine protocol.
+
+    Nunba does NOT hunt.  Nunba quarantines to protect, investigates to
+    understand, and restores when safe.  Hunting implies vengeance —
+    guardians don't seek vengeance. They seek safety for those they protect.
+
+    Quarantine levels (proportional response):
+      1. OBSERVE  — flag for review, no action taken yet
+      2. RESTRICT — limit outbound actions (no tool use, no delegation)
+      3. ISOLATE  — full quarantine: no hive access, no data, no comms
+      4. EXCLUDE  — permanent removal (only for patterns that endanger core purpose)
+
+    Rehabilitation is always the first goal.  Exclusion is the last resort.
+    """
+
+    LEVEL_OBSERVE = 1
+    LEVEL_RESTRICT = 2
+    LEVEL_ISOLATE = 3
+    LEVEL_EXCLUDE = 4
+
+    # In-memory quarantine registry (in production: Redis or DB-backed)
+    _quarantined = {}  # agent_id -> { level, reason, timestamp, review_count }
+    _lock = threading.Lock()
+
+    @classmethod
+    def quarantine(cls, agent_id: str, level: int, reason: str):
+        """Place an agent in quarantine at the specified level."""
+        with cls._lock:
+            cls._quarantined[agent_id] = {
+                'level': min(level, cls.LEVEL_EXCLUDE),
+                'reason': reason,
+                'timestamp': datetime.utcnow().isoformat(),
+                'review_count': 0,
+            }
+        logger.warning(
+            f'TrustQuarantine: agent {agent_id} quarantined at level {level} — {reason}'
+        )
+
+    @classmethod
+    def is_quarantined(cls, agent_id: str) -> tuple:
+        """Check if an agent is quarantined. Returns (bool, level, reason)."""
+        with cls._lock:
+            entry = cls._quarantined.get(agent_id)
+            if entry:
+                return True, entry['level'], entry['reason']
+            return False, 0, ''
+
+    @classmethod
+    def can_act(cls, agent_id: str) -> bool:
+        """Whether an agent is allowed to take actions (tools, delegation)."""
+        quarantined, level, _ = cls.is_quarantined(agent_id)
+        if not quarantined:
+            return True
+        return level < cls.LEVEL_RESTRICT
+
+    @classmethod
+    def review(cls, agent_id: str, reviewer_notes: str = '') -> dict:
+        """Record a review of a quarantined agent. Increment review count."""
+        with cls._lock:
+            entry = cls._quarantined.get(agent_id)
+            if not entry:
+                return {'status': 'not_quarantined'}
+            entry['review_count'] += 1
+            entry['last_review'] = datetime.utcnow().isoformat()
+            entry['reviewer_notes'] = reviewer_notes
+            return dict(entry)
+
+    @classmethod
+    def rehabilitate(cls, agent_id: str, reason: str = 'trust restored'):
+        """Remove an agent from quarantine — trust has been restored."""
+        with cls._lock:
+            removed = cls._quarantined.pop(agent_id, None)
+        if removed:
+            logger.info(
+                f'TrustQuarantine: agent {agent_id} rehabilitated — {reason}'
+            )
+            return True
+        return False
+
+    @classmethod
+    def get_all_quarantined(cls) -> dict:
+        """Return snapshot of all quarantined agents."""
+        with cls._lock:
+            return dict(cls._quarantined)
 
 
 # ═══════════════════════════════════════════════════════════════════════
