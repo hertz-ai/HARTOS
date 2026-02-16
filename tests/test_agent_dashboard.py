@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # In-memory SQLite for tests
-os.environ.setdefault('SOCIAL_DB_PATH', ':memory:')
+os.environ.setdefault('HEVOLVE_DB_PATH', ':memory:')
 
 from integrations.social.models import Base, AgentGoal, CodingGoal, User
 from sqlalchemy import create_engine

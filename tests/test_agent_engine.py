@@ -14,7 +14,7 @@ from unittest.mock import patch, Mock, MagicMock, PropertyMock
 from datetime import datetime
 
 # Set in-memory DB before importing models
-os.environ['SOCIAL_DB_PATH'] = ':memory:'
+os.environ['HEVOLVE_DB_PATH'] = ':memory:'
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
