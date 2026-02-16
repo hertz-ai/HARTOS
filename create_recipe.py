@@ -115,6 +115,7 @@ from PIL import Image
 from datetime import timedelta
 from lifecycle_hooks import initialize_minimal_lifecycle_hooks
 initialize_minimal_lifecycle_hooks()  # Prints integration guide
+from cultural_wisdom import get_cultural_prompt
 
 # MCP Integration
 from integrations.mcp import load_user_mcp_servers, get_mcp_tools_for_autogen, mcp_registry
@@ -2802,6 +2803,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         llm_config=llm_config,
         code_execution_config={"work_dir": "coding", "use_docker": False},
         system_message=f"""You are Helper Agent. Help the {role} agent to complete the task:
+{get_cultural_prompt()}
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
             3. Only use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.

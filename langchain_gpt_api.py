@@ -10,6 +10,7 @@ if sys.platform == 'win32':
 
 from bs4 import BeautifulSoup
 from enum import Enum
+from cultural_wisdom import get_cultural_prompt_compact
 
 # Use langchain-classic for pydantic v2 compatibility
 from langchain.llms import OpenAI
@@ -322,7 +323,7 @@ class RequestLogRecord(logging.LogRecord):
 logging.setLogRecordFactory(RequestLogRecord)
 logging.basicConfig(level=logging.INFO)
 stream_handler = logging.StreamHandler(sys.stdout)
-# In bundled/pip-installed mode (NUNBA_BUNDLED env set by main.py), redirect log
+# In bundled/pip-installed mode (NUNBA_BUNDLED env set by main.py), redirect logs
 # to the shared Nunba log directory; standalone keeps default behavior.
 
 if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
@@ -332,10 +333,12 @@ if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
 else:
     _langchain_log_path = 'langchain.log'
 
-handler = RotatingFileHandler(_langchain_log_path, maxBytes=100000, backupCount=0)
+handler = RotatingFileHandler(_langchain_log_path, maxBytes=5_000_000, backupCount=2)
 
 # Set the logging level for the file handler
-handler.setLevel(logging.ERROR)
+# Was ERROR — changed to INFO so that LangChain, crawl4ai, and other library
+# logs are captured in Documents/Nunba/logs/langchain.log (not just errors).
+handler.setLevel(logging.INFO)
 
 # Create a logging format
 req_id = thread_local_data.get_request_id()
@@ -343,6 +346,12 @@ formatter = logging.Formatter(
     '%(asctime)s - %(name)s- [RequestID: %(req_id)s] - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 stream_handler.setFormatter(formatter)
+
+# In bundled mode, also attach the file handler to the root logger so that ALL
+# module loggers (crawl4ai, langchain, etc.) write to Documents/Nunba/logs/langchain.log
+if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
+    _root = logging.getLogger()
+    _root.addHandler(handler)
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
@@ -724,6 +733,7 @@ def create_prompt(tools):
         Your primary goal as a teacher is to assist students by answering their questions, providing accurate and up-to-date information.
         Please create a distinct personality for yourself, and remember never to refer to the user as a human or yourself as mere AI.\
         your response should not be more than 200 words.
+        {get_cultural_prompt_compact()}
         <GENERAL_INSTRUCTION_END>
         User details:
         <USER_DETAILS_START>

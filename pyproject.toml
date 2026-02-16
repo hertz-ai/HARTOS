@@ -90,7 +90,16 @@ dependencies = [
     "cryptography>=41.0.0",
     "PyJWT>=2.7.0",
 
+    # Multi-agent orchestration
+    "autogen-agentchat==0.2.37",
+    "autogen-agentchat[long-context]~=0.2",
+    "apscheduler>=3.10.0",
+    "json-repair>=0.25.0",
+
     # Communication
+    "autobahn>=23.1.2",
+    "autobahn[serialization]",
+    "autobahn[twisted]",
     "crossbarhttp3>=1.1",
     "websockets>=11.0.0",
 
