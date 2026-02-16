@@ -1584,7 +1584,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             tool_logger.info(f'Response from call of {topic}: {response}')
 
             if not response:
-                return 'Ask UserProxy to go to hevolve.ai login and start the Hyve companion app'
+                return 'Ask UserProxy to go to hevolve.ai login and start Nunba - Your Local Hyve Companion App'
 
             # Prepare crossbar message
             crossbar_message = {
@@ -1892,10 +1892,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     OS: {os_to_control}
     Task: {instructions}
 
-    The Hyve Companion App is not running on your {os_to_control} device.
+    Nunba - Your Local Hyve Companion App is not running on your {os_to_control} device.
 
     STEPS TO RESOLVE:
-    1. Open the Hyve Companion App
+    1. Open Nunba - Your Local Hyve Companion App
     2. Ensure it's connected and running
     3. Try the command again
 

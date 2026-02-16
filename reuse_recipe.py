@@ -1911,7 +1911,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             response = await subscribe_and_return({'prompt_id': prompt_id}, topic, 2000)  # Wait for the RPC response
             current_app.logger.info(f'Response from call of {topic}: {response}')
             if not response:
-                return 'Ask UserProxy to go to hevolve.ai login and start the Hyve companion app'
+                return 'Ask UserProxy to go to hevolve.ai login and start Nunba - Your Local Hyve Companion App'
             crossbar_message = {
                 'parent_request_id': request_id_list[user_prompt],
                 'user_id': f'{user_id}',
