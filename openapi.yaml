@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
-  title: Hevolve-db-app
-  description: The Hevolve-db-app API provides programmatic access to educational resources such as student information, text-to-image conversion, and course-related book details. Explore the various endpoints to retrieve students by ID, convert textual prompts into images, and search or list available books.
+  title: Hyve API
+  description: The Hyve platform API (formerly Hevolve-db-app) provides programmatic access to the crowdsourced agentic intelligence platform. Explore the various endpoints for agent orchestration, social communities, goal management, and distributed compute.
   version: '1.0'
 servers:
   - url: https://azurekong.hertzai.com:8443/db

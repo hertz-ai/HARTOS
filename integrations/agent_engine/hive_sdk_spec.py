@@ -9,8 +9,8 @@ guardrail integrity at boot.
 """
 
 HIVE_SDK_DEPENDENCY = (
-    "hevolve-sdk @ git+https://github.com/hertz-ai/"
-    "LLM-langchain_Chatbot-Agent.git@main#subdirectory=sdk"
+    "hyve-sdk @ git+https://github.com/hevolve/"
+    "hyve.git@main#subdirectory=sdk"
 )
 
 MASTER_KEY_VERIFICATION_SNIPPET = '''\

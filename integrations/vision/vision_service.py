@@ -166,6 +166,7 @@ class VisionService:
                 user_id, desc, label='Screen Context',
                 zeroshot_label='Screen Reasoning'
             )
+            self._record_to_world_model(user_id, desc, 'screen')
             self._evaluate_visual_triggers(user_id, desc, 'screen')
             self._frames_described += 1
         return desc
@@ -429,6 +430,7 @@ class VisionService:
                         if desc:
                             self.store.put_description(user_id, desc)
                             self._post_description_to_db(user_id, desc)
+                            self._record_to_world_model(user_id, desc, 'camera')
                             self._evaluate_visual_triggers(
                                 user_id, desc, 'camera'
                             )
@@ -491,6 +493,20 @@ class VisionService:
                 timeout=5,
             )
         except requests.RequestException:
+            pass
+
+    # ─── World Model Integration ───
+
+    def _record_to_world_model(self, user_id: str, description: str,
+                                channel: str = 'camera'):
+        """Feed scene descriptions to world model for continuous learning."""
+        try:
+            from integrations.agent_engine.world_model_bridge import get_world_model_bridge
+            get_world_model_bridge().record_interaction(
+                user_id=user_id, prompt_id=f'vision_{channel}',
+                prompt=f'[{channel}] describe what you see',
+                response=description, model_id='minicpm-v2')
+        except Exception:
             pass
 
     # ─── Config ───

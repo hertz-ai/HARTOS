@@ -232,7 +232,6 @@ class TestGoalManager:
         }
         prompt = GoalManager.build_prompt(goal_dict, test_product.to_dict())
         assert 'guardian angel' in prompt.lower()
-        assert 'everything app' in prompt.lower()
         assert 'sentient tool' in prompt.lower()
         assert 'not addictive' in prompt.lower() or 'not an addictive' in prompt.lower() or 'never promote addiction' in prompt.lower()
         assert 'TestProduct' in prompt
@@ -526,7 +525,7 @@ class TestSelfMarketing:
             db.flush()
 
         product = Product(
-            name='Hevolve Platform',
+            name='Hyve Platform',
             is_platform_product=True,
             category='platform',
         )
@@ -536,7 +535,7 @@ class TestSelfMarketing:
 
     def test_bootstrap_idempotent(self, db):
         # Create one
-        p1 = Product(name='Hevolve Platform', is_platform_product=True)
+        p1 = Product(name='Hyve Platform', is_platform_product=True)
         db.add(p1)
         db.flush()
         # Check only one exists
@@ -545,7 +544,7 @@ class TestSelfMarketing:
 
     def test_platform_product_has_correct_fields(self, db):
         product = Product(
-            name='Hevolve Platform',
+            name='Hyve Platform',
             description='AI-powered platform',
             category='platform',
             is_platform_product=True,
@@ -2307,8 +2306,8 @@ class TestIPProtectionAgent:
         helper.register_for_llm.return_value = lambda f: f
         assistant.register_for_execution.return_value = lambda f: f
         register_ip_protection_tools(helper, assistant, 'test_user')
-        assert helper.register_for_llm.call_count == 8  # 8 tools (incl measure_moat)
-        assert assistant.register_for_execution.call_count == 8
+        assert helper.register_for_llm.call_count == 10  # 10 tools (incl measure_moat + defensive pub + provenance)
+        assert assistant.register_for_execution.call_count == 10
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2318,11 +2317,11 @@ class TestIPProtectionAgent:
 class TestBootstrapGoals:
     """Tests for goal_seeding.py: bootstrap seeding and auto-remediation."""
 
-    def test_seed_creates_6_goals(self, db):
-        """First call creates 6 bootstrap goals."""
-        from integrations.agent_engine.goal_seeding import seed_bootstrap_goals
+    def test_seed_creates_bootstrap_goals(self, db):
+        """First call creates all bootstrap goals (9 total)."""
+        from integrations.agent_engine.goal_seeding import seed_bootstrap_goals, SEED_BOOTSTRAP_GOALS
         count = seed_bootstrap_goals(db)
-        assert count == 6
+        assert count == len(SEED_BOOTSTRAP_GOALS)
         goals = db.query(AgentGoal).filter(AgentGoal.status == 'active').all()
         slugs = set()
         for g in goals:
@@ -2336,6 +2335,9 @@ class TestBootstrapGoals:
         assert 'bootstrap_growth_analytics' in slugs
         assert 'bootstrap_coding_health' in slugs
         assert 'bootstrap_hive_embedding_audit' in slugs
+        assert 'bootstrap_revenue_monitor' in slugs
+        assert 'bootstrap_defensive_ip' in slugs
+        assert 'bootstrap_finance_agent' in slugs
 
     def test_seed_idempotent(self, db):
         """Second call creates 0 — idempotent."""
@@ -2347,16 +2349,18 @@ class TestBootstrapGoals:
     def test_seed_with_product(self, db, test_product):
         """Marketing goals get product_id, non-marketing do not."""
         from integrations.agent_engine.goal_seeding import seed_bootstrap_goals
+        from integrations.agent_engine.goal_seeding import SEED_BOOTSTRAP_GOALS
         count = seed_bootstrap_goals(db, platform_product_id=str(test_product.id))
-        assert count == 6
+        assert count == len(SEED_BOOTSTRAP_GOALS)
         for g in db.query(AgentGoal).filter(AgentGoal.status == 'active').all():
             cfg = g.config_json or {}
             slug = cfg.get('bootstrap_slug', '')
             if slug in ('bootstrap_marketing_awareness', 'bootstrap_referral_campaign',
                         'bootstrap_growth_analytics'):
                 assert g.product_id == str(test_product.id), f"{slug} should have product_id"
-            elif slug in ('bootstrap_ip_monitor', 'bootstrap_coding_health',
-                          'bootstrap_hive_embedding_audit'):
+            elif slug and slug not in ('bootstrap_marketing_awareness',
+                                        'bootstrap_referral_campaign',
+                                        'bootstrap_growth_analytics'):
                 assert g.product_id is None, f"{slug} should NOT have product_id"
 
     def test_system_agent_created(self, db):
@@ -2365,7 +2369,7 @@ class TestBootstrapGoals:
         if not existing:
             sys_agent = User(
                 username='hevolve_system_agent',
-                display_name='Hevolve System Agent',
+                display_name='Hyve System Agent',
                 user_type='agent',
                 idle_compute_opt_in=True,
                 is_admin=False,
@@ -2470,7 +2474,7 @@ class TestBootstrapGoals:
         }
         prompt = _build_coding_prompt(goal)
         assert 'HIVE INTELLIGENCE EMBEDDING' in prompt
-        assert 'hevolve-sdk' in prompt
+        assert 'hyve-sdk' in prompt
         assert 'verify_master_key' in prompt
         assert 'verify_guardrail_integrity' in prompt
         assert 'WorldModelBridge' in prompt

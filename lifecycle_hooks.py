@@ -189,6 +189,18 @@ def set_action_state(user_prompt: str, action_id: int, state: ActionState, reaso
     # Auto-sync to ledger if registered
     _auto_sync_to_ledger(user_prompt, action_id, state)
 
+    # Telemetry recording for recipe experience
+    try:
+        from recipe_experience import RecipeExperienceRecorder as RER
+        if state == ActionState.IN_PROGRESS:
+            RER.start_action_timer(user_prompt, action_id)
+        elif state in (ActionState.COMPLETED, ActionState.ERROR, ActionState.TERMINATED):
+            RER.stop_action_timer(user_prompt, action_id, state.value)
+        if state == ActionState.FALLBACK_RECEIVED:
+            RER.record_fallback_used(user_prompt, action_id, reason, True)
+    except Exception:
+        pass
+
 
 # 3. ADD these wrapper functions for safe state updates:
 def safe_set_state(user_prompt: str, action_id: int, new_state: ActionState, reason: str = ""):

@@ -1728,10 +1728,11 @@ def history(user_id,prompt_id,role,message):
 
 
 # Local llama.cpp server (Qwen3-VL)
+_llama_port = os.environ.get('LLAMA_CPP_PORT', '8080')
 config_list = [{
     "model": 'Qwen3-VL-4B-Instruct',
     "api_key": 'dummy',
-    "base_url": 'http://localhost:8080/v1',
+    "base_url": f'http://localhost:{_llama_port}/v1',
     "price": [0, 0]
 }]
 

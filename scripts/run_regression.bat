@@ -45,6 +45,11 @@ if exist "venv310\Scripts\python.exe" (
 echo Using: %PYTHON_EXE%
 echo.
 
+REM ===== WINDOWS CONSOLE FIX =====
+REM Prevent "Error in sys.excepthook:" crash on Windows console
+set PYTHONIOENCODING=utf-8
+chcp 65001 >nul 2>&1
+
 REM ===== DEFINE TEST GROUPS =====
 
 REM Group 1: P2P Network, Security, Agent Engine (~722 tests)
@@ -162,10 +167,21 @@ if "%choice%"=="1" (
     echo.
     echo Running FULL regression suite [2263 tests]...
     echo ========================================
+    echo Output saved to regression_results.txt
+    echo.
+    REM  -s disables fd-capture (pytest's tmpfile gets closed by imports,
+    REM     causing "ValueError: I/O operation on closed file" abort)
     "%PYTHON_EXE%" -m pytest ^
         tests/ ^
         integrations/channels/tests/ ^
-        --tb=short --color=yes -q
+        --override-ini="addopts=" ^
+        --tb=line --color=no -q -s ^
+        > regression_results.txt 2>&1
+    echo.
+    echo ---- SUMMARY ----
+    findstr /C:"passed" /C:"failed" /C:"error" regression_results.txt
+    echo.
+    echo Full output: regression_results.txt
 ) else if "%choice%"=="2" (
     echo.
     echo Running P2P Network + Security [~722 tests]...

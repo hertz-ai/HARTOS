@@ -5,7 +5,7 @@ import Button from '../components/common/Button';
 
 export default function Identity() {
   const [identity, setIdentity] = useState({
-    display_name: 'HevolveBot Assistant',
+    display_name: 'Hyve Assistant',
     bio: 'A helpful AI assistant for your messaging needs.',
     avatar_url: '',
   });

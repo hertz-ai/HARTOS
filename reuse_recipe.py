@@ -190,10 +190,11 @@ user_simplemem = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_simpl
 # }]
 
 # Local llama.cpp server (Qwen3-VL) - ACTIVE
+_llama_port = os.environ.get('LLAMA_CPP_PORT', '8080')
 config_list = [{
         "model": 'Qwen3-VL-4B-Instruct',
         "api_key": 'dummy',
-        "base_url": 'http://localhost:8080/v1',
+        "base_url": f'http://localhost:{_llama_port}/v1',
         "price": [0, 0]
     }]
 
@@ -1090,6 +1091,14 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         except Exception as e:
             current_app.logger.error(f'Got error as :{e} while checking for prompts/{prompt_id}_{role_number}_{i}.json')
 
+    # Build experience hints from accumulated recipe experience data
+    experience_hints = ''
+    try:
+        from recipe_experience import build_experience_hints
+        experience_hints = build_experience_hints(individual_recipe)
+    except Exception:
+        experience_hints = 'No prior experience recorded.'
+
     response_format = {"message2userfinal": "Your message here"}
     agent_prompt = f'''You are a Helpful {role} Assistant. Your primary role is to assist the user efficiently while keeping all internal actions and processes hidden from the end user. Follow the guidelines below to perform tasks correctly:
 {get_cultural_prompt()}
@@ -1133,6 +1142,10 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
         Actions: <actionsStart>{role_actions}<actionEnd>
         Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{individual_recipe}<generalized_functionsEnd><recipeEnd>
+
+        PREVIOUS EXPERIENCE (use to avoid dead ends and improve efficiency):
+        {experience_hints}
+
         When writing code, always print the final response just before returning it.
         Note: Other agents do not have access to these actions or recipe information. Ensure you provide them with the necessary context and related information to perform the required actions.
     '''
@@ -1899,7 +1912,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             response = await subscribe_and_return({'prompt_id': prompt_id}, topic, 2000)  # Wait for the RPC response
             current_app.logger.info(f'Response from call of {topic}: {response}')
             if not response:
-                return 'Ask UserProxy to go to hevolve.ai login and start the windows companion app'
+                return 'Ask UserProxy to go to hevolve.ai login and start the Hyve companion app'
             crossbar_message = {
                 'parent_request_id': request_id_list[user_prompt],
                 'user_id': f'{user_id}',
@@ -2518,6 +2531,18 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                 current_app.logger.info(f"Registered service tool: {tool_name}")
     except Exception as e:
         current_app.logger.warning(f"Service tools integration error (non-critical): {e}")
+
+    # Hyve Skills: Register ingested agent skills (Claude Code, Markdown, GitHub)
+    try:
+        from integrations.skills import skill_registry
+        skill_funcs = skill_registry.get_autogen_tools()
+        for func_name, func in skill_funcs.items():
+            description = func.__doc__ or f"Hyve skill: {func_name}"
+            helper.register_for_llm(name=func_name, description=description)(func)
+            assistant.register_for_execution(name=func_name)(func)
+            current_app.logger.info(f"Registered Hyve skill: {func_name}")
+    except Exception as e:
+        current_app.logger.debug(f"Hyve skills integration skipped: {e}")
 
     # Internal Agent Communication: Register agents and their skills for in-process communication
     try:

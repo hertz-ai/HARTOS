@@ -439,8 +439,9 @@ def get_default_llm_client():
         def complete(self, prompt: str) -> str:
             from core.http_pool import pooled_post
             try:
+                _lp = os.environ.get('LLAMA_CPP_PORT', '8080')
                 response = pooled_post(
-                    "http://localhost:8080/v1/chat/completions",
+                    f"http://localhost:{_lp}/v1/chat/completions",
                     json={
                         "model": "Qwen3-VL-4B-Instruct",
                         "messages": [{"role": "user", "content": prompt}],
