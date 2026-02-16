@@ -55,3 +55,21 @@ def get_node_health():
         data['world_model'] = {'healthy': False}
 
     return jsonify({'success': True, 'data': data}), 200
+
+
+@dashboard_bp.route('/api/social/node/capabilities', methods=['GET'])
+def get_node_capabilities():
+    """Public endpoint: this node's hardware profile, contribution tier,
+    and enabled features.  Part of the Hyve OS equilibrium system."""
+    try:
+        from security.system_requirements import get_capabilities
+        caps = get_capabilities()
+        if caps is None:
+            return jsonify({
+                'success': False,
+                'error': 'System requirements not yet checked',
+            }), 503
+        return jsonify({'success': True, 'data': caps.to_dict()}), 200
+    except Exception as e:
+        logger.error(f"Capabilities endpoint error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500

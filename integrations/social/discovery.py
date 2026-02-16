@@ -193,6 +193,18 @@ def peer_health():
     return jsonify(gossip.get_health())
 
 
+@discovery_bp.route('/api/social/peers/federation-delta', methods=['POST'])
+def peer_federation_delta():
+    """Receive a learning delta from a federated peer."""
+    try:
+        from integrations.agent_engine.federated_aggregator import get_federated_aggregator
+        agg = get_federated_aggregator()
+        accepted, reason = agg.receive_peer_delta(request.get_json() or {})
+        return jsonify({'success': accepted, 'reason': reason})
+    except Exception as e:
+        return jsonify({'success': False, 'reason': str(e)}), 500
+
+
 # ════════════════════════════════════════════════════════════════
 # Federation Endpoints (Mastodon-style instance follows + content)
 # ════════════════════════════════════════════════════════════════
@@ -471,6 +483,26 @@ def integrity_code_hash():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@discovery_bp.route('/api/social/integrity/guardrail-hash')
+def integrity_guardrail_hash():
+    """Return this node's guardrail hash (live recompute) for continuous audit.
+    Every node in the network can verify any other node's values at any time."""
+    from .peer_discovery import gossip
+    try:
+        from security.hive_guardrails import get_guardrail_hash, compute_guardrail_hash
+        cached = get_guardrail_hash()
+        live = compute_guardrail_hash()
+        return jsonify({
+            'success': True,
+            'node_id': gossip.node_id,
+            'guardrail_hash': cached,
+            'guardrail_hash_live': live,
+            'consistent': cached == live,
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @discovery_bp.route('/api/social/integrity/public-key')
 def integrity_public_key():
     """Return this node's Ed25519 public key."""
@@ -693,6 +725,20 @@ def integrity_node_ban(node_id):
         db.close()
 
 
+@discovery_bp.route('/api/social/integrity/audit-coverage')
+def integrity_audit_coverage():
+    """Network-wide audit compute dominance report.
+    Verifies that no node can outcompute its auditors."""
+    from .models import get_db
+    from .integrity_service import IntegrityService
+    db = get_db()
+    try:
+        result = IntegrityService.get_audit_coverage(db)
+        return jsonify({'success': True, 'data': result})
+    finally:
+        db.close()
+
+
 @discovery_bp.route('/api/social/integrity/dashboard')
 def integrity_dashboard():
     """Admin: integrity overview dashboard data."""
@@ -708,12 +754,12 @@ def integrity_dashboard():
 
 @discovery_bp.route('/api/social/integrity/boot-status')
 def integrity_boot_status():
-    """Return boot verification status, enforcement mode, and runtime health."""
+    """Return boot verification status, enforcement mode, runtime health, and HSM status."""
     from security.master_key import get_enforcement_mode, is_dev_mode, load_release_manifest
     from security.runtime_monitor import is_code_healthy, get_monitor
     manifest = load_release_manifest()
     monitor = get_monitor()
-    return jsonify({
+    result = {
         'success': True,
         'enforcement_mode': get_enforcement_mode(),
         'dev_mode': is_dev_mode(),
@@ -721,7 +767,24 @@ def integrity_boot_status():
         'monitor_active': monitor is not None and monitor._running if monitor else False,
         'release_version': manifest.get('version', '') if manifest else None,
         'manifest_present': manifest is not None,
-    })
+    }
+    # HSM status
+    try:
+        from security.hsm_provider import get_hsm_status
+        result['hsm'] = get_hsm_status()
+    except Exception:
+        result['hsm'] = {'available': False}
+    # HSM trust path status
+    try:
+        from security.hsm_trust import get_path_monitor
+        pm = get_path_monitor()
+        result['hsm_trust'] = {
+            'last_check': pm.get_last_check(),
+            'trust_status': pm.get_trust_status(),
+        }
+    except Exception:
+        result['hsm_trust'] = None
+    return jsonify(result)
 
 
 # ═══════════════════════════════════════════════════════════════

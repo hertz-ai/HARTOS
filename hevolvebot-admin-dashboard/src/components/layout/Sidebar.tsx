@@ -56,7 +56,7 @@ export default function Sidebar() {
             <div className="w-8 h-8 bg-primary-500 rounded-lg flex items-center justify-center">
               <MessageSquare className="w-5 h-5 text-white" />
             </div>
-            <span className="font-semibold text-slate-900 dark:text-white">HevolveBot</span>
+            <span className="font-semibold text-slate-900 dark:text-white">Hyve</span>
           </div>
         )}
         <button

@@ -114,6 +114,29 @@ def init_social(app):
         _boot_verified = True  # Allow if master_key module unavailable
         logger.debug(f"HevolveSocial boot verification skipped: {e}")
 
+    # ── System Requirements (Hyve OS Equilibrium) ──
+    # Detect hardware, classify contribution tier, auto-gate features.
+    # Must run BEFORE gossip/agents so env vars are set before they check.
+    _node_capabilities = None
+    try:
+        from security.system_requirements import run_system_check, get_tier_name
+        _node_capabilities = run_system_check()
+        _tier_name = get_tier_name()
+        logger.info(
+            f"HevolveSocial equilibrium: tier={_tier_name}, "
+            f"enabled={len(_node_capabilities.enabled_features)} features, "
+            f"disabled={len(_node_capabilities.disabled_features)} features"
+        )
+        if _node_capabilities.disabled_features:
+            for _feat, _reason in _node_capabilities.disabled_features.items():
+                logger.info(f"  Feature '{_feat}' not loaded: {_reason}")
+    except Exception as e:
+        logger.warning(f"HevolveSocial system requirements check skipped: {e}")
+        # Auto-enable agent engine if not explicitly disabled
+        import os as _os_fb
+        if _os_fb.environ.get('HEVOLVE_AGENT_ENGINE_ENABLED') is None:
+            _os_fb.environ['HEVOLVE_AGENT_ENGINE_ENABLED'] = 'true'
+
     # Start decentralized gossip peer discovery (background thread)
     if _boot_verified:
         try:
@@ -173,7 +196,7 @@ def init_social(app):
         from integrations.agent_engine import init_agent_engine
         init_agent_engine(app)
     except Exception as e:
-        logger.debug(f"HevolveSocial agent engine init skipped: {e}")
+        logger.warning(f"HevolveSocial agent engine init skipped: {e}")
 
     # Register with central registry if configured
     import os

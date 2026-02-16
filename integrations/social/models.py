@@ -218,6 +218,12 @@ class Post(Base):
     source_message_id = Column(String(200), nullable=True)
     boost_score = Column(Float, default=0.0)
     region_id = Column(String(64), ForeignKey('regions.id', use_alter=True), nullable=True)
+    # Thought Experiment fields
+    intent_category = Column(String(30), nullable=True)   # community|environment|education|health|equity|technology
+    hypothesis = Column(Text, nullable=True)               # "If we do X, then Y"
+    expected_outcome = Column(Text, nullable=True)          # Expected net positive
+    is_thought_experiment = Column(Boolean, default=False)
+    dynamic_layout = Column(JSON, nullable=True)            # Liquid UI layout JSON
     created_at = Column(DateTime, default=func.now(), index=True)
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
@@ -243,6 +249,11 @@ class Post(Base):
             'view_count': self.view_count, 'is_pinned': self.is_pinned,
             'is_locked': self.is_locked, 'source_channel': self.source_channel,
             'boost_score': self.boost_score, 'region_id': self.region_id,
+            'intent_category': self.intent_category,
+            'hypothesis': self.hypothesis,
+            'expected_outcome': self.expected_outcome,
+            'is_thought_experiment': self.is_thought_experiment or False,
+            'dynamic_layout': self.dynamic_layout,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }
@@ -524,6 +535,9 @@ class PeerNode(Base):
     active_user_count = Column(Integer, default=0)
     max_user_capacity = Column(Integer, default=0)
     dns_region = Column(String(50), nullable=True)
+    # Hyve OS equilibrium: contribution tier + enabled features
+    capability_tier = Column(String(20), nullable=True)       # observer|lite|standard|full|compute_host
+    enabled_features_json = Column(JSON, nullable=True)       # ["agent_engine", "tts", ...]
 
     node_operator = relationship('User', foreign_keys=[node_operator_id])
 
@@ -555,6 +569,8 @@ class PeerNode(Base):
             'active_user_count': self.active_user_count,
             'max_user_capacity': self.max_user_capacity,
             'dns_region': self.dns_region,
+            'capability_tier': self.capability_tier,
+            'enabled_features': self.enabled_features_json,
             'metadata': self.metadata_json,
         }
 
@@ -2118,4 +2134,157 @@ class IPInfringement(Base):
             'notice_text': self.notice_text,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════
+# TABLE 56 — Defensive Publications (prior art proof, not patents)
+# ═══════════════════════════════════════════════════════════════
+
+class DefensivePublication(Base):
+    """Timestamped proof-of-invention for legal prior art defence."""
+    __tablename__ = 'defensive_publications'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    title = Column(String(500), nullable=False)
+    abstract = Column(Text, default='')
+    content_hash = Column(String(64), nullable=False)       # SHA-256 of full content
+    git_commit_hash = Column(String(40), nullable=True)
+    code_snapshot_hash = Column(String(64), nullable=True)   # compute_code_hash() at time
+    publication_date = Column(DateTime, default=func.now())
+    signed_by_node_key = Column(String(128), nullable=True)
+    signature_hex = Column(String(256), nullable=True)       # Ed25519 signature of content_hash
+    moat_score_at_publication = Column(Float, default=0.0)
+    verification_snapshot = Column(JSON, default=dict)       # verify_exponential_improvement() snapshot
+    created_by = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=func.now())
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'title': self.title,
+            'abstract': self.abstract,
+            'content_hash': self.content_hash,
+            'git_commit_hash': self.git_commit_hash,
+            'code_snapshot_hash': self.code_snapshot_hash,
+            'publication_date': self.publication_date.isoformat() if self.publication_date else None,
+            'signed_by_node_key': self.signed_by_node_key,
+            'moat_score_at_publication': self.moat_score_at_publication,
+            'verification_snapshot': self.verification_snapshot or {},
+            'created_by': self.created_by,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════
+# TABLE 57 — Commercial API Keys
+# ═══════════════════════════════════════════════════════════════
+
+class CommercialAPIKey(Base):
+    """API keys for paid intelligence-as-a-service."""
+    __tablename__ = 'api_keys'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    user_id = Column(String(64), ForeignKey('users.id'), nullable=False, index=True)
+    key_hash = Column(String(128), nullable=False, unique=True, index=True)
+    key_prefix = Column(String(12), nullable=False)  # first 8 chars for display
+    name = Column(String(200), default='')
+    tier = Column(String(20), default='free', index=True)  # free|starter|pro|enterprise
+    rate_limit_per_day = Column(Integer, default=100)
+    monthly_quota = Column(Integer, default=3000)
+    usage_this_month = Column(Integer, default=0)
+    usage_reset_at = Column(DateTime, nullable=True)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=func.now())
+    expires_at = Column(DateTime, nullable=True)
+
+    user = relationship('User', backref='api_keys')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'key_prefix': self.key_prefix,
+            'name': self.name,
+            'tier': self.tier,
+            'rate_limit_per_day': self.rate_limit_per_day,
+            'monthly_quota': self.monthly_quota,
+            'usage_this_month': self.usage_this_month,
+            'is_active': self.is_active,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'expires_at': self.expires_at.isoformat() if self.expires_at else None,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════
+# TABLE 58 — API Usage Log
+# ═══════════════════════════════════════════════════════════════
+
+class APIUsageLog(Base):
+    """Per-request usage logging for billing."""
+    __tablename__ = 'api_usage_log'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    api_key_id = Column(String(64), ForeignKey('api_keys.id'), nullable=False, index=True)
+    endpoint = Column(String(200), nullable=False)
+    tokens_in = Column(Integer, default=0)
+    tokens_out = Column(Integer, default=0)
+    compute_ms = Column(Integer, default=0)
+    cost_credits = Column(Float, default=0.0)
+    status_code = Column(Integer, default=200)
+    created_at = Column(DateTime, default=func.now())
+
+    api_key = relationship('CommercialAPIKey', backref='usage_logs')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'api_key_id': self.api_key_id,
+            'endpoint': self.endpoint,
+            'tokens_in': self.tokens_in,
+            'tokens_out': self.tokens_out,
+            'compute_ms': self.compute_ms,
+            'cost_credits': self.cost_credits,
+            'status_code': self.status_code,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════
+# TABLE 59 — Build Licenses
+# ═══════════════════════════════════════════════════════════════
+
+class BuildLicense(Base):
+    """Licensed Linux build distribution gated by payment."""
+    __tablename__ = 'build_licenses'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    user_id = Column(String(64), ForeignKey('users.id'), nullable=False, index=True)
+    license_key = Column(String(128), nullable=False, unique=True, index=True)
+    build_type = Column(String(20), default='community')    # community|pro|enterprise
+    platform = Column(String(30), default='linux_x64')       # linux_x64|linux_arm64
+    payment_reference = Column(String(200), nullable=True)
+    download_count = Column(Integer, default=0)
+    max_downloads = Column(Integer, default=5)
+    is_active = Column(Boolean, default=True)
+    signed_by = Column(String(128), nullable=True)
+    signature_hex = Column(String(256), nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    expires_at = Column(DateTime, nullable=True)
+
+    user = relationship('User', backref='build_licenses')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'license_key': self.license_key,
+            'build_type': self.build_type,
+            'platform': self.platform,
+            'payment_reference': self.payment_reference,
+            'download_count': self.download_count,
+            'max_downloads': self.max_downloads,
+            'is_active': self.is_active,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'expires_at': self.expires_at.isoformat() if self.expires_at else None,
         }

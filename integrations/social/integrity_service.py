@@ -199,6 +199,15 @@ class IntegrityService:
             except Exception:
                 response['code_hash'] = 'unavailable'
 
+        elif challenge_type == 'guardrail_verify':
+            try:
+                from security.hive_guardrails import get_guardrail_hash, compute_guardrail_hash
+                response['guardrail_hash'] = get_guardrail_hash()
+                # Recompute live to prove it's not cached/stale
+                response['guardrail_hash_live'] = compute_guardrail_hash()
+            except Exception:
+                response['guardrail_hash'] = 'unavailable'
+
         elif challenge_type == 'impression_audit':
             ad_id = challenge_data.get('ad_id')
             if ad_id:
@@ -286,6 +295,24 @@ class IntegrityService:
             if peer and peer.code_hash and reported_hash != peer.code_hash:
                 passed = False
                 details = 'Code hash changed since last exchange'
+
+        elif challenge.challenge_type == 'guardrail_verify':
+            reported_hash = response_data.get('guardrail_hash', '')
+            reported_live = response_data.get('guardrail_hash_live', '')
+            try:
+                from security.hive_guardrails import get_guardrail_hash
+                expected = get_guardrail_hash()
+                if reported_hash != expected:
+                    passed = False
+                    details = f'Guardrail hash mismatch: expected {expected[:16]}, got {reported_hash[:16]}'
+                elif reported_live and reported_live != expected:
+                    passed = False
+                    details = f'Guardrail live recompute mismatch — possible tampering'
+                elif reported_hash != reported_live:
+                    passed = False
+                    details = 'Cached vs live guardrail hash mismatch — values may have drifted'
+            except Exception:
+                pass
 
         challenge.status = 'passed' if passed else 'failed'
         challenge.result_details = details
@@ -627,11 +654,98 @@ class IntegrityService:
             db, node_id)
         results['score_jump'] = IntegrityService.detect_score_jump(db, node_id)
         results['collusion'] = IntegrityService.detect_collusion(db, node_id)
+        results['audit_dominance'] = IntegrityService.verify_audit_dominance(
+            db, node_id)
 
         peer = db.query(PeerNode).filter_by(node_id=node_id).first()
         results['fraud_score'] = peer.fraud_score if peer else 0.0
         results['integrity_status'] = peer.integrity_status if peer else 'unknown'
         return results
+
+    # ─── Audit Compute Dominance ───
+
+    @staticmethod
+    def verify_audit_dominance(db: Session, target_node_id: str) -> Dict:
+        """Verify that the compute available for auditing a node exceeds
+        that node's own compute. No node should be able to outcompute its auditors.
+
+        Principle: audit_compute > target_compute — always.
+        This is enforced by compute democracy (max 5% influence) but we
+        verify it explicitly here to catch edge cases.
+        """
+        target = db.query(PeerNode).filter_by(node_id=target_node_id).first()
+        if not target:
+            return {'dominant': True, 'details': 'Unknown node'}
+
+        target_compute = _get_node_compute(target)
+
+        # Sum compute of all active non-banned peers (excluding target)
+        auditors = db.query(PeerNode).filter(
+            PeerNode.status == 'active',
+            PeerNode.node_id != target_node_id,
+            PeerNode.integrity_status != 'banned',
+        ).all()
+
+        auditor_compute = sum(_get_node_compute(p) for p in auditors)
+        auditor_count = len(auditors)
+
+        # The audit collective must have more compute than the target
+        dominant = auditor_compute > target_compute
+
+        if not dominant and auditor_count > 0:
+            # If a single node has more compute than all its auditors combined,
+            # flag it — this violates compute democracy
+            logger.warning(
+                f"Audit dominance violation: node {target_node_id[:8]} has "
+                f"{target_compute} compute vs {auditor_compute} auditor compute "
+                f"({auditor_count} auditors)")
+            IntegrityService.increase_fraud_score(
+                db, target_node_id, 10.0,
+                f'Audit dominance violation: target compute ({target_compute}) '
+                f'exceeds auditor compute ({auditor_compute})',
+                {'target_compute': target_compute,
+                 'auditor_compute': auditor_compute,
+                 'auditor_count': auditor_count})
+
+        return {
+            'dominant': dominant,
+            'target_compute': target_compute,
+            'auditor_compute': auditor_compute,
+            'auditor_count': auditor_count,
+            'ratio': round(auditor_compute / max(target_compute, 1), 2),
+        }
+
+    @staticmethod
+    def get_audit_coverage(db: Session) -> Dict:
+        """Network-wide audit dominance report. Returns nodes where
+        audit compute does NOT exceed their own compute."""
+        active_peers = db.query(PeerNode).filter(
+            PeerNode.status == 'active',
+            PeerNode.integrity_status != 'banned',
+        ).all()
+
+        total_compute = sum(_get_node_compute(p) for p in active_peers)
+        violations = []
+
+        for peer in active_peers:
+            peer_compute = _get_node_compute(peer)
+            # Auditors = everyone else
+            auditor_compute = total_compute - peer_compute
+            if peer_compute > 0 and auditor_compute <= peer_compute:
+                violations.append({
+                    'node_id': peer.node_id,
+                    'node_name': peer.name,
+                    'compute': peer_compute,
+                    'auditor_compute': auditor_compute,
+                    'ratio': round(auditor_compute / max(peer_compute, 1), 2),
+                })
+
+        return {
+            'total_nodes': len(active_peers),
+            'total_compute': total_compute,
+            'violations': violations,
+            'all_dominant': len(violations) == 0,
+        }
 
     # ─── Fraud Score Management ───
 
@@ -849,6 +963,20 @@ class IntegrityService:
         # The alert is created inside increase_fraud_score
         return {'node_id': node_id, 'alert_type': alert_type,
                 'severity': severity, 'description': description}
+
+
+def _get_node_compute(peer) -> float:
+    """Extract compute score from a PeerNode's metadata.
+    Uses contribution_score as primary metric, falls back to metadata fields."""
+    if peer.contribution_score and peer.contribution_score > 0:
+        return float(peer.contribution_score)
+    meta = peer.metadata_json or {}
+    # Check for reported compute capacity (TFLOPS, GPU count, etc.)
+    compute = meta.get('compute_tflops', 0) or meta.get('gpu_count', 0)
+    if compute:
+        return float(compute)
+    # Minimum: 1.0 (every node has at least some compute)
+    return 1.0
 
 
 def _determine_alert_type(reason: str) -> str:

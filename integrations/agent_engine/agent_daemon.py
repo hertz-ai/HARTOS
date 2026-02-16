@@ -98,6 +98,19 @@ class AgentDaemon:
             if not idle_agents:
                 return
 
+            # Assign excess idle agents as exception watchers
+            try:
+                from .exception_watcher import ExceptionWatcher
+                watcher = ExceptionWatcher.get_instance()
+                if len(idle_agents) > len(goals):
+                    excess = idle_agents[len(goals):]
+                    for agent in excess:
+                        watcher.assign_watcher(str(agent['user_id']), agent['username'])
+                if watcher.has_watchers():
+                    watcher.process_exceptions(db)
+            except Exception as e:
+                logger.debug(f"Exception watcher: {e}")
+
             dispatched = 0
             used_agents = set()
             max_concurrent = int(os.environ.get('HEVOLVE_AGENT_MAX_CONCURRENT', '10'))
@@ -170,6 +183,74 @@ class AgentDaemon:
                         logger.info(f"Auto-remediation: created {rem_count} goal(s)")
                 except Exception as e:
                     logger.debug(f"Auto-remediation check failed: {e}")
+
+                # Intelligence milestone: auto-file patent when threshold reached
+                try:
+                    from .ip_service import IPService
+                    milestone = IPService.check_intelligence_milestone(db)
+                    if milestone.get('triggered', False):
+                        from integrations.social.models import AgentGoal
+                        active_filing = db.query(AgentGoal).filter(
+                            AgentGoal.status == 'active',
+                            AgentGoal.goal_type == 'ip_protection',
+                        ).all()
+                        has_filing = any(
+                            (g.config_json or {}).get('mode') == 'file'
+                            for g in active_filing
+                        )
+                        if not has_filing:
+                            from .goal_manager import GoalManager
+                            GoalManager.create_goal(
+                                db,
+                                goal_type='ip_protection',
+                                title='Auto-File Provisional Patent: Critical Intelligence Reached',
+                                description=(
+                                    f'Intelligence milestone triggered: '
+                                    f'{milestone["consecutive_verified"]} consecutive verified days, '
+                                    f'moat catch-up: {milestone["moat_catch_up"]}. '
+                                    f'Use draft_patent_claims then draft_provisional_patent.'
+                                ),
+                                config={'mode': 'file', 'auto_triggered': True,
+                                        'milestone': milestone},
+                                spark_budget=500,
+                                created_by='intelligence_milestone',
+                            )
+                            logger.info("Intelligence milestone reached — auto-patent goal created")
+                except Exception as e:
+                    logger.debug(f"Intelligence milestone check: {e}")
+
+                # Self-healing: create fix goals for recurring exceptions
+                try:
+                    from .self_healing_dispatcher import SelfHealingDispatcher
+                    healer = SelfHealingDispatcher.get_instance()
+                    fix_count = healer.check_and_dispatch(db)
+                    if fix_count > 0:
+                        logger.info(f"Self-healing: created {fix_count} fix goal(s)")
+                except Exception as e:
+                    logger.debug(f"Self-healing check: {e}")
+
+            # Federation: aggregate learning deltas across peers every 2nd tick
+            if self._tick_count % 2 == 0:
+                try:
+                    from .federated_aggregator import get_federated_aggregator
+                    fed = get_federated_aggregator()
+                    fed_result = fed.tick()
+                    if fed_result.get('aggregated'):
+                        logger.info(
+                            f"Federation: epoch={fed_result.get('epoch')}, "
+                            f"convergence={fed_result.get('convergence', 0):.3f}")
+                except Exception as e:
+                    logger.debug(f"Federation tick: {e}")
+
+            # Monthly API quota reset
+            if self._tick_count == 1 or self._tick_count % (self._remediate_every * 10) == 0:
+                try:
+                    from .commercial_api import CommercialAPIService
+                    reset_count = CommercialAPIService.reset_monthly_quotas(db)
+                    if reset_count > 0:
+                        logger.info(f"Reset monthly API quotas for {reset_count} keys")
+                except Exception:
+                    pass
 
             db.commit()
         except Exception as e:

@@ -198,7 +198,7 @@ def _register_defaults():
         config_list_entry={
             'model': 'Qwen3-VL-4B-Instruct',
             'api_key': 'dummy',
-            'base_url': 'http://localhost:8080/v1',
+            'base_url': f'http://localhost:{os.environ.get("LLAMA_CPP_PORT", "8080")}/v1',
             'price': [0, 0],
         },
         avg_latency_ms=800.0,

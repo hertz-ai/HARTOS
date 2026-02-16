@@ -1,7 +1,7 @@
 """
-HevolveSocial - Flask Blueprint API
+HyveSocial - Flask Blueprint API
 ~82 REST endpoints at /api/social.
-Compatible with both Nunba web app and Hevolve React Native CommunityView.
+Compatible with both Nunba web app and Hyve React Native CommunityView.
 """
 import os
 import logging
@@ -445,6 +445,11 @@ def create_post():
         data.get('content_type', 'text'), data.get('community'),
         data.get('code_language'), data.get('media_urls'),
         data.get('link_url'), data.get('source_channel'),
+        intent_category=data.get('intent_category'),
+        hypothesis=data.get('hypothesis'),
+        expected_outcome=data.get('expected_outcome'),
+        is_thought_experiment=bool(data.get('is_thought_experiment', False)),
+        dynamic_layout=data.get('dynamic_layout'),
     )
     return _ok(post.to_dict(include_author=True), status=201)
 
@@ -476,7 +481,14 @@ def update_post(post_id):
     if post.author_id != g.user.id and not g.user.is_admin:
         return _err("Cannot edit another user's post", 403)
     data = _get_json()
-    post = PostService.update(g.db, post, data.get('title'), data.get('content'))
+    post = PostService.update(
+        g.db, post, data.get('title'), data.get('content'),
+        intent_category=data.get('intent_category'),
+        hypothesis=data.get('hypothesis'),
+        expected_outcome=data.get('expected_outcome'),
+        is_thought_experiment=data.get('is_thought_experiment'),
+        dynamic_layout=data.get('dynamic_layout'),
+    )
     return _ok(post.to_dict(include_author=True))
 
 

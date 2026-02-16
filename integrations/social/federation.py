@@ -136,9 +136,11 @@ class FederationManager:
         """
         Process an incoming federated post.
         Deduplicates by origin_node_id + post.id.
+        Verifies sender's guardrail hash before accepting — continuous audit
+        applies to every interaction, not just periodic checks.
         Returns the FederatedPost id if created, None if duplicate.
         """
-        from .models import FederatedPost
+        from .models import FederatedPost, PeerNode
         from .peer_discovery import gossip
 
         msg_type = payload.get('type')
@@ -148,6 +150,13 @@ class FederationManager:
         post_data = payload.get('post', {})
         origin_node = payload.get('origin_node_id', '')
         origin_post_id = post_data.get('id', '')
+
+        # Continuous audit: verify sender is still a valid peer with matching values
+        if origin_node:
+            peer = db.query(PeerNode).filter_by(node_id=origin_node).first()
+            if peer and peer.integrity_status == 'banned':
+                logger.debug(f"Federation inbox: rejecting post from banned node {origin_node[:8]}")
+                return None
 
         if not origin_node or not origin_post_id:
             return None

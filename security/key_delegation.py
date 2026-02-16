@@ -207,10 +207,26 @@ def verify_tier_authorization() -> dict:
                 'details': 'Local/flat tier — no credentials required'}
 
     if tier == 'central':
+        # Check HSM provider first (production path)
+        try:
+            from security.hsm_provider import get_hsm_provider
+            provider = get_hsm_provider()
+            from security.master_key import MASTER_PUBLIC_KEY_HEX
+            hsm_pub = provider.get_public_key_hex()
+            if hsm_pub == MASTER_PUBLIC_KEY_HEX:
+                return {'authorized': True, 'tier': tier,
+                        'details': f'Central tier authorized — HSM ({provider.get_provider_name()})'}
+            else:
+                return {'authorized': False, 'tier': tier,
+                        'details': 'HSM public key does not match trust anchor'}
+        except Exception:
+            pass
+
+        # Legacy fallback: check env var (dev mode)
         priv_hex = os.environ.get('HEVOLVE_MASTER_PRIVATE_KEY', '')
         if not priv_hex:
             return {'authorized': False, 'tier': tier,
-                    'details': 'Central tier requires HEVOLVE_MASTER_PRIVATE_KEY env var'}
+                    'details': 'Central tier requires HSM or HEVOLVE_MASTER_PRIVATE_KEY'}
         try:
             from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
             priv = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(priv_hex))
@@ -223,7 +239,7 @@ def verify_tier_authorization() -> dict:
                 return {'authorized': False, 'tier': tier,
                         'details': 'Master private key does not match hardcoded public key'}
             return {'authorized': True, 'tier': tier,
-                    'details': 'Central tier authorized — master key verified'}
+                    'details': 'Central tier authorized — env var fallback (use HSM in production)'}
         except (ValueError, Exception) as e:
             return {'authorized': False, 'tier': tier,
                     'details': f'Invalid master private key: {e}'}
