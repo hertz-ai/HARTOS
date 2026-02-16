@@ -80,6 +80,24 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
             except ImportError:
                 pass
 
+            # GUARDRAIL: coding goals — no merge without constitutional review
+            if goal_type == 'coding':
+                try:
+                    from security.hive_guardrails import ConstitutionalFilter
+                    review_dict = {
+                        'title': f'Code commit review: {goal_id}',
+                        'description': response[:2000],
+                        'goal_type': 'coding',
+                    }
+                    passed, reason = ConstitutionalFilter.check_goal(review_dict)
+                    if not passed:
+                        logger.warning(
+                            f"Coding goal {goal_id} output blocked by "
+                            f"constitutional review: {reason}")
+                        return None
+                except ImportError:
+                    pass
+
             # Record to world model (training data for hive intelligence)
             try:
                 from .world_model_bridge import get_world_model_bridge

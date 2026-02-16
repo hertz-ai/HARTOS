@@ -4,7 +4,7 @@ Agent Dashboard Service — Truth-Grounded Unified View
 Queries actual database state, applies staleness detection, computes priority.
 Shows what is REALLY happening, not what we wish was happening.
 
-Consumed by Nunba (desktop), Hevolve RN (mobile), and hevolve.ai (web).
+Consumed by Nunba (desktop), Hyve RN (mobile), and hevolve.ai (web).
 """
 import logging
 import os

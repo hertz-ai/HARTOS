@@ -7,6 +7,24 @@ import shutil
 from unittest.mock import Mock, MagicMock, patch
 from datetime import datetime
 
+# ─── Windows excepthook crash guard ───
+# On Windows, sys.excepthook can crash when writing tracebacks to certain
+# consoles/pipes, killing the entire pytest process mid-run.  Installing a
+# resilient hook prevents the abort while still attempting to display the error.
+_original_excepthook = sys.excepthook
+
+def _safe_excepthook(exc_type, exc_value, exc_tb):
+    try:
+        _original_excepthook(exc_type, exc_value, exc_tb)
+    except Exception:
+        # Fallback: write to stderr directly (avoids "I/O on closed file" abort)
+        try:
+            sys.stderr.write(f"\n[conftest] Unhandled {exc_type.__name__}: {exc_value}\n")
+        except Exception:
+            pass
+
+sys.excepthook = _safe_excepthook
+
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -37,14 +55,23 @@ from helper import Action
 
 @pytest.fixture(autouse=True)
 def reset_state_machine():
-    """Reset state machine before each test"""
-    action_states.clear()
-    flow_lifecycle.flows.clear()
-    initialize_deterministic_actions()
+    """Reset state machine before each test.
+
+    Wrapped in try/except because initialize_deterministic_actions()
+    requires Flask app context, which not all test files set up.
+    """
+    try:
+        action_states.clear()
+        flow_lifecycle.flows.clear()
+        initialize_deterministic_actions()
+    except (RuntimeError, Exception):
+        pass  # No Flask app context — test doesn't use lifecycle hooks
     yield
-    # Cleanup after test
-    action_states.clear()
-    flow_lifecycle.flows.clear()
+    try:
+        action_states.clear()
+        flow_lifecycle.flows.clear()
+    except (RuntimeError, Exception):
+        pass
 
 
 @pytest.fixture
@@ -179,13 +206,18 @@ def sample_recipe_json(temp_prompts_dir, test_prompt_id):
 
 @pytest.fixture
 def mock_flask_app():
-    """Mock Flask app context"""
-    with patch('flask.current_app') as mock_app:
-        mock_app.logger = Mock()
-        mock_app.logger.info = Mock()
-        mock_app.logger.warning = Mock()
-        mock_app.logger.error = Mock()
-        yield mock_app
+    """Provide a real Flask application context.
+
+    Using patch('flask.current_app') fails on Python 3.10+ because
+    mock introspects the werkzeug LocalProxy (calls hasattr(__func__))
+    which triggers RuntimeError outside an app context.
+    A real minimal Flask app avoids this entirely.
+    """
+    from flask import Flask
+    app = Flask(__name__)
+    app.config['TESTING'] = True
+    with app.app_context():
+        yield app
 
 
 @pytest.fixture

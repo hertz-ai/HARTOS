@@ -302,3 +302,71 @@ def get_moat_depth():
     """Technical irreproducibility — how far ahead of a code clone."""
     from .ip_service import IPService
     return jsonify({'success': True, 'data': IPService.measure_moat_depth()})
+
+
+# ─── Defensive Publications ───
+
+@agent_engine_bp.route('/api/ip/defensive-publications', methods=['GET'])
+@require_auth
+def list_defensive_publications():
+    """List all defensive publications — timestamped prior art evidence."""
+    from .ip_service import IPService
+    pubs = IPService.list_defensive_publications(g.db)
+    return jsonify({'success': True, 'publications': pubs})
+
+
+@agent_engine_bp.route('/api/ip/defensive-publications', methods=['POST'])
+@require_auth
+def create_defensive_publication():
+    """Create a new defensive publication — signed prior art proof."""
+    from .ip_service import IPService
+    data = request.get_json() or {}
+    if not data.get('title') or not data.get('content'):
+        return jsonify({'success': False, 'error': 'title and content required'}), 400
+    result = IPService.create_defensive_publication(
+        g.db,
+        title=data['title'],
+        content=data['content'],
+        abstract=data.get('abstract', ''),
+        git_commit=data.get('git_commit'),
+        created_by=str(g.user.id),
+    )
+    return jsonify({'success': True, 'publication': result}), 201
+
+
+@agent_engine_bp.route('/api/ip/provenance', methods=['GET'])
+@require_auth
+def get_provenance():
+    """Full provenance chain — all publications, patents, moat, evidence."""
+    from .ip_service import IPService
+    return jsonify({'success': True, 'data': IPService.get_provenance_record(g.db)})
+
+
+@agent_engine_bp.route('/api/ip/milestone', methods=['GET'])
+@require_auth
+def check_milestone():
+    """Check intelligence milestone — auto-patent filing trigger status."""
+    from .ip_service import IPService
+    days = request.args.get('days', 14, type=int)
+    result = IPService.check_intelligence_milestone(g.db, consecutive_days_required=days)
+    return jsonify({'success': True, 'data': result})
+
+
+# ─── World Model Health ───
+
+@agent_engine_bp.route('/api/world-model/health', methods=['GET'])
+def world_model_health():
+    """World model bridge health check — no auth required for monitoring."""
+    try:
+        from .world_model_bridge import get_world_model_bridge
+        bridge = get_world_model_bridge()
+        return jsonify({
+            'success': True,
+            'health': bridge.check_health(),
+            'stats': bridge.get_learning_stats(),
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'health': {'healthy': False, 'error': str(e)},
+        })

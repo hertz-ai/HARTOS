@@ -129,6 +129,121 @@ SEED_BOOTSTRAP_GOALS = [
         'spark_budget': 200,
         'use_product': False,
     },
+    {
+        'slug': 'bootstrap_revenue_monitor',
+        'goal_type': 'revenue',
+        'title': 'Monitor API Revenue and Pricing',
+        'description': (
+            'Monitor commercial API revenue and optimise: '
+            '1) Use get_api_revenue_stats to check revenue trends, '
+            '2) Analyse tier distribution and usage patterns, '
+            '3) Recommend pricing adjustments based on demand/costs, '
+            '4) Generate API documentation for developer onboarding. '
+            'Fair pricing: free tier always free, 90% to compute providers. '
+            'All compute falls under one basket — tread carefully, genuine value first.'
+        ),
+        'config': {
+            'mode': 'monitor',
+        },
+        'spark_budget': 150,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_defensive_ip',
+        'goal_type': 'ip_protection',
+        'title': 'Continuous Defensive Publication and Intelligence Milestone',
+        'description': (
+            'Generate defensive publications and monitor for patent trigger: '
+            '1) Create defensive publications for novel architecture components, '
+            '2) Use get_provenance_record to maintain evidence chain, '
+            '3) Monitor loop health for consecutive verified status, '
+            '4) When intelligence milestone reached (14 days verified + moat >= months), '
+            'trigger provisional patent filing via draft_patent_claims. '
+            'Defensive publications first. Patents only when critical intelligence confirmed. '
+            'Hyve character: Vijai — cautious, methodical, net-positive.'
+        ),
+        'config': {
+            'mode': 'monitor',
+            'auto_patent_trigger': True,
+        },
+        'spark_budget': 200,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_finance_agent',
+        'goal_type': 'finance',
+        'title': 'Self-Sustaining Business — Finance Agent Vijai',
+        'description': (
+            'Make the business self-sustaining with Vijai personality: '
+            '1) Use get_financial_health to monitor platform revenue and costs, '
+            '2) Use track_revenue_split to verify 90/10 compliance every period, '
+            '3) Use assess_sustainability to determine if revenue covers infrastructure, '
+            '4) Use manage_invite_participation to review private core access agreements. '
+            'No code merges without review against vision, mission, goals, constitution. '
+            'The coding agent proposes; guardrails and review approve. '
+            'Cautious market. Genuine value first. Vijai builds, never rushes.'
+        ),
+        'config': {
+            'mode': 'monitor',
+            'personality': 'vijai',
+            'commit_review_required': True,
+        },
+        'spark_budget': 200,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_exception_watcher',
+        'goal_type': 'self_heal',
+        'title': 'Continuous Exception Monitor and Self-Healing',
+        'description': (
+            'Monitor the platform for runtime exceptions. '
+            'When exception patterns are detected (3+ occurrences of same type), '
+            'create coding fix goals for idle agents. '
+            'This goal runs continuously to keep the platform self-healing.'
+        ),
+        'config': {
+            'mode': 'watch',
+            'continuous': True,
+        },
+        'spark_budget': 100,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_federation_sync',
+        'goal_type': 'federation',
+        'title': 'Federated Learning Synchronization Monitor',
+        'description': (
+            'Monitor federated learning convergence across the network: '
+            '1) Use check_federation_convergence to track sync health, '
+            '2) Identify diverging or stalled nodes via get_peer_learning_health, '
+            '3) Trigger manual sync if convergence drops below 0.5, '
+            '4) Report federation stats and trends.'
+        ),
+        'config': {
+            'mode': 'monitor',
+        },
+        'spark_budget': 150,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_upgrade_monitor',
+        'goal_type': 'upgrade',
+        'title': 'Continuous Version Upgrade Monitor',
+        'description': (
+            'Monitor for new version deployments and orchestrate upgrades: '
+            '1) Use check_upgrade_status to detect new versions, '
+            '2) Capture pre-upgrade benchmarks, '
+            '3) Start 7-stage pipeline (build→test→audit→benchmark→sign→canary→deploy), '
+            '4) Monitor canary health during rollout, '
+            '5) Rollback immediately on ANY degradation.'
+        ),
+        'config': {
+            'mode': 'monitor',
+            'continuous': True,
+        },
+        'spark_budget': 200,
+        'use_product': False,
+    },
 ]
 
 # ─── Loophole → Remediation Goal Map ───
@@ -217,6 +332,18 @@ LOOPHOLE_REMEDIATION_MAP = {
             'Report partition boundaries and suggest recovery strategy.'
         ),
         'config': {'mode': 'monitor', 'remediation': 'gossip_partition'},
+        'spark_budget': 100,
+    },
+    'learning_stall': {
+        'goal_type': 'federation',
+        'title': 'Remediate Learning Stall: Adjust Aggregation',
+        'description': (
+            'Federation convergence below threshold. '
+            'Check peer learning health for diverging nodes. '
+            'Trigger manual sync and report anomalies. '
+            'May need to adjust aggregation weights or flush frequency.'
+        ),
+        'config': {'mode': 'monitor', 'remediation': 'learning_stall'},
         'spark_budget': 100,
     },
 }

@@ -65,10 +65,17 @@ class WorldModelBridge:
             'node_tier': self._node_tier,
         }
 
+        # Configurable HTTP timeouts
+        self._timeout_flush = int(os.environ.get('HEVOLVE_WM_FLUSH_TIMEOUT', '15'))
+        self._timeout_correction = int(os.environ.get('HEVOLVE_WM_CORRECTION_TIMEOUT', '30'))
+        self._timeout_default = int(os.environ.get('HEVOLVE_WM_HTTP_TIMEOUT', '10'))
+
         # In-process mode: direct Python calls (no HTTP overhead)
         self._provider = None  # LearningLLMProvider
         self._hive_mind = None  # HiveMind
         self._in_process = False
+        self._in_process_retry_done = False
+        self._federation_aggregated = {}
         self._init_in_process()
 
     def _init_in_process(self):
@@ -109,6 +116,11 @@ class WorldModelBridge:
 
         GUARDRAIL: ConstitutionalFilter screens before storage.
         """
+        # Lazy in-process re-check: crawl4ai may have initialized after our __init__
+        if not self._in_process and not self._in_process_retry_done:
+            self._in_process_retry_done = True
+            self._init_in_process()
+
         try:
             from security.hive_guardrails import ConstitutionalFilter
             passed, _ = ConstitutionalFilter.check_prompt(response)
@@ -209,7 +221,7 @@ class WorldModelBridge:
                 requests.post(
                     f'{self._api_url}/v1/chat/completions',
                     json=body,
-                    timeout=15,
+                    timeout=self._timeout_flush,
                 )
                 with self._lock:
                     self._stats['total_flushed'] += 1
@@ -283,7 +295,7 @@ class WorldModelBridge:
             resp = requests.post(
                 f'{self._api_url}/v1/corrections',
                 json=body,
-                timeout=30,
+                timeout=self._timeout_correction,
             )
             if resp.status_code == 200:
                 with self._lock:
@@ -392,7 +404,7 @@ class WorldModelBridge:
         # HTTP fallback
         try:
             resp = requests.get(
-                f'{self._api_url}/v1/stats', timeout=10)
+                f'{self._api_url}/v1/stats', timeout=self._timeout_default)
             if resp.status_code == 200:
                 result['learning'] = resp.json()
         except requests.RequestException:
@@ -400,7 +412,7 @@ class WorldModelBridge:
 
         try:
             resp = requests.get(
-                f'{self._api_url}/v1/hivemind/stats', timeout=10)
+                f'{self._api_url}/v1/hivemind/stats', timeout=self._timeout_default)
             if resp.status_code == 200:
                 result['hivemind'] = resp.json()
         except requests.RequestException:
@@ -424,7 +436,7 @@ class WorldModelBridge:
         # HTTP fallback
         try:
             resp = requests.get(
-                f'{self._api_url}/v1/hivemind/agents', timeout=10)
+                f'{self._api_url}/v1/hivemind/agents', timeout=self._timeout_default)
             if resp.status_code == 200:
                 data = resp.json()
                 return data.get('agents', data) if isinstance(data, dict) else data
@@ -546,6 +558,31 @@ class WorldModelBridge:
                 'in_process': self._in_process,
                 **self._stats,
             }
+
+    # ─── Federation support ───────────────────────────────────────
+
+    def extract_learning_delta(self) -> dict:
+        """Pull stats for federation delta extraction.
+
+        Used by FederatedAggregator.extract_local_delta() to build the
+        lightweight metric delta that gets broadcast to peers.
+        """
+        stats = self.get_stats()
+        learning = self.get_learning_stats()
+        return {
+            'bridge': stats,
+            'learning': learning.get('learning', {}),
+            'hivemind': learning.get('hivemind', {}),
+        }
+
+    def apply_federation_update(self, aggregated: dict) -> bool:
+        """Store aggregated network-wide metrics locally.
+
+        Does NOT push to crawl4ai — federation metrics are consumed
+        by BenchmarkRegistry and dashboard, not crawl4ai's learning pipeline.
+        """
+        self._federation_aggregated = aggregated
+        return True
 
 
 # ─── Module-level singleton ───

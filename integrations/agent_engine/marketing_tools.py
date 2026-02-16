@@ -33,7 +33,7 @@ def register_marketing_tools(helper, assistant, user_id: str):
         community_id: Annotated[Optional[str], "Community to post in (optional)"] = None,
         media_url: Annotated[Optional[str], "URL of media attachment (optional)"] = None,
     ) -> str:
-        """Create a post on the Hevolve social platform."""
+        """Create a post on the Hyve social platform."""
         try:
             from integrations.social.models import get_db, Post
             db = get_db()
@@ -160,7 +160,7 @@ def register_marketing_tools(helper, assistant, user_id: str):
     def create_referral_campaign(
         name: Annotated[str, "Campaign name"],
         description: Annotated[str, "Campaign description and referral strategy"],
-        referral_message: Annotated[str, "Shareable referral message for users"] = "Join me on Hevolve!",
+        referral_message: Annotated[str, "Shareable referral message for users"] = "Join me on Hyve!",
         target_communities: Annotated[Optional[str], "Comma-separated community IDs to target"] = None,
         budget: Annotated[int, "Spark budget for this campaign"] = 100,
     ) -> str:
@@ -252,7 +252,7 @@ def register_marketing_tools(helper, assistant, user_id: str):
 
     # Register all marketing tools
     tools = [
-        ('create_social_post', 'Create a post on the Hevolve social platform for marketing', create_social_post),
+        ('create_social_post', 'Create a post on the Hyve social platform for marketing', create_social_post),
         ('create_campaign', 'Create a marketing campaign with strategy, targeting, and budget', create_campaign),
         ('create_ad', 'Create a targeted ad unit with budget and audience targeting', create_ad),
         ('post_to_channel', 'Post content to external channels (Twitter, Instagram, Email, Discord, etc.)', post_to_channel),
@@ -270,7 +270,7 @@ def register_marketing_tools(helper, assistant, user_id: str):
     try:
         from integrations.internal_comm.internal_agent_communication import register_agent_with_skills
         register_agent_with_skills(f"marketing_{user_id}", [
-            {'name': 'social_posting', 'description': 'Create posts on Hevolve platform', 'proficiency': 0.9},
+            {'name': 'social_posting', 'description': 'Create posts on Hyve platform', 'proficiency': 0.9},
             {'name': 'campaign_management', 'description': 'Create and manage marketing campaigns', 'proficiency': 0.9},
             {'name': 'ad_creation', 'description': 'Create targeted ad units', 'proficiency': 0.9},
             {'name': 'channel_distribution', 'description': 'Post to external channels', 'proficiency': 0.8},

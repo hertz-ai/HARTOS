@@ -1,7 +1,16 @@
 """
-One-time master keypair generation for HevolveSocial deployment control.
+One-time master keypair generation for Hyve deployment control.
 
-Outputs:
+FOR DEVELOPMENT ONLY. In production, generate the key directly inside
+the HSM (Google Cloud KMS, Azure Key Vault, or HashiCorp Vault) so
+the private key NEVER exists outside hardware.
+
+HSM key generation:
+  - GCP:   gcloud kms keys create hyve-master --keyring=hyve --location=global --purpose=asymmetric-signing --default-algorithm=ec-sign-ed25519
+  - Azure: az keyvault key create --vault-name hyve-vault --name hyve-master --kty OKP-HSM --curve Ed25519
+  - Vault: vault write transit/keys/hyve-master type=ed25519
+
+Dev fallback (this script):
   - Private key hex → store as GitHub Secret HEVOLVE_MASTER_PRIVATE_KEY_HEX
   - Public key hex  → embed in security/master_key.py MASTER_PUBLIC_KEY_HEX
 
@@ -28,9 +37,12 @@ def main():
         format=serialization.PublicFormat.Raw,
     )
 
-    print("=" * 60)
-    print("HevolveSocial Master Keypair Generated")
-    print("=" * 60)
+    print("=" * 70)
+    print("Hyve Master Keypair Generated (DEV ONLY)")
+    print("=" * 70)
+    print()
+    print("  In production, generate keys INSIDE the HSM so the private")
+    print("  key never exists outside hardware. See docstring for commands.")
     print()
     print(f"PRIVATE KEY (hex) - Store as GitHub Secret:")
     print(f"  HEVOLVE_MASTER_PRIVATE_KEY_HEX={priv_bytes.hex()}")
@@ -39,8 +51,8 @@ def main():
     print(f"  MASTER_PUBLIC_KEY_HEX = '{pub_bytes.hex()}'")
     print()
     print("WARNING: The private key must NEVER be committed to git.")
-    print("         Store it ONLY as a GitHub Actions secret.")
-    print("=" * 60)
+    print("         In production, use HSM (GCP KMS / Azure Key Vault / Vault).")
+    print("=" * 70)
 
 
 if __name__ == '__main__':
