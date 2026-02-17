@@ -289,6 +289,33 @@ class AgentDaemon:
                 except Exception as e:
                     logger.debug(f"Self-healing check: {e}")
 
+            # Baseline intelligence check: re-snapshot when world model stats shift
+            if self._tick_count % (self._remediate_every * 2) == 0:
+                try:
+                    from .agent_baseline_service import (
+                        AgentBaselineService, capture_baseline_async)
+                    from integrations.social.models import AgentGoal
+                    active_goals = db.query(AgentGoal).filter(
+                        AgentGoal.status.in_(['active', 'completed'])).all()
+                    checked = set()
+                    for goal in active_goals:
+                        key = f'{goal.prompt_id}_{goal.flow_id or 0}'
+                        if key in checked or not goal.prompt_id:
+                            continue
+                        checked.add(key)
+                        result = AgentBaselineService.validate_against_baseline(
+                            str(goal.prompt_id), goal.flow_id or 0)
+                        if result and not result.get('passed', True):
+                            capture_baseline_async(
+                                prompt_id=str(goal.prompt_id),
+                                flow_id=goal.flow_id or 0,
+                                trigger='intelligence_change')
+                            logger.info(
+                                f"Intelligence change detected for {key}: "
+                                f"{result.get('regressions', [])}")
+                except Exception as e:
+                    logger.debug(f"Baseline intelligence check: {e}")
+
             # Federation: aggregate learning deltas across peers every 2nd tick
             if self._tick_count % 2 == 0:
                 try:

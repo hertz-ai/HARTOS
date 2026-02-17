@@ -105,6 +105,24 @@ def init_agent_engine(app):
     except Exception as e:
         logger.debug(f"Build distribution blueprint skipped: {e}")
 
+    # Register regional host blueprint
+    try:
+        from integrations.social.api_regional_host import regional_host_bp
+        app.register_blueprint(regional_host_bp)
+        logger.info("Regional host endpoints registered")
+    except Exception as e:
+        logger.debug(f"Regional host blueprint skipped: {e}")
+
+    # Register AgentBaselineAdapter with benchmark registry
+    try:
+        from .benchmark_registry import get_benchmark_registry
+        from .agent_baseline_service import AgentBaselineAdapter
+        registry = get_benchmark_registry()
+        registry.register_benchmark(AgentBaselineAdapter())
+        logger.info("AgentBaselineAdapter registered with benchmark registry")
+    except Exception as e:
+        logger.debug(f"AgentBaselineAdapter registration skipped: {e}")
+
     # Start background daemon
     try:
         from .agent_daemon import agent_daemon

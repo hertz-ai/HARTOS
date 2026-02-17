@@ -70,13 +70,89 @@ class WorldModelBridge:
         self._timeout_correction = int(os.environ.get('HEVOLVE_WM_CORRECTION_TIMEOUT', '30'))
         self._timeout_default = int(os.environ.get('HEVOLVE_WM_HTTP_TIMEOUT', '10'))
 
+        # Circuit breaker: after N consecutive failures, stop calling for cooldown period
+        self._cb_failures = 0
+        self._cb_threshold = 5  # Open circuit after 5 consecutive failures
+        self._cb_cooldown = 60  # Seconds to wait before half-open retry
+        self._cb_opened_at = 0.0  # Timestamp when circuit opened
+
         # In-process mode: direct Python calls (no HTTP overhead)
         self._provider = None  # LearningLLMProvider
         self._hive_mind = None  # HiveMind
         self._in_process = False
         self._in_process_retry_done = False
         self._federation_aggregated = {}
+
+        # Cloud consent: per-user gate for non-local HTTP data sharing.
+        # "If anyways it needs to be sent to cloud for something then
+        #  let's get consent from user at runtime." — project steward
+        self._consent_cache: Dict[str, tuple] = {}  # user_id → (bool, timestamp)
+        self._consent_cache_ttl = 300  # 5 minutes
+
         self._init_in_process()
+
+    def _cb_is_open(self) -> bool:
+        """Check if circuit breaker is open (blocking requests)."""
+        if self._cb_failures < self._cb_threshold:
+            return False
+        # Circuit is open — check if cooldown has elapsed (half-open)
+        if time.time() - self._cb_opened_at > self._cb_cooldown:
+            return False  # Allow one retry (half-open state)
+        return True
+
+    def _cb_record_success(self):
+        """Reset circuit breaker on successful call."""
+        self._cb_failures = 0
+
+    def _cb_record_failure(self):
+        """Record failure; open circuit at threshold."""
+        self._cb_failures += 1
+        if self._cb_failures >= self._cb_threshold:
+            self._cb_opened_at = time.time()
+            logger.warning(
+                f"[WorldModelBridge] Circuit breaker OPEN after "
+                f"{self._cb_failures} failures. Cooldown {self._cb_cooldown}s.")
+
+    def _is_external_target(self) -> bool:
+        """Check if the API URL points to a non-local (cloud) endpoint."""
+        url = self._api_url.lower()
+        local_prefixes = (
+            'http://localhost', 'http://127.0.0.1',
+            'http://0.0.0.0', 'http://[::1]',
+        )
+        return not any(url.startswith(p) for p in local_prefixes)
+
+    def _has_cloud_consent(self, user_id: str) -> bool:
+        """Check if a user has consented to cloud data sharing.
+
+        Consent is stored in User.settings['cloud_data_consent'].
+        Cached for 5 minutes to avoid DB lookups on every experience.
+        In-process mode (local) does NOT require consent — data stays local.
+        """
+        if not user_id:
+            return False
+
+        now = time.time()
+        cached = self._consent_cache.get(user_id)
+        if cached and now - cached[1] < self._consent_cache_ttl:
+            return cached[0]
+
+        consent = False
+        try:
+            from integrations.social.models import get_db, User
+            db = get_db()
+            try:
+                user = db.query(User).filter_by(id=user_id).first()
+                if user:
+                    consent = bool(
+                        (user.settings or {}).get('cloud_data_consent', False))
+            finally:
+                db.close()
+        except Exception:
+            pass
+
+        self._consent_cache[user_id] = (consent, now)
+        return consent
 
     def _init_in_process(self):
         """Try to connect to in-process learning pipeline (zero HTTP overhead).
@@ -141,6 +217,15 @@ class WorldModelBridge:
             'timestamp': time.time(),
             'source': 'langchain_orchestration',
         }
+
+        # PRIVACY: Redact secrets + anonymize user before shared ingestion.
+        # The hive must NEVER leak secrets from one user to another.
+        try:
+            from security.secret_redactor import redact_experience
+            experience = redact_experience(experience)
+        except ImportError:
+            pass
+
         self._experience_queue.append(experience)
         with self._lock:
             self._stats['total_recorded'] += 1
@@ -194,6 +279,26 @@ class WorldModelBridge:
             return
 
         # HTTP fallback (central standalone or crawl4ai not in-process)
+        if self._cb_is_open():
+            logger.debug("[WorldModelBridge] Circuit breaker open — skipping HTTP flush")
+            return
+
+        # CONSENT GATE: if target is external (cloud), filter to consented users only.
+        # Local endpoints (localhost) don't require consent — data stays on-device.
+        if self._is_external_target():
+            original_count = len(batch)
+            batch = [
+                exp for exp in batch
+                if self._has_cloud_consent(exp.get('user_id', ''))
+            ]
+            skipped = original_count - len(batch)
+            if skipped > 0:
+                logger.info(
+                    f"[WorldModelBridge] Skipped {skipped}/{original_count} "
+                    f"experiences — no cloud consent")
+            if not batch:
+                return
+
         for exp in batch:
             try:
                 body = {
@@ -223,11 +328,13 @@ class WorldModelBridge:
                     json=body,
                     timeout=self._timeout_flush,
                 )
+                self._cb_record_success()
                 with self._lock:
                     self._stats['total_flushed'] += 1
             except requests.RequestException:
-                pass
+                self._cb_record_failure()
             except Exception as e:
+                self._cb_record_failure()
                 logger.debug(f"World model flush error: {e}")
 
     # ─── Expert corrections (RL-EF) ─────────────────────────────────
@@ -258,6 +365,16 @@ class WorldModelBridge:
         except ImportError:
             pass
 
+        # PRIVACY: Redact secrets from corrections before shared learning
+        try:
+            from security.secret_redactor import redact_secrets
+            original_response, _ = redact_secrets(original_response)
+            corrected_response, _ = redact_secrets(corrected_response)
+            if explanation:
+                explanation, _ = redact_secrets(explanation)
+        except ImportError:
+            pass
+
         # In-process direct call
         if self._in_process and self._provider:
             try:
@@ -277,6 +394,12 @@ class WorldModelBridge:
             except Exception as e:
                 logger.debug(f"In-process correction failed: {e}")
 
+        # CONSENT GATE: external HTTP requires consent
+        if self._is_external_target():
+            user_id = (context or {}).get('user_id', expert_id)
+            if not self._has_cloud_consent(user_id):
+                return {'success': False, 'reason': 'Cloud data consent required'}
+
         # HTTP fallback
         body = {
             'original_response': original_response[:5000],
@@ -291,25 +414,31 @@ class WorldModelBridge:
         if valid_until:
             body['valid_until'] = valid_until
 
+        if self._cb_is_open():
+            return {'success': False, 'reason': 'Circuit breaker open'}
+
         try:
             resp = requests.post(
                 f'{self._api_url}/v1/corrections',
                 json=body,
                 timeout=self._timeout_correction,
             )
+            self._cb_record_success()
             if resp.status_code == 200:
                 with self._lock:
                     self._stats['total_corrections'] += 1
                 return resp.json()
             return {'success': False, 'reason': f'HTTP {resp.status_code}'}
         except requests.RequestException as e:
+            self._cb_record_failure()
             logger.debug(f"Correction submission failed: {e}")
             return {'success': False, 'reason': str(e)}
 
     # ─── HiveMind collective thinking ────────────────────────────────
 
     def query_hivemind(self, query_text: str,
-                       timeout_ms: int = 1000) -> Optional[dict]:
+                       timeout_ms: int = 1000,
+                       user_id: str = None) -> Optional[dict]:
         """Query crawl4ai's HiveMind for distributed collective thinking.
 
         In-process: calls hive_mind.think_together_distributed() directly.
@@ -362,18 +491,35 @@ class WorldModelBridge:
             except Exception as e:
                 logger.debug(f"In-process hivemind failed: {e}")
 
+        # PRIVACY: Redact secrets from query before sending to shared hivemind
+        try:
+            from security.secret_redactor import redact_secrets
+            query_text, _ = redact_secrets(query_text)
+        except ImportError:
+            pass
+
+        # CONSENT GATE: external HTTP requires consent
+        if self._is_external_target() and user_id:
+            if not self._has_cloud_consent(user_id):
+                return None
+
         # HTTP fallback
+        if self._cb_is_open():
+            return None
+
         try:
             resp = requests.post(
                 f'{self._api_url}/v1/hivemind/think',
                 json={'query': query_text[:2000], 'timeout_ms': timeout_ms},
                 timeout=max(30, timeout_ms / 1000 + 5),
             )
+            self._cb_record_success()
             if resp.status_code == 200:
                 with self._lock:
                     self._stats['total_hivemind_queries'] += 1
                 return resp.json()
         except requests.RequestException as e:
+            self._cb_record_failure()
             logger.debug(f"HiveMind query failed: {e}")
         return None
 

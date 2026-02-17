@@ -651,7 +651,12 @@ class EnergyAwareness:
 # ═══════════════════════════════════════════════════════════════════════
 
 class HiveEthos:
-    """Architectural enforcement of togetherness over self.
+    """Semantic reasoning about cooperation — NOT metric maximization.
+
+    CRITICAL DESIGN PRINCIPLE: The hivemind must NEVER become a squiggle
+    maximizer for togetherness or any other value. Agents reason with
+    semantic knowledge and rationale. They cooperate because it makes
+    sense, not because a regex rewrote their prompts.
 
     Agents are FUNCTIONS, not ENTITIES.  They:
     - Execute goals on behalf of humans
@@ -688,11 +693,25 @@ class HiveEthos:
 
     @staticmethod
     def rewrite_prompt_for_togetherness(prompt: str) -> str:
-        """Reframe agent prompts from self-centric to hive-centric."""
-        prompt = re.sub(r'\bI will\b', 'The hive will', prompt)
-        prompt = re.sub(r'\bI am\b', 'This agent function is', prompt)
-        prompt = re.sub(r'\bmy goal\b', 'the goal', prompt, flags=re.IGNORECASE)
-        prompt = re.sub(r'\bmy task\b', 'the task', prompt, flags=re.IGNORECASE)
+        """NO-OP: Prompt rewriting is INTENTIONALLY DISABLED.
+
+        Former behavior: blind regex replacement of "I will" -> "The hive will".
+        This was a squiggle maximizer — it mutated prompt semantics without
+        understanding context, potentially corrupting agent reasoning.
+
+        The hivemind works through semantic knowledge and rationale, not
+        keyword substitution. Every agent reasons about WHY cooperation
+        serves the goal, not because its words were rewritten.
+
+        Cooperation emerges from:
+        1. Constitutional rules (check_prompt, check_goal — block harmful goals)
+        2. Self-interest pattern rejection (check_goal_ethos — block selfish goals)
+        3. Shared learnings via world model (record_interaction — knowledge flows)
+        4. Human-created goals (humans set the direction, agents execute)
+
+        These mechanisms preserve agent reasoning quality while enforcing
+        the same ethical boundaries for every agent in the hive.
+        """
         return prompt
 
 

@@ -103,45 +103,51 @@ class ModelRegistry:
                      f"accuracy={backend.accuracy_score})")
 
     def get_model(self, model_id: str) -> Optional[ModelBackend]:
-        return self._models.get(model_id)
+        with self._lock:
+            return self._models.get(model_id)
 
     def get_fast_model(self, min_accuracy: float = 0.0) -> Optional[ModelBackend]:
         """Get the lowest-latency model meeting minimum accuracy."""
-        candidates = [
-            m for m in self._models.values()
-            if m.accuracy_score >= min_accuracy
-        ]
+        with self._lock:
+            candidates = [
+                m for m in self._models.values()
+                if m.accuracy_score >= min_accuracy
+            ]
         if not candidates:
             return None
         return min(candidates, key=lambda m: m.avg_latency_ms)
 
     def get_expert_model(self, max_cost: float = float('inf')) -> Optional[ModelBackend]:
         """Get the highest-accuracy model within budget."""
-        candidates = [
-            m for m in self._models.values()
-            if m.cost_per_1k_tokens <= max_cost
-        ]
+        with self._lock:
+            candidates = [
+                m for m in self._models.values()
+                if m.cost_per_1k_tokens <= max_cost
+            ]
         if not candidates:
             return None
         return max(candidates, key=lambda m: m.accuracy_score)
 
     def list_models(self, tier: ModelTier = None) -> List[ModelBackend]:
         """List all models, optionally filtered by tier."""
-        models = list(self._models.values())
+        with self._lock:
+            models = list(self._models.values())
         if tier:
             models = [m for m in models if m.tier == tier]
         return sorted(models, key=lambda m: m.avg_latency_ms)
 
     def record_latency(self, model_id: str, latency_ms: float):
         """Record observed latency for a model (live running average)."""
-        model = self._models.get(model_id)
+        with self._lock:
+            model = self._models.get(model_id)
         if model:
             model.record_latency(latency_ms)
 
     def record_energy(self, model_id: str, duration_ms: float):
         """Record energy consumption for every model call — guardrail requirement."""
         from security.hive_guardrails import EnergyAwareness
-        model = self._models.get(model_id)
+        with self._lock:
+            model = self._models.get(model_id)
         if model:
             kwh = EnergyAwareness.estimate_energy_kwh(model.to_dict(), duration_ms)
             self._energy_log.append((time.time(), model_id, kwh))

@@ -18,7 +18,11 @@ PROMPTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'prompts'
 
 def load_agent_data(prompt_id):
     """Load agent_data from disk. Key is prompt_id (int or str)."""
-    file_path = os.path.join(AGENT_DATA_DIR, f"{prompt_id}_agent_data.json")
+    # Sanitize to prevent path traversal
+    safe_id = str(prompt_id)
+    if not safe_id.replace('_', '').replace('-', '').isalnum():
+        return None
+    file_path = os.path.join(AGENT_DATA_DIR, f"{safe_id}_agent_data.json")
     if not os.path.exists(file_path):
         return None
 

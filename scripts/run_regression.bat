@@ -52,7 +52,7 @@ chcp 65001 >nul 2>&1
 
 REM ===== DEFINE TEST GROUPS =====
 
-REM Group 1: P2P Network, Security, Agent Engine (~722 tests)
+REM Group 1: P2P Network, Security, Agent Engine (~800+ tests)
 set P2P_SECURITY_TESTS=^
     tests/test_hierarchy_system.py ^
     tests/test_integrity_system.py ^
@@ -65,7 +65,10 @@ set P2P_SECURITY_TESTS=^
     tests/test_node_watchdog.py ^
     tests/test_auto_discovery.py ^
     tests/test_agent_dashboard.py ^
-    tests/test_mode_aware_inference.py
+    tests/test_mode_aware_inference.py ^
+    tests/test_system_requirements.py ^
+    tests/test_commercial_ip_builds.py ^
+    tests/test_federation_upgrade.py
 
 REM Group 2: Social Platform (~148 tests)
 set SOCIAL_TESTS=^
@@ -104,7 +107,7 @@ set CHANNEL_E2E_TESTS=^
     integrations/channels/tests/test_gateway_protocol.py ^
     integrations/channels/tests/test_metrics_collector.py
 
-REM Group 6: Agent and Recipe Pipeline (~200 tests)
+REM Group 6: Agent and Recipe Pipeline (~230+ tests)
 set AGENT_RECIPE_TESTS=^
     tests/test_agent_creation.py ^
     tests/test_recipe_generation.py ^
@@ -116,7 +119,9 @@ set AGENT_RECIPE_TESTS=^
     tests/test_dynamic_agents.py ^
     tests/test_nested_tasks_direct.py ^
     tests/test_complete_integration.py ^
-    tests/test_complete_e2e_integration.py
+    tests/test_complete_e2e_integration.py ^
+    tests/test_e2e_pipelines.py ^
+    tests/test_recipe_experience_healing.py
 
 REM Group 7: Session and Messaging (~90 tests)
 set SESSION_TESTS=^
@@ -126,7 +131,7 @@ set SESSION_TESTS=^
     tests/test_preferences.py ^
     tests/test_builtin_commands.py
 
-REM Group 8: Tools and AI (~250 tests)
+REM Group 8: Tools and AI (~320+ tests)
 set TOOLS_AI_TESTS=^
     tests/test_vlm_agent.py ^
     tests/test_shell_execution.py ^
@@ -136,7 +141,8 @@ set TOOLS_AI_TESTS=^
     tests/test_embeddings.py ^
     tests/test_memory_search.py ^
     tests/test_image_gen.py ^
-    tests/test_tts.py
+    tests/test_tts.py ^
+    tests/test_runtime_tools.py
 
 REM Group 9: Core, Performance, and Concurrency (~150 tests)
 set CORE_PERF_TESTS=^

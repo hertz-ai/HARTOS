@@ -722,6 +722,12 @@ class NotificationService:
         )
         db.add(notif)
         db.flush()
+        # Push to SSE + WAMP in real-time (fire-and-forget)
+        try:
+            from .realtime import on_notification
+            on_notification(user_id, notif.to_dict())
+        except Exception:
+            pass
         return notif
 
     @staticmethod

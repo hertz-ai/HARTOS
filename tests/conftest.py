@@ -53,6 +53,12 @@ from lifecycle_hooks import (
 from helper import Action
 
 
+def pytest_configure(config):
+    """Register custom markers for optional dependencies."""
+    config.addinivalue_line("markers", "requires_pyautogui: test needs pyautogui")
+    config.addinivalue_line("markers", "requires_telegram: test needs python-telegram-bot")
+
+
 @pytest.fixture(autouse=True)
 def reset_state_machine():
     """Reset state machine before each test.

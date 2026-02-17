@@ -51,6 +51,8 @@ export HEVOLVE_LLM_ENDPOINT_URL="${LLM_HOST}"
 export HEVOLVE_LLM_MODEL_NAME="${LLM_MODEL}"
 export HEVOLVE_LLM_API_KEY="${LLM_KEY}"
 export HEVOLVE_AGENT_ENGINE_ENABLED=true
+# Diarization: auto-started as sidecar. Set URL only to override with external service.
+# export HEVOLVE_DIARIZATION_URL="ws://external-host:8004"
 
 echo "[MODE]   HEVOLVE_NODE_TIER=regional"
 echo "[LLM]    Endpoint: ${LLM_HOST}"

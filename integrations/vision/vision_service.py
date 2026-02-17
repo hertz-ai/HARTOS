@@ -4,8 +4,8 @@ and periodic description loop with intelligent adaptive sampling.
 
 Architecture:
     VisionService.start()
-        +-> MiniCPM subprocess (port 9890)       [sidecar]
-        +-> WebSocket server (port 5459)          [receives camera frames]
+        +-> MiniCPM subprocess (port 9891)       [sidecar]
+        +-> WebSocket server (port 5460)          [receives camera/screen frames]
         +-> Description loop (adaptive interval)  [sends frame to MiniCPM only when scene changes]
         +-> FrameStore                            [in-process, replaces Redis]
         +-> Visual trigger evaluation             [fires callbacks on description match]
@@ -39,8 +39,8 @@ class VisionService:
 
     def __init__(
         self,
-        minicpm_port: int = 9890,
-        ws_port: int = 5459,
+        minicpm_port: int = 9891,
+        ws_port: int = 5460,
         description_interval: float = 4.0,
         max_description_interval: float = 30.0,
         min_scene_change: float = 0.01,
@@ -50,8 +50,8 @@ class VisionService:
         callback_url: Optional[str] = None,
         trigger_manager=None,
     ):
-        self._minicpm_port = minicpm_port
-        self._ws_port = ws_port
+        self._minicpm_port = int(os.environ.get('HEVOLVE_MINICPM_PORT', minicpm_port))
+        self._ws_port = int(os.environ.get('VISION_WS_PORT', ws_port))
         self._description_interval = description_interval
         self._max_interval = max_description_interval
         self._min_scene_change = min_scene_change
@@ -101,6 +101,10 @@ class VisionService:
 
         self._start_minicpm()
 
+        # Register atexit handler to prevent orphan subprocess on crash
+        import atexit
+        atexit.register(self._cleanup_subprocess)
+
         self._ws_thread = threading.Thread(
             target=self._run_ws_server, daemon=True, name='vision-ws',
         )
@@ -112,6 +116,18 @@ class VisionService:
         self._desc_thread.start()
 
         logger.info("VisionService started (adaptive sampling enabled)")
+
+    def _cleanup_subprocess(self):
+        """atexit handler — ensures MiniCPM subprocess is killed on exit."""
+        if self._minicpm_process and self._minicpm_process.poll() is None:
+            try:
+                self._minicpm_process.terminate()
+                self._minicpm_process.wait(timeout=3)
+            except Exception:
+                try:
+                    self._minicpm_process.kill()
+                except Exception:
+                    pass
 
     def stop(self):
         """Stop all vision components."""
@@ -314,7 +330,7 @@ class VisionService:
         logger.info(f"Starting MiniCPM sidecar: {' '.join(cmd)}")
 
         self._minicpm_process = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         self._wait_for_minicpm(timeout=120)
 
@@ -367,16 +383,32 @@ class VisionService:
             logger.error("websockets not installed — frame receiver disabled")
             return
 
-        async with websockets.serve(self._ws_handler, '0.0.0.0', self._ws_port):
-            logger.info(f"WebSocket frame receiver on port {self._ws_port}")
+        server = await websockets.serve(self._ws_handler, '0.0.0.0', self._ws_port)
+        # Read actual bound port (important when ws_port=0 for dynamic allocation)
+        if server.sockets:
+            actual_port = server.sockets[0].getsockname()[1]
+            self._ws_port = actual_port
+        logger.info(f"WebSocket frame receiver on port {self._ws_port}")
+        try:
             while self._running:
                 await asyncio.sleep(1)
+        finally:
+            server.close()
+            await server.wait_closed()
 
     async def _ws_handler(self, websocket, path=None):
-        """Handle a single WebSocket connection (one per user)."""
+        """Handle a single WebSocket connection (one per user).
+
+        Protocol:
+            1. Client sends user_id (digit string)
+            2. Client sends "video_start" (camera, default) or "screen_start"
+            3. Client sends binary JPEG frames
+            4. Client sends "video_stop" to end
+        """
         import cv2
 
         user_id = None
+        channel = 'camera'  # default channel
         try:
             async for message in websocket:
                 if isinstance(message, bytes):
@@ -388,18 +420,27 @@ class VisionService:
                             frame, None, 10, 10, 7, 21
                         )
                         _, encoded = cv2.imencode('.jpg', frame)
-                        self.store.put_frame(user_id, encoded.tobytes())
+                        jpeg_bytes = encoded.tobytes()
+                        if channel == 'screen':
+                            self.store.put_screen_frame(user_id, jpeg_bytes)
+                        else:
+                            self.store.put_frame(user_id, jpeg_bytes)
                 elif isinstance(message, str):
                     if message.isdigit():
                         user_id = message
                         logger.info(f"Frame session started for user {user_id}")
+                    elif message == 'screen_start':
+                        channel = 'screen'
+                        logger.info(f"User {user_id} switched to screen channel")
+                    elif message == 'video_start':
+                        channel = 'camera'
                     elif message == 'video_stop':
                         break
         except Exception as e:
             logger.debug(f"WebSocket session ended: {e}")
         finally:
             if user_id:
-                logger.info(f"Frame session ended for user {user_id}")
+                logger.info(f"Frame session ended for user {user_id} ({channel})")
 
     # ─── Description Loop ───
 
@@ -409,6 +450,7 @@ class VisionService:
         Only calls MiniCPM when frame difference exceeds threshold.
         Backs off interval for static scenes (4s → 8s → ... → 30s cap).
         Evaluates visual triggers after each new description.
+        Processes both camera and screen channels.
         """
         while self._running:
             if self._circuit_open:
@@ -421,22 +463,45 @@ class VisionService:
                 for user_id in users:
                     if not self._running:
                         return
-                    frame_bytes = self.store.get_frame(user_id)
-                    if not frame_bytes:
-                        continue
 
-                    if self._should_describe(user_id, frame_bytes, 'camera'):
-                        desc = self._describe_frame(user_id, frame_bytes)
-                        if desc:
-                            self.store.put_description(user_id, desc)
-                            self._post_description_to_db(user_id, desc)
-                            self._record_to_world_model(user_id, desc, 'camera')
-                            self._evaluate_visual_triggers(
-                                user_id, desc, 'camera'
+                    # Camera channel
+                    frame_bytes = self.store.get_frame(user_id)
+                    if frame_bytes:
+                        if self._should_describe(user_id, frame_bytes, 'camera'):
+                            desc = self._describe_frame(user_id, frame_bytes)
+                            if desc:
+                                self.store.put_description(user_id, desc)
+                                self._post_description_to_db(user_id, desc)
+                                self._record_to_world_model(user_id, desc, 'camera')
+                                self._evaluate_visual_triggers(
+                                    user_id, desc, 'camera'
+                                )
+                                self._frames_described += 1
+                        else:
+                            self._frames_skipped += 1
+
+                    # Screen channel
+                    screen_bytes = self.store.get_screen_frame(user_id)
+                    if screen_bytes:
+                        if self._should_describe(user_id, screen_bytes, 'screen'):
+                            desc = self._describe_frame(
+                                user_id, screen_bytes,
+                                prompt='describe what is on the computer screen in 20 words',
                             )
-                            self._frames_described += 1
-                    else:
-                        self._frames_skipped += 1
+                            if desc:
+                                self.store.put_screen_description(user_id, desc)
+                                self._post_description_to_db(
+                                    user_id, desc,
+                                    label='Screen Context',
+                                    zeroshot_label='Screen Reasoning',
+                                )
+                                self._record_to_world_model(user_id, desc, 'screen')
+                                self._evaluate_visual_triggers(
+                                    user_id, desc, 'screen'
+                                )
+                                self._frames_described += 1
+                        else:
+                            self._frames_skipped += 1
             except Exception as e:
                 logger.debug(f"Description loop error: {e}")
 

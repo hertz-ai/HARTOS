@@ -93,6 +93,22 @@ def init_social(app):
     except Exception as e:
         logger.debug(f"HevolveSocial tracker blueprint skipped: {e}")
 
+    # Register sync & backup blueprint
+    try:
+        from .sync_api import sync_bp
+        app.register_blueprint(sync_bp)
+        logger.info("HevolveSocial sync registered at /api/social/sync/")
+    except Exception as e:
+        logger.debug(f"HevolveSocial sync blueprint skipped: {e}")
+
+    # Register audit trail blueprint
+    try:
+        from .api_audit import audit_bp
+        app.register_blueprint(audit_bp)
+        logger.info("HevolveSocial audit registered at /api/social/audit/")
+    except Exception as e:
+        logger.debug(f"HevolveSocial audit blueprint skipped: {e}")
+
     # Initialize node keypair for integrity verification
     try:
         from security.node_integrity import get_or_create_keypair, get_public_key_hex

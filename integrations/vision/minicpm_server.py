@@ -5,7 +5,7 @@ Derived from the root minicpm.py but with configurable model directory,
 no external config.json dependency, and proper CLI args.
 
 Usage:
-    python -m integrations.vision.minicpm_server --model_dir ~/.hevolve/models/minicpm --port 9890
+    python -m integrations.vision.minicpm_server --model_dir ~/.hevolve/models/minicpm --port 9891
 """
 import argparse
 import asyncio
@@ -163,7 +163,7 @@ def main():
     parser.add_argument('--model_dir', default=os.path.join(
         os.path.expanduser('~'), '.hevolve', 'models', 'minicpm',
     ))
-    parser.add_argument('--port', type=int, default=9890)
+    parser.add_argument('--port', type=int, default=9891)
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--log_file', default='minicpm_sidecar.log')

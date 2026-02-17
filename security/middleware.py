@@ -53,13 +53,20 @@ def _apply_security_headers(app: Flask):
 
 
 def _apply_cors(app: Flask):
-    """CORS with explicit origin allowlist."""
+    """CORS with explicit origin allowlist.
 
+    If CORS_ORIGINS is not set, no origins are allowed (fail-closed).
+    Set CORS_ORIGINS=* for development only.
+    """
+    raw_origins = os.environ.get('CORS_ORIGINS', '')
     allowed_origins = set(
-        o.strip() for o in
-        os.environ.get('CORS_ORIGINS', '').split(',')
+        o.strip() for o in raw_origins.split(',')
         if o.strip()
     )
+    if not allowed_origins:
+        logger.warning(
+            "CORS_ORIGINS not configured — no cross-origin requests allowed. "
+            "Set CORS_ORIGINS env var for production (comma-separated origins).")
 
     @app.after_request
     def add_cors_headers(response):

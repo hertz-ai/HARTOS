@@ -6,13 +6,14 @@ Default port: 11235
 Deployment: docker run -d -p 11235:11235 --shm-size=1g unclecode/crawl4ai:latest
 """
 
+import os
 from .registry import ServiceToolInfo, service_tool_registry
 
 
 class Crawl4AITool:
     """Thin wrapper to register Crawl4AI with the ServiceToolRegistry."""
 
-    DEFAULT_URL = "http://localhost:11235"
+    DEFAULT_URL = os.environ.get('CRAWL4AI_URL', "http://localhost:11235")
 
     @classmethod
     def create_tool_info(cls, base_url: str = None) -> ServiceToolInfo:

@@ -65,14 +65,15 @@ async def fetch(session, url):
 
 
 async def async_main(urls):
-    async with aiohttp.ClientSession() as session:
+    timeout = aiohttp.ClientTimeout(total=30, connect=5)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
         tasks = [fetch(session, url) for url in urls]
         return await asyncio.gather(*tasks)
 
 
 
 # Configuration for Crawl4AI API service
-CRAWL4AI_API_URL = "http://localhost:8094"  # Update this to your actual service URL
+CRAWL4AI_API_URL = os.environ.get('CRAWL4AI_API_URL', 'http://localhost:8094')
 
 # --- Path traversal protection for prompt file access ---
 PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
@@ -1465,7 +1466,28 @@ def txt2img(text: Annotated[str, "Text to create image"]) -> str:
 
 
 def get_frame(user_id):
+    """Get latest camera frame — FrameStore first, Redis fallback."""
     current_app.logger.info('inside get_frame')
+
+    # Primary: FrameStore (in-process, zero latency)
+    try:
+        from langchain_gpt_api import get_vision_service
+        svc = get_vision_service()
+        if svc:
+            frame_bytes = svc.store.get_frame(str(user_id))
+            if frame_bytes is not None:
+                import cv2
+                frame = cv2.imdecode(
+                    np.frombuffer(frame_bytes, np.uint8), cv2.IMREAD_COLOR,
+                )
+                if frame is not None:
+                    current_app.logger.info(
+                        f"Frame for user_id {user_id} from FrameStore")
+                    return frame[:, :, ::-1]  # BGR → RGB
+    except Exception:
+        pass
+
+    # Fallback: Redis (legacy path)
     serialized_frame = redis_client.get(user_id)
     current_app.logger.info('after redis client')
     try:
@@ -1473,7 +1495,7 @@ def get_frame(user_id):
             from security.safe_deserialize import safe_load_frame
             frame_bgr = safe_load_frame(serialized_frame)
             current_app.logger.info(
-                f"Frame for user_id {user_id} retrieved successfully.")
+                f"Frame for user_id {user_id} from Redis")
             frame = frame_bgr[:, :, ::-1]
             return frame
         else:

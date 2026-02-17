@@ -389,6 +389,15 @@ try:
 except Exception as e:
     app.logger.warning(f"HevolveSocial init skipped (non-critical): {e}")
 
+try:
+    from integrations.distributed_agent import distributed_agent_bp
+    app.register_blueprint(distributed_agent_bp)
+    app.logger.info("distributed_agent_bp registered at /api/distributed")
+except ImportError:
+    app.logger.info("distributed_agent module not available, skipping")
+except Exception as e:
+    app.logger.warning(f"distributed_agent init skipped: {e}")
+
 # ============================================================================
 # Google A2A Protocol Initialization
 # ============================================================================
@@ -629,6 +638,157 @@ def get_hive_mind():
 threading.Thread(
     target=_init_learning_pipeline, daemon=True,
     name='embodied_ai_init').start()
+
+
+# ============================================================================
+# Vision Pipeline (VisionService — MiniCPM sidecar + FrameStore)
+# ============================================================================
+_vision_service = None
+
+
+def _init_vision_service():
+    """Start VisionService in standalone mode only.
+
+    In bundled mode (Nunba), Nunba owns the VisionService lifecycle
+    and stores it at ``__main__._vision_service``.  We skip here to
+    prevent double-start.
+    """
+    global _vision_service
+    if _is_bundled():
+        logging.getLogger(__name__).info(
+            "[Vision] Bundled mode — Nunba owns VisionService lifecycle")
+        return
+
+    try:
+        from integrations.vision import VisionService
+        _vision_service = VisionService()
+        _vision_service.start()
+        logging.getLogger(__name__).info(
+            "[Vision] VisionService started (standalone mode)")
+    except ImportError:
+        logging.getLogger(__name__).info(
+            "[Vision] vision module not available — disabled")
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            f"[Vision] VisionService failed to start: {e}")
+
+
+def get_vision_service():
+    """Get the active VisionService instance.
+
+    Checks module-level var first, then falls back to Nunba's
+    ``__main__._vision_service`` for bundled mode.
+    """
+    if _vision_service is not None:
+        return _vision_service
+    # Bundled mode: Nunba stores it on __main__
+    main_mod = sys.modules.get('__main__')
+    if main_mod:
+        return getattr(main_mod, '_vision_service', None)
+    return None
+
+
+def get_frame_store():
+    """Get the active FrameStore (from VisionService)."""
+    svc = get_vision_service()
+    return svc.store if svc else None
+
+
+def _wire_vision_to_learning():
+    """Connect FrameStore to crawl4ai's video learning pipeline.
+
+    Waits up to 60s for both VisionService and LearningLLMProvider,
+    then calls start_video_learning().
+    """
+    _logger = logging.getLogger(__name__)
+    for _ in range(60):
+        svc = get_vision_service()
+        if svc and _learning_provider:
+            break
+        time.sleep(1)
+    else:
+        _logger.info(
+            "[Wiring] Vision or learning not ready after 60s — skipping")
+        return
+
+    try:
+        if hasattr(_learning_provider, 'start_video_learning'):
+            _learning_provider.start_video_learning(
+                frame_store=svc.store,
+                frame_store_user_id='default',
+            )
+            _logger.info(
+                "[Wiring] FrameStore → crawl4ai video learning connected")
+        else:
+            _logger.info(
+                "[Wiring] LearningProvider has no start_video_learning — skip")
+    except Exception as e:
+        _logger.warning(f"[Wiring] FrameStore→learning failed: {e}")
+
+
+# Boot vision pipeline in background
+threading.Thread(
+    target=_init_vision_service, daemon=True,
+    name='vision_init').start()
+
+# Wire FrameStore to crawl4ai after both subsystems are ready
+threading.Thread(
+    target=_wire_vision_to_learning, daemon=True,
+    name='vision_learning_wire').start()
+
+
+# ============================================================================
+# Speaker Diarization Pipeline (sidecar subprocess)
+# ============================================================================
+_diarization_service = None
+
+
+def _init_diarization_service():
+    """Start DiarizationService in standalone mode only.
+
+    In bundled mode (Nunba), Nunba owns the lifecycle.
+    Skips if HEVOLVE_DIARIZATION_URL is already set (external service).
+    """
+    global _diarization_service
+    if _is_bundled():
+        logging.getLogger(__name__).info(
+            "[Diarization] Bundled mode — Nunba owns lifecycle")
+        return
+
+    # If user already configured an external diarization URL, don't start sidecar
+    if os.environ.get('HEVOLVE_DIARIZATION_URL', '').strip():
+        logging.getLogger(__name__).info(
+            "[Diarization] External URL configured — skipping sidecar")
+        return
+
+    try:
+        from integrations.audio import DiarizationService
+        _diarization_service = DiarizationService()
+        _diarization_service.start()
+        logging.getLogger(__name__).info(
+            "[Diarization] DiarizationService starting (standalone mode)")
+    except ImportError:
+        logging.getLogger(__name__).info(
+            "[Diarization] audio module not available — disabled")
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            f"[Diarization] DiarizationService failed to start: {e}")
+
+
+def get_diarization_service():
+    """Get the active DiarizationService instance."""
+    if _diarization_service is not None:
+        return _diarization_service
+    main_mod = sys.modules.get('__main__')
+    if main_mod:
+        return getattr(main_mod, '_diarization_service', None)
+    return None
+
+
+# Boot diarization sidecar in background
+threading.Thread(
+    target=_init_diarization_service, daemon=True,
+    name='diarization_init').start()
 
 # task scheduling and logging
 
@@ -2026,14 +2186,29 @@ redis_client = redis.StrictRedis(
 
 
 def get_frame(user_id):
-    serialized_frame = redis_client.get(user_id)
+    """Get latest camera frame — FrameStore first, Redis fallback."""
+    # Primary: FrameStore (in-process, zero latency)
+    svc = get_vision_service()
+    if svc:
+        frame_bytes = svc.store.get_frame(str(user_id))
+        if frame_bytes is not None:
+            import cv2
+            frame = cv2.imdecode(
+                np.frombuffer(frame_bytes, np.uint8), cv2.IMREAD_COLOR,
+            )
+            if frame is not None:
+                app.logger.info(
+                    f"Frame for user_id {user_id} from FrameStore")
+                return frame[:, :, ::-1]  # BGR → RGB
 
+    # Fallback: Redis (legacy path)
+    serialized_frame = redis_client.get(user_id)
     try:
         if serialized_frame is not None:
             from security.safe_deserialize import safe_load_frame
             frame_bgr = safe_load_frame(serialized_frame)
             app.logger.info(
-                f"Frame for user_id {user_id} retrieved successfully.")
+                f"Frame for user_id {user_id} from Redis")
             frame = frame_bgr[:, :, ::-1]
             return frame
         else:
@@ -2061,22 +2236,41 @@ def parse_visual_context(inp: str):
         image = Image.fromarray(frame)
         # Save the image
         image.save(image_path)
+
+        prompt_text = f'Instruction: Respond in second person point of view\ninput:-{inp}'
+
+        # Tier 1: Try local MiniCPM sidecar (port 9890) — zero latency, no cloud
+        local_minicpm_port = int(os.environ.get('MINICPM_PORT', 9890))
+        try:
+            with open(image_path, 'rb') as f:
+                r = requests.post(
+                    f'http://localhost:{local_minicpm_port}/describe',
+                    data=f.read(),
+                    params={'prompt': prompt_text},
+                    headers={'Content-Type': 'application/octet-stream'},
+                    timeout=10,
+                )
+                if r.status_code == 200:
+                    result = r.json().get('result', r.text)
+                    app.logger.info(f'Visual context from local MiniCPM: {result[:100]}')
+                    return result
+        except Exception as e:
+            app.logger.debug(f"Local MiniCPM sidecar unavailable, falling back to cloud: {e}")
+
+        # Tier 2: Cloud MiniCPM fallback
         url = "http://azurekong.hertzai.com:8000/minicpm/upload"
-        payload = {
-            'prompt': f'Instruction: Respond in second person point of view\ninput:-{inp}'}
+        payload = {'prompt': prompt_text}
         files = [
             ('file', ('call.jpg', open(image_path, 'rb'), 'image/jpeg'))
         ]
-        headers = {}
         try:
-            response = pooled_post(
-                url, headers=headers, data=payload, files=files)
+            response = pooled_post(url, headers={}, data=payload, files=files)
             app.logger.info(response.text)
-            response = response.text
-
-            return response
+            return response.text
         except Exception as e:
-            app.logger.error('Got error in visal QA')
+            app.logger.error('Got error in visual QA (cloud fallback)')
+
+    return "No visual context available — camera not active."
 
 
 def parse_user_id(inp: str):
@@ -2587,6 +2781,21 @@ def _autonomous_gather_info(user_id, description, prompt_id):
                 with open(name, 'w') as f:
                     json.dump(parsed, f)
                 app.logger.info(f'Autonomous agent config saved to {name}')
+                # Sync to cloud DB so prompt_id matches
+                try:
+                    pooled_post(
+                        f'{DB_URL}/createpromptlist',
+                        json={'listprompts': [{
+                            'prompt_id': prompt_id,
+                            'prompt': parsed.get('goal', ''),
+                            'user_id': user_id,
+                            'name': parsed.get('name', ''),
+                            'is_active': True,
+                            'image_url': parsed.get('image_url', ''),
+                        }]},
+                        timeout=5)
+                except Exception as e:
+                    app.logger.debug(f"Cloud sync failed (non-fatal): {e}")
                 return 'Agent details gathered autonomously. Moving to review.'
         except (json.JSONDecodeError, AttributeError, Exception) as e:
             app.logger.debug(f'Autonomous gather iteration {iteration}: {e}')
@@ -2707,6 +2916,10 @@ def chat():
                 conversation_agent[user_id] = True
 
     if create_agent:
+        # Generate prompt_id server-side if not provided
+        if not prompt_id:
+            prompt_id = _next_prompt_id()
+            app.logger.info(f'Generated server-side prompt_id={prompt_id} for new agent')
         # Phase 1: Gather Requirements
         if user_id not in review_agents.keys() or review_agents[user_id] == False:
             review_agents[user_id] = False
@@ -2727,7 +2940,7 @@ def chat():
                 review_agents[user_id] = True
                 conversation_agent[user_id] = False
                 _record_lifecycle('Review Mode', user_id, prompt_id, f'Autonomous creation via dispatch: {prompt[:100]}')
-                return jsonify({'response': auto_response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [], 'Agent_status': 'Review Mode', 'autonomous_creation': True})
+                return jsonify({'response': auto_response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [], 'Agent_status': 'Review Mode', 'autonomous_creation': True, 'prompt_id': prompt_id})
             from gather_agentdetails import gather_info
             response = gather_info(user_id,prompt,prompt_id)
             new_response = response.replace('true','True').replace("false", "False")
@@ -2753,7 +2966,7 @@ def chat():
                     app.logger.info('PENDING STATUS')
                     ans = new_res['question'] if 'question' in new_res else new_res['review_details']
                     _record_lifecycle('Creation Mode', user_id, prompt_id, 'Agent creation started via gather_info')
-                    return jsonify({'response': ans, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Creation Mode'})
+                    return jsonify({'response': ans, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Creation Mode', 'prompt_id': prompt_id})
                 else:
                     app.logger.info('COMPLETED STATUS')
                     new_res['prompt_id'] = prompt_id
@@ -2765,9 +2978,24 @@ def chat():
                     with open(name, "w") as json_file:
                         json.dump(new_res, json_file)
                     app.logger.info(f"Dictionary saved to {name}")
+                    # Sync to cloud DB so prompt_id matches
+                    try:
+                        pooled_post(
+                            f'{DB_URL}/createpromptlist',
+                            json={'listprompts': [{
+                                'prompt_id': prompt_id,
+                                'prompt': new_res.get('goal', ''),
+                                'user_id': user_id,
+                                'name': new_res.get('name', ''),
+                                'is_active': True,
+                                'image_url': new_res.get('image_url', ''),
+                            }]},
+                            timeout=5)
+                    except Exception as e:
+                        app.logger.debug(f"Cloud sync failed (non-fatal): {e}")
                     review_agents[user_id] = True
                     _record_lifecycle('Review Mode', user_id, prompt_id, 'Agent details gathered, entering review')
-                    return jsonify({'response': 'Got Agent details successfully lets move on to review them one at a time', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Review Mode'})
+                    return jsonify({'response': 'Got Agent details successfully lets move on to review them one at a time', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Review Mode', 'prompt_id': prompt_id})
             except Exception as e:
                 app.logger.error('GOT some error while eval and returning the response')
                 app.logger.error(e)
@@ -2813,7 +3041,7 @@ def chat():
                 is_auto = signal.get('autonomous', False)
                 app.logger.info(f'Autogen create_new_agent tool fired: desc="{agent_desc}", autonomous={is_auto}')
 
-                new_prompt_id = int(time.time())
+                new_prompt_id = _next_prompt_id()
                 if is_auto:
                     # Autonomous: run gather_info with LLM-generated answers
                     auto_response = _autonomous_gather_info(user_id, agent_desc, new_prompt_id)
@@ -2915,7 +3143,7 @@ def chat():
     if thread_local_data.get_creation_requested():
         agent_description = thread_local_data.get_creation_description()
         is_autonomous = thread_local_data.get_creation_autonomous()
-        new_prompt_id = int(time.time())
+        new_prompt_id = _next_prompt_id()
         thread_local_data.clear_creation_flags()
         app.logger.info(f'LLM Create_Agent tool fired: desc="{agent_description}", autonomous={is_autonomous}')
 
@@ -3220,6 +3448,28 @@ def get_public_prompts():
     return jsonify(prompts)
 
 
+_prompt_id_lock = threading.Lock()
+
+
+def _next_prompt_id():
+    """Generate a globally-unique prompt_id.
+
+    Uses millisecond timestamp so IDs are unique across nodes in the
+    federation (no central coordinator needed).  A local collision check
+    ensures two agents created on the same node within the same
+    millisecond still get distinct IDs.
+
+    Thread-safe via lock.
+    """
+    with _prompt_id_lock:
+        prompts_dir = os.path.join(os.path.dirname(__file__), 'prompts')
+        pid = int(time.time() * 1000)
+        if os.path.isdir(prompts_dir):
+            while os.path.exists(os.path.join(prompts_dir, f'{pid}.json')):
+                pid += 1
+        return pid
+
+
 @app.route('/prompts', methods=['POST'])
 def create_prompts():
     """Create/update prompts. Saves locally AND syncs to cloud DB."""
@@ -3230,10 +3480,7 @@ def create_prompts():
     for item in listprompts:
         pid = item.get('prompt_id')
         if not pid:
-            # Auto-assign prompt_id from existing files
-            existing = [f.replace('.json', '') for f in os.listdir('prompts')
-                        if f.endswith('.json') and '_' not in f and f[0].isdigit()]
-            pid = max([int(x) for x in existing if x.isdigit()] or [0]) + 1
+            pid = _next_prompt_id()
             item['prompt_id'] = pid
 
         # Save locally

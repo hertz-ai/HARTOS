@@ -161,6 +161,18 @@ class TestChannelRegistry:
         assert status["channel2"] == ChannelStatus.DISCONNECTED
 
 
+_HAS_TELEGRAM = False
+try:
+    import telegram  # noqa: F401
+    _HAS_TELEGRAM = True
+except ImportError:
+    pass
+
+
+@pytest.mark.skipif(
+    not _HAS_TELEGRAM,
+    reason="python-telegram-bot not installed"
+)
 class TestTelegramAdapter:
     """Tests for TelegramAdapter."""
 

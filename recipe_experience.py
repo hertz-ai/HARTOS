@@ -224,6 +224,17 @@ class RecipeExperienceRecorder:
                 json.dump(recipe, f, indent=2)
             os.replace(tmp_path, recipe_path)
             logger.info(f"Experience merged into {recipe_path}")
+
+            # Capture baseline snapshot on recipe change
+            try:
+                from integrations.agent_engine.agent_baseline_service import (
+                    capture_baseline_async)
+                capture_baseline_async(
+                    prompt_id=str(prompt_id), flow_id=flow,
+                    trigger='recipe_change', user_prompt=user_prompt)
+            except Exception:
+                pass
+
         except Exception as e:
             logger.error(f"Failed to write experience to recipe: {e}")
             # Clean up tmp file on failure

@@ -8,7 +8,7 @@ from .models import get_engine, Base
 
 logger = logging.getLogger('hevolve_social')
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 25
 
 
 def get_schema_version(engine) -> int:
@@ -434,3 +434,30 @@ def run_migrations():
                      APIUsageLog.__table__, BuildLicense.__table__]:
             tbl.create(engine, checkfirst=True)
         set_schema_version(engine, 22)
+
+    if current < 23:
+        logger.info("HevolveSocial: migrating to v23 (Fail2ban: ban_count + ban_until on PeerNode)")
+        with engine.connect() as conn:
+            for stmt in [
+                "ALTER TABLE peer_nodes ADD COLUMN ban_count INTEGER DEFAULT 0",
+                "ALTER TABLE peer_nodes ADD COLUMN ban_until DATETIME",
+            ]:
+                try:
+                    conn.execute(text(stmt))
+                except Exception:
+                    pass  # Column may already exist
+            conn.commit()
+        set_schema_version(engine, 23)
+
+    if current < 24:
+        logger.info("HevolveSocial: migrating to v24 (Guest Recovery + Device Bindings + Backup Metadata)")
+        from .models import GuestRecovery, DeviceBinding, BackupMetadata
+        for tbl in [GuestRecovery.__table__, DeviceBinding.__table__, BackupMetadata.__table__]:
+            tbl.create(engine, checkfirst=True)
+        set_schema_version(engine, 24)
+
+    if current < 25:
+        logger.info("HevolveSocial: migrating to v25 (Regional Host Requests)")
+        from .models import RegionalHostRequest
+        RegionalHostRequest.__table__.create(engine, checkfirst=True)
+        set_schema_version(engine, 25)

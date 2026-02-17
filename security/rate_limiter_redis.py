@@ -47,7 +47,11 @@ class RedisRateLimiter:
                 'REDIS_RATE_LIMIT_URL',
                 os.environ.get('REDIS_URL', 'redis://localhost:6379/1')
             )
-            self._redis = redis.from_url(redis_url, decode_responses=True)
+            self._redis = redis.from_url(
+                redis_url, decode_responses=True,
+                socket_timeout=3, socket_connect_timeout=2,
+                socket_keepalive=True, retry_on_timeout=True,
+            )
             self._redis.ping()
             logger.info("Redis rate limiter connected")
         except Exception as e:
@@ -93,8 +97,9 @@ class RedisRateLimiter:
             current_count = results[1]
             return current_count < max_requests
         except Exception as e:
-            logger.debug(f"Redis rate limit check failed: {e}")
-            return True  # Allow on Redis error
+            logger.warning(f"Redis rate limit check failed, falling back to memory: {e}")
+            # Fail-closed: fall back to in-memory limiter, NOT open allow
+            return self._check_memory(key, max_requests, window)
 
     def _check_memory(self, key: str, max_requests: int, window: int) -> bool:
         """In-memory sliding window (fallback)."""

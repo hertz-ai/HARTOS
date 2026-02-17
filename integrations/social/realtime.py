@@ -53,3 +53,14 @@ def on_vote_update(target_type: str, target_id: str, score: int):
 
 def on_notification(user_id: str, notification_dict: dict):
     publish_event(f'social.user.{user_id}.notification', notification_dict)
+    # Also broadcast to SSE clients (Nunba desktop)
+    try:
+        import sys
+        main_mod = sys.modules.get('__main__')
+        if main_mod and hasattr(main_mod, 'broadcast_sse_event'):
+            main_mod.broadcast_sse_event('notification', {
+                'user_id': user_id,
+                **notification_dict,
+            })
+    except Exception:
+        pass

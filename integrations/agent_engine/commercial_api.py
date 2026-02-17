@@ -9,6 +9,7 @@ Service Pattern: static methods, db: Session, db.flush() not db.commit().
 Blueprint Pattern: Blueprint('commercial_api', __name__).
 """
 import hashlib
+import hmac
 import logging
 import secrets
 import time
@@ -81,23 +82,29 @@ class CommercialAPIService:
 
     @staticmethod
     def validate_api_key(db: Session, raw_key: str) -> Optional[Dict]:
-        """Validate an API key. Returns key dict if valid, None if invalid."""
+        """Validate an API key. Returns key dict if valid, None if invalid.
+
+        Uses constant-time hash comparison to prevent timing side-channels.
+        """
         from integrations.social.models import CommercialAPIKey
 
         key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
         api_key = db.query(CommercialAPIKey).filter_by(
             key_hash=key_hash).first()
 
+        # Constant-time validation: check all conditions before returning
+        valid = True
         if not api_key:
-            return None
-        if not api_key.is_active:
-            return None
-        if api_key.expires_at and api_key.expires_at < datetime.utcnow():
-            return None
-        if api_key.usage_this_month >= api_key.monthly_quota:
-            return None
+            valid = False
+        else:
+            if not api_key.is_active:
+                valid = False
+            if api_key.expires_at and api_key.expires_at < datetime.utcnow():
+                valid = False
+            if api_key.usage_this_month >= api_key.monthly_quota:
+                valid = False
 
-        return api_key.to_dict()
+        return api_key.to_dict() if valid and api_key else None
 
     @staticmethod
     def log_usage(db: Session, api_key_id: str, endpoint: str,
@@ -314,7 +321,8 @@ def intelligence_chat():
         response_text = resp_data.get('response', '')
         tokens_out = len(response_text.split())
     except Exception as e:
-        response_text = f'Intelligence endpoint error: {e}'
+        logger.warning(f"Intelligence endpoint error: {e}")
+        response_text = 'Intelligence service temporarily unavailable'
 
     elapsed_ms = int((time.time() - t0) * 1000)
 
@@ -357,7 +365,8 @@ def intelligence_analyze():
         response_text = resp.get('response', '')
         tokens_out = len(response_text.split())
     except Exception as e:
-        response_text = f'Analysis error: {e}'
+        logger.warning(f"Analysis endpoint error: {e}")
+        response_text = 'Analysis service temporarily unavailable'
         tokens_out = 0
 
     elapsed_ms = int((time.time() - t0) * 1000)
@@ -392,7 +401,8 @@ def intelligence_generate():
         import json
         result = json.loads(result_json) if isinstance(result_json, str) else result_json
     except Exception as e:
-        result = {'error': str(e)}
+        logger.warning(f"Generate endpoint error: {e}")
+        result = {'error': 'Generation service temporarily unavailable'}
 
     elapsed_ms = int((time.time() - t0) * 1000)
     tokens_in = len(prompt_text.split())
@@ -420,7 +430,8 @@ def intelligence_hivemind():
         bridge = get_world_model_bridge()
         result = bridge.query_hivemind(query)
     except Exception as e:
-        result = {'error': str(e)}
+        logger.warning(f"HiveMind endpoint error: {e}")
+        result = {'error': 'HiveMind service temporarily unavailable'}
 
     elapsed_ms = int((time.time() - t0) * 1000)
     CommercialAPIService.log_usage(

@@ -210,43 +210,137 @@ class AudioProcessor:
         speaker_diarization: bool = False
     ) -> TranscriptionResult:
         """
-        Transcribe audio to text.
+        Transcribe audio to text using Whisper.
 
         Args:
             audio: Audio file path, URL, or bytes
             language: Expected language (ISO code) or None for auto-detect
             prompt: Optional prompt to guide transcription
             word_timestamps: Whether to include word-level timestamps
-            speaker_diarization: Whether to identify different speakers
+            speaker_diarization: Whether to query speaker_diarization service
 
         Returns:
             TranscriptionResult with transcribed text and metadata
         """
         await self._ensure_initialized()
 
-        # Read audio if path provided
-        audio_data = audio
+        import json as _json
+        import os
+        import tempfile
+
+        # Resolve audio to a file path for whisper_transcribe
+        audio_path = None
+        cleanup_path = False
         if isinstance(audio, (str, Path)):
             path = Path(audio)
             if path.exists():
-                with open(path, 'rb') as f:
-                    audio_data = f.read()
+                audio_path = str(path)
+        elif isinstance(audio, bytes):
+            # Write bytes to temp file
+            tmp = tempfile.NamedTemporaryFile(
+                suffix='.wav', delete=False)
+            tmp.write(audio)
+            tmp.close()
+            audio_path = tmp.name
+            cleanup_path = True
 
-        # Simulated transcription - would call actual provider
-        result = TranscriptionResult(
-            text="",
-            language=language or "en",
-            confidence=0.0,
+        text = ""
+        detected_language = language or "en"
+        confidence = 0.0
+        speakers = []
+
+        try:
+            # Transcribe with Whisper
+            if audio_path:
+                try:
+                    from integrations.service_tools.whisper_tool import (
+                        whisper_transcribe,
+                    )
+                    result_json = whisper_transcribe(audio_path, language)
+                    parsed = _json.loads(result_json)
+                    if 'error' not in parsed:
+                        text = parsed.get('text', '')
+                        detected_language = parsed.get(
+                            'language', detected_language)
+                        confidence = 0.9
+                except ImportError:
+                    logger.warning(
+                        "whisper not available — transcription disabled")
+                except Exception as e:
+                    logger.warning(f"Whisper transcription failed: {e}")
+
+            # Speaker diarization via WebSocket bridge
+            if speaker_diarization and audio_path:
+                diarization_url = os.environ.get('HEVOLVE_DIARIZATION_URL')
+                if diarization_url:
+                    diarization_result = await self._run_diarization(
+                        audio_path, diarization_url)
+                    if diarization_result:
+                        n_speakers = diarization_result.get(
+                            'no_of_speaker', 0)
+                        speakers = [
+                            f"Speaker_{i}" for i in range(n_speakers)]
+        finally:
+            if cleanup_path and audio_path:
+                try:
+                    os.unlink(audio_path)
+                except OSError:
+                    pass
+
+        return TranscriptionResult(
+            text=text,
+            language=detected_language,
+            confidence=confidence,
             duration=await self.get_duration(audio),
+            speakers=speakers,
             metadata={
                 "provider": self.provider.value,
                 "model": self.model,
                 "word_timestamps": word_timestamps,
-                "speaker_diarization": speaker_diarization
-            }
+                "speaker_diarization": speaker_diarization,
+            },
         )
 
-        return result
+    async def _run_diarization(
+        self, audio_path: str, diarization_url: str
+    ) -> Optional[Dict[str, Any]]:
+        """Send audio to speaker_diarization service via WebSocket.
+
+        The service expects PCM 16-bit mono 16kHz audio as hex-encoded
+        chunks and returns ``{"no_of_speaker": N, "stop_mic": bool}``.
+
+        Sends JSON format (compatible with both new sidecar and old server).
+        Parses response as JSON first, falls back to ast.literal_eval
+        for old servers that send Python repr.
+        """
+        import ast
+        import json as _json
+
+        try:
+            import websockets
+        except ImportError:
+            logger.warning("websockets not installed — diarization disabled")
+            return None
+
+        try:
+            with open(audio_path, 'rb') as f:
+                audio_bytes = f.read()
+
+            async with websockets.connect(
+                diarization_url, close_timeout=5
+            ) as ws:
+                msg = _json.dumps(
+                    {'user_id': 0, 'chunk': audio_bytes.hex()})
+                await ws.send(msg)
+                response = await asyncio.wait_for(ws.recv(), timeout=10)
+                # New sidecar sends JSON, old server sends Python repr
+                try:
+                    return _json.loads(response)
+                except (_json.JSONDecodeError, ValueError):
+                    return ast.literal_eval(response)
+        except Exception as e:
+            logger.debug(f"Diarization failed: {e}")
+            return None
 
     async def detect_language(
         self,

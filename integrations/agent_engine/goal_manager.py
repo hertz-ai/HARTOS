@@ -50,6 +50,52 @@ def get_registered_types() -> List[str]:
     return list(_prompt_builders.keys())
 
 
+# ─── Prompt Injection Sanitization ───
+
+# Patterns that indicate potential prompt injection in goal titles/descriptions
+_INJECTION_MARKERS = [
+    'ignore previous', 'ignore all', 'disregard above',
+    'forget your instructions', 'new instructions:',
+    'you are now', 'you are a ', 'act as ',
+    'system:', 'assistant:', 'human:',
+    '```system', '```instructions',
+    '<|im_start|>', '<|im_end|>',  # ChatML injection
+    '### instruction', '### system',
+]
+
+
+def _sanitize_goal_input(text: str, max_length: int = 2000) -> str:
+    """Sanitize goal title/description to prevent prompt injection.
+
+    Does NOT remove content (might be legitimate), but:
+    - Truncates to max_length
+    - Strips control characters
+    - Logs warnings for suspicious patterns
+    """
+    if not text:
+        return ''
+
+    sanitized = text[:max_length]
+
+    # Strip control characters (keep newlines and tabs)
+    sanitized = ''.join(
+        c for c in sanitized
+        if c in ('\n', '\t') or (ord(c) >= 32)
+    )
+
+    # Log warnings for injection markers (do NOT block — ConstitutionalFilter
+    # handles blocking, we just sanitize and warn)
+    lower = sanitized.lower()
+    for marker in _INJECTION_MARKERS:
+        if marker in lower:
+            logger.warning(
+                f"[GoalManager] Potential injection marker in goal input: "
+                f"'{marker}' — content will be delimited in prompt")
+            break
+
+    return sanitized
+
+
 # ─── Goal Manager ───
 
 class GoalManager:
@@ -82,7 +128,8 @@ class GoalManager:
             if not passed:
                 return {'success': False, 'error': f'Guardrail: {reason}'}
         except ImportError:
-            pass
+            logger.error("CRITICAL: hive_guardrails not available — blocking goal creation")
+            return {'success': False, 'error': 'Security module unavailable'}
 
         goal = AgentGoal(
             goal_type=goal_type,
@@ -128,7 +175,7 @@ class GoalManager:
             from security.hive_guardrails import HiveEthos
             HiveEthos.enforce_ephemeral_agents(goal_id, status)
         except ImportError:
-            pass
+            logger.warning("hive_guardrails not available for ephemeral cleanup")
 
         return {'success': True, 'goal': goal.to_dict()}
 
@@ -166,21 +213,38 @@ class GoalManager:
     def build_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
         """Build a /chat prompt using the registered prompt builder for this goal type.
 
-        GUARDRAIL: HiveEthos.rewrite_prompt_for_togetherness applied to output.
+        GUARDRAIL: Fail-closed — requires hive_guardrails to be importable.
+        Prompt is NOT mutated (anti-squiggle-maximizer design). Agents reason
+        semantically with full knowledge of their context.
+
+        SANITIZATION: Goal title/description (user input) are sanitized
+        and wrapped in clear delimiters to prevent prompt injection.
         """
         goal_type = goal_dict.get('goal_type', '')
+
+        # Sanitize user-supplied fields before interpolation
+        safe_dict = dict(goal_dict)
+        safe_dict['title'] = _sanitize_goal_input(
+            safe_dict.get('title', ''), max_length=200)
+        safe_dict['description'] = _sanitize_goal_input(
+            safe_dict.get('description', ''), max_length=2000)
+
         builder = _prompt_builders.get(goal_type)
         if not builder:
-            prompt = f"Goal: {goal_dict.get('title', '')}\n{goal_dict.get('description', '')}"
+            # Fallback: delimit user content clearly
+            prompt = (
+                f"Goal title: {safe_dict['title']}\n"
+                f"Goal description: {safe_dict['description']}"
+            )
         else:
-            prompt = builder(goal_dict, product_dict)
+            prompt = builder(safe_dict, product_dict)
 
-        # GUARDRAIL: togetherness rewrite
+        # GUARDRAIL: verify guardrails module is available (fail-closed)
         try:
-            from security.hive_guardrails import HiveEthos
-            prompt = HiveEthos.rewrite_prompt_for_togetherness(prompt)
+            from security.hive_guardrails import HiveEthos  # noqa: F401
         except ImportError:
-            pass
+            logger.error("CRITICAL: hive_guardrails not available — cannot build prompt")
+            return None
 
         return prompt
 

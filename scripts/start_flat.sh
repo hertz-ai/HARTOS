@@ -27,6 +27,8 @@ done
 
 export HEVOLVE_NODE_TIER=flat
 export LLAMA_CPP_PORT="${LLM_PORT}"
+# Diarization: auto-started as sidecar. Set URL only to override with external service.
+# export HEVOLVE_DIARIZATION_URL="ws://external-host:8004"
 
 echo "[MODE] HEVOLVE_NODE_TIER=flat"
 echo "[LLM]  llama.cpp on localhost:${LLM_PORT}"

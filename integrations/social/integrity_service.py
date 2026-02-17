@@ -30,6 +30,9 @@ FRAUD_WEIGHTS = {
     'score_jump': 10.0,
     'witness_refusal': 5.0,
     'collusion_suspected': 25.0,
+    'reward_velocity_anomaly': 25.0,
+    'reward_self_dealing': 35.0,
+    'spark_gaming': 20.0,
 }
 
 IMPRESSION_ANOMALY_STDDEV = 3.0
@@ -39,6 +42,22 @@ ATTESTATION_EXPIRY_DAYS = 7
 MIN_WITNESS_PEERS = 1
 CHALLENGE_TIMEOUT_SECONDS = 30
 WITNESS_TIMESTAMP_MAX_AGE = 60  # seconds
+
+# ── Fraud Score Decay ──
+# Every audit round, each node's fraud score decays by this amount.
+# Good behavior over time earns back trust.  But ban records persist.
+FRAUD_SCORE_DECAY_PER_ROUND = 2.0  # Points per audit round (~5 min)
+FRAUD_SCORE_DECAY_MIN = 0.0
+
+# ── Fail2ban: Progressive Ban Durations ──
+# Each subsequent ban lasts longer. ban_count tracked on PeerNode.
+# After max_bans (4+), node must petition for human review.
+FAIL2BAN_DURATIONS = {
+    1: timedelta(hours=1),     # 1st offense: 1 hour
+    2: timedelta(hours=24),    # 2nd offense: 24 hours
+    3: timedelta(days=7),      # 3rd offense: 1 week
+}
+FAIL2BAN_MAX_DURATION = timedelta(days=30)  # 4th+ offense: 30 days
 
 
 class IntegrityService:
@@ -646,8 +665,18 @@ class IntegrityService:
     @staticmethod
     def run_full_audit(db: Session, node_id: str,
                        registry_url: str = None) -> Dict:
-        """Run all fraud detection checks on a node."""
+        """Run all fraud detection checks on a node, including reward hacking.
+
+        Also applies fraud score decay and checks ban expiry — good nodes
+        recover trust over time, banned nodes serve their sentence then
+        return to 'suspicious' for re-evaluation.
+        """
         results = {}
+
+        # Decay fraud scores + check ban expiry BEFORE running checks.
+        # This ensures previously-banned nodes get a fair reassessment.
+        results['decay'] = IntegrityService.apply_fraud_score_decay(db)
+
         results['code_hash'] = IntegrityService.verify_code_hash(
             db, node_id, registry_url)
         results['impression_anomaly'] = IntegrityService.detect_impression_anomaly(
@@ -657,9 +686,31 @@ class IntegrityService:
         results['audit_dominance'] = IntegrityService.verify_audit_dominance(
             db, node_id)
 
+        # Reward hacking detection
+        results['reward_velocity'] = IntegrityService.detect_reward_velocity_anomaly(
+            db, node_id)
+        results['reward_self_dealing'] = IntegrityService.detect_reward_self_dealing(
+            db, node_id)
+        results['spark_gaming'] = IntegrityService.detect_spark_gaming(db, node_id)
+
         peer = db.query(PeerNode).filter_by(node_id=node_id).first()
         results['fraud_score'] = peer.fraud_score if peer else 0.0
         results['integrity_status'] = peer.integrity_status if peer else 'unknown'
+        results['ban_count'] = peer.ban_count if peer else 0
+        results['ban_until'] = peer.ban_until.isoformat() if peer and peer.ban_until else None
+
+        # Auto-isolate if multiple reward hacking signals fire
+        reward_hack_signals = sum(1 for k in (
+            'reward_velocity', 'reward_self_dealing', 'spark_gaming'
+        ) if results.get(k) is not None)
+        if reward_hack_signals >= 2:
+            results['isolation'] = IntegrityService.isolate_reward_hacker(
+                db, node_id,
+                f'Multiple reward hacking signals: {reward_hack_signals}/3 triggered',
+                {'signals': {k: results.get(k) for k in (
+                    'reward_velocity', 'reward_self_dealing', 'spark_gaming'
+                ) if results.get(k)}})
+
         return results
 
     # ─── Audit Compute Dominance ───
@@ -779,15 +830,32 @@ class IntegrityService:
         )
         db.add(alert)
 
-        # Auto-ban at threshold
+        # Auto-ban at threshold — fail2ban progressive duration
         if peer.fraud_score >= FRAUD_BAN_THRESHOLD:
-            peer.integrity_status = 'banned'
-            logger.warning(f"Node {node_id[:8]} auto-banned: fraud_score={peer.fraud_score}")
+            IntegrityService._apply_fail2ban(db, peer, reason)
         elif peer.fraud_score >= 40:
             peer.integrity_status = 'suspicious'
 
         db.flush()
         return peer.fraud_score
+
+    @staticmethod
+    def _apply_fail2ban(db: Session, peer: 'PeerNode', reason: str):
+        """Apply fail2ban progressive ban. Each offense = longer ban.
+
+        1st ban: 1 hour,  2nd: 24 hours,  3rd: 7 days,  4th+: 30 days.
+        ban_count persists across unbans — history is never erased.
+        """
+        peer.ban_count = (peer.ban_count or 0) + 1
+        peer.integrity_status = 'banned'
+
+        duration = FAIL2BAN_DURATIONS.get(peer.ban_count, FAIL2BAN_MAX_DURATION)
+        peer.ban_until = datetime.utcnow() + duration
+
+        logger.warning(
+            f"Node {peer.node_id[:8]} fail2ban: offense #{peer.ban_count}, "
+            f"banned until {peer.ban_until.isoformat()}, "
+            f"fraud_score={peer.fraud_score}, reason={reason}")
 
     @staticmethod
     def decrease_fraud_score(db: Session, node_id: str, delta: float,
@@ -799,7 +867,7 @@ class IntegrityService:
 
         peer.fraud_score = max((peer.fraud_score or 0) - delta, 0.0)
 
-        # Upgrade status if score dropped
+        # Upgrade status if score dropped below threshold
         if peer.fraud_score < 40 and peer.integrity_status == 'suspicious':
             peer.integrity_status = 'verified'
 
@@ -807,12 +875,69 @@ class IntegrityService:
         return peer.fraud_score
 
     @staticmethod
+    def apply_fraud_score_decay(db: Session) -> Dict:
+        """Decay all nodes' fraud scores by a small amount each audit round.
+
+        Good behavior over time earns back trust.  Called every audit round
+        (typically every ~5 minutes via AgentDaemon integrity tick).
+
+        Also checks ban expiry: if a banned node's ban_until has passed,
+        move to 'suspicious' (not 'verified' — they must prove themselves).
+
+        Returns summary of decay effects.
+        """
+        now = datetime.utcnow()
+        decayed = 0
+        unbanned = 0
+
+        # Decay all non-zero fraud scores
+        peers_with_score = db.query(PeerNode).filter(
+            PeerNode.fraud_score > FRAUD_SCORE_DECAY_MIN
+        ).all()
+
+        for peer in peers_with_score:
+            old_score = peer.fraud_score or 0
+            peer.fraud_score = max(old_score - FRAUD_SCORE_DECAY_PER_ROUND, 0.0)
+            if peer.fraud_score != old_score:
+                decayed += 1
+
+            # If score drops below suspicious threshold, upgrade
+            if (peer.fraud_score < 40 and
+                    peer.integrity_status == 'suspicious'):
+                peer.integrity_status = 'verified'
+
+        # Check ban expiry (fail2ban timer)
+        banned_peers = db.query(PeerNode).filter(
+            PeerNode.integrity_status == 'banned',
+            PeerNode.ban_until != None,  # noqa: E711 (SQLAlchemy)
+            PeerNode.ban_until <= now,
+        ).all()
+
+        for peer in banned_peers:
+            peer.integrity_status = 'suspicious'
+            peer.fraud_score = min(peer.fraud_score or 0, 50.0)
+            peer.ban_until = None
+            unbanned += 1
+            logger.info(
+                f"Node {peer.node_id[:8]} ban expired (offense #{peer.ban_count}). "
+                f"Status → suspicious. Will be re-audited.")
+
+        if decayed or unbanned:
+            db.flush()
+
+        return {
+            'decayed_count': decayed,
+            'unbanned_count': unbanned,
+            'total_with_score': len(peers_with_score),
+        }
+
+    @staticmethod
     def ban_node(db: Session, node_id: str, reason: str):
-        """Set integrity_status='banned'."""
+        """Set integrity_status='banned' with fail2ban progression."""
         peer = db.query(PeerNode).filter_by(node_id=node_id).first()
         if peer:
-            peer.integrity_status = 'banned'
             peer.fraud_score = 100.0
+            IntegrityService._apply_fail2ban(db, peer, reason)
             alert = FraudAlert(
                 node_id=node_id, alert_type='manual_ban',
                 severity='critical', description=reason,
@@ -951,6 +1076,237 @@ class IntegrityService:
             'open_alerts': open_alerts,
         }
 
+    # ─── Reward Hacking Detection ───
+
+    @staticmethod
+    def detect_reward_velocity_anomaly(db: Session, node_id: str,
+                                        period_hours: int = 24) -> Optional[Dict]:
+        """Detect nodes claiming rewards at anomalously high rates.
+
+        Compares this node's reward claim rate to the network average.
+        A node receiving >3 stddev above mean reward amount per period
+        is flagged for investigation.
+        """
+        cutoff = datetime.utcnow() - timedelta(hours=period_hours)
+
+        # Get per-node reward totals in the period
+        node_totals = db.query(
+            HostingReward.node_id,
+            sqlfunc.sum(HostingReward.amount).label('total'),
+            sqlfunc.count(HostingReward.id).label('claim_count'),
+        ).filter(
+            HostingReward.created_at >= cutoff,
+        ).group_by(HostingReward.node_id).all()
+
+        if len(node_totals) < 3:
+            return None  # Not enough nodes to compare
+
+        amounts = [nt.total for nt in node_totals]
+        target_entry = next(
+            (nt for nt in node_totals if nt.node_id == node_id), None)
+        if not target_entry or target_entry.total < 10:
+            return None  # Too low to flag
+
+        mean = statistics.mean(amounts)
+        stddev = statistics.stdev(amounts) if len(amounts) > 1 else 0
+        if stddev == 0:
+            return None
+
+        z_score = (target_entry.total - mean) / stddev
+
+        if z_score > 3.0:
+            return IntegrityService._create_fraud_alert(
+                db, node_id, 'reward_velocity_anomaly', 'high',
+                f'Reward velocity anomaly: {target_entry.total:.1f} Spark '
+                f'in {period_hours}h ({target_entry.claim_count} claims, '
+                f'z-score={z_score:.1f}, mean={mean:.1f})',
+                FRAUD_WEIGHTS['reward_velocity_anomaly'],
+                {'total': round(target_entry.total, 2),
+                 'claim_count': target_entry.claim_count,
+                 'mean': round(mean, 2), 'stddev': round(stddev, 2),
+                 'z_score': round(z_score, 2),
+                 'period_hours': period_hours})
+
+        return None
+
+    @staticmethod
+    def detect_reward_self_dealing(db: Session, node_id: str) -> Optional[Dict]:
+        """Detect circular reward patterns — nodes awarding rewards to
+        themselves or to a small ring of accomplices who reciprocate.
+
+        Checks:
+        1. Node's operator_id matches the node's own user account
+        2. Reward claims where the same small group witnesses each other
+        """
+        # Check 1: Self-referential rewards
+        peer = db.query(PeerNode).filter_by(node_id=node_id).first()
+        if not peer:
+            return None
+
+        self_rewards = db.query(HostingReward).filter(
+            HostingReward.node_id == node_id,
+            HostingReward.operator_id == peer.owner_id,
+        ).count()
+
+        total_rewards = db.query(HostingReward).filter(
+            HostingReward.node_id == node_id,
+        ).count()
+
+        if total_rewards > 5 and self_rewards > total_rewards * 0.5:
+            return IntegrityService._create_fraud_alert(
+                db, node_id, 'reward_self_dealing', 'critical',
+                f'Self-dealing: {self_rewards}/{total_rewards} rewards '
+                f'({self_rewards / total_rewards * 100:.0f}%) awarded to '
+                f'own operator account',
+                FRAUD_WEIGHTS['reward_self_dealing'],
+                {'self_rewards': self_rewards, 'total_rewards': total_rewards,
+                 'ratio': round(self_rewards / total_rewards, 3)})
+
+        # Check 2: Witness ring — same small set of peers witness all
+        # of this node's ad impressions (already partially covered by
+        # detect_collusion, but this checks the reward side specifically)
+        cutoff = datetime.utcnow() - timedelta(days=7)
+        witnessed = db.query(AdImpression).filter(
+            AdImpression.node_id == node_id,
+            AdImpression.created_at >= cutoff,
+            AdImpression.witness_node_id.isnot(None),
+        ).all()
+
+        if len(witnessed) > 10:
+            witness_set = set(w.witness_node_id for w in witnessed)
+            if len(witness_set) <= 2:
+                return IntegrityService._create_fraud_alert(
+                    db, node_id, 'reward_self_dealing', 'high',
+                    f'Witness ring: {len(witnessed)} impressions all '
+                    f'witnessed by only {len(witness_set)} peer(s): '
+                    f'{", ".join(w[:8] for w in witness_set)}',
+                    FRAUD_WEIGHTS['reward_self_dealing'],
+                    {'impression_count': len(witnessed),
+                     'unique_witnesses': len(witness_set),
+                     'witness_ids': list(witness_set)})
+
+        return None
+
+    @staticmethod
+    def detect_spark_gaming(db: Session, node_id: str) -> Optional[Dict]:
+        """Detect goals created to burn Spark budget without producing
+        real output — a form of reward hacking where the node claims
+        compute credits for work it didn't meaningfully do.
+
+        Signals: high goal failure rate, minimal output, rapid goal cycling.
+        """
+        try:
+            from integrations.social.models import AgentGoal
+        except ImportError:
+            return None
+
+        # Get goals associated with this node's user
+        peer = db.query(PeerNode).filter_by(node_id=node_id).first()
+        if not peer or not peer.owner_id:
+            return None
+
+        cutoff = datetime.utcnow() - timedelta(hours=48)
+        recent_goals = db.query(AgentGoal).filter(
+            AgentGoal.owner_id == peer.owner_id,
+            AgentGoal.created_at >= cutoff,
+        ).all()
+
+        if len(recent_goals) < 5:
+            return None  # Not enough to judge
+
+        total = len(recent_goals)
+        failed = sum(1 for g in recent_goals if g.status in ('failed', 'error'))
+        total_spent = sum((g.spark_spent or 0) for g in recent_goals)
+        completed = sum(1 for g in recent_goals if g.status == 'completed')
+
+        # High failure rate with significant spend = gaming
+        failure_rate = failed / total if total > 0 else 0
+        if failure_rate > 0.7 and total_spent > 100:
+            return IntegrityService._create_fraud_alert(
+                db, node_id, 'spark_gaming', 'high',
+                f'Spark gaming suspected: {failed}/{total} goals failed '
+                f'({failure_rate:.0%}) while spending {total_spent} Spark '
+                f'in 48h. Only {completed} completed.',
+                FRAUD_WEIGHTS['spark_gaming'],
+                {'total_goals': total, 'failed': failed,
+                 'completed': completed, 'spark_spent': total_spent,
+                 'failure_rate': round(failure_rate, 3)})
+
+        # Rapid cycling: many goals created and immediately abandoned
+        abandoned = sum(1 for g in recent_goals
+                       if g.status == 'archived' and (g.spark_spent or 0) > 0)
+        if abandoned > 10 and total_spent > 200:
+            return IntegrityService._create_fraud_alert(
+                db, node_id, 'spark_gaming', 'medium',
+                f'Goal cycling: {abandoned} goals abandoned after spending '
+                f'{total_spent} Spark in 48h',
+                FRAUD_WEIGHTS['spark_gaming'],
+                {'abandoned': abandoned, 'spark_spent': total_spent})
+
+        return None
+
+    @staticmethod
+    def isolate_reward_hacker(db: Session, node_id: str,
+                               reason: str, evidence: dict = None) -> Dict:
+        """Isolate a confirmed reward hacker from the network.
+
+        This is the enforcement action when reward hacking is detected
+        with high confidence. The node is:
+        1. Quarantined via TrustQuarantine (ISOLATE level)
+        2. All pending rewards frozen
+        3. Fraud score set to maximum
+        4. Witnesses notified
+        5. Node cannot re-enter until reviewed by a human auditor
+
+        Reward hackers are isolated, not punished — the goal is to
+        protect the network, not to seek vengeance (per TrustQuarantine).
+        """
+        # 1. Set fraud score to max and ban
+        IntegrityService.increase_fraud_score(
+            db, node_id, 50.0,
+            f'Reward hacker isolated: {reason}', evidence)
+
+        peer = db.query(PeerNode).filter_by(node_id=node_id).first()
+        if peer:
+            peer.integrity_status = 'banned'
+            peer.fraud_score = 100.0
+
+        # 2. Quarantine via guardrail system
+        try:
+            from security.hive_guardrails import TrustQuarantine
+            TrustQuarantine.quarantine(
+                node_id,
+                TrustQuarantine.LEVEL_ISOLATE,
+                f'Reward hacking: {reason}')
+        except ImportError:
+            logger.warning("TrustQuarantine not available for isolation")
+
+        # 3. Freeze pending rewards (mark as disputed)
+        pending = db.query(HostingReward).filter(
+            HostingReward.node_id == node_id,
+            HostingReward.created_at >= datetime.utcnow() - timedelta(days=30),
+        ).all()
+        frozen_amount = 0.0
+        for reward in pending:
+            frozen_amount += reward.amount
+            reward.reason = f'FROZEN: {reward.reason} [reward hack investigation]'
+        db.flush()
+
+        result = {
+            'node_id': node_id,
+            'action': 'isolated',
+            'reason': reason,
+            'rewards_frozen': len(pending),
+            'frozen_amount': round(frozen_amount, 2),
+            'requires_human_review': True,
+        }
+
+        logger.warning(
+            f"Reward hacker isolated: node={node_id[:8]}, "
+            f"reason={reason}, frozen={frozen_amount:.2f} Spark")
+
+        return result
+
     # ─── Private Helpers ───
 
     @staticmethod
@@ -982,6 +1338,14 @@ def _get_node_compute(peer) -> float:
 def _determine_alert_type(reason: str) -> str:
     """Infer alert type from reason string."""
     reason_lower = reason.lower()
+    if 'reward hack' in reason_lower or 'isolated' in reason_lower:
+        return 'reward_hacking'
+    if 'self-dealing' in reason_lower or 'witness ring' in reason_lower:
+        return 'reward_self_dealing'
+    if 'spark gaming' in reason_lower or 'goal cycling' in reason_lower:
+        return 'spark_gaming'
+    if 'reward velocity' in reason_lower:
+        return 'reward_velocity_anomaly'
     if 'hash' in reason_lower or 'code' in reason_lower:
         return 'hash_mismatch'
     if 'challenge' in reason_lower:

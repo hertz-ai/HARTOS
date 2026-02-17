@@ -61,7 +61,12 @@ def get_engine():
             @event.listens_for(_engine, "connect")
             def _set_sqlite_wal(dbapi_connection, connection_record):
                 cursor = dbapi_connection.cursor()
-                cursor.execute("PRAGMA journal_mode=WAL")
+                result = cursor.execute("PRAGMA journal_mode=WAL").fetchone()
+                if result and result[0].lower() != 'wal':
+                    import logging
+                    logging.getLogger('hevolve_social').warning(
+                        f"WAL mode not enabled (got {result[0]}). "
+                        f"Concurrent writes may corrupt data.")
                 cursor.close()
     return _engine
 
@@ -547,6 +552,9 @@ class PeerNode(Base):
     # Hyve OS equilibrium: contribution tier + enabled features
     capability_tier = Column(String(20), nullable=True)       # observer|lite|standard|full|compute_host
     enabled_features_json = Column(JSON, nullable=True)       # ["agent_engine", "tts", ...]
+    # Fail2ban: progressive ban tracking
+    ban_count = Column(Integer, default=0)                    # How many times this node has been banned
+    ban_until = Column(DateTime, nullable=True)               # When current ban expires (None = no ban)
 
     node_operator = relationship('User', foreign_keys=[node_operator_id])
 
@@ -580,6 +588,8 @@ class PeerNode(Base):
             'dns_region': self.dns_region,
             'capability_tier': self.capability_tier,
             'enabled_features': self.enabled_features_json,
+            'ban_count': self.ban_count,
+            'ban_until': self.ban_until.isoformat() if self.ban_until else None,
             'metadata': self.metadata_json,
         }
 
@@ -2296,4 +2306,148 @@ class BuildLicense(Base):
             'is_active': self.is_active,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'expires_at': self.expires_at.isoformat() if self.expires_at else None,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════
+# TABLE 60 — Guest Recovery
+# ═══════════════════════════════════════════════════════════════
+
+class GuestRecovery(Base):
+    """Recovery codes for guest users to restore identity across devices."""
+    __tablename__ = 'guest_recovery'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    user_id = Column(String(64), ForeignKey('users.id'), nullable=False, index=True)
+    recovery_code_hash = Column(String(255), nullable=False)
+    device_id = Column(String(128), nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    last_used_at = Column(DateTime, nullable=True)
+
+    user = relationship('User', backref='guest_recoveries')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'device_id': self.device_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'last_used_at': self.last_used_at.isoformat() if self.last_used_at else None,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════
+# TABLE 61 — Device Bindings
+# ═══════════════════════════════════════════════════════════════
+
+class DeviceBinding(Base):
+    """Tracks devices linked to a user for sync purposes."""
+    __tablename__ = 'device_bindings'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    user_id = Column(String(64), ForeignKey('users.id'), nullable=False, index=True)
+    device_id = Column(String(128), nullable=False)
+    device_name = Column(String(100), default='')
+    platform = Column(String(30), default='web')
+    linked_at = Column(DateTime, default=func.now())
+    last_sync_at = Column(DateTime, nullable=True)
+    is_active = Column(Boolean, default=True)
+
+    user = relationship('User', backref='device_bindings')
+
+    __table_args__ = (
+        UniqueConstraint('user_id', 'device_id', name='uq_user_device'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'device_id': self.device_id,
+            'device_name': self.device_name,
+            'platform': self.platform,
+            'linked_at': self.linked_at.isoformat() if self.linked_at else None,
+            'last_sync_at': self.last_sync_at.isoformat() if self.last_sync_at else None,
+            'is_active': self.is_active,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════
+# TABLE 62 — Backup Metadata
+# ═══════════════════════════════════════════════════════════════
+
+class BackupMetadata(Base):
+    """Metadata for encrypted backups (blob stored on filesystem)."""
+    __tablename__ = 'backup_metadata'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    user_id = Column(String(64), ForeignKey('users.id'), nullable=False, index=True)
+    device_id = Column(String(128), nullable=True)
+    backup_version = Column(Integer, default=1)
+    content_hash = Column(String(64), nullable=False)
+    size_bytes = Column(Integer, default=0)
+    created_at = Column(DateTime, default=func.now())
+
+    user = relationship('User', backref='backups')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'device_id': self.device_id,
+            'backup_version': self.backup_version,
+            'content_hash': self.content_hash,
+            'size_bytes': self.size_bytes,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════
+# Regional Host Request (v25)
+# ═══════════════════════════════════════════════════════════════
+
+class RegionalHostRequest(Base):
+    """Tracks regional host applications through the hybrid approval flow."""
+    __tablename__ = 'regional_host_requests'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    user_id = Column(String(64), ForeignKey('users.id'), nullable=False, index=True)
+    node_id = Column(String(64), nullable=True)
+    public_key_hex = Column(String(128), nullable=True)
+    compute_tier = Column(String(20), nullable=True)
+    compute_info_json = Column(Text, nullable=True)
+    trust_score = Column(Float, default=0.0)
+    status = Column(String(20), default='pending', index=True)
+    region_name = Column(String(50), nullable=True)
+    certificate_json = Column(Text, nullable=True)
+    github_username = Column(String(100), nullable=True)
+    github_invite_sent = Column(Boolean, default=False)
+    requested_at = Column(DateTime, default=func.now())
+    approved_at = Column(DateTime, nullable=True)
+    approved_by = Column(String(64), nullable=True)
+    rejected_reason = Column(Text, nullable=True)
+
+    user = relationship('User', backref='regional_host_requests')
+
+    def to_dict(self):
+        import json as _json
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'node_id': self.node_id,
+            'public_key_hex': self.public_key_hex,
+            'compute_tier': self.compute_tier,
+            'compute_info': _json.loads(self.compute_info_json)
+                if self.compute_info_json else None,
+            'trust_score': self.trust_score,
+            'status': self.status,
+            'region_name': self.region_name,
+            'github_username': self.github_username,
+            'github_invite_sent': self.github_invite_sent,
+            'requested_at': self.requested_at.isoformat()
+                if self.requested_at else None,
+            'approved_at': self.approved_at.isoformat()
+                if self.approved_at else None,
+            'approved_by': self.approved_by,
+            'rejected_reason': self.rejected_reason,
         }

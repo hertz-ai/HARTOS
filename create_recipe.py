@@ -471,20 +471,8 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
 
 
 def get_frame(user_id):
-    serialized_frame = redis_client.get(user_id)
-    try:
-        if serialized_frame is not None:
-            from security.safe_deserialize import safe_load_frame
-            frame_bgr = safe_load_frame(serialized_frame)
-            current_app.logger.info(
-                f"Frame for user_id {user_id} retrieved successfully.")
-            frame = frame_bgr[:, :, ::-1]
-            return frame
-        else:
-            current_app.logger.info(f"No frame found for user_id {user_id}.")
-            return None
-    except ModuleNotFoundError as e:
-        raise e
+    """Delegate to helper.get_frame() — FrameStore first, Redis fallback."""
+    return helper_fun.get_frame(user_id)
 
 def get_visual_context(user_id, minutes=2):
     """Get visual context from the past specified minutes"""
@@ -1577,16 +1565,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                 enhanced_instruction += "\nAdapt these steps to the current screen state as needed."
                 tool_logger.info(f"Created enhanced instruction with {len(matching_recipe.get('recipe', []))} steps")
 
-            # Initial connectivity check
-            topic = f'com.hertzai.hevolve.action.{user_id}'
-            tool_logger.info(f'calling {topic} for 5 second')
-            response = await subscribe_and_return({'prompt_id': prompt_id}, topic, 2000)
-            tool_logger.info(f'Response from call of {topic}: {response}')
-
-            if not response:
-                return 'Ask UserProxy to go to hevolve.ai login and start Nunba - Your Local Hyve Companion App'
-
-            # Prepare crossbar message
+            # Prepare VLM message (shared across all tiers)
             crossbar_message = {
                 'parent_request_id': request_id_list[user_prompt],
                 'user_id': f'{user_id}',
@@ -1603,14 +1582,27 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                 crossbar_message['enhanced_instruction'] = enhanced_instruction
                 tool_logger.info(f"Added enhanced instruction to crossbar message")
 
-            # Execute the command
-            topic = 'com.hertzai.hevolve.action'
-            tool_logger.info(f'calling {topic} for 1800 seconds')
-
+            # Three-tier VLM execution (Tier 1: in-process, Tier 2: HTTP local)
+            from integrations.vlm.vlm_adapter import execute_vlm_instruction, check_vlm_available
             start_time = time.time()
-            response = await subscribe_and_return(crossbar_message, topic, 1800000)
-            execution_time = time.time() - start_time
+            response = execute_vlm_instruction(crossbar_message)
 
+            if response is None:
+                # Tier 3: Crossbar WAMP (central/regional or fallback)
+                tool_logger.info("VLM Tier 1/2 unavailable, falling back to Crossbar WAMP")
+                topic = f'com.hertzai.hevolve.action.{user_id}'
+                tool_logger.info(f'calling {topic} for 5 second')
+                response = await subscribe_and_return({'prompt_id': prompt_id}, topic, 2000)
+                tool_logger.info(f'Response from call of {topic}: {response}')
+
+                if not response:
+                    return 'Ask UserProxy to go to hevolve.ai login and start Nunba - Your Local Hyve Companion App'
+
+                topic = 'com.hertzai.hevolve.action'
+                tool_logger.info(f'calling {topic} for 1800 seconds')
+                response = await subscribe_and_return(crossbar_message, topic, 1800000)
+
+            execution_time = time.time() - start_time
             tool_logger.info(f'THIS IS RESPONSE type: {type(response)} value: {response}')
 
             if not response:
@@ -2472,6 +2464,16 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         try:
             from recipe_experience import RecipeExperienceRecorder
             RecipeExperienceRecorder.merge_experience_into_recipe(prompt_id, flow, user_prompt)
+        except Exception:
+            pass
+
+        # Capture agent baseline snapshot on creation
+        try:
+            from integrations.agent_engine.agent_baseline_service import capture_baseline_async
+            capture_baseline_async(
+                prompt_id=str(prompt_id), flow_id=flow,
+                trigger='creation', user_id=str(user_id),
+                user_prompt=user_prompt)
         except Exception:
             pass
 

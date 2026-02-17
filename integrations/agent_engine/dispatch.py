@@ -36,7 +36,7 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     Returns:
         Response text or None on failure
     """
-    # GUARDRAIL: full pre-dispatch gate
+    # GUARDRAIL: full pre-dispatch gate (fail-closed: block if guardrails unavailable)
     try:
         from security.hive_guardrails import GuardrailEnforcer
         allowed, reason, prompt = GuardrailEnforcer.before_dispatch(prompt)
@@ -44,7 +44,8 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
             logger.warning(f"Dispatch blocked for {goal_type} goal {goal_id}: {reason}")
             return None
     except ImportError:
-        pass
+        logger.error("CRITICAL: hive_guardrails not available — blocking dispatch")
+        return None
 
     base_url = os.environ.get('HEVOLVE_BASE_URL', 'http://localhost:6777')
     prompt_id = f"{goal_type}_{goal_id[:8]}"
@@ -70,7 +71,7 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
             result = resp.json()
             response = result.get('response', '')
 
-            # GUARDRAIL: post-response check
+            # GUARDRAIL: post-response check (fail-closed)
             try:
                 from security.hive_guardrails import GuardrailEnforcer
                 passed, reason = GuardrailEnforcer.after_response(response)
@@ -78,7 +79,8 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
                     logger.warning(f"Response filtered for goal {goal_id}: {reason}")
                     return None
             except ImportError:
-                pass
+                logger.error("CRITICAL: hive_guardrails not available — blocking response")
+                return None
 
             # GUARDRAIL: coding goals — no merge without constitutional review
             if goal_type == 'coding':
@@ -96,7 +98,8 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
                             f"constitutional review: {reason}")
                         return None
                 except ImportError:
-                    pass
+                    logger.error("CRITICAL: ConstitutionalFilter not available — blocking coding goal")
+                    return None
 
             # Record to world model (training data for hive intelligence)
             try:

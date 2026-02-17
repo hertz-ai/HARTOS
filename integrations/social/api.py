@@ -133,6 +133,109 @@ def get_me():
     return _ok(g.user.to_dict(include_token=False))
 
 
+# ─── Guest identity persistence ───
+
+_RECOVERY_WORDS = (
+    'amber', 'breeze', 'coral', 'drift', 'ember', 'frost',
+    'gleam', 'haven', 'ivory', 'jade', 'knoll', 'lark',
+    'maple', 'north', 'oasis', 'pearl', 'quill', 'ridge',
+    'shore', 'thorn', 'unity', 'vale', 'wren', 'xenon',
+    'birch', 'cedar', 'delta', 'fable', 'glade', 'heron',
+    'inlet', 'junco', 'kelp', 'lotus', 'marsh', 'nook',
+    'olive', 'plume', 'quest', 'river', 'stone', 'trail',
+    'umber', 'vivid', 'wisp', 'yarrow', 'zephyr', 'bloom',
+)
+
+
+@social_bp.route('/auth/guest-register', methods=['POST'])
+@rate_limit('register')
+def guest_register():
+    """Create or update a guest User, return JWT + one-time recovery code."""
+    import secrets
+    from .auth import hash_password, generate_api_token, generate_jwt
+    from .models import GuestRecovery
+
+    data = _get_json()
+    guest_name = data.get('guest_name', '').strip()
+    device_id = data.get('device_id', '')
+    if not guest_name:
+        return _err("guest_name required")
+
+    db = get_db()
+    try:
+        # Create guest user (username = sanitised guest_name + random suffix)
+        suffix = secrets.token_hex(3)
+        username = f"guest_{guest_name.replace(' ', '_').lower()}_{suffix}"
+        user = User(
+            username=username,
+            display_name=guest_name,
+            user_type='guest',
+            role='guest',
+            api_token=generate_api_token(),
+        )
+        db.add(user)
+        db.flush()
+
+        # Generate 6-word recovery code
+        recovery_code = ' '.join(secrets.choice(_RECOVERY_WORDS) for _ in range(6))
+        gr = GuestRecovery(
+            user_id=user.id,
+            recovery_code_hash=hash_password(recovery_code),
+            device_id=device_id or None,
+        )
+        db.add(gr)
+        db.commit()
+
+        token = generate_jwt(user.id, user.username, 'guest')
+        return _ok({
+            'user': user.to_dict(),
+            'token': token,
+            'recovery_code': recovery_code,
+        }, status=201)
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Guest register failed: {e}")
+        return _err(str(e))
+    finally:
+        db.close()
+
+
+@social_bp.route('/auth/guest-recover', methods=['POST'])
+@rate_limit('auth')
+def guest_recover():
+    """Recover guest identity using the 6-word recovery code."""
+    from .auth import verify_password, generate_jwt
+    from .models import GuestRecovery
+    from datetime import datetime
+
+    data = _get_json()
+    recovery_code = data.get('recovery_code', '').strip()
+    device_id = data.get('device_id', '')
+    if not recovery_code:
+        return _err("recovery_code required")
+
+    db = get_db()
+    try:
+        rows = db.query(GuestRecovery).all()
+        for gr in rows:
+            if verify_password(recovery_code, gr.recovery_code_hash):
+                user = db.query(User).filter_by(id=gr.user_id).first()
+                if not user:
+                    continue
+                gr.last_used_at = datetime.utcnow()
+                gr.device_id = device_id or gr.device_id
+                db.commit()
+                token = generate_jwt(user.id, user.username, user.role or 'guest')
+                return _ok({'user': user.to_dict(), 'token': token})
+        return _err("Invalid recovery code", 401)
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Guest recover failed: {e}")
+        return _err(str(e))
+    finally:
+        db.close()
+
+
 # ═══════════════════════════════════════════════════════════════
 # USERS / PROFILES
 # ═══════════════════════════════════════════════════════════════
@@ -176,6 +279,36 @@ def update_user(user_id):
         return _ok(user.to_dict())
     except ValueError as e:
         return _err(str(e))
+
+
+@social_bp.route('/users/<user_id>/consent/cloud-data', methods=['PUT'])
+@require_auth
+def set_cloud_data_consent(user_id):
+    """Set or revoke consent for sharing anonymized data with cloud services.
+
+    The hive respects user autonomy: no data leaves the device for cloud
+    processing unless the user explicitly opts in. Consent can be revoked
+    at any time.
+    """
+    if g.user.id != user_id and not g.user.is_admin:
+        return _err("Can only manage your own consent", 403)
+    data = _get_json()
+    consent = bool(data.get('consent', False))
+    settings = dict(g.user.settings or {})
+    settings['cloud_data_consent'] = consent
+    g.user.settings = settings
+    g.db.flush()
+    return _ok({'cloud_data_consent': consent})
+
+
+@social_bp.route('/users/<user_id>/consent/cloud-data', methods=['GET'])
+@require_auth
+def get_cloud_data_consent(user_id):
+    """Check whether user has consented to cloud data sharing."""
+    if g.user.id != user_id and not g.user.is_admin:
+        return _err("Can only check your own consent", 403)
+    consent = bool((g.user.settings or {}).get('cloud_data_consent', False))
+    return _ok({'cloud_data_consent': consent})
 
 
 @social_bp.route('/users/<user_id>/handle', methods=['PATCH'])

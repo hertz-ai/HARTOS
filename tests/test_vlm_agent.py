@@ -117,90 +117,91 @@ class TestVLMAgentCommandExecution:
     """Test VLM agent can execute commands on user's computer"""
 
     def test_vlm_agent_execute_shell_command(self, test_user_id, test_prompt_id, mock_flask_app):
-        """Test VLM agent executes shell commands"""
-        with patch('create_recipe.os.system') as mock_system:
-            with patch('create_recipe.subprocess.run') as mock_run:
-                mock_run.return_value = Mock(returncode=0, stdout="Command executed")
-
-                # This would be called within VLM agent's tools
-                # Test that command execution works
-                result = mock_system('echo "test"')
-                assert mock_system.called or mock_run.called or True
+        """Test VLM local_computer_tool can execute file operations"""
+        from integrations.vlm.local_computer_tool import execute_action
+        import tempfile, os
+        # Test list_folders_and_files action (no pyautogui needed)
+        result = execute_action({'action': 'list_folders_and_files', 'path': '.'}, 'inprocess')
+        assert result.get('output')
+        assert 'error' not in result or not result['error']
 
     def test_vlm_agent_file_operations(self, test_user_id, test_prompt_id, tmp_path, mock_flask_app):
-        """Test VLM agent can perform file operations"""
-        test_file = tmp_path / "test.txt"
+        """Test VLM agent can perform file operations via local_computer_tool"""
+        from integrations.vlm.local_computer_tool import execute_action
 
-        with patch('create_recipe.user_agents', {
-            f"{test_user_id}_{test_prompt_id}": (
-                Mock(), Mock(), Mock(), Mock(), Mock(), Mock(), Mock()
-            )
-        }):
-            try:
-                # VLM agent should be able to create files
-                test_file.write_text("VLM created this")
-                assert test_file.exists()
+        test_file = str(tmp_path / "vlm_test.txt")
 
-                # VLM agent should be able to read files
-                content = test_file.read_text()
-                assert content == "VLM created this"
+        # Write file
+        result = execute_action({
+            'action': 'write_file', 'path': test_file, 'content': 'VLM created this'
+        }, 'inprocess')
+        assert 'Written to' in result.get('output', '')
 
-                # VLM agent should be able to delete files
-                test_file.unlink()
-                assert not test_file.exists()
-            except Exception as e:
-                pytest.fail(f"VLM file operations failed: {e}")
+        # Read file
+        result = execute_action({
+            'action': 'read_file_and_understand', 'path': test_file
+        }, 'inprocess')
+        assert 'VLM created this' in result.get('output', '')
 
     def test_vlm_agent_execute_python_code(self, test_user_id, test_prompt_id, mock_flask_app):
         """Test VLM agent can execute Python code"""
-        with patch('create_recipe.exec') as mock_exec:
-            code = "result = 2 + 2"
-            try:
-                exec(code)
-                # Should execute without error
-            except Exception as e:
-                pytest.fail(f"VLM Python code execution failed: {e}")
+        code = "result = 2 + 2"
+        try:
+            exec(code)
+        except Exception as e:
+            pytest.fail(f"VLM Python code execution failed: {e}")
 
     def test_vlm_agent_screenshot_capture(self, test_user_id, test_prompt_id, mock_flask_app):
-        """Test VLM agent can capture screenshots"""
-        with patch('create_recipe.get_frame') as mock_frame:
-            # Mock frame capture
-            fake_frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-            mock_frame.return_value = fake_frame
+        """Test VLM agent can capture screenshots via local_computer_tool"""
+        import integrations.vlm.local_computer_tool as lct
+        mock_pyautogui = MagicMock()
+        mock_img = Mock()
+        mock_img.save = Mock(side_effect=lambda buf, **kw: buf.write(b'\x89PNG' + b'\x00' * 100))
+        mock_pyautogui.screenshot.return_value = mock_img
 
-            frame = get_frame(str(test_user_id))
-            assert frame is not None
-            assert frame.shape == (480, 640, 3)
+        orig = lct.pyautogui
+        try:
+            lct.pyautogui = mock_pyautogui
+            result = lct.take_screenshot('inprocess')
+            assert isinstance(result, str)
+            assert len(result) > 0
+            mock_pyautogui.screenshot.assert_called_once()
+        finally:
+            lct.pyautogui = orig
 
     def test_vlm_agent_keyboard_mouse_input(self, test_user_id, test_prompt_id, mock_flask_app):
-        """Test VLM agent can simulate keyboard/mouse input"""
-        with patch('create_recipe.pyautogui') as mock_pyautogui:
-            # This would be part of VLM agent's computer use capability
-            # Test keyboard input
-            mock_pyautogui.typewrite.return_value = None
-            mock_pyautogui.click.return_value = None
+        """Test VLM agent can simulate keyboard/mouse input via local_computer_tool"""
+        import integrations.vlm.local_computer_tool as lct
+        mock_pyautogui = MagicMock()
 
-            try:
-                mock_pyautogui.typewrite("test")
-                mock_pyautogui.click(100, 100)
-            except Exception as e:
-                pytest.fail(f"VLM keyboard/mouse simulation failed: {e}")
+        orig = lct.pyautogui
+        try:
+            lct.pyautogui = mock_pyautogui
+            # Test click
+            result = lct.execute_action({'action': 'left_click', 'coordinate': [100, 200]}, 'inprocess')
+            mock_pyautogui.click.assert_called_once_with(100, 200)
+            assert 'Clicked' in result.get('output', '')
+
+            # Test key press
+            result = lct.execute_action({'action': 'key', 'text': 'enter'}, 'inprocess')
+            mock_pyautogui.press.assert_called_once_with('enter')
+        finally:
+            lct.pyautogui = orig
 
     def test_vlm_agent_window_manipulation(self, test_user_id, test_prompt_id, mock_flask_app):
-        """Test VLM agent can manipulate windows"""
-        with patch('create_recipe.pygetwindow') as mock_window:
-            # Mock window operations
-            mock_win = Mock()
-            mock_win.title = "Test Window"
-            mock_win.activate = Mock()
-            mock_window.getWindowsWithTitle.return_value = [mock_win]
+        """Test VLM agent can execute wait and hotkey actions"""
+        import integrations.vlm.local_computer_tool as lct
+        mock_pyautogui = MagicMock()
 
-            try:
-                windows = mock_window.getWindowsWithTitle("Test")
-                if windows:
-                    windows[0].activate()
-            except Exception as e:
-                pytest.fail(f"VLM window manipulation failed: {e}")
+        orig = lct.pyautogui
+        try:
+            lct.pyautogui = mock_pyautogui
+            # Test hotkey (e.g. alt+tab for window switching)
+            result = lct.execute_action({'action': 'hotkey', 'text': 'alt+tab'}, 'inprocess')
+            mock_pyautogui.hotkey.assert_called_once_with('alt', 'tab')
+            assert 'Hotkey' in result.get('output', '')
+        finally:
+            lct.pyautogui = orig
 
 
 class TestVLMVisualContextQA:
@@ -366,10 +367,11 @@ class TestVLMAgentIntegration:
                             pass
 
     def test_vlm_frame_retrieval_from_redis(self, test_user_id, mock_flask_app):
-        """Test retrieving video frame from Redis"""
+        """Test retrieving video frame from Redis (FrameStore miss → Redis fallback)"""
         import pickle
 
-        with patch('create_recipe.redis_client') as mock_redis:
+        with patch('helper.redis_client') as mock_redis, \
+             patch('langchain_gpt_api.get_vision_service', return_value=None):
             # Mock serialized frame
             fake_frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
             serialized = pickle.dumps(fake_frame)
@@ -381,7 +383,8 @@ class TestVLMAgentIntegration:
 
     def test_vlm_frame_retrieval_no_frame(self, test_user_id, mock_flask_app):
         """Test frame retrieval when no frame is available"""
-        with patch('create_recipe.redis_client') as mock_redis:
+        with patch('helper.redis_client') as mock_redis, \
+             patch('langchain_gpt_api.get_vision_service', return_value=None):
             mock_redis.get.return_value = None
 
             frame = get_frame(str(test_user_id))
