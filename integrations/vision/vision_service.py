@@ -25,6 +25,7 @@ import requests
 
 from .frame_store import FrameStore, compute_frame_difference, decode_jpeg
 from .minicpm_installer import MiniCPMInstaller
+from .lightweight_backend import get_vision_backend, VisionBackend
 
 logger = logging.getLogger('hevolve_vision')
 
@@ -73,6 +74,9 @@ class VisionService:
         self._max_failures = 5
         self._circuit_open = False
 
+        # Lightweight vision backend (auto-selected when MiniCPM unavailable)
+        self._vision_backend: Optional[VisionBackend] = None
+
         # Intelligent sampling state (per-user)
         self._last_described_frame: Dict[str, np.ndarray] = {}  # user_id → numpy
         self._user_intervals: Dict[str, float] = {}  # user_id → current interval
@@ -82,28 +86,62 @@ class VisionService:
 
     # ─── Public API ───
 
-    def start(self):
-        """Start the vision pipeline (non-blocking)."""
+    def start(self, mode: str = 'auto'):
+        """Start the vision pipeline (non-blocking).
+
+        Args:
+            mode: 'full' (MiniCPM+WS+desc), 'lite' (lightweight backend+WS+desc),
+                  'headless' (FrameStore only), 'auto' (detect from hardware tier).
+        """
         if self._running:
             logger.warning("VisionService already running")
             return
 
         self._running = True
 
-        if not self._installer.is_installed():
-            if self._installer.detect_gpu():
-                logger.info("MiniCPM not installed — downloading...")
-                self._installer.install()
-            else:
-                logger.warning("No GPU — vision sidecar will not start")
-                self._running = False
+        # Auto-detect mode from hardware tier
+        if mode == 'auto':
+            mode = self._detect_mode()
+
+        if mode == 'headless':
+            logger.info("VisionService started in headless mode (FrameStore only)")
+            return
+
+        if mode == 'lite':
+            # Use lightweight CPU backend instead of MiniCPM sidecar
+            self._vision_backend = get_vision_backend()
+            if self._vision_backend.name == 'none':
+                logger.warning("No vision backend available — headless mode")
                 return
+            if not self._vision_backend.start():
+                logger.warning(f"Failed to start {self._vision_backend.name} — headless mode")
+                self._vision_backend = None
+                return
+            logger.info(f"Vision backend: {self._vision_backend.name} "
+                        f"(RAM: {self._vision_backend.ram_mb}MB)")
+        else:
+            # Full mode — MiniCPM sidecar
+            if not self._installer.is_installed():
+                if self._installer.detect_gpu():
+                    logger.info("MiniCPM not installed — downloading...")
+                    self._installer.install()
+                else:
+                    # Fall back to lightweight backend
+                    logger.info("No GPU — trying lightweight vision backend")
+                    self._vision_backend = get_vision_backend()
+                    if self._vision_backend.name != 'none':
+                        self._vision_backend.start()
+                        logger.info(f"Fell back to {self._vision_backend.name} backend")
+                    else:
+                        logger.warning("No vision backend available — headless mode")
+                        self._vision_backend = None
+                        return
 
-        self._start_minicpm()
-
-        # Register atexit handler to prevent orphan subprocess on crash
-        import atexit
-        atexit.register(self._cleanup_subprocess)
+            if self._vision_backend is None:
+                self._start_minicpm()
+                # Register atexit handler to prevent orphan subprocess on crash
+                import atexit
+                atexit.register(self._cleanup_subprocess)
 
         self._ws_thread = threading.Thread(
             target=self._run_ws_server, daemon=True, name='vision-ws',
@@ -115,7 +153,23 @@ class VisionService:
         )
         self._desc_thread.start()
 
-        logger.info("VisionService started (adaptive sampling enabled)")
+        backend_name = self._vision_backend.name if self._vision_backend else 'minicpm'
+        logger.info(f"VisionService started (backend={backend_name}, adaptive sampling)")
+
+    def _detect_mode(self) -> str:
+        """Detect vision mode from hardware tier."""
+        try:
+            from security.system_requirements import get_capabilities
+            caps = get_capabilities()
+            tier = getattr(caps, 'tier_name', '').lower()
+            if tier == 'embedded':
+                return 'headless'
+            elif tier in ('observer', 'lite'):
+                return 'lite'
+            else:
+                return 'full'
+        except Exception:
+            return 'full'
 
     def _cleanup_subprocess(self):
         """atexit handler — ensures MiniCPM subprocess is killed on exit."""
@@ -140,6 +194,10 @@ class VisionService:
                 self._minicpm_process.kill()
             self._minicpm_process = None
             logger.info("MiniCPM sidecar stopped")
+        if self._vision_backend is not None:
+            self._vision_backend.stop()
+            logger.info(f"Vision backend {self._vision_backend.name} stopped")
+            self._vision_backend = None
         logger.info(
             f"VisionService stopped (described={self._frames_described}, "
             f"skipped={self._frames_skipped})"
@@ -228,9 +286,12 @@ class VisionService:
 
     def get_status(self) -> Dict:
         """Return service status for health dashboards."""
-        minicpm_alive = self._check_minicpm_health()
+        backend_name = self._vision_backend.name if self._vision_backend else 'minicpm'
+        minicpm_alive = (self._check_minicpm_health()
+                         if self._vision_backend is None else False)
         return {
             'running': self._running,
+            'backend': backend_name,
             'minicpm_alive': minicpm_alive,
             'minicpm_port': self._minicpm_port,
             'ws_port': self._ws_port,
@@ -518,9 +579,19 @@ class VisionService:
         self, user_id: str, frame_bytes: bytes,
         prompt: str = 'describe what the user is doing in 20 words',
     ) -> Optional[str]:
-        """Send frame to MiniCPM /describe endpoint and return text."""
+        """Describe a frame using the active backend (MiniCPM or lightweight)."""
         if self._circuit_open:
             return None
+
+        # Use lightweight backend if available
+        if self._vision_backend is not None:
+            try:
+                return self._vision_backend.describe(frame_bytes)
+            except Exception as e:
+                logger.debug(f"Lightweight backend error: {e}")
+                return None
+
+        # MiniCPM sidecar path
         try:
             r = requests.post(
                 f'http://localhost:{self._minicpm_port}/describe',
@@ -567,10 +638,11 @@ class VisionService:
         """Feed scene descriptions to world model for continuous learning."""
         try:
             from integrations.agent_engine.world_model_bridge import get_world_model_bridge
+            model_id = self._vision_backend.name if self._vision_backend else 'minicpm-v2'
             get_world_model_bridge().record_interaction(
                 user_id=user_id, prompt_id=f'vision_{channel}',
                 prompt=f'[{channel}] describe what you see',
-                response=description, model_id='minicpm-v2')
+                response=description, model_id=model_id)
         except Exception:
             pass
 

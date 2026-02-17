@@ -265,3 +265,164 @@ class TestBackendProperties:
             if not backend.requires_gpu:
                 assert backend.ram_mb <= 1000, \
                     f"{name}: CPU backend claiming > 1GB RAM"
+
+
+class TestVisionServiceBackendIntegration:
+    """Verify VisionService uses lightweight backends when MiniCPM unavailable."""
+
+    def test_detect_mode_embedded(self):
+        """EMBEDDED tier → headless mode."""
+        from integrations.vision.vision_service import VisionService
+        svc = VisionService.__new__(VisionService)
+        mock_caps = MagicMock()
+        mock_caps.tier_name = 'embedded'
+        with patch('security.system_requirements.get_capabilities',
+                   return_value=mock_caps):
+            assert svc._detect_mode() == 'headless'
+
+    def test_detect_mode_lite(self):
+        """LITE tier → lite mode."""
+        from integrations.vision.vision_service import VisionService
+        svc = VisionService.__new__(VisionService)
+        mock_caps = MagicMock()
+        mock_caps.tier_name = 'lite'
+        with patch('security.system_requirements.get_capabilities',
+                   return_value=mock_caps):
+            assert svc._detect_mode() == 'lite'
+
+    def test_detect_mode_standard(self):
+        """STANDARD tier → full mode."""
+        from integrations.vision.vision_service import VisionService
+        svc = VisionService.__new__(VisionService)
+        mock_caps = MagicMock()
+        mock_caps.tier_name = 'standard'
+        with patch('security.system_requirements.get_capabilities',
+                   return_value=mock_caps):
+            assert svc._detect_mode() == 'full'
+
+    def test_detect_mode_fallback(self):
+        """If detection fails → full mode."""
+        from integrations.vision.vision_service import VisionService
+        svc = VisionService.__new__(VisionService)
+        with patch('security.system_requirements.get_capabilities',
+                   side_effect=Exception("no caps")):
+            assert svc._detect_mode() == 'full'
+
+    def test_headless_mode_starts_no_threads(self):
+        """Headless mode only initializes FrameStore, no threads."""
+        from integrations.vision.vision_service import VisionService
+        from integrations.vision.frame_store import FrameStore
+        svc = VisionService.__new__(VisionService)
+        svc._running = False
+        svc._ws_thread = None
+        svc._desc_thread = None
+        svc._vision_backend = None
+        svc.store = FrameStore()
+        svc.start(mode='headless')
+        assert svc._running is True
+        assert svc._ws_thread is None
+        assert svc._desc_thread is None
+
+    def test_describe_frame_uses_lightweight_backend(self):
+        """When _vision_backend is set, _describe_frame() uses it."""
+        from integrations.vision.vision_service import VisionService
+        svc = VisionService.__new__(VisionService)
+        svc._circuit_open = False
+        mock_backend = MagicMock()
+        mock_backend.describe.return_value = 'A robot arm moving'
+        svc._vision_backend = mock_backend
+        result = svc._describe_frame('user1', b'fake_jpeg')
+        assert result == 'A robot arm moving'
+        mock_backend.describe.assert_called_once_with(b'fake_jpeg')
+
+    def test_describe_frame_minicpm_path(self):
+        """When _vision_backend is None, uses MiniCPM HTTP."""
+        import integrations.vision.vision_service as vs_mod
+        from integrations.vision.vision_service import VisionService
+        svc = VisionService.__new__(VisionService)
+        svc._circuit_open = False
+        svc._vision_backend = None
+        svc._minicpm_port = 9891
+        svc._consecutive_failures = 0
+        svc._max_failures = 5
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {'result': 'User typing on keyboard'}
+        with patch.object(vs_mod.requests, 'post', return_value=mock_resp):
+            result = svc._describe_frame('user1', b'fake_jpeg')
+            assert result == 'User typing on keyboard'
+
+    def test_get_status_includes_backend(self):
+        """get_status() includes active backend name."""
+        from integrations.vision.vision_service import VisionService
+        svc = VisionService.__new__(VisionService)
+        svc._running = True
+        svc._circuit_open = False
+        svc._consecutive_failures = 0
+        svc._frames_described = 10
+        svc._frames_skipped = 5
+        svc._minicpm_port = 9891
+        svc._ws_port = 5460
+        svc._trigger_manager = None
+        svc._installer = MagicMock()
+        svc._installer.get_status.return_value = {}
+        svc.store = MagicMock()
+        svc.store.stats.return_value = {}
+
+        mock_backend = MagicMock()
+        mock_backend.name = 'mobilevlm'
+        svc._vision_backend = mock_backend
+        status = svc.get_status()
+        assert status['backend'] == 'mobilevlm'
+
+    def test_stop_cleans_up_backend(self):
+        """stop() calls backend.stop() and clears it."""
+        from integrations.vision.vision_service import VisionService
+        svc = VisionService.__new__(VisionService)
+        svc._running = True
+        svc._minicpm_process = None
+        svc._frames_described = 0
+        svc._frames_skipped = 0
+        mock_backend = MagicMock()
+        mock_backend.name = 'clip'
+        svc._vision_backend = mock_backend
+        svc.stop()
+        mock_backend.stop.assert_called_once()
+        assert svc._vision_backend is None
+        assert svc._running is False
+
+
+class TestModelRegistryVisionLite:
+    """Verify mobilevlm-1.7b-onnx registration in ModelRegistry."""
+
+    def test_mobilevlm_registered_when_enabled(self):
+        """HEVOLVE_VISION_LITE_ENABLED=true → mobilevlm in registry."""
+        with patch.dict(os.environ, {'HEVOLVE_VISION_LITE_ENABLED': 'true'}):
+            from integrations.agent_engine.model_registry import (
+                ModelRegistry, ModelBackend, ModelTier,
+            )
+            reg = ModelRegistry()
+            reg.register(ModelBackend(
+                model_id='mobilevlm-1.7b-onnx',
+                display_name='MobileVLM 1.7B (ONNX CPU)',
+                tier=ModelTier.FAST,
+                config_list_entry={'model': 'mobilevlm-1.7b', 'api_key': 'local',
+                                   'base_url': 'local://onnxruntime', 'price': [0, 0]},
+                avg_latency_ms=500.0, accuracy_score=0.45,
+                cost_per_1k_tokens=0.0, is_local=True,
+                hardware_dependent=True, gpu_tdp_watts=0.0,
+            ))
+            model = reg.get_model('mobilevlm-1.7b-onnx')
+            assert model is not None
+            assert model.tier == ModelTier.FAST
+            assert model.is_local is True
+            assert model.gpu_tdp_watts == 0.0
+
+    def test_mobilevlm_is_fast_tier(self):
+        from integrations.agent_engine.model_registry import ModelBackend, ModelTier
+        mb = ModelBackend(
+            model_id='mobilevlm-1.7b-onnx',
+            display_name='MobileVLM', tier=ModelTier.FAST,
+            config_list_entry={}, gpu_tdp_watts=0.0,
+        )
+        assert mb.tier == ModelTier.FAST

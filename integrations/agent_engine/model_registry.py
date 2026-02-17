@@ -305,6 +305,26 @@ def _register_defaults():
             hardware_dependent=True,
         ))
 
+    # 7. MobileVLM ONNX (fast — lightweight CPU vision for embedded/lite tiers)
+    if os.environ.get('HEVOLVE_VISION_LITE_ENABLED', '').lower() == 'true':
+        model_registry.register(ModelBackend(
+            model_id='mobilevlm-1.7b-onnx',
+            display_name='MobileVLM 1.7B (ONNX CPU)',
+            tier=ModelTier.FAST,
+            config_list_entry={
+                'model': 'mobilevlm-1.7b',
+                'api_key': 'local',
+                'base_url': 'local://onnxruntime',
+                'price': [0, 0],
+            },
+            avg_latency_ms=500.0,
+            accuracy_score=0.45,
+            cost_per_1k_tokens=0.0,
+            is_local=True,
+            hardware_dependent=True,
+            gpu_tdp_watts=0.0,  # CPU-only, no GPU power draw
+        ))
+
     logger.info(f"ModelRegistry: {len(model_registry._models)} backends registered")
 
 
