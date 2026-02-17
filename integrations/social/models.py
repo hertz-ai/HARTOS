@@ -61,6 +61,7 @@ def get_engine():
             @event.listens_for(_engine, "connect")
             def _set_sqlite_wal(dbapi_connection, connection_record):
                 cursor = dbapi_connection.cursor()
+                cursor.execute("PRAGMA busy_timeout=5000")
                 result = cursor.execute("PRAGMA journal_mode=WAL").fetchone()
                 if result and result[0].lower() != 'wal':
                     import logging
