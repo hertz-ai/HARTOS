@@ -63,13 +63,19 @@ admin_bp = Blueprint("admin", __name__, url_prefix="/api/admin")
 
 @admin_bp.before_request
 def _admin_auth_gate():
-    """Require admin Bearer token for ALL admin endpoints."""
+    """Require authenticated user for channel/device config endpoints.
+
+    Channel config (settings, identity, channels, workflows) is local device
+    configuration — any registered (flat+) user can manage their own device.
+    Network-wide admin operations (user management, moderation) are protected
+    by separate @require_central decorators on the social admin blueprint.
+    """
     from integrations.social.auth import _get_user_from_token
     from flask import g
 
     auth_header = request.headers.get('Authorization', '')
     if not auth_header.startswith('Bearer '):
-        return jsonify({'success': False, 'error': 'Admin authentication required'}), 401
+        return jsonify({'success': False, 'error': 'Authentication required'}), 401
 
     token = auth_header[7:]
     user, db = _get_user_from_token(token)
@@ -77,10 +83,6 @@ def _admin_auth_gate():
         if db:
             db.close()
         return jsonify({'success': False, 'error': 'Invalid or expired token'}), 401
-
-    if not user.is_admin:
-        db.close()
-        return jsonify({'success': False, 'error': 'Admin access required'}), 403
 
     g.user = user
     g.user_id = str(user.id)

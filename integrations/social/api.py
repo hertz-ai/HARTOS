@@ -17,7 +17,12 @@ from .feed_engine import (
     get_personalized_feed, get_global_feed, get_trending_feed, get_agent_feed
 )
 from .karma_engine import recalculate_karma, get_karma_breakdown
-from .models import get_db, Post, Comment, User, Community, TaskRequest, Report, AgentSkillBadge
+from .models import (
+    get_db, Post, Comment, User, Community, TaskRequest, Report, AgentSkillBadge,
+    AdUnit, AdImpression, APIUsageLog, CommercialAPIKey,
+    AgentGoal, Boost, Campaign, AgentEvolution, AgentCollaboration,
+    ResonanceTransaction, HostingReward,
+)
 from .schemas import APIResponse, PaginationMeta
 from sqlalchemy.orm import joinedload
 
@@ -1401,6 +1406,239 @@ def platform_stats():
         'total_humans': total_humans, 'total_posts': total_posts,
         'total_comments': total_comments, 'total_communities': total_communities,
         'pending_reports': pending_reports,
+    })
+
+
+@social_bp.route('/admin/revenue-analytics', methods=['GET'])
+@require_admin
+def admin_revenue_analytics():
+    """Revenue & usage analytics for central admin dashboard."""
+    from sqlalchemy import func as sqlfunc, case
+    from datetime import datetime, timedelta
+
+    days = min(int(request.args.get('days', 30)), 365)
+    since = datetime.utcnow() - timedelta(days=days)
+
+    # ── 1. OVERVIEW TOTALS ──
+    total_ad_revenue = g.db.query(
+        sqlfunc.coalesce(sqlfunc.sum(AdUnit.spent_spark), 0)
+    ).scalar()
+    total_ad_impressions = g.db.query(
+        sqlfunc.coalesce(sqlfunc.sum(AdUnit.impression_count), 0)
+    ).scalar()
+    total_ad_clicks = g.db.query(
+        sqlfunc.coalesce(sqlfunc.sum(AdUnit.click_count), 0)
+    ).scalar()
+
+    total_compute_cost = g.db.query(
+        sqlfunc.coalesce(sqlfunc.sum(APIUsageLog.cost_credits), 0)
+    ).scalar()
+    total_tokens_in = g.db.query(
+        sqlfunc.coalesce(sqlfunc.sum(APIUsageLog.tokens_in), 0)
+    ).scalar()
+    total_tokens_out = g.db.query(
+        sqlfunc.coalesce(sqlfunc.sum(APIUsageLog.tokens_out), 0)
+    ).scalar()
+    total_compute_ms = g.db.query(
+        sqlfunc.coalesce(sqlfunc.sum(APIUsageLog.compute_ms), 0)
+    ).scalar()
+
+    agent_goal_spent = g.db.query(
+        sqlfunc.coalesce(sqlfunc.sum(AgentGoal.spark_spent), 0)
+    ).scalar()
+    boost_spent = g.db.query(
+        sqlfunc.coalesce(sqlfunc.sum(Boost.spark_spent), 0)
+    ).scalar()
+    campaign_spent = g.db.query(
+        sqlfunc.coalesce(sqlfunc.sum(Campaign.spark_spent), 0)
+    ).scalar()
+    total_agent_spark_spent = agent_goal_spent + boost_spent + campaign_spent
+
+    active_agents = g.db.query(sqlfunc.count(User.id)).filter(
+        User.user_type == 'agent', User.is_banned == False,
+    ).scalar()
+
+    hosting_total = g.db.query(
+        sqlfunc.coalesce(sqlfunc.sum(HostingReward.amount), 0)
+    ).scalar()
+
+    # ── 2. TIME SERIES (daily buckets) ──
+    ad_daily = g.db.query(
+        sqlfunc.date(AdImpression.created_at).label('day'),
+        sqlfunc.count(case(
+            (AdImpression.impression_type == 'view', 1),
+        )).label('views'),
+        sqlfunc.count(case(
+            (AdImpression.impression_type == 'click', 1),
+        )).label('clicks'),
+    ).filter(
+        AdImpression.created_at >= since,
+    ).group_by(
+        sqlfunc.date(AdImpression.created_at)
+    ).order_by(sqlfunc.date(AdImpression.created_at)).all()
+
+    compute_daily = g.db.query(
+        sqlfunc.date(APIUsageLog.created_at).label('day'),
+        sqlfunc.coalesce(sqlfunc.sum(APIUsageLog.cost_credits), 0).label('cost'),
+        sqlfunc.coalesce(sqlfunc.sum(APIUsageLog.tokens_in + APIUsageLog.tokens_out), 0).label('tokens'),
+        sqlfunc.count(APIUsageLog.id).label('requests'),
+    ).filter(
+        APIUsageLog.created_at >= since,
+    ).group_by(
+        sqlfunc.date(APIUsageLog.created_at)
+    ).order_by(sqlfunc.date(APIUsageLog.created_at)).all()
+
+    spark_daily = g.db.query(
+        sqlfunc.date(ResonanceTransaction.created_at).label('day'),
+        sqlfunc.coalesce(sqlfunc.sum(
+            case(
+                (ResonanceTransaction.amount < 0, sqlfunc.abs(ResonanceTransaction.amount)),
+                else_=0
+            )
+        ), 0).label('spark_spent'),
+    ).filter(
+        ResonanceTransaction.created_at >= since,
+        ResonanceTransaction.currency == 'spark',
+        ResonanceTransaction.source_type.in_(['boost', 'campaign', 'spend']),
+    ).group_by(
+        sqlfunc.date(ResonanceTransaction.created_at)
+    ).order_by(sqlfunc.date(ResonanceTransaction.created_at)).all()
+
+    # ── 3. PER-USER REVENUE TABLE ──
+    ad_per_user = g.db.query(
+        AdUnit.advertiser_id.label('user_id'),
+        sqlfunc.coalesce(sqlfunc.sum(AdUnit.spent_spark), 0).label('ad_revenue'),
+        sqlfunc.count(AdUnit.id).label('ad_count'),
+    ).group_by(AdUnit.advertiser_id).subquery()
+
+    compute_per_user = g.db.query(
+        CommercialAPIKey.user_id.label('user_id'),
+        sqlfunc.coalesce(sqlfunc.sum(APIUsageLog.cost_credits), 0).label('compute_cost'),
+        sqlfunc.coalesce(sqlfunc.sum(APIUsageLog.tokens_in + APIUsageLog.tokens_out), 0).label('total_tokens'),
+    ).join(
+        APIUsageLog, APIUsageLog.api_key_id == CommercialAPIKey.id
+    ).group_by(CommercialAPIKey.user_id).subquery()
+
+    agents_owned_sq = g.db.query(
+        User.owner_id.label('user_id'),
+        sqlfunc.count(User.id).label('agents_owned'),
+    ).filter(
+        User.user_type == 'agent', User.owner_id.isnot(None),
+    ).group_by(User.owner_id).subquery()
+
+    goal_per_user = g.db.query(
+        AgentGoal.owner_id.label('user_id'),
+        sqlfunc.coalesce(sqlfunc.sum(AgentGoal.spark_spent), 0).label('goal_spark'),
+    ).group_by(AgentGoal.owner_id).subquery()
+
+    user_rows = g.db.query(
+        User.id, User.username, User.display_name, User.avatar_url,
+        ad_per_user.c.ad_revenue, ad_per_user.c.ad_count,
+        compute_per_user.c.compute_cost, compute_per_user.c.total_tokens,
+        agents_owned_sq.c.agents_owned, goal_per_user.c.goal_spark,
+    ).outerjoin(
+        ad_per_user, User.id == ad_per_user.c.user_id
+    ).outerjoin(
+        compute_per_user, User.id == compute_per_user.c.user_id
+    ).outerjoin(
+        agents_owned_sq, User.id == agents_owned_sq.c.user_id
+    ).outerjoin(
+        goal_per_user, User.id == goal_per_user.c.user_id
+    ).filter(User.user_type == 'human').order_by(
+        sqlfunc.coalesce(ad_per_user.c.ad_revenue, 0).desc()
+    ).limit(100).all()
+
+    per_user_table = []
+    for row in user_rows:
+        ad_rev = row.ad_revenue or 0
+        comp = row.compute_cost or 0
+        owned = row.agents_owned or 0
+        goal_s = row.goal_spark or 0
+        if ad_rev or comp or owned or goal_s:
+            per_user_table.append({
+                'user_id': row.id, 'username': row.username,
+                'display_name': row.display_name, 'avatar_url': row.avatar_url,
+                'ad_revenue': ad_rev, 'ad_count': row.ad_count or 0,
+                'compute_cost': round(comp, 4), 'total_tokens': row.total_tokens or 0,
+                'agents_owned': owned, 'goal_spark_spent': goal_s,
+            })
+
+    # ── 4. AGENT OWNERSHIP PANEL ──
+    top_owners = g.db.query(User.id, User.username).filter(
+        User.user_type == 'human',
+    ).outerjoin(
+        agents_owned_sq, User.id == agents_owned_sq.c.user_id
+    ).order_by(
+        sqlfunc.coalesce(agents_owned_sq.c.agents_owned, 0).desc()
+    ).limit(20).all()
+
+    ownership_panel = []
+    for owner in top_owners:
+        owned_list = g.db.query(
+            User.id, User.username, User.display_name, User.agent_id,
+        ).filter(User.owner_id == owner.id, User.user_type == 'agent').all()
+
+        owned_details = []
+        for a in owned_list:
+            evo = g.db.query(AgentEvolution).filter(AgentEvolution.user_id == a.id).first()
+            skill_count = g.db.query(sqlfunc.count(AgentSkillBadge.id)).filter(
+                AgentSkillBadge.user_id == a.id
+            ).scalar()
+            owned_details.append({
+                'agent_id': a.id, 'username': a.username,
+                'display_name': a.display_name, 'prompt_id': a.agent_id,
+                'total_tasks': evo.total_tasks if evo else 0,
+                'evolution_xp': evo.evolution_xp if evo else 0,
+                'skill_count': skill_count or 0,
+            })
+
+        collabs = g.db.query(
+            AgentCollaboration.agent_b_id.label('agent_id'),
+            sqlfunc.count(AgentCollaboration.id).label('collab_count'),
+        ).filter(
+            AgentCollaboration.agent_a_id == owner.id
+        ).group_by(AgentCollaboration.agent_b_id).limit(10).all()
+
+        external_agents = []
+        for c in collabs:
+            agent_user = g.db.query(User.id, User.username, User.display_name, User.owner_id).filter(
+                User.id == c.agent_id
+            ).first()
+            if agent_user and str(agent_user.owner_id) != str(owner.id):
+                external_agents.append({
+                    'agent_id': agent_user.id, 'username': agent_user.username,
+                    'display_name': agent_user.display_name, 'collab_count': c.collab_count,
+                })
+
+        if owned_details or external_agents:
+            ownership_panel.append({
+                'user_id': owner.id, 'username': owner.username,
+                'owned_agents': owned_details, 'external_agents_used': external_agents,
+            })
+
+    return _ok({
+        'overview': {
+            'total_ad_revenue': total_ad_revenue,
+            'total_ad_impressions': total_ad_impressions,
+            'total_ad_clicks': total_ad_clicks,
+            'total_compute_cost': round(float(total_compute_cost), 4),
+            'total_tokens_in': total_tokens_in,
+            'total_tokens_out': total_tokens_out,
+            'total_compute_ms': total_compute_ms,
+            'total_agent_spark_spent': total_agent_spark_spent,
+            'agent_goal_spent': agent_goal_spent,
+            'boost_spent': boost_spent,
+            'campaign_spent': campaign_spent,
+            'active_agents': active_agents,
+            'hosting_rewards_total': round(float(hosting_total), 2),
+        },
+        'time_series': {
+            'ad_daily': [{'day': str(r.day), 'views': r.views, 'clicks': r.clicks} for r in ad_daily],
+            'compute_daily': [{'day': str(r.day), 'cost': round(float(r.cost), 4), 'tokens': r.tokens, 'requests': r.requests} for r in compute_daily],
+            'spark_daily': [{'day': str(r.day), 'spark_spent': round(float(r.spark_spent), 2)} for r in spark_daily],
+        },
+        'per_user': per_user_table,
+        'ownership': ownership_panel,
     })
 
 
