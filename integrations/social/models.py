@@ -2452,3 +2452,44 @@ class RegionalHostRequest(Base):
             'approved_by': self.approved_by,
             'rejected_reason': self.rejected_reason,
         }
+
+
+# ═══════════════════════════════════════════════════════════════
+# Fleet Command (v26) — Queen Bee Authority
+# ═══════════════════════════════════════════════════════════════
+
+class FleetCommand(Base):
+    """Commands pushed by central (queen bee) to fleet nodes.
+
+    Central has instant, total authority. Commands are signed with the
+    issuer's certificate and verified by the target before execution.
+    """
+    __tablename__ = 'fleet_commands'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    target_node_id = Column(String(64), nullable=False, index=True)
+    cmd_type = Column(String(30), nullable=False)
+    params_json = Column(Text, nullable=True)
+    issued_by = Column(String(64), nullable=False)
+    signature = Column(Text, nullable=True)
+    status = Column(String(20), default='pending', index=True)
+    result_message = Column(Text, nullable=True)
+    created_at = Column(Float, default=lambda: __import__('time').time())
+    delivered_at = Column(Float, nullable=True)
+    completed_at = Column(Float, nullable=True)
+
+    def to_dict(self):
+        import json as _json
+        return {
+            'id': self.id,
+            'target_node_id': self.target_node_id,
+            'cmd_type': self.cmd_type,
+            'params': _json.loads(self.params_json) if self.params_json else {},
+            'issued_by': self.issued_by,
+            'signature': self.signature,
+            'status': self.status,
+            'result_message': self.result_message,
+            'created_at': self.created_at,
+            'delivered_at': self.delivered_at,
+            'completed_at': self.completed_at,
+        }

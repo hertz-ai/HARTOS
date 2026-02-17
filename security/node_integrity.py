@@ -130,17 +130,83 @@ def verify_json_signature(public_key_hex: str, payload: dict,
 
 def compute_code_hash(code_root: str = None) -> str:
     """Compute SHA-256 manifest hash of all .py files in the project.
-    Deterministic across identical deployments."""
-    root = Path(code_root or _CODE_ROOT)
-    manifest_lines = []
 
+    Deterministic across identical deployments.
+
+    Performance modes for embedded/resource-constrained devices:
+        HEVOLVE_CODE_HASH_PRECOMPUTED: Skip computation entirely (ROM/SD card).
+            Set at build time from a known-good hash.
+        File cache (agent_data/code_hash_cache.json): Reuse cached hash if
+            no .py file has a newer mtime than the cache timestamp.
+    """
+    # Tier 1: Precomputed hash (ROM/read-only deployments)
+    precomputed = os.environ.get('HEVOLVE_CODE_HASH_PRECOMPUTED', '')
+    if precomputed:
+        logger.debug(f"Code hash: using precomputed {precomputed[:16]}...")
+        return precomputed
+
+    root = Path(code_root or _CODE_ROOT)
+
+    # Tier 2: File-based cache (skip recompute if .py files unchanged)
+    cached = _load_code_hash_cache(root)
+    if cached:
+        return cached
+
+    # Tier 3: Full computation
+    manifest_lines = []
     py_files = sorted(_collect_py_files(root, root))
     for rel_path, file_path in py_files:
         file_hash = _hash_file(file_path)
         manifest_lines.append(f"{rel_path}:{file_hash}")
 
     manifest = '\n'.join(manifest_lines)
-    return hashlib.sha256(manifest.encode('utf-8')).hexdigest()
+    result = hashlib.sha256(manifest.encode('utf-8')).hexdigest()
+
+    # Save to cache for next boot
+    _save_code_hash_cache(root, result)
+
+    return result
+
+
+def _load_code_hash_cache(root: Path) -> Optional[str]:
+    """Load cached code hash if no .py file has changed since cache was written."""
+    cache_path = root / 'agent_data' / 'code_hash_cache.json'
+    try:
+        if not cache_path.exists():
+            return None
+        with open(cache_path, 'r') as f:
+            cache = json.load(f)
+        cached_hash = cache.get('code_hash', '')
+        cached_at = cache.get('cached_at', 0)
+        if not cached_hash or not cached_at:
+            return None
+
+        # Check if any .py file is newer than the cache
+        for _, file_path in _collect_py_files(root, root):
+            try:
+                if file_path.stat().st_mtime > cached_at:
+                    logger.debug("Code hash cache stale: .py file modified")
+                    return None
+            except OSError:
+                continue
+
+        logger.debug(f"Code hash: using cache {cached_hash[:16]}...")
+        return cached_hash
+    except (json.JSONDecodeError, OSError, KeyError):
+        return None
+
+
+def _save_code_hash_cache(root: Path, code_hash: str):
+    """Save code hash to file cache for faster subsequent boots."""
+    import time
+    cache_path = root / 'agent_data' / 'code_hash_cache.json'
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_path, 'w') as f:
+            json.dump({'code_hash': code_hash, 'cached_at': time.time()}, f)
+    except (OSError, IOError) as e:
+        # Read-only FS — silently skip
+        logger.debug(f"Code hash cache write skipped: {e}")
 
 
 def compute_file_manifest(code_root: str = None) -> Dict[str, str]:

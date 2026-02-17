@@ -6,7 +6,7 @@ actual hardware capabilities and auto-configure features to match what this
 node can sustain.
 
 Philosophy:
-    Every node is net-positive.  A Raspberry Pi running gossip + audit matters.
+    Every node is net-positive.  A Raspberry Pi Zero running gossip matters.
     A 64-core GPU server generating video matters.  The system finds equilibrium:
     each node auto-adapts to what it can sustain, and the network as a whole is
     always net positive.  No node is punished for being small.  No node is
@@ -14,7 +14,8 @@ Philosophy:
 
 Contribution Tiers (what you CAN contribute, not what you're excluded from):
 
-    OBSERVER      -  < 2 cores / < 4 GB — gossip-only, audit witness
+    EMBEDDED      -  Any device that can run Python — sensors, GPIO, serial, MQTT bridge
+    OBSERVER      -  < 2 cores / < 4 GB — gossip-only, audit witness, Flask server
     LITE          -  2 cores,  4 GB RAM,   1 GB disk — chat + gossip + audit
     STANDARD      -  4 cores,  8 GB RAM,  10 GB disk — + TTS, Whisper, agents
     FULL          -  8 cores, 16 GB RAM,  50 GB disk, 8 GB VRAM — + video, media, local 7B LLM
@@ -22,6 +23,7 @@ Contribution Tiers (what you CAN contribute, not what you're excluded from):
 
 Mathematical Derivation (from vram_manager.py VRAM_BUDGETS + model disk sizes):
 
+    EMBEDDED:  Python(0.05) + gossip(0.05) + adapters(0.02) = ~120 MB → no floor
     OBSERVER:  OS(1) + Flask(0.5) + gossip(0.2) = 1.7 GB RAM → floor 2 GB
     LITE:      OS(1) + Flask(0.5) + cloud_chat(0.5) + relay(0.5) = 3 GB → 4 GB
     STANDARD:  OS(1) + Flask(0.5) + Whisper_CPU(0.5) + TTS_CPU(2)
@@ -68,7 +70,8 @@ FORCE_TIER_ENV = 'HEVOLVE_FORCE_TIER'
 
 class NodeTierLevel(Enum):
     """Contribution tier — what this node can offer the network."""
-    OBSERVER = "observer"           # Below lite — still gossips, still audits
+    EMBEDDED = "embedded"           # Any device — sensors, GPIO, serial, MQTT bridge
+    OBSERVER = "observer"           # Below lite — still gossips, still audits, Flask
     LITE = "lite"                   # Basic chat + gossip + audit + storage relay
     STANDARD = "standard"           # + TTS, Whisper, coding agent, goal engine
     FULL = "full"                   # + Video gen, media agent, full model registry
@@ -82,6 +85,7 @@ _TIER_ORDER = [
     NodeTierLevel.STANDARD,
     NodeTierLevel.LITE,
     NodeTierLevel.OBSERVER,
+    NodeTierLevel.EMBEDDED,
 ]
 
 # Numeric rank for comparison (higher = more capable)
@@ -112,6 +116,11 @@ class HardwareProfile:
     os_platform: str = ''
     python_version: str = ''
     network_reachable: bool = False
+    # Embedded / hardware I/O detection
+    is_read_only_fs: bool = False
+    has_gpio: bool = False
+    has_serial: bool = False
+    has_camera_hw: bool = False
     detected_at: float = field(default_factory=time.time)
 
     def to_dict(self) -> Dict:
@@ -127,6 +136,10 @@ class HardwareProfile:
             'os_platform': self.os_platform,
             'python_version': self.python_version,
             'network_reachable': self.network_reachable,
+            'is_read_only_fs': self.is_read_only_fs,
+            'has_gpio': self.has_gpio,
+            'has_serial': self.has_serial,
+            'has_camera_hw': self.has_camera_hw,
         }
 
 
@@ -179,7 +192,8 @@ TIER_REQUIREMENTS: List[TierRequirement] = [
     TierRequirement(NodeTierLevel.FULL,          8, 16.0,  50.0,  8.0),
     TierRequirement(NodeTierLevel.STANDARD,      4,  8.0,  10.0,  0.0),
     TierRequirement(NodeTierLevel.LITE,          2,  4.0,   1.0,  0.0),
-    # OBSERVER has no requirements — it's the floor.
+    TierRequirement(NodeTierLevel.OBSERVER,      1,  2.0,   0.0,  0.0),
+    # EMBEDDED has no requirements — it's the floor. Any device that runs Python.
 ]
 
 
@@ -189,14 +203,25 @@ TIER_REQUIREMENTS: List[TierRequirement] = [
 
 # (minimum_tier, env_var_name)
 FEATURE_TIER_MAP: Dict[str, Tuple[NodeTierLevel, str]] = {
-    'agent_engine':         (NodeTierLevel.STANDARD, 'HEVOLVE_AGENT_ENGINE_ENABLED'),
-    'coding_agent':         (NodeTierLevel.STANDARD, 'HEVOLVE_CODING_AGENT_ENABLED'),
-    'tts':                  (NodeTierLevel.STANDARD, 'HEVOLVE_TTS_ENABLED'),
-    'whisper':              (NodeTierLevel.STANDARD, 'HEVOLVE_WHISPER_ENABLED'),
-    'video_gen':            (NodeTierLevel.FULL,     'HEVOLVE_VIDEO_GEN_ENABLED'),
-    'media_agent':          (NodeTierLevel.FULL,     'HEVOLVE_MEDIA_AGENT_ENABLED'),
-    'speculative_dispatch': (NodeTierLevel.FULL,     'HEVOLVE_SPECULATIVE_ENABLED'),
-    'local_llm':            (NodeTierLevel.FULL,     'HEVOLVE_LOCAL_LLM_ENABLED'),
+    # Embedded tier — any device that runs Python
+    'gossip':               (NodeTierLevel.EMBEDDED,  'HEVOLVE_GOSSIP_ENABLED'),
+    'sensor_bridge':        (NodeTierLevel.EMBEDDED,  'HEVOLVE_SENSOR_BRIDGE_ENABLED'),
+    'protocol_adapter':     (NodeTierLevel.EMBEDDED,  'HEVOLVE_PROTOCOL_ADAPTER_ENABLED'),
+    # Observer tier — minimal server
+    'flask_server':         (NodeTierLevel.OBSERVER,  'HEVOLVE_FLASK_ENABLED'),
+    # Lite tier — cloud-backed chat
+    'vision_lightweight':   (NodeTierLevel.LITE,      'HEVOLVE_VISION_LITE_ENABLED'),
+    # Standard tier — full agent capabilities
+    'agent_engine':         (NodeTierLevel.STANDARD,  'HEVOLVE_AGENT_ENGINE_ENABLED'),
+    'coding_agent':         (NodeTierLevel.STANDARD,  'HEVOLVE_CODING_AGENT_ENABLED'),
+    'tts':                  (NodeTierLevel.STANDARD,  'HEVOLVE_TTS_ENABLED'),
+    'whisper':              (NodeTierLevel.STANDARD,  'HEVOLVE_WHISPER_ENABLED'),
+    # Full tier — GPU workloads
+    'video_gen':            (NodeTierLevel.FULL,      'HEVOLVE_VIDEO_GEN_ENABLED'),
+    'media_agent':          (NodeTierLevel.FULL,      'HEVOLVE_MEDIA_AGENT_ENABLED'),
+    'speculative_dispatch': (NodeTierLevel.FULL,      'HEVOLVE_SPECULATIVE_ENABLED'),
+    'local_llm':            (NodeTierLevel.FULL,      'HEVOLVE_LOCAL_LLM_ENABLED'),
+    # Compute host tier — regional hosting
     'local_llm_large':      (NodeTierLevel.COMPUTE_HOST, 'HEVOLVE_LOCAL_LLM_LARGE_ENABLED'),
     'regional_host':        (NodeTierLevel.COMPUTE_HOST, 'HEVOLVE_REGIONAL_HOST_ELIGIBLE'),
 }
@@ -241,6 +266,12 @@ def detect_hardware() -> HardwareProfile:
 
     # Network
     hw.network_reachable = check_network_connectivity()
+
+    # Embedded / hardware I/O
+    hw.is_read_only_fs = _detect_read_only_fs()
+    hw.has_gpio = _detect_gpio()
+    hw.has_serial = _detect_serial()
+    hw.has_camera_hw = _detect_camera_hw()
 
     hw.detected_at = time.time()
     return hw
@@ -310,6 +341,81 @@ def _detect_disk_gb() -> Tuple[float, float]:
         return 0.0, 0.0
 
 
+def _detect_read_only_fs() -> bool:
+    """Detect if the filesystem is read-only (ROM, SD card in read mode)."""
+    try:
+        import tempfile
+        code_root = os.environ.get('HEVOLVE_CODE_ROOT',
+                                   os.path.dirname(os.path.dirname(
+                                       os.path.abspath(__file__))))
+        # Try writing a temp file in agent_data (or code root)
+        test_dir = os.path.join(code_root, 'agent_data')
+        if not os.path.isdir(test_dir):
+            test_dir = code_root
+        fd, path = tempfile.mkstemp(dir=test_dir, prefix='.hevolve_ro_test_')
+        os.close(fd)
+        os.unlink(path)
+        return False
+    except (OSError, IOError):
+        return True
+    except Exception:
+        return False  # If we can't determine, assume writable
+
+
+def _detect_gpio() -> bool:
+    """Detect GPIO availability (Raspberry Pi, embedded Linux boards)."""
+    # Check for gpiod (modern Linux GPIO)
+    try:
+        import importlib
+        importlib.import_module('gpiod')
+        return True
+    except ImportError:
+        pass
+    # Check for RPi.GPIO (Raspberry Pi specific)
+    try:
+        import importlib
+        importlib.import_module('RPi.GPIO')
+        return True
+    except ImportError:
+        pass
+    # Check for sysfs GPIO (Linux)
+    if os.path.isdir('/sys/class/gpio'):
+        return True
+    return False
+
+
+def _detect_serial() -> bool:
+    """Detect serial port availability (USB-to-serial, UART)."""
+    try:
+        from serial.tools import list_ports
+        ports = list(list_ports.comports())
+        return len(ports) > 0
+    except ImportError:
+        pass
+    # Fallback: check for common Linux serial devices
+    for dev in ['/dev/ttyUSB0', '/dev/ttyACM0', '/dev/ttyS0', '/dev/ttyAMA0']:
+        if os.path.exists(dev):
+            return True
+    return False
+
+
+def _detect_camera_hw() -> bool:
+    """Detect camera hardware (USB webcam, CSI camera, V4L2)."""
+    # Check for V4L2 video devices (Linux)
+    if os.path.exists('/dev/video0'):
+        return True
+    # Check for Raspberry Pi camera via vcgencmd
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['vcgencmd', 'get_camera'], capture_output=True, text=True, timeout=3)
+        if result.returncode == 0 and 'detected=1' in result.stdout:
+            return True
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    return False
+
+
 def check_network_connectivity(timeout: float = 5.0) -> bool:
     """Quick TCP connectivity check."""
     host = os.environ.get('HEVOLVE_CONNECTIVITY_HOST', '8.8.8.8')
@@ -329,8 +435,9 @@ def check_network_connectivity(timeout: float = 5.0) -> bool:
 def classify_tier(hw: HardwareProfile) -> NodeTierLevel:
     """Determine the highest tier this hardware qualifies for.
 
-    Iterates from COMPUTE_HOST down to LITE. If none match, returns OBSERVER.
-    OBSERVER is never excluded — every node contributes.
+    Iterates from COMPUTE_HOST down to OBSERVER. If none match, returns EMBEDDED.
+    EMBEDDED is never excluded — every node contributes. A Raspberry Pi Zero
+    running gossip + sensor bridge matters.
     """
     # Check for forced tier override
     force_tier = os.environ.get(FORCE_TIER_ENV, '').lower()
@@ -347,8 +454,9 @@ def classify_tier(hw: HardwareProfile) -> NodeTierLevel:
                 hw.gpu_vram_gb >= req.min_gpu_vram_gb):
             return req.tier
 
-    # Below all thresholds — observer mode. Still counts. Still matters.
-    return NodeTierLevel.OBSERVER
+    # Below all thresholds — embedded mode. Sensors, GPIO, gossip relay.
+    # Still counts. Still matters. Every drop.
+    return NodeTierLevel.EMBEDDED
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -481,10 +589,10 @@ def get_capabilities() -> Optional[NodeCapabilities]:
 
 
 def get_tier() -> NodeTierLevel:
-    """Get current tier. Returns OBSERVER if not yet detected."""
+    """Get current tier. Returns EMBEDDED if not yet detected."""
     if _capabilities:
         return _capabilities.tier
-    return NodeTierLevel.OBSERVER
+    return NodeTierLevel.EMBEDDED
 
 
 def get_tier_name() -> str:

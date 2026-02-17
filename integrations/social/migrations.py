@@ -8,7 +8,7 @@ from .models import get_engine, Base
 
 logger = logging.getLogger('hevolve_social')
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 
 
 def get_schema_version(engine) -> int:
@@ -461,3 +461,9 @@ def run_migrations():
         from .models import RegionalHostRequest
         RegionalHostRequest.__table__.create(engine, checkfirst=True)
         set_schema_version(engine, 25)
+
+    if current < 26:
+        logger.info("HevolveSocial: migrating to v26 (Fleet Command — Queen Bee Authority)")
+        from .models import FleetCommand
+        FleetCommand.__table__.create(engine, checkfirst=True)
+        set_schema_version(engine, 26)
