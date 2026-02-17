@@ -1465,11 +1465,30 @@ def txt2img(text: Annotated[str, "Text to create image"]) -> str:
     return response.json()['img_url']
 
 
-def get_frame(user_id):
-    """Get latest camera frame — FrameStore first, Redis fallback."""
+def get_frame(user_id, frame_store=None):
+    """Get latest camera frame — FrameStore first, Redis fallback.
+
+    Args:
+        user_id: User/device ID.
+        frame_store: Optional FrameStore instance for direct injection.
+            Used by embedded devices running headless (no Flask app).
+    """
     current_app.logger.info('inside get_frame')
 
-    # Primary: FrameStore (in-process, zero latency)
+    # Direct FrameStore injection (embedded headless mode)
+    if frame_store is not None:
+        frame_bytes = frame_store.get_frame(str(user_id))
+        if frame_bytes is not None:
+            import cv2
+            frame = cv2.imdecode(
+                np.frombuffer(frame_bytes, np.uint8), cv2.IMREAD_COLOR,
+            )
+            if frame is not None:
+                current_app.logger.info(
+                    f"Frame for user_id {user_id} from injected FrameStore")
+                return frame[:, :, ::-1]  # BGR → RGB
+
+    # Primary: FrameStore via VisionService (in-process, zero latency)
     try:
         from langchain_gpt_api import get_vision_service
         svc = get_vision_service()

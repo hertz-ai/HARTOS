@@ -15,6 +15,57 @@ from datetime import datetime, timedelta
 logger = logging.getLogger('hevolve_social')
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# Bandwidth Profiles — auto-selected by tier, override via env
+# ═══════════════════════════════════════════════════════════════════════
+
+BANDWIDTH_PROFILES = {
+    'full': {
+        'gossip_interval': 60,
+        'health_interval': 120,
+        'gossip_fanout': 3,
+        'payload_mode': 'json',       # Full JSON with all fields
+        'stale_threshold': 300,
+        'dead_threshold': 900,
+    },
+    'constrained': {
+        'gossip_interval': 300,
+        'health_interval': 600,
+        'gossip_fanout': 2,
+        'payload_mode': 'json_compact',  # Stripped optional fields
+        'stale_threshold': 900,
+        'dead_threshold': 2700,
+    },
+    'minimal': {
+        'gossip_interval': 900,
+        'health_interval': 1800,
+        'gossip_fanout': 1,
+        'payload_mode': 'msgpack',    # ~60% smaller than JSON
+        'stale_threshold': 2700,
+        'dead_threshold': 7200,
+    },
+}
+
+# Tier → default bandwidth profile
+_TIER_BANDWIDTH_MAP = {
+    'embedded': 'minimal',
+    'observer': 'constrained',
+    'lite': 'constrained',
+    'standard': 'full',
+    'full': 'full',
+    'compute_host': 'full',
+    'flat': 'full',       # Legacy flat nodes default to full
+    'regional': 'full',
+    'central': 'full',
+}
+
+# Compact payload: only essential fields for gossip on constrained links
+_COMPACT_FIELDS = frozenset({
+    'node_id', 'url', 'public_key', 'guardrail_hash',
+    'signature', 'tier', 'capability_tier', 'timestamp',
+})
+
+
 class GossipProtocol:
     """Gossip-based peer discovery for HevolveBot network."""
 
@@ -28,19 +79,42 @@ class GossipProtocol:
         self.version = '1.0.0'
         self.started_at = datetime.utcnow()
 
-        # Configuration
-        self.gossip_interval = int(os.environ.get('HEVOLVE_GOSSIP_INTERVAL', '60'))
-        self.health_interval = int(os.environ.get('HEVOLVE_HEALTH_INTERVAL', '120'))
-        self.stale_threshold = int(os.environ.get('HEVOLVE_STALE_THRESHOLD', '300'))
-        self.dead_threshold = int(os.environ.get('HEVOLVE_DEAD_THRESHOLD', '900'))
-        self.gossip_fanout = int(os.environ.get('HEVOLVE_GOSSIP_FANOUT', '3'))
-
-        # Hierarchy configuration
+        # Hierarchy configuration (needed before bandwidth selection)
         try:
             from security.key_delegation import get_node_tier
             self.tier = get_node_tier()
         except ImportError:
             self.tier = 'flat'
+
+        # Bandwidth profile: auto-select from tier, allow env override
+        self.bandwidth_profile = os.environ.get('HEVOLVE_GOSSIP_BANDWIDTH', '')
+        if not self.bandwidth_profile:
+            # Auto-select from capability tier (from system_requirements)
+            cap_tier = ''
+            try:
+                from security.system_requirements import get_capabilities
+                caps = get_capabilities()
+                if caps:
+                    cap_tier = caps.tier.value
+            except Exception:
+                pass
+            self.bandwidth_profile = _TIER_BANDWIDTH_MAP.get(
+                cap_tier or self.tier, 'full')
+        profile = BANDWIDTH_PROFILES.get(self.bandwidth_profile, BANDWIDTH_PROFILES['full'])
+
+        # Configuration — profile defaults, overridable by env
+        self.gossip_interval = int(os.environ.get(
+            'HEVOLVE_GOSSIP_INTERVAL', str(profile['gossip_interval'])))
+        self.health_interval = int(os.environ.get(
+            'HEVOLVE_HEALTH_INTERVAL', str(profile['health_interval'])))
+        self.stale_threshold = int(os.environ.get(
+            'HEVOLVE_STALE_THRESHOLD', str(profile['stale_threshold'])))
+        self.dead_threshold = int(os.environ.get(
+            'HEVOLVE_DEAD_THRESHOLD', str(profile['dead_threshold'])))
+        self.gossip_fanout = int(os.environ.get(
+            'HEVOLVE_GOSSIP_FANOUT', str(profile['gossip_fanout'])))
+        self.payload_mode = profile['payload_mode']
+
         self.central_url = os.environ.get('HEVOLVE_CENTRAL_URL', '').rstrip('/')
         self.regional_url = os.environ.get('HEVOLVE_REGIONAL_URL', '').rstrip('/')
 
@@ -55,6 +129,52 @@ class GossipProtocol:
         self._running = False
         self._thread = None
         self._lock = threading.Lock()
+
+        logger.info(
+            f"Gossip bandwidth: {self.bandwidth_profile} "
+            f"(gossip={self.gossip_interval}s, health={self.health_interval}s, "
+            f"fanout={self.gossip_fanout}, payload={self.payload_mode})"
+        )
+
+    # ─── Payload Serialization ───
+
+    def _gossip_self_info(self):
+        """Return self info appropriate for current bandwidth profile."""
+        info = self._self_info()
+        if self.payload_mode == 'json_compact':
+            return {k: v for k, v in info.items() if k in _COMPACT_FIELDS}
+        return info
+
+    def _gossip_peer_list(self):
+        """Return peer list appropriate for current bandwidth profile."""
+        peers = self.get_peer_list()
+        if self.payload_mode == 'json_compact':
+            return [{k: v for k, v in p.items() if k in _COMPACT_FIELDS}
+                    for p in peers]
+        return peers
+
+    @staticmethod
+    def _serialize_payload(data) -> bytes:
+        """Serialize payload using msgpack if available, else JSON."""
+        try:
+            import msgpack
+            return msgpack.packb(data, use_bin_type=True)
+        except ImportError:
+            import json
+            return json.dumps(data).encode('utf-8')
+
+    @staticmethod
+    def _deserialize_payload(raw: bytes):
+        """Deserialize payload from msgpack or JSON."""
+        try:
+            import msgpack
+            return msgpack.unpackb(raw, raw=False)
+        except ImportError:
+            import json
+            return json.loads(raw.decode('utf-8'))
+        except Exception:
+            import json
+            return json.loads(raw.decode('utf-8'))
 
     def start(self):
         """Load peers from DB, announce to seeds/known peers, start background thread."""
@@ -73,7 +193,8 @@ class GossipProtocol:
         self._thread = threading.Thread(target=self._background_loop, daemon=True)
         self._thread.start()
         logger.info(f"Gossip started: node={self.node_id[:8]}, "
-                    f"name={self.node_name}, seeds={len(self.seed_peers)}")
+                    f"name={self.node_name}, seeds={len(self.seed_peers)}, "
+                    f"bandwidth={self.bandwidth_profile}")
 
     def stop(self):
         """Stop the gossip background thread."""
@@ -197,11 +318,31 @@ class GossipProtocol:
 
     def _exchange_with_peer(self, peer_url):
         try:
-            resp = requests.post(
-                f"{peer_url}/api/social/peers/exchange",
-                json={'peers': self.get_peer_list(), 'sender': self._self_info()},
-                timeout=10,
-            )
+            payload = {
+                'peers': self._gossip_peer_list(),
+                'sender': self._gossip_self_info(),
+            }
+            # Use msgpack for minimal bandwidth if both sides support it
+            if self.payload_mode == 'msgpack':
+                try:
+                    import msgpack
+                    resp = requests.post(
+                        f"{peer_url}/api/social/peers/exchange",
+                        data=self._serialize_payload(payload),
+                        headers={'Content-Type': 'application/msgpack'},
+                        timeout=10,
+                    )
+                except ImportError:
+                    # Fallback to JSON if msgpack not installed
+                    resp = requests.post(
+                        f"{peer_url}/api/social/peers/exchange",
+                        json=payload, timeout=10,
+                    )
+            else:
+                resp = requests.post(
+                    f"{peer_url}/api/social/peers/exchange",
+                    json=payload, timeout=10,
+                )
             if resp.status_code == 200:
                 data = resp.json()
                 return data.get('peers', [])

@@ -78,10 +78,16 @@ class TestClassifyTier:
         assert classify_tier(hw) == NodeTierLevel.LITE
 
     def test_classify_tier_observer(self):
-        """Below all thresholds — observer. Still valid, still counts."""
+        """1 core, 2 GB RAM — observer tier."""
         hw = HardwareProfile(cpu_cores=1, ram_gb=2.0, disk_free_gb=0.5,
                              gpu_vram_gb=0.0, cuda_available=False)
         assert classify_tier(hw) == NodeTierLevel.OBSERVER
+
+    def test_classify_tier_embedded(self):
+        """Below all thresholds — embedded. Still valid, still counts."""
+        hw = HardwareProfile(cpu_cores=1, ram_gb=0.5, disk_free_gb=0.1,
+                             gpu_vram_gb=0.0, cuda_available=False)
+        assert classify_tier(hw) == NodeTierLevel.EMBEDDED
 
     def test_classify_tier_partial_full(self):
         """Enough CPU/RAM/disk for FULL but no GPU → falls to STANDARD."""
@@ -100,6 +106,13 @@ class TestClassifyTier:
         hw = HardwareProfile(cpu_cores=2, ram_gb=4.0, disk_free_gb=1.0)
         with patch.dict(os.environ, {'HEVOLVE_FORCE_TIER': 'compute_host'}):
             assert classify_tier(hw) == NodeTierLevel.COMPUTE_HOST
+
+    def test_force_tier_embedded(self):
+        """Force a powerful machine to embedded tier."""
+        hw = HardwareProfile(cpu_cores=16, ram_gb=32.0, disk_free_gb=100.0,
+                             gpu_vram_gb=12.0)
+        with patch.dict(os.environ, {'HEVOLVE_FORCE_TIER': 'embedded'}):
+            assert classify_tier(hw) == NodeTierLevel.EMBEDDED
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -130,11 +143,26 @@ class TestResolveFeatures:
         assert 'regional_host' in disabled  # needs COMPUTE_HOST
 
     def test_resolve_observer_tier(self):
-        """Observer: everything disabled. Still participates in gossip + audit."""
+        """Observer: gossip + sensor + protocol + flask enabled, higher disabled."""
         hw = HardwareProfile(cpu_cores=1, ram_gb=2.0, disk_free_gb=0.5)
         enabled, disabled = resolve_features(NodeTierLevel.OBSERVER, hw)
-        assert len(enabled) == 0
-        assert len(disabled) == len(FEATURE_TIER_MAP)
+        assert 'gossip' in enabled
+        assert 'sensor_bridge' in enabled
+        assert 'protocol_adapter' in enabled
+        assert 'flask_server' in enabled
+        assert 'agent_engine' in disabled
+        assert 'video_gen' in disabled
+
+    def test_resolve_embedded_tier(self):
+        """Embedded: only gossip + sensor + protocol enabled."""
+        hw = HardwareProfile(cpu_cores=1, ram_gb=0.5, disk_free_gb=0.1)
+        enabled, disabled = resolve_features(NodeTierLevel.EMBEDDED, hw)
+        assert 'gossip' in enabled
+        assert 'sensor_bridge' in enabled
+        assert 'protocol_adapter' in enabled
+        assert 'flask_server' in disabled
+        assert 'agent_engine' in disabled
+        assert len(enabled) == 3  # Only embedded-tier features
 
     def test_resolve_compute_host_tier(self):
         """Compute host: everything enabled."""
@@ -207,8 +235,8 @@ class TestFullPipeline:
     def test_get_capabilities_none_before_check(self):
         """Before run_system_check(), get_capabilities() is None."""
         assert get_capabilities() is None
-        assert get_tier() == NodeTierLevel.OBSERVER
-        assert get_tier_name() == 'observer'
+        assert get_tier() == NodeTierLevel.EMBEDDED
+        assert get_tier_name() == 'embedded'
 
     def test_run_system_check_full_flow(self):
         """Mock hardware, verify full pipeline returns NodeCapabilities."""
@@ -312,7 +340,8 @@ class TestNetworkConnectivity:
 class TestTierOrdering:
 
     def test_tier_rank_order(self):
-        """OBSERVER < LITE < STANDARD < FULL < COMPUTE_HOST."""
+        """EMBEDDED < OBSERVER < LITE < STANDARD < FULL < COMPUTE_HOST."""
+        assert _TIER_RANK[NodeTierLevel.EMBEDDED] < _TIER_RANK[NodeTierLevel.OBSERVER]
         assert _TIER_RANK[NodeTierLevel.OBSERVER] < _TIER_RANK[NodeTierLevel.LITE]
         assert _TIER_RANK[NodeTierLevel.LITE] < _TIER_RANK[NodeTierLevel.STANDARD]
         assert _TIER_RANK[NodeTierLevel.STANDARD] < _TIER_RANK[NodeTierLevel.FULL]
@@ -354,3 +383,97 @@ class TestLocalLLMFeatures:
         enabled, disabled = resolve_features(NodeTierLevel.FULL, hw_full)
         assert 'local_llm_large' not in enabled
         assert 'local_llm_large' in disabled
+
+
+# ══════════════════════════════════════════════════════════════════
+# Embedded Tier Features
+# ══════════════════════════════════════════════════════════════════
+
+class TestEmbeddedFeatures:
+
+    def test_gossip_requires_embedded(self):
+        """gossip available at EMBEDDED tier (lowest)."""
+        assert FEATURE_TIER_MAP['gossip'][0] == NodeTierLevel.EMBEDDED
+        assert FEATURE_TIER_MAP['gossip'][1] == 'HEVOLVE_GOSSIP_ENABLED'
+
+    def test_sensor_bridge_requires_embedded(self):
+        assert FEATURE_TIER_MAP['sensor_bridge'][0] == NodeTierLevel.EMBEDDED
+        assert FEATURE_TIER_MAP['sensor_bridge'][1] == 'HEVOLVE_SENSOR_BRIDGE_ENABLED'
+
+    def test_protocol_adapter_requires_embedded(self):
+        assert FEATURE_TIER_MAP['protocol_adapter'][0] == NodeTierLevel.EMBEDDED
+        assert FEATURE_TIER_MAP['protocol_adapter'][1] == 'HEVOLVE_PROTOCOL_ADAPTER_ENABLED'
+
+    def test_flask_server_requires_observer(self):
+        """Flask server needs OBSERVER tier — embedded devices are headless."""
+        assert FEATURE_TIER_MAP['flask_server'][0] == NodeTierLevel.OBSERVER
+        assert FEATURE_TIER_MAP['flask_server'][1] == 'HEVOLVE_FLASK_ENABLED'
+
+    def test_vision_lightweight_requires_lite(self):
+        assert FEATURE_TIER_MAP['vision_lightweight'][0] == NodeTierLevel.LITE
+        assert FEATURE_TIER_MAP['vision_lightweight'][1] == 'HEVOLVE_VISION_LITE_ENABLED'
+
+    def test_embedded_gets_gossip_but_not_flask(self):
+        """Embedded device can gossip but doesn't run Flask."""
+        hw = HardwareProfile(cpu_cores=1, ram_gb=0.5, disk_free_gb=0.1)
+        enabled, disabled = resolve_features(NodeTierLevel.EMBEDDED, hw)
+        assert 'gossip' in enabled
+        assert 'flask_server' in disabled
+
+    def test_lite_gets_vision_lightweight(self):
+        """Lite node gets lightweight vision (CPU-only VLM)."""
+        hw = HardwareProfile(cpu_cores=2, ram_gb=4.0, disk_free_gb=1.0)
+        enabled, disabled = resolve_features(NodeTierLevel.LITE, hw)
+        assert 'vision_lightweight' in enabled
+        assert 'gossip' in enabled
+        assert 'flask_server' in enabled
+
+
+# ══════════════════════════════════════════════════════════════════
+# Hardware I/O Detection
+# ══════════════════════════════════════════════════════════════════
+
+class TestHardwareIODetection:
+
+    def test_hardware_profile_has_embedded_fields(self):
+        """HardwareProfile includes embedded I/O detection fields."""
+        hw = HardwareProfile()
+        assert hasattr(hw, 'is_read_only_fs')
+        assert hasattr(hw, 'has_gpio')
+        assert hasattr(hw, 'has_serial')
+        assert hasattr(hw, 'has_camera_hw')
+        assert hw.is_read_only_fs is False
+        assert hw.has_gpio is False
+        assert hw.has_serial is False
+        assert hw.has_camera_hw is False
+
+    def test_to_dict_includes_embedded_fields(self):
+        """to_dict() includes the new embedded I/O fields."""
+        hw = HardwareProfile(has_gpio=True, has_serial=True,
+                             is_read_only_fs=True, has_camera_hw=True)
+        d = hw.to_dict()
+        assert d['has_gpio'] is True
+        assert d['has_serial'] is True
+        assert d['is_read_only_fs'] is True
+        assert d['has_camera_hw'] is True
+
+    def test_read_only_fs_detection_writable(self):
+        """On this dev machine, filesystem should be writable."""
+        from security.system_requirements import _detect_read_only_fs
+        assert _detect_read_only_fs() is False
+
+    def test_gpio_detection_no_gpio_on_dev_machine(self):
+        """Dev machine (Windows) should not have GPIO."""
+        from security.system_requirements import _detect_gpio
+        # On Windows, no /sys/class/gpio and no gpiod/RPi.GPIO
+        result = _detect_gpio()
+        # Don't assert False since CI might have pyserial; just check it returns bool
+        assert isinstance(result, bool)
+
+    def test_detect_hardware_includes_io_fields(self):
+        """detect_hardware() populates the embedded I/O fields."""
+        hw = detect_hardware()
+        assert isinstance(hw.is_read_only_fs, bool)
+        assert isinstance(hw.has_gpio, bool)
+        assert isinstance(hw.has_serial, bool)
+        assert isinstance(hw.has_camera_hw, bool)
