@@ -55,6 +55,29 @@ SEED_BOOTSTRAP_GOALS = [
         'use_product': True,
     },
     {
+        'slug': 'bootstrap_crowdsource_intelligence',
+        'goal_type': 'marketing',
+        'title': 'Promote Crowdsourced Intelligence via Thought Experiments',
+        'description': (
+            'Create content promoting the crowdsourced intelligence concept: '
+            '1) Research how thought experiments enable collective intelligence — '
+            'users propose hypotheses, multi-agent evaluation scores them, '
+            'the hive learns from every experiment via memory chaining, '
+            '2) Generate educational posts explaining the hypothesis→evaluation→learning pipeline, '
+            '3) Create campaigns highlighting the 6 intent categories '
+            '(community, environment, education, health, equity, technology), '
+            '4) Show how every experiment makes the hive smarter — '
+            'constructive-only voting ensures quality, HITL approval gates ensure safety. '
+            'Authentic value, not hype. Let the feature speak for itself.'
+        ),
+        'config': {
+            'goal_sub_type': 'content',
+            'channels': ['platform', 'twitter', 'linkedin'],
+        },
+        'spark_budget': 250,
+        'use_product': True,
+    },
+    {
         'slug': 'bootstrap_ip_monitor',
         'goal_type': 'ip_protection',
         'title': 'Continuous Flywheel Health Monitor',

@@ -2359,11 +2359,12 @@ class TestBootstrapGoals:
             cfg = g.config_json or {}
             slug = cfg.get('bootstrap_slug', '')
             if slug in ('bootstrap_marketing_awareness', 'bootstrap_referral_campaign',
-                        'bootstrap_growth_analytics'):
+                        'bootstrap_growth_analytics', 'bootstrap_crowdsource_intelligence'):
                 assert g.product_id == str(test_product.id), f"{slug} should have product_id"
             elif slug and slug not in ('bootstrap_marketing_awareness',
                                         'bootstrap_referral_campaign',
-                                        'bootstrap_growth_analytics'):
+                                        'bootstrap_growth_analytics',
+                                        'bootstrap_crowdsource_intelligence'):
                 assert g.product_id is None, f"{slug} should NOT have product_id"
 
     def test_system_agent_created(self, db):
