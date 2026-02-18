@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd">
+<policyconfig>
+
+  <vendor>HyveOS</vendor>
+  <vendor_url>https://hevolve.ai</vendor_url>
+  <icon_name>hyve-os</icon_name>
+
+  <action id="com.hyve.agent.approve-action">
+    <description>Allow HyveOS agent to perform an action</description>
+    <message>An AI agent is requesting permission to perform an action on your behalf.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="com.hyve.agent.install-remote">
+    <description>Allow HyveOS to provision a remote machine</description>
+    <message>HyveOS wants to install itself on a remote network machine via SSH.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+  </action>
+
+  <action id="com.hyve.agent.manage-services">
+    <description>Allow management of HyveOS services</description>
+    <message>A request to start, stop, or restart HyveOS services.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+</policyconfig>

@@ -1,0 +1,22 @@
+Package: hyve-os
+Version: 1.0.0
+Section: net
+Priority: optional
+Architecture: amd64
+Depends: python3.10, python3.10-venv, python3-pip, ufw, curl
+Maintainer: Hevolve AI <team@hevolve.ai>
+Homepage: https://hevolve.ai
+Description: HyveOS - Crowdsourced Agentic Intelligence Platform
+ HyveOS is a custom Linux distribution layer for running autonomous
+ AI agents with crowdsourced compute, peer-to-peer federation,
+ constitutional guardrails, and 90% revenue back to contributors.
+ .
+ Features:
+  - 96 specialized AI agents across 10 categories
+  - Recipe pattern: learn once, replay efficiently
+  - Ed25519 signed peer-to-peer federation
+  - Constitutional AI guardrails (33 immutable rules)
+  - Local LLM inference (llama.cpp) + cloud fallback
+  - Vision AI sidecar (MiniCPM)
+  - Kids learning platform (105 built-in games)
+  - WearOS companion support

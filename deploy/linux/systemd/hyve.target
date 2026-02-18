@@ -1,0 +1,8 @@
+[Unit]
+Description=HyveOS Services
+Documentation=https://github.com/hevolve-ai/hyve
+After=network-online.target
+Wants=hyve-backend.service hyve-discovery.service hyve-agent-daemon.service
+
+[Install]
+WantedBy=multi-user.target

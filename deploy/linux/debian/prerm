@@ -1,0 +1,25 @@
+#!/bin/bash
+# HyveOS pre-removal script
+# Runs before .deb package files are removed
+
+set -e
+
+echo "[HyveOS] Stopping services..."
+
+systemctl stop hyve.target 2>/dev/null || true
+systemctl disable hyve.target 2>/dev/null || true
+
+# Remove service files
+rm -f /etc/systemd/system/hyve-backend.service
+rm -f /etc/systemd/system/hyve-discovery.service
+rm -f /etc/systemd/system/hyve-vision.service
+rm -f /etc/systemd/system/hyve-llm.service
+rm -f /etc/systemd/system/hyve-agent-daemon.service
+rm -f /etc/systemd/system/hyve.target
+
+systemctl daemon-reload
+
+rm -f /usr/local/bin/hyve
+
+echo "[HyveOS] Services stopped and disabled."
+echo "[HyveOS] Data directory /var/lib/hyve preserved."

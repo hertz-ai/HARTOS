@@ -1,0 +1,32 @@
+[Unit]
+Description=HyveOS Backend (Flask/Waitress)
+Documentation=https://github.com/hevolve-ai/hyve
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hyve
+Group=hyve
+WorkingDirectory=/opt/hyve
+ExecStart=/opt/hyve/venv/bin/python -m waitress --port=${HYVE_BACKEND_PORT:-6777} --threads=50 langchain_gpt_api:app
+EnvironmentFile=/etc/hyve/hyve.env
+Restart=on-failure
+RestartSec=5
+WatchdogSec=120
+TimeoutStartSec=30
+TimeoutStopSec=15
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/hyve /var/log/hyve /opt/hyve/agent_data
+PrivateTmp=yes
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hyve-backend
+
+[Install]
+WantedBy=hyve.target

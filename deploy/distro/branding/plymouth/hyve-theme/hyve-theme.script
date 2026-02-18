@@ -1,0 +1,48 @@
+# HyveOS Plymouth Boot Splash Script
+# Displays the HyveOS logo with a pulsing animation during boot.
+
+# Window setup
+Window.SetBackgroundTopColor(0.05, 0.05, 0.10);
+Window.SetBackgroundBottomColor(0.02, 0.02, 0.05);
+
+# Logo
+logo.image = Image("hyve-logo.png");
+logo.sprite = Sprite(logo.image);
+logo.sprite.SetX(Window.GetWidth() / 2 - logo.image.GetWidth() / 2);
+logo.sprite.SetY(Window.GetHeight() / 2 - logo.image.GetHeight() / 2 - 40);
+
+# Text: "HyveOS"
+title_text = Image.Text("HyveOS", 0.30, 0.80, 0.77, 1, "Sans 24");
+title_sprite = Sprite(title_text);
+title_sprite.SetX(Window.GetWidth() / 2 - title_text.GetWidth() / 2);
+title_sprite.SetY(Window.GetHeight() / 2 + logo.image.GetHeight() / 2);
+
+# Subtitle
+sub_text = Image.Text("Crowdsourced Agentic Intelligence", 0.50, 0.50, 0.55, 1, "Sans 12");
+sub_sprite = Sprite(sub_text);
+sub_sprite.SetX(Window.GetWidth() / 2 - sub_text.GetWidth() / 2);
+sub_sprite.SetY(Window.GetHeight() / 2 + logo.image.GetHeight() / 2 + 35);
+
+# Progress indicator (pulsing dot)
+progress = 0;
+
+fun refresh_callback() {
+    progress++;
+    # Pulse opacity between 0.3 and 1.0
+    opacity = 0.3 + 0.7 * Math.Abs(Math.Sin(progress * 0.05));
+    logo.sprite.SetOpacity(opacity);
+}
+
+Plymouth.SetRefreshFunction(refresh_callback);
+
+# Message display (for fsck, etc.)
+message_sprite = Sprite();
+
+fun message_callback(text) {
+    msg_image = Image.Text(text, 0.60, 0.60, 0.65, 1, "Sans 10");
+    message_sprite.SetImage(msg_image);
+    message_sprite.SetX(Window.GetWidth() / 2 - msg_image.GetWidth() / 2);
+    message_sprite.SetY(Window.GetHeight() - 50);
+}
+
+Plymouth.SetMessageFunction(message_callback);

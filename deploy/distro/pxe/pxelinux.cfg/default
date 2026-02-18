@@ -1,0 +1,20 @@
+# HyveOS PXE Boot Menu
+# Served by hyve-pxe-server.py via TFTP
+
+DEFAULT hyve-os
+TIMEOUT 100
+PROMPT 1
+
+LABEL hyve-os
+    MENU LABEL ^HyveOS 1.0 (Automated Install)
+    KERNEL vmlinuz
+    APPEND initrd=initrd ip=dhcp autoinstall ds=nocloud-net;s=http://${pxe_server}:8888/autoinstall/ ---
+
+LABEL hyve-os-manual
+    MENU LABEL HyveOS 1.0 (^Manual Install)
+    KERNEL vmlinuz
+    APPEND initrd=initrd ip=dhcp ---
+
+LABEL local
+    MENU LABEL Boot from ^local disk
+    LOCALBOOT 0

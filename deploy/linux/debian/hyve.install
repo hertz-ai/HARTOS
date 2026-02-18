@@ -1,0 +1,22 @@
+# HyveOS file mapping for dpkg
+# Source paths are relative to the package build root
+
+# Application code
+opt/hyve/
+
+# Configuration template
+etc/hyve/hyve.env.template
+
+# systemd units
+etc/systemd/system/hyve-backend.service
+etc/systemd/system/hyve-discovery.service
+etc/systemd/system/hyve-vision.service
+etc/systemd/system/hyve-llm.service
+etc/systemd/system/hyve-agent-daemon.service
+etc/systemd/system/hyve.target
+
+# CLI tool
+usr/local/bin/hyve
+
+# Firewall profiles
+etc/ufw/applications.d/hyve

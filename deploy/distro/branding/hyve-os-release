@@ -1,0 +1,12 @@
+NAME="HyveOS"
+PRETTY_NAME="HyveOS 1.0 (Sentient)"
+VERSION="1.0"
+VERSION_ID="1.0"
+VERSION_CODENAME=sentient
+ID=hyve-os
+ID_LIKE=ubuntu
+HOME_URL="https://hevolve.ai"
+SUPPORT_URL="https://github.com/hevolve-ai/hyve/issues"
+BUG_REPORT_URL="https://github.com/hevolve-ai/hyve/issues"
+PRIVACY_POLICY_URL="https://hevolve.ai/privacy"
+UBUNTU_CODENAME=jammy

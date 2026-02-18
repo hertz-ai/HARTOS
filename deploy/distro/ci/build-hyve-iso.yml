@@ -1,0 +1,188 @@
+# ============================================================
+# HyveOS ISO Build Pipeline — GitHub Actions
+#
+# Builds bootable HyveOS ISOs for all variants on push to
+# release branches or manual dispatch.
+#
+# Artifacts: ISO + SHA-256 checksum per variant
+# ============================================================
+
+name: Build HyveOS ISO
+
+on:
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - 'release/*'
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: 'Build variant (server|desktop|edge|all)'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - server
+          - desktop
+          - edge
+      version:
+        description: 'Version string (e.g. 1.0.0)'
+        required: false
+        default: ''
+
+env:
+  DEFAULT_VERSION: '1.0.0'
+
+jobs:
+  prepare:
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      variants: ${{ steps.variants.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ -n "${{ github.event.inputs.version }}" ]]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ env.DEFAULT_VERSION }}-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Determine variants
+        id: variants
+        run: |
+          VARIANT="${{ github.event.inputs.variant }}"
+          if [[ -z "$VARIANT" || "$VARIANT" == "all" ]]; then
+            echo 'matrix=["server","desktop","edge"]' >> "$GITHUB_OUTPUT"
+          else
+            echo "matrix=[\"$VARIANT\"]" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-iso:
+    needs: prepare
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        variant: ${{ fromJSON(needs.prepare.outputs.variants) }}
+      fail-fast: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get clean
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            live-build \
+            syslinux-utils \
+            xorriso \
+            squashfs-tools \
+            rsync
+
+      - name: Build HyveOS ISO (${{ matrix.variant }})
+        run: |
+          sudo bash deploy/distro/build-iso.sh \
+            --variant ${{ matrix.variant }} \
+            --version ${{ needs.prepare.outputs.version }} \
+            --output ${{ github.workspace }}/dist
+
+      - name: Verify ISO
+        run: |
+          ISO_NAME="hyve-os-${{ needs.prepare.outputs.version }}-${{ matrix.variant }}-amd64"
+          ls -lh dist/${ISO_NAME}.iso
+          cat dist/${ISO_NAME}.iso.sha256
+          cd dist && sha256sum -c ${ISO_NAME}.iso.sha256
+
+      - name: Upload ISO artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hyve-os-${{ matrix.variant }}-${{ needs.prepare.outputs.version }}
+          path: |
+            dist/*.iso
+            dist/*.sha256
+          retention-days: 30
+
+  release:
+    needs: [prepare, build-iso]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download all ISO artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect ISOs
+        run: |
+          mkdir -p release
+          find artifacts -name "*.iso" -exec cp {} release/ \;
+          find artifacts -name "*.sha256" -exec cp {} release/ \;
+          ls -lh release/
+
+      - name: Create GitHub Release
+        # Pinned to v2.2.1 SHA for supply chain security
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda  # v2.2.1
+        with:
+          name: "HyveOS ${{ needs.prepare.outputs.version }}"
+          body: |
+            ## HyveOS ${{ needs.prepare.outputs.version }}
+
+            ### Downloads
+
+            | Variant | Description | Target |
+            |---------|-------------|--------|
+            | **server** | Headless, all services | Servers, cloud VMs, Raspberry Pi |
+            | **desktop** | GNOME + system tray + dashboard | Workstations, dev machines |
+            | **edge** | Minimal observer node | IoT, embedded, edge devices |
+
+            ### Quick Start
+
+            ```bash
+            # Test with QEMU
+            qemu-system-x86_64 -m 4096 -cdrom hyve-os-${{ needs.prepare.outputs.version }}-server-amd64.iso -boot d
+
+            # Write to USB
+            sudo dd if=hyve-os-${{ needs.prepare.outputs.version }}-server-amd64.iso of=/dev/sdX bs=4M status=progress
+            ```
+
+            ### Verify checksums
+            ```bash
+            sha256sum -c hyve-os-${{ needs.prepare.outputs.version }}-server-amd64.iso.sha256
+            ```
+          files: release/*
+          draft: false
+          prerelease: ${{ contains(needs.prepare.outputs.version, '-') }}
+
+  bundle:
+    needs: prepare
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build deployment bundle
+        run: |
+          bash deploy/linux/build_bundle.sh
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hyve-os-bundle-${{ needs.prepare.outputs.version }}
+          path: dist/*.tar.gz
+          retention-days: 30

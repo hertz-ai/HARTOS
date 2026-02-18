@@ -1,0 +1,12 @@
+[Unit]
+Description=HyveOS Update Check
+After=network-online.target hyve-backend.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/opt/hyve/venv/bin/python /opt/hyve/deploy/distro/update/hyve-update-service.py
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=600

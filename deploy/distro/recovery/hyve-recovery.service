@@ -1,0 +1,14 @@
+[Unit]
+Description=HyveOS Recovery Mode
+DefaultDependencies=no
+After=local-fs.target
+# Only triggered manually via: systemctl start hyve-recovery.service
+# or from GRUB recovery menu with kernel param hyve.recovery=1
+ConditionKernelCommandLine=hyve.recovery=1
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/hyve/deploy/distro/recovery/hyve-recovery.sh
+StandardOutput=journal+console
+StandardError=journal+console
+TimeoutStartSec=300

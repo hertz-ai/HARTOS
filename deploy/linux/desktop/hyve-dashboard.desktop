@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=HyveOS Tray
+Comment=HyveOS system tray indicator
+Exec=/opt/hyve/venv/bin/python /opt/hyve/deploy/linux/desktop/hyve-tray.py
+Icon=hyve-os
+Terminal=false
+Type=Application
+Categories=System;
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=5
+Hidden=false
+NoDisplay=true
