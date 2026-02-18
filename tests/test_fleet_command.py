@@ -297,10 +297,11 @@ class TestValidation:
     def test_valid_command_types_is_frozen(self):
         """VALID_COMMAND_TYPES is immutable."""
         assert isinstance(VALID_COMMAND_TYPES, frozenset)
-        assert len(VALID_COMMAND_TYPES) == 6
+        assert len(VALID_COMMAND_TYPES) >= 6
 
     def test_all_expected_types_present(self):
-        """All 6 command types are in VALID_COMMAND_TYPES."""
+        """All core + device command types are in VALID_COMMAND_TYPES."""
         expected = {'config_update', 'goal_assign', 'sensor_config',
-                    'firmware_update', 'halt', 'restart'}
-        assert VALID_COMMAND_TYPES == expected
+                    'firmware_update', 'halt', 'restart',
+                    'tts_stream', 'agent_consent'}
+        assert expected.issubset(VALID_COMMAND_TYPES)

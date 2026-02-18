@@ -5,11 +5,31 @@ Separate from per-agent A2A cards — this advertises the platform itself.
 """
 import os
 import logging
+import time as _time
 from flask import Blueprint, jsonify, request
 
 logger = logging.getLogger('hevolve_social')
 
 discovery_bp = Blueprint('social_discovery', __name__)
+
+# ─── Gossip Rate Limiter ───
+_ANNOUNCE_RATE = {}   # ip -> list of timestamps
+_RATE_LIMIT = 10      # max announcements per window per IP
+_RATE_WINDOW = 60     # window in seconds
+
+
+def _check_announce_rate(ip: str) -> bool:
+    """Returns True if request is allowed, False if rate-limited.
+    Prevents gossip flooding from rapid peer announcements."""
+    now = _time.time()
+    times = _ANNOUNCE_RATE.get(ip, [])
+    # Prune expired entries
+    times = [t for t in times if now - t < _RATE_WINDOW]
+    if len(times) >= _RATE_LIMIT:
+        return False
+    times.append(now)
+    _ANNOUNCE_RATE[ip] = times
+    return True
 
 _BASE_URL = os.environ.get('HEVOLVE_BASE_URL', 'http://localhost:6777')
 
@@ -143,6 +163,8 @@ def discover_communities():
 @discovery_bp.route('/api/social/peers/announce', methods=['POST'])
 def peer_announce():
     """Receive a peer announcement. Merge into local peer list."""
+    if not _check_announce_rate(request.remote_addr):
+        return jsonify({'success': False, 'error': 'Rate limited'}), 429
     from .peer_discovery import gossip
     data = request.get_json(force=True, silent=True) or {}
     if not data.get('node_id') or not data.get('url'):
@@ -172,6 +194,8 @@ def peer_list():
 @discovery_bp.route('/api/social/peers/exchange', methods=['POST'])
 def peer_exchange():
     """Gossip exchange: receive their peers, return ours."""
+    if not _check_announce_rate(request.remote_addr):
+        return jsonify({'success': False, 'error': 'Rate limited'}), 429
     from .peer_discovery import gossip
     data = request.get_json(force=True, silent=True) or {}
     their_peers = data.get('peers', [])

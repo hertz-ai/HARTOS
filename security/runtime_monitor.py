@@ -27,6 +27,12 @@ class RuntimeIntegrityMonitor:
         self._lock = threading.Lock()
         self._tampered = False
         self._boot_manifest_snapshot = None
+        # Purge __pycache__ before snapshot — blocks bytecode injection
+        try:
+            from security.node_integrity import purge_pycache
+            purge_pycache(code_root)
+        except Exception:
+            pass
         # Snapshot file manifest at boot for diff on tamper
         try:
             from security.node_integrity import compute_file_manifest
