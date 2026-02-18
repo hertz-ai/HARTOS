@@ -133,8 +133,9 @@ class VisionService:
                         self._vision_backend.start()
                         logger.info(f"Fell back to {self._vision_backend.name} backend")
                     else:
-                        logger.warning("No vision backend available — headless mode")
+                        logger.warning("No vision backend available")
                         self._vision_backend = None
+                        self._running = False
                         return
 
             if self._vision_backend is None:

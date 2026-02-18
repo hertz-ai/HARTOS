@@ -2350,6 +2350,8 @@ class DeviceBinding(Base):
     device_id = Column(String(128), nullable=False)
     device_name = Column(String(100), default='')
     platform = Column(String(30), default='web')
+    form_factor = Column(String(20), default='phone')       # phone|watch|tablet|desktop|embedded|tv
+    capabilities_json = Column(Text, default='{}')           # {"tts":true,"mic":true,"speaker":true,...}
     linked_at = Column(DateTime, default=func.now())
     last_sync_at = Column(DateTime, nullable=True)
     is_active = Column(Boolean, default=True)
@@ -2360,6 +2362,14 @@ class DeviceBinding(Base):
         UniqueConstraint('user_id', 'device_id', name='uq_user_device'),
     )
 
+    @property
+    def capabilities(self):
+        import json as _json
+        try:
+            return _json.loads(self.capabilities_json or '{}')
+        except (ValueError, TypeError):
+            return {}
+
     def to_dict(self):
         return {
             'id': self.id,
@@ -2367,6 +2377,8 @@ class DeviceBinding(Base):
             'device_id': self.device_id,
             'device_name': self.device_name,
             'platform': self.platform,
+            'form_factor': self.form_factor,
+            'capabilities': self.capabilities,
             'linked_at': self.linked_at.isoformat() if self.linked_at else None,
             'last_sync_at': self.last_sync_at.isoformat() if self.last_sync_at else None,
             'is_active': self.is_active,

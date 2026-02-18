@@ -8,7 +8,7 @@ from .models import get_engine, Base
 
 logger = logging.getLogger('hevolve_social')
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 
 
 def get_schema_version(engine) -> int:
@@ -467,3 +467,17 @@ def run_migrations():
         from .models import FleetCommand
         FleetCommand.__table__.create(engine, checkfirst=True)
         set_schema_version(engine, 26)
+
+    if current < 27:
+        logger.info("HevolveSocial: migrating to v27 (Device form_factor + capabilities)")
+        with engine.connect() as conn:
+            for stmt in [
+                "ALTER TABLE device_bindings ADD COLUMN form_factor VARCHAR(20) DEFAULT 'phone'",
+                "ALTER TABLE device_bindings ADD COLUMN capabilities_json TEXT DEFAULT '{}'",
+            ]:
+                try:
+                    conn.execute(text(stmt))
+                except Exception:
+                    pass
+            conn.commit()
+        set_schema_version(engine, 27)

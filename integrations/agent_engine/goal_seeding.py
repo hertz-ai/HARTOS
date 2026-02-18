@@ -267,6 +267,79 @@ SEED_BOOTSTRAP_GOALS = [
         'spark_budget': 200,
         'use_product': False,
     },
+    # ─── News Push Notification Agents ───
+    {
+        'slug': 'bootstrap_news_regional',
+        'goal_type': 'news',
+        'title': 'Regional News Curation and Push Notifications',
+        'description': (
+            'Subscribe to local and regional news feeds, curate relevant stories, '
+            'and push notifications to users in the region: '
+            '1) Use subscribe_news_feed for local RSS sources (city papers, regional outlets), '
+            '2) Use fetch_news_feeds to pull latest items hourly, '
+            '3) Curate top stories by relevance — community impact, weather, local events, '
+            '4) Use send_news_notification with scope=regional to push curated items, '
+            '5) Use get_news_metrics to track delivery rates and read engagement. '
+            'Quality over quantity — only push stories that matter to the community.'
+        ),
+        'config': {
+            'scope': 'regional',
+            'categories': ['local', 'community', 'weather', 'events'],
+            'feed_urls': [],
+            'frequency': 'hourly',
+        },
+        'spark_budget': 150,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_news_national',
+        'goal_type': 'news',
+        'title': 'National News Curation and Push Notifications',
+        'description': (
+            'Monitor national news feeds, filter by category relevance, '
+            'and push digest notifications: '
+            '1) Use subscribe_news_feed for major national outlets and wire services, '
+            '2) Use fetch_news_feeds to pull latest items hourly, '
+            '3) Filter and rank by category: politics, economy, sports, health, science, '
+            '4) Use send_news_notification with scope=all for high-importance national stories, '
+            '5) Use get_trending_news to identify breakout stories, '
+            '6) Use get_news_metrics to optimise send frequency and engagement. '
+            'Balanced coverage — no single category dominates. Factual, not sensational.'
+        ),
+        'config': {
+            'scope': 'national',
+            'categories': ['politics', 'economy', 'sports', 'health', 'science'],
+            'feed_urls': [],
+            'frequency': 'hourly',
+        },
+        'spark_budget': 200,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_news_international',
+        'goal_type': 'news',
+        'title': 'International News Curation and Push Notifications',
+        'description': (
+            'Curate global news from international feeds with focus on technology, '
+            'AI, climate, and geopolitics: '
+            '1) Use subscribe_news_feed for international wire services and global outlets, '
+            '2) Use fetch_news_feeds every 4 hours for world news, '
+            '3) Prioritise: world events, technology breakthroughs, AI developments, '
+            'climate updates, geopolitical shifts, '
+            '4) Use send_news_notification with scope=all for major global stories, '
+            '5) Use get_trending_news to surface viral international stories, '
+            '6) Use get_news_metrics to track cross-category engagement. '
+            'Global perspective — diverse sources, multiple viewpoints, fact-based.'
+        ),
+        'config': {
+            'scope': 'international',
+            'categories': ['world', 'technology', 'ai', 'climate', 'geopolitics'],
+            'feed_urls': [],
+            'frequency': 'every_4h',
+        },
+        'spark_budget': 200,
+        'use_product': False,
+    },
 ]
 
 # ─── Loophole → Remediation Goal Map ───

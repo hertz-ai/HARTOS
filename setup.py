@@ -51,7 +51,7 @@ install_requires = [
     "aiohttp>=3.9.0",
     "aiofiles>=23.2.0",
     "requests>=2.31.0",
-    "httpx>=0.24.0",
+    "httpx>=0.27.0,<1",
 
     # Data processing
     "numpy>=1.25.0",

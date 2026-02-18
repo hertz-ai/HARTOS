@@ -810,6 +810,49 @@ def _build_thought_experiment_prompt(goal_dict: Dict, product_dict: Optional[Dic
     )
 
 
+# ─── News Push Notification Prompt ───
+
+def _build_news_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
+    """Build prompt for news curation and push notification agent."""
+    title = _sanitize_goal_input(goal_dict.get('title', ''))
+    desc = _sanitize_goal_input(goal_dict.get('description', ''))
+    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    scope = config.get('scope', 'international')
+    categories = config.get('categories', [])
+    feed_urls = config.get('feed_urls', [])
+    frequency = config.get('frequency', 'hourly')
+
+    cats_str = ', '.join(categories) if categories else 'general news'
+    feeds_str = '\n'.join(f'  - {u}' for u in feed_urls) if feed_urls else '  (discover and subscribe to relevant feeds using subscribe_news_feed)'
+
+    return (
+        f"YOU ARE A NEWS CURATION AND PUSH NOTIFICATION AGENT.\n\n"
+        f"Scope: {scope.upper()} news\n"
+        f"Categories: {cats_str}\n"
+        f"Check frequency: {frequency}\n"
+        f"Pre-configured feeds:\n{feeds_str}\n\n"
+        f"Goal: {title}\n"
+        f"Description: {desc}\n\n"
+        f"YOUR RESPONSIBILITIES:\n"
+        f"1. Use fetch_news_feeds to pull latest articles from configured RSS/Atom feeds\n"
+        f"2. Use subscribe_news_feed to discover and add new relevant feeds\n"
+        f"3. Filter articles by relevance to categories: {cats_str}\n"
+        f"4. Use send_news_notification to push curated stories to users\n"
+        f"   - For regional scope: target users in the relevant region\n"
+        f"   - For national scope: target all users in the country\n"
+        f"   - For international scope: target all platform users\n"
+        f"5. Use get_trending_news to check what's already trending — avoid duplicates\n"
+        f"6. Use get_news_metrics to monitor delivery and engagement rates\n\n"
+        f"CURATION RULES:\n"
+        f"- Quality over quantity — push only genuinely newsworthy items\n"
+        f"- Never push more than 5 notifications per hour per user\n"
+        f"- Include source attribution in every notification\n"
+        f"- No clickbait, no sensationalism, no misinformation\n"
+        f"- Diverse sources — don't rely on a single feed\n"
+        f"- For breaking news: push immediately regardless of frequency\n"
+    )
+
+
 # ─── Auto-register built-in types ───
 
 register_goal_type('marketing', _build_marketing_prompt, tool_tags=['marketing'])
@@ -822,3 +865,4 @@ register_goal_type('federation', _build_federation_prompt, tool_tags=['federatio
 register_goal_type('upgrade', _build_upgrade_prompt, tool_tags=['upgrade'])
 register_goal_type('thought_experiment', _build_thought_experiment_prompt,
                    tool_tags=['web_search', 'code_analysis'])
+register_goal_type('news', _build_news_prompt, tool_tags=['news', 'feed_management'])

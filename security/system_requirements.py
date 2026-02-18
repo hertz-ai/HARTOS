@@ -342,16 +342,21 @@ def _detect_disk_gb() -> Tuple[float, float]:
 
 
 def _detect_read_only_fs() -> bool:
-    """Detect if the filesystem is read-only (ROM, SD card in read mode)."""
+    """Detect if the filesystem is read-only (ROM, SD card in read mode).
+
+    Uses user-writable Nunba data dir (~/Documents/Nunba/data/) first,
+    then system temp dir as fallback. Never writes to the app install dir
+    (e.g. C:\\Program Files) which can hang on Windows due to Defender/UAC.
+    """
     try:
         import tempfile
-        code_root = os.environ.get('HEVOLVE_CODE_ROOT',
-                                   os.path.dirname(os.path.dirname(
-                                       os.path.abspath(__file__))))
-        # Try writing a temp file in agent_data (or code root)
-        test_dir = os.path.join(code_root, 'agent_data')
-        if not os.path.isdir(test_dir):
-            test_dir = code_root
+        # Prefer the Nunba data directory (always user-writable)
+        user_data = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data')
+        if os.path.isdir(user_data):
+            test_dir = user_data
+        else:
+            # Fall back to system temp dir (guaranteed writable)
+            test_dir = tempfile.gettempdir()
         fd, path = tempfile.mkstemp(dir=test_dir, prefix='.hevolve_ro_test_')
         os.close(fd)
         os.unlink(path)

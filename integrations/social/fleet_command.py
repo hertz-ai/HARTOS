@@ -33,6 +33,8 @@ VALID_COMMAND_TYPES = frozenset({
     'firmware_update',
     'halt',
     'restart',
+    'tts_stream',
+    'agent_consent',
 })
 
 
@@ -228,6 +230,10 @@ class FleetCommandService:
                 return _execute_goal_assign(params)
             elif cmd_type == 'firmware_update':
                 return _execute_firmware_update(params)
+            elif cmd_type == 'tts_stream':
+                return _execute_tts_stream(params)
+            elif cmd_type == 'agent_consent':
+                return _execute_agent_consent(params)
             else:
                 return {'success': False, 'message': f'Unknown command: {cmd_type}'}
         except Exception as e:
@@ -350,6 +356,57 @@ def _execute_firmware_update(params: dict) -> Dict:
         'requested_at': time.time(),
     })
     return {'success': True, 'message': f'Firmware update queued: {release_hash[:16]}...'}
+
+
+def _execute_tts_stream(params: dict) -> Dict:
+    """Stream TTS to this device or relay to a paired device.
+
+    Params:
+        text: Text to speak.
+        voice: Voice ID (default 'default').
+        lang: Language code (default 'en').
+        relay_to_device_id: If set, this device should relay audio to that device.
+    """
+    text = params.get('text', '')
+    if not text:
+        return {'success': False, 'message': 'No text provided'}
+
+    relay_to = params.get('relay_to_device_id', '')
+
+    # Set env flags for the local TTS/relay loop to pick up
+    os.environ['HEVOLVE_TTS_PENDING'] = json.dumps({
+        'text': text,
+        'voice': params.get('voice', 'default'),
+        'lang': params.get('lang', 'en'),
+        'relay_to_device_id': relay_to,
+        'agent_id': params.get('agent_id', ''),
+        'requested_at': time.time(),
+    })
+    action = f"relay to {relay_to[:8]}..." if relay_to else "local playback"
+    return {'success': True, 'message': f'TTS queued: {action}'}
+
+
+def _execute_agent_consent(params: dict) -> Dict:
+    """Display consent prompt for an agent action.
+
+    Params:
+        action: What the agent wants to do.
+        agent_id: Which agent is requesting.
+        description: Human-readable explanation.
+        timeout_s: How long to wait for response (default 60).
+    """
+    action = params.get('action', '')
+    if not action:
+        return {'success': False, 'message': 'No action specified'}
+
+    os.environ['HEVOLVE_CONSENT_PENDING'] = json.dumps({
+        'action': action,
+        'agent_id': params.get('agent_id', ''),
+        'description': params.get('description', ''),
+        'timeout_s': params.get('timeout_s', 60),
+        'requested_at': time.time(),
+    })
+    return {'success': True, 'message': f'Consent requested: {action}'}
 
 
 # ═══════════════════════════════════════════════════════════════

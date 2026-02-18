@@ -103,17 +103,28 @@ def link_device():
         existing = db.query(DeviceBinding).filter_by(
             user_id=g.user.id, device_id=device_id).first()
         if existing:
+            import json as _json
             existing.last_sync_at = datetime.utcnow()
             existing.is_active = True
             existing.device_name = data.get('device_name', existing.device_name)
+            if 'form_factor' in data:
+                existing.form_factor = data['form_factor']
+            caps = data.get('capabilities')
+            if isinstance(caps, dict):
+                existing.capabilities_json = _json.dumps(caps)
             db.commit()
             return _ok(existing.to_dict())
 
+        import json as _json
+        caps = data.get('capabilities')
+        caps_json = _json.dumps(caps) if isinstance(caps, dict) else '{}'
         binding = DeviceBinding(
             user_id=g.user.id,
             device_id=device_id,
             device_name=data.get('device_name', ''),
             platform=data.get('platform', 'web'),
+            form_factor=data.get('form_factor', 'phone'),
+            capabilities_json=caps_json,
         )
         db.add(binding)
         db.commit()

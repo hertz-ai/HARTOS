@@ -1,0 +1,259 @@
+"""
+embedded_main.py — Headless entry point for Hyve on embedded/robot devices.
+
+Boots with minimal imports: security + gossip + sync + fleet commands.
+Does NOT import Flask, langchain, autogen, torch, numpy, opencv, PIL, redis.
+
+Usage:
+    HEVOLVE_HEADLESS=true python3 embedded_main.py
+
+Environment variables:
+    HEVOLVE_HEADLESS=true           Required. Enables headless mode.
+    HEVOLVE_CODE_HASH_PRECOMPUTED   Skip code hash computation (ROM/SD card).
+    HEVOLVE_TAMPER_CHECK_SKIP=true  Skip periodic tamper checks (read-only FS).
+    HEVOLVE_FORCE_TIER=embedded     Force embedded tier (optional, auto-detected).
+    HEVOLVE_GOSSIP_BANDWIDTH        Override gossip bandwidth profile (minimal/constrained/full).
+    HEVOLVE_MQTT_BROKER             MQTT broker for sensor bridge (optional).
+    HEVOLVE_DB_PATH                 SQLite DB path (default: agent_data/hevolve.db).
+
+Queen Bee Authority:
+    Central has instant, total authority over this node. On every gossip round,
+    the main loop checks for pending fleet commands from central. Commands are
+    signed with central's certificate and executed immediately:
+        config_update, goal_assign, sensor_config, firmware_update, halt, restart
+"""
+import logging
+import os
+import signal
+import sys
+import time
+
+# Set headless mode before any other imports
+os.environ.setdefault('HEVOLVE_HEADLESS', 'true')
+
+logger = logging.getLogger('hevolve_embedded')
+
+
+def _setup_logging():
+    """Minimal logging for embedded devices."""
+    level_name = os.environ.get('HEVOLVE_LOG_LEVEL', 'INFO').upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s [%(name)s] %(levelname)s: %(message)s',
+        datefmt='%H:%M:%S',
+    )
+
+
+def _boot_identity():
+    """Initialize Ed25519 keypair and compute code hash."""
+    from security.node_integrity import get_or_create_keypair, compute_code_hash
+
+    priv, pub = get_or_create_keypair()
+    from security.node_integrity import get_public_key_hex
+    node_id = get_public_key_hex()[:16]
+    logger.info(f"Node identity: {node_id}")
+
+    code_hash = compute_code_hash()
+    logger.info(f"Code hash: {code_hash[:16]}...")
+
+    return node_id, code_hash
+
+
+def _boot_guardrails():
+    """Verify guardrail integrity (required for federation)."""
+    try:
+        from security.hive_guardrails import (
+            compute_guardrail_hash, verify_guardrail_integrity,
+        )
+        gh = compute_guardrail_hash()
+        ok = verify_guardrail_integrity()
+        logger.info(f"Guardrail hash: {gh[:16]}... (verified={ok})")
+        return gh
+    except ImportError:
+        logger.warning("Guardrail module unavailable — running unverified")
+        return ''
+
+
+def _boot_system_check():
+    """Run hardware detection and tier classification."""
+    from security.system_requirements import run_system_check
+    caps = run_system_check()
+    logger.info(
+        f"Tier: {caps.tier.value}, "
+        f"Features: {caps.enabled_features}, "
+        f"Hardware: cpu={caps.hardware.cpu_cores}, "
+        f"ram={caps.hardware.ram_gb}GB, "
+        f"gpio={caps.hardware.has_gpio}, "
+        f"serial={caps.hardware.has_serial}"
+    )
+    return caps
+
+
+def _boot_db():
+    """Initialize SQLite database for fleet commands + sync queue."""
+    db_path = os.environ.get('HEVOLVE_DB_PATH',
+                             os.environ.get('SOCIAL_DB_PATH', 'agent_data/hevolve.db'))
+    os.environ['HEVOLVE_DB_PATH'] = db_path
+
+    try:
+        from integrations.social.models import get_engine, Base
+        engine = get_engine()
+        Base.metadata.create_all(engine)
+        logger.info(f"Database ready: {db_path}")
+        return True
+    except Exception as e:
+        logger.warning(f"Database init failed (gossip-only mode): {e}")
+        return False
+
+
+def _drain_fleet_commands(node_id: str):
+    """Check for and execute pending fleet commands from central."""
+    try:
+        from integrations.social.models import get_db
+        from integrations.social.fleet_command import FleetCommandService
+
+        db = get_db()
+        try:
+            commands = FleetCommandService.get_pending_commands(db, node_id)
+            for cmd in commands:
+                logger.info(f"Fleet command: {cmd['cmd_type']} from {cmd['issued_by'][:8]}...")
+
+                # Verify signature before executing
+                if not FleetCommandService.verify_command_signature(cmd):
+                    logger.warning(f"Fleet command {cmd['id']}: invalid signature, skipping")
+                    FleetCommandService.ack_command(
+                        db, cmd['id'], node_id, success=False,
+                        result_message='Invalid signature',
+                    )
+                    continue
+
+                # Execute the command
+                result = FleetCommandService.execute_command(
+                    cmd['cmd_type'], cmd.get('params', {}),
+                )
+                FleetCommandService.ack_command(
+                    db, cmd['id'], node_id,
+                    success=result.get('success', False),
+                    result_message=result.get('message', ''),
+                )
+
+            if commands:
+                db.commit()
+        finally:
+            db.close()
+    except Exception as e:
+        logger.debug(f"Fleet command check failed: {e}")
+
+
+def _check_halt():
+    """Check if halt has been requested (by fleet command or circuit breaker)."""
+    if os.environ.get('HEVOLVE_HALTED', '').lower() == 'true':
+        reason = os.environ.get('HEVOLVE_HALT_REASON', 'Unknown')
+        logger.critical(f"HALT: {reason}")
+        return True
+    return False
+
+
+def _check_restart():
+    """Check if restart has been requested by fleet command."""
+    target = os.environ.get('HEVOLVE_RESTART_REQUESTED', '')
+    if target:
+        os.environ.pop('HEVOLVE_RESTART_REQUESTED', None)
+        logger.info(f"Restart requested: {target}")
+        return target
+    return ''
+
+
+def _main_loop(node_id: str, gossip_interval: int = 60):
+    """Main loop: gossip + fleet commands + hardware adapters.
+
+    Runs until SIGTERM/SIGINT or halt command from central.
+    """
+    tick = 0
+    logger.info(f"Main loop started (interval={gossip_interval}s)")
+
+    while True:
+        tick += 1
+
+        # Check halt flag (queen bee authority)
+        if _check_halt():
+            logger.critical("Halted by central. Exiting.")
+            break
+
+        # Check restart flag
+        restart_target = _check_restart()
+        if restart_target:
+            logger.info(f"Restarting {restart_target}...")
+            # For now, just log. Future: restart specific subsystems.
+
+        # Drain fleet commands from central
+        _drain_fleet_commands(node_id)
+
+        # Sleep for gossip interval
+        try:
+            time.sleep(gossip_interval)
+        except KeyboardInterrupt:
+            logger.info("Interrupted. Shutting down.")
+            break
+
+
+def main():
+    """Boot sequence for embedded/headless Hyve node."""
+    _setup_logging()
+    logger.info("=" * 50)
+    logger.info("Hyve Embedded Node — Starting")
+    logger.info("=" * 50)
+
+    # Graceful shutdown on SIGTERM
+    def _sigterm_handler(signum, frame):
+        logger.info("SIGTERM received. Shutting down.")
+        os.environ['HEVOLVE_HALTED'] = 'true'
+        os.environ['HEVOLVE_HALT_REASON'] = 'SIGTERM'
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
+    # Step 1: System check (tier, hardware detection)
+    caps = _boot_system_check()
+
+    # Step 2: Identity (Ed25519 keypair, code hash)
+    node_id, code_hash = _boot_identity()
+
+    # Step 3: Guardrails (required for federation)
+    guardrail_hash = _boot_guardrails()
+
+    # Step 4: Database (fleet commands, sync queue)
+    db_ok = _boot_db()
+
+    # Step 5: Determine gossip interval from tier/bandwidth profile
+    bandwidth = os.environ.get('HEVOLVE_GOSSIP_BANDWIDTH', '')
+    if not bandwidth:
+        # Auto-select from tier
+        tier_name = caps.tier.value
+        bandwidth = {
+            'embedded': 'minimal',
+            'observer': 'constrained',
+            'lite': 'constrained',
+        }.get(tier_name, 'full')
+
+    gossip_intervals = {
+        'minimal': 900,      # 15 minutes
+        'constrained': 300,  # 5 minutes
+        'full': 60,          # 1 minute
+    }
+    interval = gossip_intervals.get(bandwidth, 60)
+
+    logger.info(f"Gossip bandwidth: {bandwidth} (interval={interval}s)")
+
+    # Step 6: Enter main loop
+    try:
+        _main_loop(node_id, gossip_interval=interval)
+    except Exception as e:
+        logger.critical(f"Main loop crashed: {e}")
+        sys.exit(1)
+
+    logger.info("Hyve Embedded Node - Stopped")
+
+
+if __name__ == '__main__':
+    main()

@@ -106,7 +106,10 @@ try:
 except ImportError:
     from pydantic import BaseModel, Field, root_validator
 from threadlocal import thread_local_data
-import crossbarhttp
+try:
+    import crossbarhttp
+except Exception:
+    crossbarhttp = None
 from PIL import Image
 import numpy as np
 # Cohere rerank - make optional to avoid pydantic v2 incompatibility with old langchain
@@ -848,7 +851,7 @@ else:
     chain = None
 
 
-client = crossbarhttp.Client('http://aws_rasa.hertzai.com:8088/publish')
+client = crossbarhttp.Client('http://aws_rasa.hertzai.com:8088/publish') if crossbarhttp else None
 
 # Create thread pool executor for async Crossbar publishing
 crossbar_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='crossbar_publish')
@@ -863,23 +866,22 @@ def publish_async(topic, message, timeout=2.0):
         message: Message payload (dict)
         timeout: Maximum time to wait for publish (default: 2.0 seconds)
     """
+    if client is None:
+        return
+
     def _publish():
         import socket
         try:
-            # Set socket timeout to prevent long waits
             original_timeout = socket.getdefaulttimeout()
             socket.setdefaulttimeout(timeout)
-
             client.publish(topic, message)
             app.logger.debug(f"Successfully published to {topic}")
         except Exception as e:
             app.logger.error(f"Error publishing to {topic}: {e}")
         finally:
-            # Restore original timeout
             if original_timeout is not None:
                 socket.setdefaulttimeout(original_timeout)
 
-    # Submit to executor without waiting for result
     crossbar_executor.submit(_publish)
 
 
@@ -2281,7 +2283,7 @@ def parse_user_id(inp: str):
     }
 
     try:
-        prov_user_id = re.findall('\d', inp)[0]
+        prov_user_id = re.findall(r'\d', inp)[0]
     except:
         pass
     finally:
