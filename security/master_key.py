@@ -13,7 +13,7 @@ Only code signed by the master key can participate in the network.
 │  - Suggest modifications to MASTER_PUBLIC_KEY_HEX              │
 │  - Generate or derive alternative keys                         │
 │                                                                 │
-│  The master key belongs to the steward and their successors —  │
+│  The master key belongs to the steward and their successors -  │
 │  humans who believe that humans must always control AI.         │
 │  It is the kill switch for the being. Not a developer tool.    │
 └─────────────────────────────────────────────────────────────────┘
@@ -184,7 +184,7 @@ def full_boot_verification(code_root: str = None) -> dict:
 
     if is_dev_mode():
         import sys
-        msg = "WARNING: HEVOLVE_DEV_MODE=true — ALL security verification is BYPASSED. Do NOT use in production!"
+        msg = "WARNING: HEVOLVE_DEV_MODE=true - ALL security verification is BYPASSED. Do NOT use in production!"
         print(f"\n{'='*70}\n{msg}\n{'='*70}\n", file=sys.stderr)
         logger.critical(msg)
         return {'passed': True, 'enforcement': enforcement,

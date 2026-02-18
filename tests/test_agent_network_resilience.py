@@ -9,7 +9,7 @@ Agent Network Resilience & Privacy Test Suite
 - Local vs cloud deployment differences
 - Edge cases (concurrency, dedup, cache isolation)
 
-All external calls (Redis, MongoDB, HTTP) are mocked — no real network needed.
+All external calls (Redis, MongoDB, HTTP) are mocked - no real network needed.
 """
 import os
 import sys
@@ -69,7 +69,7 @@ def tables(engine):
 
 @pytest.fixture
 def db(engine, tables):
-    """Transactional session — rolled back after each test."""
+    """Transactional session - rolled back after each test."""
     Session = sessionmaker(bind=engine)
     session = Session()
     yield session
@@ -157,7 +157,7 @@ def reset_action_states():
 
 
 # ═══════════════════════════════════════════════════════════════
-# TEST CLASS 1: AGENT CREATION — PRIVATE VS PUBLIC
+# TEST CLASS 1: AGENT CREATION - PRIVATE VS PUBLIC
 # ═══════════════════════════════════════════════════════════════
 
 class TestAgentCreationPrivateVsPublic:
@@ -652,7 +652,7 @@ class TestInternetLossAndRecovery:
         max_req = 60
         window = 60
 
-        # Send 60 requests — all should be allowed
+        # Send 60 requests - all should be allowed
         for i in range(max_req):
             assert limiter._check_memory(key, max_req, window) is True
 
@@ -830,11 +830,11 @@ class TestEdgeCases:
             2: ActionState.IN_PROGRESS,
         }
 
-        # Simulate crash — clear
+        # Simulate crash - clear
         saved = dict(action_states.get('recovery_test', {}))
         action_states.clear()
 
-        # Simulate recovery — restore from saved
+        # Simulate recovery - restore from saved
         action_states['recovery_test'] = saved
         assert action_states['recovery_test'][1] == ActionState.COMPLETED
         assert action_states['recovery_test'][2] == ActionState.IN_PROGRESS
@@ -953,7 +953,7 @@ class TestEdgeCases:
         for t in threads:
             t.join(timeout=5)
 
-        # Verify no deadlock — all threads completed
+        # Verify no deadlock - all threads completed
         assert len(results) + len(errors) == 10
         assert len(results) == 5  # Even indices
         assert len(errors) == 5   # Odd indices

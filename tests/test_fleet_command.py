@@ -1,5 +1,5 @@
 """
-Tests for integrations.social.fleet_command — Queen Bee Authority.
+Tests for integrations.social.fleet_command - Queen Bee Authority.
 
 Covers: push_command, push_broadcast, get_pending_commands, ack_command,
 execute_command (all 6 types), signature verification, validation.
@@ -151,7 +151,7 @@ class TestGetAndAckCommands:
         # All should now be 'delivered'
         assert all(c['status'] == 'delivered' for c in pending)
 
-        # Get again — should be empty (already delivered)
+        # Get again - should be empty (already delivered)
         again = FleetCommandService.get_pending_commands(db, 'node_x')
         assert len(again) == 0
 

@@ -260,7 +260,7 @@ def get_conversations(post_id):
 @tracker_bp.route('/experiments/<post_id>/approve', methods=['POST'])
 @require_auth
 def approve_task(post_id):
-    """HITL approval — unblocks APPROVAL_REQUIRED tasks for this experiment."""
+    """HITL approval - unblocks APPROVAL_REQUIRED tasks for this experiment."""
     post = g.db.query(Post).filter_by(id=post_id).first()
     if not post:
         return _err('Post not found', 404)
@@ -298,7 +298,7 @@ def approve_task(post_id):
 @tracker_bp.route('/experiments/<post_id>/reject', methods=['POST'])
 @require_auth
 def reject_task(post_id):
-    """HITL rejection — fails APPROVAL_REQUIRED tasks for this experiment."""
+    """HITL rejection - fails APPROVAL_REQUIRED tasks for this experiment."""
     post = g.db.query(Post).filter_by(id=post_id).first()
     if not post:
         return _err('Post not found', 404)

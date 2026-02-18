@@ -1,5 +1,5 @@
 """
-End-to-End Pipeline Tests — Real integration chains, minimal mocks.
+End-to-End Pipeline Tests - Real integration chains, minimal mocks.
 
 Proves the pieces work TOGETHER, not just in isolation.
 Tests every pipeline that will face the real world:
@@ -110,26 +110,26 @@ class TestCommercialAPILifecycle:
         raw_key = created['raw_key']
         key_id = created['id']
 
-        # Step 2: Validate — should work
+        # Step 2: Validate - should work
         validated = CommercialAPIService.validate_api_key(db, raw_key)
         assert validated is not None
         assert validated['tier'] == 'starter'
 
-        # Step 3: Log usage — meter a real call
+        # Step 3: Log usage - meter a real call
         log1 = CommercialAPIService.log_usage(
             db, key_id, '/v1/intelligence/chat',
             tokens_in=500, tokens_out=800, compute_ms=1200)
         assert log1['cost_credits'] > 0  # starter tier has cost
         assert log1['tokens_in'] == 500
 
-        # Step 4: Log more — verify accumulation
+        # Step 4: Log more - verify accumulation
         log2 = CommercialAPIService.log_usage(
             db, key_id, '/v1/intelligence/analyze',
             tokens_in=200, tokens_out=300, compute_ms=600)
         key = db.query(CommercialAPIKey).filter_by(id=key_id).first()
         assert key.usage_this_month >= 2
 
-        # Step 5: Rate limit — should still be under
+        # Step 5: Rate limit - should still be under
         assert CommercialAPIService.check_rate_limit(db, key_id) is True
 
         # Step 6: Usage stats aggregation
@@ -143,7 +143,7 @@ class TestCommercialAPILifecycle:
         revoked = CommercialAPIService.revoke_api_key(db, key_id)
         assert revoked['is_active'] is False
 
-        # Step 8: Validate after revoke — should fail
+        # Step 8: Validate after revoke - should fail
         invalid = CommercialAPIService.validate_api_key(db, raw_key)
         assert invalid is None
 
@@ -201,7 +201,7 @@ class TestBuildDistributionLifecycle:
         license_key = license['license_key']
         license_id = license['id']
 
-        # Step 2: Verify — valid
+        # Step 2: Verify - valid
         verify = BuildDistributionService.verify_build_license(db, license_key)
         assert verify['valid'] is True
 
@@ -213,15 +213,15 @@ class TestBuildDistributionLifecycle:
         d2 = BuildDistributionService.record_download(db, license_id)
         assert d2['download_count'] == 2
 
-        # Step 5: Download 3 — last allowed
+        # Step 5: Download 3 - last allowed
         d3 = BuildDistributionService.record_download(db, license_id)
         assert d3['download_count'] == 3
 
-        # Step 6: Download 4 — should fail
+        # Step 6: Download 4 - should fail
         d4 = BuildDistributionService.record_download(db, license_id)
         assert 'error' in d4
 
-        # Step 7: Verify — now invalid (downloads exhausted)
+        # Step 7: Verify - now invalid (downloads exhausted)
         verify2 = BuildDistributionService.verify_build_license(db, license_key)
         assert verify2['valid'] is False
         assert 'limit' in verify2['reason'].lower()
@@ -278,7 +278,7 @@ class TestDefensiveIPPipeline:
             db.add(pub)
         db.flush()
 
-        # Check milestone — should trigger
+        # Check milestone - should trigger
         result = IPService.check_intelligence_milestone(db)
         assert result['triggered'] is True
         assert result['consecutive_verified'] >= 14
@@ -465,7 +465,7 @@ class TestAllGoalTypes:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 6. Bootstrap Seeding — All 9 Goals
+# 6. Bootstrap Seeding - All 9 Goals
 # ═══════════════════════════════════════════════════════════════
 
 class TestBootstrapSeeding:
@@ -616,14 +616,14 @@ class TestCrossSystemIntegration:
             CommercialAPIService, COST_PER_1K_TOKENS,
         )
 
-        # Free tier — no cost
+        # Free tier - no cost
         free_key = CommercialAPIService.create_api_key(
             db, str(test_user.id), tier='free')
         free_log = CommercialAPIService.log_usage(
             db, free_key['id'], '/test', tokens_in=1000, tokens_out=1000)
         assert free_log['cost_credits'] == 0
 
-        # Starter tier — has cost
+        # Starter tier - has cost
         starter_key = CommercialAPIService.create_api_key(
             db, str(test_user.id), tier='starter')
         starter_log = CommercialAPIService.log_usage(
@@ -631,7 +631,7 @@ class TestCrossSystemIntegration:
         expected_cost = round((2000 / 1000.0) * COST_PER_1K_TOKENS['starter'], 6)
         assert starter_log['cost_credits'] == expected_cost
 
-        # Pro tier — lower per-token but still charges
+        # Pro tier - lower per-token but still charges
         pro_key = CommercialAPIService.create_api_key(
             db, str(test_user.id), tier='pro')
         pro_log = CommercialAPIService.log_usage(
@@ -652,7 +652,7 @@ class TestCrossSystemIntegration:
         assert compute_share + platform_share == total_revenue
 
     def test_free_tier_always_free(self):
-        """Free tier cost is 0 — non-negotiable."""
+        """Free tier cost is 0 - non-negotiable."""
         from integrations.agent_engine.commercial_api import COST_PER_1K_TOKENS
         assert COST_PER_1K_TOKENS['free'] == 0.0
 

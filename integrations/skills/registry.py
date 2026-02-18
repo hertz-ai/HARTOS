@@ -1,5 +1,5 @@
 """
-Skill Registry — follows ServiceToolRegistry / MCPToolRegistry pattern.
+Skill Registry - follows ServiceToolRegistry / MCPToolRegistry pattern.
 
 Ingests agent skills (Claude Code SKILL.md, plain Markdown, JSON) into the
 Hevolve pipeline so any Hyve agent can execute them during thought experiments.
@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# YAML frontmatter parser (no PyYAML dependency — keep it self-contained)
+# YAML frontmatter parser (no PyYAML dependency - keep it self-contained)
 # ---------------------------------------------------------------------------
 
 def _parse_frontmatter(text: str) -> tuple:
@@ -44,7 +44,7 @@ def _parse_frontmatter(text: str) -> tuple:
     yaml_block = text[3:end].strip()
     body = text[end + 3:].strip()
 
-    # Minimal YAML parser — handles key: value, key: [list], key: "quoted"
+    # Minimal YAML parser - handles key: value, key: [list], key: "quoted"
     meta: Dict[str, Any] = {}
     for line in yaml_block.splitlines():
         line = line.strip()
@@ -86,7 +86,7 @@ class SkillInfo:
     """Metadata + content for an ingested skill."""
     name: str
     description: str
-    instructions: str           # Markdown body — the actual skill prompt
+    instructions: str           # Markdown body - the actual skill prompt
     source: str = "local"       # local | github | http | builtin
     source_path: str = ""       # File path or URL it was loaded from
     allowed_tools: List[str] = field(default_factory=list)
@@ -176,7 +176,7 @@ class SkillInfo:
 
 class SkillRegistry:
     """
-    Registry for agent skills — any skill definition becomes a Hyve tool.
+    Registry for agent skills - any skill definition becomes a Hyve tool.
 
     Mirrors ServiceToolRegistry pattern:
     - register_skill / unregister_skill

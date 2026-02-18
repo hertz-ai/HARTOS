@@ -178,7 +178,7 @@ class TestDetectWitnessRing:
             _make_impression(db, ad.id, node_a.node_id,
                            witness_node_id=node_b.node_id,
                            created_at=now - timedelta(hours=i))
-        # B's impressions witnessed by A (10 times) — bidirectional
+        # B's impressions witnessed by A (10 times) - bidirectional
         for i in range(10):
             _make_impression(db, ad.id, node_b.node_id,
                            witness_node_id=node_a.node_id,

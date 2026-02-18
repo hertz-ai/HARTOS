@@ -2,7 +2,7 @@
 HevolveSocial - Encrypted Backup & Restore Service
 Zero-knowledge backup: Fernet encryption (AES-128-CBC + HMAC-SHA256)
 Key derived from user passphrase via PBKDF2 (600K iterations).
-Server stores only opaque ciphertext — cannot read user data.
+Server stores only opaque ciphertext - cannot read user data.
 """
 import base64
 import hashlib
@@ -147,7 +147,7 @@ def restore_backup(db, user_id: str, passphrase: str, backup_id: str = None) -> 
     try:
         plaintext = f.decrypt(ciphertext)
     except Exception:
-        raise ValueError("Invalid passphrase — decryption failed")
+        raise ValueError("Invalid passphrase - decryption failed")
 
     bundle = json.loads(plaintext.decode())
     restored = {'profile': False, 'posts': 0, 'comments': 0, 'votes': 0}

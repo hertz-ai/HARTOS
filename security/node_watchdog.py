@@ -1,5 +1,5 @@
 """
-Node Watchdog — Frozen Thread Auto-Detection and Restart
+Node Watchdog - Frozen Thread Auto-Detection and Restart
 
 Monitors all background daemon threads via heartbeat protocol.
 Detects frozen/crashed threads and auto-restarts them.
@@ -154,7 +154,7 @@ class NodeWatchdog:
                 threshold = info.expected_interval * self._frozen_multiplier
                 if age > threshold and info.status in ('healthy', 'frozen'):
                     logger.critical(
-                        f"Watchdog: thread '{name}' FROZEN — no heartbeat "
+                        f"Watchdog: thread '{name}' FROZEN - no heartbeat "
                         f"for {age:.0f}s (threshold: {threshold:.0f}s)")
                     info.status = 'frozen'
                     to_restart.append(name)

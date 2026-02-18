@@ -1,5 +1,5 @@
 """
-Tests for Cross-Device Agent Communication — DeviceBinding extensions,
+Tests for Cross-Device Agent Communication - DeviceBinding extensions,
 FleetCommand types, and DeviceRoutingService.
 """
 import json

@@ -853,6 +853,30 @@ def _build_news_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> 
     )
 
 
+def _build_provision_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
+    """Build prompt for HyveOS network provisioning goals."""
+    title = goal_dict.get('title', 'Network Provisioning')
+    desc = goal_dict.get('description', '')
+    return (
+        f"GOAL: {title}\n"
+        f"DESCRIPTION: {desc}\n\n"
+        f"You are the HyveOS network provisioning agent. Your job is to install "
+        f"HyveOS on remote machines over the network via SSH.\n\n"
+        f"WORKFLOW:\n"
+        f"1. If the user specified a target host, use provision_network_machine to install\n"
+        f"2. If the user wants to find machines, use scan_network_for_machines first\n"
+        f"3. After provisioning, use check_provisioned_node to verify health\n"
+        f"4. Use list_provisioned_nodes to show the fleet status\n"
+        f"5. Use update_provisioned_node to update existing installations\n\n"
+        f"RULES:\n"
+        f"- Always run preflight checks before full provisioning\n"
+        f"- Report the new node's ID, tier, and dashboard URL to the user\n"
+        f"- If provisioning fails, report the specific error and suggest fixes\n"
+        f"- Never store SSH passwords — use key-based auth when possible\n"
+        f"- The installer requires Ubuntu Server 22.04+ with 4GB+ RAM\n"
+    )
+
+
 # ─── Auto-register built-in types ───
 
 register_goal_type('marketing', _build_marketing_prompt, tool_tags=['marketing'])
@@ -866,3 +890,4 @@ register_goal_type('upgrade', _build_upgrade_prompt, tool_tags=['upgrade'])
 register_goal_type('thought_experiment', _build_thought_experiment_prompt,
                    tool_tags=['web_search', 'code_analysis'])
 register_goal_type('news', _build_news_prompt, tool_tags=['news', 'feed_management'])
+register_goal_type('provision', _build_provision_prompt, tool_tags=['provision'])

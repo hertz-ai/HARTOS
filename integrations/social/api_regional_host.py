@@ -1,9 +1,9 @@
 """
-Regional Host API — Blueprint for regional host request + approval.
+Regional Host API - Blueprint for regional host request + approval.
 
-POST /api/social/regional-host/request     — User requests regional host status
-GET  /api/social/regional-host/requests    — Steward lists pending requests
-POST /api/social/regional-host/approve     — Steward approves
+POST /api/social/regional-host/request     - User requests regional host status
+GET  /api/social/regional-host/requests    - Steward lists pending requests
+POST /api/social/regional-host/approve     - Steward approves
 POST /api/social/regional-host/reject      — Steward rejects
 POST /api/social/regional-host/revoke      — Steward revokes
 GET  /api/social/regional-host/status      — User checks their request status

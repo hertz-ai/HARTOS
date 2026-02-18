@@ -1,5 +1,5 @@
 """
-Tests for News Push Notification Agent — goal type, prompt builder, seed goals, and tools.
+Tests for News Push Notification Agent - goal type, prompt builder, seed goals, and tools.
 """
 import json
 import os

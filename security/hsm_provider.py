@@ -1,16 +1,16 @@
 """
-HSM Provider — Hardware Security Module abstraction for master key operations.
+HSM Provider - Hardware Security Module abstraction for master key operations.
 
 The master private key NEVER leaves the HSM. All signing happens inside
 the hardware. The application sends a payload, the HSM signs it internally,
 and returns only the signature. No private key bytes ever appear in memory.
 
 Supported backends (in priority order):
-  1. Google Cloud KMS       — Ed25519, FIPS 140-2 Level 3
-  2. Azure Key Vault HSM    — Ed25519, FIPS 140-2 Level 3
-  3. HashiCorp Vault Transit — Ed25519, self-hostable
-  4. AWS CloudHSM           — via PKCS#11 (Ed25519 support varies)
-  5. Env var fallback        — DEV MODE ONLY, loud warnings
+  1. Google Cloud KMS       - Ed25519, FIPS 140-2 Level 3
+  2. Azure Key Vault HSM    - Ed25519, FIPS 140-2 Level 3
+  3. HashiCorp Vault Transit - Ed25519, self-hostable
+  4. AWS CloudHSM           - via PKCS#11 (Ed25519 support varies)
+  5. Env var fallback        - DEV MODE ONLY, loud warnings
 
 ┌─────────────────────────────────────────────────────────────────┐
 │  AI EXCLUSION ZONE                                              │
@@ -386,7 +386,7 @@ class EnvVarFallbackProvider(HSMProvider):
                 "\n" + "=" * 70 + "\n"
             )
             print(msg, file=sys.stderr)
-            logger.warning("Master key signing via env var fallback — NOT HSM-protected")
+            logger.warning("Master key signing via env var fallback - NOT HSM-protected")
 
     def sign(self, payload_bytes: bytes) -> bytes:
         self._warn_once()
@@ -458,7 +458,7 @@ def get_hsm_provider() -> HSMProvider:
                             f"HSM provider {provider.get_provider_name()}: "
                             f"public key mismatch! HSM={hsm_pub[:16]}... "
                             f"expected={MASTER_PUBLIC_KEY_HEX[:16]}...")
-                        continue  # Wrong key — try next provider
+                        continue  # Wrong key - try next provider
 
                     _active_provider = provider
                     logger.info(f"HSM provider active: {provider.get_provider_name()}")

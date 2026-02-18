@@ -1,10 +1,10 @@
 """
-vlm_adapter.py — Three-tier VLM execution adapter.
+vlm_adapter.py - Three-tier VLM execution adapter.
 
 Follows the same pattern as Nunba's hevolve_backend_adapter.py:
 - Tier 1: In-process (NUNBA_BUNDLED + pyautogui + OmniParser direct import)
 - Tier 2: HTTP local (flat mode, localhost:5001 screenshot/execute + localhost:8080 parse)
-- Tier 3: Crossbar WAMP (central/regional mode — caller handles via subscribe_and_return)
+- Tier 3: Crossbar WAMP (central/regional mode - caller handles via subscribe_and_return)
 
 Reuses existing env vars: NUNBA_BUNDLED, sys.frozen, HEVOLVE_NODE_TIER.
 Circuit breaker: 2 consecutive failures → skip tier (same as hevolve_backend_adapter.py).
@@ -57,8 +57,8 @@ def execute_vlm_instruction(message: dict) -> dict | None:
     Three-tier VLM execution.
 
     Returns:
-        dict  — {status, extracted_responses, execution_time_seconds} on success
-        None  — signals caller to fall back to Tier 3 (Crossbar subscribe_and_return)
+        dict  - {status, extracted_responses, execution_time_seconds} on success
+        None  - signals caller to fall back to Tier 3 (Crossbar subscribe_and_return)
     """
     global _tier1_fail_count, _tier2_fail_count
 
@@ -90,14 +90,14 @@ def execute_vlm_instruction(message: dict) -> dict | None:
                 f"({_tier2_fail_count}/{_FAIL_THRESHOLD}): {e}"
             )
 
-    # Tier 3: Crossbar WAMP — return None so caller uses subscribe_and_return()
+    # Tier 3: Crossbar WAMP - return None so caller uses subscribe_and_return()
     logger.info("VLM routing to Tier 3 (Crossbar WAMP)")
     return None
 
 
 def check_vlm_available() -> bool:
     """
-    Quick availability check — replaces the 2-second Crossbar ping.
+    Quick availability check - replaces the 2-second Crossbar ping.
 
     Returns True if at least one tier is expected to work.
     """
@@ -105,7 +105,7 @@ def check_vlm_available() -> bool:
     if _BUNDLED_MODE and _HAS_PYAUTOGUI:
         return True
 
-    # Tier 2: flat mode — probe local services (cached)
+    # Tier 2: flat mode - probe local services (cached)
     if _node_tier == 'flat':
         if _probe_local_services():
             return True

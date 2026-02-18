@@ -206,7 +206,7 @@ def _save_code_hash_cache(root: Path, code_hash: str):
         with open(cache_path, 'w') as f:
             json.dump({'code_hash': code_hash, 'cached_at': time.time()}, f)
     except (OSError, IOError) as e:
-        # Read-only FS — silently skip
+        # Read-only FS - silently skip
         logger.debug(f"Code hash cache write skipped: {e}")
 
 
@@ -294,5 +294,5 @@ def purge_pycache(code_root: str = None) -> int:
         if count:
             logger.info(f"Boot integrity: purged {count} __pycache__ directories")
     except (PermissionError, OSError) as e:
-        logger.warning(f"Boot integrity: pycache purge partial — {e}")
+        logger.warning(f"Boot integrity: pycache purge partial - {e}")
     return count

@@ -1,7 +1,7 @@
 """
 HevolveSocial - Mastodon-Style Federation
 Instances follow each other and share content across the federated network.
-Built on top of gossip peer discovery — gossip finds peers, federation shares content.
+Built on top of gossip peer discovery - gossip finds peers, federation shares content.
 
 Concepts:
 - Instance follow: Node A follows Node B → B pushes new posts to A's inbox
@@ -136,7 +136,7 @@ class FederationManager:
         """
         Process an incoming federated post.
         Deduplicates by origin_node_id + post.id.
-        Verifies sender's guardrail hash before accepting — continuous audit
+        Verifies sender's guardrail hash before accepting - continuous audit
         applies to every interaction, not just periodic checks.
         Returns the FederatedPost id if created, None if duplicate.
         """

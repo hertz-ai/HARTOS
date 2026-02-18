@@ -1,5 +1,5 @@
 """
-local_omniparser.py — Lazy-loaded OmniParser for screen parsing.
+local_omniparser.py - Lazy-loaded OmniParser for screen parsing.
 
 Tier 'inprocess': imports OmniParser's Omniparser class directly (singleton).
 Tier 'http': HTTP POST to localhost:8080/parse/ (existing FastAPI endpoint).
@@ -37,12 +37,12 @@ def parse_screen(screenshot_b64: str, tier: str) -> dict:
         tier: 'inprocess' (direct import) or 'http' (localhost:8080)
     Returns:
         dict with keys:
-        - 'screen_info': str — formatted ID→label text for LLM consumption
-        - 'parsed_content_list': list — [{type, content, bbox, idx}, ...]
-        - 'som_image_base64': str — labeled screenshot with bounding boxes
-        - 'original_screenshot_base64': str — original screenshot
-        - 'width': int, 'height': int — screen dimensions
-        - 'latency': float — parse time in seconds
+        - 'screen_info': str - formatted ID→label text for LLM consumption
+        - 'parsed_content_list': list - [{type, content, bbox, idx}, ...]
+        - 'som_image_base64': str - labeled screenshot with bounding boxes
+        - 'original_screenshot_base64': str - original screenshot
+        - 'width': int, 'height': int - screen dimensions
+        - 'latency': float - parse time in seconds
     """
     if tier == 'inprocess':
         return _parse_inprocess(screenshot_b64)

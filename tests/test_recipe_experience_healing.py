@@ -258,7 +258,7 @@ class TestRecipeExperienceRecorder:
             time.sleep(0.03)
             RER.stop_action_timer('test_merge', 2, 'completed')
 
-            # Merge — need to be in the right directory
+            # Merge - need to be in the right directory
             old_cwd = os.getcwd()
             try:
                 os.chdir(tmpdir)
@@ -377,7 +377,7 @@ class TestSelfHealingDispatcher:
             collector.record(ValueError(f"v{i}"), module='mymod', function='myfn')
 
         db = MagicMock()
-        # Mock the goal creation — GoalManager is lazily imported inside the method
+        # Mock the goal creation - GoalManager is lazily imported inside the method
         with patch('integrations.agent_engine.goal_manager.GoalManager.create_goal') as mock_create:
             mock_create.return_value = {'success': True, 'goal': {'id': 'test'}}
             # Mock _is_already_being_fixed (query for existing self_heal goals)

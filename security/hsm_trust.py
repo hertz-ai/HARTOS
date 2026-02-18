@@ -1,5 +1,5 @@
 """
-HSM Trust Network — Certificate pinning and path protection for HSM connections.
+HSM Trust Network - Certificate pinning and path protection for HSM connections.
 
 Ensures the entire path from application to HSM is protected:
   1. TLS certificate pinning to HSM endpoints
@@ -48,7 +48,7 @@ _KNOWN_HSM_PINS: Dict[str, List[str]] = {
     ],
     # Azure Key Vault
     'vault.azure.net': [],
-    # HashiCorp Vault — user-configured, loaded from HYVE_VAULT_CA_CERT
+    # HashiCorp Vault - user-configured, loaded from HYVE_VAULT_CA_CERT
 }
 
 

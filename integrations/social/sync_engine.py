@@ -172,7 +172,7 @@ class SyncEngine:
 
             try:
                 if op == 'register_agent':
-                    # Agent data sync — store as metadata for now
+                    # Agent data sync - store as metadata for now
                     logger.info(f"Sync: received agent registration from child")
                 elif op == 'sync_post':
                     logger.info(f"Sync: received post sync from child")

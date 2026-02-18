@@ -1,5 +1,5 @@
 """
-local_computer_tool.py — Synchronous pyautogui/HTTP wrapper for VLM actions.
+local_computer_tool.py - Synchronous pyautogui/HTTP wrapper for VLM actions.
 
 Replaces OmniParser's Crossbar RPC-based ComputerTool with direct local execution.
 Supports same action types as OmniParser computer.py (key, type, left_click, etc.).

@@ -1,5 +1,5 @@
 """
-Tests for Embedded Tier Support (Phase 1 — system_requirements + code hash caching).
+Tests for Embedded Tier Support (Phase 1 - system_requirements + code hash caching).
 
 Tests: EMBEDDED tier classification, feature gating, force-tier override,
 hardware I/O detection fields, embedded feature map entries.
@@ -169,7 +169,7 @@ class TestHardwareProfileEmbeddedFields:
 # ─── EMBEDDED Has No Requirements ───
 
 class TestEmbeddedNoRequirements:
-    """EMBEDDED should not appear in TIER_REQUIREMENTS — it's the floor."""
+    """EMBEDDED should not appear in TIER_REQUIREMENTS - it's the floor."""
 
     def test_not_in_requirements(self):
         for req in TIER_REQUIREMENTS:

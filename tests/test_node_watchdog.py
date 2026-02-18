@@ -1,4 +1,4 @@
-"""Tests for NodeWatchdog — frozen thread detection and auto-restart."""
+"""Tests for NodeWatchdog - frozen thread detection and auto-restart."""
 import os
 import sys
 import time

@@ -1,21 +1,21 @@
 """
-Fleet Command Service — Queen Bee Authority for Embedded/Robot Devices
+Fleet Command Service - Queen Bee Authority for Embedded/Robot Devices
 
 Central is the queen bee. It has instant, total authority over all nodes:
 - Push commands to any node (config update, goal assign, halt, restart)
 - Broadcast commands to all nodes of a tier
-- Commands are signed with central's certificate — devices verify before executing
+- Commands are signed with central's certificate - devices verify before executing
 
 Embedded devices check for pending commands on every gossip round.
 Commands flow through the existing SyncQueue mechanism (offline-first).
 
 Command types:
-    config_update    — Push env var / config changes to a node
-    goal_assign      — Dispatch an AgentGoal to a node
-    sensor_config    — Configure sensor polling intervals, pin assignments
-    firmware_update  — Trigger firmware/code update on a node
-    halt             — Emergency stop (respects HiveCircuitBreaker)
-    restart          — Restart node services
+    config_update    - Push env var / config changes to a node
+    goal_assign      - Dispatch an AgentGoal to a node
+    sensor_config    - Configure sensor polling intervals, pin assignments
+    firmware_update  - Trigger firmware/code update on a node
+    halt             - Emergency stop (respects HiveCircuitBreaker)
+    restart          - Restart node services
 """
 import json
 import logging
@@ -25,7 +25,7 @@ from typing import Dict, List, Optional
 
 logger = logging.getLogger('hevolve_social')
 
-# Valid command types — anything else is rejected
+# Valid command types - anything else is rejected
 VALID_COMMAND_TYPES = frozenset({
     'config_update',
     'goal_assign',
@@ -215,7 +215,7 @@ class FleetCommandService:
         """Execute a fleet command locally on this node.
 
         Called by the embedded main loop when commands are received.
-        Does NOT require a db session — executes in-process.
+        Does NOT require a db session - executes in-process.
 
         Args:
             cmd_type: The command type to execute.
@@ -328,14 +328,14 @@ def _execute_config_update(params: dict) -> Dict:
 
 
 def _execute_halt(params: dict) -> Dict:
-    """Emergency halt — sets halt flag for the main loop.
+    """Emergency halt - sets halt flag for the main loop.
 
     Note: HiveCircuitBreaker.halt_network() requires master key signature
     and is reserved for the steward. Fleet halt uses a process-level flag
     that the main loop checks.
     """
     reason = params.get('reason', 'Central commanded halt')
-    logger.critical(f"Fleet: HALT received — {reason}")
+    logger.critical(f"Fleet: HALT received - {reason}")
     os.environ['HEVOLVE_HALTED'] = 'true'
     os.environ['HEVOLVE_HALT_REASON'] = reason
     return {'success': True, 'message': f'Halt flag set: {reason}'}
@@ -345,7 +345,7 @@ def _execute_restart(params: dict) -> Dict:
     """Restart node services (not the OS)."""
     target = params.get('target', 'all')  # 'all', 'gossip', 'daemon', 'vision'
     logger.info(f"Fleet: restart requested for {target}")
-    # Set restart flag — main loop checks this
+    # Set restart flag - main loop checks this
     os.environ['HEVOLVE_RESTART_REQUESTED'] = target
     return {'success': True, 'message': f'Restart requested: {target}'}
 
@@ -385,7 +385,7 @@ def _execute_firmware_update(params: dict) -> Dict:
     if not update_url or not release_hash:
         return {'success': False, 'message': 'update_url and release_hash required'}
 
-    # Set update flag — main loop handles the actual update
+    # Set update flag - main loop handles the actual update
     os.environ['HEVOLVE_PENDING_UPDATE'] = json.dumps({
         'url': update_url,
         'hash': release_hash,

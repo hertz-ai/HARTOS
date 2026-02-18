@@ -1,5 +1,5 @@
 """
-DiarizationService — manages the speaker diarization sidecar subprocess.
+DiarizationService - manages the speaker diarization sidecar subprocess.
 
 Mirrors VisionService's MiniCPM management pattern:
     DiarizationService.start()
@@ -43,7 +43,7 @@ class DiarizationService:
         # Check if whisperx is available before starting subprocess
         if not self._is_whisperx_available():
             logger.info(
-                "whisperx not installed — diarization sidecar disabled")
+                "whisperx not installed - diarization sidecar disabled")
             return
 
         # Check HF token
@@ -66,7 +66,7 @@ class DiarizationService:
                         pass
         if not hf_token:
             logger.warning(
-                "No HuggingFace token — diarization sidecar disabled. "
+                "No HuggingFace token - diarization sidecar disabled. "
                 "Set HEVOLVE_HF_TOKEN env var.")
             return
 
@@ -195,7 +195,7 @@ class DiarizationService:
                 self._running = False
 
     def _cleanup_subprocess(self):
-        """atexit handler — kill orphan subprocess."""
+        """atexit handler - kill orphan subprocess."""
         if self._process and self._process.poll() is None:
             try:
                 self._process.terminate()

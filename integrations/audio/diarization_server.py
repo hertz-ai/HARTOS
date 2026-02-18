@@ -1,5 +1,5 @@
 """
-Speaker Diarization Server — standalone WebSocket server for the sidecar.
+Speaker Diarization Server - standalone WebSocket server for the sidecar.
 
 Derived from speaker_diarization/main.py but with:
 - Security fixes (no eval, proper JSON)

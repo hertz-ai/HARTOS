@@ -191,7 +191,7 @@ def init_social(app):
             except Exception as e:
                 logger.debug(f"HevolveSocial runtime monitor start skipped: {e}")
     else:
-        logger.critical("HevolveSocial: gossip NOT started — boot verification failed (hard mode)")
+        logger.critical("HevolveSocial: gossip NOT started - boot verification failed (hard mode)")
 
     # Start sync engine for regional/local tiers
     if _boot_verified:
@@ -236,7 +236,7 @@ def init_social(app):
         except Exception as e:
             logger.debug(f"HevolveSocial registry registration skipped: {e}")
 
-    # ── NodeWatchdog — start LAST, monitors all daemon threads ──
+    # ── NodeWatchdog - start LAST, monitors all daemon threads ──
     try:
         from security.node_watchdog import start_watchdog
         watchdog = start_watchdog()

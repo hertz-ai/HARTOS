@@ -1566,7 +1566,7 @@ class AdImpression(Base):
     impression_type = Column(String(10), default='view')  # view|click
     ip_hash = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=func.now(), index=True)
-    # Impression immutability — seal after witness attestation
+    # Impression immutability - seal after witness attestation
     witness_node_id = Column(String(64), nullable=True)
     witness_signature = Column(String(256), nullable=True)
     sealed_hash = Column(String(64), nullable=True)
@@ -2180,7 +2180,7 @@ class IPInfringement(Base):
 
 
 # ═══════════════════════════════════════════════════════════════
-# TABLE 56 — Defensive Publications (prior art proof, not patents)
+# TABLE 56 - Defensive Publications (prior art proof, not patents)
 # ═══════════════════════════════════════════════════════════════
 
 class DefensivePublication(Base):
@@ -2219,7 +2219,7 @@ class DefensivePublication(Base):
 
 
 # ═══════════════════════════════════════════════════════════════
-# TABLE 57 — Commercial API Keys
+# TABLE 57 - Commercial API Keys
 # ═══════════════════════════════════════════════════════════════
 
 class CommercialAPIKey(Base):
@@ -2259,7 +2259,7 @@ class CommercialAPIKey(Base):
 
 
 # ═══════════════════════════════════════════════════════════════
-# TABLE 58 — API Usage Log
+# TABLE 58 - API Usage Log
 # ═══════════════════════════════════════════════════════════════
 
 class APIUsageLog(Base):
@@ -2293,7 +2293,7 @@ class APIUsageLog(Base):
 
 
 # ═══════════════════════════════════════════════════════════════
-# TABLE 59 — Build Licenses
+# TABLE 59 - Build Licenses
 # ═══════════════════════════════════════════════════════════════
 
 class BuildLicense(Base):
@@ -2527,3 +2527,27 @@ class FleetCommand(Base):
             'delivered_at': self.delivered_at,
             'completed_at': self.completed_at,
         }
+
+
+class ProvisionedNode(Base):
+    """Tracks machines where HyveOS was remotely provisioned via SSH.
+
+    Created by NetworkProvisioner when an agent installs HyveOS on
+    a network machine. Used for fleet management, health monitoring,
+    and remote updates.
+    """
+    __tablename__ = 'provisioned_nodes'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    target_host = Column(String(256), nullable=False, index=True)
+    ssh_user = Column(String(64), default='root')
+    node_id = Column(String(64), nullable=True)
+    peer_node_id = Column(Integer, nullable=True)
+    capability_tier = Column(String(20), nullable=True)
+    status = Column(String(20), default='pending', index=True)
+    installed_version = Column(String(32), nullable=True)
+    last_health_check = Column(DateTime, nullable=True)
+    provisioned_at = Column(DateTime, nullable=True)
+    provisioned_by = Column(String(64), nullable=False, default='system')
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=func.now())

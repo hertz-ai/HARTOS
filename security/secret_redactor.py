@@ -1,5 +1,5 @@
 """
-Secret Redactor — Deterministic PII & Secret Detection for Hive Privacy
+Secret Redactor - Deterministic PII & Secret Detection for Hive Privacy
 
 Prevents cross-user secret leakage:
   User A shares an API key in a conversation → it MUST NOT appear in
@@ -10,18 +10,18 @@ Design principle (from project steward):
    and reveal to another."
 
 THREE-LAYER DEFENSE:
-  Layer 1 — SECRET REDACTION (deterministic regex):
+  Layer 1 - SECRET REDACTION (deterministic regex):
     Pattern-based, zero false negatives on known structured secrets.
     API keys, tokens, passwords, PEM keys, connection strings.
     Regex is correct here: structured secrets have known formats.
 
-  Layer 2 — PER-USER ISOLATION (model-based PII + anonymization):
+  Layer 2 - PER-USER ISOLATION (model-based PII + anonymization):
     Local LLM (crawl4ai / llama.cpp) semantically detects PII in
     free text: names, addresses, medical info, financial details.
     Falls back to regex for emails, phones, URLs, @mentions.
     user_id/prompt_id/node_id anonymized via SHA-256.
 
-  Layer 3 — DIFFERENTIAL PRIVACY (statistical noise):
+  Layer 3 - DIFFERENTIAL PRIVACY (statistical noise):
     Gaussian noise on latency, timestamp quantization, text truncation.
 
 Why model-based PII (Layer 2)?
@@ -57,7 +57,7 @@ from typing import List, Tuple
 
 logger = logging.getLogger('hevolve_social')
 
-# Model-based PII detection — retry cooldown after failure
+# Model-based PII detection - retry cooldown after failure
 _model_last_failure = 0.0
 _MODEL_RETRY_INTERVAL = 60  # Don't retry model for 60s after failure
 
@@ -121,7 +121,7 @@ _add('connection_string',
      r'(?:mongodb(?:\+srv)?|postgres(?:ql)?|mysql|redis|amqp|mssql)'
      r'://[^\s"\'<>]{10,}')
 
-# ── Credit card numbers (basic format — 4 groups of 4 digits) ──
+# ── Credit card numbers (basic format - 4 groups of 4 digits) ──
 _add('credit_card',
      r'\b(?:\d{4}[-\s]?){3}\d{4}\b')
 
@@ -191,10 +191,10 @@ def redact_experience(experience: dict) -> dict:
 
     THREE LAYERS applied in sequence:
 
-    Layer 1 — SECRET REDACTION (deterministic regex):
+    Layer 1 - SECRET REDACTION (deterministic regex):
       API keys, tokens, passwords, PEM keys, etc. → [REDACTED:<type>]
 
-    Layer 2 — PER-USER ISOLATION:
+    Layer 2 - PER-USER ISOLATION:
       - user_id → anonymized hash (not reversible)
       - prompt_id → anonymized hash (not reversible)
       - Quoted text stripped (verbatim content from other systems)
@@ -202,7 +202,7 @@ def redact_experience(experience: dict) -> dict:
       - Phone numbers stripped
       - Names/handles removed from text body
 
-    Layer 3 — DIFFERENTIAL PRIVACY (statistical noise):
+    Layer 3 - DIFFERENTIAL PRIVACY (statistical noise):
       - Gaussian noise on latency_ms (ε=1.0)
       - Timestamp quantized to 5-minute buckets (k-anonymity)
       - node_id anonymized (learn patterns, not node identity)
@@ -229,19 +229,19 @@ def redact_experience(experience: dict) -> dict:
 
     # ── Layer 2: Per-user isolation ──
 
-    # Anonymize user_id — the world model learns PATTERNS, not who said what
+    # Anonymize user_id - the world model learns PATTERNS, not who said what
     if 'user_id' in redacted and redacted['user_id']:
         uid_hash = hashlib.sha256(
             str(redacted['user_id']).encode()).hexdigest()[:8]
         redacted['user_id'] = f'anon_{uid_hash}'
 
-    # Anonymize prompt_id — prevent cross-session correlation
+    # Anonymize prompt_id - prevent cross-session correlation
     if 'prompt_id' in redacted and redacted['prompt_id']:
         pid_hash = hashlib.sha256(
             str(redacted['prompt_id']).encode()).hexdigest()[:8]
         redacted['prompt_id'] = f'prompt_{pid_hash}'
 
-    # Strip PII from text fields — model-based detection with regex fallback.
+    # Strip PII from text fields - model-based detection with regex fallback.
     # The model catches semantic PII (names, addresses, medical info) that
     # regex cannot. Falls back to regex-only if model is unavailable.
     for field in ('prompt', 'response'):
@@ -260,13 +260,13 @@ def redact_experience(experience: dict) -> dict:
         bucket = 300  # 5 minutes
         redacted['timestamp'] = (redacted['timestamp'] // bucket) * bucket
 
-    # Anonymize node_id — learn compute patterns, not node identity
+    # Anonymize node_id - learn compute patterns, not node identity
     if 'node_id' in redacted and redacted['node_id']:
         nid_hash = hashlib.sha256(
             str(redacted['node_id']).encode()).hexdigest()[:8]
         redacted['node_id'] = f'node_{nid_hash}'
 
-    # Truncate text for shared learning — reduces memorization surface.
+    # Truncate text for shared learning - reduces memorization surface.
     # The world model needs PATTERNS, not full conversations.
     for field in ('prompt', 'response'):
         if field in redacted and redacted[field]:
@@ -285,7 +285,7 @@ _EMAIL_PATTERN = re.compile(
 _PHONE_PATTERN = re.compile(
     r'(?:\+?\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{3,4}\b')
 
-# Quoted text (content from other systems/people — high risk of verbatim leak)
+# Quoted text (content from other systems/people - high risk of verbatim leak)
 _QUOTED_PATTERN = re.compile(
     r'(?:^|\n)\s*>.*(?:\n\s*>.*)*', re.MULTILINE)
 
@@ -390,7 +390,7 @@ def _model_detect_pii(text: str) -> str:
                             regex_result = regex_result.replace(
                                 item, '[PII_REDACTED]')
                     return regex_result
-        # Non-200 or unparseable — regex result is still good
+        # Non-200 or unparseable - regex result is still good
         _model_last_failure = time.time()
         return regex_result
 

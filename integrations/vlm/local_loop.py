@@ -1,5 +1,5 @@
 """
-local_loop.py — Synchronous agentic loop for VLM execution.
+local_loop.py - Synchronous agentic loop for VLM execution.
 
 Equivalent to OmniParser's sampling_loop_sync() (loop.py) but without Twisted.
 Orchestrates: screenshot → parse → LLM reason → execute action → repeat.

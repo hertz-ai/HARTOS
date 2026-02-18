@@ -15,7 +15,7 @@ Ad System & Hosting Rewards Test Suite
 - Migration v10 (schema version, tables, backfill)
 - AWARD_TABLE extensions
 
-All external calls mocked — in-memory SQLite.
+All external calls mocked - in-memory SQLite.
 """
 import os
 import sys
@@ -228,7 +228,7 @@ class TestAdServing:
     def test_serve_ad_budget_exhausted(self, db):
         user = _make_user(db, spark=500)
         ad = _make_ad(db, user, budget=10, spent=10, status='active')
-        # Budget fully spent — should not be served
+        # Budget fully spent - should not be served
         result = AdService.serve_ad(db, user_id=str(uuid.uuid4()))
         # The ad with spent==budget won't pass the filter
         if result:
@@ -237,7 +237,7 @@ class TestAdServing:
     def test_serve_ad_region_targeting(self, db):
         user = _make_user(db, spark=500)
         ad = _make_ad(db, user, targeting={'region_ids': ['region-123']})
-        # Request for different region — should not match
+        # Request for different region - should not match
         result = AdService.serve_ad(db, region_id='region-456')
         if result:
             assert result['ad']['id'] != ad.id
@@ -520,7 +520,7 @@ class TestHostingRewards:
         peer = _make_peer(db, operator=operator, agent_count=10)
         HostingRewardService.check_milestones(db, peer.node_id)
         db.flush()
-        # Check again — should not award again
+        # Check again - should not award again
         result = HostingRewardService.check_milestones(db, peer.node_id)
         assert result is None
 

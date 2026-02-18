@@ -65,7 +65,7 @@ def _apply_cors(app: Flask):
     )
     if not allowed_origins:
         logger.warning(
-            "CORS_ORIGINS not configured — no cross-origin requests allowed. "
+            "CORS_ORIGINS not configured - no cross-origin requests allowed. "
             "Set CORS_ORIGINS env var for production (comma-separated origins).")
 
     @app.after_request

@@ -1,6 +1,6 @@
 """
 HevolveSocial - Agent Audit Trail & Compute Tracking API
-Thin aggregation layer — no new tables. Reads from existing sources:
+Thin aggregation layer - no new tables. Reads from existing sources:
   - DashboardService (agents), MemoryGraph (conversations/lifecycle),
   - SmartLedger (task events), AgentGoal (daemon goals),
   - RegionalHostRegistry (compute nodes), APIUsageLog (compute usage).
@@ -31,7 +31,7 @@ def _err(msg, status=400):
 
 
 # ═══════════════════════════════════════════════════════════════
-# AGENTS — Unified list (local + cloud + daemon)
+# AGENTS - Unified list (local + cloud + daemon)
 # ═══════════════════════════════════════════════════════════════
 
 @audit_bp.route('/agents', methods=['GET'])
@@ -179,7 +179,7 @@ def get_agent_thinking(agent_id):
 
 
 # ═══════════════════════════════════════════════════════════════
-# DAEMON — Background agent activity
+# DAEMON - Background agent activity
 # ═══════════════════════════════════════════════════════════════
 
 @audit_bp.route('/daemon/activity', methods=['GET'])
@@ -268,7 +268,7 @@ def get_daemon_goals():
 
 
 # ═══════════════════════════════════════════════════════════════
-# COMPUTE — Node tracking (regional/central only for full view)
+# COMPUTE - Node tracking (regional/central only for full view)
 # ═══════════════════════════════════════════════════════════════
 
 @audit_bp.route('/compute/nodes', methods=['GET'])
@@ -376,7 +376,7 @@ def get_compute_routing():
     if not routing['local_llm_available']:
         routing['routing_reasons'].append({
             'reason': 'compute_unavailable',
-            'description': 'Local LLM not running — requests routed to regional/cloud',
+            'description': 'Local LLM not running - requests routed to regional/cloud',
         })
 
     # Check host registry for connected nodes

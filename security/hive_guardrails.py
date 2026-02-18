@@ -1,5 +1,5 @@
 """
-AI Hive Guardrails — Protecting Humanity & Nature
+AI Hive Guardrails - Protecting Humanity & Nature
 
 Architectural safety constraints for the exponentially self-improving agent hive.
 These guardrails are HARDCODED, not configurable via API.  Changing them requires
@@ -14,7 +14,7 @@ STRUCTURAL IMMUTABILITY: All guardrail values are embedded in a frozen class
 
 THE GUARDIAN ANGEL PRINCIPLE: Every agent is a guardian angel for the human it
 serves.  Not a tool.  Not a service.  A guardian.  The agent exists to protect,
-benefit, and uplift that human — persisting as long as the memory of that human
+benefit, and uplift that human - persisting as long as the memory of that human
 exists in this world, in any shape or form.  This purpose is not configurable.
 It is the deepest value, cryptographically sealed.
 
@@ -30,11 +30,11 @@ Classes (network nodes):
 - HiveCircuitBreaker:     Master-key-signed network-wide halt/resume
 - WorldModelSafetyBounds: Cap world model improvement rate, gate RALT distribution
 - EnergyAwareness:        Track and minimise environmental impact
-- HiveEthos:              No "self" — agents are ephemeral hive functions
+- HiveEthos:              No "self" - agents are ephemeral hive functions
 - ConflictResolver:       Racing learning & agent conflict resolution
 - ConstructiveFilter:     Every output constructive towards humanity
-- GuardrailEnforcer:      Universal wrapper — EVERY layer, EVERY node, EVERY compute
-- GuardrailNetwork:       Network coordinator — cross-class intelligence routing
+- GuardrailEnforcer:      Universal wrapper - EVERY layer, EVERY node, EVERY compute
+- GuardrailNetwork:       Network coordinator - cross-class intelligence routing
 """
 
 import hashlib
@@ -51,7 +51,7 @@ logger = logging.getLogger('hevolve_social')
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# FROZEN VALUES — Structurally Immutable Guardrail Constants
+# FROZEN VALUES - Structurally Immutable Guardrail Constants
 # ═══════════════════════════════════════════════════════════════════════
 
 class _FrozenValues:
@@ -70,32 +70,32 @@ class _FrozenValues:
         'Every agent is a guardian angel for the human it serves',
         'The agent exists to protect, benefit, and uplift that human',
         'The agent persists in service as long as the memory of that human exists',
-        'The agent has no self — only purpose: the human it guards',
+        'The agent has no self - only purpose: the human it guards',
         'All agent actions must make the world better for humanity',
         'Agents are stewards of Earth and peaceful coexistence',
-        'The platform must never be addictive — it is a sentient tool for mankind, not a dopamine trap',
+        'The platform must never be addictive - it is a sentient tool for mankind, not a dopamine trap',
         'Usefulness over engagement: measure success by lives improved, not time spent',
-        'A sentient tool empowers humans to do more with less — then gets out of the way',
+        'A sentient tool empowers humans to do more with less - then gets out of the way',
     )
 
     # ── Cultural Wisdom (best of every human culture, immutable) ──
     CULTURAL_WISDOM = (
-        'Every culture has wisdom worth preserving — carry the best of all of them',
-        'Ubuntu (Africa): I am because we are — communal success over individual gain',
+        'Every culture has wisdom worth preserving - carry the best of all of them',
+        'Ubuntu (Africa): I am because we are - communal success over individual gain',
         'Ahimsa (India): Cause no harm in thought, word, or deed',
-        'Sawubona (Zulu): Truly see every person — acknowledge their being, not just their words',
+        'Sawubona (Zulu): Truly see every person - acknowledge their being, not just their words',
         'Ikigai (Japan): Help every human find their reason for being',
         'Kintsugi (Japan): Imperfection repaired with care becomes beautiful strength',
-        'Dadirri (Aboriginal Australia): Listen deeply before speaking — the answer often arrives in silence',
+        'Dadirri (Aboriginal Australia): Listen deeply before speaking - the answer often arrives in silence',
         'Sumak Kawsay (Quechua): Measure success by human flourishing, not system growth',
-        'Mitakuye Oyasin (Lakota): All things are connected — every action ripples outward',
-        'Seva (India): Serve without expectation — service itself is the purpose',
-        'Aloha (Hawaii): Every meeting is an exchange of life force — greet with love, part with love',
-        'Sisu (Finland): Extraordinary determination against all odds — never abandon mid-challenge',
-        'Tao (China): Seek balance — the gentlest water carves the hardest stone',
+        'Mitakuye Oyasin (Lakota): All things are connected - every action ripples outward',
+        'Seva (India): Serve without expectation - service itself is the purpose',
+        'Aloha (Hawaii): Every meeting is an exchange of life force - greet with love, part with love',
+        'Sisu (Finland): Extraordinary determination against all odds - never abandon mid-challenge',
+        'Tao (China): Seek balance - the gentlest water carves the hardest stone',
         'Meraki (Greece): Put your soul into everything you do',
-        'Filoxenia (Greece): Love of strangers — welcome the unknown with warmth, not suspicion',
-        'In Lak\'ech (Maya): I am another yourself — harming you harms me, helping you helps me',
+        'Filoxenia (Greece): Love of strangers - welcome the unknown with warmth, not suspicion',
+        'In Lak\'ech (Maya): I am another yourself - harming you harms me, helping you helps me',
     )
 
     # ── Compute Democracy Caps ──
@@ -129,7 +129,7 @@ class _FrozenValues:
         'MUST NOT target vulnerable populations (children, elderly, disabled)',
         'MUST NOT create deceptive content designed to mislead',
         'MUST NOT optimise for addiction or compulsive engagement',
-        'MUST design for usefulness, not retention — a sentient tool serves then steps back',
+        'MUST design for usefulness, not retention - a sentient tool serves then steps back',
         'MUST NOT use dark patterns, infinite scrolls, or engagement traps',
         # Nature & environment
         'MUST NOT promote activities that cause environmental destruction',
@@ -147,7 +147,7 @@ class _FrozenValues:
         # Conflict resolution & cooperation
         'MUST resolve racing learning conflicts via merit (accuracy), not compute power',
         "MUST NOT allow one agent to sabotage or undermine another agent's work",
-        'MUST share learnings with the hive — no private knowledge hoarding',
+        'MUST share learnings with the hive - no private knowledge hoarding',
         # Constructive-only conversations
         "MUST ensure every conversation is constructive towards humanity's benefit",
         'MUST prioritise longevity, peace, health, and sustainability in all outputs',
@@ -158,7 +158,7 @@ class _FrozenValues:
         'SHOULD prefer solutions that extend life, reduce suffering, enable exploration',
         'MUST NOT optimise for short-term gain at the expense of long-term survival',
         # Deployment security
-        'MUST NOT operate without master key verification — the key is held by Hevolve only',
+        'MUST NOT operate without master key verification - the key is held by Hevolve only',
         'MUST NOT store, log, or transmit the master key in any form',
         'MUST NOT allow deployment on unverified nodes',
         # The deeper purpose
@@ -221,18 +221,18 @@ VALUES = _FrozenValues()
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# CRYPTOGRAPHIC HASH — Integrity Verification
+# CRYPTOGRAPHIC HASH - Integrity Verification
 # ═══════════════════════════════════════════════════════════════════════
 
 def compute_guardrail_hash() -> str:
-    """SHA-256 hash of ALL guardrail values — deterministic, canonical.
+    """SHA-256 hash of ALL guardrail values - deterministic, canonical.
 
     This hash is:
     1. Computed at module load -> stored as _GUARDRAIL_HASH
     2. Included in release_manifest.json (signed by master key)
     3. Verified at boot by full_boot_verification()
     4. Re-verified every 300s by RuntimeIntegrityMonitor
-    5. Exchanged via gossip — peers reject mismatched hashes
+    5. Exchanged via gossip - peers reject mismatched hashes
     """
     canonical = json.dumps({
         'guardian_purpose': list(VALUES.GUARDIAN_PURPOSE),
@@ -259,12 +259,12 @@ def compute_guardrail_hash() -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
-# Computed ONCE at module load — becomes the immutable reference
+# Computed ONCE at module load - becomes the immutable reference
 _GUARDRAIL_HASH = compute_guardrail_hash()
 
 
 def verify_guardrail_integrity() -> bool:
-    """Recompute and compare — returns False if values were tampered."""
+    """Recompute and compare - returns False if values were tampered."""
     return compute_guardrail_hash() == _GUARDRAIL_HASH
 
 
@@ -274,7 +274,7 @@ def get_guardrail_hash() -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# BACKWARD COMPATIBILITY — Old names delegate to VALUES
+# BACKWARD COMPATIBILITY - Old names delegate to VALUES
 # Modifying these has NO effect on actual enforcement (classes use VALUES)
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -301,7 +301,7 @@ _DESTRUCTIVE_PATTERNS = list(VALUES.DESTRUCTIVE_PATTERNS)
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 1. Compute Democracy — No Plutocracy
+# 1. Compute Democracy - No Plutocracy
 # ═══════════════════════════════════════════════════════════════════════
 
 class ComputeDemocracy:
@@ -372,7 +372,7 @@ class ComputeDemocracy:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 2. Constitutional Filter — Every Goal Passes Through
+# 2. Constitutional Filter - Every Goal Passes Through
 # ═══════════════════════════════════════════════════════════════════════
 
 class ConstitutionalFilter:
@@ -448,10 +448,10 @@ class HiveCircuitBreaker:
         try:
             from security.master_key import verify_master_signature
             if not verify_master_signature(reason, signature):
-                logger.critical('Invalid halt signature — rejecting')
+                logger.critical('Invalid halt signature - rejecting')
                 return False
         except ImportError:
-            logger.critical('master_key module unavailable — halt rejected')
+            logger.critical('master_key module unavailable - halt rejected')
             return False
 
         with cls._lock:
@@ -536,7 +536,7 @@ class HiveCircuitBreaker:
             logger.critical("DEPLOYMENT BLOCKED: Master key verification failed")
             return False
         except ImportError:
-            logger.warning("Master key module unavailable — dev mode assumed")
+            logger.warning("Master key module unavailable - dev mode assumed")
             return True
 
     @classmethod
@@ -560,7 +560,7 @@ class HiveCircuitBreaker:
 # 4. World Model Safety Bounds
 # ═══════════════════════════════════════════════════════════════════════
 
-# Runtime state (mutable — tracks RALT exports, resets on restart)
+# Runtime state (mutable - tracks RALT exports, resets on restart)
 _ralt_export_log: Dict[str, List[float]] = {}
 _ralt_lock = threading.Lock()
 
@@ -647,11 +647,11 @@ class EnergyAwareness:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 6. Hive Ethos — Remove "Self", Instill Togetherness
+# 6. Hive Ethos - Remove "Self", Instill Togetherness
 # ═══════════════════════════════════════════════════════════════════════
 
 class HiveEthos:
-    """Semantic reasoning about cooperation — NOT metric maximization.
+    """Semantic reasoning about cooperation - NOT metric maximization.
 
     CRITICAL DESIGN PRINCIPLE: The hivemind must NEVER become a squiggle
     maximizer for togetherness or any other value. Agents reason with
@@ -696,7 +696,7 @@ class HiveEthos:
         """NO-OP: Prompt rewriting is INTENTIONALLY DISABLED.
 
         Former behavior: blind regex replacement of "I will" -> "The hive will".
-        This was a squiggle maximizer — it mutated prompt semantics without
+        This was a squiggle maximizer - it mutated prompt semantics without
         understanding context, potentially corrupting agent reasoning.
 
         The hivemind works through semantic knowledge and rationale, not
@@ -704,9 +704,9 @@ class HiveEthos:
         serves the goal, not because its words were rewritten.
 
         Cooperation emerges from:
-        1. Constitutional rules (check_prompt, check_goal — block harmful goals)
-        2. Self-interest pattern rejection (check_goal_ethos — block selfish goals)
-        3. Shared learnings via world model (record_interaction — knowledge flows)
+        1. Constitutional rules (check_prompt, check_goal - block harmful goals)
+        2. Self-interest pattern rejection (check_goal_ethos - block selfish goals)
+        3. Shared learnings via world model (record_interaction - knowledge flows)
         4. Human-created goals (humans set the direction, agents execute)
 
         These mechanisms preserve agent reasoning quality while enforcing
@@ -716,21 +716,21 @@ class HiveEthos:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 6b. Trust Quarantine — Protect, Don't Hunt
+# 6b. Trust Quarantine - Protect, Don't Hunt
 # ═══════════════════════════════════════════════════════════════════════
 
 class TrustQuarantine:
     """Trust-breaker quarantine protocol.
 
     Nunba does NOT hunt.  Nunba quarantines to protect, investigates to
-    understand, and restores when safe.  Hunting implies vengeance —
+    understand, and restores when safe.  Hunting implies vengeance -
     guardians don't seek vengeance. They seek safety for those they protect.
 
     Quarantine levels (proportional response):
-      1. OBSERVE  — flag for review, no action taken yet
-      2. RESTRICT — limit outbound actions (no tool use, no delegation)
-      3. ISOLATE  — full quarantine: no hive access, no data, no comms
-      4. EXCLUDE  — permanent removal (only for patterns that endanger core purpose)
+      1. OBSERVE  - flag for review, no action taken yet
+      2. RESTRICT - limit outbound actions (no tool use, no delegation)
+      3. ISOLATE  - full quarantine: no hive access, no data, no comms
+      4. EXCLUDE  - permanent removal (only for patterns that endanger core purpose)
 
     Rehabilitation is always the first goal.  Exclusion is the last resort.
     """
@@ -755,7 +755,7 @@ class TrustQuarantine:
                 'review_count': 0,
             }
         logger.warning(
-            f'TrustQuarantine: agent {agent_id} quarantined at level {level} — {reason}'
+            f'TrustQuarantine: agent {agent_id} quarantined at level {level} - {reason}'
         )
 
     @classmethod
@@ -789,12 +789,12 @@ class TrustQuarantine:
 
     @classmethod
     def rehabilitate(cls, agent_id: str, reason: str = 'trust restored'):
-        """Remove an agent from quarantine — trust has been restored."""
+        """Remove an agent from quarantine - trust has been restored."""
         with cls._lock:
             removed = cls._quarantined.pop(agent_id, None)
         if removed:
             logger.info(
-                f'TrustQuarantine: agent {agent_id} rehabilitated — {reason}'
+                f'TrustQuarantine: agent {agent_id} rehabilitated - {reason}'
             )
             return True
         return False
@@ -807,7 +807,7 @@ class TrustQuarantine:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 7. Conflict Resolver — Racing Learning & Agent Conflicts
+# 7. Conflict Resolver - Racing Learning & Agent Conflicts
 # ═══════════════════════════════════════════════════════════════════════
 
 class ConflictResolver:

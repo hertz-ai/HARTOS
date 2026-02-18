@@ -1,4 +1,4 @@
-"""Tests for PRReviewService — automated PR review + build breaker detection."""
+"""Tests for PRReviewService - automated PR review + build breaker detection."""
 import json
 import os
 import sys

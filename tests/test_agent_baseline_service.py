@@ -1,4 +1,4 @@
-"""Tests for AgentBaselineService — unified performance snapshots."""
+"""Tests for AgentBaselineService - unified performance snapshots."""
 import json
 import os
 import shutil
@@ -156,7 +156,7 @@ class TestCaptureSnapshot:
         mock_trust.return_value = {}
 
         s1 = AgentBaselineService.capture_snapshot('c', 0, 'creation')
-        # Immediately call recipe_change — should be deduped
+        # Immediately call recipe_change - should be deduped
         s2 = AgentBaselineService.capture_snapshot('c', 0, 'recipe_change')
 
         assert s1 is not None

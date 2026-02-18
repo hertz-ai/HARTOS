@@ -1,8 +1,8 @@
 """
-Tests for hardware I/O channel adapters (Phase 2 — Embedded/Robot Support).
+Tests for hardware I/O channel adapters (Phase 2 - Embedded/Robot Support).
 
 Tests: SerialAdapter, GPIOAdapter, WAMPIoTAdapter, ROSBridgeAdapter, auto_register.
-All hardware libraries are mocked — tests run on any platform.
+All hardware libraries are mocked - tests run on any platform.
 """
 import asyncio
 import json
@@ -322,7 +322,7 @@ class TestGPIOAdapter:
         adapter._pin_states[17] = False
         adapter._pin_last_event[17] = time.time() * 1000  # Just now
 
-        # Simulate rapid poll — should be debounced
+        # Simulate rapid poll - should be debounced
         received = []
         adapter.on_message(lambda msg: received.append(msg))
 

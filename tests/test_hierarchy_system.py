@@ -105,7 +105,7 @@ def child_keypair():
 
 
 # =====================================================================
-# TEST CLASS 1: Key Delegation — Certificate Creation & Verification
+# TEST CLASS 1: Key Delegation - Certificate Creation & Verification
 # =====================================================================
 
 class TestKeyDelegation:
@@ -541,7 +541,7 @@ class TestHierarchyService:
         assert result['registered'] is False
 
     def test_register_local_node(self, db, master_keypair, child_keypair):
-        """Register a local node — requires at least one regional host to exist."""
+        """Register a local node - requires at least one regional host to exist."""
         from integrations.social.hierarchy_service import HierarchyService
         from security.key_delegation import create_child_certificate
 
@@ -678,7 +678,7 @@ class TestHierarchyService:
     def test_gossip_targets_central(self, db):
         from integrations.social.hierarchy_service import HierarchyService
 
-        # Create a regional and a local — central should only see regional
+        # Create a regional and a local - central should only see regional
         reg_nid = f'c-reg-{uuid.uuid4().hex[:6]}'
         loc_nid = f'c-loc-{uuid.uuid4().hex[:6]}'
         db.add(PeerNode(node_id=reg_nid, url='http://reg.test:8000', tier='regional', status='active'))

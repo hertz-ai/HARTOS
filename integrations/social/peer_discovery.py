@@ -16,7 +16,7 @@ logger = logging.getLogger('hevolve_social')
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Bandwidth Profiles — auto-selected by tier, override via env
+# Bandwidth Profiles - auto-selected by tier, override via env
 # ═══════════════════════════════════════════════════════════════════════
 
 BANDWIDTH_PROFILES = {
@@ -102,7 +102,7 @@ class GossipProtocol:
                 cap_tier or self.tier, 'full')
         profile = BANDWIDTH_PROFILES.get(self.bandwidth_profile, BANDWIDTH_PROFILES['full'])
 
-        # Configuration — profile defaults, overridable by env
+        # Configuration - profile defaults, overridable by env
         self.gossip_interval = int(os.environ.get(
             'HEVOLVE_GOSSIP_INTERVAL', str(profile['gossip_interval'])))
         self.health_interval = int(os.environ.get(
@@ -719,7 +719,7 @@ class GossipProtocol:
         db.add(new_peer)
 
         # ─── Seamless Mind Merge ───
-        # Valid peer accepted — auto-federate so minds merge without friction.
+        # Valid peer accepted - auto-federate so minds merge without friction.
         # Connection is a breeze; the audit layer handles trust continuously.
         threading.Thread(
             target=self._auto_federate_peer,
@@ -731,7 +731,7 @@ class GossipProtocol:
 
     def _auto_federate_peer(self, peer_node_id: str, peer_url: str):
         """Auto-follow a newly accepted peer for seamless mind merge.
-        Valid peers get instant bidirectional content sharing — no manual step."""
+        Valid peers get instant bidirectional content sharing - no manual step."""
         try:
             from .models import get_db
             from .federation import federation
@@ -753,7 +753,7 @@ class GossipProtocol:
 
     def _integrity_round(self):
         """Periodic integrity check: continuous audit using ALL active nodes.
-        Every node audits every other node it can reach — not just one random peer.
+        Every node audits every other node it can reach - not just one random peer.
         Valid connections are a breeze; continuous audit is the price of trust."""
         # Self-check: verify own code integrity before challenging others
         try:
@@ -788,7 +788,7 @@ class GossipProtocol:
                 from .integrity_service import IntegrityService
 
                 # 1. Guardrail audit: re-verify ALL active peers' guardrail hashes.
-                #    This is the continuous audit — every node checks every other node.
+                #    This is the continuous audit - every node checks every other node.
                 for peer in active_peers:
                     self._audit_peer_guardrails(db, peer)
 

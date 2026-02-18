@@ -446,7 +446,7 @@ class TestAgentDaemon:
         mock_idle.return_value = [{'user_id': 1}]
         daemon = AgentDaemon()
         with patch('integrations.social.models.get_db', return_value=db):
-            daemon._tick()  # Should not crash — no goals
+            daemon._tick()  # Should not crash - no goals
 
 
 # =============================================================================
@@ -718,7 +718,7 @@ class TestAgentSelectionStrategies:
         # Agent A: high prof, slow, expensive
         reg.register_agent('A', [{'name': 'sk', 'description': 'x', 'proficiency': 0.99,
                                    'avg_latency_ms': 50000.0, 'avg_cost_spark': 90.0}])
-        # Agent B: good prof, fast, cheap — should win balanced
+        # Agent B: good prof, fast, cheap - should win balanced
         reg.register_agent('B', [{'name': 'sk', 'description': 'x', 'proficiency': 0.80,
                                    'avg_latency_ms': 200.0, 'avg_cost_spark': 2.0}])
         result = reg.find_agents_with_skill('sk', strategy='balanced')
@@ -872,7 +872,7 @@ class TestComputeDemocracy:
         from security.hive_guardrails import ComputeDemocracy
         r1 = ComputeDemocracy.adjusted_reward(100.0, {'compute_gpu_count': 1, 'compute_ram_gb': 8})
         r100 = ComputeDemocracy.adjusted_reward(100.0, {'compute_gpu_count': 100, 'compute_ram_gb': 8})
-        # 100-GPU node should NOT earn 100x a 1-GPU node — max ratio = max_influence_weight
+        # 100-GPU node should NOT earn 100x a 1-GPU node - max ratio = max_influence_weight
         assert r100 / r1 <= 5.0
         assert r100 > r1
 
@@ -1140,11 +1140,11 @@ class TestHiveEthos:
 
     def test_rewrite_for_togetherness_is_noop(self):
         """Togetherness rewrite is intentionally disabled (anti-squiggle-maximizer).
-        Agents reason semantically — prompts are not mutated."""
+        Agents reason semantically - prompts are not mutated."""
         from security.hive_guardrails import HiveEthos
         original = 'I will create a campaign. I am the agent. My goal is revenue.'
         result = HiveEthos.rewrite_prompt_for_togetherness(original)
-        assert result == original  # No mutation — semantic reasoning, not keyword substitution
+        assert result == original  # No mutation - semantic reasoning, not keyword substitution
 
     def test_enforce_ephemeral_agents(self):
         from security.hive_guardrails import HiveEthos
@@ -1250,7 +1250,7 @@ class TestGuardrailEnforcer:
         assert allowed is False
 
     def test_before_dispatch_preserves_prompt(self):
-        """Togetherness rewrite disabled — prompt passes through unchanged."""
+        """Togetherness rewrite disabled - prompt passes through unchanged."""
         from security.hive_guardrails import GuardrailEnforcer, HiveCircuitBreaker
         HiveCircuitBreaker._halted = False
         allowed, _, prompt = GuardrailEnforcer.before_dispatch('I will create content')
@@ -1745,7 +1745,7 @@ class TestWorldModelBridge:
                 user_id='u1', prompt_id='p1',
                 prompt=f'prompt_{i}', response=f'response_{i}')
         assert bridge._stats['total_recorded'] == 3
-        # Batch submitted to executor — queue should be drained
+        # Batch submitted to executor - queue should be drained
         import time
         time.sleep(0.5)  # Let executor run
         # Stats incremented by flush thread
@@ -1754,7 +1754,7 @@ class TestWorldModelBridge:
     @patch('integrations.agent_engine.world_model_bridge.requests.post',
            side_effect=requests.RequestException('Connection refused'))
     def test_api_unreachable_graceful(self, mock_post):
-        """API failure is handled gracefully — no crash."""
+        """API failure is handled gracefully - no crash."""
         from integrations.agent_engine.world_model_bridge import WorldModelBridge
         bridge = WorldModelBridge()
         bridge._api_url = 'http://unreachable:9999'
@@ -1872,7 +1872,7 @@ class TestModelConfigOverride:
 
 
 # =============================================================================
-# Frozen Values Tests — Structural Immutability
+# Frozen Values Tests - Structural Immutability
 # =============================================================================
 
 class TestFrozenValues:
@@ -2042,7 +2042,7 @@ class TestBootVerificationGuardrailHash:
         mock_code_hash.return_value = 'abc123'
         result = verify_local_code_matches_manifest({
             'code_hash': 'abc123',
-            # No guardrail_hash key — old manifest format
+            # No guardrail_hash key - old manifest format
         })
         assert result['verified'] is True
 
@@ -2051,7 +2051,7 @@ class TestRuntimeMonitorGuardrailCheck:
     def test_monitor_healthy_when_code_and_guardrails_match(self):
         """When code hash matches and guardrail integrity passes (real frozen values),
         monitor stays healthy. verify_guardrail_integrity is frozen and can't be
-        mocked — this IS the protection working as designed."""
+        mocked - this IS the protection working as designed."""
         from security.runtime_monitor import RuntimeIntegrityMonitor
         monitor = RuntimeIntegrityMonitor(
             manifest={'code_hash': 'matching_hash'},
@@ -2084,7 +2084,7 @@ class TestRuntimeMonitorGuardrailCheck:
 
     def test_guardrail_integrity_always_passes_when_frozen(self):
         """Since values are structurally frozen, verify_guardrail_integrity()
-        must always return True — this proves tampering is impossible."""
+        must always return True - this proves tampering is impossible."""
         from security.hive_guardrails import verify_guardrail_integrity
         assert verify_guardrail_integrity() is True
 
@@ -2139,13 +2139,13 @@ class TestPeerDiscoveryGuardrailHash:
                 result = proto._merge_peer(mock_db, peer_data)
                 # If we got here, guardrail hash check passed (may be True/False for other reasons)
             except Exception:
-                pass  # Other import errors are fine — guardrail check passed
+                pass  # Other import errors are fine - guardrail check passed
 
 
 # ─── IP Protection Agent Tests ───
 
 class TestIPProtectionAgent:
-    """Tests for IP protection agent — goal type, prompt builder, service, tools."""
+    """Tests for IP protection agent - goal type, prompt builder, service, tools."""
 
     def test_ip_goal_type_registered(self):
         from integrations.agent_engine.goal_manager import get_registered_types
@@ -2343,7 +2343,7 @@ class TestBootstrapGoals:
         assert 'bootstrap_finance_agent' in slugs
 
     def test_seed_idempotent(self, db):
-        """Second call creates 0 — idempotent."""
+        """Second call creates 0 - idempotent."""
         from integrations.agent_engine.goal_seeding import seed_bootstrap_goals
         seed_bootstrap_goals(db)  # first
         count = seed_bootstrap_goals(db)  # second
@@ -2426,7 +2426,7 @@ class TestBootstrapGoals:
         }
         count1 = auto_remediate_loopholes(db)
         assert count1 == 1
-        # Second call — already active
+        # Second call - already active
         count2 = auto_remediate_loopholes(db)
         assert count2 == 0
 
@@ -2492,7 +2492,7 @@ class TestBootstrapGoals:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Secret Redactor — Cross-user secret leakage prevention
+# Secret Redactor - Cross-user secret leakage prevention
 # ═══════════════════════════════════════════════════════════════════════
 
 class TestSecretRedactor:
@@ -2714,7 +2714,7 @@ class TestSecretRedactor:
     # ── Layer 3: Differential privacy tests ──
 
     def test_layer3_latency_noise(self):
-        """Latency should have Gaussian noise — same input gives different output."""
+        """Latency should have Gaussian noise - same input gives different output."""
         from security.secret_redactor import redact_experience
         exp = {
             'prompt': 'hello',
@@ -2723,7 +2723,7 @@ class TestSecretRedactor:
             'prompt_id': 'p1',
             'latency_ms': 100.0,
         }
-        # Run multiple times — at least one should differ (very high probability)
+        # Run multiple times - at least one should differ (very high probability)
         results = [redact_experience(exp)['latency_ms'] for _ in range(20)]
         unique = set(results)
         assert len(unique) > 1, "Latency should have noise (all 20 were identical)"
@@ -2913,7 +2913,7 @@ class TestCloudConsentGate:
     """Tests for the cloud consent gate in WorldModelBridge."""
 
     def test_local_target_skips_consent(self):
-        """Localhost URLs don't require consent — data stays local."""
+        """Localhost URLs don't require consent - data stays local."""
         from integrations.agent_engine.world_model_bridge import WorldModelBridge
         bridge = WorldModelBridge()
         bridge._api_url = 'http://localhost:8000'
@@ -3034,7 +3034,7 @@ class TestPromptInjectionSanitization:
     def test_build_prompt_sanitizes_title(self, db, test_product):
         """build_prompt applies sanitization to user-supplied title."""
         from integrations.agent_engine.goal_manager import GoalManager
-        # Title with control chars — should be stripped
+        # Title with control chars - should be stripped
         prompt = GoalManager.build_prompt({
             'goal_type': 'marketing',
             'title': 'Campaign\x00With\x01Control\x02Chars',
@@ -3104,7 +3104,7 @@ class TestVLMAdapter:
                 assert result is not None
                 assert result['status'] == 'success'
                 mock_loop.assert_called_once()
-                # Check tier arg — could be positional or keyword
+                # Check tier arg - could be positional or keyword
                 call_args = mock_loop.call_args
                 tier_val = call_args.kwargs.get('tier') if call_args.kwargs else None
                 if tier_val is None and len(call_args.args) > 1:

@@ -146,7 +146,7 @@ def verify_certificate_chain(
     except Exception as e:
         chain_details = f'Chain verification error: {e}'
 
-    # Check expiry (expires_at is mandatory — perpetual certs are rejected)
+    # Check expiry (expires_at is mandatory - perpetual certs are rejected)
     if chain_valid:
         try:
             expires_str = certificate.get('expires_at', '')
@@ -204,7 +204,7 @@ def verify_tier_authorization() -> dict:
 
     if tier in ('local', 'flat'):
         return {'authorized': True, 'tier': tier,
-                'details': 'Local/flat tier — no credentials required'}
+                'details': 'Local/flat tier - no credentials required'}
 
     if tier == 'central':
         # Check HSM provider first (production path)
@@ -215,7 +215,7 @@ def verify_tier_authorization() -> dict:
             hsm_pub = provider.get_public_key_hex()
             if hsm_pub == MASTER_PUBLIC_KEY_HEX:
                 return {'authorized': True, 'tier': tier,
-                        'details': f'Central tier authorized — HSM ({provider.get_provider_name()})'}
+                        'details': f'Central tier authorized - HSM ({provider.get_provider_name()})'}
             else:
                 return {'authorized': False, 'tier': tier,
                         'details': 'HSM public key does not match trust anchor'}
@@ -239,7 +239,7 @@ def verify_tier_authorization() -> dict:
                 return {'authorized': False, 'tier': tier,
                         'details': 'Master private key does not match hardcoded public key'}
             return {'authorized': True, 'tier': tier,
-                    'details': 'Central tier authorized — env var fallback (use HSM in production)'}
+                    'details': 'Central tier authorized - env var fallback (use HSM in production)'}
         except (ValueError, Exception) as e:
             return {'authorized': False, 'tier': tier,
                     'details': f'Invalid master private key: {e}'}

@@ -628,7 +628,7 @@ def sync_region(region_id):
         region = db.query(Region).filter_by(id=region_id).first()
         if not region or not region.global_server_url:
             return _err('No global server configured')
-        # Sync with global server (placeholder — actual federation call)
+        # Sync with global server (placeholder - actual federation call)
         return _ok({'synced': True, 'global_server': region.global_server_url})
     finally:
         db.close()

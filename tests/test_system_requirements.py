@@ -1,5 +1,5 @@
 """
-Tests for security.system_requirements — Hyve OS equilibrium layer.
+Tests for security.system_requirements - Hyve OS equilibrium layer.
 
 Covers: hardware detection, tier classification, feature resolution,
 feature gating (env vars), user override respect, force tier override,
@@ -78,13 +78,13 @@ class TestClassifyTier:
         assert classify_tier(hw) == NodeTierLevel.LITE
 
     def test_classify_tier_observer(self):
-        """1 core, 2 GB RAM — observer tier."""
+        """1 core, 2 GB RAM - observer tier."""
         hw = HardwareProfile(cpu_cores=1, ram_gb=2.0, disk_free_gb=0.5,
                              gpu_vram_gb=0.0, cuda_available=False)
         assert classify_tier(hw) == NodeTierLevel.OBSERVER
 
     def test_classify_tier_embedded(self):
-        """Below all thresholds — embedded. Still valid, still counts."""
+        """Below all thresholds - embedded. Still valid, still counts."""
         hw = HardwareProfile(cpu_cores=1, ram_gb=0.5, disk_free_gb=0.1,
                              gpu_vram_gb=0.0, cuda_available=False)
         assert classify_tier(hw) == NodeTierLevel.EMBEDDED
@@ -405,7 +405,7 @@ class TestEmbeddedFeatures:
         assert FEATURE_TIER_MAP['protocol_adapter'][1] == 'HEVOLVE_PROTOCOL_ADAPTER_ENABLED'
 
     def test_flask_server_requires_observer(self):
-        """Flask server needs OBSERVER tier — embedded devices are headless."""
+        """Flask server needs OBSERVER tier - embedded devices are headless."""
         assert FEATURE_TIER_MAP['flask_server'][0] == NodeTierLevel.OBSERVER
         assert FEATURE_TIER_MAP['flask_server'][1] == 'HEVOLVE_FLASK_ENABLED'
 

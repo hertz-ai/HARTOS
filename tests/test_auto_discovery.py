@@ -1,4 +1,4 @@
-"""Tests for AutoDiscovery — zero-config LAN peer finding via UDP broadcast."""
+"""Tests for AutoDiscovery - zero-config LAN peer finding via UDP broadcast."""
 import json
 import os
 import sys

@@ -1,5 +1,5 @@
 """
-Tests for lightweight vision backends (Phase 4 — Embedded/Robot Support).
+Tests for lightweight vision backends (Phase 4 - Embedded/Robot Support).
 
 Tests: VisionBackend interface, NoneBackend, MiniCPMBackend, auto-selection,
 backend registry.
@@ -47,7 +47,7 @@ class TestVisionBackendInterface:
 
 
 class TestNoneBackend:
-    """NoneBackend — zero overhead, always available."""
+    """NoneBackend - zero overhead, always available."""
 
     def test_name(self):
         assert NoneBackend().name == 'none'
@@ -69,7 +69,7 @@ class TestNoneBackend:
 
 
 class TestMiniCPMBackend:
-    """MiniCPMBackend — GPU sidecar."""
+    """MiniCPMBackend - GPU sidecar."""
 
     def test_name(self):
         assert MiniCPMBackend().name == 'minicpm'
@@ -112,7 +112,7 @@ class TestMiniCPMBackend:
 
 
 class TestMobileVLMBackend:
-    """MobileVLMBackend — ONNX Runtime CPU."""
+    """MobileVLMBackend - ONNX Runtime CPU."""
 
     def test_name(self):
         assert MobileVLMBackend().name == 'mobilevlm'
@@ -138,7 +138,7 @@ class TestMobileVLMBackend:
 
 
 class TestCLIPBackend:
-    """CLIPBackend — classification only."""
+    """CLIPBackend - classification only."""
 
     def test_name(self):
         assert CLIPBackend().name == 'clip'

@@ -710,7 +710,7 @@ class TestAdaptiveRouter:
         router._cloud_encoder = MagicMock()
         router._last_probe = 0.0
 
-        # Simulate recovery probes — TPS=15 > 10*1.2=12
+        # Simulate recovery probes - TPS=15 > 10*1.2=12
         for _ in range(3):
             router._maybe_switch()
         assert router._offloaded is False  # Recovered
@@ -889,7 +889,7 @@ class TestEncoderAdaptiveWrapping:
 # ════════════════════════════════════════════════════════════════════
 
 class TestEmbodiedInProcess:
-    """Test in-process learning pipeline (crawl4ai — zero HTTP overhead)."""
+    """Test in-process learning pipeline (crawl4ai - zero HTTP overhead)."""
 
     def test_init_learning_pipeline_success(self):
         """Mock crawl4ai imports → verify provider + hivemind initialized."""
@@ -1423,7 +1423,7 @@ class TestFlatModeBehavior:
 
 
 class TestRegionalModeBehavior:
-    """Regional mode: same as flat — bundled in-process, NOT standalone.
+    """Regional mode: same as flat - bundled in-process, NOT standalone.
 
     Regional nodes are Nunba desktops that are part of a region cluster.
     They use the same in-process architecture as flat. The only difference
@@ -1483,7 +1483,7 @@ class TestRegionalModeBehavior:
         """Regional and flat must produce identical bridge behavior.
 
         Both are bundled in-process. Only difference is gossip targets
-        and sync to central — NOT the learning pipeline mode.
+        and sync to central - NOT the learning pipeline mode.
         """
         with patch(
             'integrations.agent_engine.world_model_bridge.WorldModelBridge'
@@ -1507,7 +1507,7 @@ class TestRegionalModeBehavior:
         flat_health = flat_bridge.check_health()
         regional_health = regional_bridge.check_health()
 
-        # Same mode, same learning_active — only node_tier differs
+        # Same mode, same learning_active - only node_tier differs
         assert flat_health['mode'] == regional_health['mode'] == 'in_process'
         assert flat_health['learning_active'] == regional_health['learning_active']
         assert flat_health['node_tier'] == 'flat'
@@ -1777,7 +1777,7 @@ class TestStatusEndpointLearning:
 
 
 # ════════════════════════════════════════════════════════════════════
-# Zero Extra Ports — pip-installed (flat/regional) mode
+# Zero Extra Ports - pip-installed (flat/regional) mode
 # ════════════════════════════════════════════════════════════════════
 
 class TestNoExtraPortsInProcessMode:
@@ -1797,14 +1797,14 @@ class TestNoExtraPortsInProcessMode:
         """_init_learning_pipeline must NOT import crawl4ai.server.api_server.
 
         api_server.py starts a FastAPI+uvicorn server on port 8000.
-        In flat/regional mode, we import learning functions directly —
+        In flat/regional mode, we import learning functions directly -
         the server module must never be loaded.
         """
         import inspect
         import langchain_gpt_api as lgapi
         source = inspect.getsource(lgapi._init_learning_pipeline)
 
-        # Strip docstring — only check executable code, not comments
+        # Strip docstring - only check executable code, not comments
         lines = source.split('\n')
         code_lines = []
         in_docstring = False
@@ -1871,7 +1871,7 @@ class TestNoExtraPortsInProcessMode:
             )
 
     def test_flat_mode_no_http_calls_during_flush(self):
-        """Flat mode flush must make ZERO HTTP calls — not even to localhost.
+        """Flat mode flush must make ZERO HTTP calls - not even to localhost.
 
         This is the strongest port-free guarantee: even if port 8000 were
         running, flat mode must not use it.
@@ -2020,7 +2020,7 @@ class TestNoExtraPortsInProcessMode:
         Must NOT import: crawl4ai.server (api_server, wamp, etc.)
 
         If api_server is imported, its module-level code starts the
-        proof monitor and creates a FastAPI app — opening port 8000.
+        proof monitor and creates a FastAPI app - opening port 8000.
         """
         import inspect
         import langchain_gpt_api as lgapi
@@ -2036,10 +2036,10 @@ class TestNoExtraPortsInProcessMode:
 
         # Must NOT import server modules
         assert 'crawl4ai.server' not in source, (
-            "Must NOT import crawl4ai.server — that starts FastAPI on port 8000"
+            "Must NOT import crawl4ai.server - that starts FastAPI on port 8000"
         )
         assert 'api_server' not in source, (
-            "Must NOT import api_server — that binds port 8000"
+            "Must NOT import api_server - that binds port 8000"
         )
 
     def test_bridge_in_process_mode_reports_no_port(self):
@@ -2093,7 +2093,7 @@ class TestNoExtraPortsInProcessMode:
 
 
 # ════════════════════════════════════════════════════════════════════
-# Phase Coverage — Boot → Init → Runtime → Error
+# Phase Coverage - Boot → Init → Runtime → Error
 # ════════════════════════════════════════════════════════════════════
 
 class TestBootPhase:
@@ -2140,7 +2140,7 @@ class TestBootPhase:
         # Module import should be near-instant (< 5s)
         # The learning pipeline runs in background
         assert elapsed < 5.0, (
-            f"Module import took {elapsed:.1f}s — _init_learning_pipeline "
+            f"Module import took {elapsed:.1f}s - _init_learning_pipeline "
             f"may be blocking instead of running in a daemon thread"
         )
 
@@ -2321,7 +2321,7 @@ class TestRuntimePhaseTransitions:
 
 
 # ============================================================================
-# llama.cpp Coordination — prevent double-start
+# llama.cpp Coordination - prevent double-start
 # ============================================================================
 
 
@@ -2401,7 +2401,7 @@ class TestWaitForLlmServer:
     def test_non_200_treated_as_not_ready(self):
         import langchain_gpt_api as lgapi
         mock_resp = MagicMock(status=503)
-        # status != 200 means server is loading — keep polling
+        # status != 200 means server is loading - keep polling
         effects = [mock_resp, mock_resp, MagicMock(status=200)]
         with patch('urllib.request.urlopen', side_effect=effects), \
              patch('time.sleep'):
@@ -2409,7 +2409,7 @@ class TestWaitForLlmServer:
 
 
 # ============================================================================
-# Full Combination Matrix — server state × execution context
+# Full Combination Matrix - server state × execution context
 # ============================================================================
 
 
@@ -2528,7 +2528,7 @@ class TestBundledFlatExternalLlamaCppRunning:
     """Flat mode + user already runs their own llama.cpp on 8080."""
 
     def test_reuses_users_server(self):
-        """Same as Nunba server — wait detects it, reuses it."""
+        """Same as Nunba server - wait detects it, reuses it."""
         import langchain_gpt_api as lgapi
         mock_resp = MagicMock(status=200)
         with patch.dict(os.environ, {'HEVOLVE_LLM_ENDPOINT_URL': ''}), \
@@ -2568,7 +2568,7 @@ class TestBundledFlatNothingAvailable:
             assert lgapi._learning_provider is None
 
     def test_chat_still_works_without_learning(self):
-        """Learning disabled ≠ chat disabled — provider is None, bridge gracefully degrades."""
+        """Learning disabled ≠ chat disabled - provider is None, bridge gracefully degrades."""
         import langchain_gpt_api as lgapi
         assert lgapi._learning_provider is None or True  # None is fine
         # WorldModelBridge._in_process would be False → HTTP fallback or no-op
@@ -2600,7 +2600,7 @@ class TestBundledFlatCloudApiStoppedWorking:
 
         crawl4ai's Priority 0 path will try the cloud endpoint, fail,
         and fall through to local (or fail gracefully).  We don't
-        auto-start a server — the user needs to fix their API key.
+        auto-start a server - the user needs to fix their API key.
         """
         import langchain_gpt_api as lgapi
         with patch.dict(os.environ, {
@@ -2722,7 +2722,7 @@ class TestStandaloneLlamaCppUninstalled:
                  'crawl4ai.embodied_ai.learning.hive_mind': MagicMock(),
              }):
             rl_ef = sys.modules['crawl4ai.embodied_ai.rl_ef']
-            # No provider returned — fallback to transformers
+            # No provider returned - fallback to transformers
             rl_ef.create_learning_llm_config.return_value = {}
             lgapi._learning_provider = None
             lgapi._hive_mind = None
@@ -2763,7 +2763,7 @@ class TestServerStopsMidSession:
             assert health['healthy'] is False
 
     def test_learning_degrades_gracefully(self):
-        """Flush and corrections silently fail — no crash."""
+        """Flush and corrections silently fail - no crash."""
         with patch(
             'integrations.agent_engine.world_model_bridge.WorldModelBridge'
             '._init_in_process'
@@ -2894,7 +2894,7 @@ class TestInitStructure:
 
     def test_bundled_path_returns_early_when_no_server(self):
         """In bundled mode, if server not found, function returns before
-        create_learning_llm_config — verified by source inspection."""
+        create_learning_llm_config - verified by source inspection."""
         import inspect
         import langchain_gpt_api as lgapi
         source = inspect.getsource(lgapi._init_learning_pipeline)

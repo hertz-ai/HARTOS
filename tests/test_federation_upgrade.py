@@ -367,7 +367,7 @@ class TestUpgradeOrchestrator:
         orch1 = UpgradeOrchestrator()
         orch1.start_upgrade('v2.0', 'sha123')
 
-        # Create new instance — should load persisted state
+        # Create new instance - should load persisted state
         orch2 = UpgradeOrchestrator()
         assert orch2.get_status()['version'] == 'v2.0'
         assert orch2.get_status()['stage'] == 'building'

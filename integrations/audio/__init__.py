@@ -1,5 +1,5 @@
 """
-Audio Sidecar — speaker diarization as a managed subprocess.
+Audio Sidecar - speaker diarization as a managed subprocess.
 
 Replaces standalone speaker_diarization service.
 Manages WhisperX + pyannote as a subprocess sidecar with auto-start.

@@ -3,7 +3,7 @@
 """
 Setup script for hyve-backend package (formerly hevolve-backend).
 
-Hyve — Crowdsourced Agentic Intelligence Platform.
+Hyve - Crowdsourced Agentic Intelligence Platform.
 """
 
 from setuptools import setup, find_packages
@@ -15,7 +15,7 @@ try:
     with open(os.path.join(here, "README.md"), encoding="utf-8") as f:
         long_description = f.read()
 except FileNotFoundError:
-    long_description = "Hyve — Crowdsourced Agentic Intelligence Platform"
+    long_description = "Hyve - Crowdsourced Agentic Intelligence Platform"
 
 # Core dependencies required for the server to run
 install_requires = [
@@ -129,7 +129,7 @@ setup(
     setup_requires=["setuptools-scm>=8.0"],
     author="Hyve Team",
     author_email="contact@hevolve.ai",
-    description="Hyve — Crowdsourced Agentic Intelligence Platform",
+    description="Hyve - Crowdsourced Agentic Intelligence Platform",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/hevolve/hyve",

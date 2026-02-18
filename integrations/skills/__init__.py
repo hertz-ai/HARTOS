@@ -1,8 +1,8 @@
 """
-Hyve Skill Ingestion — ingest any agent skill into the Hevolve (Hyvemind) pipeline.
+Hyve Skill Ingestion - ingest any agent skill into the Hevolve (Hyvemind) pipeline.
 
 Supports:
-- Claude Code skills (SKILL.md — YAML frontmatter + Markdown)
+- Claude Code skills (SKILL.md - YAML frontmatter + Markdown)
 - Agent Skills open standard (agentskills.io)
 - Raw Markdown/text skill definitions
 - GitHub-hosted skill repos

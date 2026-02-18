@@ -124,7 +124,7 @@ class MCPServerConnector:
             }
 
         try:
-            # Security: MCP sandbox — validate tool call before execution
+            # Security: MCP sandbox - validate tool call before execution
             try:
                 from security.mcp_sandbox import MCPSandbox
                 sandbox = MCPSandbox()

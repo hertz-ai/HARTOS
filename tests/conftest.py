@@ -41,7 +41,7 @@ collect_ignore = [
     os.path.join(os.path.dirname(__file__), 'run_manual_tests.py'),
 ]
 collect_ignore_glob = [
-    # runtime_tests/ need a live API server — run via scripts/run_e2e_tests.bat
+    # runtime_tests/ need a live API server - run via scripts/run_e2e_tests.bat
     os.path.join(os.path.dirname(__file__), 'runtime_tests', '*.py'),
 ]
 
@@ -71,7 +71,7 @@ def reset_state_machine():
         flow_lifecycle.flows.clear()
         initialize_deterministic_actions()
     except (RuntimeError, Exception):
-        pass  # No Flask app context — test doesn't use lifecycle hooks
+        pass  # No Flask app context - test doesn't use lifecycle hooks
     yield
     try:
         action_states.clear()

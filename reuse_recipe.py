@@ -189,7 +189,8 @@ user_simplemem = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_simpl
 #     "price": [0.0025, 0.01]
 # }]
 
-# Mode-aware config_list: cloud/regional use external LLM, flat uses local llama.cpp
+# Mode-aware config_list: cloud/regional use external LLM, flat uses local
+# (user's wizard-configured endpoint via HEVOLVE_LOCAL_LLM_URL or LLAMA_CPP_PORT)
 _node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
 if _node_tier in ('regional', 'central') and os.environ.get('HEVOLVE_LLM_ENDPOINT_URL'):
     config_list = [{
@@ -199,11 +200,13 @@ if _node_tier in ('regional', 'central') and os.environ.get('HEVOLVE_LLM_ENDPOIN
         "price": [0.0025, 0.01]
     }]
 else:
+    # Dynamic: reads from user's LLM Setup Wizard config (set by Nunba app.py)
     _llama_port = os.environ.get('LLAMA_CPP_PORT', '8080')
+    _local_llm_url = os.environ.get('HEVOLVE_LOCAL_LLM_URL', f'http://localhost:{_llama_port}/v1')
     config_list = [{
-        "model": 'Qwen3-VL-4B-Instruct',
+        "model": os.environ.get('HEVOLVE_LOCAL_LLM_MODEL', 'local'),
         "api_key": 'dummy',
-        "base_url": f'http://localhost:{_llama_port}/v1',
+        "base_url": _local_llm_url,
         "price": [0, 0]
     }]
 

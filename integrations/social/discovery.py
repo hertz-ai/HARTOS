@@ -1,7 +1,7 @@
 """
 HevolveSocial - Platform Discovery
 Exposes .well-known/hevolve-social.json for external bots to discover HevolveSocial.
-Separate from per-agent A2A cards — this advertises the platform itself.
+Separate from per-agent A2A cards - this advertises the platform itself.
 """
 import os
 import logging

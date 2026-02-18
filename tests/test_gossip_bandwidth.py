@@ -1,5 +1,5 @@
 """
-Tests for bandwidth-configurable gossip (Phase 3 — Embedded/Robot Support).
+Tests for bandwidth-configurable gossip (Phase 3 - Embedded/Robot Support).
 
 Tests bandwidth profiles, payload compaction, tier auto-selection,
 and serialization helpers.

@@ -1,5 +1,5 @@
 """
-System Requirements — Hardware detection, tier classification, and adaptive feature gating.
+System Requirements - Hardware detection, tier classification, and adaptive feature gating.
 
 The Hyve OS equilibrium layer.  Runs early in the boot sequence to detect
 actual hardware capabilities and auto-configure features to match what this
@@ -14,12 +14,12 @@ Philosophy:
 
 Contribution Tiers (what you CAN contribute, not what you're excluded from):
 
-    EMBEDDED      -  Any device that can run Python — sensors, GPIO, serial, MQTT bridge
-    OBSERVER      -  < 2 cores / < 4 GB — gossip-only, audit witness, Flask server
-    LITE          -  2 cores,  4 GB RAM,   1 GB disk — chat + gossip + audit
-    STANDARD      -  4 cores,  8 GB RAM,  10 GB disk — + TTS, Whisper, agents
-    FULL          -  8 cores, 16 GB RAM,  50 GB disk, 8 GB VRAM — + video, media, local 7B LLM
-    COMPUTE_HOST  - 16 cores, 32 GB RAM, 100 GB disk, 12 GB VRAM — regional host, local 13B+ LLM
+    EMBEDDED      -  Any device that can run Python - sensors, GPIO, serial, MQTT bridge
+    OBSERVER      -  < 2 cores / < 4 GB - gossip-only, audit witness, Flask server
+    LITE          -  2 cores,  4 GB RAM,   1 GB disk - chat + gossip + audit
+    STANDARD      -  4 cores,  8 GB RAM,  10 GB disk - + TTS, Whisper, agents
+    FULL          -  8 cores, 16 GB RAM,  50 GB disk, 8 GB VRAM - + video, media, local 7B LLM
+    COMPUTE_HOST  - 16 cores, 32 GB RAM, 100 GB disk, 12 GB VRAM - regional host, local 13B+ LLM
 
 Mathematical Derivation (from vram_manager.py VRAM_BUDGETS + model disk sizes):
 
@@ -69,9 +69,9 @@ FORCE_TIER_ENV = 'HEVOLVE_FORCE_TIER'
 # ═══════════════════════════════════════════════════════════════
 
 class NodeTierLevel(Enum):
-    """Contribution tier — what this node can offer the network."""
-    EMBEDDED = "embedded"           # Any device — sensors, GPIO, serial, MQTT bridge
-    OBSERVER = "observer"           # Below lite — still gossips, still audits, Flask
+    """Contribution tier - what this node can offer the network."""
+    EMBEDDED = "embedded"           # Any device - sensors, GPIO, serial, MQTT bridge
+    OBSERVER = "observer"           # Below lite - still gossips, still audits, Flask
     LITE = "lite"                   # Basic chat + gossip + audit + storage relay
     STANDARD = "standard"           # + TTS, Whisper, coding agent, goal engine
     FULL = "full"                   # + Video gen, media agent, full model registry
@@ -189,11 +189,11 @@ MODEL_RESOURCE_TABLE = {
 
 TIER_REQUIREMENTS: List[TierRequirement] = [
     TierRequirement(NodeTierLevel.COMPUTE_HOST, 16, 32.0, 100.0, 12.0),
-    TierRequirement(NodeTierLevel.FULL,          8, 16.0,  50.0,  8.0),
-    TierRequirement(NodeTierLevel.STANDARD,      4,  8.0,  10.0,  0.0),
+    TierRequirement(NodeTierLevel.FULL,          8, 16.0,  20.0,  8.0),
+    TierRequirement(NodeTierLevel.STANDARD,      4,  8.0,   2.0,  0.0),
     TierRequirement(NodeTierLevel.LITE,          2,  4.0,   1.0,  0.0),
     TierRequirement(NodeTierLevel.OBSERVER,      1,  2.0,   0.0,  0.0),
-    # EMBEDDED has no requirements — it's the floor. Any device that runs Python.
+    # EMBEDDED has no requirements - it's the floor. Any device that runs Python.
 ]
 
 
@@ -203,25 +203,25 @@ TIER_REQUIREMENTS: List[TierRequirement] = [
 
 # (minimum_tier, env_var_name)
 FEATURE_TIER_MAP: Dict[str, Tuple[NodeTierLevel, str]] = {
-    # Embedded tier — any device that runs Python
+    # Embedded tier - any device that runs Python
     'gossip':               (NodeTierLevel.EMBEDDED,  'HEVOLVE_GOSSIP_ENABLED'),
     'sensor_bridge':        (NodeTierLevel.EMBEDDED,  'HEVOLVE_SENSOR_BRIDGE_ENABLED'),
     'protocol_adapter':     (NodeTierLevel.EMBEDDED,  'HEVOLVE_PROTOCOL_ADAPTER_ENABLED'),
-    # Observer tier — minimal server
+    # Observer tier - minimal server
     'flask_server':         (NodeTierLevel.OBSERVER,  'HEVOLVE_FLASK_ENABLED'),
-    # Lite tier — cloud-backed chat
+    # Lite tier - cloud-backed chat
     'vision_lightweight':   (NodeTierLevel.LITE,      'HEVOLVE_VISION_LITE_ENABLED'),
-    # Standard tier — full agent capabilities
+    # Standard tier - full agent capabilities
     'agent_engine':         (NodeTierLevel.STANDARD,  'HEVOLVE_AGENT_ENGINE_ENABLED'),
     'coding_agent':         (NodeTierLevel.STANDARD,  'HEVOLVE_CODING_AGENT_ENABLED'),
     'tts':                  (NodeTierLevel.STANDARD,  'HEVOLVE_TTS_ENABLED'),
     'whisper':              (NodeTierLevel.STANDARD,  'HEVOLVE_WHISPER_ENABLED'),
-    # Full tier — GPU workloads
+    # Full tier - GPU workloads
     'video_gen':            (NodeTierLevel.FULL,      'HEVOLVE_VIDEO_GEN_ENABLED'),
     'media_agent':          (NodeTierLevel.FULL,      'HEVOLVE_MEDIA_AGENT_ENABLED'),
     'speculative_dispatch': (NodeTierLevel.FULL,      'HEVOLVE_SPECULATIVE_ENABLED'),
     'local_llm':            (NodeTierLevel.FULL,      'HEVOLVE_LOCAL_LLM_ENABLED'),
-    # Compute host tier — regional hosting
+    # Compute host tier - regional hosting
     'local_llm_large':      (NodeTierLevel.COMPUTE_HOST, 'HEVOLVE_LOCAL_LLM_LARGE_ENABLED'),
     'regional_host':        (NodeTierLevel.COMPUTE_HOST, 'HEVOLVE_REGIONAL_HOST_ELIGIBLE'),
 }
@@ -441,7 +441,7 @@ def classify_tier(hw: HardwareProfile) -> NodeTierLevel:
     """Determine the highest tier this hardware qualifies for.
 
     Iterates from COMPUTE_HOST down to OBSERVER. If none match, returns EMBEDDED.
-    EMBEDDED is never excluded — every node contributes. A Raspberry Pi Zero
+    EMBEDDED is never excluded - every node contributes. A Raspberry Pi Zero
     running gossip + sensor bridge matters.
     """
     # Check for forced tier override
@@ -459,7 +459,7 @@ def classify_tier(hw: HardwareProfile) -> NodeTierLevel:
                 hw.gpu_vram_gb >= req.min_gpu_vram_gb):
             return req.tier
 
-    # Below all thresholds — embedded mode. Sensors, GPIO, gossip relay.
+    # Below all thresholds - embedded mode. Sensors, GPIO, gossip relay.
     # Still counts. Still matters. Every drop.
     return NodeTierLevel.EMBEDDED
 
@@ -527,7 +527,7 @@ def apply_feature_gates(
                     f"Reason: {disabled.get(feature, 'unknown')}. "
                     f"Respecting user override."
                 )
-                # DON'T override — user knows their hardware
+                # DON'T override - user knows their hardware
 
     return env_set
 

@@ -1,5 +1,5 @@
 """
-Tests for the Vision Sidecar — FrameStore, MiniCPMInstaller, VisionService.
+Tests for the Vision Sidecar - FrameStore, MiniCPMInstaller, VisionService.
 
 No GPU or real model needed: all external dependencies are mocked.
 """
@@ -95,7 +95,7 @@ class TestFrameStore:
 
 
 class TestFrameStoreScreenChannel:
-    """Screen channel — separate from camera, shorter TTL."""
+    """Screen channel - separate from camera, shorter TTL."""
 
     def setup_method(self):
         from integrations.vision.frame_store import FrameStore
@@ -122,7 +122,7 @@ class TestFrameStoreScreenChannel:
         assert store.get_screen_description('u1') is None
 
     def test_camera_desc_survives_longer_than_screen(self):
-        """Camera TTL (30s) > screen TTL (5s) — camera description survives."""
+        """Camera TTL (30s) > screen TTL (5s) - camera description survives."""
         from integrations.vision.frame_store import FrameStore
         store = FrameStore(description_ttl=1.0, screen_description_ttl=0.1)
         store.put_description('u1', 'camera desc')
@@ -360,7 +360,7 @@ class TestMiniCPMInstaller:
 # ─── VisionService Tests ───
 
 class TestVisionService:
-    """VisionService orchestrator — all external I/O mocked."""
+    """VisionService orchestrator - all external I/O mocked."""
 
     def test_init_creates_frame_store(self):
         from integrations.vision.vision_service import VisionService
@@ -547,8 +547,8 @@ class TestIntelligentSampling:
         from integrations.vision.vision_service import VisionService
         svc = VisionService(description_interval=0.05)
         jpeg = _make_jpeg(128)
-        svc._should_describe('u1', jpeg, 'camera')  # First — True
-        # Immediately try again with same frame — should skip (within interval)
+        svc._should_describe('u1', jpeg, 'camera')  # First - True
+        # Immediately try again with same frame - should skip (within interval)
         assert svc._should_describe('u1', jpeg, 'camera') is False
 
     def test_different_frame_described_after_interval(self):
@@ -558,7 +558,7 @@ class TestIntelligentSampling:
         jpeg2 = _make_jpeg(200)
         svc._should_describe('u1', jpeg1, 'camera')
         time.sleep(0.06)
-        # Different frame after interval — should describe
+        # Different frame after interval - should describe
         assert svc._should_describe('u1', jpeg2, 'camera') is True
 
     def test_static_scene_backs_off_interval(self):
@@ -567,7 +567,7 @@ class TestIntelligentSampling:
         jpeg = _make_jpeg(128)
         svc._should_describe('u1', jpeg, 'camera')
         time.sleep(0.06)
-        # Same frame (diff < 0.5 threshold) — backs off
+        # Same frame (diff < 0.5 threshold) - backs off
         svc._should_describe('u1', jpeg, 'camera')
         key = 'u1:camera'
         assert svc._user_intervals[key] > svc._description_interval
@@ -581,7 +581,7 @@ class TestIntelligentSampling:
         # Artificially back off
         svc._user_intervals['u1:camera'] = 10.0
         svc._last_describe_time['u1:camera'] = time.time() - 20.0
-        # Big scene change — should reset interval
+        # Big scene change - should reset interval
         svc._should_describe('u1', jpeg2, 'camera')
         assert svc._user_intervals['u1:camera'] == svc._description_interval
 
@@ -589,7 +589,7 @@ class TestIntelligentSampling:
         from integrations.vision.vision_service import VisionService
         svc = VisionService()
         jpeg = _make_jpeg(128)
-        # First frame on camera and screen — both should describe
+        # First frame on camera and screen - both should describe
         assert svc._should_describe('u1', jpeg, 'camera') is True
         assert svc._should_describe('u1', jpeg, 'screen') is True
 
@@ -604,10 +604,10 @@ class TestIntelligentSampling:
         svc._running = True
         svc._circuit_open = False
         jpeg = _make_jpeg(128)
-        # First call — passes (first frame on screen channel)
+        # First call - passes (first frame on screen channel)
         svc.describe_screen_frame('u1', jpeg)
         svc._frames_skipped = 0
-        # Second call — same frame within long interval → skipped
+        # Second call - same frame within long interval → skipped
         svc.describe_screen_frame('u1', jpeg)
         assert svc._frames_skipped >= 1
 
@@ -776,7 +776,7 @@ class TestVisualTriggers:
 # ─── Visual History Search Tests ───
 
 class TestSearchVisualHistory:
-    """helper.search_visual_history — thin wrapper over DB endpoint."""
+    """helper.search_visual_history - thin wrapper over DB endpoint."""
 
     @patch('helper.pooled_request')
     def test_search_returns_matching_camera_results(self, mock_req):

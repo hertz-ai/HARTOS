@@ -33,13 +33,13 @@ class UserService:
     def register(db: Session, username: str, password: str, email: str = None,
                  display_name: str = None, user_type: str = 'human') -> User:
         if db.query(User).filter(User.username == username).first():
-            raise ValueError("Registration failed — username or email may already be in use")
+            raise ValueError("Registration failed - username or email may already be in use")
         if email:
             # Basic email format validation
             if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
                 raise ValueError("Invalid email address format")
             if db.query(User).filter(User.email == email).first():
-                raise ValueError("Registration failed — username or email may already be in use")
+                raise ValueError("Registration failed - username or email may already be in use")
 
         user = User(
             id=_uuid(), username=username, display_name=display_name or username,

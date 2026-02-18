@@ -9,6 +9,8 @@ Pattern from: integrations/vision/minicpm_installer.py (detect_gpu)
 """
 
 import logging
+import subprocess
+import sys
 from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -36,6 +38,7 @@ class VRAMManager:
     def detect_gpu(self) -> Dict:
         """Detect GPU and return info dict.
 
+        Priority: nvidia-smi (no deps) → PyTorch (if already loaded) → macOS Metal.
         Returns: {name, total_gb, free_gb, cuda_available}
         """
         if self._gpu_info is not None:
@@ -48,27 +51,75 @@ class VRAMManager:
             "cuda_available": False,
         }
 
+        # 1) nvidia-smi — zero-dependency, works on any NVIDIA GPU system
         try:
-            import torch
-            if torch.cuda.is_available():
-                props = torch.cuda.get_device_properties(0)
-                total = props.total_mem / (1024 ** 3)
-                allocated = torch.cuda.memory_allocated(0) / (1024 ** 3)
-                reserved = torch.cuda.memory_reserved(0) / (1024 ** 3)
-                info.update({
-                    "name": torch.cuda.get_device_name(0),
-                    "total_gb": round(total, 2),
-                    "free_gb": round(total - allocated, 2),
-                    "cuda_available": True,
-                })
-                logger.info(
-                    f"GPU: {info['name']} — {info['total_gb']} GB total, "
-                    f"{info['free_gb']} GB free"
-                )
-        except ImportError:
-            logger.warning("PyTorch not installed — GPU detection unavailable")
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name,memory.total,memory.free",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                line = result.stdout.strip().split("\n")[0]
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) >= 3:
+                    total_mb = float(parts[1])
+                    free_mb = float(parts[2])
+                    info.update({
+                        "name": parts[0],
+                        "total_gb": round(total_mb / 1024, 2),
+                        "free_gb": round(free_mb / 1024, 2),
+                        "cuda_available": True,
+                    })
+                    logger.info(
+                        f"GPU (nvidia-smi): {info['name']} — "
+                        f"{info['total_gb']} GB total, {info['free_gb']} GB free"
+                    )
+                    self._gpu_info = info
+                    return info
+        except FileNotFoundError:
+            pass  # nvidia-smi not on PATH — no NVIDIA GPU or drivers
         except Exception as e:
-            logger.warning(f"GPU detection failed: {e}")
+            logger.debug(f"nvidia-smi failed: {e}")
+
+        # 2) PyTorch — only if already imported (don't trigger a 2GB import)
+        if "torch" in sys.modules:
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    props = torch.cuda.get_device_properties(0)
+                    total = props.total_mem / (1024 ** 3)
+                    allocated = torch.cuda.memory_allocated(0) / (1024 ** 3)
+                    info.update({
+                        "name": torch.cuda.get_device_name(0),
+                        "total_gb": round(total, 2),
+                        "free_gb": round(total - allocated, 2),
+                        "cuda_available": True,
+                    })
+                    logger.info(
+                        f"GPU (PyTorch): {info['name']} — "
+                        f"{info['total_gb']} GB total, {info['free_gb']} GB free"
+                    )
+                    self._gpu_info = info
+                    return info
+            except Exception as e:
+                logger.debug(f"PyTorch GPU detection failed: {e}")
+
+        # 3) macOS Metal
+        if sys.platform == "darwin":
+            try:
+                import platform
+                info.update({
+                    "name": f"Apple Metal ({'Apple Silicon' if platform.machine() == 'arm64' else 'Intel'})",
+                    "total_gb": 0.0,  # shared memory — hard to measure
+                    "free_gb": 0.0,
+                    "cuda_available": False,
+                    "metal_available": True,
+                })
+            except Exception:
+                pass
+
+        if not info["cuda_available"]:
+            logger.info("No NVIDIA GPU detected (nvidia-smi not found or no CUDA device)")
 
         self._gpu_info = info
         return info

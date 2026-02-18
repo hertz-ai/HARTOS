@@ -1466,7 +1466,7 @@ def txt2img(text: Annotated[str, "Text to create image"]) -> str:
 
 
 def get_frame(user_id, frame_store=None):
-    """Get latest camera frame — FrameStore first, Redis fallback.
+    """Get latest camera frame - FrameStore first, Redis fallback.
 
     Args:
         user_id: User/device ID.
@@ -1688,7 +1688,7 @@ def get_visual_context(user_id,mins=5):
 def get_screen_context(user_id, mins=2):
     '''
         Get recent screen understanding descriptions (shorter window than visual).
-        Screen context goes stale faster — default 2 minute window.
+        Screen context goes stale faster - default 2 minute window.
     '''
     action_url = f"https://mailer.hertzai.com/get_visual_bymins?user_id={user_id}&mins={mins}"
     time_zone = "Asia/Kolkata"
@@ -1909,7 +1909,7 @@ def create_visual_agent(user_id,prompt_id):
             Only mark an action as "Completed" if the Assistant Agent confirms successful completion.
             For pending tasks or ongoing actions, respond to helper to complete the task.
             Verify the action performed by assistant and make sure the action is performed correctly as per instructions. if action performed was not as per instructions give the pending actions to the helper agent.
-            Report status only—do not perform actions yourself.
+            Report status only-do not perform actions yourself.
             Use "requires_breakdown" when an action is too complex and needs to be split into smaller subtasks.
 
         """,

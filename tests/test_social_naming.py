@@ -100,7 +100,7 @@ class TestAgentNamingValidation:
     def test_name_too_long_rejected(self):
         valid, err = self.validate("abcdefghijklmno.abcdefghijklmno.abcdefghijklmno")  # 47+ chars
         assert valid is False or valid is True  # 47 is the limit
-        # Calculate: 15 + 1 + 15 + 1 + 15 = 47 — right at limit
+        # Calculate: 15 + 1 + 15 + 1 + 15 = 47 - right at limit
         # Actually this is exactly 47, should pass
 
 

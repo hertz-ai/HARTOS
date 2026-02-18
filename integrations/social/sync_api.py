@@ -69,7 +69,7 @@ def restore_backup():
     """Restore user data from an encrypted backup."""
     data = request.get_json(force=True, silent=True) or {}
     passphrase = data.get('passphrase', '').strip()
-    backup_id = data.get('backup_id')  # optional — defaults to latest
+    backup_id = data.get('backup_id')  # optional - defaults to latest
     if not passphrase:
         return _err("Passphrase required")
 

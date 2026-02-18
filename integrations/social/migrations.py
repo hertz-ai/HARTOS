@@ -8,7 +8,7 @@ from .models import get_engine, Base
 
 logger = logging.getLogger('hevolve_social')
 
-SCHEMA_VERSION = 28
+SCHEMA_VERSION = 29
 
 
 def get_schema_version(engine) -> int:
@@ -414,7 +414,7 @@ def run_migrations():
         set_schema_version(engine, 20)
 
     if current < 21:
-        logger.info("HevolveSocial: migrating to v21 (Node capability tier — Hyve OS equilibrium)")
+        logger.info("HevolveSocial: migrating to v21 (Node capability tier - Hyve OS equilibrium)")
         with engine.connect() as conn:
             for stmt in [
                 "ALTER TABLE peer_nodes ADD COLUMN capability_tier VARCHAR(20)",
@@ -463,7 +463,7 @@ def run_migrations():
         set_schema_version(engine, 25)
 
     if current < 26:
-        logger.info("HevolveSocial: migrating to v26 (Fleet Command — Queen Bee Authority)")
+        logger.info("HevolveSocial: migrating to v26 (Fleet Command - Queen Bee Authority)")
         from .models import FleetCommand
         FleetCommand.__table__.create(engine, checkfirst=True)
         set_schema_version(engine, 26)
@@ -497,3 +497,41 @@ def run_migrations():
                     pass
             conn.commit()
         set_schema_version(engine, 28)
+
+    if current < 29:
+        logger.info("HevolveSocial: migrating to v29 (ProvisionedNode table)")
+        with engine.connect() as conn:
+            try:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS provisioned_nodes (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        target_host VARCHAR(256) NOT NULL,
+                        ssh_user VARCHAR(64) DEFAULT 'root',
+                        node_id VARCHAR(64),
+                        peer_node_id INTEGER,
+                        capability_tier VARCHAR(20),
+                        status VARCHAR(20) DEFAULT 'pending',
+                        installed_version VARCHAR(32),
+                        last_health_check DATETIME,
+                        provisioned_at DATETIME,
+                        provisioned_by VARCHAR(64) NOT NULL DEFAULT 'system',
+                        error_message TEXT,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                """))
+            except Exception:
+                pass
+            try:
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_provisioned_nodes_target_host "
+                    "ON provisioned_nodes (target_host)"))
+            except Exception:
+                pass
+            try:
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_provisioned_nodes_status "
+                    "ON provisioned_nodes (status)"))
+            except Exception:
+                pass
+            conn.commit()
+        set_schema_version(engine, 29)

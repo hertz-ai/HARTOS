@@ -1,4 +1,4 @@
-"""Tests for RegionalHostService — hybrid approval flow."""
+"""Tests for RegionalHostService - hybrid approval flow."""
 import json
 import os
 import sys

@@ -1,4 +1,4 @@
-"""Tests for PrivateRepoAccessService — GitHub invite/revoke + access control."""
+"""Tests for PrivateRepoAccessService - GitHub invite/revoke + access control."""
 import os
 import sys
 

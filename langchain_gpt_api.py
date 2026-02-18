@@ -156,7 +156,7 @@ import threading
 
 try:
     from helper import retrieve_json
-except ImportError:
+except Exception:
     retrieve_json = None
 
 # Google A2A integration (from gpt4.1)
@@ -170,7 +170,7 @@ except ImportError:
 # os.environ['LANGCHAIN_ENDPOINT'] = 'https://api.smith.langchain.com'
 # os.environ['LANGCHAIN_API_KEY'] = os.getenv("LANGCHAIN_API_KEY")
 # os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGCHAIN_PROJECT")
-groq_api_key = os.environ['GROQ_API_KEY']
+groq_api_key = os.environ.get('GROQ_API_KEY', '')
 
 
 # ============================================================================
@@ -222,10 +222,11 @@ def _record_lifecycle(status, user_id, prompt_id, details=''):
 # ============================================================================
 class ChatQwen3VL(LLM):
     """
-    Custom LangChain LLM wrapper for local Qwen3-VL API server.
+    Custom LangChain LLM wrapper for a local OpenAI-compatible API server.
 
-    Compatible with LangChain's LLM interface while calling the local
-    crawl4ai server at http://localhost:8000/v1/chat/completions.
+    In bundled Nunba mode, automatically targets the llama.cpp server that
+    Nunba already starts on port 8080 (CPU inference). Otherwise falls back
+    to Qwen3-VL on port 8000 or any HEVOLVE_LOCAL_LLM_URL override.
 
     Features:
     - OpenAI-compatible API interface
@@ -234,8 +235,8 @@ class ChatQwen3VL(LLM):
     - Drop-in replacement for ChatOpenAI
     """
 
-    base_url: str = "http://localhost:8000/v1"
-    model_name: str = "Qwen3-VL-4B-Instruct"
+    base_url: str = os.environ.get('HEVOLVE_LOCAL_LLM_URL', "http://localhost:8000/v1")
+    model_name: str = "local"
     temperature: float = 0.7
     max_tokens: int = 1500
 
@@ -264,6 +265,8 @@ class ChatQwen3VL(LLM):
         if stop:
             payload["stop"] = stop
 
+        _log = logging.getLogger(__name__)
+        # Primary: crawl4ai embodied-ai on port 8000
         try:
             response = pooled_post(
                 f"{self.base_url}/chat/completions",
@@ -271,13 +274,29 @@ class ChatQwen3VL(LLM):
                 timeout=60
             )
             response.raise_for_status()
-
             data = response.json()
             return data["choices"][0]["message"]["content"]
-
         except Exception as e:
-            app.logger.error(f"[Qwen3-VL] Error calling API: {e}")
-            raise
+            _log.warning(f"[LocalLLM] {self.base_url} unavailable: {e}")
+
+        # Fallback: llama.cpp (Nunba always starts it)
+        _llama_port = os.environ.get('LLAMA_CPP_PORT', '8080')
+        _llama_url = f"http://127.0.0.1:{_llama_port}/v1"
+        if _llama_url not in self.base_url:
+            try:
+                _log.info(f"[LocalLLM] Falling back to llama.cpp at {_llama_url}")
+                response = pooled_post(
+                    f"{_llama_url}/chat/completions",
+                    json=payload,
+                    timeout=120
+                )
+                response.raise_for_status()
+                data = response.json()
+                return data["choices"][0]["message"]["content"]
+            except Exception as e2:
+                _log.error(f"[LocalLLM] llama.cpp fallback also failed: {e2}")
+                raise
+        raise
 
     @property
     def _identifying_params(self) -> dict:
@@ -401,6 +420,15 @@ except ImportError:
 except Exception as e:
     app.logger.warning(f"distributed_agent init skipped: {e}")
 
+try:
+    from integrations.social.api_provision import provision_bp
+    app.register_blueprint(provision_bp)
+    app.logger.info("provision_bp registered at /api/provision")
+except ImportError:
+    app.logger.info("Provision module not available, skipping")
+except Exception as e:
+    app.logger.warning(f"Provision init skipped: {e}")
+
 # ============================================================================
 # Google A2A Protocol Initialization
 # ============================================================================
@@ -426,20 +454,27 @@ except Exception as e:
     spec = None
 
 
-with open("config.json", 'r') as f:
-    config = json.load(f)
-
+# Load config.json — graceful fallback when keys are absent (e.g. bundled Nunba install
+# where the config.json is Nunba's URL-template file, not langchain's API-key file).
+try:
+    with open("config.json", 'r') as f:
+        config = json.load(f)
+except Exception:
+    config = {}
 
 # global variables
-encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
+try:
+    encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
+except Exception:
+    encoding = None
 
-# api and keys
-# app.logger.log(config['OPENAI_API_KEY'])
-os.environ["OPENAI_API_KEY"] = config['OPENAI_API_KEY']
-os.environ["GOOGLE_CSE_ID"] = config['GOOGLE_CSE_ID']
-os.environ["GOOGLE_API_KEY"] = config['GOOGLE_API_KEY']
-os.environ["NEWS_API_KEY"] = config['NEWS_API_KEY']
-os.environ["SERPAPI_API_KEY"] = config['SERPAPI_API_KEY']
+# api and keys — use config if available, otherwise keep existing env vars / empty
+for _cfg_key in ('OPENAI_API_KEY', 'GOOGLE_CSE_ID', 'GOOGLE_API_KEY',
+                  'NEWS_API_KEY', 'SERPAPI_API_KEY'):
+    if _cfg_key in config:
+        os.environ[_cfg_key] = config[_cfg_key]
+    else:
+        os.environ.setdefault(_cfg_key, '')
 
 # Mode-aware inference: pass LLM endpoint to crawl4ai for non-flat deployments
 _node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
@@ -454,17 +489,21 @@ if config.get('CLOUD_FALLBACK_URL'):
     os.environ.setdefault('HEVOLVE_CLOUD_FALLBACK_MODEL', config.get('CLOUD_FALLBACK_MODEL', 'gpt-4'))
 # Zep removed — replaced by SimpleMem (local, zero-latency)
 # ZEP_API_URL / ZEP_API_KEY no longer needed
-GPT_API = config['GPT_API']
-STUDENT_API = config['STUDENT_API']
-ACTION_API = config['ACTION_API']
-FAV_TEACHER_API = config['FAV_TEACHER_API']
-DREAMBOOTH_API = config['DREAMBOOTH_API']
-STABLE_DIFF_API = config['STABLE_DIFF_API']
-LLAVA_API = config['LLAVA_API']
-BOOKPARSING_API = config['BOOKPARSING_API']
-CRAWLAB_API = config['CRAWLAB_API']
-RAG_API = config['RAG_API']
-DB_URL = config['DB_URL']
+# API endpoints — fall back to IP_ADDRESS sub-dict or empty when keys missing.
+# In bundled Nunba mode the config.json is URL-template format with IP_ADDRESS dict;
+# in cloud/dev mode it has flat top-level keys.
+_ip = config.get('IP_ADDRESS', {})
+GPT_API = config.get('GPT_API', _ip.get('gpt3_url', ''))
+STUDENT_API = config.get('STUDENT_API', '')
+ACTION_API = config.get('ACTION_API', _ip.get('database_url', ''))
+FAV_TEACHER_API = config.get('FAV_TEACHER_API', '')
+DREAMBOOTH_API = config.get('DREAMBOOTH_API', '')
+STABLE_DIFF_API = config.get('STABLE_DIFF_API', '')
+LLAVA_API = config.get('LLAVA_API', '')
+BOOKPARSING_API = config.get('BOOKPARSING_API', '')
+CRAWLAB_API = config.get('CRAWLAB_API', '')
+RAG_API = config.get('RAG_API', '')
+DB_URL = config.get('DB_URL', _ip.get('database_url', ''))
 
 # ============================================================================
 # Embodied AI Learning Pipeline (crawl4ai — in-process, no extra port)
@@ -815,11 +854,11 @@ class TaskNames(Enum):
     USER_ID_RETRIEVER = "USER_ID_RETRIEVER"
 
 
-# google search API
+# google search API — graceful when GOOGLE_API_KEY is missing (e.g. local-only mode)
 try:
     search = GoogleSearchAPIWrapper(k=4)
 except Exception as e:
-    app.logger.warning(f"Could not initialize Google Search: {e}")
+    logging.getLogger(__name__).info(f"Google Search unavailable (expected in local mode): {e}")
     search = None
 
 # constants
@@ -832,7 +871,10 @@ except Exception as e:
 # llm_math = LLMMathChain(ChatOpenAI(model_name="gpt-3.5-turbo"))
 # Old: llm_math = LLMMathChain(llm=ChatOpenAI(model_name="gpt-3.5-turbo"))
 # New: Using get_llm() to automatically use Qwen3-VL or OpenAI based on USE_QWEN3VL flag
-llm_math = LLMMathChain(llm=get_llm(model_name="gpt-3.5-turbo"))
+try:
+    llm_math = LLMMathChain(llm=get_llm(model_name="gpt-3.5-turbo"))
+except Exception:
+    llm_math = None
 # llm_math = LLMMathChain(llm= ChatGroq(groq_api_key=groq_api_key,
 #                model_name = "mixtral-8x7b-32768"))
 

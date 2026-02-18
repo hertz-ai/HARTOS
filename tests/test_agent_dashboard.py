@@ -1,4 +1,4 @@
-"""Tests for Agent Dashboard — truth-grounded unified view."""
+"""Tests for Agent Dashboard - truth-grounded unified view."""
 import os
 import sys
 import pytest

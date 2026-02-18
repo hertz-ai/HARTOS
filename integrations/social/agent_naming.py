@@ -1,10 +1,10 @@
 """
 HevolveSocial - Agent Naming System (what3words-style, dot-separated)
 
-Local names:  2-word (adjective.noun) — unique per user, work offline.
+Local names:  2-word (adjective.noun) - unique per user, work offline.
               Example: swift.falcon, calm.oracle, bold.storm
 
-Global names: 3-word (local.name.handle) — globally unique.
+Global names: 3-word (local.name.handle) - globally unique.
               Example: swift.falcon.sathi, calm.oracle.john
 
 Handle:       A unique creator tag each user picks once (like a gamertag).

@@ -1,5 +1,5 @@
 """
-Tests for restorable TTLCache — loader callback and cache_loaders.
+Tests for restorable TTLCache - loader callback and cache_loaders.
 
 Verifies that TTLCache auto-loads from persistent storage on cache miss,
 and that individual loader functions correctly restore data from disk/Redis.
@@ -139,12 +139,12 @@ class TestTTLCacheLoader:
 
         cache = TTLCache(ttl_seconds=60, max_size=10, name='test', loader=counting_loader)
 
-        # First access — loader called
+        # First access - loader called
         result1 = cache['my_key']
         assert result1 == {'count': 1}
         assert call_count == 1
 
-        # Second access — should use cached value, NOT call loader
+        # Second access - should use cached value, NOT call loader
         result2 = cache['my_key']
         assert result2 == {'count': 1}
         assert call_count == 1
