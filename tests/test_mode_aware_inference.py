@@ -1281,7 +1281,7 @@ class TestFlatModeBehavior:
     Port 5000: Flask GUI + hevolve-backend API (via test_client)
     Port 8080: llama.cpp raw inference
     NO port 8000: learning pipeline runs in-process (direct Python calls)
-    NO port 6778: hevolve-backend served in-process, not standalone
+    NO port 6777: hevolve-backend served in-process, not standalone
 
     These tests MUST fail if someone re-introduces HTTP self-calls
     or adds unnecessary ports for flat mode.
@@ -1787,7 +1787,7 @@ class TestNoExtraPortsInProcessMode:
       Port 5000: Flask GUI + API (served by Nunba app.py)
       Port 8080: llama.cpp raw inference (started by llama_config)
       NO port 8000: crawl4ai api_server must NOT run
-      NO port 6778: hevolve-backend must NOT run standalone
+      NO port 6777: hevolve-backend must NOT run standalone
 
     These tests MUST fail if someone re-introduces a crawl4ai HTTP server
     or starts hevolve-backend on its own port in flat/regional mode.

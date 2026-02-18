@@ -3947,7 +3947,7 @@ def main():
     skills_thread = threading.Thread(target=_init_skills, daemon=True)
     skills_thread.start()
 
-    serve(app, host='0.0.0.0', port=6778, threads=50)
+    serve(app, host='0.0.0.0', port=6777, threads=50)
 
 
 if __name__ == '__main__':

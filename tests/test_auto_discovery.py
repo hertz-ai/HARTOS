@@ -15,7 +15,7 @@ from integrations.social.peer_discovery import AutoDiscovery, GossipProtocol
 def mock_gossip():
     g = MagicMock(spec=GossipProtocol)
     g.node_id = 'test-node-001'
-    g.base_url = 'http://localhost:6778'
+    g.base_url = 'http://localhost:6777'
     g.node_name = 'test-node'
     g.version = '1.0.0'
     g.tier = 'flat'
@@ -40,7 +40,7 @@ class TestAutoDiscoveryBeacon:
         payload = json.loads(json_bytes.decode('utf-8'))
         assert payload['type'] == 'hevolve-discovery'
         assert payload['node_id'] == 'test-node-001'
-        assert payload['url'] == 'http://localhost:6778'
+        assert payload['url'] == 'http://localhost:6777'
         assert payload['name'] == 'test-node'
         assert 'timestamp' in payload
 
@@ -49,7 +49,7 @@ class TestAutoDiscoveryBeacon:
         payload = {
             'type': 'hevolve-discovery',
             'node_id': 'other-node-002',
-            'url': 'http://other:6778',
+            'url': 'http://other:6777',
             'name': 'other',
             'version': '1.0.0',
             'tier': 'flat',
@@ -58,7 +58,7 @@ class TestAutoDiscoveryBeacon:
         data = AutoDiscovery.BEACON_MAGIC + json.dumps(payload).encode('utf-8')
         result = discovery._parse_beacon(data)
         assert result['node_id'] == 'other-node-002'
-        assert result['url'] == 'http://other:6778'
+        assert result['url'] == 'http://other:6777'
 
     def test_parse_beacon_wrong_magic(self, discovery):
         data = b'WRONG_MAGIC_BYTES' + b'{"type":"hevolve-discovery"}'
@@ -68,7 +68,7 @@ class TestAutoDiscoveryBeacon:
         payload = {
             'type': 'hevolve-discovery',
             'node_id': 'test-node-001',  # Same as our node
-            'url': 'http://localhost:6778',
+            'url': 'http://localhost:6777',
             'timestamp': int(time.time()),
         }
         data = AutoDiscovery.BEACON_MAGIC + json.dumps(payload).encode('utf-8')
@@ -78,7 +78,7 @@ class TestAutoDiscoveryBeacon:
         payload = {
             'type': 'hevolve-discovery',
             'node_id': 'stale-node-003',
-            'url': 'http://stale:6778',
+            'url': 'http://stale:6777',
             'timestamp': int(time.time()) - 600,  # 10 minutes old
         }
         data = AutoDiscovery.BEACON_MAGIC + json.dumps(payload).encode('utf-8')
@@ -107,7 +107,7 @@ class TestAutoDiscoveryBeacon:
             payload = {
                 'type': 'hevolve-discovery',
                 'node_id': 'mismatch-005',
-                'url': 'http://mismatch:6778',
+                'url': 'http://mismatch:6777',
                 'timestamp': int(time.time()),
                 'guardrail_hash': 'different_hash_xyz',
             }
@@ -122,7 +122,7 @@ class TestAutoDiscoveryIntegration:
         payload = {
             'type': 'hevolve-discovery',
             'node_id': 'new-node-010',
-            'url': 'http://new:6778',
+            'url': 'http://new:6777',
             'name': 'new-node',
             'version': '1.0.0',
             'tier': 'flat',
