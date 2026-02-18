@@ -89,6 +89,10 @@ COPY release_manifest.json ./
 # Create necessary directories
 RUN mkdir -p /app/logs /app/media /app/output_images /app/agent_data
 
+# DEPLOYMENT: Run with read-only filesystem to prevent runtime code modification:
+#   docker run --read-only --tmpfs /tmp --tmpfs /app/logs --tmpfs /app/agent_data ...
+# With read-only FS, set HEVOLVE_TAMPER_CHECK_SKIP=true (filesystem itself is the guard).
+
 # Create log file
 RUN touch /app/langchain.log
 

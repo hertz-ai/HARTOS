@@ -1566,6 +1566,11 @@ class AdImpression(Base):
     impression_type = Column(String(10), default='view')  # view|click
     ip_hash = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=func.now(), index=True)
+    # Impression immutability — seal after witness attestation
+    witness_node_id = Column(String(64), nullable=True)
+    witness_signature = Column(String(256), nullable=True)
+    sealed_hash = Column(String(64), nullable=True)
+    sealed_at = Column(DateTime, nullable=True)
 
     ad = relationship('AdUnit', backref='impressions')
 
@@ -1573,6 +1578,19 @@ class AdImpression(Base):
         Index('ix_ad_impressions_ad_user', 'ad_id', 'user_id', 'created_at'),
         Index('ix_ad_impressions_node', 'node_id', 'created_at'),
     )
+
+    @property
+    def compute_seal_hash(self) -> str:
+        """SHA-256 of canonical impression data for tamper detection."""
+        import hashlib
+        import json as _json
+        canonical = _json.dumps({
+            'id': self.id, 'ad_id': self.ad_id, 'node_id': self.node_id,
+            'user_id': self.user_id, 'impression_type': self.impression_type,
+            'created_at': self.created_at.isoformat() if self.created_at else '',
+            'witness_node_id': self.witness_node_id or '',
+        }, sort_keys=True, separators=(',', ':'))
+        return hashlib.sha256(canonical.encode()).hexdigest()
 
     def to_dict(self):
         return {
@@ -1582,6 +1600,10 @@ class AdImpression(Base):
             'user_id': self.user_id,
             'impression_type': self.impression_type,
             'created_at': self.created_at.isoformat() if self.created_at else None,
+            'witness_node_id': self.witness_node_id,
+            'witness_signature': self.witness_signature,
+            'sealed_hash': self.sealed_hash,
+            'sealed_at': self.sealed_at.isoformat() if self.sealed_at else None,
         }
 
 

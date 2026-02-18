@@ -6,6 +6,7 @@ import os
 import json
 import hashlib
 import logging
+import shutil
 from pathlib import Path
 from typing import Optional, Tuple, Dict
 
@@ -271,3 +272,27 @@ def reset_keypair():
     global _private_key, _public_key
     _private_key = None
     _public_key = None
+
+
+def purge_pycache(code_root: str = None) -> int:
+    """Delete all __pycache__ directories and prevent bytecode regeneration.
+
+    Called at boot before the integrity manifest snapshot is taken.
+    Blocks bytecode injection attacks where malicious .pyc files
+    could be loaded by Python instead of the verified .py sources.
+
+    Returns count of __pycache__ directories removed.
+    """
+    os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
+    root = Path(code_root or _CODE_ROOT)
+    count = 0
+    try:
+        for pycache_dir in root.rglob('__pycache__'):
+            if pycache_dir.is_dir():
+                shutil.rmtree(pycache_dir, ignore_errors=True)
+                count += 1
+        if count:
+            logger.info(f"Boot integrity: purged {count} __pycache__ directories")
+    except (PermissionError, OSError) as e:
+        logger.warning(f"Boot integrity: pycache purge partial — {e}")
+    return count

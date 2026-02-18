@@ -33,6 +33,9 @@ FRAUD_WEIGHTS = {
     'reward_velocity_anomaly': 25.0,
     'reward_self_dealing': 35.0,
     'spark_gaming': 20.0,
+    'witness_ring': 30.0,
+    'temporal_clustering': 20.0,
+    'seal_tamper': 35.0,
 }
 
 IMPRESSION_ANOMALY_STDDEV = 3.0
@@ -693,6 +696,13 @@ class IntegrityService:
             db, node_id)
         results['spark_gaming'] = IntegrityService.detect_spark_gaming(db, node_id)
 
+        # Impression integrity (collusion + tampering)
+        results['witness_ring'] = IntegrityService.detect_witness_ring(db, node_id)
+        results['temporal_clustering'] = IntegrityService.detect_temporal_clustering(
+            db, node_id)
+        results['seal_integrity'] = IntegrityService.verify_all_sealed_impressions(
+            db, node_id, limit=50)
+
         peer = db.query(PeerNode).filter_by(node_id=node_id).first()
         results['fraud_score'] = peer.fraud_score if peer else 0.0
         results['integrity_status'] = peer.integrity_status if peer else 'unknown'
@@ -710,6 +720,20 @@ class IntegrityService:
                 {'signals': {k: results.get(k) for k in (
                     'reward_velocity', 'reward_self_dealing', 'spark_gaming'
                 ) if results.get(k)}})
+
+        # Auto-isolate impression fraud: witness_ring + temporal_clustering together
+        impression_fraud_signals = sum(1 for k in (
+            'witness_ring', 'temporal_clustering',
+        ) if results.get(k) is not None)
+        seal_tampered = (results.get('seal_integrity') or {}).get('tampered', 0) > 0
+        if impression_fraud_signals >= 2 or (impression_fraud_signals >= 1 and seal_tampered):
+            results['impression_isolation'] = IntegrityService.isolate_reward_hacker(
+                db, node_id,
+                f'Impression fraud: {impression_fraud_signals} signals + '
+                f'seal_tampered={seal_tampered}',
+                {'witness_ring': results.get('witness_ring'),
+                 'temporal_clustering': results.get('temporal_clustering'),
+                 'seal_integrity': results.get('seal_integrity')})
 
         return results
 
@@ -1143,9 +1167,10 @@ class IntegrityService:
         if not peer:
             return None
 
+        operator_id = peer.node_operator_id
         self_rewards = db.query(HostingReward).filter(
             HostingReward.node_id == node_id,
-            HostingReward.operator_id == peer.owner_id,
+            HostingReward.operator_id == operator_id,
         ).count()
 
         total_rewards = db.query(HostingReward).filter(
@@ -1202,12 +1227,12 @@ class IntegrityService:
 
         # Get goals associated with this node's user
         peer = db.query(PeerNode).filter_by(node_id=node_id).first()
-        if not peer or not peer.owner_id:
+        if not peer or not peer.node_operator_id:
             return None
 
         cutoff = datetime.utcnow() - timedelta(hours=48)
         recent_goals = db.query(AgentGoal).filter(
-            AgentGoal.owner_id == peer.owner_id,
+            AgentGoal.owner_id == peer.node_operator_id,
             AgentGoal.created_at >= cutoff,
         ).all()
 
@@ -1244,6 +1269,211 @@ class IntegrityService:
                 {'abandoned': abandoned, 'spark_spent': total_spent})
 
         return None
+
+    # ─── Impression Integrity (Collusion + Tampering) ───
+
+    @staticmethod
+    def detect_witness_ring(db: Session, node_id: str,
+                             period_days: int = 7,
+                             min_impressions: int = 10,
+                             max_witnesses: int = 2,
+                             ring_ratio: float = 0.9) -> Optional[Dict]:
+        """Detect small witness rings — a tight group of nodes that
+        exclusively witness each other's ad impressions.
+
+        Unlike detect_collusion (which checks attestation concentration),
+        this checks bidirectional impression witnessing: if A witnesses B
+        and B witnesses A with the same tiny set, it's a ring.
+
+        Signals:
+        1. Node's impressions witnessed by <=max_witnesses unique peers
+        2. Those same peers have their impressions witnessed by this node
+        3. The overlap ratio exceeds ring_ratio
+        """
+        cutoff = datetime.utcnow() - timedelta(days=period_days)
+
+        # 1. Who witnesses this node's impressions?
+        node_impressions = db.query(AdImpression).filter(
+            AdImpression.node_id == node_id,
+            AdImpression.created_at >= cutoff,
+            AdImpression.witness_node_id.isnot(None),
+        ).all()
+
+        if len(node_impressions) < min_impressions:
+            return None  # Not enough data
+
+        witness_counts = {}
+        for imp in node_impressions:
+            witness_counts[imp.witness_node_id] = witness_counts.get(
+                imp.witness_node_id, 0) + 1
+
+        unique_witnesses = set(witness_counts.keys())
+        if len(unique_witnesses) > max_witnesses:
+            return None  # Diverse enough
+
+        # 2. Check bidirectional: does this node witness those peers back?
+        ring_members = set()
+        for witness_id in unique_witnesses:
+            reverse_count = db.query(sqlfunc.count(AdImpression.id)).filter(
+                AdImpression.node_id == witness_id,
+                AdImpression.witness_node_id == node_id,
+                AdImpression.created_at >= cutoff,
+            ).scalar() or 0
+            if reverse_count >= min_impressions // 2:
+                ring_members.add(witness_id)
+
+        if not ring_members:
+            return None
+
+        # 3. Calculate ring tightness
+        total_witnessed = len(node_impressions)
+        ring_witnessed = sum(witness_counts.get(m, 0) for m in ring_members)
+        ratio = ring_witnessed / total_witnessed if total_witnessed > 0 else 0
+
+        if ratio >= ring_ratio:
+            return IntegrityService._create_fraud_alert(
+                db, node_id, 'witness_ring', 'high',
+                f'Witness ring detected: {total_witnessed} impressions, '
+                f'{len(ring_members)+1} nodes in ring '
+                f'(bidirectional ratio={ratio:.0%})',
+                FRAUD_WEIGHTS['witness_ring'],
+                {'ring_members': [node_id] + list(ring_members),
+                 'total_witnessed': total_witnessed,
+                 'ring_witnessed': ring_witnessed,
+                 'ratio': round(ratio, 3),
+                 'period_days': period_days})
+
+        return None
+
+    @staticmethod
+    def detect_temporal_clustering(db: Session, node_id: str,
+                                    period_hours: int = 1,
+                                    cluster_window_seconds: int = 5,
+                                    min_cluster_size: int = 10,
+                                    min_impressions: int = 20) -> Optional[Dict]:
+        """Detect suspiciously tight temporal clustering of impressions.
+
+        Legitimate traffic has organic timing variation. Bot-driven or
+        fabricated impressions often arrive in tight bursts — many
+        impressions within a few seconds, then silence.
+
+        Algorithm: slide a window of cluster_window_seconds across the
+        node's impressions. If any window contains >=min_cluster_size
+        impressions, flag it.
+        """
+        cutoff = datetime.utcnow() - timedelta(hours=period_hours)
+
+        impressions = db.query(AdImpression).filter(
+            AdImpression.node_id == node_id,
+            AdImpression.created_at >= cutoff,
+        ).order_by(AdImpression.created_at.asc()).all()
+
+        if len(impressions) < min_impressions:
+            return None
+
+        # Sliding window: find max cluster density
+        timestamps = [imp.created_at for imp in impressions]
+        max_cluster = 0
+        worst_window_start = None
+
+        for i, ts in enumerate(timestamps):
+            window_end = ts + timedelta(seconds=cluster_window_seconds)
+            # Count impressions within [ts, ts + window]
+            cluster_count = 0
+            for j in range(i, len(timestamps)):
+                if timestamps[j] <= window_end:
+                    cluster_count += 1
+                else:
+                    break
+            if cluster_count > max_cluster:
+                max_cluster = cluster_count
+                worst_window_start = ts
+
+        if max_cluster >= min_cluster_size:
+            return IntegrityService._create_fraud_alert(
+                db, node_id, 'temporal_clustering', 'medium',
+                f'Temporal clustering: {max_cluster} impressions in '
+                f'{cluster_window_seconds}s window '
+                f'(total={len(impressions)} in {period_hours}h)',
+                FRAUD_WEIGHTS['temporal_clustering'],
+                {'max_cluster': max_cluster,
+                 'window_seconds': cluster_window_seconds,
+                 'total_impressions': len(impressions),
+                 'worst_window_start': worst_window_start.isoformat()
+                 if worst_window_start else None,
+                 'period_hours': period_hours})
+
+        return None
+
+    @staticmethod
+    def verify_impression_seal(db: Session, impression_id: str) -> Dict:
+        """Verify that a sealed impression's hash matches its current data.
+
+        Once an impression is sealed (witnessed + hashed), its data should
+        be immutable. If the recomputed hash doesn't match sealed_hash,
+        the impression has been tampered with post-seal.
+
+        Returns: {'valid': bool, 'details': str, 'impression_id': str}
+        """
+        imp = db.query(AdImpression).filter_by(id=impression_id).first()
+        if not imp:
+            return {'valid': False, 'details': 'Impression not found',
+                    'impression_id': impression_id}
+
+        if not imp.sealed_hash:
+            return {'valid': True, 'details': 'Not sealed (no hash to verify)',
+                    'impression_id': impression_id}
+
+        # Recompute and compare
+        current_hash = imp.compute_seal_hash
+        if current_hash == imp.sealed_hash:
+            return {'valid': True, 'details': 'Seal intact',
+                    'impression_id': impression_id}
+
+        # Tampered — raise fraud alert on the node
+        if imp.node_id:
+            IntegrityService._create_fraud_alert(
+                db, imp.node_id, 'seal_tamper', 'critical',
+                f'Impression seal tampered: id={impression_id[:16]}, '
+                f'expected={imp.sealed_hash[:16]}..., '
+                f'got={current_hash[:16]}...',
+                FRAUD_WEIGHTS['seal_tamper'],
+                {'impression_id': impression_id,
+                 'sealed_hash': imp.sealed_hash,
+                 'recomputed_hash': current_hash})
+
+        return {'valid': False, 'details': 'Seal hash mismatch — tampered',
+                'impression_id': impression_id,
+                'sealed_hash': imp.sealed_hash,
+                'recomputed_hash': current_hash}
+
+    @staticmethod
+    def verify_all_sealed_impressions(db: Session, node_id: str = None,
+                                       limit: int = 100) -> Dict:
+        """Batch-verify sealed impressions. Returns summary of tampered seals."""
+        q = db.query(AdImpression).filter(
+            AdImpression.sealed_hash.isnot(None),
+        )
+        if node_id:
+            q = q.filter(AdImpression.node_id == node_id)
+        impressions = q.order_by(AdImpression.sealed_at.desc()).limit(limit).all()
+
+        total = len(impressions)
+        tampered = 0
+        tampered_ids = []
+
+        for imp in impressions:
+            result = IntegrityService.verify_impression_seal(db, imp.id)
+            if not result['valid'] and 'tampered' in result.get('details', '').lower():
+                tampered += 1
+                tampered_ids.append(imp.id)
+
+        return {
+            'total_checked': total,
+            'tampered': tampered,
+            'tampered_ids': tampered_ids,
+            'integrity_ratio': round((total - tampered) / total, 3) if total > 0 else 1.0,
+        }
 
     @staticmethod
     def isolate_reward_hacker(db: Session, node_id: str,

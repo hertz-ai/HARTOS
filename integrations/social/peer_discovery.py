@@ -585,6 +585,19 @@ class GossipProtocol:
 
         integrity_status = 'verified' if signature_valid else 'unverified'
 
+        # Enforcement gate: reject unsigned peers in hard mode
+        if not signature_valid:
+            try:
+                from security.master_key import get_enforcement_mode
+                enforcement = get_enforcement_mode()
+                if enforcement == 'hard':
+                    logger.warning(f"Rejecting unsigned peer {node_id[:8]} (enforcement=hard)")
+                    return False
+                elif enforcement == 'soft':
+                    logger.info(f"Unsigned peer {node_id[:8]} accepted (enforcement=soft)")
+            except ImportError:
+                pass  # No enforcement module = dev mode, accept all
+
         # Guardrail hash verification: reject peers with different guardrail values
         peer_guardrail_hash = peer_data.get('guardrail_hash', '')
         if peer_guardrail_hash:

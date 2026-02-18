@@ -138,15 +138,15 @@ class FleetCommandService:
     def get_pending_commands(db, node_id: str) -> List[Dict]:
         """Get pending commands for a node. Called by gossip handler.
 
-        Marks retrieved commands as 'delivered'. The node is responsible
-        for executing them and reporting back.
+        Verifies each command's issuer exists in PeerNode with authority.
+        Marks verified commands as 'delivered', unverified as 'rejected'.
 
         Args:
             db: SQLAlchemy session.
             node_id: The requesting node's ID.
 
         Returns:
-            List of command dicts.
+            List of command dicts (only verified ones).
         """
         from .models import FleetCommand
 
@@ -157,12 +157,19 @@ class FleetCommandService:
 
         results = []
         for cmd in pending:
+            if not _verify_issuer(db, cmd.issued_by):
+                cmd.status = 'rejected'
+                logger.warning(
+                    f"Fleet: rejected cmd {cmd.id} from unverified issuer "
+                    f"{cmd.issued_by[:8] if cmd.issued_by else '?'}...")
+                continue
             cmd.status = 'delivered'
             cmd.delivered_at = time.time()
             results.append(cmd.to_dict())
 
-        if results:
+        if results or any(c.status == 'rejected' for c in pending):
             db.flush()
+        if results:
             logger.info(f"Fleet: delivered {len(results)} commands to {node_id[:8]}...")
 
         return results
@@ -267,6 +274,35 @@ class FleetCommandService:
                 return verify_guardrail_integrity()
             except ImportError:
                 return False
+
+
+# ═══════════════════════════════════════════════════════════════
+# Issuer verification
+# ═══════════════════════════════════════════════════════════════
+
+def _verify_issuer(db, issued_by: str) -> bool:
+    """Check that a fleet command issuer exists in PeerNode and has authority.
+
+    Self-issued commands are always valid. External issuers must be
+    known, active, and have central or regional tier.
+    """
+    if not issued_by or issued_by == 'unknown':
+        return True  # No issuer info = legacy/local command
+    self_id = _get_self_node_id()
+    if issued_by == self_id:
+        return True
+    try:
+        from .models import PeerNode
+        peer = db.query(PeerNode).filter_by(node_id=issued_by).first()
+        if not peer:
+            return False
+        if peer.status in ('dead', 'banned'):
+            return False
+        if peer.tier not in ('central', 'regional'):
+            return False
+        return True
+    except Exception:
+        return True  # DB error = fail open for availability
 
 
 # ═══════════════════════════════════════════════════════════════

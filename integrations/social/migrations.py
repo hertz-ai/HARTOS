@@ -8,7 +8,7 @@ from .models import get_engine, Base
 
 logger = logging.getLogger('hevolve_social')
 
-SCHEMA_VERSION = 27
+SCHEMA_VERSION = 28
 
 
 def get_schema_version(engine) -> int:
@@ -481,3 +481,19 @@ def run_migrations():
                     pass
             conn.commit()
         set_schema_version(engine, 27)
+
+    if current < 28:
+        logger.info("HevolveSocial: migrating to v28 (Impression seal columns)")
+        with engine.connect() as conn:
+            for stmt in [
+                "ALTER TABLE ad_impressions ADD COLUMN witness_node_id VARCHAR(64)",
+                "ALTER TABLE ad_impressions ADD COLUMN witness_signature VARCHAR(256)",
+                "ALTER TABLE ad_impressions ADD COLUMN sealed_hash VARCHAR(64)",
+                "ALTER TABLE ad_impressions ADD COLUMN sealed_at DATETIME",
+            ]:
+                try:
+                    conn.execute(text(stmt))
+                except Exception:
+                    pass
+            conn.commit()
+        set_schema_version(engine, 28)

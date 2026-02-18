@@ -274,8 +274,17 @@ class AdService:
         if node_id:
             try:
                 from .integrity_service import IntegrityService
-                witnessed = IntegrityService.request_nearest_witness(
+                witness_result = IntegrityService.request_nearest_witness(
                     db, imp.id, ad_id, node_id)
+                if witness_result:
+                    witnessed = True
+                    # Seal the impression with witness data
+                    imp.witness_node_id = witness_result.get(
+                        'attester_node_id', '')
+                    imp.witness_signature = witness_result.get(
+                        'signature', '')
+                    imp.sealed_hash = imp.compute_seal_hash
+                    imp.sealed_at = datetime.utcnow()
             except Exception:
                 pass
 
