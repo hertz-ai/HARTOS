@@ -45,15 +45,25 @@ def get_config() -> dict:
         except Exception:
             pass
 
-        # Fall back to config.json
-        config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config.json')
-        try:
-            with open(config_path, 'r') as f:
-                _config = json.load(f)
-            logger.info("Config loaded from config.json")
-        except FileNotFoundError:
-            logger.warning("config.json not found, using environment variables only")
-            _config = {}
+        # Fall back to config.json (standalone) or langchain_config.json (bundled)
+        _base_dir = os.path.dirname(os.path.dirname(__file__))
+        # In frozen/bundled mode, config lives next to the exe as langchain_config.json
+        if getattr(__import__('sys'), 'frozen', False):
+            _base_dir = os.path.dirname(__import__('sys').executable)
+        _config_candidates = [
+            os.path.join(_base_dir, 'config.json'),
+            os.path.join(_base_dir, 'langchain_config.json'),
+        ]
+        for _cp in _config_candidates:
+            try:
+                with open(_cp, 'r') as f:
+                    _config = json.load(f)
+                logger.info(f"Config loaded from {os.path.basename(_cp)}")
+                return _config
+            except FileNotFoundError:
+                continue
+        logger.warning("config.json not found, using environment variables only")
+        _config = {}
 
         return _config
 
