@@ -212,22 +212,24 @@ def optional_auth(f):
 
 
 def require_admin(f):
-    """Decorator: requires admin user."""
+    """Decorator: requires admin user or flat+ role (device owner)."""
     @wraps(f)
     @require_auth
     def decorated(*args, **kwargs):
-        if not g.user.is_admin:
+        user_role = getattr(g.user, 'role', None) or 'flat'
+        if not (g.user.is_admin or user_role in ('flat', 'regional', 'central')):
             return jsonify({'success': False, 'error': 'Admin access required'}), 403
         return f(*args, **kwargs)
     return decorated
 
 
 def require_moderator(f):
-    """Decorator: requires moderator or admin user."""
+    """Decorator: requires moderator, admin, or flat+ role (device owner)."""
     @wraps(f)
     @require_auth
     def decorated(*args, **kwargs):
-        if not (g.user.is_admin or g.user.is_moderator):
+        user_role = getattr(g.user, 'role', None) or 'flat'
+        if not (g.user.is_admin or g.user.is_moderator or user_role in ('flat', 'regional', 'central')):
             return jsonify({'success': False, 'error': 'Moderator access required'}), 403
         return f(*args, **kwargs)
     return decorated

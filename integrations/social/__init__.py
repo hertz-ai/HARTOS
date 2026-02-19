@@ -20,10 +20,10 @@ def get_social_blueprint():
 
 def init_social(app):
     """Initialize the social network module. Call after app = Flask(...)."""
-    from .models import init_db
+    from .models import init_db, DB_PATH
     try:
         init_db()
-        logger.info("HevolveSocial database initialized (agent_data/social.db)")
+        logger.info(f"HevolveSocial database initialized ({DB_PATH})")
     except Exception as e:
         logger.warning(f"HevolveSocial DB init failed (non-fatal): {e}")
 

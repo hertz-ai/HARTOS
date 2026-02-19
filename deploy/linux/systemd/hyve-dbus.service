@@ -1,0 +1,23 @@
+[Unit]
+Description=HyveOS D-Bus Agent Service
+Documentation=https://github.com/hevolve-ai/hyve
+After=hyve-backend.service dbus.service
+BindsTo=hyve-backend.service
+Requires=dbus.service
+
+[Service]
+Type=simple
+User=hyve
+Group=hyve
+EnvironmentFile=/etc/hyve/hyve.env
+ExecStart=/opt/hyve/venv/bin/python /opt/hyve/deploy/linux/dbus/hyve_dbus_service.py
+Restart=on-failure
+RestartSec=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hyve-dbus
+
+[Install]
+WantedBy=hyve.target
