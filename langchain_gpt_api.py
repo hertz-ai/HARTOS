@@ -316,20 +316,71 @@ def get_llm(model_name="gpt-3.5-turbo", temperature=0.7, max_tokens=1500):
     """
     Get LLM instance based on configuration.
 
-    Returns ChatQwen3VL if USE_QWEN3VL is True, otherwise ChatOpenAI.
+    Priority:
+    1. Wizard-configured cloud provider (HEVOLVE_ACTIVE_CLOUD_PROVIDER env var)
+    2. ChatQwen3VL (local) if USE_QWEN3VL flag is True
+    3. ChatOpenAI fallback
     """
+    _active = os.environ.get('HEVOLVE_ACTIVE_CLOUD_PROVIDER', '')
+
+    if _active == 'anthropic' and os.environ.get('ANTHROPIC_API_KEY'):
+        try:
+            from langchain_anthropic import ChatAnthropic
+            return ChatAnthropic(
+                model=os.environ.get('ANTHROPIC_MODEL', 'claude-sonnet-4-20250514'),
+                api_key=os.environ['ANTHROPIC_API_KEY'],
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except ImportError:
+            pass
+
+    if _active == 'google_gemini' and os.environ.get('GOOGLE_API_KEY'):
+        try:
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            return ChatGoogleGenerativeAI(
+                model=os.environ.get('GOOGLE_MODEL', 'gemini-2.0-flash'),
+                google_api_key=os.environ['GOOGLE_API_KEY'],
+                temperature=temperature,
+                max_output_tokens=max_tokens,
+            )
+        except ImportError:
+            pass
+
+    if _active == 'groq' and os.environ.get('GROQ_API_KEY'):
+        try:
+            from langchain_groq import ChatGroq
+            return ChatGroq(
+                model=os.environ.get('GROQ_MODEL', 'llama-3.3-70b-versatile'),
+                api_key=os.environ['GROQ_API_KEY'],
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except ImportError:
+            pass
+
+    if _active in ('openai', 'azure_openai', 'custom_openai') and os.environ.get('OPENAI_API_KEY'):
+        _kwargs = dict(
+            model_name=os.environ.get('OPENAI_MODEL', model_name),
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        if _active == 'custom_openai' and os.environ.get('CUSTOM_LLM_BASE_URL'):
+            _kwargs['openai_api_base'] = os.environ['CUSTOM_LLM_BASE_URL']
+        return ChatOpenAI(**_kwargs)
+
     if USE_QWEN3VL:
         return ChatQwen3VL(
             model_name="Qwen3-VL-2B-Instruct",
             temperature=temperature,
             max_tokens=max_tokens
         )
-    else:
-        return ChatOpenAI(
-            model_name=model_name,
-            temperature=temperature,
-            max_tokens=max_tokens
-        )
+
+    return ChatOpenAI(
+        model_name=model_name,
+        temperature=temperature,
+        max_tokens=max_tokens
+    )
 # ============================================================================
 
 
@@ -456,11 +507,21 @@ except Exception as e:
 
 # Load config.json — graceful fallback when keys are absent (e.g. bundled Nunba install
 # where the config.json is Nunba's URL-template file, not langchain's API-key file).
-try:
-    with open("config.json", 'r') as f:
-        config = json.load(f)
-except Exception:
-    config = {}
+# In frozen Nunba builds, langchain config is bundled as langchain_config.json to avoid
+# collision with the project root config.json (which has IP_ADDRESS settings).
+config = {}
+for _cfg_name in ('langchain_config.json', 'config.json'):
+    try:
+        with open(_cfg_name, 'r') as f:
+            _loaded = json.load(f)
+        # Distinguish langchain config (has API keys) from Nunba URL config (has IP_ADDRESS)
+        if 'IP_ADDRESS' not in _loaded or any(k.endswith('_API_KEY') for k in _loaded):
+            config = _loaded
+            break
+        elif not config:
+            config = _loaded  # fall through to try langchain_config.json first
+    except Exception:
+        pass
 
 # global variables
 try:
@@ -478,10 +539,16 @@ for _cfg_key in ('OPENAI_API_KEY', 'GOOGLE_CSE_ID', 'GOOGLE_API_KEY',
 
 # Mode-aware inference: pass LLM endpoint to crawl4ai for non-flat deployments
 _node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
+_active_cloud = os.environ.get('HEVOLVE_ACTIVE_CLOUD_PROVIDER', '')
 if _node_tier in ('regional', 'central'):
     os.environ.setdefault('HEVOLVE_LLM_ENDPOINT_URL', config.get('OPENAI_API_BASE', ''))
     os.environ.setdefault('HEVOLVE_LLM_API_KEY', config.get('OPENAI_API_KEY', ''))
     os.environ.setdefault('HEVOLVE_LLM_MODEL_NAME', config.get('OPENAI_MODEL', 'gpt-4'))
+elif _active_cloud and os.environ.get('HEVOLVE_LLM_API_KEY'):
+    # Wizard-configured cloud provider (flat mode desktop user).
+    # Vault already populated HEVOLVE_LLM_* env vars via export_to_env() in app.py.
+    # Crawl4AI's create_learning_llm_config() reads these automatically.
+    pass
 # Cloud fallback for adaptive routing (flat mode — offload when local CPU overloaded)
 if config.get('CLOUD_FALLBACK_URL'):
     os.environ.setdefault('HEVOLVE_CLOUD_FALLBACK_URL', config['CLOUD_FALLBACK_URL'])
@@ -634,8 +701,9 @@ def _init_learning_pipeline():
 
         # Learning provider (wraps llama.cpp on port 8080 or cloud endpoint)
         _domain = 'general'
+        _wizard_key = os.environ.get('HEVOLVE_LLM_API_KEY', '') or None
         llm_config = create_learning_llm_config(
-            domain=_domain, fallback_api_key=None)
+            domain=_domain, fallback_api_key=_wizard_key)
         if '_provider' in llm_config:
             _learning_provider = llm_config['_provider']
             register_learning_provider(_domain, _learning_provider)
@@ -2480,17 +2548,13 @@ else:
 if autogen is not None:
     def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]:
         """Create new assistant and user proxy agents for a user with basic configuration."""
-        config_list = [{
-            "model": 'hertzai-4o',
-            "api_type": "azure",
-            "api_key": os.environ.get('AZURE_OPENAI_API_KEY', ''),
-            "base_url": 'https://hertzai-gpt4.openai.azure.com/',
-            "api_version": "2024-02-15-preview"
-        }]
+        # Use the dynamic module-level config_list (cloud or local, set by wizard)
+        from threadlocal import thread_local_data as _tld
+        _override = _tld.get_model_config_override() if hasattr(_tld, 'get_model_config_override') else None
+        _clist = _override or config_list
 
-        # Create a basic function calling config
         llm_config = {
-            "config_list": config_list,
+            "config_list": _clist,
             "seed": 42
         }
 
@@ -2567,16 +2631,13 @@ if autogen is not None:
 
     def create_agents(user_id: str,recipe:str) -> Tuple[autogen.ConversableAgent, autogen.ConversableAgent]:
         """Create new assistant and user agents for a given user_id"""
+        from threadlocal import thread_local_data as _tld
+        _override = _tld.get_model_config_override() if hasattr(_tld, 'get_model_config_override') else None
+        _clist = _override or config_list
 
         llm_config = {
             "temperature": 0.7,
-            "config_list": [{
-            "model": 'hertzai-4o',
-            "api_type": "azure",
-            "api_key": os.environ.get('AZURE_OPENAI_API_KEY', ''),
-            "base_url": 'https://hertzai-gpt4.openai.azure.com/',
-            "api_version": "2024-02-15-preview"
-        }],
+            "config_list": _clist,
         }
         conversation = True
         if conversation:

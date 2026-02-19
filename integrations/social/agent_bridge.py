@@ -18,7 +18,8 @@ def sync_trained_agents() -> int:
         # Import DynamicAgentDiscovery (may not be available)
         from integrations.google_a2a.dynamic_agent_registry import get_dynamic_discovery
         discovery = get_dynamic_discovery()
-        agents = discovery.discover_all_agents()
+        discovery.discover_all_agents()  # populates internal registry, returns count
+        agents = discovery.get_all_agents()  # returns List[TrainedAgent]
 
         for agent in agents:
             agent_id = agent.agent_id  # e.g., "65_0"

@@ -72,7 +72,7 @@ class TFTPHandler(socketserver.BaseRequestHandler):
 
         filename = parts[0].decode('ascii', errors='replace')
         # Security: prevent path traversal
-        filename = filename.lstrip('/').replace('..', '')
+        filename = filename.replace('..', '').lstrip('/')
 
         filepath = os.path.join(self.server.serve_dir, filename)
 

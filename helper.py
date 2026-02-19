@@ -34,18 +34,23 @@ from core.event_loop import get_or_create_event_loop
 
 config = _get_config()
 
-os.environ["OPENAI_API_KEY"] = config.get('OPENAI_API_KEY', '')
-os.environ["GOOGLE_CSE_ID"] = config.get('GOOGLE_CSE_ID', '')
-os.environ["GOOGLE_API_KEY"] = config.get('GOOGLE_API_KEY', '')
-os.environ["NEWS_API_KEY"] = config.get('NEWS_API_KEY', '')
-os.environ["SERPAPI_API_KEY"] = config.get('SERPAPI_API_KEY', '')
+# Only set env vars when config actually has non-empty values
+# (empty string would clobber a valid env var and fail pydantic validation)
+for _key in ('OPENAI_API_KEY', 'GOOGLE_CSE_ID', 'GOOGLE_API_KEY', 'NEWS_API_KEY', 'SERPAPI_API_KEY'):
+    _val = config.get(_key, '')
+    if _val:
+        os.environ[_key] = _val
 
 ACTION_API = config.get('ACTION_API', '')
 STUDENT_API = config.get('STUDENT_API', '')
 ZEP_API_URL = config.get('ZEP_API_URL', '')
 ZEP_API_KEY = config.get('ZEP_API_KEY', '')
 
-search = GoogleSearchAPIWrapper(k=4)
+try:
+    search = GoogleSearchAPIWrapper(k=4)
+except Exception as _search_err:
+    logging.getLogger(__name__).info(f"Google Search unavailable (expected in local mode): {_search_err}")
+    search = None
 redis_client = redis.StrictRedis(
     host='azure_all_vms.hertzai.com', port=6369, db=0)
 
@@ -258,6 +263,8 @@ def top5_results(query):
 
     try:
         # Your existing Google search
+        if search is None:
+            return []
         top_2_search_res = search.results(query, 2)
         top_2_search_res_link = [res['link'] for res in top_2_search_res]
 

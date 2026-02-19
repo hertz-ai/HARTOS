@@ -284,6 +284,7 @@ time_agents = TTLCache(ttl_seconds=7200, max_size=500, name='create_time_agents'
 # Mode-aware config_list: cloud/regional use external LLM, flat uses local
 # (user's wizard-configured endpoint via HEVOLVE_LOCAL_LLM_URL or LLAMA_CPP_PORT)
 _node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
+_active_cloud = os.environ.get('HEVOLVE_ACTIVE_CLOUD_PROVIDER', '')
 if _node_tier in ('regional', 'central') and os.environ.get('HEVOLVE_LLM_ENDPOINT_URL'):
     config_list = [{
         "model": os.environ.get('HEVOLVE_LLM_MODEL_NAME', 'gpt-4.1-mini'),
@@ -291,6 +292,16 @@ if _node_tier in ('regional', 'central') and os.environ.get('HEVOLVE_LLM_ENDPOIN
         "base_url": os.environ['HEVOLVE_LLM_ENDPOINT_URL'],
         "price": [0.0025, 0.01]
     }]
+elif _active_cloud and os.environ.get('HEVOLVE_LLM_API_KEY'):
+    # Wizard-configured cloud provider (flat mode desktop user)
+    _cloud_cfg = {
+        "model": os.environ.get('HEVOLVE_LLM_MODEL_NAME', 'gpt-4o-mini'),
+        "api_key": os.environ['HEVOLVE_LLM_API_KEY'],
+        "price": [0.0025, 0.01],
+    }
+    if os.environ.get('HEVOLVE_LLM_ENDPOINT_URL'):
+        _cloud_cfg["base_url"] = os.environ['HEVOLVE_LLM_ENDPOINT_URL']
+    config_list = [_cloud_cfg]
 else:
     # Dynamic: reads from user's LLM Setup Wizard config (set by Nunba app.py)
     _llama_port = os.environ.get('LLAMA_CPP_PORT', '8080')
