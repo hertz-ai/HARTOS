@@ -216,8 +216,14 @@ class RedisBackend(StorageBackend):
 
     def list_keys(self, pattern: str = "*") -> List[str]:
         redis_pattern = f"{self.prefix}{pattern}"
-        keys = self.redis_client.keys(redis_pattern)
-        return [k.replace(self.prefix, '') for k in keys]
+        keys = []
+        cursor = 0
+        while True:
+            cursor, batch = self.redis_client.scan(cursor=cursor, match=redis_pattern, count=100)
+            keys.extend(batch)
+            if cursor == 0:
+                break
+        return [k.replace(self.prefix, '') if isinstance(k, str) else k.decode().replace(self.prefix, '') for k in keys]
 
 
 class MongoDBBackend(StorageBackend):

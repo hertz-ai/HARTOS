@@ -23,6 +23,9 @@ case "$ACTION" in
         # Remove any existing identity
         rm -f /var/lib/hyve/node_private.key
         rm -f /var/lib/hyve/node_public.key
+
+        # Wipe SSH host keys (regenerated on first real boot)
+        rm -f /etc/ssh/ssh_host_*_key*
         rm -f /var/lib/hyve/hevolve_database.db
         rm -f /var/lib/hyve/.first-boot-done
 
@@ -61,6 +64,9 @@ case "$ACTION" in
 
         # Regenerate machine-id
         systemd-machine-id-setup 2>/dev/null || true
+
+        # Regenerate SSH host keys (wiped during OEM prepare)
+        ssh-keygen -A 2>/dev/null || true
 
         # Run the standard first-boot
         bash /opt/hyve/deploy/distro/first-boot/hyve-first-boot.sh

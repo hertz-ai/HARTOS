@@ -23,6 +23,17 @@ ProtectHome=yes
 ReadWritePaths=/var/lib/hyve /opt/hyve/models
 PrivateTmp=yes
 
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+MemoryDenyWriteExecute=no
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=hyve-vision

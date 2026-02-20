@@ -130,3 +130,10 @@ def init_agent_engine(app):
         logger.info("Agent engine daemon started")
     except Exception as e:
         logger.debug(f"Agent engine daemon start skipped: {e}")
+
+    # Start distributed worker loop (claims tasks from shared Redis)
+    try:
+        from integrations.distributed_agent.worker_loop import worker_loop
+        worker_loop.start()
+    except Exception as e:
+        logger.debug(f"Distributed worker loop start skipped: {e}")

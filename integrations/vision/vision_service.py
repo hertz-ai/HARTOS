@@ -391,9 +391,10 @@ class VisionService:
         ]
         logger.info(f"Starting MiniCPM sidecar: {' '.join(cmd)}")
 
-        self._minicpm_process = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+        _popen_kw = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if sys.platform == 'win32':
+            _popen_kw['creationflags'] = subprocess.CREATE_NO_WINDOW
+        self._minicpm_process = subprocess.Popen(cmd, **_popen_kw)
         self._wait_for_minicpm(timeout=120)
 
     def _wait_for_minicpm(self, timeout: float = 120):

@@ -3,7 +3,6 @@ from enum import Enum
 import random
 import autogen
 import os
-import cv2
 import pytz
 import requests
 from typing import Dict, Optional, Tuple, Any
@@ -17,6 +16,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 import json
+import ast
 from collections import deque
 import redis
 import pickle
@@ -1994,8 +1994,11 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                             # For JSON-like strings
                             if text.strip().startswith("{") and "action" in text:
                                 try:
-                                    # Try to evaluate the string as a Python dict
-                                    action_data = eval(text.strip())
+                                    # Try to parse the string as JSON/Python dict safely
+                                    try:
+                                        action_data = json.loads(text.strip())
+                                    except (json.JSONDecodeError, ValueError):
+                                        action_data = ast.literal_eval(text.strip())
                                     action_type = action_data.get("action", "")
 
                                     if action_type == "mouse_move":
@@ -3116,7 +3119,10 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                 current_app.logger.info(
                     f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
                 try:
-                    json_obj = eval(group_chat.messages[-2]["content"])
+                    try:
+                        json_obj = json.loads(group_chat.messages[-2]["content"])
+                    except (json.JSONDecodeError, ValueError):
+                        json_obj = ast.literal_eval(group_chat.messages[-2]["content"])
                     current_app.logger.info(f'got json object {json_obj}')
                     if json_obj['status'].lower() == 'completed':
                         current_app.logger.info(f'UPDATING CURRENT ACTION AS :{int(json_obj["action_id"])}')
@@ -3153,7 +3159,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                                                               clear_history=False, silent=False)
                                 continue
                         else:
-                            raise 'No json found'
+                            raise ValueError('No json found')
                     except Exception as e:
                         current_app.logger.warning(f'it is not a json object the error is: {e}')
                         current_app.logger.info('it is not a json object You should ask status verifier to give response in proper format & not move ahead to next action')
@@ -3586,7 +3592,10 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                         current_app.logger.info(
                             f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
                         try:
-                            json_obj = eval(group_chat.messages[-2]["content"])
+                            try:
+                                json_obj = json.loads(group_chat.messages[-2]["content"])
+                            except (json.JSONDecodeError, ValueError):
+                                json_obj = ast.literal_eval(group_chat.messages[-2]["content"])
                             current_app.logger.info(f'got json object {json_obj}')
                             if json_obj['status'].lower() == 'completed':
                                 current_app.logger.info(f'UPDATIN CURRENT ACTION AS :{int(json_obj["action_id"])}')
@@ -3623,7 +3632,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
 
 
                                 else:
-                                    raise 'No json found'
+                                    raise ValueError('No json found')
                             except IndexError as e:
                                 current_app.logger.info(f"COmpleted ALL ACTIONS:")
                                 return ''

@@ -260,12 +260,17 @@ class RuntimeToolManager:
         python_exe = sys.executable
 
         try:
-            proc = subprocess.Popen(
-                [python_exe, script],
+            _popen_kwargs = dict(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env=env,
                 text=True,
+            )
+            if sys.platform == 'win32':
+                _popen_kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+            proc = subprocess.Popen(
+                [python_exe, script],
+                **_popen_kwargs,
             )
 
             # Read PORT=NNNNN from stdout (timeout 30s)

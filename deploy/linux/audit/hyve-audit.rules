@@ -1,0 +1,23 @@
+## HyveOS security audit rules
+## Install: cp to /etc/audit/rules.d/hyve.rules && augenrules --load
+
+# Monitor node private key access
+-w /var/lib/hyve/node_private.key -p rwa -k hyve_key_access
+
+# Monitor config changes
+-w /etc/hyve/hyve.env -p wa -k hyve_config_change
+-w /etc/hyve/ -p wa -k hyve_config_change
+
+# Monitor code directory modifications
+-w /opt/hyve/ -p wa -k hyve_code_change
+
+# Monitor service management (who restarts services?)
+-w /usr/bin/systemctl -p x -k hyve_service_mgmt
+
+# Monitor user/group changes
+-w /etc/passwd -p wa -k hyve_identity
+-w /etc/group -p wa -k hyve_identity
+
+# Track all process execution by hyve user
+-a always,exit -F arch=b64 -S execve -F uid=hyve -k hyve_exec
+-a always,exit -F arch=b32 -S execve -F uid=hyve -k hyve_exec

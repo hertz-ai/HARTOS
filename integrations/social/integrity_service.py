@@ -737,6 +737,83 @@ class IntegrityService:
 
         return results
 
+    # ─── Post-Update Peer Witness Verification ───
+
+    @staticmethod
+    def verify_post_update(db: Session, node_id: str,
+                           expected_version: str = '') -> Dict:
+        """Verify a node after it reports an upgrade.
+
+        Challenges code_hash, verifies guardrail_hash, and records
+        attestation in NodeAttestation table. Called on next gossip round
+        after a peer announces a new version.
+        """
+        peer = db.query(PeerNode).filter_by(node_id=node_id).first()
+        if not peer:
+            return {'verified': False, 'reason': 'peer not found'}
+
+        results = {'node_id': node_id, 'checks': {}}
+
+        # 1. Code hash verification (against master-signed manifest)
+        hash_result = IntegrityService.verify_code_hash(db, node_id)
+        results['checks']['code_hash'] = hash_result
+
+        # 2. Guardrail hash verification via challenge
+        if peer.url:
+            try:
+                challenge_result = IntegrityService.create_challenge(
+                    db, challenger_node_id='self',
+                    target_node_id=node_id,
+                    target_url=peer.url,
+                    challenge_type='code_hash_check')
+                results['checks']['challenge'] = challenge_result or {}
+            except Exception as e:
+                results['checks']['challenge'] = {'error': str(e)}
+
+        # 3. Guardrail hash match check from latest gossip info
+        try:
+            from security.hive_guardrails import get_guardrail_hash
+            our_hash = get_guardrail_hash()
+            peer_hash = getattr(peer, 'guardrail_hash', None)
+            if peer_hash and peer_hash != our_hash:
+                results['checks']['guardrail_hash'] = {
+                    'match': False, 'our': our_hash[:16], 'theirs': peer_hash[:16]}
+                IntegrityService.increase_fraud_score(
+                    db, node_id, 10.0,
+                    f'Post-update guardrail hash mismatch',
+                    {'expected': our_hash[:16], 'got': peer_hash[:16]})
+            else:
+                results['checks']['guardrail_hash'] = {'match': True}
+        except ImportError:
+            results['checks']['guardrail_hash'] = {'skipped': True}
+
+        # 4. Record attestation
+        try:
+            attestation = NodeAttestation(
+                node_id=node_id,
+                attestation_type='post_update_verification',
+                attestation_data={
+                    'version': expected_version,
+                    'code_hash_verified': hash_result.get('verified', False),
+                    'checks': {k: bool(v.get('verified') or v.get('match'))
+                               for k, v in results['checks'].items()
+                               if isinstance(v, dict)},
+                },
+            )
+            db.add(attestation)
+            db.flush()
+            results['attestation_id'] = attestation.id
+        except Exception as e:
+            results['attestation_error'] = str(e)
+
+        all_passed = all(
+            v.get('verified') or v.get('match') or v.get('skipped') or v.get('passed')
+            for v in results['checks'].values()
+            if isinstance(v, dict)
+        )
+        results['verified'] = all_passed
+        return results
+
     # ─── Audit Compute Dominance ───
 
     @staticmethod

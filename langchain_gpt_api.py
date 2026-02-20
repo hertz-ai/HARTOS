@@ -526,8 +526,8 @@ for _cfg_name in ('langchain_config.json', 'config.json'):
 # global variables
 try:
     encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
-except Exception:
-    encoding = None
+except (KeyError, Exception):
+    encoding = tiktoken.get_encoding("cl100k_base")  # GPT-4 default
 
 # api and keys — use config if available, otherwise keep existing env vars / empty
 for _cfg_key in ('OPENAI_API_KEY', 'GOOGLE_CSE_ID', 'GOOGLE_API_KEY',
@@ -1420,7 +1420,7 @@ class CustomGPT(LLM):
 
         app.logger.info(f"len---->{len(prompt.split(' '))}")
         # encoding = tiktoken.get_encoding("gpt-3.5-turbo")
-        num_tokens = len(encoding.encode(prompt))
+        num_tokens = len(encoding.encode(prompt)) if encoding else len(prompt.split())
         thread_local_data.update_req_token_count(num_tokens)
         app.logger.info(f"len---->{num_tokens}")
 
@@ -1655,7 +1655,7 @@ class CustomGPT(LLM):
             elapsed_time = end_time - start_time
             app.logger.info(f"time taken for this call is {elapsed_time}")
             num_tokens = len(encoding.encode(
-                str(response).replace('\n', ' ').replace('\t', '')))
+                str(response).replace('\n', ' ').replace('\t', ''))) if encoding else len(str(response).split())
             app.logger.info(f"current num_tokens: {num_tokens}")
             thread_local_data.update_res_token_count(num_tokens)
             end_result = str(response).replace('\n', ' ').replace('\t', '')
@@ -1689,7 +1689,7 @@ class CustomGPT(LLM):
             app.logger.info(f"time taken for this call is {elapsed_time}")
             response_text = response.json()["choices"][0]["message"]["content"]
             num_tokens = len(encoding.encode(
-                response_text.replace('\n', ' ').replace('\t', '')))
+                response_text.replace('\n', ' ').replace('\t', ''))) if encoding else len(response_text.split())
             thread_local_data.update_res_token_count(num_tokens)
             return response_text.replace('\n', ' ').replace('\t', '')
 
@@ -2351,8 +2351,8 @@ def parse_visual_context(inp: str):
 
         prompt_text = f'Instruction: Respond in second person point of view\ninput:-{inp}'
 
-        # Tier 1: Try local MiniCPM sidecar (port 9890) — zero latency, no cloud
-        local_minicpm_port = int(os.environ.get('MINICPM_PORT', 9890))
+        # Tier 1: Try local MiniCPM sidecar (port 9891) — zero latency, no cloud
+        local_minicpm_port = int(os.environ.get('HEVOLVE_MINICPM_PORT', 9891))
         try:
             with open(image_path, 'rb') as f:
                 r = requests.post(
@@ -2372,15 +2372,18 @@ def parse_visual_context(inp: str):
         # Tier 2: Cloud MiniCPM fallback
         url = "http://azurekong.hertzai.com:8000/minicpm/upload"
         payload = {'prompt': prompt_text}
-        files = [
-            ('file', ('call.jpg', open(image_path, 'rb'), 'image/jpeg'))
-        ]
+        fh = open(image_path, 'rb')
         try:
+            files = [
+                ('file', ('call.jpg', fh, 'image/jpeg'))
+            ]
             response = pooled_post(url, headers={}, data=payload, files=files)
             app.logger.info(response.text)
             return response.text
         except Exception as e:
             app.logger.error('Got error in visual QA (cloud fallback)')
+        finally:
+            fh.close()
 
     return "No visual context available — camera not active."
 
@@ -2394,9 +2397,7 @@ def parse_user_id(inp: str):
 
     try:
         prov_user_id = re.findall(r'\d', inp)[0]
-    except:
-        pass
-    finally:
+    except Exception:
         prov_user_id = ""
 
     payload = json.dumps({
@@ -2861,6 +2862,42 @@ review_agents = {"10077":True,10077:True}
 conversation_agent = {"10077":False,10077:False}
 _state_lock = threading.Lock()  # Protects review_agents, conversation_agent, first_promts
 
+# --- TTL-based cleanup for review_agents / conversation_agent (M2 fix) ---
+_AGENT_TTL = 3600  # 1 hour
+_agent_timestamps = {}  # user_id -> last-access epoch
+
+
+def _touch_agent_timestamp(user_id):
+    """Record that an agent entry was accessed (call under _state_lock)."""
+    _agent_timestamps[user_id] = time.time()
+
+
+def _cleanup_stale_agents():
+    """Remove agent state entries not accessed in the last _AGENT_TTL seconds.
+
+    Must be called *outside* _state_lock or inside an already-acquired lock.
+    Safe to call frequently -- it is O(n) over active users only.
+    """
+    now = time.time()
+    for key in list(_agent_timestamps.keys()):
+        if now - _agent_timestamps[key] > _AGENT_TTL:
+            review_agents.pop(key, None)
+            conversation_agent.pop(key, None)
+            _agent_timestamps.pop(key, None)
+
+# Per-user locks to prevent race conditions when concurrent requests
+# for the same user modify review_agents / conversation_agent dicts.
+_user_locks = {}
+_user_locks_lock = threading.Lock()
+
+
+def _get_user_lock(user_key):
+    """Get or create a per-user lock to serialize state mutations."""
+    with _user_locks_lock:
+        if user_key not in _user_locks:
+            _user_locks[user_key] = threading.Lock()
+        return _user_locks[user_key]
+
 
 def _autonomous_gather_info(user_id, description, prompt_id):
     """Run gather_info autonomously — LLM answers all questions itself.
@@ -2918,6 +2955,10 @@ def _autonomous_gather_info(user_id, description, prompt_id):
 def chat():
 
     start_time = time.time()
+
+    # Periodically evict stale agent state to prevent unbounded memory growth (M2 fix)
+    _cleanup_stale_agents()
+
     data = request.get_json()
     user_id = data.get('user_id', None)
     preferred_lang = data.get('preferred_lang', 'en')
@@ -2926,7 +2967,7 @@ def chat():
     file_id = data.get('file_id', None)
     prompt_id = data.get('prompt_id', None)
     create_agent = data.get('create_agent', None)
-    casual_conv = data.get('casual_conv', True)
+    casual_conv = data.get('casual_conv', False)
     autonomous = data.get('autonomous', False)
     probe = data.get('probe', None)
     intermediate = data.get('intermediate', None)
@@ -2945,6 +2986,8 @@ def chat():
         thread_local_data.set_model_config_override(model_config)
     else:
         thread_local_data.clear_model_config_override()
+
+    prompt = data.get('prompt', None)
 
     # GUARDRAIL: full pre-dispatch gate on every /chat call
     if prompt:
@@ -2977,7 +3020,6 @@ def chat():
 
     # return ""
     thread_local_data.set_request_id(request_id=request_id)
-    prompt = data.get('prompt', None)
 
     # Security: Prompt injection detection
     if prompt:
@@ -2991,7 +3033,10 @@ def chat():
             pass  # Degrade gracefully
 
     if prompt_id:
-        with _state_lock:
+        # Per-user lock prevents concurrent requests from corrupting agent state.
+        # Replaces the global _state_lock for better concurrency.
+        _user_lock = _get_user_lock(user_id)
+        with _user_lock:
             if os.path.exists(f'prompts/{prompt_id}.json'):
                 app.logger.info('GATHER JSON EXISTS')
                 if os.path.exists(f'prompts/{prompt_id}_0_recipe.json'):
@@ -3008,26 +3053,36 @@ def chat():
                         create_agent = True
                         review_agents[user_id] = True
                         conversation_agent[user_id] = False
+                        _touch_agent_timestamp(user_id)
                 else:
                     app.logger.info('0 Recipe JSON doesnot EXISTS')
                     create_agent = True
                     review_agents[user_id] = True
                     conversation_agent[user_id] = False
+                    _touch_agent_timestamp(user_id)
 
             else:
                 app.logger.info('GATHER JSON doesnot EXISTS')
                 create_agent = True
                 review_agents[user_id] = False
                 conversation_agent[user_id] = True
+                _touch_agent_timestamp(user_id)
 
     if create_agent:
         # Generate prompt_id server-side if not provided
         if not prompt_id:
             prompt_id = _next_prompt_id()
             app.logger.info(f'Generated server-side prompt_id={prompt_id} for new agent')
+        # Per-user lock: snapshot agent state flags (lock NOT held during LLM calls)
+        _user_lock = _get_user_lock(user_id)
+        with _user_lock:
+            _in_review = user_id in review_agents and review_agents[user_id]
+            _in_convo = user_id in conversation_agent and conversation_agent[user_id]
         # Phase 1: Gather Requirements
-        if user_id not in review_agents.keys() or review_agents[user_id] == False:
-            review_agents[user_id] = False
+        if not _in_review:
+            with _user_lock:
+                review_agents[user_id] = False
+                _touch_agent_timestamp(user_id)
             prompt = data.get('prompt', None)
             if prompt_id not in first_promts:
                 first_promts.append(prompt_id)
@@ -3042,8 +3097,10 @@ def chat():
             if autonomous:
                 # Autonomous dispatch (from daemon or API): LLM self-generates agent config
                 auto_response = _autonomous_gather_info(user_id, prompt, prompt_id)
-                review_agents[user_id] = True
-                conversation_agent[user_id] = False
+                with _user_lock:
+                    review_agents[user_id] = True
+                    conversation_agent[user_id] = False
+                    _touch_agent_timestamp(user_id)
                 _record_lifecycle('Review Mode', user_id, prompt_id, f'Autonomous creation via dispatch: {prompt[:100]}')
                 return jsonify({'response': auto_response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [], 'Agent_status': 'Review Mode', 'autonomous_creation': True, 'prompt_id': prompt_id})
             from gather_agentdetails import gather_info
@@ -3065,7 +3122,7 @@ def chat():
                         new_res = json.loads(json_part)
                         app.logger.info(f'After loads new_res:{new_res}')
                     else:
-                        raise 'No Json in response'
+                        raise ValueError('No JSON in response')
                 app.logger.info('AFTER EVAL')
                 if new_res['status'] == 'pending':
                     app.logger.info('PENDING STATUS')
@@ -3076,7 +3133,9 @@ def chat():
                     app.logger.info('COMPLETED STATUS')
                     new_res['prompt_id'] = prompt_id
                     new_res['creator_user_id'] = user_id
-                    conversation_agent[user_id] = False
+                    with _user_lock:
+                        conversation_agent[user_id] = False
+                        _touch_agent_timestamp(user_id)
                     app.logger.info(
                         'Agent Created Successfully saving it and reusing it for further purpose')
                     name = f'prompts/{prompt_id}.json'
@@ -3098,7 +3157,9 @@ def chat():
                             timeout=5)
                     except Exception as e:
                         app.logger.debug(f"Cloud sync failed (non-fatal): {e}")
-                    review_agents[user_id] = True
+                    with _user_lock:
+                        review_agents[user_id] = True
+                        _touch_agent_timestamp(user_id)
                     _record_lifecycle('Review Mode', user_id, prompt_id, 'Agent details gathered, entering review')
                     return jsonify({'response': 'Got Agent details successfully lets move on to review them one at a time', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Review Mode', 'prompt_id': prompt_id})
             except Exception as e:
@@ -3106,11 +3167,16 @@ def chat():
                 app.logger.error(e)
                 _record_lifecycle('Creation Mode', user_id, prompt_id, f'Creation continuing after parse error: {e}')
                 return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Creation Mode'})
-        # Phase 2: Review Phase
-        if review_agents[user_id] and not conversation_agent[user_id]:
+        # Phase 2: Review Phase (re-snapshot flags under lock after Phase 1 may have mutated)
+        with _user_lock:
+            _in_review = user_id in review_agents and review_agents[user_id]
+            _in_convo = user_id in conversation_agent and conversation_agent[user_id]
+        if _in_review and not _in_convo:
             response = recipe(user_id,prompt,prompt_id,file_id,request_id)
             if response =='Agent Created Successfully':
-                conversation_agent[user_id] = True
+                with _user_lock:
+                    conversation_agent[user_id] = True
+                _touch_agent_timestamp(user_id)
                 # Bridge: auto-create social identity for this agent
                 try:
                     _create_social_agent_from_prompt(user_id, prompt_id)
@@ -3121,7 +3187,7 @@ def chat():
             _record_lifecycle('Review Mode', user_id, prompt_id, 'Agent details being reviewed')
             return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Review Mode'})
         # Phase 3: Evaluation Phase
-        if review_agents[user_id] and conversation_agent[user_id]:
+        if _in_review and _in_convo:
             return evaluate_agent_after_creation_in_review(file_id, prompt, prompt_id, request_id, user_id)
 
     if prompt_id and os.path.exists(f'prompts/{prompt_id}.json'):
@@ -3151,6 +3217,7 @@ def chat():
                     # Autonomous: run gather_info with LLM-generated answers
                     auto_response = _autonomous_gather_info(user_id, agent_desc, new_prompt_id)
                     review_agents[user_id] = True
+                    _touch_agent_timestamp(user_id)
                     _record_lifecycle('Review Mode', user_id, new_prompt_id, f'Autonomous creation from reuse: {agent_desc[:100]}')
                     return jsonify({
                         'response': auto_response,
@@ -3256,6 +3323,7 @@ def chat():
             # Autonomous: run gather_info with LLM-generated answers
             auto_response = _autonomous_gather_info(user_id, agent_description, new_prompt_id)
             review_agents[user_id] = True
+            _touch_agent_timestamp(user_id)
             _record_lifecycle('Review Mode', user_id, new_prompt_id, f'Autonomous creation via LLM tool: {agent_description[:100]}')
             return jsonify({
                 'response': auto_response,
@@ -3330,6 +3398,7 @@ def set_flags_to_enter_review_mode(no_of_flow, user_id):
     create_agent = False
     review_agents[user_id] = True
     conversation_agent[user_id] = False
+    _touch_agent_timestamp(user_id)
     return create_agent
 
 

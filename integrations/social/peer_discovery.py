@@ -497,6 +497,32 @@ class GossipProtocol:
                 }
         except Exception:
             pass
+        # Advertise idle compute availability for distributed task execution
+        try:
+            from integrations.coding_agent.idle_detection import IdleDetectionService
+            from integrations.social.models import get_db
+            db = get_db()
+            try:
+                idle_stats = IdleDetectionService.get_idle_stats(db)
+                info['idle_compute'] = {
+                    'available': idle_stats.get('currently_idle', 0) > 0,
+                    'idle_agents': idle_stats.get('currently_idle', 0),
+                    'opted_in': idle_stats.get('total_opted_in', 0),
+                }
+            finally:
+                db.close()
+        except Exception:
+            pass
+        # Advertise version info for autonomous upgrade discovery
+        try:
+            from integrations.agent_engine.upgrade_orchestrator import get_upgrade_orchestrator
+            orch = get_upgrade_orchestrator()
+            info['current_version'] = self.version
+            status = orch.get_status()
+            if status.get('version') and status.get('stage') == 'completed':
+                info['available_version'] = status['version']
+        except Exception:
+            pass
         return info
 
     def _seed_initial_peers(self):

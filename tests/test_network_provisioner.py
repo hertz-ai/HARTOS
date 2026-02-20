@@ -402,3 +402,35 @@ class TestGoalManagerRegistration:
         from integrations.agent_engine.goal_manager import get_tool_tags
         tags = get_tool_tags('provision')
         assert 'provision' in tags
+
+
+# ──────────────────────────────────────────────────
+# Input Validation Tests (A4-A5)
+# ──────────────────────────────────────────────────
+
+class TestInputValidation:
+    """Tests for provisioner input validation (A4-A5)."""
+
+    def test_command_injection_hostname(self):
+        """Hostname with shell metacharacters should be rejected."""
+        from integrations.agent_engine.network_provisioner import NetworkProvisioner
+        with pytest.raises(ValueError):
+            NetworkProvisioner._validate_params('192.168.1.1; rm -rf /', 'root', 6777)
+
+    def test_command_injection_username(self):
+        """Username with shell metacharacters should be rejected."""
+        from integrations.agent_engine.network_provisioner import NetworkProvisioner
+        with pytest.raises(ValueError):
+            NetworkProvisioner._validate_params('192.168.1.1', 'root; cat /etc/shadow', 6777)
+
+    def test_valid_params_accepted(self):
+        """Valid hostname+user+port should pass validation."""
+        from integrations.agent_engine.network_provisioner import NetworkProvisioner
+        # Should not raise
+        NetworkProvisioner._validate_params('192.168.1.50', 'hyve', 6777)
+
+    def test_invalid_port(self):
+        """Port out of range should be rejected."""
+        from integrations.agent_engine.network_provisioner import NetworkProvisioner
+        with pytest.raises(ValueError):
+            NetworkProvisioner._validate_params('192.168.1.1', 'root', 99999)

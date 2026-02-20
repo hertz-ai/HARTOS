@@ -1,0 +1,23 @@
+#include <tunables/global>
+
+/opt/hyve/venv/bin/python {
+  #include <abstractions/base>
+  #include <abstractions/python>
+  #include <abstractions/nameservice>
+
+  /opt/hyve/** r,
+  /opt/hyve/venv/bin/python ix,
+
+  /var/lib/hyve/node_public.key r,
+  /var/lib/hyve/node_private.key r,
+  /var/log/hyve/** w,
+  /etc/hyve/** r,
+
+  network inet dgram,
+  network inet stream,
+  network inet6 dgram,
+
+  deny /etc/shadow r,
+  deny /root/** rw,
+  deny /var/lib/hyve/hevolve_database.db rw,
+}

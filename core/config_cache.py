@@ -6,6 +6,25 @@ reuse_recipe.py, and langchain_gpt_api.py with a single cached load.
 
 Before: config.json read 3+ times at module import (once per file).
 After:  config.json read exactly once, cached in memory.
+
+Configuration Loading Priority (highest to lowest):
+1. Environment variables — always checked first by get_secret()
+2. Encrypted vault (SecretsManager) — if migrated to encrypted storage
+3. config.json (standalone) — developer mode, repo root
+4. langchain_config.json (bundled) — Nunba/cx_Freeze, next to executable
+5. Empty dict fallback — env-vars-only mode
+
+Deployment mode detection:
+- Bundled (Nunba): sys.frozen == True → looks for langchain_config.json next to .exe
+- Standalone: looks for config.json in repo root (parent of core/)
+- HyveOS: /etc/hyve/hyve.env loaded by systemd, no config.json needed
+
+Note: Nunba's AIKeyVault loads encrypted keys into env vars BEFORE
+config_cache runs. get_secret() checks env vars first, so vault keys
+always take precedence.
+
+See deploy/deployment-manifest.json for the full deployment mode matrix
+including tier definitions, service port assignments, and variant configs.
 """
 
 import json

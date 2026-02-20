@@ -67,38 +67,46 @@ app.logger.addHandler(handler)
 app.logger.info('Logger initialized')
 
 #openAPI spec
-spec = OpenAPISpec.from_file(
-    "./openapi.yaml"
-)
+_helper_func_dir = os.path.dirname(os.path.abspath(__file__))
+try:
+    _openapi_path = os.path.join(_helper_func_dir, "openapi.yaml")
+    if os.path.isfile(_openapi_path):
+        spec = OpenAPISpec.from_file(_openapi_path)
+    else:
+        spec = None
+        logging.getLogger(__name__).warning("openapi.yaml not found at %s — skipping", _openapi_path)
+except Exception as _e:
+    spec = None
+    logging.getLogger(__name__).warning("Failed to load openapi.yaml: %s", _e)
 
-
-
-with open("config.json", 'r') as f:
-    config = json.load(f)
+try:
+    _config_path = os.path.join(_helper_func_dir, "config.json")
+    with open(_config_path, 'r') as f:
+        config = json.load(f)
+except FileNotFoundError:
+    config = {}
+    logging.getLogger(__name__).warning("config.json not found at %s — using empty config", _config_path)
 
 
 
 # global variables
 encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
 
-#api and keys
-# app.logger.log(config['OPENAI_API_KEY'])
-os.environ["OPENAI_API_KEY"] = config['OPENAI_API_KEY']
-os.environ["GOOGLE_CSE_ID"] = config['GOOGLE_CSE_ID']
-os.environ["GOOGLE_API_KEY"] = config['GOOGLE_API_KEY']
-os.environ["NEWS_API_KEY"] = config['NEWS_API_KEY']
-os.environ["SERPAPI_API_KEY"] = config['SERPAPI_API_KEY']
-ZEP_API_URL = config['ZEP_API_URL']
-ZEP_API_KEY = config['ZEP_API_KEY']
-GPT_API = config['GPT_API']
-STUDENT_API= config['STUDENT_API']
-ACTION_API = config['ACTION_API']
-FAV_TEACHER_API = config['FAV_TEACHER_API']
-DREAMBOOTH_API= config['DREAMBOOTH_API']
-STABLE_DIFF_API = config['STABLE_DIFF_API']
-LLAVA_API = config['LLAVA_API']
-BOOKPARSING_API = config['BOOKPARSING_API']
-CRAWLAB_API = config['CRAWLAB_API']
+#api and keys — use .get() to avoid KeyError when config.json is missing keys
+for _env_key in ('OPENAI_API_KEY', 'GOOGLE_CSE_ID', 'GOOGLE_API_KEY', 'NEWS_API_KEY', 'SERPAPI_API_KEY'):
+    if config.get(_env_key):
+        os.environ.setdefault(_env_key, config[_env_key])
+ZEP_API_URL = config.get('ZEP_API_URL', '')
+ZEP_API_KEY = config.get('ZEP_API_KEY', '')
+GPT_API = config.get('GPT_API', '')
+STUDENT_API = config.get('STUDENT_API', '')
+ACTION_API = config.get('ACTION_API', '')
+FAV_TEACHER_API = config.get('FAV_TEACHER_API', '')
+DREAMBOOTH_API = config.get('DREAMBOOTH_API', '')
+STABLE_DIFF_API = config.get('STABLE_DIFF_API', '')
+LLAVA_API = config.get('LLAVA_API', '')
+BOOKPARSING_API = config.get('BOOKPARSING_API', '')
+CRAWLAB_API = config.get('CRAWLAB_API', '')
 
 
 def get_memory(user_id:int):

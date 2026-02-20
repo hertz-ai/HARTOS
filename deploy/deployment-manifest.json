@@ -1,0 +1,71 @@
+{
+  "version": "1.0.0",
+  "modes": {
+    "standalone": {
+      "description": "Developer machine running Flask directly",
+      "entry_point": "langchain_gpt_api.py",
+      "database": "sqlite",
+      "certificate_tier": "flat",
+      "config_file": "config.json",
+      "default_port": 6777,
+      "features": ["backend", "social", "agent_engine", "coding_agent"]
+    },
+    "bundled": {
+      "description": "Nunba desktop app (cx_Freeze)",
+      "entry_point": "Nunba.exe / Nunba.app",
+      "database": "sqlite",
+      "certificate_tier": "flat",
+      "config_file": "langchain_config.json",
+      "default_port": 6777,
+      "detection": "sys.frozen == True or NUNBA_BUNDLED env var",
+      "features": ["backend", "social", "agent_engine", "coding_agent", "vision"]
+    },
+    "headless": {
+      "description": "Embedded/headless mode (no Flask, API only)",
+      "entry_point": "embedded_main.py",
+      "database": "sqlite",
+      "certificate_tier": "flat",
+      "config_file": "config.json",
+      "default_port": 6777,
+      "features": ["backend", "agent_engine"]
+    },
+    "regional": {
+      "description": "HyveOS regional host (systemd services)",
+      "entry_point": "/opt/hyve/venv/bin/python langchain_gpt_api.py",
+      "database": "sqlite_or_postgres",
+      "certificate_tier": "regional",
+      "config_file": "/etc/hyve/hyve.env",
+      "default_port": 6777,
+      "features": ["backend", "social", "agent_engine", "coding_agent", "vision", "llm", "discovery", "gossip", "fleet_command"]
+    },
+    "central": {
+      "description": "Central authority node",
+      "entry_point": "/opt/hyve/venv/bin/python langchain_gpt_api.py",
+      "database": "postgres",
+      "certificate_tier": "central",
+      "config_file": "/etc/hyve/hyve.env",
+      "default_port": 6777,
+      "features": ["backend", "social", "agent_engine", "coding_agent", "vision", "llm", "discovery", "gossip", "fleet_command", "registry"]
+    }
+  },
+  "tiers": {
+    "EMBEDDED": {"min_ram_gb": 0, "min_cores": 1, "gpu_required": false, "features": ["backend"]},
+    "OBSERVER": {"min_ram_gb": 1, "min_cores": 1, "gpu_required": false, "features": ["backend", "discovery"]},
+    "LITE": {"min_ram_gb": 2, "min_cores": 2, "gpu_required": false, "features": ["backend", "discovery", "social"]},
+    "STANDARD": {"min_ram_gb": 4, "min_cores": 2, "gpu_required": false, "features": ["backend", "discovery", "social", "agent_engine"]},
+    "PERFORMANCE": {"min_ram_gb": 8, "min_cores": 4, "gpu_required": false, "features": ["backend", "discovery", "social", "agent_engine", "vision"]},
+    "COMPUTE_HOST": {"min_ram_gb": 16, "min_cores": 8, "gpu_required": true, "features": ["backend", "discovery", "social", "agent_engine", "vision", "llm"]}
+  },
+  "services": {
+    "hyve-backend": {"port": 6777, "protocol": "tcp", "always_enabled": true},
+    "hyve-discovery": {"port": 6780, "protocol": "udp", "always_enabled": true},
+    "hyve-vision": {"ports": [9891, 5460], "protocol": "tcp", "min_tier": "PERFORMANCE"},
+    "hyve-llm": {"port": 8080, "protocol": "tcp", "min_tier": "COMPUTE_HOST"},
+    "hyve-agent-daemon": {"port": null, "protocol": null, "min_tier": "STANDARD"}
+  },
+  "variants": {
+    "server": {"description": "Headless, all services per tier", "min_ram_gb": 4, "gui": false},
+    "desktop": {"description": "GNOME + D-Bus + tray app", "min_ram_gb": 8, "gui": true},
+    "edge": {"description": "Minimal observer only", "min_ram_gb": 1, "gui": false}
+  }
+}

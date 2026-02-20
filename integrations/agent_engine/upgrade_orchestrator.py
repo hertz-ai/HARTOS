@@ -19,6 +19,7 @@ from typing import Dict, Optional
 logger = logging.getLogger('hevolve_social')
 
 STATE_FILE = os.path.join('agent_data', 'upgrade_state.json')
+BENCHMARK_DIR = os.path.join('agent_data', 'benchmarks')
 
 
 class UpgradeStage(enum.Enum):
@@ -258,7 +259,25 @@ class UpgradeOrchestrator:
 
             prev_version = snapshots[0].replace('.json', '')
             safe, reason = registry.is_upgrade_safe(prev_version, version)
-            return safe, reason
+            if not safe:
+                return False, reason
+
+            # Gate: crawl4ai world model health must be acceptable
+            try:
+                from .world_model_bridge import get_world_model_bridge
+                wm = get_world_model_bridge()
+                health = wm.check_health()
+                if health and not health.get('healthy', True):
+                    return False, 'world model unhealthy during benchmark'
+                stats = wm.get_learning_stats()
+                if stats:
+                    flush_rate = stats.get('flush_rate', 1.0)
+                    if isinstance(flush_rate, (int, float)) and flush_rate < 0.5:
+                        return False, f'world model flush_rate={flush_rate:.2%} < 50%'
+            except Exception:
+                pass  # World model optional — don't block if unavailable
+
+            return True, reason
         except Exception as e:
             return False, f'Benchmark stage error: {e}'
 

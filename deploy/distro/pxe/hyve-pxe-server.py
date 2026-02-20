@@ -30,6 +30,7 @@ import os
 import shutil
 import socket
 import socketserver
+import ssl
 import struct
 import subprocess
 import sys
@@ -71,10 +72,21 @@ class TFTPHandler(socketserver.BaseRequestHandler):
             return
 
         filename = parts[0].decode('ascii', errors='replace')
-        # Security: prevent path traversal
-        filename = filename.replace('..', '').lstrip('/')
-
+        # Security: prevent path traversal (null bytes, .., backslash tricks)
+        filename = os.path.normpath(filename.replace('\x00', '')).lstrip('/').lstrip('\\')
+        # Remove any remaining .. components
+        filename = '/'.join(p for p in filename.split('/') if p != '..')
         filepath = os.path.join(self.server.serve_dir, filename)
+        # Fail-closed: verify path stays under serve_dir
+        try:
+            common = os.path.commonpath([os.path.abspath(filepath), os.path.abspath(self.server.serve_dir)])
+            if common != os.path.abspath(self.server.serve_dir):
+                logger.warning("[TFTP] Path traversal blocked: %s", filename)
+                self._send_error(sock, 2, "Access denied")
+                return
+        except ValueError:
+            self._send_error(sock, 2, "Access denied")
+            return
 
         if not os.path.isfile(filepath):
             logger.warning("[TFTP] File not found: %s", filename)
@@ -279,13 +291,109 @@ def setup_autoinstall_dir(output_dir: str):
             shutil.copy2(src, dst)
 
 
-def start_http_server(serve_dir: str, port: int):
-    """Start HTTP server for autoinstall + squashfs."""
+def _generate_self_signed_cert(cert_path: str, key_path: str, hostname: str = None):
+    """Generate a self-signed TLS certificate for PXE HTTPS serving.
+
+    Uses subprocess openssl to create a temporary self-signed cert.
+    Falls back to Python's ssl module if openssl CLI is unavailable.
+
+    Args:
+        cert_path: Path to write the certificate PEM file.
+        key_path: Path to write the private key PEM file.
+        hostname: Common Name for the certificate (defaults to machine hostname).
+    """
+    if hostname is None:
+        hostname = socket.gethostname()
+
+    subject = f"/CN={hostname}/O=HyveOS PXE Server"
+
+    try:
+        # Prefer openssl CLI for broader compatibility
+        subprocess.run([
+            'openssl', 'req', '-x509', '-newkey', 'rsa:2048',
+            '-keyout', key_path, '-out', cert_path,
+            '-days', '365', '-nodes',
+            '-subj', subject,
+        ], check=True, capture_output=True)
+        logger.info("Generated self-signed TLS certificate: %s (CN=%s)", cert_path, hostname)
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        # Fallback: use Python's ssl module to generate via openssl wrapper
+        # This requires the cryptography library
+        try:
+            from cryptography import x509
+            from cryptography.x509.oid import NameOID
+            from cryptography.hazmat.primitives import hashes, serialization
+            from cryptography.hazmat.primitives.asymmetric import rsa
+            import datetime
+
+            key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+            name = x509.Name([
+                x509.NameAttribute(NameOID.COMMON_NAME, hostname),
+                x509.NameAttribute(NameOID.ORGANIZATION_NAME, "HyveOS PXE Server"),
+            ])
+
+            cert = (
+                x509.CertificateBuilder()
+                .subject_name(name)
+                .issuer_name(name)
+                .public_key(key.public_key())
+                .serial_number(x509.random_serial_number())
+                .not_valid_before(datetime.datetime.utcnow())
+                .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=365))
+                .add_extension(
+                    x509.SubjectAlternativeName([
+                        x509.DNSName(hostname),
+                        x509.DNSName("localhost"),
+                    ]),
+                    critical=False,
+                )
+                .sign(key, hashes.SHA256())
+            )
+
+            with open(key_path, 'wb') as f:
+                f.write(key.private_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PrivateFormat.TraditionalOpenSSL,
+                    serialization.NoEncryption(),
+                ))
+
+            with open(cert_path, 'wb') as f:
+                f.write(cert.public_bytes(serialization.Encoding.PEM))
+
+            logger.info("Generated self-signed TLS certificate (Python cryptography): %s", cert_path)
+        except ImportError:
+            logger.error(
+                "Cannot generate self-signed cert: neither openssl CLI nor "
+                "Python cryptography library available. Install one of them or "
+                "provide --tls-cert and --tls-key manually."
+            )
+            raise RuntimeError("No TLS certificate generation method available") from e
+
+
+def start_http_server(serve_dir: str, port: int, tls_cert: str = None, tls_key: str = None):
+    """Start HTTP server for autoinstall + squashfs.
+
+    Args:
+        serve_dir: Directory to serve files from.
+        port: TCP port to listen on.
+        tls_cert: Path to TLS certificate PEM file (optional).
+        tls_key: Path to TLS private key PEM file (optional).
+    """
     handler = lambda *args, **kwargs: PXEHTTPHandler(
         *args, serve_dir=serve_dir, **kwargs)
 
     with socketserver.TCPServer(("", port), handler) as httpd:
-        logger.info("HTTP server listening on port %d (dir: %s)", port, serve_dir)
+        if tls_cert and tls_key:
+            ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ssl_ctx.load_cert_chain(certfile=tls_cert, keyfile=tls_key)
+            # Secure defaults
+            ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            httpd.socket = ssl_ctx.wrap_socket(httpd.socket, server_side=True)
+            logger.info("HTTPS server listening on port %d (TLS enabled, dir: %s)",
+                        port, serve_dir)
+        else:
+            logger.info("HTTP server listening on port %d (dir: %s)", port, serve_dir)
         httpd.serve_forever()
 
 
@@ -333,6 +441,12 @@ def main():
                         help='Network interface to bind to (e.g., eth0)')
     parser.add_argument('--serve-dir', default='/srv/hyve-pxe',
                         help='Directory to serve PXE files from')
+    parser.add_argument('--tls-cert', default=None,
+                        help='Path to TLS certificate PEM file for HTTPS')
+    parser.add_argument('--tls-key', default=None,
+                        help='Path to TLS private key PEM file for HTTPS')
+    parser.add_argument('--tls-auto', action='store_true', default=False,
+                        help='Auto-generate a self-signed cert if --tls-cert/--tls-key not provided')
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -367,11 +481,34 @@ def main():
     if not os.path.exists(os.path.join(serve_dir, 'pxelinux.0')):
         logger.warning("pxelinux.0 not found! Install: apt install pxelinux syslinux-common")
 
+    # ─── TLS Setup (optional) ───
+    tls_cert = args.tls_cert
+    tls_key = args.tls_key
+
+    if args.tls_auto and not (tls_cert and tls_key):
+        # Auto-generate a self-signed certificate
+        tls_dir = os.path.join(serve_dir, '.tls')
+        os.makedirs(tls_dir, exist_ok=True)
+        tls_cert = os.path.join(tls_dir, 'pxe-server.crt')
+        tls_key = os.path.join(tls_dir, 'pxe-server.key')
+        if not (os.path.exists(tls_cert) and os.path.exists(tls_key)):
+            _generate_self_signed_cert(tls_cert, tls_key, hostname=server_ip)
+
+    if tls_cert and tls_key:
+        if not os.path.exists(tls_cert):
+            logger.error("TLS certificate not found: %s", tls_cert)
+            sys.exit(1)
+        if not os.path.exists(tls_key):
+            logger.error("TLS key not found: %s", tls_key)
+            sys.exit(1)
+
     # Start TFTP server in background thread
+    # Note: TFTP is UDP-based and does not support TLS (this is standard)
+    proto = "https" if (tls_cert and tls_key) else "http"
     logger.info("Starting HyveOS PXE server...")
-    logger.info("  TFTP: 0.0.0.0:%d", args.tftp_port)
-    logger.info("  HTTP: http://0.0.0.0:%d", args.port)
-    logger.info("  Autoinstall: http://%s:%d/autoinstall/", server_ip, args.port)
+    logger.info("  TFTP: 0.0.0.0:%d (UDP, no TLS)", args.tftp_port)
+    logger.info("  %s: %s://0.0.0.0:%d", proto.upper(), proto, args.port)
+    logger.info("  Autoinstall: %s://%s:%d/autoinstall/", proto, server_ip, args.port)
 
     tftp_thread = threading.Thread(
         target=start_tftp_server,
@@ -380,8 +517,8 @@ def main():
     )
     tftp_thread.start()
 
-    # Start HTTP server (main thread — blocks)
-    start_http_server(serve_dir, args.port)
+    # Start HTTP/HTTPS server (main thread — blocks)
+    start_http_server(serve_dir, args.port, tls_cert=tls_cert, tls_key=tls_key)
 
 
 if __name__ == '__main__':

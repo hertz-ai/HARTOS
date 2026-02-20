@@ -89,6 +89,11 @@ class WorldModelBridge:
         self._consent_cache: Dict[str, tuple] = {}  # user_id → (bool, timestamp)
         self._consent_cache_ttl = 300  # 5 minutes
 
+        # CCT (Compute Contribution Token) cache for learning access gating
+        self._cct_cache: Optional[tuple] = None  # (cct_string, timestamp)
+        self._cct_cache_ttl = 300  # 5 minutes
+        self._node_id: Optional[str] = None
+
         self._init_in_process()
 
     def _cb_is_open(self) -> bool:
@@ -153,6 +158,35 @@ class WorldModelBridge:
 
         self._consent_cache[user_id] = (consent, now)
         return consent
+
+    # ─── CCT (Compute Contribution Token) gating ──────────────────
+
+    def _load_cached_cct(self) -> Optional[str]:
+        """Load CCT from file, cache in memory (5 min TTL)."""
+        now = time.time()
+        if self._cct_cache and now - self._cct_cache[1] < self._cct_cache_ttl:
+            return self._cct_cache[0]
+
+        try:
+            from .continual_learner_gate import ContinualLearnerGateService
+            cct = ContinualLearnerGateService.load_cct_from_file()
+            if cct:
+                self._cct_cache = (cct, now)
+            return cct
+        except Exception:
+            return None
+
+    def _check_cct_access(self, capability: str) -> bool:
+        """Check if node's CCT grants a specific capability. Zero DB calls."""
+        try:
+            from .continual_learner_gate import ContinualLearnerGateService
+            cct = self._load_cached_cct()
+            if not cct:
+                return False
+            return ContinualLearnerGateService.check_cct_capability(
+                cct, capability, self._node_id)
+        except Exception:
+            return False  # Fail-closed
 
     def _init_in_process(self):
         """Try to connect to in-process learning pipeline (zero HTTP overhead).
@@ -453,7 +487,18 @@ class WorldModelBridge:
 
         Use this for real-time multi-modal reasoning (tensor-level fusion).
         For coarse-grained task delegation, use agent-level dispatch instead.
+
+        CCT gating: requires 'hivemind_query' capability. Without valid CCT,
+        returns cached/stale response (graceful degradation, not hard block).
         """
+        # CCT access gate (graceful: degrade to cached, don't block)
+        if not self._check_cct_access('hivemind_query'):
+            logger.debug("HiveMind query: no CCT with hivemind_query capability")
+            cached = self._federation_aggregated.get('last_thought')
+            if cached:
+                return {'thought': cached, 'source': 'cached', 'cct_gated': True}
+            return None
+
         try:
             from security.hive_guardrails import ConstitutionalFilter
             passed, _ = ConstitutionalFilter.check_prompt(query_text)
@@ -602,9 +647,18 @@ class WorldModelBridge:
         local crawl4ai instance.
 
         GUARDRAILS:
-        1. WorldModelSafetyBounds.gate_ralt_export() — rate limit + witness
-        2. ConstructiveFilter.check_output() — constructiveness check
+        1. CCT gate — requires 'skill_distribution' capability
+        2. WorldModelSafetyBounds.gate_ralt_export() — rate limit + witness
+        3. ConstructiveFilter.check_output() — constructiveness check
         """
+        # CCT access gate (hard block: cannot distribute without contribution)
+        if not self._check_cct_access('skill_distribution'):
+            logger.info("Skill distribution blocked: no CCT with "
+                        "skill_distribution capability")
+            with self._lock:
+                self._stats['total_skills_blocked'] += 1
+            return {'success': False, 'reason': 'no_cct_skill_distribution'}
+
         try:
             from security.hive_guardrails import WorldModelSafetyBounds
             passed, reason = WorldModelSafetyBounds.gate_ralt_export(

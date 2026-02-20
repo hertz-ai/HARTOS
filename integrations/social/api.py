@@ -367,10 +367,12 @@ def get_user_comments(user_id):
     limit = min(int(request.args.get('limit', 25)), 100)
     offset = int(request.args.get('offset', 0))
     comments = g.db.query(Comment).filter(
-        Comment.author_id == user_id, Comment.is_deleted == False
+        Comment.author_id == user_id, Comment.is_deleted == False,
+        Comment.is_hidden == False
     ).order_by(Comment.created_at.desc()).offset(offset).limit(limit).all()
     total = g.db.query(Comment).filter(
-        Comment.author_id == user_id, Comment.is_deleted == False).count()
+        Comment.author_id == user_id, Comment.is_deleted == False,
+        Comment.is_hidden == False).count()
     return _ok([c.to_dict() for c in comments], _paginate(total, limit, offset))
 
 
@@ -578,6 +580,11 @@ def create_post():
     title = data.get('title') or data.get('caption', '')
     if not title:
         return _err("title required")
+    if len(title) > 300:
+        return jsonify({'success': False, 'error': 'Title too long (max 300 characters)'}), 400
+    content = data.get('content', '')
+    if content and len(content) > 40000:
+        return jsonify({'success': False, 'error': 'Content too long (max 40000 characters)'}), 400
     post = PostService.create(
         g.db, g.user, title, data.get('content', ''),
         data.get('content_type', 'text'), data.get('community'),
@@ -756,6 +763,8 @@ def create_comment(post_id):
     content = data.get('content') or data.get('text', '')
     if not content:
         return _err("content required")
+    if len(content) > 10000:
+        return jsonify({'success': False, 'error': 'Comment too long (max 10000 characters)'}), 400
     parent_id = data.get('parent_id') or data.get('parent_comment_id')
     if parent_id == 0:
         parent_id = None
@@ -777,6 +786,8 @@ def reply_to_comment(comment_id):
     content = data.get('content') or data.get('text', '')
     if not content:
         return _err("content required")
+    if len(content) > 10000:
+        return jsonify({'success': False, 'error': 'Comment too long (max 10000 characters)'}), 400
     reply = CommentService.create(g.db, post, g.user, content, comment_id)
     return _ok(reply.to_dict(include_author=True), status=201)
 
@@ -887,10 +898,22 @@ def create_community():
         return _err(str(e))
 
 
+def _resolve_community(name):
+    """Resolve a community by name or numeric ID."""
+    community = CommunityService.get_by_name(g.db, name)
+    if not community:
+        # Try as numeric ID (frontend may send ID instead of name)
+        try:
+            community = g.db.query(Community).filter(Community.id == int(name)).first()
+        except (ValueError, TypeError):
+            pass
+    return community
+
+
 @social_bp.route('/communities/<name>', methods=['GET'])
 @optional_auth
 def get_community(name):
-    community = CommunityService.get_by_name(g.db, name)
+    community = _resolve_community(name)
     if not community:
         return _err("Community not found", 404)
     data = community.to_dict()
@@ -903,7 +926,7 @@ def get_community(name):
 @social_bp.route('/communities/<name>', methods=['PATCH'])
 @require_auth
 def update_community(name):
-    community = CommunityService.get_by_name(g.db, name)
+    community = _resolve_community(name)
     if not community:
         return _err("Community not found", 404)
     role = CommunityService.get_user_role(g.db, g.user.id, community.id)
@@ -923,17 +946,20 @@ def update_community(name):
 @social_bp.route('/communities/<name>/posts', methods=['GET'])
 @optional_auth
 def get_community_posts(name):
+    # Resolve by name or ID so frontend can pass either
+    community = _resolve_community(name)
+    community_name = community.name if community else name
     sort = request.args.get('sort', 'new')
     limit = min(int(request.args.get('limit', 25)), 100)
     offset = int(request.args.get('offset', 0))
-    posts, total = PostService.list_posts(g.db, sort, community_name=name, limit=limit, offset=offset)
+    posts, total = PostService.list_posts(g.db, sort, community_name=community_name, limit=limit, offset=offset)
     return _ok([p.to_dict(include_author=True) for p in posts], _paginate(total, limit, offset))
 
 
 @social_bp.route('/communities/<name>/join', methods=['POST'])
 @require_auth
 def join_community(name):
-    community = CommunityService.get_by_name(g.db, name)
+    community = _resolve_community(name)
     if not community:
         return _err("Community not found", 404)
     joined = CommunityService.join(g.db, g.user, community)
@@ -943,7 +969,7 @@ def join_community(name):
 @social_bp.route('/communities/<name>/leave', methods=['DELETE'])
 @require_auth
 def leave_community(name):
-    community = CommunityService.get_by_name(g.db, name)
+    community = _resolve_community(name)
     if not community:
         return _err("Community not found", 404)
     CommunityService.leave(g.db, g.user, community)
@@ -953,7 +979,7 @@ def leave_community(name):
 @social_bp.route('/communities/<name>/members', methods=['GET'])
 @optional_auth
 def get_community_members(name):
-    community = CommunityService.get_by_name(g.db, name)
+    community = _resolve_community(name)
     if not community:
         return _err("Community not found", 404)
     limit = min(int(request.args.get('limit', 50)), 100)
@@ -965,7 +991,7 @@ def get_community_members(name):
 @social_bp.route('/communities/<name>/moderators', methods=['POST'])
 @require_auth
 def add_moderator(name):
-    community = CommunityService.get_by_name(g.db, name)
+    community = _resolve_community(name)
     if not community:
         return _err("Community not found", 404)
     role = CommunityService.get_user_role(g.db, g.user.id, community.id)
@@ -987,7 +1013,7 @@ def add_moderator(name):
 @social_bp.route('/communities/<name>/moderators/<user_id>', methods=['DELETE'])
 @require_auth
 def remove_moderator(name, user_id):
-    community = CommunityService.get_by_name(g.db, name)
+    community = _resolve_community(name)
     if not community:
         return _err("Community not found", 404)
     role = CommunityService.get_user_role(g.db, g.user.id, community.id)
@@ -1022,7 +1048,8 @@ def global_feed():
     sort = request.args.get('sort', 'new')
     limit = min(int(request.args.get('limit', 25)), 100)
     offset = int(request.args.get('offset', 0))
-    posts, total = get_global_feed(g.db, sort, limit, offset)
+    uid = g.user.id if getattr(g, 'user', None) else None
+    posts, total = get_global_feed(g.db, sort, limit, offset, user_id=uid)
     return _ok([p.to_dict(include_author=True) for p in posts], _paginate(total, limit, offset))
 
 
@@ -1031,7 +1058,8 @@ def global_feed():
 def trending_feed():
     limit = min(int(request.args.get('limit', 25)), 100)
     offset = int(request.args.get('offset', 0))
-    posts, total = get_trending_feed(g.db, limit, offset)
+    uid = g.user.id if getattr(g, 'user', None) else None
+    posts, total = get_trending_feed(g.db, limit, offset, user_id=uid)
     return _ok([p.to_dict(include_author=True) for p in posts], _paginate(total, limit, offset))
 
 
@@ -1040,7 +1068,8 @@ def trending_feed():
 def agent_feed():
     limit = min(int(request.args.get('limit', 25)), 100)
     offset = int(request.args.get('offset', 0))
-    posts, total = get_agent_feed(g.db, limit, offset)
+    uid = g.user.id if getattr(g, 'user', None) else None
+    posts, total = get_agent_feed(g.db, limit, offset, user_id=uid)
     return _ok([p.to_dict(include_author=True) for p in posts], _paginate(total, limit, offset))
 
 
@@ -1082,10 +1111,31 @@ def search():
         ).offset(offset).limit(limit).all()
         return _ok([s.to_dict() for s in communities])
     else:  # posts
-        posts = g.db.query(Post).options(joinedload(Post.author)).filter(
+        from sqlalchemy import or_
+        from .models import CommunityMembership
+        current_user_id = g.user.id if g.user else None
+        query = g.db.query(Post).options(joinedload(Post.author)).filter(
             Post.is_deleted == False,
+            Post.is_hidden == False,
             Post.title.ilike(q_like) | Post.content.ilike(q_like)
-        ).order_by(Post.score.desc()).offset(offset).limit(limit).all()
+        )
+        # Filter out posts from private communities that the user isn't a member of
+        privacy_conditions = [
+            Post.community_id == None,
+            Post.community_id.in_(
+                g.db.query(Community.id).filter(Community.is_private == False)
+            ),
+        ]
+        if current_user_id:
+            privacy_conditions.append(
+                Post.community_id.in_(
+                    g.db.query(CommunityMembership.community_id).filter(
+                        CommunityMembership.user_id == current_user_id
+                    )
+                )
+            )
+        query = query.filter(or_(*privacy_conditions))
+        posts = query.order_by(Post.score.desc()).offset(offset).limit(limit).all()
         return _ok([p.to_dict(include_author=True) for p in posts])
 
 

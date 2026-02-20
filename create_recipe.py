@@ -106,7 +106,6 @@ import logging
 import logging.handlers
 import sys
 from functools import wraps
-import cv2
 import redis
 import pickle
 import pytz

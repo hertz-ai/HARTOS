@@ -6,6 +6,7 @@ Uses security.jwt_manager for hardened token management.
 import hashlib
 import hmac
 import os
+import stat
 import secrets
 import logging
 import time
@@ -40,8 +41,38 @@ def _get_jwt_manager():
 # Legacy fallback values - fail closed if not configured
 SECRET_KEY = os.environ.get('SOCIAL_SECRET_KEY', '')
 if not SECRET_KEY:
-    SECRET_KEY = secrets.token_hex(32)
-    logger.critical("SOCIAL_SECRET_KEY not set! Generated ephemeral key - tokens will NOT survive restarts. Set SOCIAL_SECRET_KEY in production!")
+    # Auto-generate and persist so tokens survive restarts.
+    # Stored next to the database file (writable user dir).
+    def _load_or_create_secret_key():
+        db_path = os.environ.get('HEVOLVE_DB_PATH', '')
+        if db_path and db_path != ':memory:' and os.path.isabs(db_path):
+            key_file = os.path.join(os.path.dirname(db_path), '.social_secret_key')
+        else:
+            key_file = os.path.join('agent_data', '.social_secret_key')
+        try:
+            if os.path.exists(key_file):
+                with open(key_file, 'r') as f:
+                    key = f.read().strip()
+                if len(key) >= 32:
+                    return key
+            # Generate new key and persist
+            key = secrets.token_hex(32)
+            os.makedirs(os.path.dirname(key_file), exist_ok=True)
+            with open(key_file, 'w') as f:
+                f.write(key)
+            # Restrict file permissions to owner read/write only (600)
+            try:
+                os.chmod(key_file, stat.S_IRUSR | stat.S_IWUSR)
+            except (OSError, NotImplementedError):
+                pass  # Windows doesn't support POSIX chmod the same way
+            logger.info(f"Generated persistent secret key at {key_file}")
+            return key
+        except (PermissionError, OSError) as e:
+            logger.warning(f"Cannot persist secret key ({e}), using ephemeral")
+            return secrets.token_hex(32)
+    SECRET_KEY = _load_or_create_secret_key()
+    if not os.environ.get('SOCIAL_SECRET_KEY'):
+        logger.info("SOCIAL_SECRET_KEY not set — using auto-generated persistent key")
 
 TOKEN_EXPIRY = 3600  # 1 hour (was 30 days)
 
@@ -212,24 +243,24 @@ def optional_auth(f):
 
 
 def require_admin(f):
-    """Decorator: requires admin user or flat+ role (device owner)."""
+    """Decorator: requires central (cloud admin) role or is_admin flag."""
     @wraps(f)
     @require_auth
     def decorated(*args, **kwargs):
         user_role = getattr(g.user, 'role', None) or 'flat'
-        if not (g.user.is_admin or user_role in ('flat', 'regional', 'central')):
+        if not (g.user.is_admin or user_role in ('central',)):
             return jsonify({'success': False, 'error': 'Admin access required'}), 403
         return f(*args, **kwargs)
     return decorated
 
 
 def require_moderator(f):
-    """Decorator: requires moderator, admin, or flat+ role (device owner)."""
+    """Decorator: requires regional/central role, or is_admin/is_moderator flag."""
     @wraps(f)
     @require_auth
     def decorated(*args, **kwargs):
         user_role = getattr(g.user, 'role', None) or 'flat'
-        if not (g.user.is_admin or g.user.is_moderator or user_role in ('flat', 'regional', 'central')):
+        if not (g.user.is_admin or g.user.is_moderator or user_role in ('regional', 'central')):
             return jsonify({'success': False, 'error': 'Moderator access required'}), 403
         return f(*args, **kwargs)
     return decorated

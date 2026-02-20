@@ -58,6 +58,8 @@ os.chmod('$DATA_DIR/node_private.key', 0o600)
 print(f'Node ID: {public_bytes.hex()[:16]}...')
 "
     chown hyve:hyve "$DATA_DIR/node_private.key" "$DATA_DIR/node_public.key"
+    # Set immutable flag — even root can't modify without chattr -i
+    chattr +i "$DATA_DIR/node_private.key" 2>/dev/null || true
 fi
 
 # Read node ID (xxd with Python fallback)
@@ -99,6 +101,10 @@ echo "  CPU: ${CPU_CORES} cores"
 echo "  RAM: ${RAM_GB}GB"
 echo "  GPU: ${GPU:-none} (${GPU_COUNT} device(s))"
 echo "  Tier: ${TIER}"
+
+# Read variant from /etc/hyve/variant (set during ISO build)
+VARIANT=$(cat /etc/hyve/variant 2>/dev/null || echo "server")
+echo "  Variant: ${VARIANT}"
 
 # ─── Step 3: Configure services per tier ───
 echo "[3/5] Configuring services for tier: ${TIER}..."
@@ -152,6 +158,16 @@ if [[ "$TIER" == "COMPUTE_HOST" ]]; then
             elif command -v wget &>/dev/null; then
                 wget -q -O "$MODEL_PATH" "$MODEL_URL" 2>/var/log/hyve/model-download.log
             fi
+            # Verify model checksum (pinned hash)
+            EXPECTED_HASH="${HYVE_DEFAULT_MODEL_HASH:-}"
+            if [[ -n "$EXPECTED_HASH" && -f "$MODEL_PATH" ]]; then
+                ACTUAL_HASH=$(sha256sum "$MODEL_PATH" | cut -d' ' -f1)
+                if [[ "$ACTUAL_HASH" != "$EXPECTED_HASH" ]]; then
+                    echo "[HyveOS] MODEL CHECKSUM FAILED: expected=$EXPECTED_HASH actual=$ACTUAL_HASH" >> /var/log/hyve/first-boot.log
+                    rm -f "$MODEL_PATH"
+                    echo "[HyveOS] Corrupted model removed" >> /var/log/hyve/first-boot.log
+                fi
+            fi
             if [[ -f "$MODEL_PATH" && -s "$MODEL_PATH" ]]; then
                 chown hyve:hyve "$MODEL_PATH"
                 echo "[HyveOS] Default model downloaded: $MODEL_PATH" >> /var/log/hyve/first-boot.log
@@ -164,6 +180,14 @@ if [[ "$TIER" == "COMPUTE_HOST" ]]; then
         ) &
         echo "  Model download started in background (see /var/log/hyve/model-download.log)"
     fi
+fi
+
+# Edge variant forces minimal services regardless of tier
+if [[ "$VARIANT" == "edge" ]]; then
+    systemctl disable hyve-agent-daemon.service 2>/dev/null || true
+    systemctl disable hyve-vision.service 2>/dev/null || true
+    systemctl disable hyve-llm.service 2>/dev/null || true
+    echo "  Edge variant override: minimal services only"
 fi
 
 # ─── Step 4: Initialize database ───
@@ -194,6 +218,11 @@ for i in $(seq 1 20); do
     fi
     sleep 2
 done
+
+# ─── Boot Audit ───
+if [[ -x "$INSTALL_DIR/deploy/distro/first-boot/hyve-boot-audit.sh" ]]; then
+    bash "$INSTALL_DIR/deploy/distro/first-boot/hyve-boot-audit.sh" "$NODE_ID" "$TIER"
+fi
 
 # ─── Mark completion ───
 touch "$MARKER"

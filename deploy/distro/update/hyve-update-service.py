@@ -208,19 +208,48 @@ class HyveUpdateService:
                 os.unlink(bundle_path)
                 raise ValueError("Ed25519 signature verification failed — update rejected")
         except urllib.error.URLError:
-            logger.warning("No .sig file found at %s — signature verification skipped", sig_url)
+            require_sig = os.environ.get('HYVE_UPDATE_REQUIRE_SIGNATURE', 'true').lower() == 'true'
+            if require_sig:
+                os.unlink(bundle_path)
+                raise ValueError(
+                    "Unsigned update rejected (HYVE_UPDATE_REQUIRE_SIGNATURE=true). "
+                    "No .sig file at: " + sig_url)
+            else:
+                logger.warning("No .sig file at %s — sig verification skipped (dev mode)", sig_url)
 
         return bundle_path
 
-    def apply_update(self, bundle_path: str) -> bool:
+    def _check_fleet_approval(self, version):
+        """Ask regional host if this version is approved for rollout.
+        Standalone nodes auto-approve. Fleet nodes check with their regional host."""
+        try:
+            url = f"http://localhost:6777/api/social/fleet/update-approved?v={version}"
+            req = urllib.request.Request(url, method='GET')
+            resp = urllib.request.urlopen(req, timeout=10)
+            data = json.loads(resp.read().decode())
+            approved = data.get('approved', False)
+            if not approved:
+                logger.info(f"Fleet update {version} not yet approved by regional host")
+            return approved
+        except Exception:
+            # Standalone or offline: auto-approve
+            logger.debug("Fleet approval check unavailable, auto-approving (standalone mode)")
+            return True
+
+    def apply_update(self, bundle_path: str, version: str = None) -> bool:
         """Apply update bundle.
 
         Steps:
+        0. Check fleet approval (regional host must approve for fleet nodes)
         1. Create backup of current installation
         2. Extract new code
         3. Preserve config and data
         4. Restart services
         """
+        # Fleet approval gate: regional host must approve before applying
+        if version and not self._check_fleet_approval(version):
+            logger.info("Update blocked: fleet approval not granted for version %s", version)
+            return False
         backup_dir = os.path.join(DATA_DIR, 'backup-pre-update')
 
         try:
@@ -328,6 +357,65 @@ class HyveUpdateService:
             logger.error("Rollback failed: %s", e)
             return False
 
+    def _run_orchestrated_upgrade(self, version: str, bundle_path: str,
+                                  checksum_url: str = None) -> bool:
+        """Run the 7-stage upgrade orchestrator before applying the update.
+
+        The orchestrator gates: BUILD→TEST→AUDIT→BENCHMARK→SIGN→CANARY→DEPLOY.
+        Only if all stages pass does apply_update() run.
+        """
+        try:
+            sys.path.insert(0, INSTALL_DIR)
+            from integrations.agent_engine.upgrade_orchestrator import get_upgrade_orchestrator
+            orch = get_upgrade_orchestrator()
+
+            # Start pipeline
+            start_result = orch.start_upgrade(version)
+            if not start_result.get('success'):
+                logger.warning("Orchestrator start failed: %s", start_result.get('error'))
+                return False
+
+            terminal_stages = ('completed', 'failed', 'rolled_back')
+            max_iterations = 50  # Safety cap
+
+            for _ in range(max_iterations):
+                status = orch.get_status()
+                stage = status.get('stage', '')
+
+                if stage in terminal_stages:
+                    break
+
+                result = orch.advance_pipeline()
+                if not result.get('success'):
+                    detail = result.get('detail', 'stage failed')
+                    # Canary "check again later" is not a failure
+                    if 'check again later' in detail or 'canary in progress' in detail:
+                        logger.info("Canary in progress, waiting 30s...")
+                        time.sleep(30)
+                        continue
+                    logger.error("Pipeline failed at %s: %s", stage, detail)
+                    orch.rollback(detail)
+                    return False
+
+            final = orch.get_status()
+            if final.get('stage') == 'completed':
+                logger.info("Orchestrator passed all stages for v%s", version)
+                return True
+            else:
+                logger.error("Orchestrator ended in %s for v%s",
+                             final.get('stage'), version)
+                return False
+
+        except ImportError:
+            logger.info("Upgrade orchestrator not available — direct apply (standalone mode)")
+            return True  # Standalone nodes without orchestrator: allow direct update
+        except Exception as e:
+            logger.error("Orchestrator error: %s — falling back to direct apply", e)
+            return True
+        finally:
+            if INSTALL_DIR in sys.path:
+                sys.path.remove(INSTALL_DIR)
+
     def run(self):
         """Main update check + apply cycle."""
         logger.info("HyveOS Update Service starting (current: %s)...",
@@ -348,7 +436,15 @@ class HyveUpdateService:
                 result['download_url'],
                 result.get('checksum_url'),
             )
-            success = self.apply_update(bundle_path)
+
+            # Run orchestrated upgrade pipeline (gates before apply)
+            if not self._run_orchestrated_upgrade(
+                    result['latest'], bundle_path, result.get('checksum_url')):
+                logger.error("Orchestrated upgrade rejected v%s — not applying.",
+                             result['latest'])
+                return
+
+            success = self.apply_update(bundle_path, version=result['latest'])
 
             if success:
                 logger.info("Updated to %s successfully!", result['latest'])

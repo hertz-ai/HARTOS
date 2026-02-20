@@ -17,6 +17,7 @@ import io
 import json
 import logging
 import os
+import re
 import socket
 import tarfile
 import tempfile
@@ -47,14 +48,29 @@ MIN_DISK_GB = 10
 SUPPORTED_OS = ['ubuntu', 'debian']
 
 
+_HOSTNAME_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9._-]{0,254}$')
+_USERNAME_RE = re.compile(r'^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,31}$')
+
+
 class NetworkProvisioner:
     """SSH-based remote HyveOS installation and management."""
+
+    @staticmethod
+    def _validate_params(target_host: str, ssh_user: str, backend_port: int = 6777):
+        """Validate provisioning parameters to prevent command injection."""
+        if not _HOSTNAME_RE.match(target_host):
+            raise ValueError(f"Invalid target_host: {target_host!r} — must be FQDN or IPv4")
+        if not _USERNAME_RE.match(ssh_user):
+            raise ValueError(f"Invalid ssh_user: {ssh_user!r} — alphanumeric + underscore only")
+        if not (1 <= int(backend_port) <= 65535):
+            raise ValueError(f"Invalid backend_port: {backend_port} — must be 1-65535")
 
     @staticmethod
     def _get_ssh_client(target_host: str, ssh_user: str = 'root',
                         ssh_key_path: str = None,
                         ssh_password: str = None,
-                        timeout: int = 15) -> 'paramiko.SSHClient':
+                        timeout: int = 15,
+                        **kwargs) -> 'paramiko.SSHClient':
         """Create and connect an SSH client."""
         if not PARAMIKO_AVAILABLE:
             raise RuntimeError("paramiko not installed. Run: pip install paramiko")
@@ -65,14 +81,16 @@ class NetworkProvisioner:
         known_hosts_path = os.path.expanduser('~/.ssh/known_hosts')
         if os.path.exists(known_hosts_path):
             client.load_host_keys(known_hosts_path)
-            # Warn+add if unknown, but log it (safer than silent AutoAdd)
-            client.set_missing_host_key_policy(paramiko.WarningPolicy())
+
+        # Strict mode rejects unknown hosts; default adds with warning
+        strict_host_key = kwargs.pop('strict_host_key', False)
+        if strict_host_key:
+            client.set_missing_host_key_policy(paramiko.RejectPolicy())
+            logger.info("SSH strict host key: unknown hosts will be REJECTED for %s", target_host)
         else:
-            # No known_hosts file — warn but allow connection
-            logger.warning("No known_hosts file found — accepting host key for %s. "
-                           "Consider running: ssh-keyscan %s >> ~/.ssh/known_hosts",
-                           target_host, target_host)
-            client.set_missing_host_key_policy(paramiko.WarningPolicy())
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            logger.warning("SSH auto-add: accepting host key for %s (add to known_hosts for production)",
+                           target_host)
 
         connect_kwargs = {
             'hostname': target_host,
@@ -246,6 +264,9 @@ class NetworkProvisioner:
         """
         if not PARAMIKO_AVAILABLE:
             return {'success': False, 'error': 'paramiko not installed'}
+
+        # Validate inputs to prevent command injection
+        NetworkProvisioner._validate_params(target_host, ssh_user, backend_port)
 
         # Step 1: Preflight
         logger.info("Provisioning %s@%s — running preflight checks...",

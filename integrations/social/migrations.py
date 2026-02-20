@@ -49,12 +49,12 @@ def run_migrations():
         with engine.connect() as conn:
             try:
                 conn.execute(text("ALTER TABLE users ADD COLUMN handle VARCHAR(30) UNIQUE"))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("v2 migration: ADD COLUMN handle skipped (may already exist): %s", e)
             try:
                 conn.execute(text("ALTER TABLE users ADD COLUMN local_name VARCHAR(35)"))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("v2 migration: ADD COLUMN local_name skipped (may already exist): %s", e)
             conn.commit()
         set_schema_version(engine, 2)
 
@@ -75,8 +75,8 @@ def run_migrations():
             ]:
                 try:
                     conn.execute(text(stmt))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("v3 migration: %s skipped: %s", stmt.split("ADD COLUMN ")[-1].split()[0], e)
             conn.commit()
         # Bootstrap existing users: create wallets
         from .models import get_db, User
@@ -128,8 +128,8 @@ def run_migrations():
             ]:
                 try:
                     conn.execute(text(stmt))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("v5 migration: %s skipped: %s", stmt.split("ADD COLUMN ")[-1].split()[0], e)
             conn.commit()
         set_schema_version(engine, 5)
 
@@ -163,8 +163,8 @@ def run_migrations():
             ]:
                 try:
                     conn.execute(text(stmt))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("v8 migration: %s skipped: %s", stmt.split("ADD COLUMN ")[-1].split()[0], e)
             conn.commit()
         set_schema_version(engine, 8)
 
@@ -184,8 +184,8 @@ def run_migrations():
             ]:
                 try:
                     conn.execute(text(stmt))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("v9 migration: %s skipped: %s", stmt.split("ADD COLUMN ")[-1].split()[0], e)
             conn.commit()
         set_schema_version(engine, 9)
 
@@ -200,8 +200,8 @@ def run_migrations():
             try:
                 conn.execute(text(
                     "ALTER TABLE peer_nodes ADD COLUMN node_operator_id VARCHAR(64) REFERENCES users(id)"))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("v10 migration: ADD COLUMN node_operator_id skipped: %s", e)
             conn.commit()
         # Backfill contribution_score for existing active nodes
         from .models import get_db, PeerNode
@@ -261,8 +261,8 @@ def run_migrations():
             ]:
                 try:
                     conn.execute(text(stmt))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("v11 migration: %s skipped: %s", stmt.split("ADD COLUMN ")[-1].split()[0], e)
             conn.commit()
         set_schema_version(engine, 11)
 
@@ -275,8 +275,8 @@ def run_migrations():
             ]:
                 try:
                     conn.execute(text(stmt))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("v12 migration: %s skipped: %s", stmt.split("ADD COLUMN ")[-1].split()[0], e)
             conn.commit()
         set_schema_version(engine, 12)
 
@@ -302,8 +302,8 @@ def run_migrations():
             ]:
                 try:
                     conn.execute(text(stmt))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("v13 migration: %s skipped: %s", stmt.split("ADD COLUMN ")[-1].split()[0], e)
             # Add hierarchy columns to regions
             for stmt in [
                 "ALTER TABLE regions ADD COLUMN host_node_id VARCHAR(64)",
@@ -316,8 +316,8 @@ def run_migrations():
             ]:
                 try:
                     conn.execute(text(stmt))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("v13 migration: %s skipped: %s", stmt.split("ADD COLUMN ")[-1].split()[0], e)
             conn.commit()
         set_schema_version(engine, 13)
 
@@ -329,8 +329,8 @@ def run_migrations():
         with engine.connect() as conn:
             try:
                 conn.execute(text("ALTER TABLE users ADD COLUMN idle_compute_opt_in BOOLEAN DEFAULT 0"))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("v14 migration: ADD COLUMN idle_compute_opt_in skipped: %s", e)
             conn.commit()
         set_schema_version(engine, 14)
 
@@ -339,15 +339,15 @@ def run_migrations():
         with engine.connect() as conn:
             try:
                 conn.execute(text("ALTER TABLE users ADD COLUMN role VARCHAR(20) DEFAULT 'flat'"))
-            except Exception:
-                pass  # Column may already exist
+            except Exception as e:
+                logger.warning("v15 migration: ADD COLUMN role skipped (may already exist): %s", e)
             # Backfill: is_admin -> central, is_moderator (non-admin) -> regional, NULL -> flat
             try:
                 conn.execute(text("UPDATE users SET role = 'central' WHERE is_admin = 1"))
                 conn.execute(text("UPDATE users SET role = 'regional' WHERE is_moderator = 1 AND is_admin = 0"))
                 conn.execute(text("UPDATE users SET role = 'flat' WHERE role IS NULL"))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error("v15 migration: role backfill failed: %s", e)
             conn.commit()
         set_schema_version(engine, 15)
 
@@ -356,12 +356,12 @@ def run_migrations():
         with engine.connect() as conn:
             try:
                 conn.execute(text("ALTER TABLE posts ADD COLUMN is_hidden BOOLEAN DEFAULT 0"))
-            except Exception:
-                pass  # Column may already exist
+            except Exception as e:
+                logger.warning("v16 migration: ADD COLUMN posts.is_hidden skipped (may already exist): %s", e)
             try:
                 conn.execute(text("ALTER TABLE comments ADD COLUMN is_hidden BOOLEAN DEFAULT 0"))
-            except Exception:
-                pass  # Column may already exist
+            except Exception as e:
+                logger.warning("v16 migration: ADD COLUMN comments.is_hidden skipped (may already exist): %s", e)
             conn.commit()
         set_schema_version(engine, 16)
 
@@ -377,8 +377,8 @@ def run_migrations():
             ]:
                 try:
                     conn.execute(text(stmt))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("v17 migration: rename skipped: %s — %s", stmt[:60], e)
             conn.commit()
         set_schema_version(engine, 17)
 
@@ -408,8 +408,8 @@ def run_migrations():
             ]:
                 try:
                     conn.execute(text(stmt))
-                except Exception:
-                    pass  # Column may already exist
+                except Exception as e:
+                    logger.warning("v20 migration: %s skipped (may already exist): %s", stmt.split("ADD COLUMN ")[-1].split()[0], e)
             conn.commit()
         set_schema_version(engine, 20)
 
@@ -422,8 +422,8 @@ def run_migrations():
             ]:
                 try:
                     conn.execute(text(stmt))
-                except Exception:
-                    pass  # Column may already exist
+                except Exception as e:
+                    logger.warning("v21 migration: %s skipped (may already exist): %s", stmt.split("ADD COLUMN ")[-1].split()[0], e)
             conn.commit()
         set_schema_version(engine, 21)
 
@@ -444,8 +444,8 @@ def run_migrations():
             ]:
                 try:
                     conn.execute(text(stmt))
-                except Exception:
-                    pass  # Column may already exist
+                except Exception as e:
+                    logger.warning("v23 migration: %s skipped (may already exist): %s", stmt.split("ADD COLUMN ")[-1].split()[0], e)
             conn.commit()
         set_schema_version(engine, 23)
 
@@ -477,8 +477,8 @@ def run_migrations():
             ]:
                 try:
                     conn.execute(text(stmt))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("v27 migration: %s skipped: %s", stmt.split("ADD COLUMN ")[-1].split()[0], e)
             conn.commit()
         set_schema_version(engine, 27)
 
@@ -493,8 +493,8 @@ def run_migrations():
             ]:
                 try:
                     conn.execute(text(stmt))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("v28 migration: %s skipped: %s", stmt.split("ADD COLUMN ")[-1].split()[0], e)
             conn.commit()
         set_schema_version(engine, 28)
 
@@ -519,19 +519,19 @@ def run_migrations():
                         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                     )
                 """))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("v29 migration: CREATE TABLE provisioned_nodes skipped: %s", e)
             try:
                 conn.execute(text(
                     "CREATE INDEX IF NOT EXISTS ix_provisioned_nodes_target_host "
                     "ON provisioned_nodes (target_host)"))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("v29 migration: CREATE INDEX target_host skipped: %s", e)
             try:
                 conn.execute(text(
                     "CREATE INDEX IF NOT EXISTS ix_provisioned_nodes_status "
                     "ON provisioned_nodes (status)"))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("v29 migration: CREATE INDEX status skipped: %s", e)
             conn.commit()
         set_schema_version(engine, 29)

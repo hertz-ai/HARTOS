@@ -14,6 +14,17 @@ ExecStart=/opt/hyve/venv/bin/python /opt/hyve/deploy/linux/dbus/hyve_dbus_servic
 Restart=on-failure
 RestartSec=5
 
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+MemoryDenyWriteExecute=no
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+
 # Logging
 StandardOutput=journal
 StandardError=journal

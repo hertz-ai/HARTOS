@@ -18,7 +18,12 @@ Base = declarative_base()
 try:
     from security.sanitize import sanitize_html as _sanitize_html
 except ImportError:
-    _sanitize_html = lambda x: x  # No-op fallback
+    import html as _html_module
+    def _sanitize_html(text):
+        """Minimal fallback: escape HTML entities to prevent XSS."""
+        if not isinstance(text, str):
+            return text
+        return _html_module.escape(text)
 
 # Unified DB path: HEVOLVE_DB_PATH (preferred) or SOCIAL_DB_PATH (backward compat)
 _DB_PATH_ENV = os.environ.get('HEVOLVE_DB_PATH') or os.environ.get('SOCIAL_DB_PATH')
@@ -268,6 +273,7 @@ class Post(Base):
             'hypothesis': self.hypothesis,
             'expected_outcome': self.expected_outcome,
             'is_thought_experiment': self.is_thought_experiment or False,
+            'is_hidden': self.is_hidden or False,
             'dynamic_layout': self.dynamic_layout,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
@@ -309,6 +315,7 @@ class Comment(Base):
             'upvotes': self.upvotes, 'downvotes': self.downvotes,
             'score': self.score, 'depth': self.depth,
             'is_deleted': self.is_deleted,
+            'is_hidden': self.is_hidden or False,
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
         if include_author and self.author:

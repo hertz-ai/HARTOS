@@ -12,7 +12,13 @@ import logging
 
 logger = logging.getLogger('hevolve_core')
 
-AGENT_DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'agent_data')
+def _resolve_agent_data_dir():
+    db_path = os.environ.get('HEVOLVE_DB_PATH', '')
+    if db_path and db_path != ':memory:' and os.path.isabs(db_path):
+        return os.path.join(os.path.dirname(db_path), 'agent_data')
+    return os.path.join(os.path.dirname(os.path.dirname(__file__)), 'agent_data')
+
+AGENT_DATA_DIR = _resolve_agent_data_dir()
 PROMPTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'prompts')
 
 

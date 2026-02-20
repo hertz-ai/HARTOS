@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 import time
 import uuid
 from datetime import datetime
@@ -152,7 +153,7 @@ class AdminAPI:
             logger.warning("Failed to load admin config: %s", e)
 
     def _save_config(self) -> None:
-        """Save configuration to file."""
+        """Save configuration to file using atomic write (temp + rename)."""
         config_path = os.path.join(
             os.path.dirname(__file__),
             "..",
@@ -162,9 +163,17 @@ class AdminAPI:
             "admin_config.json"
         )
         try:
-            os.makedirs(os.path.dirname(config_path), exist_ok=True)
-            with open(config_path, "w") as f:
-                json.dump(self._config, f, indent=2, default=str)
+            config_dir = os.path.dirname(config_path)
+            os.makedirs(config_dir, exist_ok=True)
+            # Write to temp file first, then atomic rename to prevent corruption
+            fd, tmp_path = tempfile.mkstemp(dir=config_dir, suffix='.tmp')
+            try:
+                with os.fdopen(fd, 'w') as f:
+                    json.dump(self._config, f, indent=2, default=str)
+                os.replace(tmp_path, config_path)  # atomic rename
+            except:
+                os.unlink(tmp_path)
+                raise
             logger.info("Saved admin configuration to %s", config_path)
         except Exception as e:
             logger.warning("Failed to save admin config: %s", e)

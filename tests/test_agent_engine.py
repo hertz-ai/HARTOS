@@ -1656,7 +1656,8 @@ class TestWorldModelBridge:
             })
         bridge = WorldModelBridge()
         bridge._api_url = 'http://localhost:8000'
-        result = bridge.query_hivemind('What is in this image?', timeout_ms=2000)
+        with patch.object(bridge, '_check_cct_access', return_value=True):
+            result = bridge.query_hivemind('What is in this image?', timeout_ms=2000)
         assert result is not None
         assert 'contributing_agents' in result
         call_args = mock_post.call_args
@@ -1724,12 +1725,13 @@ class TestWorldModelBridge:
         from security.hive_guardrails import _ralt_export_log
         _ralt_export_log.clear()
         bridge = WorldModelBridge()
-        result = bridge.distribute_skill_packet({
-            'source_integrity_status': 'verified',
-            'description': 'new skill',
-            'category': 'normal',
-            'witness_count': 0,  # Below minimum
-        }, node_id='n1')
+        with patch.object(bridge, '_check_cct_access', return_value=True):
+            result = bridge.distribute_skill_packet({
+                'source_integrity_status': 'verified',
+                'description': 'new skill',
+                'category': 'normal',
+                'witness_count': 0,  # Below minimum
+            }, node_id='n1')
         assert result['success'] is False
         assert 'witness' in result['reason'].lower()
 

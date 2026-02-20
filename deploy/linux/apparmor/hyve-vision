@@ -1,0 +1,24 @@
+#include <tunables/global>
+
+/opt/hyve/venv/bin/python {
+  #include <abstractions/base>
+  #include <abstractions/python>
+
+  /opt/hyve/** r,
+  /opt/hyve/venv/bin/python ix,
+  /opt/hyve/models/** r,
+  /var/log/hyve/** w,
+  /etc/hyve/** r,
+
+  # GPU access
+  /dev/video* rw,
+  /dev/dri/** rw,
+  /dev/nvidia* rw,
+  /sys/class/drm/** r,
+
+  network inet stream,
+
+  deny /etc/shadow r,
+  deny /root/** rw,
+  deny /var/lib/hyve/node_private.key r,
+}

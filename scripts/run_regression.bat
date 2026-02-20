@@ -2,7 +2,7 @@
 REM ============================================================
 REM HevolveBot — Master Regression Test Runner
 REM ============================================================
-REM Runs ALL 2263 unit/integration tests across the codebase.
+REM Runs ALL 2700+ unit/integration tests across the codebase.
 REM
 REM Test groups:
 REM   P2P & Security       ~722 tests  (hierarchy, integrity, agent engine, etc.)
@@ -15,6 +15,7 @@ REM   Session & Messaging    ~90 tests  (session, queue, streaming, preferences)
 REM   Tools & AI            ~250 tests  (VLM, coding, embeddings, TTS, vision)
 REM   Core & Performance    ~150 tests  (core perf, naming, state, concurrency)
 REM   Integration            ~50 tests  (integration, redis ledger)
+REM   Distro & Hardening   ~469 tests  (distro configs, PXE, OTA, provisioner, security)
 REM
 REM Standalone scripts (not included — run directly with python):
 REM   test_nested_task_system.py, test_nested_tasks.py,
@@ -52,7 +53,7 @@ chcp 65001 >nul 2>&1
 
 REM ===== DEFINE TEST GROUPS =====
 
-REM Group 1: P2P Network, Security, Agent Engine (~800+ tests)
+REM Group 1: P2P Network, Security, Agent Engine (~860+ tests)
 set P2P_SECURITY_TESTS=^
     tests/test_hierarchy_system.py ^
     tests/test_integrity_system.py ^
@@ -68,7 +69,8 @@ set P2P_SECURITY_TESTS=^
     tests/test_mode_aware_inference.py ^
     tests/test_system_requirements.py ^
     tests/test_commercial_ip_builds.py ^
-    tests/test_federation_upgrade.py
+    tests/test_federation_upgrade.py ^
+    tests/test_continual_learner_gate.py
 
 REM Group 2: Social Platform (~148 tests)
 set SOCIAL_TESTS=^
@@ -155,9 +157,19 @@ set INTEGRATION_TESTS=^
     tests/test_integration.py ^
     tests/test_redis_ledger.py
 
+REM Group 11: Distro, Security Hardening, Deployment (~469 tests)
+set DISTRO_TESTS=^
+    tests/test_distro_configs.py ^
+    tests/test_distro_tools.py ^
+    tests/test_pxe_server.py ^
+    tests/test_ota_update.py ^
+    tests/test_network_provisioner.py ^
+    tests/test_security_hardening_distro.py ^
+    tests/test_deployment_modes.py
+
 echo Select regression scope:
 echo.
-echo   1. FULL regression (all 2263 tests)
+echo   1. FULL regression (all 2700+ tests)
 echo   2. P2P Network + Security (722 tests - core infrastructure)
 echo   3. Social Platform (148 tests)
 echo   4. All Channels (infra + adapters + e2e)
@@ -165,9 +177,10 @@ echo   5. Agent + Recipe Pipeline
 echo   6. Tools + AI (VLM, embeddings, TTS, vision)
 echo   7. Quick smoke (P2P security only - fastest)
 echo   8. Custom pytest pattern
+echo   9. Distro + Security Hardening (469 tests)
 echo.
 
-set /p choice="Enter choice (1-8): "
+set /p choice="Enter choice (1-9): "
 
 if "%choice%"=="1" (
     echo.
@@ -236,6 +249,13 @@ if "%choice%"=="1" (
     set /p pattern="Enter pytest pattern (e.g. tests/test_file.py -k test_name): "
     echo Running custom pattern...
     "%PYTHON_EXE%" -m pytest %pattern% --tb=short --color=yes
+) else if "%choice%"=="9" (
+    echo.
+    echo Running Distro + Security Hardening [~469 tests]...
+    echo ========================================
+    "%PYTHON_EXE%" -m pytest ^
+        %DISTRO_TESTS% ^
+        --tb=short --color=yes -q
 ) else (
     echo Invalid choice
     pause

@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=root
+User=hyve
 ExecStart=/opt/hyve/venv/bin/python /opt/hyve/deploy/distro/update/hyve-update-service.py
 StandardOutput=journal
 StandardError=journal

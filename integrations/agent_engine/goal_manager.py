@@ -891,3 +891,67 @@ register_goal_type('thought_experiment', _build_thought_experiment_prompt,
                    tool_tags=['web_search', 'code_analysis'])
 register_goal_type('news', _build_news_prompt, tool_tags=['news', 'feed_management'])
 register_goal_type('provision', _build_provision_prompt, tool_tags=['provision'])
+
+
+def _build_content_gen_prompt(goal_dict, product_dict=None):
+    """Build prompt for content generation monitor agent."""
+    config = goal_dict.get('config_json', {})
+    game_id = config.get('game_id', 'unknown')
+    game_title = config.get('game_title', game_id)
+    media_reqs = config.get('media_requirements', {})
+    task_jobs = config.get('task_jobs', {})
+
+    tasks_summary = []
+    for media_type, job_info in task_jobs.items():
+        status = job_info.get('status', 'pending')
+        progress = job_info.get('progress', 0)
+        tasks_summary.append(f"  - {media_type}: {status} ({progress}%)")
+
+    tasks_text = '\n'.join(tasks_summary) if tasks_summary else '  No tasks started yet'
+
+    return (
+        f"You are a content generation monitor for the kids learning game "
+        f"'{game_title}' (ID: {game_id}).\n\n"
+        f"MEDIA REQUIREMENTS:\n"
+        f"  Images: {media_reqs.get('images', 0)}\n"
+        f"  TTS: {media_reqs.get('tts', 0)}\n"
+        f"  Music: {media_reqs.get('music', 0)}\n"
+        f"  Video: {media_reqs.get('video', 0)}\n\n"
+        f"CURRENT TASK STATUS:\n{tasks_text}\n\n"
+        f"YOUR JOB:\n"
+        f"1. Check the status of all media generation tasks\n"
+        f"2. For stuck tasks: check if the service is running, retry if needed\n"
+        f"3. For failed tasks: restart the service and retry\n"
+        f"4. Report progress percentage and any blockers\n"
+        f"5. If a service cannot start, mark the task as deferred and report why\n"
+    )
+
+
+register_goal_type('content_gen', _build_content_gen_prompt,
+                   tool_tags=['content_gen'])
+
+
+def _build_learning_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
+    """Build a /chat prompt for a continual learning coordination goal."""
+    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    return (
+        f"YOU ARE A CONTINUAL LEARNING COORDINATOR AGENT for the Hyve platform.\n\n"
+        f"Goal: {goal_dict.get('title', '')}\n"
+        f"Description: {goal_dict.get('description', '')}\n\n"
+        f"YOUR RESPONSIBILITIES:\n"
+        f"1. Check learning pipeline health with check_learning_health\n"
+        f"2. Verify compute contributions with verify_compute_contribution\n"
+        f"3. Issue/renew CCTs for eligible nodes with issue_cct\n"
+        f"4. Monitor learning access tiers with get_learning_tier_stats\n"
+        f"5. Distribute skill packets to eligible nodes with distribute_learning_skill\n"
+        f"6. Check individual node status with get_node_learning_status\n\n"
+        f"CONTEXT:\n"
+        f"The continual learner is the incentive. People who contribute compute\n"
+        f"to help train the model earn access to the learned intelligence.\n"
+        f"No contribution = no learning. Intelligence is earned, not given.\n"
+        f"90% of value flows back to contributors.\n\n"
+        f"Config: {json.dumps(config)}\n"
+    )
+
+
+register_goal_type('learning', _build_learning_prompt, tool_tags=['learning'])

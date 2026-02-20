@@ -12,9 +12,12 @@ from flask import request, g, jsonify
 class TokenBucket:
     """Thread-safe in-memory token bucket rate limiter."""
 
+    _CLEANUP_INTERVAL = 100  # Run cleanup every 100 calls
+
     def __init__(self):
         self._buckets = {}  # key -> (tokens, last_refill)
         self._lock = threading.Lock()
+        self._cleanup_counter = 0
 
     def _get_key(self, user_id: str, action: str) -> str:
         return f"{user_id}:{action}"
@@ -24,6 +27,11 @@ class TokenBucket:
         Check if action is allowed. Returns True if allowed, False if rate-limited.
         refill_rate = tokens added per second.
         """
+        self._cleanup_counter += 1
+        if self._cleanup_counter >= self._CLEANUP_INTERVAL:
+            self._cleanup_counter = 0
+            self.cleanup()
+
         key = self._get_key(user_id, action)
         now = time.time()
 

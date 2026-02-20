@@ -12,6 +12,7 @@ Tests every pipeline that will face the real world:
 6. Full boot: init_agent_engine() → all bootstrap goals seeded
 7. Provenance chain: publications + patents → complete evidence
 8. Coding dispatch constitutional review gate
+9. CCT lifecycle: tier → issue → validate → gate → renew → revoke → degrade
 """
 import os
 import sys
@@ -32,6 +33,7 @@ from sqlalchemy.orm import sessionmaker
 from integrations.social.models import (
     Base, User, AgentGoal, Product, DefensivePublication,
     CommercialAPIKey, APIUsageLog, BuildLicense,
+    PeerNode, NodeAttestation, ResonanceWallet,
 )
 
 
@@ -688,3 +690,398 @@ class TestSchemaIntegrity:
         """Bootstrap goals defined (>= 9 original + new goal types)."""
         from integrations.agent_engine.goal_seeding import SEED_BOOTSTRAP_GOALS
         assert len(SEED_BOOTSTRAP_GOALS) >= 9
+
+
+# ═══════════════════════════════════════════════════════════════
+# 11. CCT Lifecycle — Continual Learning Incentive Pipeline
+# ═══════════════════════════════════════════════════════════════
+
+class TestCCTLifecycle:
+    """E2E: tier compute → issue CCT → validate → gate access → renew → revoke → degrade."""
+
+    @patch('security.node_integrity.sign_json_payload',
+           return_value='a1' * 64)
+    @patch('security.node_integrity.get_public_key_hex',
+           return_value='b2' * 32)
+    @patch('security.node_integrity.get_node_identity',
+           return_value={'node_id': 'e2e_issuer'})
+    def test_full_cct_lifecycle(self, mock_id, mock_pub, mock_sign, db):
+        """Full cycle: eligible node → issue → validate → revoke → invalid."""
+        from integrations.agent_engine.continual_learner_gate import (
+            ContinualLearnerGateService)
+
+        # Step 1: Create a compute contributor node
+        peer = PeerNode(
+            node_id='e2e_cct_node', url='http://e2e:6777',
+            status='active', contribution_score=250.0,
+            integrity_status='verified', capability_tier='full',
+        )
+        db.add(peer)
+        db.flush()
+
+        # Step 2: Compute tier — should be 'full'
+        tier_info = ContinualLearnerGateService.compute_learning_tier(
+            db, 'e2e_cct_node')
+        assert tier_info['tier'] == 'full'
+        assert tier_info['eligible']
+        assert 'manifold_credit' in tier_info['capabilities']
+        assert 'meta_learning' in tier_info['capabilities']
+
+        # Step 3: Issue CCT
+        cct_result = ContinualLearnerGateService.issue_cct(
+            db, 'e2e_cct_node')
+        assert cct_result is not None
+        assert cct_result['tier'] == 'full'
+        cct_token = cct_result['cct']
+        assert '.' in cct_token
+
+        # Step 4: Validate — should be valid
+        with patch('security.node_integrity.verify_json_signature',
+                   return_value=True):
+            validation = ContinualLearnerGateService.validate_cct(
+                cct_token, 'e2e_cct_node')
+        assert validation['valid']
+        assert validation['tier'] == 'full'
+
+        # Step 5: Check capabilities
+        with patch('security.node_integrity.verify_json_signature',
+                   return_value=True):
+            assert ContinualLearnerGateService.check_cct_capability(
+                cct_token, 'manifold_credit', 'e2e_cct_node')
+            assert not ContinualLearnerGateService.check_cct_capability(
+                cct_token, 'skill_distribution', 'e2e_cct_node')
+
+        # Step 6: Attestation recorded in DB
+        att = db.query(NodeAttestation).filter_by(
+            subject_node_id='e2e_cct_node',
+            attestation_type='cct_issued',
+        ).first()
+        assert att is not None
+        assert att.is_valid is True
+        assert att.payload_json['tier'] == 'full'
+
+        # Step 7: Revoke — invalidates attestation
+        revoke = ContinualLearnerGateService.revoke_cct(
+            db, 'e2e_cct_node', 'e2e_test')
+        assert revoke['success']
+        assert revoke['revoked_count'] >= 1
+
+        # Step 8: Attestation is now invalid
+        att_after = db.query(NodeAttestation).filter_by(
+            subject_node_id='e2e_cct_node',
+            attestation_type='cct_issued',
+        ).first()
+        assert att_after.is_valid is False
+
+    def test_ineligible_node_denied(self, db):
+        """Node with low score and unverified status — no CCT."""
+        from integrations.agent_engine.continual_learner_gate import (
+            ContinualLearnerGateService)
+
+        observer = PeerNode(
+            node_id='e2e_observer', url='http://obs:6777',
+            status='active', contribution_score=10.0,
+            integrity_status='unverified', capability_tier='observer',
+        )
+        db.add(observer)
+        db.flush()
+
+        tier_info = ContinualLearnerGateService.compute_learning_tier(
+            db, 'e2e_observer')
+        assert tier_info['tier'] == 'none'
+        assert not tier_info['eligible']
+
+        result = ContinualLearnerGateService.issue_cct(db, 'e2e_observer')
+        assert result is None
+
+    @patch('security.node_integrity.sign_json_payload',
+           return_value='c3' * 64)
+    @patch('security.node_integrity.get_public_key_hex',
+           return_value='b2' * 32)
+    @patch('security.node_integrity.get_node_identity',
+           return_value={'node_id': 'e2e_issuer'})
+    def test_tier_progression(self, mock_id, mock_pub, mock_sign, db):
+        """Score increase → tier upgrade on next CCT issuance."""
+        from integrations.agent_engine.continual_learner_gate import (
+            ContinualLearnerGateService)
+
+        # Start at basic tier
+        peer = PeerNode(
+            node_id='e2e_progress', url='http://prog:6777',
+            status='active', contribution_score=60.0,
+            integrity_status='verified', capability_tier='standard',
+        )
+        db.add(peer)
+        db.flush()
+
+        cct1 = ContinualLearnerGateService.issue_cct(db, 'e2e_progress')
+        assert cct1['tier'] == 'basic'
+        assert len(cct1['capabilities']) == 1
+
+        # Upgrade: score rises + hardware upgrade
+        peer.contribution_score = 550.0
+        peer.capability_tier = 'compute_host'
+        db.flush()
+
+        cct2 = ContinualLearnerGateService.issue_cct(db, 'e2e_progress')
+        assert cct2['tier'] == 'host'
+        assert len(cct2['capabilities']) == 6
+
+
+class TestCCTWorldModelIntegration:
+    """E2E: CCT gating on WorldModelBridge — real bridge, real gate logic."""
+
+    def test_distribute_blocked_then_allowed(self):
+        """distribute_skill_packet blocked without CCT, passes with valid CCT."""
+        from integrations.agent_engine.world_model_bridge import WorldModelBridge
+
+        bridge = WorldModelBridge()
+
+        # Without CCT → blocked
+        with patch.object(bridge, '_check_cct_access', return_value=False):
+            result = bridge.distribute_skill_packet(
+                {'description': 'test'}, 'e2e_node')
+        assert not result['success']
+        assert result['reason'] == 'no_cct_skill_distribution'
+
+        # With valid CCT → passes through to witness check
+        with patch.object(bridge, '_check_cct_access', return_value=True):
+            result = bridge.distribute_skill_packet(
+                {'description': 'test', 'witness_count': 0}, 'e2e_node')
+        # Passes CCT gate but fails at witness check — proves gate was bypassed
+        assert not result['success']
+        assert 'witness' in result['reason'].lower()
+
+    def test_hivemind_degrades_gracefully(self):
+        """query_hivemind returns cached data when CCT is missing."""
+        from integrations.agent_engine.world_model_bridge import WorldModelBridge
+
+        bridge = WorldModelBridge()
+        bridge._federation_aggregated['last_thought'] = 'cached intelligence'
+
+        # Without CCT → graceful degrade to cached
+        with patch.object(bridge, '_check_cct_access', return_value=False):
+            result = bridge.query_hivemind('test question')
+        assert result is not None
+        assert result['source'] == 'cached'
+        assert result['cct_gated'] is True
+
+        # With CCT but no API → None (no cached, API unreachable)
+        bridge2 = WorldModelBridge()
+        with patch.object(bridge2, '_check_cct_access', return_value=True):
+            result2 = bridge2.query_hivemind('test question')
+        assert result2 is None  # No API configured, no cache
+
+
+class TestCCTRewardIntegration:
+    """E2E: CCT issuance → Spark rewards → wallet balance update."""
+
+    @patch('security.node_integrity.sign_json_payload',
+           return_value='r1' * 64)
+    @patch('security.node_integrity.get_public_key_hex',
+           return_value='b2' * 32)
+    @patch('security.node_integrity.get_node_identity',
+           return_value={'node_id': 'e2e_issuer'})
+    def test_cct_issue_awards_spark(self, mock_id, mock_pub, mock_sign, db):
+        """Issuing a CCT awards learning_contribution Spark + XP."""
+        from integrations.agent_engine.continual_learner_gate import (
+            ContinualLearnerGateService)
+        from integrations.social.resonance_engine import ResonanceService
+
+        # Create user + peer for the same node operator
+        user = User(id='e2e_cct_user', username='cct_reward_user')
+        db.add(user)
+        peer = PeerNode(
+            node_id='e2e_reward_node', url='http://reward:6777',
+            status='active', contribution_score=300.0,
+            integrity_status='verified', capability_tier='full',
+            node_operator='e2e_cct_user',
+        )
+        db.add(peer)
+        db.flush()
+
+        # Check wallet before
+        wallet_before = ResonanceService.get_wallet(db, 'e2e_cct_user')
+
+        # Issue CCT — triggers reward
+        result = ContinualLearnerGateService.issue_cct(db, 'e2e_reward_node')
+        assert result is not None
+        db.flush()
+
+        # Check wallet after — should have increased
+        wallet_after = ResonanceService.get_or_create_wallet(
+            db, 'e2e_cct_user')
+        assert wallet_after.spark > 0
+        assert wallet_after.xp > 0
+
+    def test_reward_table_entries_functional(self, db):
+        """All 3 learning reward types can be awarded through ResonanceService."""
+        from integrations.social.resonance_engine import ResonanceService
+
+        user = User(id='e2e_reward_test', username='reward_test')
+        db.add(user)
+        db.flush()
+
+        for action in ['learning_contribution', 'learning_skill_shared',
+                        'learning_credit_assigned']:
+            result = ResonanceService.award_action(
+                db, 'e2e_reward_test', action, 'test')
+            assert 'spark' in result, f"{action} should award spark"
+
+
+class TestCCTComputeBenchmark:
+    """E2E: Submit benchmark → create attestation → verify contribution."""
+
+    @patch('security.node_integrity.sign_json_payload',
+           return_value='bm' * 64)
+    @patch('security.node_integrity.get_public_key_hex',
+           return_value='b2' * 32)
+    @patch('security.node_integrity.get_node_identity',
+           return_value={'node_id': 'e2e_issuer'})
+    def test_benchmark_to_attestation(self, mock_id, mock_pub, mock_sign, db):
+        """Benchmark submission creates NodeAttestation record."""
+        from integrations.agent_engine.continual_learner_gate import (
+            ContinualLearnerGateService)
+
+        peer = PeerNode(
+            node_id='e2e_bench', url='http://bench:6777',
+            status='active', contribution_score=100.0,
+            integrity_status='verified', capability_tier='standard',
+        )
+        db.add(peer)
+        db.flush()
+
+        result = ContinualLearnerGateService.verify_compute_contribution(
+            db, 'e2e_bench', {
+                'benchmark_type': 'credit_assignment',
+                'score': 85.0,
+                'duration_ms': 200.0,
+            })
+        assert result['verified']
+        assert result['score'] == 85.0
+
+        att = db.query(NodeAttestation).filter_by(
+            subject_node_id='e2e_bench',
+            attestation_type='compute_contribution',
+        ).first()
+        assert att is not None
+        assert att.is_valid is True
+
+    @patch('security.node_integrity.sign_json_payload',
+           return_value='bm' * 64)
+    @patch('security.node_integrity.get_public_key_hex',
+           return_value='b2' * 32)
+    @patch('security.node_integrity.get_node_identity',
+           return_value={'node_id': 'e2e_issuer'})
+    def test_invalid_benchmark_rejected(self, mock_id, mock_pub,
+                                         mock_sign, db):
+        """Zero-score benchmark is rejected."""
+        from integrations.agent_engine.continual_learner_gate import (
+            ContinualLearnerGateService)
+
+        peer = PeerNode(
+            node_id='e2e_bench2', url='http://bench2:6777',
+            status='active', contribution_score=100.0,
+            integrity_status='verified', capability_tier='standard',
+        )
+        db.add(peer)
+        db.flush()
+
+        result = ContinualLearnerGateService.verify_compute_contribution(
+            db, 'e2e_bench2', {'score': 0, 'duration_ms': 0})
+        assert not result['verified']
+        assert result['reason'] == 'invalid_benchmark'
+
+
+class TestCCTAPIEndToEnd:
+    """E2E: Flask API endpoints for CCT management."""
+
+    @pytest.fixture
+    def client(self):
+        from flask import Flask
+        from integrations.agent_engine.api_learning import learning_bp
+        app = Flask(__name__)
+        app.register_blueprint(learning_bp)
+        app.config['TESTING'] = True
+        with app.test_client() as c:
+            yield c
+
+    def test_verify_then_tiers_flow(self, client):
+        """POST /verify → GET /tiers — public read-only flow."""
+        # Verify an invalid CCT
+        resp = client.post('/api/learning/cct/verify',
+                          json={'cct': 'garbage_token'})
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data['success']
+        assert data['data']['valid'] is False
+
+        # Get tier stats
+        with patch('integrations.social.models.get_db') as mock_db:
+            mock_session = MagicMock()
+            mock_db.return_value = mock_session
+            mock_session.query.return_value.filter.return_value.all.return_value = []
+            resp = client.get('/api/learning/tiers')
+        assert resp.status_code == 200
+
+    def test_request_cct_auth_flow(self, client):
+        """POST /request without signature → 400/403."""
+        # Missing node_id
+        resp = client.post('/api/learning/cct/request', json={})
+        assert resp.status_code == 400
+
+        # Invalid signature
+        resp = client.post('/api/learning/cct/request',
+                          json={'node_id': 'x', 'signature': 'bad',
+                                'public_key': 'bad'})
+        assert resp.status_code == 403
+
+
+class TestCCTBootstrapIntegration:
+    """E2E: Learning goal type is fully wired into the agent engine."""
+
+    def test_learning_goal_type_complete_wiring(self):
+        """learning type: registered, prompt builds, tool tags present, seed goal exists."""
+        from integrations.agent_engine.goal_manager import (
+            get_prompt_builder, get_tool_tags, get_registered_types)
+        from integrations.agent_engine.goal_seeding import SEED_BOOTSTRAP_GOALS
+        from integrations.agent_engine.learning_tools import LEARNING_TOOLS
+
+        # Type registered
+        assert 'learning' in get_registered_types()
+
+        # Prompt builder works
+        builder = get_prompt_builder('learning')
+        prompt = builder({
+            'title': 'Test', 'description': 'E2E wiring test',
+        })
+        assert 'CONTINUAL LEARNING COORDINATOR' in prompt
+        assert 'Intelligence is earned' in prompt
+
+        # Tool tags
+        tags = get_tool_tags('learning')
+        assert 'learning' in tags
+
+        # Tools registered
+        assert len(LEARNING_TOOLS) == 6
+        tool_names = {t['name'] for t in LEARNING_TOOLS}
+        assert 'check_learning_health' in tool_names
+        assert 'issue_cct' in tool_names
+        assert 'distribute_learning_skill' in tool_names
+
+        # Bootstrap goal seeded
+        slugs = [g['slug'] for g in SEED_BOOTSTRAP_GOALS]
+        assert 'bootstrap_learning_coordinator' in slugs
+        goal = next(g for g in SEED_BOOTSTRAP_GOALS
+                    if g['slug'] == 'bootstrap_learning_coordinator')
+        assert goal['goal_type'] == 'learning'
+        assert goal['config']['continuous'] is True
+
+    def test_learning_rewards_in_resonance(self):
+        """All 3 learning reward actions exist in AWARD_TABLE."""
+        from integrations.social.resonance_engine import AWARD_TABLE
+
+        for action in ['learning_contribution', 'learning_skill_shared',
+                        'learning_credit_assigned']:
+            assert action in AWARD_TABLE, f"{action} missing from AWARD_TABLE"
+            assert 'spark' in AWARD_TABLE[action]

@@ -52,6 +52,9 @@ AWARD_TABLE = {
     'ad_impression_served': {'spark': 1},
     'hosting_uptime_bonus': {'spark': 10, 'pulse': 5, 'xp': 20},
     'hosting_milestone': {'spark': 50, 'pulse': 25, 'xp': 100},
+    'learning_contribution':    {'spark': 25, 'pulse': 10, 'signal': 0.08, 'xp': 40},
+    'learning_skill_shared':    {'spark': 15, 'signal': 0.05, 'xp': 25},
+    'learning_credit_assigned': {'spark': 5, 'xp': 10},
 }
 
 

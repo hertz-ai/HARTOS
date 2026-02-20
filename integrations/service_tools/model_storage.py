@@ -13,6 +13,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
@@ -116,11 +117,10 @@ class ModelStorageManager:
             # Already cloned — pull latest
             logger.info(f"Pulling latest for {tool_name}...")
             try:
-                subprocess.run(
-                    ['git', 'pull'],
-                    cwd=str(tool_dir),
-                    capture_output=True, timeout=120,
-                )
+                _git_kwargs = dict(cwd=str(tool_dir), capture_output=True, timeout=120)
+                if sys.platform == 'win32':
+                    _git_kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+                subprocess.run(['git', 'pull'], **_git_kwargs)
                 return tool_dir
             except Exception as e:
                 logger.warning(f"git pull failed for {tool_name}: {e}")
@@ -135,9 +135,10 @@ class ModelStorageManager:
         cmd += [repo_url, str(tool_dir)]
 
         try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=300,
-            )
+            _clone_kwargs = dict(capture_output=True, text=True, timeout=300)
+            if sys.platform == 'win32':
+                _clone_kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+            result = subprocess.run(cmd, **_clone_kwargs)
             if result.returncode != 0:
                 logger.error(f"git clone failed: {result.stderr[:300]}")
                 return None

@@ -340,6 +340,29 @@ SEED_BOOTSTRAP_GOALS = [
         'spark_budget': 200,
         'use_product': False,
     },
+    # ─── Continual Learning Coordination ───
+    {
+        'slug': 'bootstrap_learning_coordinator',
+        'goal_type': 'learning',
+        'title': 'Continual Learning Coordination and CCT Management',
+        'description': (
+            'Coordinate the continual learning incentive system: '
+            '1) Monitor compute contributions across all nodes with check_learning_health, '
+            '2) Issue and renew Compute Contribution Tokens for eligible nodes with issue_cct, '
+            '3) Verify learning microbenchmarks for compute attestation with verify_compute_contribution, '
+            '4) Track learning tier distribution and skill sharing rates with get_learning_tier_stats, '
+            '5) Report learning health metrics to dashboard. '
+            'Intelligence is the reward for contribution. '
+            'Every compute cycle donated makes the hive smarter. '
+            '90% of value flows back to contributors.'
+        ),
+        'config': {
+            'mode': 'monitor',
+            'continuous': True,
+        },
+        'spark_budget': 200,
+        'use_product': False,
+    },
 ]
 
 # ─── Loophole → Remediation Goal Map ───

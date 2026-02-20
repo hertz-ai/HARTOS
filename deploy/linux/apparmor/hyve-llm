@@ -1,0 +1,19 @@
+#include <tunables/global>
+
+/opt/hyve/models/** r,
+/usr/local/bin/llama-server {
+  #include <abstractions/base>
+
+  /opt/hyve/models/** r,
+  /var/log/hyve/** w,
+
+  # GPU
+  /dev/nvidia* rw,
+  /dev/dri/** rw,
+
+  network inet stream,
+
+  deny /etc/shadow r,
+  deny /root/** rw,
+  deny /var/lib/hyve/node_private.key r,
+}

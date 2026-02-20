@@ -142,11 +142,10 @@ class DiarizationService:
         ]
         logger.info(f"Starting diarization sidecar: {' '.join(cmd)}")
 
-        self._process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
+        _popen_kw = dict(stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        if sys.platform == 'win32':
+            _popen_kw['creationflags'] = subprocess.CREATE_NO_WINDOW
+        self._process = subprocess.Popen(cmd, **_popen_kw)
 
     def _wait_for_ready(self, timeout: float = 180):
         """Read stdout for DIARIZATION_READY signal.

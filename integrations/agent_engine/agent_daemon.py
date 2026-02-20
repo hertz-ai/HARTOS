@@ -90,6 +90,75 @@ class AgentDaemon:
         if self._thread:
             self._thread.join(timeout=10)
 
+    def _try_parallel_dispatch(self, goal, idle_agents, dispatched, max_concurrent):
+        """Check if a goal has parallel subtasks and dispatch them concurrently.
+
+        Returns number of tasks dispatched (0 if no parallel tasks found).
+        """
+        try:
+            ledger = self._get_goal_ledger(goal)
+            if not ledger:
+                return 0
+
+            parallel_tasks = ledger.get_parallel_executable_tasks()
+            if not parallel_tasks:
+                return 0
+
+            from .parallel_dispatch import dispatch_parallel_tasks
+            from .dispatch import dispatch_goal
+
+            batch_count = min(
+                len(parallel_tasks),
+                len(idle_agents) - dispatched,
+                max_concurrent - dispatched,
+            )
+            if batch_count <= 0:
+                return 0
+
+            def _dispatch_task(task):
+                """Dispatch a single parallel subtask via /chat."""
+                goal_id = str(goal.id) if hasattr(goal, 'id') else ''
+                goal_type = goal.goal_type if hasattr(goal, 'goal_type') else 'marketing'
+                user_id = str(goal.user_id) if hasattr(goal, 'user_id') else 'system'
+                result = dispatch_goal(
+                    task.description, user_id, goal_id, goal_type)
+                return {'success': result is not None, 'response': result}
+
+            result = dispatch_parallel_tasks(
+                ledger, _dispatch_task, max_concurrent=batch_count)
+
+            count = result['completed'] + result['failed']
+            if count > 0:
+                logger.info(
+                    f"Parallel dispatch for goal {goal.id}: "
+                    f"{result['completed']} completed, {result['failed']} failed")
+            return count
+
+        except Exception as e:
+            logger.debug(f"Parallel dispatch check failed: {e}")
+            return 0
+
+    def _get_goal_ledger(self, goal):
+        """Get a SmartLedger for a goal's task graph (if one exists).
+
+        Returns None when no ledger exists or it has only 1 task (no parallelism).
+        """
+        try:
+            from agent_ledger import SmartLedger
+            goal_id = str(goal.id) if hasattr(goal, 'id') else ''
+            user_id = str(goal.user_id) if hasattr(goal, 'user_id') else 'system'
+
+            ledger = SmartLedger(agent_id=user_id, session_id=str(goal_id))
+            ledger_path = os.path.join(
+                'agent_data', f'ledger_{user_id}_{goal_id}.json')
+            if os.path.isfile(ledger_path):
+                ledger.load(ledger_path)
+                if len(ledger.tasks) > 1:
+                    return ledger
+        except Exception:
+            pass
+        return None
+
     def _loop(self):
         while self._running:
             time.sleep(self._interval)
@@ -166,6 +235,13 @@ class AgentDaemon:
                 if dispatched >= len(idle_agents) or dispatched >= max_concurrent:
                     break
 
+                # ── PARALLEL DISPATCH: check for goals with parallel subtasks ──
+                parallel_dispatched = self._try_parallel_dispatch(
+                    goal, idle_agents, dispatched, max_concurrent)
+                if parallel_dispatched > 0:
+                    dispatched += parallel_dispatched
+                    continue
+
                 agent = idle_agents[dispatched]
                 if agent['user_id'] in used_agents:
                     dispatched += 1
@@ -233,6 +309,23 @@ class AgentDaemon:
 
             if dispatched > 0:
                 logger.info(f"Agent daemon: dispatched {dispatched} goal(s) to idle agents")
+
+            # Content gen monitor: check stuck games every 5 ticks (~2.5 min)
+            if self._tick_count % 5 == 0:
+                try:
+                    from .content_gen_tracker import ContentGenTracker
+                    stuck = ContentGenTracker.get_stuck_games(db)
+                    for game in stuck:
+                        game_id = game.get('game_id', '')
+                        result = ContentGenTracker.attempt_unblock(db, game_id)
+                        if result.get('success'):
+                            logger.info(
+                                f"Content gen unblocked {game_id}: "
+                                f"{result.get('action_taken')}")
+                        # Record progress snapshot for delta tracking
+                        ContentGenTracker.record_progress_snapshot(db, game_id)
+                except Exception as e:
+                    logger.debug(f"Content gen monitor: {e}")
 
             # Periodic auto-remediation: scan loopholes every Nth tick
             if self._tick_count % self._remediate_every == 0:

@@ -93,6 +93,14 @@ def init_social(app):
     except Exception as e:
         logger.debug(f"HevolveSocial tracker blueprint skipped: {e}")
 
+    # Register fleet OTA update approval blueprint
+    try:
+        from .api_fleet_update import fleet_update_bp
+        app.register_blueprint(fleet_update_bp)
+        logger.info("HevolveSocial fleet update registered at /api/social/fleet/")
+    except Exception as e:
+        logger.debug(f"HevolveSocial fleet update blueprint skipped: {e}")
+
     # Register sync & backup blueprint
     try:
         from .sync_api import sync_bp
@@ -108,6 +116,22 @@ def init_social(app):
         logger.info("HevolveSocial audit registered at /api/social/audit/")
     except Exception as e:
         logger.debug(f"HevolveSocial audit blueprint skipped: {e}")
+
+    # Register content generation task tracking blueprint
+    try:
+        from integrations.agent_engine.api_content_gen import content_gen_bp
+        app.register_blueprint(content_gen_bp)
+        logger.info("HevolveSocial content gen registered at /api/social/content-gen/")
+    except Exception as e:
+        logger.debug(f"HevolveSocial content gen blueprint skipped: {e}")
+
+    # Register continual learning CCT management blueprint
+    try:
+        from integrations.agent_engine.api_learning import learning_bp
+        app.register_blueprint(learning_bp)
+        logger.info("Learning CCT endpoints registered at /api/learning/")
+    except Exception as e:
+        logger.debug(f"Learning blueprint skipped: {e}")
 
     # Initialize node keypair for integrity verification
     try:

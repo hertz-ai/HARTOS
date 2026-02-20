@@ -1,0 +1,17 @@
+// HyveOS automatic security updates
+// Install: cp to /etc/apt/apt.conf.d/50hyve-unattended-upgrades
+Unattended-Upgrade::Allowed-Origins {
+    "${distro_id}:${distro_codename}-security";
+    "${distro_id}ESMApps:${distro_codename}-apps-security";
+};
+
+Unattended-Upgrade::Package-Blacklist {
+    // Never auto-update kernel (requires manual reboot planning)
+    "linux-image*";
+    "linux-headers*";
+};
+
+Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Mail "root";
+Unattended-Upgrade::MailReport "on-change";

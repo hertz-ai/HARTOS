@@ -12,6 +12,9 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+# Hosts not seen within this window (seconds) are considered stale and purged.
+STALE_THRESHOLD = 300  # 5 minutes
+
 
 class RegionalHostRegistry:
     """
@@ -19,6 +22,10 @@ class RegionalHostRegistry:
 
     Each host registers with capabilities (tools, skills) and compute budget.
     Other hosts discover peers via shared Redis.
+
+    Host entries carry a ``last_seen`` timestamp.  Entries older than
+    ``STALE_THRESHOLD`` seconds are automatically purged when the host list
+    is queried via ``get_all_hosts()`` or ``get_hosts_with_capability()``.
     """
 
     HOSTS_HASH = "distributed_agent:hosts"
@@ -63,8 +70,41 @@ class RegionalHostRegistry:
             logger.error(f"Failed to deregister host: {e}")
             return False
 
+    # ── stale-host purging ────────────────────────────────────────
+    def _purge_stale(self) -> int:
+        """Remove host entries whose ``last_seen`` is older than STALE_THRESHOLD.
+
+        Returns the number of purged entries.
+        """
+        purged = 0
+        try:
+            now = datetime.now()
+            all_data = self._redis.hgetall(self.HOSTS_HASH)
+            for hid, raw in all_data.items():
+                try:
+                    entry = json.loads(raw)
+                    last_seen_str = entry.get("last_seen")
+                    if not last_seen_str:
+                        # No timestamp — treat as stale
+                        self._redis.hdel(self.HOSTS_HASH, hid)
+                        purged += 1
+                        continue
+                    last_seen = datetime.fromisoformat(last_seen_str)
+                    if (now - last_seen).total_seconds() > STALE_THRESHOLD:
+                        self._redis.hdel(self.HOSTS_HASH, hid)
+                        purged += 1
+                        logger.info(f"Purged stale host: {hid} (last seen {last_seen_str})")
+                except (json.JSONDecodeError, ValueError):
+                    # Corrupt entry — remove it
+                    self._redis.hdel(self.HOSTS_HASH, hid)
+                    purged += 1
+        except Exception as e:
+            logger.error(f"Failed to purge stale hosts: {e}")
+        return purged
+
     def get_all_hosts(self) -> List[Dict[str, Any]]:
-        """List all registered hosts."""
+        """List all registered hosts (purges stale entries first)."""
+        self._purge_stale()
         hosts = []
         try:
             all_data = self._redis.hgetall(self.HOSTS_HASH)

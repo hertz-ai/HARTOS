@@ -53,10 +53,17 @@ class VRAMManager:
 
         # 1) nvidia-smi — zero-dependency, works on any NVIDIA GPU system
         try:
+            _smi_kwargs = dict(capture_output=True, text=True, timeout=5)
+            if sys.platform == 'win32':
+                si = subprocess.STARTUPINFO()
+                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                si.wShowWindow = 0
+                _smi_kwargs['startupinfo'] = si
+                _smi_kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
             result = subprocess.run(
                 ["nvidia-smi", "--query-gpu=name,memory.total,memory.free",
                  "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=5,
+                **_smi_kwargs,
             )
             if result.returncode == 0 and result.stdout.strip():
                 line = result.stdout.strip().split("\n")[0]

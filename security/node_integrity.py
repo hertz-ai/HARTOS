@@ -18,7 +18,16 @@ from cryptography.exceptions import InvalidSignature
 
 logger = logging.getLogger('hevolve_security')
 
-_KEY_DIR = os.environ.get('HEVOLVE_KEY_DIR', 'agent_data')
+def _resolve_key_dir():
+    explicit = os.environ.get('HEVOLVE_KEY_DIR')
+    if explicit:
+        return explicit
+    db_path = os.environ.get('HEVOLVE_DB_PATH', '')
+    if db_path and db_path != ':memory:' and os.path.isabs(db_path):
+        return os.path.dirname(db_path)
+    return 'agent_data'
+
+_KEY_DIR = _resolve_key_dir()
 _PRIVATE_KEY_FILE = 'node_private_key.pem'
 _PUBLIC_KEY_FILE = 'node_public_key.pem'
 _CODE_ROOT = os.environ.get('HEVOLVE_CODE_ROOT', os.path.dirname(

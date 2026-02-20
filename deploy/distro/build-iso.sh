@@ -245,6 +245,9 @@ chmod +x config/includes.chroot/usr/local/bin/hyve
 mkdir -p config/includes.chroot/etc/hyve
 cp "$REPO_DIR/deploy/linux/hyve.env.template" config/includes.chroot/etc/hyve/hyve.env
 
+# Write variant to /etc/hyve/variant
+echo "$VARIANT" > config/includes.chroot/etc/hyve/variant
+
 # ─── Add autoinstall for subiquity ───
 log "Adding autoinstall configuration..."
 mkdir -p config/includes.chroot/autoinstall

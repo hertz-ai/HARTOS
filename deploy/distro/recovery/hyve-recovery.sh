@@ -59,6 +59,8 @@ systemctl stop hyve.target 2>/dev/null || true
 
 # Step 2: Wipe node data
 echo "[2/5] Wiping node data..."
+# Clear immutable flag before removal
+chattr -i "$DATA_DIR/node_private.key" 2>/dev/null || true
 rm -f "$DATA_DIR/node_private.key"
 rm -f "$DATA_DIR/node_public.key"
 rm -f "$DATA_DIR/hevolve_database.db"

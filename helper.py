@@ -1,4 +1,5 @@
 from collections import deque
+import logging
 import requests
 import re
 import ast
@@ -1948,10 +1949,26 @@ def create_visual_agent(user_id,prompt_id):
     return visual_agent, visual_user, helper2, executor2, multi_role_agent2, verify2, chat_instructor2
 
 
-# Create agent_data directory if it doesn't exist
-AGENT_DATA_DIR = "agent_data"
-if not os.path.exists(AGENT_DATA_DIR):
-    os.makedirs(AGENT_DATA_DIR)
+# Create agent_data directory if it doesn't exist.
+# When running from a read-only install dir (e.g. C:\Program Files on Windows),
+# derive the path from HEVOLVE_DB_PATH so writes go to a writable user directory.
+def _resolve_agent_data_dir():
+    """Resolve agent_data directory, preferring the DB path's parent for bundled apps."""
+    db_path = os.environ.get('HEVOLVE_DB_PATH', '')
+    if db_path and db_path != ':memory:' and os.path.isabs(db_path):
+        # Use sibling directory to the database file
+        return os.path.join(os.path.dirname(db_path), 'agent_data')
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'agent_data')
+
+AGENT_DATA_DIR = _resolve_agent_data_dir()
+try:
+    if not os.path.exists(AGENT_DATA_DIR):
+        os.makedirs(AGENT_DATA_DIR, exist_ok=True)
+except PermissionError:
+    # Fallback: user home directory (e.g. bundled app in Program Files)
+    AGENT_DATA_DIR = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data')
+    os.makedirs(AGENT_DATA_DIR, exist_ok=True)
+    logging.getLogger(__name__).warning(f"agent_data dir redirected to {AGENT_DATA_DIR} (install dir not writable)")
 
 
 def get_agent_data_file_path(prompt_id: int) -> str:
