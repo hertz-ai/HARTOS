@@ -1,5 +1,5 @@
 """
-Tests for HyveOS PXE Boot Server (deploy/distro/pxe/hyve-pxe-server.py).
+Tests for HART OS PXE Boot Server (deploy/distro/pxe/hart-pxe-server.py).
 
 Tests cover:
 - TFTPHandler: RRQ parsing, block transfer, path traversal protection, error packets
@@ -33,8 +33,8 @@ sys.path.insert(0, PXE_DIR)
 # Import with fallback to manual spec
 import importlib.util
 _spec = importlib.util.spec_from_file_location(
-    'hyve_pxe_server',
-    os.path.join(PXE_DIR, 'hyve-pxe-server.py')
+    'hart_pxe_server',
+    os.path.join(PXE_DIR, 'hart-pxe-server.py')
 )
 pxe = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(pxe)
@@ -54,7 +54,7 @@ def serve_dir(tmp_path):
     (d / 'initrd').write_bytes(b'\x00' * 2048)
     (d / 'pxelinux.0').write_bytes(b'\x00' * 512)
     # Create a small test file for TFTP
-    (d / 'test.txt').write_text('Hello HyveOS PXE')
+    (d / 'test.txt').write_text('Hello HART OS PXE')
     return str(d)
 
 
@@ -64,7 +64,7 @@ def autoinstall_dir(tmp_path):
     auto = tmp_path / 'autoinstall'
     auto.mkdir()
     (auto / 'user-data').write_text('#cloud-config\nautoinstall:\n  version: 1')
-    (auto / 'meta-data').write_text('instance-id: hyve-node')
+    (auto / 'meta-data').write_text('instance-id: hart-node')
     (auto / 'vendor-data').write_text('')
     return str(auto)
 
@@ -327,8 +327,8 @@ class TestSetupPXEConfig:
         pxe.setup_pxe_config(out, '1.2.3.4', 8888)
         with open(os.path.join(out, 'pxelinux.cfg', 'default')) as f:
             content = f.read()
-        assert 'LABEL hyve-auto' in content
-        assert 'LABEL hyve-manual' in content
+        assert 'LABEL hart-auto' in content
+        assert 'LABEL hart-manual' in content
         assert 'LABEL local' in content
 
     def test_config_has_autoinstall_url(self, tmp_path):
@@ -395,20 +395,20 @@ class TestConstants:
         parser.add_argument('--port', type=int, default=8888)
         parser.add_argument('--tftp-port', type=int, default=69)
         parser.add_argument('--interface')
-        parser.add_argument('--serve-dir', default='/srv/hyve-pxe')
+        parser.add_argument('--serve-dir', default='/srv/hart-pxe')
 
         args = parser.parse_args(['--iso', '/test.iso', '--port', '9999'])
         assert args.iso == '/test.iso'
         assert args.port == 9999
         assert args.tftp_port == 69
-        assert args.serve_dir == '/srv/hyve-pxe'
+        assert args.serve_dir == '/srv/hart-pxe'
 
 
 # ──────────────────────────────────────────────────
 # TLS Support Tests (E6)
 # ──────────────────────────────────────────────────
 
-PXE_SERVER_PATH = os.path.join(PXE_DIR, 'hyve-pxe-server.py')
+PXE_SERVER_PATH = os.path.join(PXE_DIR, 'hart-pxe-server.py')
 
 
 class TestTLSSupport:

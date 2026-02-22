@@ -36,6 +36,8 @@ FRAUD_WEIGHTS = {
     'witness_ring': 30.0,
     'temporal_clustering': 20.0,
     'seal_tamper': 35.0,
+    'gradient_magnitude_anomaly': 20.0,
+    'gradient_direction_flip': 25.0,
 }
 
 IMPRESSION_ANOMALY_STDDEV = 3.0
@@ -78,6 +80,18 @@ class IntegrityService:
             return {'verified': False, 'details': 'No code hash available'}
 
         expected = None
+
+        # Priority 0: Release hash registry (multi-version support)
+        try:
+            from security.release_hash_registry import get_release_hash_registry
+            registry = get_release_hash_registry()
+            if registry.is_known_release_hash(peer.code_hash):
+                peer.integrity_status = 'verified'
+                peer.last_attestation_at = datetime.utcnow()
+                return {'verified': True,
+                        'details': 'Code hash in release registry'}
+        except Exception:
+            pass
 
         # Primary: check against master-signed manifest
         try:

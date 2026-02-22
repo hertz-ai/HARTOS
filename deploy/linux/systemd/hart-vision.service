@@ -1,0 +1,44 @@
+[Unit]
+Description=HART OS Vision Service (MiniCPM)
+Documentation=https://github.com/hevolve-ai/hart
+After=hart-backend.service
+ConditionPathExists=/opt/hart/models/minicpm/
+
+[Service]
+Type=simple
+User=hart
+Group=hart
+WorkingDirectory=/opt/hart
+ExecStart=/opt/hart/venv/bin/python integrations/vision/minicpm_server.py --model_dir /opt/hart/models/minicpm --port ${HART_VISION_PORT:-9891} --device auto
+EnvironmentFile=/etc/hart/hart.env
+Restart=on-failure
+RestartSec=15
+StartLimitBurst=3
+StartLimitIntervalSec=60
+TimeoutStartSec=120
+
+# Vision service needs GPU access
+SupplementaryGroups=video render
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/hart /opt/hart/models
+PrivateTmp=yes
+
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+MemoryDenyWriteExecute=no
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hart-vision
+
+[Install]
+WantedBy=hart.target

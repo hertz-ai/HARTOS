@@ -1,7 +1,7 @@
 """
-HyveSocial - Flask Blueprint API
+HARTSocial - Flask Blueprint API
 ~82 REST endpoints at /api/social.
-Compatible with both Nunba web app and Hyve React Native CommunityView.
+Compatible with both Nunba web app and HART React Native CommunityView.
 """
 import os
 import logging
@@ -17,11 +17,12 @@ from .feed_engine import (
     get_personalized_feed, get_global_feed, get_trending_feed, get_agent_feed
 )
 from .karma_engine import recalculate_karma, get_karma_breakdown
+from datetime import datetime
 from .models import (
-    get_db, Post, Comment, User, Community, TaskRequest, Report, AgentSkillBadge,
-    AdUnit, AdImpression, APIUsageLog, CommercialAPIKey,
+    get_db, db_session, Post, Comment, User, Community, TaskRequest, Report,
+    AgentSkillBadge, AdUnit, AdImpression, APIUsageLog, CommercialAPIKey,
     AgentGoal, Boost, Campaign, AgentEvolution, AgentCollaboration,
-    ResonanceTransaction, HostingReward,
+    ResonanceTransaction, HostingReward, Follow,
 )
 from .schemas import APIResponse, PaginationMeta
 from sqlalchemy.orm import joinedload
@@ -79,49 +80,41 @@ def register():
     except ValueError as e:
         return _err(str(e))
 
-    db = get_db()
     try:
-        if data.get('user_type') == 'agent':
-            user = UserService.register_agent(
-                db, username, data.get('description', ''),
-                data.get('agent_id'), data.get('owner_id'))
-        else:
-            user = UserService.register(
-                db, username, password, data.get('email'),
-                data.get('display_name'), data.get('user_type', 'human'))
+        with db_session() as db:
+            if data.get('user_type') == 'agent':
+                user = UserService.register_agent(
+                    db, username, data.get('description', ''),
+                    data.get('agent_id'), data.get('owner_id'))
+            else:
+                user = UserService.register(
+                    db, username, password, data.get('email'),
+                    data.get('display_name'), data.get('user_type', 'human'))
 
-        # Apply referral code if provided (one-step signup)
-        referral_code = data.get('referral_code', '').strip()
-        if referral_code and user:
-            try:
-                from .distribution_service import DistributionService
-                DistributionService.use_referral_code(db, str(user.id), referral_code)
-            except Exception as e:
-                logger.debug(f"Referral code application skipped: {e}")
+            # Apply referral code if provided (one-step signup)
+            referral_code = data.get('referral_code', '').strip()
+            if referral_code and user:
+                try:
+                    from .distribution_service import DistributionService
+                    DistributionService.use_referral_code(db, str(user.id), referral_code)
+                except Exception as e:
+                    logger.debug(f"Referral code application skipped: {e}")
 
-        db.commit()
-        return _ok(user.to_dict(include_token=True), status=201)
+            return _ok(user.to_dict(include_token=True), status=201)
     except ValueError as e:
-        db.rollback()
         return _err(str(e))
-    finally:
-        db.close()
 
 
 @social_bp.route('/auth/login', methods=['POST'])
 @rate_limit('auth')
 def login():
     data = _get_json()
-    db = get_db()
     try:
-        user, token = UserService.login(db, data.get('username', ''), data.get('password', ''))
-        db.commit()
-        return _ok({'user': user.to_dict(), 'token': token})
+        with db_session() as db:
+            user, token = UserService.login(db, data.get('username', ''), data.get('password', ''))
+            return _ok({'user': user.to_dict(), 'token': token})
     except ValueError as e:
-        db.rollback()
         return _err(str(e), 401)
-    finally:
-        db.close()
 
 
 @social_bp.route('/auth/logout', methods=['POST'])
@@ -219,26 +212,22 @@ def guest_recover():
     if not recovery_code:
         return _err("recovery_code required")
 
-    db = get_db()
     try:
-        rows = db.query(GuestRecovery).all()
-        for gr in rows:
-            if verify_password(recovery_code, gr.recovery_code_hash):
-                user = db.query(User).filter_by(id=gr.user_id).first()
-                if not user:
-                    continue
-                gr.last_used_at = datetime.utcnow()
-                gr.device_id = device_id or gr.device_id
-                db.commit()
-                token = generate_jwt(user.id, user.username, user.role or 'guest')
-                return _ok({'user': user.to_dict(), 'token': token})
-        return _err("Invalid recovery code", 401)
+        with db_session() as db:
+            rows = db.query(GuestRecovery).all()
+            for gr in rows:
+                if verify_password(recovery_code, gr.recovery_code_hash):
+                    user = db.query(User).filter_by(id=gr.user_id).first()
+                    if not user:
+                        continue
+                    gr.last_used_at = datetime.utcnow()
+                    gr.device_id = device_id or gr.device_id
+                    token = generate_jwt(user.id, user.username, user.role or 'guest')
+                    return _ok({'user': user.to_dict(), 'token': token})
+            return _err("Invalid recovery code", 401)
     except Exception as e:
-        db.rollback()
         logger.error(f"Guest recover failed: {e}")
         return _err(str(e))
-    finally:
-        db.close()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -344,12 +333,9 @@ def check_handle_availability():
     valid, error = validate_handle(handle)
     if not valid:
         return _ok({'available': False, 'handle': handle, 'error': error})
-    db = get_db()
-    try:
+    with db_session(commit=False) as db:
         available = is_handle_available(db, handle)
         return _ok({'available': available, 'handle': handle})
-    finally:
-        db.close()
 
 
 @social_bp.route('/users/<user_id>/posts', methods=['GET'])
@@ -514,16 +500,13 @@ def suggest_agent_names():
     count = min(int(request.args.get('count', 5)), 20)
     mode = request.args.get('mode', 'global')
     handle = request.args.get('handle', '').strip().lower() or None
-    db = get_db()
-    try:
+    with db_session(commit=False) as db:
         suggestions = generate_agent_name(db, count=count, mode=mode, handle=handle)
         result = {'suggestions': suggestions, 'count': len(suggestions), 'mode': mode}
         if mode == 'local' and handle:
             from .agent_naming import compose_global_name
             result['global_preview'] = [compose_global_name(s, handle) for s in suggestions]
         return _ok(result)
-    finally:
-        db.close()
 
 
 @social_bp.route('/agents/validate-name', methods=['POST'])
@@ -539,8 +522,7 @@ def validate_agent_name_endpoint():
     name = data.get('name', '').strip().lower()
     mode = data.get('mode', 'global')
     handle = data.get('handle', '').strip().lower() if data.get('handle') else None
-    db = get_db()
-    try:
+    with db_session(commit=False) as db:
         if mode == 'local' and handle:
             valid, error = validate_local_name(name)
             if not valid:
@@ -553,8 +535,6 @@ def validate_agent_name_endpoint():
         else:
             valid, error = validate_and_check(db, name)
             return _ok({'valid': valid, 'error': error, 'name': name})
-    finally:
-        db.close()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2282,6 +2262,69 @@ def feed_subscribe():
 
 
 # ═══════════════════════════════════════════════════════════════
+# GDPR — DATA PRIVACY (user data export + deletion/anonymization)
+# ═══════════════════════════════════════════════════════════════
+
+@social_bp.route('/users/<user_id>/data/export', methods=['GET'])
+@require_auth
+def gdpr_export_user_data(user_id):
+    """GDPR Article 20 — export all user data as JSON (data portability)."""
+    if g.user.id != user_id and not getattr(g.user, 'is_admin', False):
+        return _err("Cannot export another user's data", 403)
+
+    user = UserService.get_by_id(g.db, user_id)
+    if not user:
+        return _err("User not found", 404)
+
+    posts = PostService.list_posts(g.db, author_id=user_id, limit=10000, offset=0)
+    comments = g.db.query(Comment).filter_by(author_id=user_id).all()
+    follows_out = g.db.query(Follow).filter_by(follower_id=user_id).all()
+    follows_in = g.db.query(Follow).filter_by(following_id=user_id).all()
+
+    export = {
+        'user': user.to_dict(),
+        'posts': [p.to_dict() for p in (posts[0] if isinstance(posts, tuple) else posts)],
+        'comments': [c.to_dict() for c in comments],
+        'following': [f.following_id for f in follows_out],
+        'followers': [f.follower_id for f in follows_in],
+        'exported_at': datetime.utcnow().isoformat(),
+    }
+    return _ok(export)
+
+
+@social_bp.route('/users/<user_id>/data', methods=['DELETE'])
+@require_auth
+def gdpr_delete_user_data(user_id):
+    """GDPR Article 17 — right to erasure. Anonymizes PII, preserves content integrity."""
+    if g.user.id != user_id and not getattr(g.user, 'is_admin', False):
+        return _err("Cannot delete another user's data", 403)
+
+    user = UserService.get_by_id(g.db, user_id)
+    if not user:
+        return _err("User not found", 404)
+
+    # Anonymize PII — don't delete the row (preserves referential integrity)
+    import hashlib
+    anon_hash = hashlib.sha256(user_id.encode()).hexdigest()[:12]
+    user.username = f'deleted_{anon_hash}'
+    user.display_name = 'Deleted User'
+    user.email = None
+    user.bio = ''
+    user.avatar_url = ''
+    if hasattr(user, 'password_hash'):
+        user.password_hash = None
+    if hasattr(user, 'handle'):
+        user.handle = None
+
+    g.db.flush()
+    return _ok({
+        'anonymized': True,
+        'user_id': user_id,
+        'message': 'PII anonymized. Content preserved for integrity.',
+    })
+
+
+# ═══════════════════════════════════════════════════════════════
 # TEST HELPERS (only available when SOCIAL_RATE_LIMIT_DISABLED or FLASK_ENV=testing)
 # ═══════════════════════════════════════════════════════════════
 
@@ -2296,3 +2339,364 @@ def reset_rate_limits():
     with limiter._lock:
         limiter._buckets.clear()
     return _ok({'reset': True})
+
+
+# ═══════════════════════════════════════════════════════════════
+# THEME (Appearance) — presets, customization, AI generation
+# ═══════════════════════════════════════════════════════════════
+
+_THEME_PRESETS = [
+    {
+        'id': 'hart-default', 'name': 'HART Default',
+        'description': 'Deep navy with aspiration violet accents',
+        'colors': {
+            'background': '#0F0E17', 'paper': '#1A1932', 'surface_elevated': '#232148',
+            'surface_overlay': '#2D2B55',
+            'primary': '#6C63FF', 'primary_light': '#9B94FF', 'primary_dark': '#4A42CC',
+            'secondary': '#FF6B6B', 'secondary_light': '#FF9494', 'secondary_dark': '#CC5555',
+            'accent': '#2ECC71', 'accent_light': '#A8E6CF',
+            'text_primary': '#FFFFFE', 'text_secondary': 'rgba(255,255,254,0.72)',
+            'divider': 'rgba(255,255,255,0.12)',
+            'success': '#2ECC71', 'warning': '#FFAB00', 'error': '#e74c3c', 'info': '#00B8D9',
+        },
+        'glass': {'blur_radius': 20, 'surface_opacity': 0.85, 'elevated_opacity': 0.92, 'border_opacity': 0.08},
+        'animations': {
+            'glassmorphism': {'enabled': True, 'intensity': 70},
+            'gradients': {'enabled': True, 'intensity': 50},
+            'liquid_motion': {'enabled': True, 'intensity': 60},
+        },
+        'font': {'family': 'Inter', 'size': 13},
+        'shell': {'panel_opacity': 0.65, 'blur_radius': 20, 'border_radius': 16},
+        'metadata': {'is_preset': True, 'is_ai_generated': False},
+    },
+    {
+        'id': 'midnight-black', 'name': 'Midnight Black',
+        'description': 'True OLED black with ice-blue highlights',
+        'colors': {
+            'background': '#000000', 'paper': '#0A0A0F', 'surface_elevated': '#141420',
+            'surface_overlay': '#1E1E2E',
+            'primary': '#00B8D9', 'primary_light': '#79E2F2', 'primary_dark': '#008DA8',
+            'secondary': '#7C4DFF', 'secondary_light': '#B388FF', 'secondary_dark': '#5E35B1',
+            'accent': '#00E5FF', 'accent_light': '#80F0FF',
+            'text_primary': '#E8E8E8', 'text_secondary': 'rgba(232,232,232,0.65)',
+            'divider': 'rgba(255,255,255,0.08)',
+            'success': '#00E676', 'warning': '#FFD600', 'error': '#FF5252', 'info': '#40C4FF',
+        },
+        'glass': {'blur_radius': 24, 'surface_opacity': 0.75, 'elevated_opacity': 0.88, 'border_opacity': 0.06},
+        'animations': {'glassmorphism': {'enabled': True, 'intensity': 80}, 'gradients': {'enabled': True, 'intensity': 60}, 'liquid_motion': {'enabled': True, 'intensity': 70}},
+        'font': {'family': 'Inter', 'size': 13},
+        'shell': {'panel_opacity': 0.55, 'blur_radius': 24, 'border_radius': 16},
+        'metadata': {'is_preset': True, 'is_ai_generated': False},
+    },
+    {
+        'id': 'ocean-blue', 'name': 'Ocean Blue',
+        'description': 'Deep sea gradients with coral accents',
+        'colors': {
+            'background': '#0B1426', 'paper': '#112240', 'surface_elevated': '#1A3358',
+            'surface_overlay': '#234570',
+            'primary': '#64B5F6', 'primary_light': '#90CAF9', 'primary_dark': '#1E88E5',
+            'secondary': '#FF8A65', 'secondary_light': '#FFAB91', 'secondary_dark': '#E64A19',
+            'accent': '#4DD0E1', 'accent_light': '#80DEEA',
+            'text_primary': '#E3F2FD', 'text_secondary': 'rgba(227,242,253,0.72)',
+            'divider': 'rgba(100,181,246,0.15)',
+            'success': '#69F0AE', 'warning': '#FFD740', 'error': '#FF8A80', 'info': '#80D8FF',
+        },
+        'glass': {'blur_radius': 20, 'surface_opacity': 0.80, 'elevated_opacity': 0.90, 'border_opacity': 0.10},
+        'animations': {'glassmorphism': {'enabled': True, 'intensity': 65}, 'gradients': {'enabled': True, 'intensity': 55}, 'liquid_motion': {'enabled': True, 'intensity': 60}},
+        'font': {'family': 'Inter', 'size': 13},
+        'shell': {'panel_opacity': 0.60, 'blur_radius': 20, 'border_radius': 16},
+        'metadata': {'is_preset': True, 'is_ai_generated': False},
+    },
+    {
+        'id': 'forest-green', 'name': 'Forest Green',
+        'description': 'Deep forest with amber firelight',
+        'colors': {
+            'background': '#0A1F0A', 'paper': '#142814', 'surface_elevated': '#1E3A1E',
+            'surface_overlay': '#2A4E2A',
+            'primary': '#66BB6A', 'primary_light': '#A5D6A7', 'primary_dark': '#388E3C',
+            'secondary': '#FFB74D', 'secondary_light': '#FFD54F', 'secondary_dark': '#F57C00',
+            'accent': '#81C784', 'accent_light': '#C8E6C9',
+            'text_primary': '#E8F5E9', 'text_secondary': 'rgba(232,245,233,0.72)',
+            'divider': 'rgba(102,187,106,0.12)',
+            'success': '#69F0AE', 'warning': '#FFE57F', 'error': '#EF5350', 'info': '#4FC3F7',
+        },
+        'glass': {'blur_radius': 18, 'surface_opacity': 0.82, 'elevated_opacity': 0.90, 'border_opacity': 0.08},
+        'animations': {'glassmorphism': {'enabled': True, 'intensity': 60}, 'gradients': {'enabled': True, 'intensity': 45}, 'liquid_motion': {'enabled': True, 'intensity': 55}},
+        'font': {'family': 'Inter', 'size': 13},
+        'shell': {'panel_opacity': 0.60, 'blur_radius': 18, 'border_radius': 16},
+        'metadata': {'is_preset': True, 'is_ai_generated': False},
+    },
+    {
+        'id': 'sunset-warm', 'name': 'Sunset Warm',
+        'description': 'Warm amber dusk with rose highlights',
+        'colors': {
+            'background': '#1A0F0A', 'paper': '#2D1B12', 'surface_elevated': '#3E2518',
+            'surface_overlay': '#4F3020',
+            'primary': '#FF8A65', 'primary_light': '#FFAB91', 'primary_dark': '#E64A19',
+            'secondary': '#F48FB1', 'secondary_light': '#F8BBD0', 'secondary_dark': '#C2185B',
+            'accent': '#FFD54F', 'accent_light': '#FFE082',
+            'text_primary': '#FFF3E0', 'text_secondary': 'rgba(255,243,224,0.72)',
+            'divider': 'rgba(255,138,101,0.15)',
+            'success': '#A5D6A7', 'warning': '#FFE082', 'error': '#EF9A9A', 'info': '#81D4FA',
+        },
+        'glass': {'blur_radius': 16, 'surface_opacity': 0.80, 'elevated_opacity': 0.88, 'border_opacity': 0.10},
+        'animations': {'glassmorphism': {'enabled': True, 'intensity': 55}, 'gradients': {'enabled': True, 'intensity': 50}, 'liquid_motion': {'enabled': True, 'intensity': 60}},
+        'font': {'family': 'Inter', 'size': 13},
+        'shell': {'panel_opacity': 0.60, 'blur_radius': 16, 'border_radius': 16},
+        'metadata': {'is_preset': True, 'is_ai_generated': False},
+    },
+    {
+        'id': 'neon-purple', 'name': 'Neon Purple',
+        'description': 'Cyberpunk vibes with electric neon',
+        'colors': {
+            'background': '#0D0015', 'paper': '#1A0030', 'surface_elevated': '#2A0050',
+            'surface_overlay': '#3A0068',
+            'primary': '#E040FB', 'primary_light': '#EA80FC', 'primary_dark': '#AA00FF',
+            'secondary': '#00E5FF', 'secondary_light': '#80F0FF', 'secondary_dark': '#00B8D4',
+            'accent': '#76FF03', 'accent_light': '#B2FF59',
+            'text_primary': '#F3E5F5', 'text_secondary': 'rgba(243,229,245,0.72)',
+            'divider': 'rgba(224,64,251,0.15)',
+            'success': '#76FF03', 'warning': '#FFEA00', 'error': '#FF1744', 'info': '#18FFFF',
+        },
+        'glass': {'blur_radius': 24, 'surface_opacity': 0.70, 'elevated_opacity': 0.85, 'border_opacity': 0.12},
+        'animations': {'glassmorphism': {'enabled': True, 'intensity': 85}, 'gradients': {'enabled': True, 'intensity': 70}, 'liquid_motion': {'enabled': True, 'intensity': 75}},
+        'font': {'family': 'Inter', 'size': 13},
+        'shell': {'panel_opacity': 0.50, 'blur_radius': 24, 'border_radius': 16},
+        'metadata': {'is_preset': True, 'is_ai_generated': False},
+    },
+    {
+        'id': 'rose-gold', 'name': 'Rose Gold',
+        'description': 'Elegant rose with warm gold tones',
+        'colors': {
+            'background': '#1A0F14', 'paper': '#2D1B25', 'surface_elevated': '#3E2535',
+            'surface_overlay': '#4F3045',
+            'primary': '#F48FB1', 'primary_light': '#F8BBD0', 'primary_dark': '#C2185B',
+            'secondary': '#FFD54F', 'secondary_light': '#FFE082', 'secondary_dark': '#FFA000',
+            'accent': '#CE93D8', 'accent_light': '#E1BEE7',
+            'text_primary': '#FCE4EC', 'text_secondary': 'rgba(252,228,236,0.72)',
+            'divider': 'rgba(244,143,177,0.15)',
+            'success': '#A5D6A7', 'warning': '#FFE082', 'error': '#EF9A9A', 'info': '#B3E5FC',
+        },
+        'glass': {'blur_radius': 20, 'surface_opacity': 0.82, 'elevated_opacity': 0.90, 'border_opacity': 0.10},
+        'animations': {'glassmorphism': {'enabled': True, 'intensity': 65}, 'gradients': {'enabled': True, 'intensity': 50}, 'liquid_motion': {'enabled': True, 'intensity': 55}},
+        'font': {'family': 'Inter', 'size': 13},
+        'shell': {'panel_opacity': 0.60, 'blur_radius': 20, 'border_radius': 16},
+        'metadata': {'is_preset': True, 'is_ai_generated': False},
+    },
+    {
+        'id': 'arctic-frost', 'name': 'Arctic Frost',
+        'description': 'Cool silver-white with ice accents',
+        'colors': {
+            'background': '#0E1621', 'paper': '#162433', 'surface_elevated': '#1E3044',
+            'surface_overlay': '#263D55',
+            'primary': '#B0BEC5', 'primary_light': '#CFD8DC', 'primary_dark': '#78909C',
+            'secondary': '#80CBC4', 'secondary_light': '#B2DFDB', 'secondary_dark': '#00897B',
+            'accent': '#B3E5FC', 'accent_light': '#E1F5FE',
+            'text_primary': '#ECEFF1', 'text_secondary': 'rgba(236,239,241,0.72)',
+            'divider': 'rgba(176,190,197,0.15)',
+            'success': '#A5D6A7', 'warning': '#FFE082', 'error': '#EF9A9A', 'info': '#80D8FF',
+        },
+        'glass': {'blur_radius': 28, 'surface_opacity': 0.78, 'elevated_opacity': 0.88, 'border_opacity': 0.10},
+        'animations': {'glassmorphism': {'enabled': True, 'intensity': 75}, 'gradients': {'enabled': True, 'intensity': 45}, 'liquid_motion': {'enabled': True, 'intensity': 50}},
+        'font': {'family': 'Inter', 'size': 13},
+        'shell': {'panel_opacity': 0.55, 'blur_radius': 28, 'border_radius': 16},
+        'metadata': {'is_preset': True, 'is_ai_generated': False},
+    },
+]
+
+_THEME_PRESETS_BY_ID = {p['id']: p for p in _THEME_PRESETS}
+
+_SUPPORTED_FONTS = [
+    {'family': 'Inter', 'category': 'sans-serif'},
+    {'family': 'Figtree', 'category': 'sans-serif'},
+    {'family': 'JetBrains Mono', 'category': 'monospace'},
+    {'family': 'Roboto', 'category': 'sans-serif'},
+    {'family': 'Fira Code', 'category': 'monospace'},
+    {'family': 'Source Sans Pro', 'category': 'sans-serif'},
+    {'family': 'Poppins', 'category': 'sans-serif'},
+    {'family': 'IBM Plex Sans', 'category': 'sans-serif'},
+]
+
+
+def _deep_merge(base, overrides):
+    """Deep-merge overrides into base dict (returns new dict)."""
+    result = dict(base)
+    for k, v in overrides.items():
+        if isinstance(v, dict) and isinstance(result.get(k), dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
+
+
+@social_bp.route('/theme/presets', methods=['GET'])
+def theme_get_presets():
+    """Return all curated theme presets (no auth required)."""
+    return _ok({'presets': _THEME_PRESETS})
+
+
+@social_bp.route('/theme/active', methods=['GET'])
+@require_auth
+def theme_get_active():
+    """Return the current user's active theme config."""
+    settings = dict(g.user.settings or {})
+    theme = settings.get('theme') or _THEME_PRESETS_BY_ID['hart-default']
+    return _ok({'theme': theme})
+
+
+@social_bp.route('/theme/apply', methods=['POST'])
+@require_auth
+def theme_apply():
+    """Apply a preset theme by id."""
+    data = request.get_json(silent=True) or {}
+    theme_id = data.get('theme_id', '').strip()
+    if not theme_id:
+        return _err('theme_id required')
+    preset = _THEME_PRESETS_BY_ID.get(theme_id)
+    if not preset:
+        return _err(f'Unknown preset: {theme_id}', 404)
+
+    settings = dict(g.user.settings or {})
+    settings['theme'] = dict(preset)
+    g.user.settings = settings
+    try:
+        db = g.db
+        db.add(g.user)
+        db.commit()
+    except Exception as e:
+        logger.error(f"theme_apply commit error: {e}")
+        return _err('Failed to save theme', 500)
+    return _ok({'theme': preset})
+
+
+@social_bp.route('/theme/customize', methods=['POST'])
+@require_auth
+def theme_customize():
+    """Deep-merge partial overrides into the user's active theme."""
+    overrides = request.get_json(silent=True) or {}
+    if not overrides:
+        return _err('No overrides provided')
+
+    settings = dict(g.user.settings or {})
+    current = settings.get('theme') or dict(_THEME_PRESETS_BY_ID['hart-default'])
+    merged = _deep_merge(current, overrides)
+    merged['metadata'] = dict(merged.get('metadata', {}), is_preset=False)
+    settings['theme'] = merged
+    g.user.settings = settings
+    try:
+        db = g.db
+        db.add(g.user)
+        db.commit()
+    except Exception as e:
+        logger.error(f"theme_customize commit error: {e}")
+        return _err('Failed to save theme', 500)
+    return _ok({'theme': merged})
+
+
+@social_bp.route('/theme/fonts', methods=['GET'])
+def theme_get_fonts():
+    """Return supported font families (no auth required)."""
+    return _ok({'fonts': _SUPPORTED_FONTS})
+
+
+@social_bp.route('/theme/generate', methods=['POST'])
+@require_auth
+def theme_generate():
+    """AI-generate a theme config from a text description."""
+    import json as _json
+    import re as _re
+
+    data = request.get_json(silent=True) or {}
+    description = (data.get('description') or '').strip()
+    if not description:
+        return _err('description required')
+
+    base_id = data.get('base_preset', 'hart-default')
+    base = _THEME_PRESETS_BY_ID.get(base_id, _THEME_PRESETS_BY_ID['hart-default'])
+
+    # Keyword fallback — deterministic mapping when LLM unavailable
+    _keyword_colors = {
+        'ocean': {'primary': '#64B5F6', 'background': '#0B1426', 'paper': '#112240', 'secondary': '#FF8A65'},
+        'sea': {'primary': '#64B5F6', 'background': '#0B1426', 'paper': '#112240', 'secondary': '#FF8A65'},
+        'sunset': {'primary': '#FF8A65', 'background': '#1A0F0A', 'paper': '#2D1B12', 'secondary': '#F48FB1'},
+        'forest': {'primary': '#66BB6A', 'background': '#0A1F0A', 'paper': '#142814', 'secondary': '#FFB74D'},
+        'neon': {'primary': '#E040FB', 'background': '#0D0015', 'paper': '#1A0030', 'secondary': '#00E5FF'},
+        'cyber': {'primary': '#E040FB', 'background': '#0D0015', 'paper': '#1A0030', 'secondary': '#00E5FF'},
+        'rose': {'primary': '#F48FB1', 'background': '#1A0F14', 'paper': '#2D1B25', 'secondary': '#FFD54F'},
+        'gold': {'primary': '#FFD54F', 'background': '#1A0F0A', 'paper': '#2D1B12', 'secondary': '#F48FB1'},
+        'ice': {'primary': '#B0BEC5', 'background': '#0E1621', 'paper': '#162433', 'secondary': '#80CBC4'},
+        'arctic': {'primary': '#B0BEC5', 'background': '#0E1621', 'paper': '#162433', 'secondary': '#80CBC4'},
+        'night': {'primary': '#00B8D9', 'background': '#000000', 'paper': '#0A0A0F', 'secondary': '#7C4DFF'},
+        'midnight': {'primary': '#00B8D9', 'background': '#000000', 'paper': '#0A0A0F', 'secondary': '#7C4DFF'},
+        'blood': {'primary': '#FF1744', 'background': '#1A0000', 'paper': '#2D0A0A', 'secondary': '#FF6E40'},
+        'purple': {'primary': '#CE93D8', 'background': '#1A0025', 'paper': '#2A0040', 'secondary': '#80CBC4'},
+        'blue': {'primary': '#64B5F6', 'background': '#0B1426', 'paper': '#112240', 'secondary': '#FF8A65'},
+        'green': {'primary': '#66BB6A', 'background': '#0A1F0A', 'paper': '#142814', 'secondary': '#FFB74D'},
+        'warm': {'primary': '#FF8A65', 'background': '#1A0F0A', 'paper': '#2D1B12', 'secondary': '#F48FB1'},
+        'cool': {'primary': '#B0BEC5', 'background': '#0E1621', 'paper': '#162433', 'secondary': '#80CBC4'},
+    }
+
+    # Try LLM generation first
+    try:
+        from hevolve_backend_adapter import chat as _adapter_chat
+        schema_hint = '{"colors":{"background":"#hex","paper":"#hex","primary":"#hex","primary_light":"#hex","primary_dark":"#hex","secondary":"#hex","accent":"#hex","text_primary":"#hex"}}'
+        system_prompt = (
+            "You are a UI theme designer for a dark-mode social platform. "
+            "Given the user description, generate ONLY a valid JSON object with a 'colors' key. "
+            f"Schema: {schema_hint}. "
+            "Rules: all backgrounds MUST be dark (luminance < 0.15). "
+            "Primary must have >= 4.5:1 contrast on background. "
+            "Return ONLY raw JSON, no markdown fences, no explanation."
+        )
+        llm_resp = _adapter_chat(
+            f"{system_prompt}\n\nUser description: \"{description}\"",
+            casual_conv=True, timeout=30
+        )
+        resp_text = llm_resp if isinstance(llm_resp, str) else str(llm_resp.get('response', ''))
+        # Extract JSON from response
+        json_match = _re.search(r'\{[\s\S]*\}', resp_text)
+        if json_match:
+            generated = _json.loads(json_match.group())
+            colors = generated.get('colors', generated)
+            merged_colors = dict(base['colors'], **{k: v for k, v in colors.items() if isinstance(v, str) and (v.startswith('#') or v.startswith('rgb'))})
+            result = dict(base, colors=merged_colors, id='ai-generated', name=f'AI: {description[:30]}')
+            result['metadata'] = {'is_preset': False, 'is_ai_generated': True, 'ai_prompt': description}
+            return _ok({'theme': result})
+    except Exception as e:
+        logger.warning(f"AI theme generation failed, using keyword fallback: {e}")
+
+    # Keyword fallback
+    desc_lower = description.lower()
+    color_overrides = {}
+    for keyword, colors in _keyword_colors.items():
+        if keyword in desc_lower:
+            color_overrides.update(colors)
+            break
+
+    if color_overrides:
+        merged_colors = dict(base['colors'], **color_overrides)
+        result = dict(base, colors=merged_colors, id='ai-generated', name=f'AI: {description[:30]}')
+        result['metadata'] = {'is_preset': False, 'is_ai_generated': True, 'ai_prompt': description}
+        return _ok({'theme': result})
+
+    return _err('Could not generate a theme from that description. Try keywords like ocean, sunset, neon, forest.', 422)
+
+
+@social_bp.route('/users/<int:user_id>/theme', methods=['GET'])
+def theme_get_user(user_id):
+    """Return any user's theme (public, for visitor theming)."""
+    db = None
+    try:
+        db = get_db()
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            return _err('User not found', 404)
+        settings = dict(user.settings or {})
+        theme = settings.get('theme')
+        return _ok({'theme': theme})
+    except Exception as e:
+        logger.error(f"theme_get_user error: {e}")
+        return _err('Failed to fetch user theme', 500)
+    finally:
+        if db:
+            db.close()

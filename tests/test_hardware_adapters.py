@@ -500,7 +500,7 @@ class TestROSBridgeAdapter:
         assert _is_image_topic('/robot/rgb') is True
         assert _is_image_topic('/depth/frame') is True
         assert _is_image_topic('/robot/cmd') is False
-        assert _is_image_topic('/hyve/input') is False
+        assert _is_image_topic('/hart/input') is False
 
     def test_connect_no_rclpy(self):
         adapter = ROSBridgeAdapter()

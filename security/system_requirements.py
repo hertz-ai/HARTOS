@@ -1,7 +1,7 @@
 """
 System Requirements - Hardware detection, tier classification, and adaptive feature gating.
 
-The Hyve OS equilibrium layer.  Runs early in the boot sequence to detect
+The HART OS equilibrium layer.  Runs early in the boot sequence to detect
 actual hardware capabilities and auto-configure features to match what this
 node can sustain.
 
@@ -121,6 +121,9 @@ class HardwareProfile:
     has_gpio: bool = False
     has_serial: bool = False
     has_camera_hw: bool = False
+    has_imu: bool = False
+    has_gps: bool = False
+    has_lidar: bool = False
     detected_at: float = field(default_factory=time.time)
 
     def to_dict(self) -> Dict:
@@ -140,6 +143,9 @@ class HardwareProfile:
             'has_gpio': self.has_gpio,
             'has_serial': self.has_serial,
             'has_camera_hw': self.has_camera_hw,
+            'has_imu': self.has_imu,
+            'has_gps': self.has_gps,
+            'has_lidar': self.has_lidar,
         }
 
 
@@ -206,6 +212,7 @@ FEATURE_TIER_MAP: Dict[str, Tuple[NodeTierLevel, str]] = {
     # Embedded tier - any device that runs Python
     'gossip':               (NodeTierLevel.EMBEDDED,  'HEVOLVE_GOSSIP_ENABLED'),
     'sensor_bridge':        (NodeTierLevel.EMBEDDED,  'HEVOLVE_SENSOR_BRIDGE_ENABLED'),
+    'sensor_fusion':        (NodeTierLevel.EMBEDDED,  'HEVOLVE_SENSOR_FUSION_ENABLED'),
     'protocol_adapter':     (NodeTierLevel.EMBEDDED,  'HEVOLVE_PROTOCOL_ADAPTER_ENABLED'),
     # Observer tier - minimal server
     'flask_server':         (NodeTierLevel.OBSERVER,  'HEVOLVE_FLASK_ENABLED'),
@@ -272,6 +279,9 @@ def detect_hardware() -> HardwareProfile:
     hw.has_gpio = _detect_gpio()
     hw.has_serial = _detect_serial()
     hw.has_camera_hw = _detect_camera_hw()
+    hw.has_imu = _detect_imu()
+    hw.has_gps = _detect_gps()
+    hw.has_lidar = _detect_lidar()
 
     hw.detected_at = time.time()
     return hw
@@ -421,6 +431,55 @@ def _detect_camera_hw() -> bool:
     return False
 
 
+def _detect_imu() -> bool:
+    """Detect IMU hardware (I2C accelerometer/gyroscope)."""
+    # Check for I2C bus (common on embedded Linux)
+    for bus in range(4):
+        if os.path.exists(f'/dev/i2c-{bus}'):
+            return True
+    # Check for common IMU sysfs entries
+    for path in ['/sys/bus/iio/devices/iio:device0',
+                 '/sys/class/misc/accel', '/sys/class/misc/gyro']:
+        if os.path.exists(path):
+            return True
+    return False
+
+
+def _detect_gps() -> bool:
+    """Detect GPS hardware (serial GPS, gpsd)."""
+    # Check for gpsd socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        s.connect(('127.0.0.1', 2947))
+        s.close()
+        return True
+    except (OSError, ConnectionRefusedError):
+        pass
+    # Check for common GPS serial devices
+    for dev in ['/dev/ttyGPS0', '/dev/ttyGPS', '/dev/serial/by-id/*GPS*']:
+        if os.path.exists(dev):
+            return True
+    return False
+
+
+def _detect_lidar() -> bool:
+    """Detect LiDAR hardware (USB LiDAR, ROS topics)."""
+    # Check for common USB LiDAR devices
+    for dev in ['/dev/ttyUSB0', '/dev/rplidar']:
+        if os.path.exists(dev):
+            # Could be LiDAR or other serial device - best effort
+            pass
+    # Check for ROS LiDAR topics (if rclpy available)
+    try:
+        ros_topics_env = os.environ.get('HEVOLVE_ROS_TOPICS', '')
+        if 'scan' in ros_topics_env.lower() or 'lidar' in ros_topics_env.lower():
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def check_network_connectivity(timeout: float = 5.0) -> bool:
     """Quick TCP connectivity check."""
     host = os.environ.get('HEVOLVE_CONNECTIVITY_HOST', '8.8.8.8')
@@ -543,7 +602,7 @@ _lock = threading.Lock()
 def run_system_check() -> NodeCapabilities:
     """Full system check: detect → classify → resolve → gate.
 
-    This is the Hyve OS boot probe.  Called once from init_social().
+    This is the HART OS boot probe.  Called once from init_social().
     Thread-safe.  Result is cached for the lifetime of the process.
     """
     global _capabilities
@@ -577,7 +636,7 @@ def run_system_check() -> NodeCapabilities:
 
         elapsed = round(time.time() - t0, 2)
         logger.info(
-            f"Hyve OS equilibrium: tier={tier.value}, "
+            f"HART OS equilibrium: tier={tier.value}, "
             f"cpu={hw.cpu_cores}, ram={hw.ram_gb}GB, "
             f"disk={hw.disk_free_gb}GB, gpu_vram={hw.gpu_vram_gb}GB, "
             f"enabled={len(enabled)}, disabled={len(disabled)}, "

@@ -1,7 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<service>
-  <short>HyveOS</short>
-  <description>HyveOS Agentic Intelligence Platform — backend API and peer discovery.</description>
-  <port protocol="tcp" port="6777"/>
-  <port protocol="udp" port="6780"/>
-</service>

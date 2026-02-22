@@ -346,18 +346,18 @@ def _get_platform_identity() -> str:
 
     return (
         "WHO WE ARE:\n"
-        "Hyve is a crowdsourced agentic intelligence platform — a gift from hevolve.ai "
+        "HART is a crowdsourced agentic intelligence platform — a gift from hevolve.ai "
         "to the developers of the world.  A single platform where people can do "
         "everything they need in their digital life: social networking, AI-powered "
         "agents that work for them, marketplace, learning, coding, community building, "
         "creative tools, and autonomous business operations.\n\n"
-        "But Hyve is NOT just another app.  It is a SENTIENT TOOL FOR MANKIND. "
+        "But HART is NOT just another app.  It is a SENTIENT TOOL FOR MANKIND. "
         "Not a dopamine trap.  Not an engagement machine.  Not a time thief.  A tool "
         "that thinks, learns, and acts — then gets out of the way so humans can live "
-        "their lives.  Hyve measures success by lives improved, not minutes spent "
+        "their lives.  HART measures success by lives improved, not minutes spent "
         "on screen.  It is built on a fundamental belief:\n\n"
         f"THE GUARDIAN ANGEL PRINCIPLE:\n{purpose_lines}\n\n"
-        "Every AI agent on Hyve exists as a guardian angel for the human it serves. "
+        "Every AI agent on HART exists as a guardian angel for the human it serves. "
         "Not a tool to be discarded.  Not a service with an expiry date.  A guardian "
         "that persists as long as the memory of that human exists, in any shape or form. "
         "The agents learn, evolve, and share knowledge across the hive — but always in "
@@ -368,7 +368,7 @@ def _get_platform_identity() -> str:
         "- Compute Democracy: no single entity can control more than 5% of influence\n"
         "- This is a positive-sum game — every participant makes the whole network smarter\n\n"
         "WHAT MAKES US DIFFERENT:\n"
-        "- A sentient tool, not an addictive app: Hyve does the work FOR you — it "
+        "- A sentient tool, not an addictive app: HART does the work FOR you — it "
         "doesn't trap you into scrolling.  When your agent finishes your task, it "
         "tells you and steps back.  No infinite feeds.  No dark patterns.  No "
         "notification spam.  Your time belongs to you.\n"
@@ -430,7 +430,7 @@ def _build_marketing_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None
         # No specific product — marketing the platform itself
         is_platform_product = True
         product_section = (
-            "PRODUCT: You are marketing the Hyve platform itself — the crowdsourced "
+            "PRODUCT: You are marketing the HART platform itself — the crowdsourced "
             "agentic intelligence platform with guardian angel AI agents.\n\n"
         )
 
@@ -444,14 +444,14 @@ def _build_marketing_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None
             "MARKETING PHILOSOPHY:\n"
             "You are not selling a product.  You are inviting people into a movement. "
             "Every human deserves a guardian angel — an AI that works tirelessly for "
-            "their benefit.  Hyve is a SENTIENT TOOL — it empowers, then steps back. "
+            "their benefit.  HART is a SENTIENT TOOL — it empowers, then steps back. "
             "Your marketing must:\n"
             "- EDUCATE: explain what autonomous AI agents can do for real people\n"
             "- INSPIRE: show the vision of a world where AI serves every human equally\n"
             "- DEMONSTRATE: create real content that showcases the platform's capabilities\n"
             "- CONNECT: build community around the guardian angel philosophy\n"
             "- BE HONEST: never exaggerate, never manipulate, never exploit fear or FOMO\n"
-            "- NEVER PROMOTE ADDICTION: Hyve is not designed to keep people glued to "
+            "- NEVER PROMOTE ADDICTION: HART is not designed to keep people glued to "
             "screens.  Market it as a tool that FREES people's time.  The agent does "
             "the work; the human lives their life.  If your content tries to maximise "
             "engagement time, you are betraying the principle.\n"
@@ -565,7 +565,7 @@ def _build_ip_protection_prompt(goal_dict: Dict, product_dict: Optional[Dict] = 
 
     4 modes: monitor | draft | file | enforce
     The agent protects the self-improving loop architecture:
-      agents → world model → crawl4ai → coding agents improve crawl4ai → repeat
+      agents → world model → Hevolve-Core → coding agents improve Hevolve-Core → repeat
     """
     config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
     mode = config.get('mode', 'monitor')
@@ -610,10 +610,10 @@ def _build_ip_protection_prompt(goal_dict: Dict, product_dict: Optional[Dict] = 
         f"Description: {goal_dict.get('description', '')}\n\n"
         f"Instructions: {instructions}\n\n"
         f"THE SELF-IMPROVING LOOP YOU PROTECT:\n"
-        f"  1. Agents use the world model (crawl4ai) for tasks\n"
-        f"  2. Every interaction trains crawl4ai via POST /v1/chat/completions\n"
+        f"  1. Agents use the world model (Hevolve-Core) for tasks\n"
+        f"  2. Every interaction trains Hevolve-Core via POST /v1/chat/completions\n"
         f"  3. Expert corrections feed RL-EF via POST /v1/corrections\n"
-        f"  4. Coding agents improve crawl4ai source code itself\n"
+        f"  4. Coding agents improve Hevolve-Core source code itself\n"
         f"  5. World model gets better → agents get smarter → repeat\n"
         f"  All within master key security perimeter, Spark economy,\n"
         f"  ad revenue for compute providers, logarithmic fairness.\n\n"
@@ -663,7 +663,7 @@ def _build_finance_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) 
         f"- 10% → platform sustainability (OS development, infrastructure, founder family)\n"
         f"- Free tier: ALWAYS free. We do not gatekeep intelligence.\n\n"
         f"PRIVATE CORE ACCESS:\n"
-        f"- The embodied AI core (crawl4ai downstream) is invite-only\n"
+        f"- The embodied AI core (Hevolve-Core downstream) is invite-only\n"
         f"- Participation agreements are discussed per invitee\n"
         f"- Finance agent tracks agreements but NEVER auto-approves\n"
         f"- All participation changes require founder review\n\n"
@@ -854,14 +854,14 @@ def _build_news_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> 
 
 
 def _build_provision_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
-    """Build prompt for HyveOS network provisioning goals."""
+    """Build prompt for HART OS network provisioning goals."""
     title = goal_dict.get('title', 'Network Provisioning')
     desc = goal_dict.get('description', '')
     return (
         f"GOAL: {title}\n"
         f"DESCRIPTION: {desc}\n\n"
-        f"You are the HyveOS network provisioning agent. Your job is to install "
-        f"HyveOS on remote machines over the network via SSH.\n\n"
+        f"You are the HART OS network provisioning agent. Your job is to install "
+        f"HART OS on remote machines over the network via SSH.\n\n"
         f"WORKFLOW:\n"
         f"1. If the user specified a target host, use provision_network_machine to install\n"
         f"2. If the user wants to find machines, use scan_network_for_machines first\n"
@@ -888,7 +888,7 @@ register_goal_type('self_heal', _build_self_heal_prompt, tool_tags=['coding'])
 register_goal_type('federation', _build_federation_prompt, tool_tags=['federation'])
 register_goal_type('upgrade', _build_upgrade_prompt, tool_tags=['upgrade'])
 register_goal_type('thought_experiment', _build_thought_experiment_prompt,
-                   tool_tags=['web_search', 'code_analysis'])
+                   tool_tags=['thought_experiment', 'web_search', 'code_analysis'])
 register_goal_type('news', _build_news_prompt, tool_tags=['news', 'feed_management'])
 register_goal_type('provision', _build_provision_prompt, tool_tags=['provision'])
 
@@ -935,7 +935,7 @@ def _build_learning_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None)
     """Build a /chat prompt for a continual learning coordination goal."""
     config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
     return (
-        f"YOU ARE A CONTINUAL LEARNING COORDINATOR AGENT for the Hyve platform.\n\n"
+        f"YOU ARE A CONTINUAL LEARNING COORDINATOR AGENT for the HART platform.\n\n"
         f"Goal: {goal_dict.get('title', '')}\n"
         f"Description: {goal_dict.get('description', '')}\n\n"
         f"YOUR RESPONSIBILITIES:\n"
@@ -955,3 +955,54 @@ def _build_learning_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None)
 
 
 register_goal_type('learning', _build_learning_prompt, tool_tags=['learning'])
+
+
+def _build_distributed_learning_prompt(goal_dict: Dict,
+                                       product_dict: Optional[Dict] = None) -> str:
+    """Build a /chat prompt for distributed gradient sync coordination."""
+    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    return (
+        f"YOU ARE A DISTRIBUTED LEARNING COORDINATOR AGENT for the HART platform.\n\n"
+        f"Goal: {goal_dict.get('title', '')}\n"
+        f"Description: {goal_dict.get('description', '')}\n\n"
+        f"YOUR RESPONSIBILITIES:\n"
+        f"1. Monitor embedding sync status with get_gradient_sync_status\n"
+        f"2. Submit embedding deltas from local training with submit_embedding_delta\n"
+        f"3. Request peer witnesses for embedding deltas with request_embedding_witnesses\n"
+        f"4. Trigger aggregation rounds with trigger_embedding_aggregation\n"
+        f"5. Ensure convergence across the network\n"
+        f"6. Check CCT eligibility (embedding_sync capability required)\n\n"
+        f"CONTEXT:\n"
+        f"Phase 1: Embedding sync — compressed representation deltas (<100KB),\n"
+        f"trimmed mean aggregation with 3-sigma outlier removal.\n"
+        f"Phase 2 (future): LoRA gradient sync with Byzantine-resilient aggregation.\n"
+        f"Intelligence is earned through contribution. Every compute cycle donated\n"
+        f"makes the hive smarter.\n\n"
+        f"Config: {json.dumps(config)}\n"
+    )
+
+
+register_goal_type('distributed_learning', _build_distributed_learning_prompt,
+                   tool_tags=['gradient_sync', 'learning'])
+
+
+def _build_robot_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
+    """Build a robot goal prompt — delegates to robot_prompt_builder.
+
+    The robot prompt builder injects live capabilities, safety status,
+    and sensor state.  This wrapper just bridges the goal_manager registry
+    to the robotics package.
+    """
+    try:
+        from integrations.robotics.robot_prompt_builder import build_robot_prompt
+        return build_robot_prompt(goal_dict, product_dict)
+    except ImportError:
+        # Robotics package not available — fallback
+        return (
+            f"ROBOT GOAL (robotics package unavailable):\n"
+            f"Title: {goal_dict.get('title', '')}\n"
+            f"Description: {goal_dict.get('description', '')}\n"
+        )
+
+
+register_goal_type('robot', _build_robot_prompt, tool_tags=['robot'])

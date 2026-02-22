@@ -165,10 +165,14 @@ class DashboardConfig:
         """Get persistence path, defaulting to Docker-friendly location."""
         if self.persistence_path:
             return self.persistence_path
-        return os.environ.get(
-            "DASHBOARD_DATA_PATH",
-            "/app/data/dashboard" if os.path.exists("/app") else "./agent_data/dashboard"
-        )
+        import sys as _sys
+        if os.environ.get('NUNBA_BUNDLED') or getattr(_sys, 'frozen', False):
+            _default = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data', 'dashboard')
+        elif os.path.exists("/app"):
+            _default = "/app/data/dashboard"
+        else:
+            _default = "./agent_data/dashboard"
+        return os.environ.get("DASHBOARD_DATA_PATH", _default)
 
 
 class AdminDashboard:

@@ -1,8 +1,0 @@
-[Plymouth Theme]
-Name=HyveOS
-Description=HyveOS boot splash — Crowdsourced Agentic Intelligence
-ModuleName=script
-
-[script]
-ImageDir=/usr/share/plymouth/themes/hyve-theme
-ScriptFile=/usr/share/plymouth/themes/hyve-theme/hyve-theme.script

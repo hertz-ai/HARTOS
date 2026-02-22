@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
-  title: Hyve API
-  description: The Hyve platform API (formerly Hevolve-db-app) provides programmatic access to the crowdsourced agentic intelligence platform. Explore the various endpoints for agent orchestration, social communities, goal management, and distributed compute.
+  title: HART API
+  description: The HART platform API (formerly Hevolve-db-app) provides programmatic access to the Hevolve Agentic Runtime. Explore the various endpoints for agent orchestration, social communities, goal management, and distributed compute.
   version: '1.0'
 servers:
   - url: https://azurekong.hertzai.com:8443/db

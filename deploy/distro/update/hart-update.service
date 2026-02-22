@@ -1,0 +1,12 @@
+[Unit]
+Description=HART OS Update Check
+After=network-online.target hart-backend.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=hart
+ExecStart=/opt/hart/venv/bin/python /opt/hart/deploy/distro/update/hart-update-service.py
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=600

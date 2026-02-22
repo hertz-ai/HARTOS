@@ -168,8 +168,8 @@ simplemem>=0.1.0
 # RSS/Atom feed parsing and generation
 feedparser>=6.0.0
 
-# SSH for network provisioning (HyveOS remote install)
+# SSH for network provisioning (HART OS remote install)
 paramiko>=3.0
 
-# System tray indicator (HyveOS desktop, optional)
+# System tray indicator (HART OS desktop, optional)
 pystray>=0.19.0

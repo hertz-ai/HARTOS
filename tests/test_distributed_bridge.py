@@ -63,7 +63,7 @@ def mock_task():
     task.task_id = 'task_abc123'
     task.description = 'Test task: generate marketing content'
     task.context = {
-        'prompt': 'Create a social media post about Hyve',
+        'prompt': 'Create a social media post about HART',
         'goal_type': 'marketing',
         'user_id': 'test_user',
         'capabilities_required': ['marketing'],
@@ -432,10 +432,10 @@ class TestDistributedEndToEnd:
 
         # 1. Submit goal (what the daemon does)
         goal_id = coordinator.submit_goal(
-            objective='Create marketing post for Hyve',
+            objective='Create marketing post for HART',
             decomposed_tasks=[{
                 'task_id': 'mkt_task_1',
-                'description': 'Write a Twitter post about Hyve AI platform',
+                'description': 'Write a Twitter post about HART AI platform',
                 'capabilities': ['marketing'],
             }],
             context={'goal_type': 'marketing', 'user_id': 'sys_agent'},
@@ -452,7 +452,7 @@ class TestDistributedEndToEnd:
         # 3. Submit result (worker completed the task)
         result_info = coordinator.submit_result(
             'mkt_task_1', 'worker_node_1',
-            'Check out Hyve — crowdsourced AI for everyone! #AI #HevolveAI')
+            'Check out HART — crowdsourced AI for everyone! #AI #HevolveAI')
         assert result_info['status'] == 'completed'
         assert 'result_hash' in result_info
 

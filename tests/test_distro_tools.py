@@ -1,8 +1,8 @@
 """
-Tests for HyveOS Linux tools:
-  - hyve-cli.py (CLI tool)
-  - hyve_dbus_service.py (D-Bus IPC bridge)
-  - hyve-tray.py (system tray indicator)
+Tests for HART OS Linux tools:
+  - hart-cli.py (CLI tool)
+  - hart_dbus_service.py (D-Bus IPC bridge)
+  - hart-tray.py (system tray indicator)
   - generate-logo.py (Plymouth logo generator)
 
 All tests use mocks to avoid requiring dbus, pystray, or Pillow.
@@ -36,33 +36,33 @@ def _load_module(name, filepath):
 
 
 # ──────────────────────────────────────────────────
-# CLI Tests (hyve-cli.py)
+# CLI Tests (hart-cli.py)
 # ──────────────────────────────────────────────────
 
-CLI_PATH = os.path.join(os.path.dirname(__file__), '..', 'deploy', 'linux', 'hyve-cli.py')
-_cli_spec, cli = _load_module('hyve_cli', CLI_PATH)
+CLI_PATH = os.path.join(os.path.dirname(__file__), '..', 'deploy', 'linux', 'hart-cli.py')
+_cli_spec, cli = _load_module('hart_cli', CLI_PATH)
 _cli_spec.loader.exec_module(cli)
 
 
-class TestHyveCLIConstants:
+class TestHartCLIConstants:
 
-    def test_hyve_version(self):
-        assert cli.HYVE_VERSION == "1.0.0"
+    def test_hart_version(self):
+        assert cli.HART_VERSION == "1.0.0"
 
     def test_service_list(self):
         expected = [
-            "hyve-backend",
-            "hyve-discovery",
-            "hyve-agent-daemon",
-            "hyve-vision",
-            "hyve-llm",
+            "hart-backend",
+            "hart-discovery",
+            "hart-agent-daemon",
+            "hart-vision",
+            "hart-llm",
         ]
         assert cli.SERVICES == expected
 
     def test_directories(self):
-        assert cli.CONFIG_DIR == "/etc/hyve"
-        assert cli.DATA_DIR == "/var/lib/hyve"
-        assert cli.INSTALL_DIR == "/opt/hyve"
+        assert cli.CONFIG_DIR == "/etc/hart"
+        assert cli.DATA_DIR == "/var/lib/hart"
+        assert cli.INSTALL_DIR == "/opt/hart"
 
 
 class TestGetBackendPort:
@@ -74,17 +74,17 @@ class TestGetBackendPort:
         assert port == 6777
 
     def test_reads_from_env_file(self, tmp_path):
-        """Reads HYVE_BACKEND_PORT from hyve.env."""
-        env_file = tmp_path / 'hyve.env'
-        env_file.write_text('HYVE_BACKEND_PORT=7777\n')
+        """Reads HART_BACKEND_PORT from hart.env."""
+        env_file = tmp_path / 'hart.env'
+        env_file.write_text('HART_BACKEND_PORT=7777\n')
         with patch.object(cli, 'CONFIG_DIR', str(tmp_path)):
             port = cli.get_backend_port()
         assert port == 7777
 
     def test_ignores_empty_port(self, tmp_path):
         """Falls back to 6777 when port value is empty."""
-        env_file = tmp_path / 'hyve.env'
-        env_file.write_text('HYVE_BACKEND_PORT=\n')
+        env_file = tmp_path / 'hart.env'
+        env_file.write_text('HART_BACKEND_PORT=\n')
         with patch.object(cli, 'CONFIG_DIR', str(tmp_path)):
             port = cli.get_backend_port()
         assert port == 6777
@@ -156,7 +156,7 @@ class TestCLICommands:
         with patch('os.path.exists', return_value=False):
             cli.cmd_version(args)
         captured = capsys.readouterr()
-        assert 'HyveOS 1.0.0' in captured.out
+        assert 'HART OS 1.0.0' in captured.out
 
     def test_cmd_node_id_exists(self, tmp_path, capsys):
         """node-id prints hex public key."""
@@ -177,19 +177,19 @@ class TestCLICommands:
     def test_cmd_start(self, mock_system, capsys):
         """start command calls systemctl."""
         cli.cmd_start(MagicMock())
-        mock_system.assert_called_once_with('sudo systemctl start hyve.target')
+        mock_system.assert_called_once_with('sudo systemctl start hart.target')
 
     @patch('os.system')
     def test_cmd_stop(self, mock_system, capsys):
         """stop command calls systemctl."""
         cli.cmd_stop(MagicMock())
-        mock_system.assert_called_once_with('sudo systemctl stop hyve.target')
+        mock_system.assert_called_once_with('sudo systemctl stop hart.target')
 
     @patch('os.system')
     def test_cmd_restart(self, mock_system, capsys):
         """restart command calls systemctl restart."""
         cli.cmd_restart(MagicMock())
-        mock_system.assert_called_once_with('sudo systemctl restart hyve.target')
+        mock_system.assert_called_once_with('sudo systemctl restart hart.target')
 
     def test_cmd_status_with_backend(self, capsys):
         """status shows service states and backend health."""
@@ -198,7 +198,7 @@ class TestCLICommands:
                 with patch('os.path.exists', return_value=False):
                     cli.cmd_status(MagicMock())
         captured = capsys.readouterr()
-        assert 'HyveOS 1.0.0' in captured.out
+        assert 'HART OS 1.0.0' in captured.out
 
     def test_cmd_health_with_dashboard(self, capsys):
         """health shows dashboard data when available."""
@@ -237,14 +237,14 @@ class TestCLICommands:
     def test_cmd_logs(self):
         """logs calls journalctl with correct service."""
         args = MagicMock()
-        args.service = 'hyve-backend'
+        args.service = 'hart-backend'
         args.lines = 100
         args.follow = False
         with patch('os.system') as mock_system:
             cli.cmd_logs(args)
         call_str = mock_system.call_args[0][0]
         assert 'journalctl' in call_str
-        assert 'hyve-backend' in call_str
+        assert 'hart-backend' in call_str
 
 
 class TestCLIMainParser:
@@ -299,8 +299,8 @@ class TestDBusService:
             'gi.repository': mock_gi.repository,
         }):
             dbus_path = os.path.join(os.path.dirname(__file__), '..',
-                                     'deploy', 'linux', 'dbus', 'hyve_dbus_service.py')
-            spec = importlib.util.spec_from_file_location('hyve_dbus_svc', dbus_path)
+                                     'deploy', 'linux', 'dbus', 'hart_dbus_service.py')
+            spec = importlib.util.spec_from_file_location('hart_dbus_svc', dbus_path)
             dbus_mod = importlib.util.module_from_spec(spec)
             with patch('builtins.open', side_effect=FileNotFoundError):
                 spec.loader.exec_module(dbus_mod)
@@ -329,8 +329,8 @@ class TestDBusService:
             'gi.repository': mock_gi.repository,
         }):
             dbus_path = os.path.join(os.path.dirname(__file__), '..',
-                                     'deploy', 'linux', 'dbus', 'hyve_dbus_service.py')
-            spec = importlib.util.spec_from_file_location('hyve_dbus_svc2', dbus_path)
+                                     'deploy', 'linux', 'dbus', 'hart_dbus_service.py')
+            spec = importlib.util.spec_from_file_location('hart_dbus_svc2', dbus_path)
             dbus_mod = importlib.util.module_from_spec(spec)
             with patch('builtins.open', side_effect=FileNotFoundError):
                 spec.loader.exec_module(dbus_mod)
@@ -354,15 +354,15 @@ class TestDBusService:
             'gi.repository': mock_gi.repository,
         }):
             dbus_path = os.path.join(os.path.dirname(__file__), '..',
-                                     'deploy', 'linux', 'dbus', 'hyve_dbus_service.py')
-            spec = importlib.util.spec_from_file_location('hyve_dbus_svc3', dbus_path)
+                                     'deploy', 'linux', 'dbus', 'hart_dbus_service.py')
+            spec = importlib.util.spec_from_file_location('hart_dbus_svc3', dbus_path)
             dbus_mod = importlib.util.module_from_spec(spec)
             with patch('builtins.open', side_effect=FileNotFoundError):
                 spec.loader.exec_module(dbus_mod)
 
-            assert dbus_mod.BUS_NAME == 'com.hyve.Agent'
-            assert dbus_mod.OBJ_PATH == '/com/hyve/Agent'
-            assert dbus_mod.IFACE == 'com.hyve.Agent'
+            assert dbus_mod.BUS_NAME == 'com.hart.Agent'
+            assert dbus_mod.OBJ_PATH == '/com/hart/Agent'
+            assert dbus_mod.IFACE == 'com.hart.Agent'
             assert dbus_mod.FLEET_POLL_INTERVAL == 10
 
     def test_backend_port_default(self):
@@ -379,8 +379,8 @@ class TestDBusService:
             'gi.repository': mock_gi.repository,
         }):
             dbus_path = os.path.join(os.path.dirname(__file__), '..',
-                                     'deploy', 'linux', 'dbus', 'hyve_dbus_service.py')
-            spec = importlib.util.spec_from_file_location('hyve_dbus_svc4', dbus_path)
+                                     'deploy', 'linux', 'dbus', 'hart_dbus_service.py')
+            spec = importlib.util.spec_from_file_location('hart_dbus_svc4', dbus_path)
             dbus_mod = importlib.util.module_from_spec(spec)
             with patch('builtins.open', side_effect=FileNotFoundError):
                 spec.loader.exec_module(dbus_mod)
@@ -392,7 +392,7 @@ class TestDBusService:
 # System Tray Tests (mocked pystray + PIL)
 # ──────────────────────────────────────────────────
 
-class TestHyveTray:
+class TestHartTray:
     """Test tray logic without requiring pystray."""
 
     def _load_tray_module(self):
@@ -414,8 +414,8 @@ class TestHyveTray:
             'PIL.ImageFont': mock_pil_font,
         }):
             tray_path = os.path.join(os.path.dirname(__file__), '..',
-                                     'deploy', 'linux', 'desktop', 'hyve-tray.py')
-            spec = importlib.util.spec_from_file_location('hyve_tray', tray_path)
+                                     'deploy', 'linux', 'desktop', 'hart-tray.py')
+            spec = importlib.util.spec_from_file_location('hart_tray', tray_path)
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
             return mod
@@ -453,11 +453,11 @@ class TestHyveTray:
             result = mod._api_get('/status')
             assert result is None
 
-    def test_hyve_tray_init(self):
-        """HyveTray initializes with unknown status."""
+    def test_hart_tray_init(self):
+        """HartTray initializes with unknown status."""
         mod = self._load_tray_module()
-        with patch.object(mod.HyveTray, '_get_node_id', return_value='abcd1234'):
-            tray = mod.HyveTray()
+        with patch.object(mod.HartTray, '_get_node_id', return_value='abcd1234'):
+            tray = mod.HartTray()
             assert tray.status == 'unknown'
             assert tray.node_id == 'abcd1234'
             assert tray._running is True
@@ -467,7 +467,7 @@ class TestHyveTray:
         mod = self._load_tray_module()
         with patch('builtins.open', MagicMock(
             return_value=BytesIO(b'\xab\xcd\xef\x01' * 4))):
-            tray = mod.HyveTray.__new__(mod.HyveTray)
+            tray = mod.HartTray.__new__(mod.HartTray)
             node_id = tray._get_node_id()
         # Returns hex string
         assert isinstance(node_id, str)
@@ -476,7 +476,7 @@ class TestHyveTray:
         """_get_node_id returns 'not-initialized' when key missing."""
         mod = self._load_tray_module()
         with patch('builtins.open', side_effect=FileNotFoundError):
-            tray = mod.HyveTray.__new__(mod.HyveTray)
+            tray = mod.HartTray.__new__(mod.HartTray)
             node_id = tray._get_node_id()
         assert node_id == 'not-initialized'
 
@@ -593,7 +593,7 @@ class TestPlymouthLogoGenerator:
             points.append((cx + radius * math.cos(angle), cy + radius * math.sin(angle)))
         draw.polygon(points, fill=TEAL)
 
-        output = str(tmp_path / 'hyve-logo.png')
+        output = str(tmp_path / 'hart-logo.png')
         img.save(output, 'PNG')
 
         assert os.path.exists(output)
@@ -605,7 +605,7 @@ class TestPlymouthLogoGenerator:
         assert sig == b'\x89PNG\r\n\x1a\n'
 
     def test_teal_color_values(self):
-        """Hyve teal is (78, 205, 196)."""
+        """HART teal is (78, 205, 196)."""
         assert (78, 205, 196) == (78, 205, 196)
 
     def test_logo_dimensions(self):

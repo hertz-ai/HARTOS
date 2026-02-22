@@ -1937,7 +1937,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                 response = await subscribe_and_return({'prompt_id': prompt_id}, topic, 2000)
                 current_app.logger.info(f'Response from call of {topic}: {response}')
                 if not response:
-                    return 'Ask UserProxy to go to hevolve.ai login and start Nunba - Your Local Hyve Companion App'
+                    return 'Ask UserProxy to go to hevolve.ai login and start Nunba - Your Local HART Companion App'
 
                 topic = 'com.hertzai.hevolve.action'
                 current_app.logger.info(f'calling {topic} for 1800 seconds')
@@ -2543,17 +2543,17 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     except Exception as e:
         current_app.logger.warning(f"Service tools integration error (non-critical): {e}")
 
-    # Hyve Skills: Register ingested agent skills (Claude Code, Markdown, GitHub)
+    # HART Skills: Register ingested agent skills (Claude Code, Markdown, GitHub)
     try:
         from integrations.skills import skill_registry
         skill_funcs = skill_registry.get_autogen_tools()
         for func_name, func in skill_funcs.items():
-            description = func.__doc__ or f"Hyve skill: {func_name}"
+            description = func.__doc__ or f"HART skill: {func_name}"
             helper.register_for_llm(name=func_name, description=description)(func)
             assistant.register_for_execution(name=func_name)(func)
-            current_app.logger.info(f"Registered Hyve skill: {func_name}")
+            current_app.logger.info(f"Registered HART skill: {func_name}")
     except Exception as e:
-        current_app.logger.debug(f"Hyve skills integration skipped: {e}")
+        current_app.logger.debug(f"HART skills integration skipped: {e}")
 
     # Internal Agent Communication: Register agents and their skills for in-process communication
     try:

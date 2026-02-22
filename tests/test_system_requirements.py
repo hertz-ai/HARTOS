@@ -1,5 +1,5 @@
 """
-Tests for security.system_requirements - Hyve OS equilibrium layer.
+Tests for security.system_requirements - HART OS equilibrium layer.
 
 Covers: hardware detection, tier classification, feature resolution,
 feature gating (env vars), user override respect, force tier override,
@@ -154,15 +154,16 @@ class TestResolveFeatures:
         assert 'video_gen' in disabled
 
     def test_resolve_embedded_tier(self):
-        """Embedded: only gossip + sensor + protocol enabled."""
+        """Embedded: only gossip + sensor + protocol + sensor_fusion enabled."""
         hw = HardwareProfile(cpu_cores=1, ram_gb=0.5, disk_free_gb=0.1)
         enabled, disabled = resolve_features(NodeTierLevel.EMBEDDED, hw)
         assert 'gossip' in enabled
         assert 'sensor_bridge' in enabled
+        assert 'sensor_fusion' in enabled
         assert 'protocol_adapter' in enabled
         assert 'flask_server' in disabled
         assert 'agent_engine' in disabled
-        assert len(enabled) == 3  # Only embedded-tier features
+        assert len(enabled) == 4  # Only embedded-tier features
 
     def test_resolve_compute_host_tier(self):
         """Compute host: everything enabled."""

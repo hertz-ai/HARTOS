@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=HART OS Tray
+Comment=HART OS system tray indicator
+Exec=/opt/hart/venv/bin/python /opt/hart/deploy/linux/desktop/hart-tray.py
+Icon=hart-os
+Terminal=false
+Type=Application
+Categories=System;
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=5
+Hidden=false
+NoDisplay=true

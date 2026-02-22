@@ -1,16 +1,16 @@
 #!/bin/bash
-# Test script for distributed HyveOS cluster
+# Test script for distributed HART OS cluster
 # Usage: bash deploy/distributed/test_distributed_cluster.sh
 #
 # Prerequisite: docker-compose -f deploy/distributed/docker-compose.distributed.yml up -d
 
 set -e
 
-CENTRAL_URL="${HYVE_CENTRAL_URL:-http://localhost:6777}"
-WORKER1_URL="${HYVE_WORKER1_URL:-http://localhost:6778}"
-WORKER2_URL="${HYVE_WORKER2_URL:-http://localhost:6779}"
+CENTRAL_URL="${HART_CENTRAL_URL:-http://localhost:6777}"
+WORKER1_URL="${HART_WORKER1_URL:-http://localhost:6778}"
+WORKER2_URL="${HART_WORKER2_URL:-http://localhost:6779}"
 
-echo "=== HyveOS Distributed Cluster Test ==="
+echo "=== HART OS Distributed Cluster Test ==="
 echo "Central: $CENTRAL_URL"
 echo "Worker1: $WORKER1_URL"
 echo "Worker2: $WORKER2_URL"
@@ -53,10 +53,10 @@ echo "--- Step 4: Submit distributed goal ---"
 goal_resp=$(curl -s -X POST "$CENTRAL_URL/api/distributed/goals" \
     -H "Content-Type: application/json" \
     -d '{
-        "objective": "Create a marketing post about HyveOS distributed computing",
+        "objective": "Create a marketing post about HART OS distributed computing",
         "tasks": [
             {"task_id": "mkt_001", "description": "Write Twitter post about distributed AI", "capabilities": ["marketing"]},
-            {"task_id": "mkt_002", "description": "Write LinkedIn post about HyveOS features", "capabilities": ["marketing"]}
+            {"task_id": "mkt_002", "description": "Write LinkedIn post about HART OS features", "capabilities": ["marketing"]}
         ],
         "context": {"goal_type": "marketing", "user_id": "test_user"}
     }' 2>/dev/null || echo '{"error":"failed"}')
@@ -82,5 +82,5 @@ echo ""
 
 echo "=== Test Complete ==="
 echo "Check docker logs for worker activity:"
-echo "  docker logs hyve-worker-1 --tail 20"
-echo "  docker logs hyve-worker-2 --tail 20"
+echo "  docker logs hart-worker-1 --tail 20"
+echo "  docker logs hart-worker-2 --tail 20"

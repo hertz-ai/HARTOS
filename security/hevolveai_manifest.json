@@ -1,0 +1,8 @@
+{
+  "_comment": "Placeholder manifest — populated by CI/CD build pipeline. Each release signs this with the build node's Ed25519 key.",
+  "version": "",
+  "build_node": "",
+  "build_timestamp": "",
+  "signature": "",
+  "files": {}
+}

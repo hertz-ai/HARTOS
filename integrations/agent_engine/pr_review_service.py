@@ -293,7 +293,7 @@ class PRReviewService:
         body += (
             f"\n### Change Complexity: "
             f"{review.get('change_complexity', '?')}\n\n"
-            f"*Automated by Hyve Coding Agent*"
+            f"*Automated by HART Coding Agent*"
         )
 
         try:

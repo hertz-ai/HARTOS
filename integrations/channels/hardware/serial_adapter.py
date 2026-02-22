@@ -1,7 +1,7 @@
 """
 Serial Channel Adapter — PySerial-based UART/USB-to-serial communication.
 
-Bridges serial devices (Arduino, microcontrollers, sensors) to Hyve agents.
+Bridges serial devices (Arduino, microcontrollers, sensors) to HART agents.
 Supports text_line (default), json_line, and binary_frame protocols.
 
 Usage:

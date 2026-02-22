@@ -144,10 +144,14 @@ class GatewayConfig:
         if self.persistence_path:
             return self.persistence_path
         # Default to volume-mounted data directory
-        return os.environ.get(
-            "GATEWAY_DATA_PATH",
-            "/app/data/gateway" if os.path.exists("/app") else "./agent_data/gateway"
-        )
+        import sys as _sys
+        if os.environ.get('NUNBA_BUNDLED') or getattr(_sys, 'frozen', False):
+            _default = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data', 'gateway')
+        elif os.path.exists("/app"):
+            _default = "/app/data/gateway"
+        else:
+            _default = "./agent_data/gateway"
+        return os.environ.get("GATEWAY_DATA_PATH", _default)
 
 
 @dataclass

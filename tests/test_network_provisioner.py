@@ -1,5 +1,5 @@
 """
-Tests for HyveOS Network Provisioner + Provision API.
+Tests for HART OS Network Provisioner + Provision API.
 
 Tests cover:
 - ProvisionedNode model
@@ -427,7 +427,7 @@ class TestInputValidation:
         """Valid hostname+user+port should pass validation."""
         from integrations.agent_engine.network_provisioner import NetworkProvisioner
         # Should not raise
-        NetworkProvisioner._validate_params('192.168.1.50', 'hyve', 6777)
+        NetworkProvisioner._validate_params('192.168.1.50', 'hart', 6777)
 
     def test_invalid_port(self):
         """Port out of range should be rejected."""

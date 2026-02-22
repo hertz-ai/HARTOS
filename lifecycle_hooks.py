@@ -93,6 +93,8 @@ class ActionState(Enum):
     RECIPE_REQUESTED = "recipe_requested"         # 9. Action recipe json creation requested to AI
     RECIPE_RECEIVED = "recipe_received"           # 10. Action recipe json received with status done
     TERMINATED = "terminated"                     # 11. Action passed to chat instructor and Terminate issued
+    EXECUTING_MOTION = "executing_motion"         # 12. Physical action executing via WorldModelBridge
+    SENSOR_CONFIRM = "sensor_confirm"             # 13. Waiting for sensor confirmation of physical outcome
 
 
 # Add to lifecycle_hooks.py

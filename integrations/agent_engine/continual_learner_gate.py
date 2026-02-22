@@ -44,9 +44,11 @@ CAPABILITY_TIER_ORDER = ['embedded', 'observer', 'lite', 'standard', 'full', 'co
 LEARNING_ACCESS_MATRIX = {
     'none': [],
     'basic': ['temporal_coherence'],
-    'full': ['temporal_coherence', 'manifold_credit', 'meta_learning'],
+    'full': ['temporal_coherence', 'manifold_credit', 'meta_learning',
+             'embedding_sync'],
     'host': ['temporal_coherence', 'manifold_credit', 'meta_learning',
-             'reality_grounded', 'hivemind_query', 'skill_distribution'],
+             'reality_grounded', 'hivemind_query', 'skill_distribution',
+             'embedding_sync'],
 }
 
 CCT_VALIDITY_HOURS = 24
@@ -210,10 +212,10 @@ class ContinualLearnerGateService:
         try:
             from integrations.social.models import PeerNode
             peer = db.query(PeerNode).filter_by(node_id=node_id).first()
-            if peer and peer.node_operator:
+            if peer and peer.node_operator_id:
                 from integrations.social.resonance_engine import ResonanceService
                 ResonanceService.award_action(
-                    db, peer.node_operator, 'learning_contribution',
+                    db, peer.node_operator_id, 'learning_contribution',
                     source_id=nonce)
         except Exception as e:
             logger.debug(f"CCT spark award failed: {e}")
@@ -444,10 +446,10 @@ class ContinualLearnerGateService:
 
         # Award spark for compute contribution
         try:
-            if peer.node_operator:
+            if peer.node_operator_id:
                 from integrations.social.resonance_engine import ResonanceService
                 ResonanceService.award_action(
-                    db, peer.node_operator, 'learning_credit_assigned',
+                    db, peer.node_operator_id, 'learning_credit_assigned',
                     source_id=attestation.id)
         except Exception:
             pass

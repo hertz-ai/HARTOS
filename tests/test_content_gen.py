@@ -55,7 +55,7 @@ def db(engine, tables):
 
 @pytest.fixture
 def system_user(db):
-    user = User(username='hevolve_system_agent', email='sys@hyve.ai',
+    user = User(username='hevolve_system_agent', email='sys@hart.ai',
                 password_hash='x', user_type='agent')
     db.add(user)
     db.flush()

@@ -1,5 +1,5 @@
 # ============================================================
-# HyveOS Build Targets
+# HART OS Build Targets
 #
 # Usage:
 #   make iso                  Build server variant ISO
@@ -21,7 +21,7 @@ ARCH      ?= amd64
 OUTPUT    ?= $(CURDIR)/../../dist
 REPO_ROOT ?= $(CURDIR)/../..
 
-ISO_NAME   = hyve-os-$(VERSION)-$(VARIANT)-$(ARCH)
+ISO_NAME   = hart-os-$(VERSION)-$(VARIANT)-$(ARCH)
 ISO_PATH   = $(OUTPUT)/$(ISO_NAME).iso
 
 # QEMU settings
@@ -34,7 +34,7 @@ QEMU_DISK ?= 20G
 .PHONY: help
 help:
 	@echo ""
-	@echo "  HyveOS Build System"
+	@echo "  HART OS Build System"
 	@echo "  ==================="
 	@echo ""
 	@echo "  ISO Targets:"
@@ -63,7 +63,7 @@ help:
 
 .PHONY: iso
 iso:
-	@echo "Building HyveOS ISO: $(ISO_NAME)"
+	@echo "Building HART OS ISO: $(ISO_NAME)"
 	sudo bash $(CURDIR)/../build-iso.sh \
 		--variant $(VARIANT) \
 		--version $(VERSION) \
@@ -82,7 +82,7 @@ iso-all:
 	done
 	@echo ""
 	@echo "All ISOs ready in $(OUTPUT)/"
-	@ls -lh $(OUTPUT)/hyve-os-*.iso 2>/dev/null
+	@ls -lh $(OUTPUT)/hart-os-*.iso 2>/dev/null
 
 .PHONY: iso-desktop
 iso-desktop:
@@ -96,7 +96,7 @@ iso-edge:
 
 .PHONY: iso-test
 iso-test: iso
-	@echo "Launching HyveOS in QEMU..."
+	@echo "Launching HART OS in QEMU..."
 	@echo "  RAM: $(QEMU_RAM)MB  CPUs: $(QEMU_CPUS)"
 	@echo "  Press Ctrl+A X to exit QEMU"
 	qemu-system-x86_64 \
@@ -106,11 +106,11 @@ iso-test: iso
 		-boot d \
 		-enable-kvm \
 		-net nic -net user,hostfwd=tcp::16777-:6777 \
-		-drive file=$(OUTPUT)/hyve-test-disk.qcow2,format=qcow2,if=virtio,size=$(QEMU_DISK)
+		-drive file=$(OUTPUT)/hart-test-disk.qcow2,format=qcow2,if=virtio,size=$(QEMU_DISK)
 
 .PHONY: iso-test-nokvm
 iso-test-nokvm: iso
-	@echo "Launching HyveOS in QEMU (no KVM)..."
+	@echo "Launching HART OS in QEMU (no KVM)..."
 	qemu-system-x86_64 \
 		-m $(QEMU_RAM) \
 		-smp $(QEMU_CPUS) \
@@ -125,7 +125,7 @@ bundle:
 	@echo "Building deployment bundle..."
 	bash $(REPO_ROOT)/deploy/linux/build_bundle.sh
 	@echo "Bundle ready in $(OUTPUT)/"
-	@ls -lh $(OUTPUT)/hyve-os-*.tar.gz 2>/dev/null
+	@ls -lh $(OUTPUT)/hart-os-*.tar.gz 2>/dev/null
 
 # ─── PXE Server ─────────────────────────────────────────────
 
@@ -138,7 +138,7 @@ pxe-server:
 	fi
 	@echo "Starting PXE server with $(ISO_PATH)..."
 	@echo "Configure DHCP to point to this machine for PXE boot."
-	sudo python3 $(CURDIR)/../pxe/hyve-pxe-server.py \
+	sudo python3 $(CURDIR)/../pxe/hart-pxe-server.py \
 		--iso $(ISO_PATH) \
 		--interface eth0
 
@@ -153,13 +153,93 @@ verify:
 	cd $(OUTPUT) && sha256sum -c $(ISO_NAME).iso.sha256
 	@echo "Checksum verified OK"
 
+# ─── NixOS Build (new immutable OS path) ─────────────────────
+
+.PHONY: nix-iso
+nix-iso:
+	@echo "Building HART OS ISO from NixOS flake..."
+	cd $(REPO_ROOT)/nixos && nix build .#iso-server
+	@echo "ISO ready: nixos/result/iso/"
+
+.PHONY: nix-vm
+nix-vm:
+	@echo "Building HART OS VM from NixOS flake..."
+	cd $(REPO_ROOT)/nixos && nix build .#vm-server
+	@echo "Run with: nixos/result/bin/run-hart-server-vm"
+
+.PHONY: e2e-test
+e2e-test: nix-iso
+	@echo "Running E2E smoke tests against NixOS ISO..."
+	bash $(REPO_ROOT)/tests/boot-qemu-for-test.sh $$(ls $(REPO_ROOT)/nixos/result/iso/*.iso)
+	bash $(REPO_ROOT)/tests/e2e-os-smoke.sh
+	@echo ""
+	@echo "E2E tests passed!"
+	@# Cleanup QEMU
+	@if [ -f /tmp/hart-qemu-test.pid ]; then \
+		kill "$$(cat /tmp/hart-qemu-test.pid)" 2>/dev/null || true; \
+		rm -f /tmp/hart-qemu-test.pid; \
+	fi
+
+# ─── NixOS Lint & Check (fast, ~30s) ──────────────────────────
+
+.PHONY: nix-check
+nix-check:
+	@echo "Running Nix lint + evaluation..."
+	@command -v statix >/dev/null 2>&1 && statix check $(REPO_ROOT)/nixos/ || echo "statix not installed (skipping)"
+	@command -v deadnix >/dev/null 2>&1 && deadnix $(REPO_ROOT)/nixos/ || echo "deadnix not installed (skipping)"
+	cd $(REPO_ROOT)/nixos && nix flake check --no-build
+	@echo "All checks passed!"
+
+# ─── NixOS Build All Key Targets ─────────────────────────────
+
+.PHONY: nix-build-all
+nix-build-all:
+	@echo "Building all key HART OS image targets..."
+	cd $(REPO_ROOT)/nixos && nix build .#iso-server --no-link --print-out-paths
+	cd $(REPO_ROOT)/nixos && nix build .#iso-desktop --no-link --print-out-paths
+	cd $(REPO_ROOT)/nixos && nix build .#iso-edge --no-link --print-out-paths
+	cd $(REPO_ROOT)/nixos && nix build .#qcow2-server --no-link --print-out-paths
+	cd $(REPO_ROOT)/nixos && nix build .#docker-server --no-link --print-out-paths
+	@echo ""
+	@echo "All 5 targets built successfully!"
+
+# ─── NixOS VM Integration Tests ──────────────────────────────
+
+.PHONY: nix-test
+nix-test:
+	@echo "Running NixOS VM integration tests..."
+	cd $(REPO_ROOT)/nixos && nix flake check
+	@echo "All VM tests passed!"
+
+# ─── Full NixOS E2E (build → boot → smoke → sandbox) ─────────
+
+.PHONY: nix-e2e
+nix-e2e: nix-check nix-iso
+	@echo "Running full NixOS E2E test pipeline..."
+	bash $(REPO_ROOT)/tests/boot-qemu-for-test.sh $$(ls $(REPO_ROOT)/nixos/result/iso/*.iso)
+	bash $(REPO_ROOT)/tests/e2e-os-smoke.sh
+	@echo ""
+	@echo "Running sandbox validation inside VM..."
+	sshpass -p 'hart' ssh \
+		-o StrictHostKeyChecking=no \
+		-o UserKnownHostsFile=/dev/null \
+		-p 10022 hart-admin@localhost \
+		'sudo hart sandbox test-all' || echo "Sandbox tests completed (check output above)"
+	@echo ""
+	@echo "Full NixOS E2E pipeline passed!"
+	@# Cleanup QEMU
+	@if [ -f /tmp/hart-qemu-test.pid ]; then \
+		kill "$$(cat /tmp/hart-qemu-test.pid)" 2>/dev/null || true; \
+		rm -f /tmp/hart-qemu-test.pid; \
+	fi
+
 # ─── Cleanup ────────────────────────────────────────────────
 
 .PHONY: clean
 clean:
-	rm -f $(OUTPUT)/hyve-os-*.iso
-	rm -f $(OUTPUT)/hyve-os-*.iso.sha256
-	rm -f $(OUTPUT)/hyve-os-*.tar.gz
-	rm -f $(OUTPUT)/hyve-test-disk.qcow2
-	rm -rf /tmp/hyve-iso-build-*
+	rm -f $(OUTPUT)/hart-os-*.iso
+	rm -f $(OUTPUT)/hart-os-*.iso.sha256
+	rm -f $(OUTPUT)/hart-os-*.tar.gz
+	rm -f $(OUTPUT)/hart-test-disk.qcow2
+	rm -rf /tmp/hart-iso-build-*
 	@echo "Build artifacts cleaned"

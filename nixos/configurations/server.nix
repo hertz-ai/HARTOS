@@ -1,0 +1,102 @@
+{ config, lib, pkgs, hartSrc, ... }:
+
+# ═══════════════════════════════════════════════════════════════
+# HART OS Server Variant
+# ═══════════════════════════════════════════════════════════════
+#
+# Headless powerhouse:
+#   - All AI services (LLM, vision, agents)
+#   - Native kernel extensions (GPU compute, agent sandboxing)
+#   - AI runtime with full GPU scheduling
+#   - Flatpak for server GUI tools (via SSH X11 forwarding)
+#   - No desktop environment, no Android, no Windows
+#
+# Minimum 4GB RAM. Recommended 16GB+ for LLM hosting.
+
+{
+  imports = [
+    "${toString <nixpkgs>}/nixos/modules/installer/cd-dvd/installation-cd-minimal.nix"
+  ];
+
+  # ─── HART OS Core Services ───
+  hart = {
+    enable = true;
+    variant = "server";
+
+    # All AI services
+    agent.enable = true;
+    llm.enable = true;
+    vision.enable = true;
+
+    # ── Kernel Extensions ──
+    kernel = {
+      enable = true;
+      androidNative.enable = false;    # No Android on server
+      windowsNative.enable = false;    # No Windows on server
+      aiCompute = {
+        enable = true;                 # Full GPU compute
+        hugePagesCount = 0;            # Auto (set high for dedicated inference)
+      };
+      agentSandbox.enable = true;      # Isolate agents
+    };
+
+    # ── AI Runtime (full power) ──
+    aiRuntime = {
+      enable = true;
+      gpu.enable = true;
+      worldModel.enable = true;
+      agents = {
+        maxConcurrent = 16;            # Server can handle many agents
+        maxMemoryPerAgent = "4G";
+      };
+      # Semantic intelligence: self-healing services + predictive prefetch
+      semantic = {
+        enable = true;
+        serviceIntelligence = true;
+        predictivePrefetch = true;
+        smartFS = false;               # No user files on server typically
+      };
+    };
+
+    # ── AI-Native OS Layers ──
+    # Model Bus: every app/service gets native AI access
+    modelBus.enable = true;
+
+    # Compute Mesh: share this server's GPU with user's other devices
+    computeMesh = {
+      enable = true;
+      maxOffloadPercent = 70;          # Server donates generously
+      allowWAN = true;
+    };
+
+    # No LiquidUI (headless server)
+    # No App Bridge (no subsystems on server)
+
+    # ── Sandbox ──
+    sandbox.enable = true;
+  };
+
+  # HART application package
+  hart.package = pkgs.callPackage ../packages/hart-app.nix { inherit hartSrc; };
+
+  # CLI tool
+  environment.systemPackages = [
+    (pkgs.callPackage ../packages/hart-cli.nix { inherit hartSrc; })
+  ];
+
+  # ISO branding
+  isoImage = {
+    isoName = lib.mkForce "hart-os-${config.hart.version}-server-${pkgs.system}.iso";
+    volumeID = lib.mkForce "HART_OS";
+    appendToMenuLabel = " HART OS Server";
+  };
+
+  # Boot configuration
+  boot.loader.timeout = 5;
+
+  # Headless: no desktop
+  services.xserver.enable = false;
+
+  # Auto-login on console (first-time setup)
+  services.getty.autologinUser = lib.mkDefault "hart-admin";
+}

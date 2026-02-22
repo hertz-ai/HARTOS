@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Setup script for hyve-backend package (formerly hevolve-backend).
+Setup script for hart-backend package (formerly hevolve-backend).
 
-Hyve - Crowdsourced Agentic Intelligence Platform.
+HART OS - Hevolve Agentic Runtime.
 """
 
 from setuptools import setup, find_packages
@@ -15,7 +15,7 @@ try:
     with open(os.path.join(here, "README.md"), encoding="utf-8") as f:
         long_description = f.read()
 except FileNotFoundError:
-    long_description = "Hyve - Crowdsourced Agentic Intelligence Platform"
+    long_description = "HART OS - Hevolve Agentic Runtime"
 
 # Core dependencies required for the server to run
 install_requires = [
@@ -124,15 +124,15 @@ extras_require = {
 }
 
 setup(
-    name="hyve-backend",
+    name="hart-backend",
     # version derived from git tags via setuptools-scm (configured in pyproject.toml)
     setup_requires=["setuptools-scm>=8.0"],
-    author="Hyve Team",
+    author="HART Team",
     author_email="contact@hevolve.ai",
-    description="Hyve - Crowdsourced Agentic Intelligence Platform",
+    description="HART OS - Hevolve Agentic Runtime",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/hevolve/hyve",
+    url="https://github.com/hevolve/hart",
     license="MIT",
 
     # Package discovery
@@ -159,7 +159,7 @@ setup(
 
     # Include main modules at root level
     py_modules=[
-        "hyve_version",
+        "hart_version",
         "langchain_gpt_api",
         "helper",
         "helper_func",
@@ -191,8 +191,8 @@ setup(
     # Entry points for console scripts
     entry_points={
         "console_scripts": [
-            "hyve-server=langchain_gpt_api:main",
-            "hyve-crossbar=crossbar_server:main",
+            "hart-server=langchain_gpt_api:main",
+            "hart-crossbar=crossbar_server:main",
         ],
     },
 
@@ -227,8 +227,8 @@ setup(
 
     # Project URLs
     project_urls={
-        "Bug Reports": "https://github.com/hevolve/hyve/issues",
-        "Source": "https://github.com/hevolve/hyve",
+        "Bug Reports": "https://github.com/hevolve/hart/issues",
+        "Source": "https://github.com/hevolve/hart",
         "Documentation": "https://docs.hevolve.ai",
     },
 )

@@ -1,7 +1,7 @@
 """
 Deployment Scenario Boundary Tests
 
-6 tests covering the full spectrum of HyveOS deployment modes:
+6 tests covering the full spectrum of HART OS deployment modes:
 1. OBSERVER tier — gossip-only, no agents, no coding
 2. STANDARD tier — agents + coding + TTS enabled
 3. FULL tier — vision + local LLM + video gen
@@ -467,3 +467,39 @@ class TestNoCoordinatorLocalFallback:
         with patch('integrations.distributed_agent.api._get_coordinator',
                    return_value=None):
             assert DistributedWorkerLoop._is_enabled() is False
+
+
+class TestStartupValidation:
+    """Test _validate_startup() config checks."""
+
+    def test_validate_startup_returns_list(self):
+        from langchain_gpt_api import _validate_startup
+        result = _validate_startup()
+        assert isinstance(result, list)
+
+    def test_validate_startup_warns_on_missing_env(self):
+        """Missing .env should produce a warning."""
+        from langchain_gpt_api import _validate_startup
+        with patch('os.path.exists') as mock_exists:
+            # config.json doesn't exist, .env doesn't exist
+            mock_exists.side_effect = lambda p: False
+            result = _validate_startup()
+        # Should have at least the .env warning
+        env_warnings = [w for w in result if '.env' in w]
+        assert len(env_warnings) >= 1
+
+    def test_validate_startup_warns_on_missing_config(self):
+        """Missing config.json should produce a warning."""
+        from langchain_gpt_api import _validate_startup
+        with patch('os.path.exists') as mock_exists:
+            mock_exists.side_effect = lambda p: False
+            result = _validate_startup()
+        config_warnings = [w for w in result if 'config.json' in w]
+        assert len(config_warnings) >= 1
+
+    def test_validate_startup_no_crash(self):
+        """Startup validation should never crash regardless of environment."""
+        from langchain_gpt_api import _validate_startup
+        # Should always return without raising
+        result = _validate_startup()
+        assert result is not None

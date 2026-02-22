@@ -35,6 +35,8 @@ VALID_COMMAND_TYPES = frozenset({
     'restart',
     'tts_stream',
     'agent_consent',
+    'estop',
+    'estop_clear',
 })
 
 
@@ -241,6 +243,10 @@ class FleetCommandService:
                 return _execute_tts_stream(params)
             elif cmd_type == 'agent_consent':
                 return _execute_agent_consent(params)
+            elif cmd_type == 'estop':
+                return _execute_estop(params)
+            elif cmd_type == 'estop_clear':
+                return _execute_estop_clear(params)
             else:
                 return {'success': False, 'message': f'Unknown command: {cmd_type}'}
         except Exception as e:
@@ -443,6 +449,48 @@ def _execute_agent_consent(params: dict) -> Dict:
         'requested_at': time.time(),
     })
     return {'success': True, 'message': f'Consent requested: {action}'}
+
+
+def _execute_estop(params: dict) -> Dict:
+    """Trigger E-stop via fleet command from central.
+
+    Uses SafetyMonitor for proper E-stop with audit trail.
+    Falls back to simple halt flag if robotics module unavailable.
+    """
+    reason = params.get('reason', 'Central commanded E-stop')
+    try:
+        from integrations.robotics.safety_monitor import get_safety_monitor
+        monitor = get_safety_monitor()
+        monitor.trigger_estop(reason, source='fleet')
+        return {'success': True, 'message': f'E-stop triggered: {reason}'}
+    except ImportError:
+        # Fallback: use simple halt flag
+        os.environ['HEVOLVE_HALTED'] = 'true'
+        os.environ['HEVOLVE_HALT_REASON'] = f'E-STOP: {reason}'
+        return {'success': True, 'message': f'E-stop (fallback halt): {reason}'}
+
+
+def _execute_estop_clear(params: dict) -> Dict:
+    """Clear E-stop via fleet command.  Requires human operator_id.
+
+    The operator_id in params must identify a human, not an agent.
+    """
+    operator_id = params.get('operator_id', '')
+    if not operator_id:
+        return {'success': False, 'message': 'E-stop clear requires operator_id'}
+
+    try:
+        from integrations.robotics.safety_monitor import get_safety_monitor
+        monitor = get_safety_monitor()
+        cleared = monitor.clear_estop(operator_id)
+        if cleared:
+            return {'success': True, 'message': f'E-stop cleared by {operator_id}'}
+        return {'success': False, 'message': 'E-stop clear rejected (agent or empty operator)'}
+    except ImportError:
+        # Fallback: clear halt flag
+        os.environ.pop('HEVOLVE_HALTED', None)
+        os.environ.pop('HEVOLVE_HALT_REASON', None)
+        return {'success': True, 'message': f'E-stop cleared (fallback): {operator_id}'}
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -88,7 +88,7 @@ def register_ip_protection_tools(helper, assistant, user_id: str):
     def draft_provisional_patent(
         patent_id: Annotated[str, "ID of existing draft patent to build into provisional"],
         inventors: Annotated[str, "Comma-separated inventor names"],
-        assignee: Annotated[str, "Assignee organization name"] = 'Hyve AI',
+        assignee: Annotated[str, "Assignee organization name"] = 'HART AI',
     ) -> str:
         """Build complete USPTO provisional patent application from a draft.
         Updates the patent with full provisional structure."""

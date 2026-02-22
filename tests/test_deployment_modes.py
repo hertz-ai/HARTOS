@@ -66,8 +66,8 @@ class TestDeploymentManifest:
         """Manifest must define all 5 services."""
         manifest = _load_manifest()
         expected_services = {
-            'hyve-backend', 'hyve-discovery', 'hyve-vision',
-            'hyve-llm', 'hyve-agent-daemon',
+            'hart-backend', 'hart-discovery', 'hart-vision',
+            'hart-llm', 'hart-agent-daemon',
         }
         actual_services = set(manifest['services'].keys())
         assert actual_services == expected_services
@@ -124,9 +124,9 @@ class TestDeploymentManifest:
         assert compute_host['gpu_required'] is True
 
     def test_backend_service_always_enabled(self):
-        """hyve-backend service must be always_enabled."""
+        """hart-backend service must be always_enabled."""
         manifest = _load_manifest()
-        backend = manifest['services']['hyve-backend']
+        backend = manifest['services']['hart-backend']
         assert backend['always_enabled'] is True
 
     def test_service_ports_match_known_values(self):
@@ -183,7 +183,7 @@ class TestConfigLoadingChain:
     def test_get_secret_checks_env_var_first(self):
         """get_secret() must return env var value when set, ignoring config file."""
         from core.config_cache import get_secret
-        test_key = '_HYVE_TEST_SECRET_ENV_FIRST_12345'
+        test_key = '_HART_TEST_SECRET_ENV_FIRST_12345'
         test_val = 'from_env_var'
         try:
             os.environ[test_key] = test_val
@@ -195,7 +195,7 @@ class TestConfigLoadingChain:
     def test_get_secret_returns_default_when_key_missing(self):
         """get_secret() must return default when key is absent from env and config."""
         from core.config_cache import get_secret
-        missing_key = '_HYVE_NONEXISTENT_KEY_99999'
+        missing_key = '_HART_NONEXISTENT_KEY_99999'
         # Ensure it is not in env
         os.environ.pop(missing_key, None)
         result = get_secret(missing_key, default='my_default_value')
@@ -261,26 +261,26 @@ class TestVariantConfig:
     def test_variant_configs_exist(self):
         """All 3 variant config files must exist."""
         for variant in ('server', 'desktop', 'edge'):
-            conf_path = os.path.join(self.VARIANTS_DIR, f'hyve-os-{variant}.conf')
+            conf_path = os.path.join(self.VARIANTS_DIR, f'hart-os-{variant}.conf')
             assert os.path.isfile(conf_path), (
                 f"Missing variant config: {conf_path}"
             )
 
     def test_first_boot_reads_variant(self):
-        """first-boot.sh must read /etc/hyve/variant to determine the variant."""
+        """first-boot.sh must read /etc/hart/variant to determine the variant."""
         fb_path = os.path.join(
-            REPO_ROOT, 'deploy', 'distro', 'first-boot', 'hyve-first-boot.sh',
+            REPO_ROOT, 'deploy', 'distro', 'first-boot', 'hart-first-boot.sh',
         )
         with open(fb_path, 'r', encoding='utf-8') as f:
             content = f.read()
-        assert '/etc/hyve/variant' in content, (
-            "first-boot.sh must read /etc/hyve/variant"
+        assert '/etc/hart/variant' in content, (
+            "first-boot.sh must read /etc/hart/variant"
         )
 
     def test_first_boot_has_edge_variant_override(self):
         """first-boot.sh must have edge variant override logic that disables services."""
         fb_path = os.path.join(
-            REPO_ROOT, 'deploy', 'distro', 'first-boot', 'hyve-first-boot.sh',
+            REPO_ROOT, 'deploy', 'distro', 'first-boot', 'hart-first-boot.sh',
         )
         with open(fb_path, 'r', encoding='utf-8') as f:
             content = f.read()
@@ -292,12 +292,12 @@ class TestVariantConfig:
         assert 'systemctl disable' in content
 
     def test_build_iso_writes_variant_to_chroot(self):
-        """build-iso.sh must write the variant to /etc/hyve/variant in the chroot."""
+        """build-iso.sh must write the variant to /etc/hart/variant in chroot."""
         iso_path = os.path.join(REPO_ROOT, 'deploy', 'distro', 'build-iso.sh')
         with open(iso_path, 'r', encoding='utf-8') as f:
             content = f.read()
-        # build-iso.sh writes: echo "$VARIANT" > config/includes.chroot/etc/hyve/variant
-        assert '/etc/hyve/variant' in content, (
-            "build-iso.sh must write variant to /etc/hyve/variant in chroot"
+        # build-iso.sh writes: echo "$VARIANT" > config/includes.chroot/etc/hart/variant
+        assert '/etc/hart/variant' in content, (
+            "build-iso.sh must write variant to /etc/hart/variant in chroot"
         )
         assert 'VARIANT' in content

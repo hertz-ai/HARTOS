@@ -16,6 +16,7 @@ Guardrails enforced at EVERY layer:
 - HiveEthos.rewrite_prompt_for_togetherness() on EVERY prompt
 - Budget enforcement via ResonanceService.spend_spark()
 """
+import atexit
 import logging
 import os
 import time
@@ -46,6 +47,7 @@ class SpeculativeDispatcher:
             max_workers=int(os.environ.get('HEVOLVE_EXPERT_WORKERS', '4')),
             thread_name_prefix='spec_expert',
         )
+        atexit.register(lambda: self._expert_pool.shutdown(wait=False))
         self._active: Dict[str, dict] = {}  # speculation_id → metadata
         self._lock = threading.Lock()
         self._results: Dict[str, dict] = {}  # speculation_id → expert result

@@ -1,5 +1,5 @@
 """
-HyveOS Provisioning AutoGen Tools — Agent tools for network provisioning.
+HART OS Provisioning AutoGen Tools — Agent tools for network provisioning.
 
 5 tools registered with GoalManager under 'provision' tag:
   - provision_network_machine
@@ -22,10 +22,10 @@ def provision_network_machine(
     ssh_key_path: Annotated[str, "Path to SSH private key (optional)"] = "",
     join_peer: Annotated[str, "URL of existing hive node to join (optional)"] = "",
 ) -> str:
-    """Install HyveOS on a remote network machine via SSH.
+    """Install HART OS on a remote network machine via SSH.
 
     This tool SSHs into the target machine, runs system checks,
-    transfers the HyveOS install bundle, and executes the installer.
+    transfers the HART OS install bundle, and executes the installer.
     The new node is automatically registered with the hive.
 
     Returns a JSON string with the provisioning result including
@@ -45,7 +45,7 @@ def provision_network_machine(
 def scan_network_for_machines(
     subnet: Annotated[str, "CIDR subnet to scan (e.g., '192.168.1.0/24'). Auto-detect if empty."] = "",
 ) -> str:
-    """Scan the local network for machines available for HyveOS provisioning.
+    """Scan the local network for machines available for HART OS provisioning.
 
     Discovers machines with open SSH port (22) on the specified subnet.
     If no subnet is provided, auto-detects the local network.
@@ -69,7 +69,7 @@ def check_provisioned_node(
     target_host: Annotated[str, "IP address or hostname of the provisioned node"],
     ssh_user: Annotated[str, "SSH username (default: root)"] = "root",
 ) -> str:
-    """Check the health and status of a provisioned HyveOS node.
+    """Check the health and status of a provisioned HART OS node.
 
     SSHs into the node and checks:
     - Service status (backend, discovery, agent daemon, vision, LLM)
@@ -92,7 +92,7 @@ def update_provisioned_node(
     target_host: Annotated[str, "IP address or hostname of the node to update"],
     ssh_user: Annotated[str, "SSH username (default: root)"] = "root",
 ) -> str:
-    """Update HyveOS on a remote provisioned node to the latest version.
+    """Update HART OS on a remote provisioned node to the latest version.
 
     SSHs into the node, pulls latest code (via git or re-transfer),
     restarts services, and verifies the backend comes back up.
@@ -109,7 +109,7 @@ def update_provisioned_node(
 
 
 def list_provisioned_nodes() -> str:
-    """List all HyveOS nodes provisioned by this hive.
+    """List all HART OS nodes provisioned by this hive.
 
     Returns a JSON list of all provisioned nodes with their status,
     capability tier, IP address, and last health check time.

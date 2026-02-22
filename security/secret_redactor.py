@@ -16,7 +16,7 @@ THREE-LAYER DEFENSE:
     Regex is correct here: structured secrets have known formats.
 
   Layer 2 - PER-USER ISOLATION (model-based PII + anonymization):
-    Local LLM (crawl4ai / llama.cpp) semantically detects PII in
+    Local LLM (Hevolve-Core / llama.cpp) semantically detects PII in
     free text: names, addresses, medical info, financial details.
     Falls back to regex for emails, phones, URLs, @mentions.
     user_id/prompt_id/node_id anonymized via SHA-256.
@@ -344,7 +344,7 @@ def _model_detect_pii(text: str) -> str:
         # Use whatever local LLM endpoint is available
         llm_url = os.environ.get(
             'HEVOLVE_LOCAL_LLM_URL',
-            os.environ.get('CRAWL4AI_API_URL', 'http://localhost:8080')
+            os.environ.get('HEVOLVEAI_API_URL', 'http://localhost:8080')
         )
 
         resp = _req.post(

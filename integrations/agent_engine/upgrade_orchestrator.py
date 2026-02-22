@@ -18,8 +18,16 @@ from typing import Dict, Optional
 
 logger = logging.getLogger('hevolve_social')
 
-STATE_FILE = os.path.join('agent_data', 'upgrade_state.json')
-BENCHMARK_DIR = os.path.join('agent_data', 'benchmarks')
+def _resolve_agent_engine_path(*parts):
+    db_path = os.environ.get('HEVOLVE_DB_PATH', '')
+    if db_path and db_path != ':memory:' and os.path.isabs(db_path):
+        return os.path.join(os.path.dirname(db_path), 'agent_data', *parts)
+    if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
+        return os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data', *parts)
+    return os.path.join('agent_data', *parts)
+
+STATE_FILE = _resolve_agent_engine_path('upgrade_state.json')
+BENCHMARK_DIR = _resolve_agent_engine_path('benchmarks')
 
 
 class UpgradeStage(enum.Enum):
@@ -262,7 +270,7 @@ class UpgradeOrchestrator:
             if not safe:
                 return False, reason
 
-            # Gate: crawl4ai world model health must be acceptable
+            # Gate: Hevolve-Core world model health must be acceptable
             try:
                 from .world_model_bridge import get_world_model_bridge
                 wm = get_world_model_bridge()
@@ -329,13 +337,22 @@ class UpgradeOrchestrator:
         try:
             from integrations.social.peer_discovery import gossip
             version = self._state.get('version', '')
+            code_hash = self._state.get('code_hash', '')
             gossip.broadcast({
                 'type': 'upgrade_deploy',
                 'version': version,
                 'git_sha': self._state.get('git_sha', ''),
-                'code_hash': self._state.get('code_hash', ''),
+                'code_hash': code_hash,
                 'timestamp': time.time(),
             })
+            # Register new hash so peers running this version are recognized
+            try:
+                from security.release_hash_registry import get_release_hash_registry
+                if version and code_hash:
+                    get_release_hash_registry().add_runtime_hash(
+                        version, code_hash)
+            except Exception:
+                pass
             return True, f'deployment broadcast for v{version}'
         except Exception as e:
             return False, f'Deploy broadcast error: {e}'

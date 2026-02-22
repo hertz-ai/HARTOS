@@ -1,5 +1,5 @@
 """
-Master Key Verification: Central authority for Hyve deployment control.
+Master Key Verification: Central authority for HART deployment control.
 The master public key is hardcoded here. The private key exists ONLY in GitHub Secrets.
 Only code signed by the master key can participate in the network.
 

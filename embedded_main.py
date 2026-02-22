@@ -1,5 +1,5 @@
 """
-embedded_main.py — Headless entry point for Hyve on embedded/robot devices.
+embedded_main.py — Headless entry point for HART on embedded/robot devices.
 
 Boots with minimal imports: security + gossip + sync + fleet commands.
 Does NOT import Flask, langchain, autogen, torch, numpy, opencv, PIL, redis.
@@ -88,6 +88,56 @@ def _boot_system_check():
         f"serial={caps.hardware.has_serial}"
     )
     return caps
+
+
+def _boot_safety(caps):
+    """Initialize safety monitor if hardware E-stop sources are configured."""
+    estop_pins_raw = os.environ.get('HEVOLVE_ESTOP_PINS', '')
+    estop_serial_raw = os.environ.get('HEVOLVE_ESTOP_SERIAL', '')
+
+    if not estop_pins_raw and not estop_serial_raw:
+        if caps.hardware.has_gpio or caps.hardware.has_serial:
+            logger.info("Safety: GPIO/serial detected but no E-stop sources configured "
+                        "(set HEVOLVE_ESTOP_PINS or HEVOLVE_ESTOP_SERIAL)")
+        return
+
+    try:
+        from integrations.robotics.safety_monitor import get_safety_monitor
+        monitor = get_safety_monitor()
+
+        # Register GPIO E-stop pins (comma-separated)
+        if estop_pins_raw:
+            for pin_str in estop_pins_raw.split(','):
+                pin_str = pin_str.strip()
+                if pin_str.isdigit():
+                    monitor.register_estop_pin(int(pin_str))
+
+        # Register serial E-stop sources (format: port:pattern,port:pattern)
+        if estop_serial_raw:
+            for entry in estop_serial_raw.split(','):
+                entry = entry.strip()
+                if ':' in entry:
+                    port, pattern = entry.split(':', 1)
+                    monitor.register_estop_serial(port.strip(), pattern.strip())
+                elif entry:
+                    monitor.register_estop_serial(entry, 'ESTOP')
+
+        # Register workspace limits from env
+        limits_raw = os.environ.get('HEVOLVE_WORKSPACE_LIMITS', '')
+        if limits_raw:
+            try:
+                import json
+                limits = json.loads(limits_raw)
+                monitor.register_workspace_limits(limits)
+            except Exception as e:
+                logger.warning(f"Safety: invalid HEVOLVE_WORKSPACE_LIMITS: {e}")
+
+        monitor.start()
+        logger.info("Safety monitor started")
+    except ImportError:
+        logger.debug("Safety: robotics module not available")
+    except Exception as e:
+        logger.warning(f"Safety monitor boot failed: {e}")
 
 
 def _boot_db():
@@ -199,10 +249,10 @@ def _main_loop(node_id: str, gossip_interval: int = 60):
 
 
 def main():
-    """Boot sequence for embedded/headless Hyve node."""
+    """Boot sequence for embedded/headless HART node."""
     _setup_logging()
     logger.info("=" * 50)
-    logger.info("Hyve Embedded Node — Starting")
+    logger.info("HART Embedded Node — Starting")
     logger.info("=" * 50)
 
     # Graceful shutdown on SIGTERM
@@ -222,8 +272,25 @@ def main():
     # Step 3: Guardrails (required for federation)
     guardrail_hash = _boot_guardrails()
 
+    # Step 3.5: Safety monitor (E-stop, workspace limits)
+    _boot_safety(caps)
+
     # Step 4: Database (fleet commands, sync queue)
     db_ok = _boot_db()
+
+    # Step 4.5: Robot subsystems (if enabled)
+    robot_enabled = os.environ.get('HEVOLVE_ROBOT_ENABLED', '').lower() == 'true'
+    robot_status = None
+    if robot_enabled:
+        try:
+            from integrations.robotics.robot_boot import boot_robotics
+            robot_status = boot_robotics(caps)
+        except ImportError:
+            logger.warning("Robot boot: robotics package not available")
+        except Exception as e:
+            logger.warning(f"Robot boot failed: {e}")
+    else:
+        logger.info("Robot subsystems disabled (set HEVOLVE_ROBOT_ENABLED=true)")
 
     # Step 5: Determine gossip interval from tier/bandwidth profile
     bandwidth = os.environ.get('HEVOLVE_GOSSIP_BANDWIDTH', '')
@@ -252,7 +319,7 @@ def main():
         logger.critical(f"Main loop crashed: {e}")
         sys.exit(1)
 
-    logger.info("Hyve Embedded Node - Stopped")
+    logger.info("HART Embedded Node - Stopped")
 
 
 if __name__ == '__main__':

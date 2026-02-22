@@ -1,7 +1,7 @@
 """
 Unified Agent Goal Engine - Federated Learning Delta Aggregation
 
-Periodic aggregation of learning metrics across Hyve nodes via gossip.
+Periodic aggregation of learning metrics across HART nodes via gossip.
 Complementary to HiveMind's inference-time tensor fusion — this handles
 training-time metric synchronization.
 
@@ -38,6 +38,11 @@ class FederatedAggregator:
         self._epoch = 0
         self._convergence_history: List[float] = []
         self._last_aggregated: Optional[dict] = None
+        # Embedding delta channel (Phase 1 gradient sync)
+        self._embedding_lock = threading.Lock()
+        self._embedding_deltas: Dict[str, dict] = {}  # node_id → compressed delta
+        self._embedding_epoch = 0
+        self._last_embedding_aggregated: Optional[dict] = None
 
     def tick(self) -> dict:
         """Full cycle: extract → broadcast → aggregate → apply → track."""
@@ -58,6 +63,11 @@ class FederatedAggregator:
                     'convergence': convergence,
                     'peer_count': len(self._peer_deltas),
                 })
+
+            # Embedding channel tick (Phase 1 gradient sync)
+            embedding_result = self.embedding_tick()
+            if embedding_result.get('aggregated'):
+                result['embedding'] = embedding_result
         except Exception as e:
             logger.debug(f"Federation tick error: {e}")
             result['error'] = str(e)
@@ -343,17 +353,83 @@ class FederatedAggregator:
             self._convergence_history = self._convergence_history[-100:]
         return score
 
+    # ─── Embedding Delta Channel (Phase 1 Gradient Sync) ───
+
+    def receive_embedding_delta(self, node_id: str, delta: dict):
+        """Store a compressed embedding delta from a peer node."""
+        if not node_id or not isinstance(delta, dict):
+            return
+        with self._embedding_lock:
+            self._embedding_deltas[node_id] = delta
+
+    def aggregate_embeddings(self) -> Optional[dict]:
+        """Aggregate all embedding deltas using trimmed mean."""
+        with self._embedding_lock:
+            deltas = list(self._embedding_deltas.values())
+        if not deltas:
+            return None
+
+        try:
+            from .embedding_delta import trimmed_mean_aggregate
+            weights = []
+            for d in deltas:
+                cs = d.get('contribution_score', 1.0)
+                weights.append(max(0.01, cs if isinstance(cs, (int, float)) else 1.0))
+
+            aggregated = trimmed_mean_aggregate(deltas, weights=weights)
+            self._last_embedding_aggregated = aggregated
+            self._embedding_epoch += 1
+            return aggregated
+        except Exception as e:
+            logger.debug(f"Embedding aggregation error: {e}")
+            return None
+
+    def embedding_tick(self) -> dict:
+        """Embedding channel tick: aggregate + clear stale deltas."""
+        result = {'embedding_epoch': self._embedding_epoch, 'aggregated': False}
+        try:
+            aggregated = self.aggregate_embeddings()
+            if aggregated:
+                result.update({
+                    'aggregated': True,
+                    'embedding_epoch': self._embedding_epoch,
+                    'peer_count': aggregated.get('peer_count', 0),
+                    'outliers_removed': aggregated.get('outliers_removed', 0),
+                })
+                # Clear processed deltas
+                with self._embedding_lock:
+                    self._embedding_deltas.clear()
+        except Exception as e:
+            result['error'] = str(e)
+        return result
+
+    def get_embedding_stats(self) -> dict:
+        """Return embedding sync stats for dashboard."""
+        with self._embedding_lock:
+            pending = len(self._embedding_deltas)
+        return {
+            'embedding_epoch': self._embedding_epoch,
+            'pending_deltas': pending,
+            'last_aggregated': self._last_embedding_aggregated,
+        }
+
     def get_stats(self) -> dict:
         """Return federation stats for dashboard."""
         with self._lock:
             peer_count = len(self._peer_deltas)
-        return {
+        stats = {
             'epoch': self._epoch,
             'peer_count': peer_count,
             'convergence': self._convergence_history[-1] if self._convergence_history else 0.0,
             'convergence_history': self._convergence_history[-10:],
             'last_aggregated': self._last_aggregated,
         }
+        # Include embedding stats
+        try:
+            stats['embedding'] = self.get_embedding_stats()
+        except Exception:
+            pass
+        return stats
 
 
 # ─── Singleton ───

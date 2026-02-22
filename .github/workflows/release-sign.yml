@@ -1,0 +1,66 @@
+name: Sign Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  sign-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install cryptography
+
+      - name: Compute code hash
+        id: hash
+        run: |
+          CODE_HASH=$(python -c "
+          import sys; sys.path.insert(0, '.')
+          from security.node_integrity import compute_code_hash, compute_file_manifest
+          import hashlib, json
+          ch = compute_code_hash()
+          fm = compute_file_manifest()
+          mh = hashlib.sha256(json.dumps(fm, sort_keys=True).encode()).hexdigest()
+          print(f'{ch}|{mh}')
+          ")
+          echo "code_hash=$(echo $CODE_HASH | cut -d'|' -f1)" >> $GITHUB_OUTPUT
+          echo "manifest_hash=$(echo $CODE_HASH | cut -d'|' -f2)" >> $GITHUB_OUTPUT
+
+      - name: Sign release manifest
+        env:
+          MASTER_PRIVATE_KEY_HEX: ${{ secrets.HEVOLVE_MASTER_PRIVATE_KEY_HEX }}
+        run: |
+          python scripts/sign_release.py \
+            --version ${{ github.ref_name }} \
+            --git-sha ${{ github.sha }} \
+            --code-hash ${{ steps.hash.outputs.code_hash }} \
+            --manifest-hash ${{ steps.hash.outputs.manifest_hash }} \
+            --output release_manifest.json
+
+      - name: Verify signature (sanity check)
+        run: |
+          python -c "
+          import sys; sys.path.insert(0, '.')
+          from security.master_key import load_release_manifest, verify_release_manifest
+          m = load_release_manifest()
+          assert m, 'Manifest not found'
+          assert verify_release_manifest(m), 'Signature verification failed'
+          print(f'Verified: version={m[\"version\"]}, hash={m[\"code_hash\"][:16]}...')
+          "
+
+      - name: Upload release manifest
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release_manifest.json

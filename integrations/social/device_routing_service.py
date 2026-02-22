@@ -22,7 +22,8 @@ from .services import NotificationService
 logger = logging.getLogger('hevolve_social')
 
 # Form factor priority for TTS (lower index = preferred)
-_TTS_PRIORITY = ['phone', 'desktop', 'tablet', 'tv', 'embedded']
+# 'robot' added — robots with speakers can receive TTS (lowest priority)
+_TTS_PRIORITY = ['phone', 'desktop', 'tablet', 'tv', 'embedded', 'robot']
 
 
 class DeviceRoutingService:

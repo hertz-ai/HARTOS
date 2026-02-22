@@ -74,7 +74,7 @@ if not SECRET_KEY:
     if not os.environ.get('SOCIAL_SECRET_KEY'):
         logger.info("SOCIAL_SECRET_KEY not set — using auto-generated persistent key")
 
-TOKEN_EXPIRY = 3600  # 1 hour (was 30 days)
+TOKEN_EXPIRY = 30 * 24 * 3600  # 30 days — desktop app needs long-lived sessions
 
 
 PBKDF2_ITERATIONS = 600_000  # OWASP 2023 minimum for PBKDF2-SHA256

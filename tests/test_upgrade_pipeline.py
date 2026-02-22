@@ -6,7 +6,7 @@ Verifies that:
 2. Upgrade tools exist and call the orchestrator
 3. Orchestrator stages advance correctly (BUILD→TEST→AUDIT→BENCHMARK→SIGN→CANARY→DEPLOY)
 4. BENCHMARK_DIR import bug is fixed in orchestrator
-5. Crawl4ai world model health gates the benchmark stage
+5. Hevolve-Core world model health gates the benchmark stage
 6. Gossip beacon includes version info
 7. OTA service runs orchestrated upgrade before applying
 8. Peer witness post-update verification works
@@ -193,10 +193,10 @@ class TestBenchmarkDirFix:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 5. Crawl4ai World Model Benchmark Gate
+# 5. Hevolve-Core World Model Benchmark Gate
 # ═══════════════════════════════════════════════════════════════
 
-class TestCrawl4aiBenchmarkGate:
+class TestHevolveAIBenchmarkGate:
     """Verify _stage_benchmark() checks world model health."""
 
     def _make_orchestrator_at_benchmark(self):
@@ -372,7 +372,7 @@ class TestGossipBeaconVersion:
 # ═══════════════════════════════════════════════════════════════
 
 class TestOTAOrchestratedUpgrade:
-    """Verify hyve-update-service.py calls orchestrator before applying."""
+    """Verify hart-update-service.py calls orchestrator before applying."""
 
     def test_run_orchestrated_upgrade_method_exists(self):
         sys.path.insert(0, os.path.join(
@@ -382,14 +382,14 @@ class TestOTAOrchestratedUpgrade:
             # We need to import with the right module path
             import importlib.util
             spec = importlib.util.spec_from_file_location(
-                'hyve_update_service',
+                'hart_update_service',
                 os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                             'deploy', 'distro', 'update', 'hyve-update-service.py'))
+                             'deploy', 'distro', 'update', 'hart-update-service.py'))
             mod = importlib.util.module_from_spec(spec)
             # Mock sys.exit and system calls
-            with patch.dict(os.environ, {'HYVE_UPDATE_URL': 'http://test'}):
+            with patch.dict(os.environ, {'HART_UPDATE_URL': 'http://test'}):
                 spec.loader.exec_module(mod)
-            assert hasattr(mod.HyveUpdateService, '_run_orchestrated_upgrade')
+            assert hasattr(mod.HartUpdateService, '_run_orchestrated_upgrade')
         finally:
             if sys.path[0].endswith('update'):
                 sys.path.pop(0)
@@ -402,14 +402,14 @@ class TestOTAOrchestratedUpgrade:
         try:
             import importlib.util
             spec = importlib.util.spec_from_file_location(
-                'hyve_update_svc2',
+                'hart_update_svc2',
                 os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                             'deploy', 'distro', 'update', 'hyve-update-service.py'))
+                             'deploy', 'distro', 'update', 'hart-update-service.py'))
             mod = importlib.util.module_from_spec(spec)
-            with patch.dict(os.environ, {'HYVE_UPDATE_URL': 'http://test'}):
+            with patch.dict(os.environ, {'HART_UPDATE_URL': 'http://test'}):
                 spec.loader.exec_module(mod)
 
-            svc = mod.HyveUpdateService()
+            svc = mod.HartUpdateService()
 
             mock_orch = MagicMock()
             mock_orch.start_upgrade.return_value = {'success': True}
@@ -441,14 +441,14 @@ class TestOTAOrchestratedUpgrade:
         try:
             import importlib.util
             spec = importlib.util.spec_from_file_location(
-                'hyve_update_svc3',
+                'hart_update_svc3',
                 os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                             'deploy', 'distro', 'update', 'hyve-update-service.py'))
+                             'deploy', 'distro', 'update', 'hart-update-service.py'))
             mod = importlib.util.module_from_spec(spec)
-            with patch.dict(os.environ, {'HYVE_UPDATE_URL': 'http://test'}):
+            with patch.dict(os.environ, {'HART_UPDATE_URL': 'http://test'}):
                 spec.loader.exec_module(mod)
 
-            svc = mod.HyveUpdateService()
+            svc = mod.HartUpdateService()
 
             mock_orch = MagicMock()
             mock_orch.start_upgrade.return_value = {'success': False, 'error': 'already active'}

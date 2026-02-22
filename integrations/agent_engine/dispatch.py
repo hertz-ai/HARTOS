@@ -125,6 +125,52 @@ def dispatch_goal_distributed(prompt: str, user_id: str, goal_id: str,
         return None
 
 
+def _check_robot_capability_match(goal_type: str, goal_id: str) -> bool:
+    """For robot goals, verify this node can handle the task.
+
+    Checks task requirements against local robot capabilities.
+    Non-robot goals always pass.  Robot goals without requirements pass.
+
+    Returns True if the node is capable, False if it should be
+    dispatched to a more capable peer via distributed dispatch.
+    """
+    if goal_type != 'robot':
+        return True
+
+    try:
+        from integrations.social.models import get_db, AgentGoal
+        db = get_db()
+        try:
+            goal = db.query(AgentGoal).filter_by(id=goal_id).first()
+            if not goal:
+                return True
+            config = goal.config_json or {}
+            required_caps = config.get('required_capabilities', [])
+            if not required_caps:
+                return True
+
+            from integrations.robotics.capability_advertiser import (
+                get_capability_advertiser,
+            )
+            adv = get_capability_advertiser()
+            score = adv.matches_task_requirements({
+                'required_capabilities': required_caps,
+                'preferred_form_factor': config.get('preferred_form_factor'),
+                'min_payload_kg': config.get('min_payload_kg'),
+            })
+            if score < 0.5:
+                logger.info(
+                    f"Robot goal {goal_id} capability mismatch "
+                    f"(score={score}), prefer distributed dispatch")
+                return False
+            return True
+        finally:
+            db.close()
+    except Exception as e:
+        logger.debug(f"Robot capability check skipped: {e}")
+        return True
+
+
 def dispatch_goal(prompt: str, user_id: str, goal_id: str,
                   goal_type: str = 'marketing',
                   model_config: list = None) -> Optional[str]:
@@ -139,6 +185,9 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     submitted to the shared DistributedTaskCoordinator. Worker nodes
     across the hive claim and execute them. Falls back to local /chat
     when the coordinator is unavailable or no peers exist.
+
+    For robot goals: capability matching ensures the task goes to a
+    node with the right hardware (locomotion, manipulation, sensors).
 
     Args:
         prompt: The goal prompt (from build_prompt)
@@ -161,6 +210,15 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
         logger.error("CRITICAL: hive_guardrails not available — blocking dispatch")
         return None
 
+    # ROBOT: capability-matched dispatch — prefer distributed for hardware mismatches
+    if not _check_robot_capability_match(goal_type, goal_id):
+        coordinator = _get_distributed_coordinator()
+        if coordinator and _has_hive_peers():
+            result = dispatch_goal_distributed(prompt, user_id, goal_id, goal_type)
+            if result is not None:
+                return result
+        # Fall through to local if no capable peer found
+
     # DISTRIBUTED: auto-distribute when coordinator is reachable and hive has peers
     coordinator = _get_distributed_coordinator()
     if coordinator and _has_hive_peers():
@@ -169,6 +227,25 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
             return result
         # Fall through to local dispatch if distributed fails
         logger.info(f"Distributed fallback -> local dispatch for {goal_type} goal {goal_id}")
+
+    # In bundled/desktop mode, use the in-process adapter instead of HTTP
+    # to port 6777 (which doesn't run as a separate server in bundled mode).
+    if os.environ.get('NUNBA_BUNDLED'):
+        try:
+            from hevolve_backend_adapter import chat as hevolve_chat
+            result = hevolve_chat(
+                text=prompt,
+                user_id=user_id,
+                agent_id=f"{goal_type}_{goal_id[:8]}",
+                create_agent=True,
+                casual_conv=False,
+            )
+            response = result.get('text') or result.get('response', '')
+            if response:
+                return response
+        except Exception as e:
+            logger.warning(f"Bundled dispatch failed for {goal_type} goal {goal_id}: {e}")
+        return None
 
     base_url = os.environ.get('HEVOLVE_BASE_URL', 'http://localhost:6777')
     prompt_id = f"{goal_type}_{goal_id[:8]}"

@@ -1,5 +1,6 @@
 from collections import deque
 import logging
+import sys
 import requests
 import re
 import ast
@@ -606,12 +607,15 @@ def retrieve_json(json_message):
         if prefix_match:
             json_message = prefix_match.group(1).strip()
 
+    # Normalize Unicode smart quotes BEFORE any parse attempt (local LLMs emit these)
+    # U+2018/2019 = curly single quotes -> ASCII apostrophe
+    # U+201C/201D = curly double quotes -> ASCII quotation mark
+    json_message = json_message.replace("\u2018", "'").replace("\u2019", "'").replace("\u201c", '"').replace("\u201d", '"')
+
     try:
         return json.loads(repair_json(json_message))
     except Exception as e:
         current_app.logger.info(f'json_repair failed: {e}')
-
-    json_message = json_message.replace(''', "'").replace(''', "'").replace('"', '"').replace('"', '"')
 
     # Try using ast.literal_eval which can handle Python dict syntax with single quotes
     try:
@@ -1958,6 +1962,9 @@ def _resolve_agent_data_dir():
     if db_path and db_path != ':memory:' and os.path.isabs(db_path):
         # Use sibling directory to the database file
         return os.path.join(os.path.dirname(db_path), 'agent_data')
+    # Bundled/frozen mode: use writable user directory (Program Files is read-only)
+    if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
+        return os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data')
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'agent_data')
 
 AGENT_DATA_DIR = _resolve_agent_data_dir()

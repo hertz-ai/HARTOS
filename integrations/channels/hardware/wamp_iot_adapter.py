@@ -1,7 +1,7 @@
 """
 WAMP/Crossbar Channel Adapter — Pub/sub for IoT devices via existing Crossbar router.
 
-Bridges IoT sensors and actuators to Hyve agents through the existing Crossbar
+Bridges IoT sensors and actuators to HART agents through the existing Crossbar
 WAMP infrastructure (ws://host:8088/ws). Uses the same router that powers
 agent multichat and channel bridging.
 

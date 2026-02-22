@@ -1,0 +1,54 @@
+{
+  "id": "hart-default",
+  "name": "HART Default",
+  "description": "Aspiration violet on dark",
+  "category": "dark",
+  "colors": {
+    "background": "0F0E17",
+    "glass_bg": "rgba(15, 14, 23, 0.65)",
+    "glass_border": "rgba(108, 99, 255, 0.15)",
+    "accent": "6C63FF",
+    "active": "00e676",
+    "text": "e0e0e0",
+    "heading": "6C63FF",
+    "error": "FF6B6B",
+    "caution": "ffab40",
+    "muted": "78909c",
+    "surface": "1a1a2e",
+    "surface_hover": "252540"
+  },
+  "conky": {
+    "background": "0F0E17",
+    "background_opacity": 180,
+    "heading": "6C63FF",
+    "active": "00e676",
+    "error": "FF6B6B",
+    "caution": "ffab40",
+    "muted": "78909c",
+    "default_text": "b0b0b0"
+  },
+  "font": {
+    "family": "JetBrains Mono",
+    "size": 13,
+    "heading_size": 18,
+    "weight": 400,
+    "heading_weight": 600
+  },
+  "shell": {
+    "blur_radius": 20,
+    "saturation": 180,
+    "border_radius": 16,
+    "panel_opacity": 0.65,
+    "topbar_height": 40,
+    "icon_size": 20,
+    "panel_titlebar_height": 32,
+    "start_menu_width": 720,
+    "start_menu_columns": 4,
+    "animation_speed_ms": 200
+  },
+  "wallpaper": {
+    "type": "gradient",
+    "value": "linear-gradient(135deg, #0F0E17 0%, #1a1a2e 50%, #16213e 100%)"
+  },
+  "gtk_prefer_dark": true
+}

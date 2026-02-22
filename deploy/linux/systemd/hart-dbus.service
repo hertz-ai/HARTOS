@@ -1,0 +1,36 @@
+[Unit]
+Description=HART OS D-Bus Agent Service
+Documentation=https://github.com/hevolve-ai/hart
+After=hart-backend.service dbus.service
+BindsTo=hart-backend.service
+Requires=dbus.service
+
+[Service]
+Type=simple
+User=hart
+Group=hart
+EnvironmentFile=/etc/hart/hart.env
+ExecStart=/opt/hart/venv/bin/python /opt/hart/deploy/linux/dbus/hart_dbus_service.py
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=3
+StartLimitIntervalSec=60
+
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+MemoryDenyWriteExecute=no
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hart-dbus
+
+[Install]
+WantedBy=hart.target

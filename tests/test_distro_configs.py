@@ -1,5 +1,5 @@
 """
-Tests for HyveOS distro configuration files.
+Tests for HART OS distro configuration files.
 
 Validates all static config files for correctness:
 - Systemd service units (7 files)
@@ -46,13 +46,13 @@ def file_exists(path):
 # ──────────────────────────────────────────────────
 
 SYSTEMD_UNITS = [
-    'deploy/linux/systemd/hyve-backend.service',
-    'deploy/linux/systemd/hyve-discovery.service',
-    'deploy/linux/systemd/hyve-agent-daemon.service',
-    'deploy/linux/systemd/hyve-vision.service',
-    'deploy/linux/systemd/hyve-llm.service',
-    'deploy/linux/systemd/hyve-dbus.service',
-    'deploy/linux/systemd/hyve.target',
+    'deploy/linux/systemd/hart-backend.service',
+    'deploy/linux/systemd/hart-discovery.service',
+    'deploy/linux/systemd/hart-agent-daemon.service',
+    'deploy/linux/systemd/hart-vision.service',
+    'deploy/linux/systemd/hart-llm.service',
+    'deploy/linux/systemd/hart-dbus.service',
+    'deploy/linux/systemd/hart.target',
 ]
 
 
@@ -84,17 +84,17 @@ class TestSystemdUnits:
 
     def test_backend_port_is_6777(self):
         """Backend service uses port 6777."""
-        content = read_file('deploy/linux/systemd/hyve-backend.service')
+        content = read_file('deploy/linux/systemd/hart-backend.service')
         assert '6777' in content
 
     def test_backend_uses_waitress(self):
         """Backend runs via waitress (not flask dev server)."""
-        content = read_file('deploy/linux/systemd/hyve-backend.service')
+        content = read_file('deploy/linux/systemd/hart-backend.service')
         assert 'waitress' in content
 
     def test_backend_security_hardening(self):
         """Backend has security directives."""
-        content = read_file('deploy/linux/systemd/hyve-backend.service')
+        content = read_file('deploy/linux/systemd/hart-backend.service')
         assert 'NoNewPrivileges=yes' in content
         assert 'ProtectSystem=strict' in content
         assert 'ProtectHome=yes' in content
@@ -102,58 +102,58 @@ class TestSystemdUnits:
 
     def test_discovery_binds_to_backend(self):
         """Discovery service binds to backend (stops if backend stops)."""
-        content = read_file('deploy/linux/systemd/hyve-discovery.service')
-        assert 'BindsTo=hyve-backend.service' in content
+        content = read_file('deploy/linux/systemd/hart-discovery.service')
+        assert 'BindsTo=hart-backend.service' in content
 
     def test_discovery_has_net_broadcast(self):
         """Discovery needs CAP_NET_BROADCAST for UDP beacon."""
-        content = read_file('deploy/linux/systemd/hyve-discovery.service')
+        content = read_file('deploy/linux/systemd/hart-discovery.service')
         assert 'CAP_NET_BROADCAST' in content
 
     def test_vision_has_gpu_groups(self):
         """Vision service has video/render supplementary groups."""
-        content = read_file('deploy/linux/systemd/hyve-vision.service')
+        content = read_file('deploy/linux/systemd/hart-vision.service')
         assert 'video' in content
         assert 'render' in content
 
     def test_vision_conditional_on_model(self):
         """Vision service only starts if minicpm model exists."""
-        content = read_file('deploy/linux/systemd/hyve-vision.service')
-        assert 'ConditionPathExists=/opt/hyve/models/minicpm/' in content
+        content = read_file('deploy/linux/systemd/hart-vision.service')
+        assert 'ConditionPathExists=/opt/hart/models/minicpm/' in content
 
     def test_llm_conditional_on_model(self):
         """LLM service only starts if default.gguf exists."""
-        content = read_file('deploy/linux/systemd/hyve-llm.service')
-        assert 'ConditionPathExists=/opt/hyve/models/default.gguf' in content
+        content = read_file('deploy/linux/systemd/hart-llm.service')
+        assert 'ConditionPathExists=/opt/hart/models/default.gguf' in content
 
     def test_dbus_requires_dbus_service(self):
         """D-Bus agent service requires dbus.service."""
-        content = read_file('deploy/linux/systemd/hyve-dbus.service')
+        content = read_file('deploy/linux/systemd/hart-dbus.service')
         assert 'Requires=dbus.service' in content
 
     def test_target_wants_core_services(self):
-        """hyve.target wants backend, discovery, and agent daemon."""
-        content = read_file('deploy/linux/systemd/hyve.target')
-        assert 'hyve-backend.service' in content
-        assert 'hyve-discovery.service' in content
-        assert 'hyve-agent-daemon.service' in content
+        """hart.target wants backend, discovery, and agent daemon."""
+        content = read_file('deploy/linux/systemd/hart.target')
+        assert 'hart-backend.service' in content
+        assert 'hart-discovery.service' in content
+        assert 'hart-agent-daemon.service' in content
 
     def test_target_is_multi_user(self):
-        """hyve.target is wanted by multi-user.target."""
-        content = read_file('deploy/linux/systemd/hyve.target')
+        """hart.target is wanted by multi-user.target."""
+        content = read_file('deploy/linux/systemd/hart.target')
         assert 'WantedBy=multi-user.target' in content
 
     @pytest.mark.parametrize('unit_path', [u for u in SYSTEMD_UNITS if u.endswith('.service')])
-    def test_service_user_is_hyve(self, unit_path):
-        """All services run as hyve user (not root)."""
+    def test_service_user_is_hart(self, unit_path):
+        """All services run as hart user (not root)."""
         content = read_file(unit_path)
-        assert 'User=hyve' in content
+        assert 'User=hart' in content
 
     @pytest.mark.parametrize('unit_path', [u for u in SYSTEMD_UNITS if u.endswith('.service')])
     def test_service_has_env_file(self, unit_path):
         """Services reference the environment file."""
         content = read_file(unit_path)
-        assert 'EnvironmentFile=/etc/hyve/hyve.env' in content
+        assert 'EnvironmentFile=/etc/hart/hart.env' in content
 
     @pytest.mark.parametrize('unit_path', [u for u in SYSTEMD_UNITS if u.endswith('.service')])
     def test_service_logs_to_journal(self, unit_path):
@@ -168,9 +168,9 @@ class TestSystemdUnits:
 # ──────────────────────────────────────────────────
 
 VARIANT_CONFIGS = [
-    'deploy/distro/variants/hyve-os-server.conf',
-    'deploy/distro/variants/hyve-os-desktop.conf',
-    'deploy/distro/variants/hyve-os-edge.conf',
+    'deploy/distro/variants/hart-os-server.conf',
+    'deploy/distro/variants/hart-os-desktop.conf',
+    'deploy/distro/variants/hart-os-edge.conf',
 ]
 
 
@@ -197,39 +197,39 @@ class TestVariantConfigs:
 
     def test_server_variant_headless(self):
         """Server variant excludes GUI packages."""
-        content = read_file('deploy/distro/variants/hyve-os-server.conf')
+        content = read_file('deploy/distro/variants/hart-os-server.conf')
         assert 'exclude' in content.lower()
         assert 'gnome' in content.lower() or 'gdm' in content.lower()
 
     def test_desktop_variant_has_gui(self):
         """Desktop variant includes D-Bus and desktop integration."""
-        content = read_file('deploy/distro/variants/hyve-os-desktop.conf')
+        content = read_file('deploy/distro/variants/hart-os-desktop.conf')
         assert 'python3-dbus' in content
         assert 'python3-gi' in content
 
     def test_edge_variant_minimal(self):
         """Edge variant has minimal resources."""
-        content = read_file('deploy/distro/variants/hyve-os-edge.conf')
+        content = read_file('deploy/distro/variants/hart-os-edge.conf')
         assert 'min_ram_gb = 1' in content
 
     def test_server_all_services_enabled(self):
         """Server variant enables all services."""
-        content = read_file('deploy/distro/variants/hyve-os-server.conf')
-        assert 'hyve-backend = enabled' in content
-        assert 'hyve-discovery = enabled' in content
-        assert 'hyve-agent-daemon = enabled' in content
+        content = read_file('deploy/distro/variants/hart-os-server.conf')
+        assert 'hart-backend = enabled' in content
+        assert 'hart-discovery = enabled' in content
+        assert 'hart-agent-daemon = enabled' in content
 
     def test_edge_disables_heavy_services(self):
         """Edge variant disables vision, LLM, agent daemon."""
-        content = read_file('deploy/distro/variants/hyve-os-edge.conf')
-        assert 'hyve-vision = disabled' in content
-        assert 'hyve-llm = disabled' in content
-        assert 'hyve-agent-daemon = disabled' in content
+        content = read_file('deploy/distro/variants/hart-os-edge.conf')
+        assert 'hart-vision = disabled' in content
+        assert 'hart-llm = disabled' in content
+        assert 'hart-agent-daemon = disabled' in content
 
     def test_desktop_enables_dbus(self):
         """Desktop variant enables D-Bus service."""
-        content = read_file('deploy/distro/variants/hyve-os-desktop.conf')
-        assert 'hyve-dbus = enabled' in content
+        content = read_file('deploy/distro/variants/hart-os-desktop.conf')
+        assert 'hart-dbus = enabled' in content
 
     @pytest.mark.parametrize('cfg_path', VARIANT_CONFIGS)
     def test_variant_has_min_ram(self, cfg_path):
@@ -251,60 +251,60 @@ class TestVariantConfigs:
 class TestKernelTuning:
 
     def test_sysctl_exists(self):
-        assert file_exists('deploy/distro/kernel/99-hyve-sysctl.conf')
+        assert file_exists('deploy/distro/kernel/99-hart-sysctl.conf')
 
     def test_sysctl_tcp_optimization(self):
         """Has TCP tuning parameters."""
-        content = read_file('deploy/distro/kernel/99-hyve-sysctl.conf')
+        content = read_file('deploy/distro/kernel/99-hart-sysctl.conf')
         assert 'net.core.somaxconn' in content
         assert 'net.ipv4.tcp_fastopen' in content
 
     def test_sysctl_kernel_hardening(self):
         """Has kernel hardening parameters."""
-        content = read_file('deploy/distro/kernel/99-hyve-sysctl.conf')
+        content = read_file('deploy/distro/kernel/99-hart-sysctl.conf')
         assert 'kernel.dmesg_restrict = 1' in content
         assert 'kernel.kptr_restrict = 2' in content
 
     def test_sysctl_rp_filter(self):
         """Reverse path filtering enabled."""
-        content = read_file('deploy/distro/kernel/99-hyve-sysctl.conf')
+        content = read_file('deploy/distro/kernel/99-hart-sysctl.conf')
         assert 'net.ipv4.conf.all.rp_filter = 1' in content
 
     def test_sysctl_redirect_disabled(self):
         """ICMP redirect acceptance disabled."""
-        content = read_file('deploy/distro/kernel/99-hyve-sysctl.conf')
+        content = read_file('deploy/distro/kernel/99-hart-sysctl.conf')
         assert 'net.ipv4.conf.all.accept_redirects = 0' in content
         assert 'net.ipv6.conf.all.accept_redirects = 0' in content
 
     def test_sysctl_file_descriptors(self):
         """High file descriptor limit for agent workloads."""
-        content = read_file('deploy/distro/kernel/99-hyve-sysctl.conf')
+        content = read_file('deploy/distro/kernel/99-hart-sysctl.conf')
         assert 'fs.file-max = 524288' in content
 
     def test_limits_exists(self):
-        assert file_exists('deploy/distro/kernel/hyve-limits.conf')
+        assert file_exists('deploy/distro/kernel/hart-limits.conf')
 
     def test_limits_nofile(self):
-        """hyve user has 65536 file descriptor limit."""
-        content = read_file('deploy/distro/kernel/hyve-limits.conf')
+        """hart user has 65536 file descriptor limit."""
+        content = read_file('deploy/distro/kernel/hart-limits.conf')
         assert 'nofile' in content
         assert '65536' in content
 
     def test_limits_nproc(self):
-        """hyve user has 4096 process limit."""
-        content = read_file('deploy/distro/kernel/hyve-limits.conf')
+        """hart user has 4096 process limit."""
+        content = read_file('deploy/distro/kernel/hart-limits.conf')
         assert 'nproc' in content
         assert '4096' in content
 
     def test_limits_memlock(self):
-        """hyve user has unlimited memlock (for GPU workloads)."""
-        content = read_file('deploy/distro/kernel/hyve-limits.conf')
+        """hart user has unlimited memlock (for GPU workloads)."""
+        content = read_file('deploy/distro/kernel/hart-limits.conf')
         assert 'memlock' in content
         assert 'unlimited' in content
 
     def test_sysctl_valid_format(self):
         """All non-comment lines match key = value format."""
-        content = read_file('deploy/distro/kernel/99-hyve-sysctl.conf')
+        content = read_file('deploy/distro/kernel/99-hart-sysctl.conf')
         for line in content.splitlines():
             stripped = line.strip()
             if stripped and not stripped.startswith('#'):
@@ -318,86 +318,86 @@ class TestKernelTuning:
 class TestBranding:
 
     def test_os_release_exists(self):
-        assert file_exists('deploy/distro/branding/hyve-os-release')
+        assert file_exists('deploy/distro/branding/hart-os-release')
 
     def test_os_release_fields(self):
         """os-release has required fields."""
-        content = read_file('deploy/distro/branding/hyve-os-release')
+        content = read_file('deploy/distro/branding/hart-os-release')
         required = ['NAME=', 'PRETTY_NAME=', 'VERSION=', 'VERSION_ID=',
                      'ID=', 'HOME_URL=']
         for field in required:
             assert field in content, f"Missing field: {field}"
 
     def test_os_release_id(self):
-        """ID is hyve-os."""
-        content = read_file('deploy/distro/branding/hyve-os-release')
-        assert 'ID=hyve-os' in content
+        """ID is hart-os."""
+        content = read_file('deploy/distro/branding/hart-os-release')
+        assert 'ID=hart-os' in content
 
     def test_os_release_id_like_ubuntu(self):
         """ID_LIKE includes ubuntu."""
-        content = read_file('deploy/distro/branding/hyve-os-release')
+        content = read_file('deploy/distro/branding/hart-os-release')
         assert 'ID_LIKE=ubuntu' in content
 
     def test_os_release_codename(self):
         """Ubuntu codename is jammy (22.04 LTS)."""
-        content = read_file('deploy/distro/branding/hyve-os-release')
+        content = read_file('deploy/distro/branding/hart-os-release')
         assert 'UBUNTU_CODENAME=jammy' in content
 
     def test_issue_banner_exists(self):
-        assert file_exists('deploy/distro/branding/hyve-issue')
+        assert file_exists('deploy/distro/branding/hart-issue')
 
     def test_issue_has_ascii_art(self):
-        """Issue banner contains HyveOS ASCII art."""
-        content = read_file('deploy/distro/branding/hyve-issue')
-        assert 'HyveOS' in content
+        """Issue banner contains HART OS ASCII art."""
+        content = read_file('deploy/distro/branding/hart-issue')
+        assert 'HART OS' in content
         assert 'Humans are always in control' in content
 
     def test_motd_exists(self):
-        assert file_exists('deploy/distro/branding/hyve-motd.sh')
+        assert file_exists('deploy/distro/branding/hart-motd.sh')
 
     def test_motd_is_shell_script(self):
         """MOTD starts with shebang."""
-        content = read_file('deploy/distro/branding/hyve-motd.sh')
+        content = read_file('deploy/distro/branding/hart-motd.sh')
         assert content.startswith('#!/bin/bash')
 
     def test_motd_shows_node_id(self):
         """MOTD displays node identity."""
-        content = read_file('deploy/distro/branding/hyve-motd.sh')
+        content = read_file('deploy/distro/branding/hart-motd.sh')
         assert 'Node ID' in content
 
     def test_motd_has_xxd_fallback(self):
         """MOTD has Python fallback when xxd unavailable."""
-        content = read_file('deploy/distro/branding/hyve-motd.sh')
+        content = read_file('deploy/distro/branding/hart-motd.sh')
         assert 'python3' in content
 
     def test_plymouth_theme_exists(self):
-        assert file_exists('deploy/distro/branding/plymouth/hyve-theme/hyve-theme.plymouth')
+        assert file_exists('deploy/distro/branding/plymouth/hart-theme/hart-theme.plymouth')
 
     def test_plymouth_theme_name(self):
-        """Plymouth theme is named HyveOS."""
-        content = read_file('deploy/distro/branding/plymouth/hyve-theme/hyve-theme.plymouth')
-        assert 'Name=HyveOS' in content
+        """Plymouth theme is named HART OS."""
+        content = read_file('deploy/distro/branding/plymouth/hart-theme/hart-theme.plymouth')
+        assert 'Name=HART OS' in content
 
     def test_plymouth_uses_script_module(self):
         """Plymouth uses script module (not text or ubuntu)."""
-        content = read_file('deploy/distro/branding/plymouth/hyve-theme/hyve-theme.plymouth')
+        content = read_file('deploy/distro/branding/plymouth/hart-theme/hart-theme.plymouth')
         assert 'ModuleName=script' in content
 
     def test_plymouth_script_exists(self):
-        assert file_exists('deploy/distro/branding/plymouth/hyve-theme/hyve-theme.script')
+        assert file_exists('deploy/distro/branding/plymouth/hart-theme/hart-theme.script')
 
     def test_plymouth_script_loads_logo(self):
-        """Plymouth script loads hyve-logo.png."""
-        content = read_file('deploy/distro/branding/plymouth/hyve-theme/hyve-theme.script')
-        assert 'hyve-logo.png' in content
+        """Plymouth script loads hart-logo.png."""
+        content = read_file('deploy/distro/branding/plymouth/hart-theme/hart-theme.script')
+        assert 'hart-logo.png' in content
 
     def test_plymouth_script_has_refresh(self):
         """Plymouth has refresh callback for animation."""
-        content = read_file('deploy/distro/branding/plymouth/hyve-theme/hyve-theme.script')
+        content = read_file('deploy/distro/branding/plymouth/hart-theme/hart-theme.script')
         assert 'SetRefreshFunction' in content
 
     def test_logo_generator_exists(self):
-        assert file_exists('deploy/distro/branding/plymouth/hyve-theme/generate-logo.py')
+        assert file_exists('deploy/distro/branding/plymouth/hart-theme/generate-logo.py')
 
 
 # ──────────────────────────────────────────────────
@@ -422,8 +422,8 @@ class TestAutoinstall:
     def test_user_data_identity(self):
         """Autoinstall sets hostname and username."""
         content = read_file('deploy/distro/autoinstall/user-data')
-        assert 'hostname: hyve-node' in content
-        assert 'username: hyve' in content
+        assert 'hostname: hart-node' in content
+        assert 'username: hart' in content
 
     def test_user_data_ssh_enabled(self):
         """SSH is installed and enabled."""
@@ -436,22 +436,22 @@ class TestAutoinstall:
         assert 'python3.10' in content
 
     def test_user_data_late_commands(self):
-        """Late commands copy HyveOS and run install."""
+        """Late commands copy HART OS and run install."""
         content = read_file('deploy/distro/autoinstall/user-data')
         assert 'install.sh' in content
-        assert 'hyve-first-boot.service' in content
+        assert 'hart-first-boot.service' in content
 
     def test_user_data_installs_branding(self):
         """Late commands install branding files."""
         content = read_file('deploy/distro/autoinstall/user-data')
-        assert 'hyve-os-release' in content
-        assert 'hyve-motd.sh' in content
+        assert 'hart-os-release' in content
+        assert 'hart-motd.sh' in content
 
     def test_user_data_kernel_tuning(self):
         """Late commands install kernel tuning."""
         content = read_file('deploy/distro/autoinstall/user-data')
-        assert '99-hyve-sysctl.conf' in content
-        assert 'hyve-limits.conf' in content
+        assert '99-hart-sysctl.conf' in content
+        assert 'hart-limits.conf' in content
 
     def test_meta_data_exists(self):
         assert file_exists('deploy/distro/autoinstall/meta-data')
@@ -467,63 +467,63 @@ class TestAutoinstall:
 class TestDBusPolicyXML:
 
     def test_dbus_conf_exists(self):
-        assert file_exists('deploy/linux/dbus/com.hyve.Agent.conf')
+        assert file_exists('deploy/linux/dbus/com.hart.Agent.conf')
 
     def test_dbus_conf_valid_xml(self):
         """D-Bus config is valid XML."""
-        path = os.path.join(REPO_ROOT, 'deploy/linux/dbus/com.hyve.Agent.conf')
+        path = os.path.join(REPO_ROOT, 'deploy/linux/dbus/com.hart.Agent.conf')
         tree = ET.parse(path)
         assert tree.getroot().tag == 'busconfig'
 
-    def test_dbus_allows_hyve_user(self):
-        """D-Bus policy allows hyve user to own bus name."""
-        content = read_file('deploy/linux/dbus/com.hyve.Agent.conf')
-        assert 'user="hyve"' in content
-        assert 'own="com.hyve.Agent"' in content
+    def test_dbus_allows_hart_user(self):
+        """D-Bus policy allows hart user to own bus name."""
+        content = read_file('deploy/linux/dbus/com.hart.Agent.conf')
+        assert 'user="hart"' in content
+        assert 'own="com.hart.Agent"' in content
 
     def test_dbus_allows_default_send(self):
         """Default policy allows sending to agent."""
-        content = read_file('deploy/linux/dbus/com.hyve.Agent.conf')
+        content = read_file('deploy/linux/dbus/com.hart.Agent.conf')
         assert 'context="default"' in content
-        assert 'send_destination="com.hyve.Agent"' in content
+        assert 'send_destination="com.hart.Agent"' in content
 
 
 class TestPolkitPolicy:
 
     def test_polkit_exists(self):
-        assert file_exists('deploy/linux/polkit/com.hyve.agent.policy')
+        assert file_exists('deploy/linux/polkit/com.hart.agent.policy')
 
     def test_polkit_valid_xml(self):
         """Polkit policy is valid XML."""
-        path = os.path.join(REPO_ROOT, 'deploy/linux/polkit/com.hyve.agent.policy')
+        path = os.path.join(REPO_ROOT, 'deploy/linux/polkit/com.hart.agent.policy')
         tree = ET.parse(path)
         assert tree.getroot().tag == 'policyconfig'
 
     def test_polkit_has_actions(self):
         """Polkit policy defines actions."""
-        path = os.path.join(REPO_ROOT, 'deploy/linux/polkit/com.hyve.agent.policy')
+        path = os.path.join(REPO_ROOT, 'deploy/linux/polkit/com.hart.agent.policy')
         tree = ET.parse(path)
         actions = tree.findall('.//action')
         assert len(actions) >= 3
 
     def test_polkit_approve_action(self):
         """Has approve-action policy."""
-        content = read_file('deploy/linux/polkit/com.hyve.agent.policy')
-        assert 'com.hyve.agent.approve-action' in content
+        content = read_file('deploy/linux/polkit/com.hart.agent.policy')
+        assert 'com.hart.agent.approve-action' in content
 
     def test_polkit_install_remote(self):
         """Has install-remote policy (provisioning)."""
-        content = read_file('deploy/linux/polkit/com.hyve.agent.policy')
-        assert 'com.hyve.agent.install-remote' in content
+        content = read_file('deploy/linux/polkit/com.hart.agent.policy')
+        assert 'com.hart.agent.install-remote' in content
 
     def test_polkit_manage_services(self):
         """Has manage-services policy."""
-        content = read_file('deploy/linux/polkit/com.hyve.agent.policy')
-        assert 'com.hyve.agent.manage-services' in content
+        content = read_file('deploy/linux/polkit/com.hart.agent.policy')
+        assert 'com.hart.agent.manage-services' in content
 
     def test_polkit_requires_auth(self):
         """All actions require admin authentication."""
-        content = read_file('deploy/linux/polkit/com.hyve.agent.policy')
+        content = read_file('deploy/linux/polkit/com.hart.agent.policy')
         assert 'auth_admin' in content
 
 
@@ -534,21 +534,21 @@ class TestPolkitPolicy:
 class TestFirewall:
 
     def test_ufw_profile_exists(self):
-        assert file_exists('deploy/linux/firewall/hyve-ufw.profile')
+        assert file_exists('deploy/linux/firewall/hart-ufw.profile')
 
     def test_ufw_includes_backend_port(self):
         """UFW profile includes port 6777."""
-        content = read_file('deploy/linux/firewall/hyve-ufw.profile')
+        content = read_file('deploy/linux/firewall/hart-ufw.profile')
         assert '6777' in content
 
     def test_ufw_includes_discovery_port(self):
         """UFW profile includes UDP port 6780."""
-        content = read_file('deploy/linux/firewall/hyve-ufw.profile')
+        content = read_file('deploy/linux/firewall/hart-ufw.profile')
         assert '6780' in content
 
     def test_ufw_has_title(self):
         """UFW profile has title."""
-        content = read_file('deploy/linux/firewall/hyve-ufw.profile')
+        content = read_file('deploy/linux/firewall/hart-ufw.profile')
         assert 'title=' in content
 
 
@@ -557,8 +557,8 @@ class TestFirewall:
 # ──────────────────────────────────────────────────
 
 DESKTOP_FILES = [
-    'deploy/linux/desktop/hyve.desktop',
-    'deploy/linux/desktop/hyve-dashboard.desktop',
+    'deploy/linux/desktop/hart.desktop',
+    'deploy/linux/desktop/hart-dashboard.desktop',
 ]
 
 
@@ -588,12 +588,12 @@ class TestDesktopEntries:
 
     def test_dashboard_opens_browser(self):
         """Dashboard desktop file uses xdg-open."""
-        content = read_file('deploy/linux/desktop/hyve.desktop')
+        content = read_file('deploy/linux/desktop/hart.desktop')
         assert 'xdg-open' in content
 
     def test_tray_desktop_autostart(self):
         """Tray desktop file has GNOME autostart enabled."""
-        content = read_file('deploy/linux/desktop/hyve-dashboard.desktop')
+        content = read_file('deploy/linux/desktop/hart-dashboard.desktop')
         assert 'X-GNOME-Autostart-enabled=true' in content
 
 
@@ -607,9 +607,9 @@ class TestDebianPackaging:
         assert file_exists('deploy/linux/debian/control')
 
     def test_control_package_name(self):
-        """Package name is hyve-os."""
+        """Package name is hart-os."""
         content = read_file('deploy/linux/debian/control')
-        assert 'Package: hyve-os' in content
+        assert 'Package: hart-os' in content
 
     def test_control_depends_python(self):
         """Package depends on python3.10."""
@@ -625,7 +625,7 @@ class TestDebianPackaging:
         """Package has description."""
         content = read_file('deploy/linux/debian/control')
         assert 'Description:' in content
-        assert 'HyveOS' in content
+        assert 'HART OS' in content
 
 
 # ──────────────────────────────────────────────────
@@ -635,73 +635,73 @@ class TestDebianPackaging:
 class TestRecovery:
 
     def test_recovery_script_exists(self):
-        assert file_exists('deploy/distro/recovery/hyve-recovery.sh')
+        assert file_exists('deploy/distro/recovery/hart-recovery.sh')
 
     def test_recovery_requires_root(self):
         """Recovery script checks for root."""
-        content = read_file('deploy/distro/recovery/hyve-recovery.sh')
+        content = read_file('deploy/distro/recovery/hart-recovery.sh')
         assert 'EUID' in content
 
     def test_recovery_has_confirmation(self):
         """Recovery requires explicit RESET confirmation."""
-        content = read_file('deploy/distro/recovery/hyve-recovery.sh')
+        content = read_file('deploy/distro/recovery/hart-recovery.sh')
         assert 'RESET' in content
 
     def test_recovery_wipes_keys(self):
         """Recovery deletes Ed25519 keys."""
-        content = read_file('deploy/distro/recovery/hyve-recovery.sh')
+        content = read_file('deploy/distro/recovery/hart-recovery.sh')
         assert 'node_private.key' in content
         assert 'node_public.key' in content
 
     def test_recovery_wipes_database(self):
         """Recovery deletes the database."""
-        content = read_file('deploy/distro/recovery/hyve-recovery.sh')
+        content = read_file('deploy/distro/recovery/hart-recovery.sh')
         assert 'hevolve_database.db' in content
 
     def test_recovery_re_enables_first_boot(self):
         """Recovery triggers first-boot setup."""
-        content = read_file('deploy/distro/recovery/hyve-recovery.sh')
-        assert 'hyve-first-boot' in content
+        content = read_file('deploy/distro/recovery/hart-recovery.sh')
+        assert 'hart-first-boot' in content
 
     def test_recovery_service_exists(self):
-        assert file_exists('deploy/distro/recovery/hyve-recovery.service')
+        assert file_exists('deploy/distro/recovery/hart-recovery.service')
 
     def test_recovery_service_requires_kernel_param(self):
-        """Recovery service requires hyve.recovery=1 kernel param."""
-        content = read_file('deploy/distro/recovery/hyve-recovery.service')
-        assert 'ConditionKernelCommandLine=hyve.recovery=1' in content
+        """Recovery service requires hart.recovery=1 kernel param."""
+        content = read_file('deploy/distro/recovery/hart-recovery.service')
+        assert 'ConditionKernelCommandLine=hart.recovery=1' in content
 
     def test_recovery_service_oneshot(self):
         """Recovery is a oneshot service."""
-        content = read_file('deploy/distro/recovery/hyve-recovery.service')
+        content = read_file('deploy/distro/recovery/hart-recovery.service')
         assert 'Type=oneshot' in content
 
 
 class TestFirstBoot:
 
     def test_first_boot_exists(self):
-        assert file_exists('deploy/distro/first-boot/hyve-first-boot.sh')
+        assert file_exists('deploy/distro/first-boot/hart-first-boot.sh')
 
     def test_first_boot_strict_mode(self):
         """Uses set -euo pipefail."""
-        content = read_file('deploy/distro/first-boot/hyve-first-boot.sh')
+        content = read_file('deploy/distro/first-boot/hart-first-boot.sh')
         assert 'set -euo pipefail' in content
 
     def test_first_boot_generates_keypair(self):
         """Generates Ed25519 node identity."""
-        content = read_file('deploy/distro/first-boot/hyve-first-boot.sh')
+        content = read_file('deploy/distro/first-boot/hart-first-boot.sh')
         assert 'Ed25519PrivateKey' in content
 
     def test_first_boot_detects_hardware(self):
         """Detects CPU, RAM, GPU."""
-        content = read_file('deploy/distro/first-boot/hyve-first-boot.sh')
+        content = read_file('deploy/distro/first-boot/hart-first-boot.sh')
         assert 'nproc' in content
         assert 'MemTotal' in content
         assert 'nvidia-smi' in content
 
     def test_first_boot_classifies_tier(self):
         """Classifies hardware into tiers."""
-        content = read_file('deploy/distro/first-boot/hyve-first-boot.sh')
+        content = read_file('deploy/distro/first-boot/hart-first-boot.sh')
         assert 'OBSERVER' in content
         assert 'STANDARD' in content
         assert 'PERFORMANCE' in content
@@ -709,42 +709,42 @@ class TestFirstBoot:
 
     def test_first_boot_configures_services(self):
         """Enables/disables services per tier."""
-        content = read_file('deploy/distro/first-boot/hyve-first-boot.sh')
+        content = read_file('deploy/distro/first-boot/hart-first-boot.sh')
         assert 'systemctl enable' in content
         assert 'systemctl disable' in content
 
     def test_first_boot_initializes_db(self):
         """Runs database migrations."""
-        content = read_file('deploy/distro/first-boot/hyve-first-boot.sh')
+        content = read_file('deploy/distro/first-boot/hart-first-boot.sh')
         assert 'run_migrations' in content
 
     def test_first_boot_starts_services(self):
-        """Starts hyve.target at the end."""
-        content = read_file('deploy/distro/first-boot/hyve-first-boot.sh')
-        assert 'systemctl restart hyve.target' in content
+        """Starts hart.target at the end."""
+        content = read_file('deploy/distro/first-boot/hart-first-boot.sh')
+        assert 'systemctl restart hart.target' in content
 
     def test_first_boot_sets_marker(self):
         """Creates .first-boot-done marker."""
-        content = read_file('deploy/distro/first-boot/hyve-first-boot.sh')
+        content = read_file('deploy/distro/first-boot/hart-first-boot.sh')
         assert '.first-boot-done' in content
 
     def test_first_boot_has_xxd_fallback(self):
         """Has Python fallback for xxd."""
-        content = read_file('deploy/distro/first-boot/hyve-first-boot.sh')
+        content = read_file('deploy/distro/first-boot/hart-first-boot.sh')
         assert 'python' in content.lower()
 
     def test_first_boot_downloads_model_for_compute(self):
         """COMPUTE_HOST tier triggers background model download."""
-        content = read_file('deploy/distro/first-boot/hyve-first-boot.sh')
-        assert 'MODEL_URL' in content or 'HYVE_DEFAULT_MODEL_URL' in content
+        content = read_file('deploy/distro/first-boot/hart-first-boot.sh')
+        assert 'MODEL_URL' in content or 'HART_DEFAULT_MODEL_URL' in content
 
     def test_first_boot_service_exists(self):
-        assert file_exists('deploy/distro/first-boot/hyve-first-boot.service')
+        assert file_exists('deploy/distro/first-boot/hart-first-boot.service')
 
     def test_first_boot_service_conditional(self):
         """Only runs if .first-boot-done doesn't exist."""
-        content = read_file('deploy/distro/first-boot/hyve-first-boot.service')
-        assert 'ConditionPathExists=!/var/lib/hyve/.first-boot-done' in content
+        content = read_file('deploy/distro/first-boot/hart-first-boot.service')
+        assert 'ConditionPathExists=!/var/lib/hart/.first-boot-done' in content
 
 
 # ──────────────────────────────────────────────────
@@ -754,37 +754,37 @@ class TestFirstBoot:
 class TestCICD:
 
     def test_github_actions_exists(self):
-        assert file_exists('deploy/distro/ci/build-hyve-iso.yml')
+        assert file_exists('deploy/distro/ci/build-hart-iso.yml')
 
     def test_github_actions_valid_yaml_structure(self):
         """YAML has expected top-level keys."""
-        content = read_file('deploy/distro/ci/build-hyve-iso.yml')
+        content = read_file('deploy/distro/ci/build-hart-iso.yml')
         assert 'name:' in content
         assert 'on:' in content
         assert 'jobs:' in content
 
     def test_github_actions_builds_all_variants(self):
         """Matrix includes server, desktop, edge."""
-        content = read_file('deploy/distro/ci/build-hyve-iso.yml')
+        content = read_file('deploy/distro/ci/build-hart-iso.yml')
         assert 'server' in content
         assert 'desktop' in content
         assert 'edge' in content
 
     def test_github_actions_uses_ubuntu_2204(self):
         """Runs on ubuntu-22.04."""
-        content = read_file('deploy/distro/ci/build-hyve-iso.yml')
+        content = read_file('deploy/distro/ci/build-hart-iso.yml')
         assert 'ubuntu-22.04' in content
 
     def test_github_actions_pinned_release_action(self):
         """Release action is pinned to SHA (not tag)."""
-        content = read_file('deploy/distro/ci/build-hyve-iso.yml')
+        content = read_file('deploy/distro/ci/build-hart-iso.yml')
         assert 'softprops/action-gh-release@' in content
         # Should be SHA, not a version tag
         assert re.search(r'softprops/action-gh-release@[a-f0-9]{40}', content)
 
     def test_github_actions_verifies_checksum(self):
         """Pipeline verifies ISO checksums."""
-        content = read_file('deploy/distro/ci/build-hyve-iso.yml')
+        content = read_file('deploy/distro/ci/build-hart-iso.yml')
         assert 'sha256sum' in content
 
     def test_makefile_exists(self):
@@ -826,9 +826,9 @@ class TestCICD:
 # ──────────────────────────────────────────────────
 
 SHELL_SCRIPTS = [
-    'deploy/distro/recovery/hyve-recovery.sh',
-    'deploy/distro/first-boot/hyve-first-boot.sh',
-    'deploy/distro/branding/hyve-motd.sh',
+    'deploy/distro/recovery/hart-recovery.sh',
+    'deploy/distro/first-boot/hart-first-boot.sh',
+    'deploy/distro/branding/hart-motd.sh',
 ]
 
 
@@ -915,16 +915,16 @@ class TestBuildISO:
 class TestPXEServerFiles:
 
     def test_pxe_server_exists(self):
-        assert file_exists('deploy/distro/pxe/hyve-pxe-server.py')
+        assert file_exists('deploy/distro/pxe/hart-pxe-server.py')
 
     def test_pxe_default_config_exists(self):
         """Default PXE boot config exists."""
         assert file_exists('deploy/distro/pxe/pxelinux.cfg/default')
 
-    def test_pxe_default_has_hyve_label(self):
-        """PXE config has HyveOS install label."""
+    def test_pxe_default_has_hart_label(self):
+        """PXE config has HART OS install label."""
         content = read_file('deploy/distro/pxe/pxelinux.cfg/default')
-        assert 'HyveOS' in content or 'hyve' in content.lower()
+        assert 'HART OS' in content or 'hart' in content.lower()
 
 
 # ──────────────────────────────────────────────────
@@ -934,10 +934,10 @@ class TestPXEServerFiles:
 class TestOEMMode:
 
     def test_oem_script_exists(self):
-        assert file_exists('deploy/distro/oem/hyve-oem-config.sh')
+        assert file_exists('deploy/distro/oem/hart-oem-config.sh')
 
     def test_oem_service_exists(self):
-        assert file_exists('deploy/distro/oem/hyve-oem.service')
+        assert file_exists('deploy/distro/oem/hart-oem.service')
 
 
 # ──────────────────────────────────────────────────
@@ -947,19 +947,19 @@ class TestOEMMode:
 class TestUpdateTimer:
 
     def test_update_service_exists(self):
-        assert file_exists('deploy/distro/update/hyve-update.service')
+        assert file_exists('deploy/distro/update/hart-update.service')
 
     def test_update_timer_exists(self):
-        assert file_exists('deploy/distro/update/hyve-update.timer')
+        assert file_exists('deploy/distro/update/hart-update.timer')
 
     def test_update_service_oneshot(self):
         """Update service is oneshot (triggered by timer)."""
-        content = read_file('deploy/distro/update/hyve-update.service')
+        content = read_file('deploy/distro/update/hart-update.service')
         assert 'Type=oneshot' in content
 
     def test_update_timer_daily(self):
         """Timer runs daily."""
-        content = read_file('deploy/distro/update/hyve-update.timer')
+        content = read_file('deploy/distro/update/hart-update.timer')
         assert 'daily' in content.lower() or 'OnCalendar=' in content
 
 
@@ -971,19 +971,19 @@ class TestBootAudit:
     """Tests for tamper-evident boot log (E1)."""
 
     def test_boot_audit_script_exists(self):
-        path = os.path.join(DISTRO_DIR, 'first-boot', 'hyve-boot-audit.sh')
+        path = os.path.join(DISTRO_DIR, 'first-boot', 'hart-boot-audit.sh')
         assert os.path.isfile(path)
 
     def test_boot_audit_has_signing_logic(self):
-        path = os.path.join(DISTRO_DIR, 'first-boot', 'hyve-boot-audit.sh')
+        path = os.path.join(DISTRO_DIR, 'first-boot', 'hart-boot-audit.sh')
         content = open(path).read()
         assert 'Ed25519' in content or 'ed25519' in content or 'sign' in content.lower()
         assert 'boot_audit.log' in content
 
     def test_first_boot_calls_audit(self):
-        path = os.path.join(DISTRO_DIR, 'first-boot', 'hyve-first-boot.sh')
+        path = os.path.join(DISTRO_DIR, 'first-boot', 'hart-first-boot.sh')
         content = open(path).read()
-        assert 'hyve-boot-audit.sh' in content
+        assert 'hart-boot-audit.sh' in content
 
 
 # ──────────────────────────────────────────────────
@@ -994,20 +994,20 @@ class TestBackupConfig:
     """Tests for backup automation (E2)."""
 
     def test_backup_script_exists(self):
-        path = os.path.join(DISTRO_DIR, 'backup', 'hyve-backup.sh')
+        path = os.path.join(DISTRO_DIR, 'backup', 'hart-backup.sh')
         assert os.path.isfile(path)
 
     def test_backup_has_retention(self):
-        path = os.path.join(DISTRO_DIR, 'backup', 'hyve-backup.sh')
+        path = os.path.join(DISTRO_DIR, 'backup', 'hart-backup.sh')
         content = open(path).read()
         assert 'mtime' in content or 'retention' in content.lower()
 
     def test_backup_timer_exists(self):
-        path = os.path.join(DISTRO_DIR, 'backup', 'hyve-backup.timer')
+        path = os.path.join(DISTRO_DIR, 'backup', 'hart-backup.timer')
         assert os.path.isfile(path)
 
     def test_backup_service_is_oneshot(self):
-        path = os.path.join(DISTRO_DIR, 'backup', 'hyve-backup.service')
+        path = os.path.join(DISTRO_DIR, 'backup', 'hart-backup.service')
         content = open(path).read()
         assert 'Type=oneshot' in content
 
@@ -1022,15 +1022,15 @@ class TestVariantFile:
     def test_build_iso_writes_variant(self):
         path = os.path.join(DISTRO_DIR, 'build-iso.sh')
         content = open(path).read()
-        assert '/etc/hyve/variant' in content
+        assert '/etc/hart/variant' in content
 
     def test_first_boot_reads_variant(self):
-        path = os.path.join(DISTRO_DIR, 'first-boot', 'hyve-first-boot.sh')
+        path = os.path.join(DISTRO_DIR, 'first-boot', 'hart-first-boot.sh')
         content = open(path).read()
-        assert '/etc/hyve/variant' in content
+        assert '/etc/hart/variant' in content
 
     def test_first_boot_edge_override(self):
-        path = os.path.join(DISTRO_DIR, 'first-boot', 'hyve-first-boot.sh')
+        path = os.path.join(DISTRO_DIR, 'first-boot', 'hart-first-boot.sh')
         content = open(path).read()
         assert 'edge' in content
 
@@ -1043,11 +1043,11 @@ class TestPlymouthProgress:
     """Tests for Plymouth boot progress (E8)."""
 
     def test_plymouth_has_progress_callback(self):
-        path = os.path.join(DISTRO_DIR, 'branding', 'plymouth', 'hyve-theme', 'hyve-theme.script')
+        path = os.path.join(DISTRO_DIR, 'branding', 'plymouth', 'hart-theme', 'hart-theme.script')
         content = open(path).read()
         assert 'progress_callback' in content or 'BootProgressFunction' in content
 
     def test_plymouth_has_message_callback(self):
-        path = os.path.join(DISTRO_DIR, 'branding', 'plymouth', 'hyve-theme', 'hyve-theme.script')
+        path = os.path.join(DISTRO_DIR, 'branding', 'plymouth', 'hart-theme', 'hart-theme.script')
         content = open(path).read()
         assert 'message_callback' in content or 'MessageFunction' in content

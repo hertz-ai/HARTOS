@@ -285,17 +285,17 @@ def _register_defaults():
             cost_per_1k_tokens=1.5,
         ))
 
-    # 6. crawl4ai Learning LLM (balanced — local world model, improves over time)
-    crawl4ai_url = os.environ.get('CRAWL4AI_API_URL')
-    if crawl4ai_url:
+    # 6. HevolveAI-Core Learning LLM (balanced — local world model, improves over time)
+    hevolveai_url = os.environ.get('HEVOLVEAI_API_URL')
+    if hevolveai_url:
         model_registry.register(ModelBackend(
-            model_id='crawl4ai-learning',
-            display_name='crawl4ai World Model (Learning)',
+            model_id='hevolveai-learning',
+            display_name='Hevolve-Core World Model (Learning)',
             tier=ModelTier.BALANCED,
             config_list_entry={
-                'model': 'crawl4ai-learning',
+                'model': 'hevolveai-learning',
                 'api_key': 'local',
-                'base_url': crawl4ai_url,
+                'base_url': hevolveai_url,
                 'price': [0, 0],
             },
             avg_latency_ms=50.0,

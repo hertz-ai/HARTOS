@@ -1,7 +1,7 @@
 """
 Private Repo Access Service — GitHub invite/revoke + access control
 
-Controls access to private repos (e.g. crawl4ai hivemind core).
+Controls access to private repos (e.g. Hevolve-Core hivemind core).
 Regional hosts get push access via GitHub collaborator invite after
 steward approval. Central has full access. Local nodes are denied.
 

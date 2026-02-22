@@ -1,14 +1,14 @@
 """
-One-time master keypair generation for Hyve deployment control.
+One-time master keypair generation for HART deployment control.
 
 FOR DEVELOPMENT ONLY. In production, generate the key directly inside
 the HSM (Google Cloud KMS, Azure Key Vault, or HashiCorp Vault) so
 the private key NEVER exists outside hardware.
 
 HSM key generation:
-  - GCP:   gcloud kms keys create hyve-master --keyring=hyve --location=global --purpose=asymmetric-signing --default-algorithm=ec-sign-ed25519
-  - Azure: az keyvault key create --vault-name hyve-vault --name hyve-master --kty OKP-HSM --curve Ed25519
-  - Vault: vault write transit/keys/hyve-master type=ed25519
+  - GCP:   gcloud kms keys create hart-master --keyring=hart --location=global --purpose=asymmetric-signing --default-algorithm=ec-sign-ed25519
+  - Azure: az keyvault key create --vault-name hart-vault --name hart-master --kty OKP-HSM --curve Ed25519
+  - Vault: vault write transit/keys/hart-master type=ed25519
 
 Dev fallback (this script):
   - Private key hex → store as GitHub Secret HEVOLVE_MASTER_PRIVATE_KEY_HEX
@@ -38,7 +38,7 @@ def main():
     )
 
     print("=" * 70)
-    print("Hyve Master Keypair Generated (DEV ONLY)")
+    print("HART Master Keypair Generated (DEV ONLY)")
     print("=" * 70)
     print()
     print("  In production, generate keys INSIDE the HSM so the private")

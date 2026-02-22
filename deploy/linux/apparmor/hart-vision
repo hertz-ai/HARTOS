@@ -1,0 +1,24 @@
+#include <tunables/global>
+
+/opt/hart/venv/bin/python {
+  #include <abstractions/base>
+  #include <abstractions/python>
+
+  /opt/hart/** r,
+  /opt/hart/venv/bin/python ix,
+  /opt/hart/models/** r,
+  /var/log/hart/** w,
+  /etc/hart/** r,
+
+  # GPU access
+  /dev/video* rw,
+  /dev/dri/** rw,
+  /dev/nvidia* rw,
+  /sys/class/drm/** r,
+
+  network inet stream,
+
+  deny /etc/shadow r,
+  deny /root/** rw,
+  deny /var/lib/hart/node_private.key r,
+}

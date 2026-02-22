@@ -1,7 +1,7 @@
 """
 ROS 2 Bridge Channel Adapter — Subscribe/publish to ROS 2 topics.
 
-Bridges ROS 2 robots to Hyve agents. Subscribes to String and Image topics,
+Bridges ROS 2 robots to HART agents. Subscribes to String and Image topics,
 publishes agent responses back to ROS 2 topics.
 
 Only loaded when HEVOLVE_ROS_BRIDGE_ENABLED=true (rclpy pulls ~500MB deps).
@@ -11,8 +11,8 @@ Usage:
 
     from integrations.channels.hardware.ros_bridge import ROSBridgeAdapter
     adapter = ROSBridgeAdapter(
-        subscribe_topics=['/hyve/input', '/camera/image_raw'],
-        publish_topic='/hyve/output',
+        subscribe_topics=['/hart/input', '/camera/image_raw'],
+        publish_topic='/hart/output',
     )
     adapter.on_message(handler)
     await adapter.start()
@@ -52,11 +52,11 @@ class ROSBridgeAdapter(ChannelAdapter):
     ):
         super().__init__(config or ChannelConfig())
         self._subscribe_topics = subscribe_topics or _parse_topic_list(
-            os.environ.get('HEVOLVE_ROS_TOPICS', '/hyve/input'))
+            os.environ.get('HEVOLVE_ROS_TOPICS', '/hart/input'))
         self._publish_topic = publish_topic or os.environ.get(
-            'HEVOLVE_ROS_PUBLISH_TOPIC', '/hyve/output')
+            'HEVOLVE_ROS_PUBLISH_TOPIC', '/hart/output')
         self._node_name = node_name or os.environ.get(
-            'HEVOLVE_ROS_NODE_NAME', 'hyve_bridge')
+            'HEVOLVE_ROS_NODE_NAME', 'hart_bridge')
         self._frame_store = frame_store  # Optional: inject frames into FrameStore
         self._node = None
         self._publisher = None
@@ -273,7 +273,7 @@ class ROSBridgeAdapter(ChannelAdapter):
 def _parse_topic_list(env_value: str) -> List[str]:
     """Parse comma-separated ROS topic names from env var."""
     if not env_value:
-        return ['/hyve/input']
+        return ['/hart/input']
     return [t.strip() for t in env_value.split(',') if t.strip()]
 
 

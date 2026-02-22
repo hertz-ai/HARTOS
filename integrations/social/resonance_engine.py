@@ -55,6 +55,10 @@ AWARD_TABLE = {
     'learning_contribution':    {'spark': 25, 'pulse': 10, 'signal': 0.08, 'xp': 40},
     'learning_skill_shared':    {'spark': 15, 'signal': 0.05, 'xp': 25},
     'learning_credit_assigned': {'spark': 5, 'xp': 10},
+    'experiment_proposed':      {'spark': 20, 'pulse': 10, 'signal': 0.10, 'xp': 30},
+    'experiment_voted':         {'spark': 10, 'pulse': 5, 'xp': 15},
+    'experiment_evaluated':     {'spark': 30, 'signal': 0.08, 'xp': 50},
+    'experiment_suggestion':    {'spark': 15, 'signal': 0.05, 'xp': 20},
 }
 
 

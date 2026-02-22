@@ -1,9 +1,9 @@
 """
 Crawl4AI tool wrapper — web scraping to markdown conversion.
 
-Service: Crawl4AI (https://github.com/unclecode/crawl4ai)
+Service: Crawl4AI (https://github.com/unclecode/hevolveai)
 Default port: 11235
-Deployment: docker run -d -p 11235:11235 --shm-size=1g unclecode/crawl4ai:latest
+Deployment: docker run -d -p 11235:11235 --shm-size=1g unclecode/hevolveai:latest
 """
 
 import os
@@ -18,7 +18,7 @@ class Crawl4AITool:
     @classmethod
     def create_tool_info(cls, base_url: str = None) -> ServiceToolInfo:
         return ServiceToolInfo(
-            name="crawl4ai",
+            name="hevolveai",
             description=(
                 "Web scraping and content extraction. Crawls URLs and converts "
                 "web pages to clean markdown optimized for LLM consumption. "

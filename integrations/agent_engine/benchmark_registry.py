@@ -2,7 +2,7 @@
 Unified Agent Goal Engine - Dynamic Benchmark Registry
 
 Benchmarks are adapters that wrap measurement suites. Built-in adapters
-reuse existing crawl4ai code. Dynamic adapters are installed by the
+reuse existing Hevolve-Core code. Dynamic adapters are installed by the
 coding agent at regional compute-heavy nodes via RuntimeToolManager pattern.
 
 Snapshots stored at agent_data/benchmarks/{version}.json.
@@ -19,7 +19,16 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger('hevolve_social')
 
-BENCHMARK_DIR = os.path.join('agent_data', 'benchmarks')
+def _resolve_benchmark_dir():
+    import sys as _sys
+    db_path = os.environ.get('HEVOLVE_DB_PATH', '')
+    if db_path and db_path != ':memory:' and os.path.isabs(db_path):
+        return os.path.join(os.path.dirname(db_path), 'agent_data', 'benchmarks')
+    if os.environ.get('NUNBA_BUNDLED') or getattr(_sys, 'frozen', False):
+        return os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data', 'benchmarks')
+    return os.path.join('agent_data', 'benchmarks')
+
+BENCHMARK_DIR = _resolve_benchmark_dir()
 
 
 class BenchmarkAdapter:
@@ -170,7 +179,7 @@ class GuardrailAdapter(BenchmarkAdapter):
 
 
 class QuantiPhyAdapter(BenchmarkAdapter):
-    """QuantiPhy physics reasoning benchmark from crawl4ai."""
+    """QuantiPhy physics reasoning benchmark from Hevolve-Core."""
     name = 'quantiphy'
     source = 'builtin'
     requires_gpu = True
@@ -179,16 +188,16 @@ class QuantiPhyAdapter(BenchmarkAdapter):
 
     def is_available(self) -> bool:
         try:
-            # Check if crawl4ai quantiphy benchmark exists
+            # Check if Hevolve-Core quantiphy benchmark exists
             import importlib.util
-            spec = importlib.util.find_spec('crawl4ai')
+            spec = importlib.util.find_spec('hevolveai')
             return spec is not None
         except Exception:
             return False
 
     def run(self, api_url: str = '', **kwargs) -> Dict:
         try:
-            from crawl4ai.tests.benchmarks.quantiphy_benchmark import QuantiPhyBenchmark
+            from hevolveai.tests.benchmarks.quantiphy_benchmark import QuantiPhyBenchmark
             bench = QuantiPhyBenchmark(api_url=api_url or 'http://localhost:8000')
             results = bench.run_benchmark(
                 phase='baseline',
@@ -207,7 +216,7 @@ class QuantiPhyAdapter(BenchmarkAdapter):
 
 
 class EmbodiedValidationAdapter(BenchmarkAdapter):
-    """Embodied AI validation benchmark from crawl4ai."""
+    """Embodied AI validation benchmark from Hevolve-Core."""
     name = 'embodied_validation'
     source = 'builtin'
     requires_gpu = True
@@ -217,14 +226,14 @@ class EmbodiedValidationAdapter(BenchmarkAdapter):
     def is_available(self) -> bool:
         try:
             import importlib.util
-            spec = importlib.util.find_spec('crawl4ai')
+            spec = importlib.util.find_spec('hevolveai')
             return spec is not None
         except Exception:
             return False
 
     def run(self, api_url: str = '', **kwargs) -> Dict:
         try:
-            from crawl4ai.embodied_ai.validation.benchmark import (
+            from hevolveai.embodied_ai.validation.benchmark import (
                 PerformanceBenchmark, ForgettingBenchmark, MemoryBenchmark)
             # Run lightweight validation checks
             metrics = {}
@@ -250,7 +259,7 @@ class EmbodiedValidationAdapter(BenchmarkAdapter):
 
 
 class QwenEncoderAdapter(BenchmarkAdapter):
-    """Qwen encoder throughput benchmark from crawl4ai."""
+    """Qwen encoder throughput benchmark from Hevolve-Core."""
     name = 'qwen_encoder'
     source = 'builtin'
     requires_gpu = True
@@ -260,14 +269,14 @@ class QwenEncoderAdapter(BenchmarkAdapter):
     def is_available(self) -> bool:
         try:
             import importlib.util
-            spec = importlib.util.find_spec('crawl4ai')
+            spec = importlib.util.find_spec('hevolveai')
             return spec is not None
         except Exception:
             return False
 
     def run(self, api_url: str = '', **kwargs) -> Dict:
         try:
-            from crawl4ai.embodied_ai.models.qwen_benchmark import (
+            from hevolveai.embodied_ai.models.qwen_benchmark import (
                 benchmark_llamacpp)
             result = benchmark_llamacpp(
                 server_url=api_url or f'http://localhost:{os.environ.get("LLAMA_CPP_PORT", "8080")}')

@@ -266,7 +266,7 @@ class ChatQwen3VL(LLM):
             payload["stop"] = stop
 
         _log = logging.getLogger(__name__)
-        # Primary: crawl4ai embodied-ai on port 8000
+        # Primary: Hevolve-Core embodied-ai on port 8000
         try:
             response = pooled_post(
                 f"{self.base_url}/chat/completions",
@@ -401,7 +401,11 @@ stream_handler = logging.StreamHandler(sys.stdout)
 
 if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
     _nunba_log_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'logs')
-    os.makedirs(_nunba_log_dir, exist_ok=True)
+    try:
+        os.makedirs(_nunba_log_dir, exist_ok=True)
+    except PermissionError:
+        _nunba_log_dir = os.path.join(os.path.expanduser('~'), '.nunba', 'logs')
+        os.makedirs(_nunba_log_dir, exist_ok=True)
     _langchain_log_path = os.path.join(_nunba_log_dir, 'langchain.log')
 else:
     _langchain_log_path = 'langchain.log'
@@ -409,7 +413,7 @@ else:
 handler = RotatingFileHandler(_langchain_log_path, maxBytes=5_000_000, backupCount=2)
 
 # Set the logging level for the file handler
-# Was ERROR — changed to INFO so that LangChain, crawl4ai, and other library
+# Was ERROR — changed to INFO so that LangChain, Hevolve-Core, and other library
 # logs are captured in Documents/Nunba/logs/langchain.log (not just errors).
 handler.setLevel(logging.INFO)
 
@@ -421,7 +425,7 @@ handler.setFormatter(formatter)
 stream_handler.setFormatter(formatter)
 
 # In bundled mode, also attach the file handler to the root logger so that ALL
-# module loggers (crawl4ai, langchain, etc.) write to Documents/Nunba/logs/langchain.log
+# module loggers (hevolve-core, langchain, etc.) write to Documents/Nunba/logs/langchain.log
 if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
     _root = logging.getLogger()
     _root.addHandler(handler)
@@ -537,7 +541,7 @@ for _cfg_key in ('OPENAI_API_KEY', 'GOOGLE_CSE_ID', 'GOOGLE_API_KEY',
     else:
         os.environ.setdefault(_cfg_key, '')
 
-# Mode-aware inference: pass LLM endpoint to crawl4ai for non-flat deployments
+# Mode-aware inference: pass LLM endpoint to Hevolve-Core for non-flat deployments
 _node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
 _active_cloud = os.environ.get('HEVOLVE_ACTIVE_CLOUD_PROVIDER', '')
 if _node_tier in ('regional', 'central'):
@@ -547,7 +551,7 @@ if _node_tier in ('regional', 'central'):
 elif _active_cloud and os.environ.get('HEVOLVE_LLM_API_KEY'):
     # Wizard-configured cloud provider (flat mode desktop user).
     # Vault already populated HEVOLVE_LLM_* env vars via export_to_env() in app.py.
-    # Crawl4AI's create_learning_llm_config() reads these automatically.
+    # Hevolve-Core's create_learning_llm_config() reads these automatically.
     pass
 # Cloud fallback for adaptive routing (flat mode — offload when local CPU overloaded)
 if config.get('CLOUD_FALLBACK_URL'):
@@ -573,7 +577,7 @@ RAG_API = config.get('RAG_API', '')
 DB_URL = config.get('DB_URL', _ip.get('database_url', ''))
 
 # ============================================================================
-# Embodied AI Learning Pipeline (crawl4ai — in-process, no extra port)
+# Embodied AI Learning Pipeline (Hevolve-Core — in-process, no extra port)
 # ============================================================================
 _learning_provider = None
 _hive_mind = None
@@ -603,11 +607,11 @@ def _wait_for_llm_server(url=None, timeout=15):
     """Wait for llama.cpp server, giving parent process time to start it.
 
     In Nunba (flat mode), the desktop app starts llama.cpp in a background
-    thread.  This function polls the health endpoint so crawl4ai sees an
+    thread.  This function polls the health endpoint so Hevolve-Core sees an
     existing server and reuses it instead of auto-starting a second one.
 
     In standalone mode nobody else starts the server, so after *timeout*
-    seconds we return False and let crawl4ai auto-start as usual.
+    seconds we return False and let Hevolve-Core auto-start as usual.
 
     Returns True if server found, False if timeout expired.
     """
@@ -627,12 +631,12 @@ def _wait_for_llm_server(url=None, timeout=15):
         time.sleep(1)
     _logger.info(
         f"[EmbodiedAI] No server on {url} after {timeout}s "
-        "\u2014 crawl4ai will auto-start")
+        "\u2014 Hevolve-Core will auto-start")
     return False
 
 
 def _init_learning_pipeline():
-    """Initialize crawl4ai's learning pipeline in-process.
+    """Initialize Hevolve-Core's learning pipeline in-process.
 
     Instead of starting a separate server on port 8000,
     we import and initialize the learning components directly.
@@ -650,22 +654,22 @@ def _init_learning_pipeline():
     **Standalone (start_with_tracing.bat, ``python langchain_gpt_api.py``):**
         Brief 5 s wait (in case user already has llama.cpp running).
         If nothing responds, ``create_learning_llm_config()`` calls
-        crawl4ai which auto-starts its own server.  Default behaviour,
+        Hevolve-Core which auto-starts its own server.  Default behaviour,
         no mode config needed.
 
     **Cloud API configured (``HEVOLVE_LLM_ENDPOINT_URL``):**
-        Skip local server wait entirely — crawl4ai's Priority 0 path
+        Skip local server wait entirely — Hevolve-Core's Priority 0 path
         routes to the external endpoint.
     """
     global _learning_provider, _hive_mind, _trace_recorder
 
     try:
-        from crawl4ai.embodied_ai.rl_ef import (
+        from hevolveai.embodied_ai.rl_ef import (
             create_learning_llm_config,
             register_learning_provider,
         )
-        from crawl4ai.embodied_ai.monitoring.trace_recorder import get_trace_recorder
-        from crawl4ai.embodied_ai.learning.hive_mind import HiveMind, AgentCapability
+        from hevolveai.embodied_ai.monitoring.trace_recorder import get_trace_recorder
+        from hevolveai.embodied_ai.learning.hive_mind import HiveMind, AgentCapability
 
         _logger = logging.getLogger(__name__)
         bundled = _is_bundled()
@@ -676,7 +680,7 @@ def _init_learning_pipeline():
 
         # ── Decide how to handle the local llama.cpp server ──
         if cloud:
-            # Cloud endpoint configured — crawl4ai uses it directly,
+            # Cloud endpoint configured — Hevolve-Core uses it directly,
             # no need to wait for or start a local server.
             _logger.info(
                 "[EmbodiedAI] Cloud API configured — skipping local server wait")
@@ -690,12 +694,12 @@ def _init_learning_pipeline():
                     "— learning disabled (chat still works)")
                 return
         else:
-            # Standalone — brief courtesy wait then let crawl4ai auto-start.
+            # Standalone — brief courtesy wait then let Hevolve-Core auto-start.
             _wait_for_llm_server(timeout=5)
 
         # Trace recorder
         recordings_dir = os.path.join(
-            os.path.expanduser('~'), '.crawl4ai', 'recordings')
+            os.path.expanduser('~'), '.hevolveai', 'recordings')
         os.makedirs(recordings_dir, exist_ok=True)
         _trace_recorder = get_trace_recorder(recordings_dir)
 
@@ -728,7 +732,7 @@ def _init_learning_pipeline():
 
     except ImportError as e:
         logging.getLogger(__name__).warning(
-            f"[EmbodiedAI] crawl4ai not installed — learning disabled: {e}")
+            f"[EmbodiedAI] Hevolve-Core not installed — learning disabled: {e}")
     except Exception as e:
         logging.getLogger(__name__).error(
             f"[EmbodiedAI] Learning pipeline init failed: {e}")
@@ -805,7 +809,7 @@ def get_frame_store():
 
 
 def _wire_vision_to_learning():
-    """Connect FrameStore to crawl4ai's video learning pipeline.
+    """Connect FrameStore to Hevolve-Core's video learning pipeline.
 
     Waits up to 60s for both VisionService and LearningLLMProvider,
     then calls start_video_learning().
@@ -828,7 +832,7 @@ def _wire_vision_to_learning():
                 frame_store_user_id='default',
             )
             _logger.info(
-                "[Wiring] FrameStore → crawl4ai video learning connected")
+                "[Wiring] FrameStore → Hevolve-Core video learning connected")
         else:
             _logger.info(
                 "[Wiring] LearningProvider has no start_video_learning — skip")
@@ -841,7 +845,7 @@ threading.Thread(
     target=_init_vision_service, daemon=True,
     name='vision_init').start()
 
-# Wire FrameStore to crawl4ai after both subsystems are ready
+# Wire FrameStore to Hevolve-Core after both subsystems are ready
 threading.Thread(
     target=_wire_vision_to_learning, daemon=True,
     name='vision_learning_wire').start()
@@ -1098,10 +1102,42 @@ def _response_signals_creation(response_text):
     return any(signal in lower for signal in _RESPONSE_CREATION_SIGNALS)
 
 
+def _safe_load_google_search():
+    """Load google-search tool, returning empty list if package is missing."""
+    try:
+        return load_tools(["google-search"])
+    except (ImportError, Exception) as e:
+        logging.warning(f"Google Search tool unavailable: {e}")
+        return []
+
+
+def _with_tool_logging(func, tool_name):
+    """Wrap a tool function with logging and generic error handling.
+
+    Acts as a @before/@after decorator for all LangChain tools:
+    - Logs entry with tool name and truncated input
+    - Catches all exceptions and returns a user-friendly error string
+      instead of crashing the agent executor
+    - Logs completion with output length or error details
+    """
+    from functools import wraps
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        logging.info(f"[TOOL] {tool_name} called | input: {str(args)[:200]}")
+        try:
+            result = func(*args, **kwargs)
+            logging.info(f"[TOOL] {tool_name} completed | output length: {len(str(result))}")
+            return result
+        except Exception as e:
+            logging.error(f"[TOOL] {tool_name} failed: {e}", exc_info=True)
+            return f"Tool '{tool_name}' encountered an error: {str(e)[:200]}"
+    return wrapper
+
+
 def get_tools(req_tool, is_first: bool = False):
 
     if is_first:
-        tools = load_tools(["google-search"])
+        tools = _safe_load_google_search()
         tool = [
 
             Tool(
@@ -1190,7 +1226,7 @@ def get_tools(req_tool, is_first: bool = False):
         except ImportError:
             pass
 
-        # Hyve Skills: Ingest agent skills (Claude Code, Markdown, GitHub)
+        # HART Skills: Ingest agent skills (Claude Code, Markdown, GitHub)
         try:
             from integrations.skills import skill_registry
             tool += skill_registry.get_langchain_tools()
@@ -1214,6 +1250,9 @@ def get_tools(req_tool, is_first: bool = False):
             pass  # Non-blocking — memory tools are optional
 
         tools += tool
+        # Wrap all tool functions with logging
+        for t in tools:
+            t.func = _with_tool_logging(t.func, t.name)
         return tools
 
     else:
@@ -1265,13 +1304,13 @@ def get_tools(req_tool, is_first: bool = False):
                     description=tool_description
                 )
             ]
-            tools = load_tools(["google-search"])
+            tools = _safe_load_google_search()
             tools += req_tool_from_user
 
         else:
             tool_description = ""
             tool_func = ""
-            tools = load_tools(["google-search"])
+            tools = _safe_load_google_search()
             # tools += req_tool_from_user
 
         tool = [
@@ -1348,6 +1387,11 @@ def get_tools(req_tool, is_first: bool = False):
                 final_tool.append(new_tool)
 
         tools += final_tool
+
+        # Wrap all tool functions with logging
+        for t in tools:
+            if hasattr(t, 'func') and callable(t.func):
+                t.func = _with_tool_logging(t.func, t.name)
 
         tool_strings = "\n".join(
             f"\n> {tool.name}: {tool.description}" for tool in tools)
@@ -2999,6 +3043,14 @@ def chat():
         except ImportError:
             pass
 
+    # SECURITY: redact secrets (API keys, tokens, passwords) from user prompts
+    if prompt:
+        try:
+            from security.secret_redactor import redact_secrets
+            prompt, _redacted_count = redact_secrets(prompt)
+        except ImportError:
+            pass
+
     # Speculative dispatch: fast response + background expert
     if speculative and prompt and user_id and prompt_id:
         try:
@@ -3719,22 +3771,94 @@ def status():
     result['llm_backend'] = _get_active_backend_info()
     result['node_tier'] = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
 
-    # crawl4ai health (non-blocking, fail-safe)
+    # Hevolve-Core health (non-blocking, fail-safe)
     try:
         from integrations.agent_engine.world_model_bridge import get_world_model_bridge
         bridge = get_world_model_bridge()
         bridge_stats = bridge.get_stats()
-        result['crawl4ai_url'] = bridge_stats.get('api_url', '')
+        result['hevolve_core_url'] = bridge_stats.get('api_url', '')
         result['in_process'] = bridge_stats.get('in_process', False)
         health = bridge.check_health()
-        result['crawl4ai_healthy'] = health.get('healthy', False)
+        result['hevolve_core_healthy'] = health.get('healthy', False)
         result['learning_active'] = health.get('learning_active', False)
         result['learning_mode'] = health.get('mode', 'unknown')
     except Exception:
-        result['crawl4ai_healthy'] = False
+        result['hevolve_core_healthy'] = False
         result['learning_active'] = False
 
     return jsonify(result)
+
+
+@app.route('/health', methods=['GET'])
+def health_liveness():
+    """Liveness probe — returns 200 if the process is running.
+
+    Use for K8s livenessProbe / systemd WatchdogSec.
+    """
+    return jsonify({'status': 'alive'}), 200
+
+
+@app.route('/ready', methods=['GET'])
+def health_readiness():
+    """Readiness probe — returns 200 only when critical subsystems are healthy.
+
+    Checks:
+    - Database: SELECT 1 via get_db()
+    - Node identity: get_node_identity() returns non-None
+
+    Returns 503 when any critical check fails.
+    """
+    checks = {}
+    all_ok = True
+
+    # Check 1: Database connectivity
+    try:
+        from integrations.social.models import get_db
+        from sqlalchemy import text as _sa_text
+        db = get_db()
+        try:
+            db.execute(_sa_text('SELECT 1'))
+            checks['database'] = 'ok'
+        finally:
+            db.close()
+    except Exception as e:
+        checks['database'] = f'fail: {e}'
+        all_ok = False
+
+    # Check 2: Node identity
+    try:
+        from security.node_integrity import get_node_identity
+        identity = get_node_identity()
+        if identity:
+            checks['node_identity'] = 'ok'
+        else:
+            checks['node_identity'] = 'fail: no identity'
+            all_ok = False
+    except Exception as e:
+        checks['node_identity'] = f'fail: {e}'
+        all_ok = False
+
+    # Check 3: Hevolve-Core bridge (optional — not critical)
+    try:
+        from integrations.agent_engine.world_model_bridge import get_world_model_bridge
+        bridge = get_world_model_bridge()
+        bridge_health = bridge.check_health()
+        checks['hevolve_core'] = 'ok' if bridge_health.get('healthy') else 'degraded'
+    except Exception:
+        checks['hevolve_core'] = 'unavailable'
+
+    # Check 4: LLM backend (optional — not critical)
+    try:
+        backend_info = _get_active_backend_info()
+        checks['llm_backend'] = backend_info.get('backend', 'unknown')
+    except Exception:
+        checks['llm_backend'] = 'unavailable'
+
+    status_code = 200 if all_ok else 503
+    return jsonify({
+        'status': 'ready' if all_ok else 'not_ready',
+        'checks': checks,
+    }), status_code
 
 @app.route('/zeroshot/', methods=['POST'])
 def zeroshot():
@@ -3982,12 +4106,12 @@ def voice_transcribe():
 
 
 # ---------------------------------------------------------------------------
-# Hyve Skills API — ingest, list, and manage agent skills
+# HART Skills API — ingest, list, and manage agent skills
 # ---------------------------------------------------------------------------
 
 @app.route('/api/skills/list', methods=['GET'])
 def skills_list():
-    """List all registered Hyve skills."""
+    """List all registered HART skills."""
     try:
         from integrations.skills import skill_registry
         return jsonify({
@@ -4087,7 +4211,7 @@ def _init_skills():
         skill_registry.load_config()
         skill_registry.discover_local()
         if skill_registry.count > 0:
-            app.logger.info(f"Hyve skills ready: {skill_registry.count} skills loaded")
+            app.logger.info(f"HART skills ready: {skill_registry.count} skills loaded")
     except Exception as e:
         logger.debug(f"Skill init skipped: {e}")
 
@@ -4105,17 +4229,65 @@ def _init_runtime_tools():
         logger.warning(f"Runtime tool init failed: {e}")
 
 
+def _validate_startup():
+    """Validate critical configuration at startup with helpful messages."""
+    import sys
+    warnings = []
+
+    # Python version check
+    v = sys.version_info
+    if v.major != 3 or v.minor < 10 or v.minor > 11:
+        warnings.append(
+            f"Python {v.major}.{v.minor}.{v.micro} detected. "
+            f"HART OS requires Python 3.10 or 3.11 (pydantic 1.10.9 compat).")
+
+    # Config file check
+    config_path = os.path.join(os.path.dirname(__file__), 'config.json')
+    langchain_config_path = os.path.join(os.path.dirname(__file__), 'langchain_config.json')
+    if not os.path.exists(config_path) and not os.path.exists(langchain_config_path):
+        warnings.append(
+            "No config.json or langchain_config.json found. "
+            "Create config.json with API keys (OPENAI, GROQ, etc.) for full functionality.")
+
+    # .env check
+    env_path = os.path.join(os.path.dirname(__file__), '.env')
+    if not os.path.exists(env_path):
+        warnings.append(
+            "No .env file found. Create .env with OPENAI_API_KEY, GROQ_API_KEY, "
+            "LANGCHAIN_API_KEY for LLM access.")
+
+    # Database directory check
+    db_dir = os.path.join(os.path.dirname(__file__), 'agent_data')
+    if not os.path.isdir(db_dir):
+        try:
+            os.makedirs(db_dir, exist_ok=True)
+        except OSError as e:
+            warnings.append(f"Cannot create agent_data directory: {e}")
+
+    if warnings:
+        logger = logging.getLogger('hevolve_social')
+        logger.warning("=" * 60)
+        logger.warning("STARTUP VALIDATION WARNINGS")
+        for w in warnings:
+            logger.warning(f"  - {w}")
+        logger.warning("=" * 60)
+
+    return warnings
+
+
 def main():
     """
     Main entry point for hevolve-server CLI command.
     Starts the Flask server using waitress.
     """
+    _validate_startup()
+
     # Start runtime tools restoration in background
     import threading
     tools_thread = threading.Thread(target=_init_runtime_tools, daemon=True)
     tools_thread.start()
 
-    # Initialize Hyve skill registry (load persisted + discover local)
+    # Initialize HART skill registry (load persisted + discover local)
     skills_thread = threading.Thread(target=_init_skills, daemon=True)
     skills_thread.start()
 

@@ -48,7 +48,7 @@ _KNOWN_HSM_PINS: Dict[str, List[str]] = {
     ],
     # Azure Key Vault
     'vault.azure.net': [],
-    # HashiCorp Vault - user-configured, loaded from HYVE_VAULT_CA_CERT
+    # HashiCorp Vault - user-configured, loaded from HART_VAULT_CA_CERT
 }
 
 
@@ -71,7 +71,7 @@ class HSMTrustManager:
     def _load_pins(self):
         """Load certificate pins from config file or environment."""
         # User-configured pins
-        pin_file = os.environ.get('HYVE_HSM_PIN_FILE', '')
+        pin_file = os.environ.get('HART_HSM_PIN_FILE', '')
         if pin_file and os.path.exists(pin_file):
             try:
                 with open(pin_file, 'r') as f:
@@ -82,11 +82,11 @@ class HSMTrustManager:
                 logger.warning(f"Failed to load HSM pin file: {e}")
 
         # Vault CA cert → derive pin
-        vault_ca = os.environ.get('HYVE_VAULT_CA_CERT', '')
+        vault_ca = os.environ.get('HART_VAULT_CA_CERT', '')
         if vault_ca and os.path.exists(vault_ca):
             try:
                 pin = self._compute_cert_pin(vault_ca)
-                vault_addr = os.environ.get('HYVE_VAULT_ADDR', '')
+                vault_addr = os.environ.get('HART_VAULT_ADDR', '')
                 if vault_addr:
                     from urllib.parse import urlparse
                     host = urlparse(vault_addr).hostname
@@ -127,13 +127,13 @@ class HSMTrustManager:
         ctx = ssl.create_default_context()
 
         # Load custom CA cert if available
-        ca_cert = os.environ.get('HYVE_HSM_CA_CERT', '')
+        ca_cert = os.environ.get('HART_HSM_CA_CERT', '')
         if ca_cert and os.path.exists(ca_cert):
             ctx.load_verify_locations(ca_cert)
 
         # Load client cert for mTLS if available
-        client_cert = os.environ.get('HYVE_HSM_CLIENT_CERT', '')
-        client_key = os.environ.get('HYVE_HSM_CLIENT_KEY', '')
+        client_cert = os.environ.get('HART_HSM_CLIENT_CERT', '')
+        client_key = os.environ.get('HART_HSM_CLIENT_KEY', '')
         if client_cert and client_key:
             try:
                 ctx.load_cert_chain(client_cert, client_key)
@@ -202,10 +202,10 @@ class HSMTrustManager:
         return {
             'pins_configured': {k: len(v) for k, v in self._pins.items() if v},
             'mtls_configured': bool(
-                os.environ.get('HYVE_HSM_CLIENT_CERT') and
-                os.environ.get('HYVE_HSM_CLIENT_KEY')),
-            'custom_ca': bool(os.environ.get('HYVE_HSM_CA_CERT')),
-            'vault_ca': bool(os.environ.get('HYVE_VAULT_CA_CERT')),
+                os.environ.get('HART_HSM_CLIENT_CERT') and
+                os.environ.get('HART_HSM_CLIENT_KEY')),
+            'custom_ca': bool(os.environ.get('HART_HSM_CA_CERT')),
+            'vault_ca': bool(os.environ.get('HART_VAULT_CA_CERT')),
             'recent_checks': self._health_history[-5:] if self._health_history else [],
         }
 

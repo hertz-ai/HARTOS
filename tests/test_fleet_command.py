@@ -263,7 +263,7 @@ class TestExecuteCommand:
     def test_execute_firmware_update(self):
         """Firmware update queues update URL."""
         result = _execute_firmware_update({
-            'update_url': 'https://releases.hyve.ai/v1.2.3',
+            'update_url': 'https://releases.hart.ai/v1.2.3',
             'release_hash': 'abc123def456',
         })
         assert result['success'] is True

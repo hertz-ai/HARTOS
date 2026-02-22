@@ -30,20 +30,20 @@
       "features": ["backend", "agent_engine"]
     },
     "regional": {
-      "description": "HyveOS regional host (systemd services)",
-      "entry_point": "/opt/hyve/venv/bin/python langchain_gpt_api.py",
+      "description": "HART OS regional host (systemd services)",
+      "entry_point": "/opt/hart/venv/bin/python langchain_gpt_api.py",
       "database": "sqlite_or_postgres",
       "certificate_tier": "regional",
-      "config_file": "/etc/hyve/hyve.env",
+      "config_file": "/etc/hart/hart.env",
       "default_port": 6777,
       "features": ["backend", "social", "agent_engine", "coding_agent", "vision", "llm", "discovery", "gossip", "fleet_command"]
     },
     "central": {
       "description": "Central authority node",
-      "entry_point": "/opt/hyve/venv/bin/python langchain_gpt_api.py",
+      "entry_point": "/opt/hart/venv/bin/python langchain_gpt_api.py",
       "database": "postgres",
       "certificate_tier": "central",
-      "config_file": "/etc/hyve/hyve.env",
+      "config_file": "/etc/hart/hart.env",
       "default_port": 6777,
       "features": ["backend", "social", "agent_engine", "coding_agent", "vision", "llm", "discovery", "gossip", "fleet_command", "registry"]
     }
@@ -57,11 +57,11 @@
     "COMPUTE_HOST": {"min_ram_gb": 16, "min_cores": 8, "gpu_required": true, "features": ["backend", "discovery", "social", "agent_engine", "vision", "llm"]}
   },
   "services": {
-    "hyve-backend": {"port": 6777, "protocol": "tcp", "always_enabled": true},
-    "hyve-discovery": {"port": 6780, "protocol": "udp", "always_enabled": true},
-    "hyve-vision": {"ports": [9891, 5460], "protocol": "tcp", "min_tier": "PERFORMANCE"},
-    "hyve-llm": {"port": 8080, "protocol": "tcp", "min_tier": "COMPUTE_HOST"},
-    "hyve-agent-daemon": {"port": null, "protocol": null, "min_tier": "STANDARD"}
+    "hart-backend": {"port": 6777, "protocol": "tcp", "always_enabled": true},
+    "hart-discovery": {"port": 6780, "protocol": "udp", "always_enabled": true},
+    "hart-vision": {"ports": [9891, 5460], "protocol": "tcp", "min_tier": "PERFORMANCE"},
+    "hart-llm": {"port": 8080, "protocol": "tcp", "min_tier": "COMPUTE_HOST"},
+    "hart-agent-daemon": {"port": null, "protocol": null, "min_tier": "STANDARD"}
   },
   "variants": {
     "server": {"description": "Headless, all services per tier", "min_ram_gb": 4, "gui": false},

@@ -53,7 +53,7 @@ chcp 65001 >nul 2>&1
 
 REM ===== DEFINE TEST GROUPS =====
 
-REM Group 1: P2P Network, Security, Agent Engine (~860+ tests)
+REM Group 1: P2P Network, Security, Agent Engine (~960+ tests)
 set P2P_SECURITY_TESTS=^
     tests/test_hierarchy_system.py ^
     tests/test_integrity_system.py ^
@@ -70,7 +70,9 @@ set P2P_SECURITY_TESTS=^
     tests/test_system_requirements.py ^
     tests/test_commercial_ip_builds.py ^
     tests/test_federation_upgrade.py ^
-    tests/test_continual_learner_gate.py
+    tests/test_continual_learner_gate.py ^
+    tests/test_gradient_sync.py ^
+    tests/test_thought_experiments.py
 
 REM Group 2: Social Platform (~148 tests)
 set SOCIAL_TESTS=^

@@ -38,7 +38,7 @@ from datetime import datetime
 logger = logging.getLogger('hevolve_security')
 
 # Rate limit: max signing operations per hour (safety against runaway code)
-_MAX_SIGNS_PER_HOUR = int(os.environ.get('HYVE_HSM_MAX_SIGNS_PER_HOUR', '50'))
+_MAX_SIGNS_PER_HOUR = int(os.environ.get('HART_HSM_MAX_SIGNS_PER_HOUR', '50'))
 
 
 class HSMSigningError(Exception):
@@ -145,13 +145,13 @@ class GoogleCloudKMSProvider(HSMProvider):
     """Google Cloud KMS with Ed25519 key (FIPS 140-2 Level 3 HSM backend).
 
     Required env vars:
-      HYVE_GCP_KMS_KEY_PATH: projects/{project}/locations/{location}/keyRings/{ring}/cryptoKeys/{key}/cryptoKeyVersions/{version}
+      HART_GCP_KMS_KEY_PATH: projects/{project}/locations/{location}/keyRings/{ring}/cryptoKeys/{key}/cryptoKeyVersions/{version}
       GOOGLE_APPLICATION_CREDENTIALS: path to service account JSON (or use workload identity)
     """
 
     def __init__(self):
         super().__init__()
-        self._key_path = os.environ.get('HYVE_GCP_KMS_KEY_PATH', '')
+        self._key_path = os.environ.get('HART_GCP_KMS_KEY_PATH', '')
         self._client = None
 
     def _get_client(self):
@@ -214,17 +214,17 @@ class AzureKeyVaultProvider(HSMProvider):
     """Azure Key Vault with Managed HSM (FIPS 140-2 Level 3).
 
     Required env vars:
-      HYVE_AZURE_VAULT_URL:  https://{vault-name}.vault.azure.net
-      HYVE_AZURE_KEY_NAME:   name of the Ed25519 key in the vault
-      HYVE_AZURE_KEY_VERSION: (optional) specific version
+      HART_AZURE_VAULT_URL:  https://{vault-name}.vault.azure.net
+      HART_AZURE_KEY_NAME:   name of the Ed25519 key in the vault
+      HART_AZURE_KEY_VERSION: (optional) specific version
       Authentication: DefaultAzureCredential (managed identity, CLI, env vars)
     """
 
     def __init__(self):
         super().__init__()
-        self._vault_url = os.environ.get('HYVE_AZURE_VAULT_URL', '')
-        self._key_name = os.environ.get('HYVE_AZURE_KEY_NAME', '')
-        self._key_version = os.environ.get('HYVE_AZURE_KEY_VERSION', '')
+        self._vault_url = os.environ.get('HART_AZURE_VAULT_URL', '')
+        self._key_name = os.environ.get('HART_AZURE_KEY_NAME', '')
+        self._key_version = os.environ.get('HART_AZURE_KEY_VERSION', '')
         self._client = None
         self._crypto_client = None
 
@@ -279,20 +279,20 @@ class VaultTransitProvider(HSMProvider):
     Self-hostable. Can back onto physical HSMs (PKCS#11 seal).
 
     Required env vars:
-      HYVE_VAULT_ADDR:       https://vault.example.com:8200
-      HYVE_VAULT_TOKEN:      auth token (or use AppRole/K8s auth)
-      HYVE_VAULT_KEY_NAME:   name of the transit key (type: ed25519)
-      HYVE_VAULT_MOUNT:      transit mount path (default: transit)
-      HYVE_VAULT_CA_CERT:    (optional) CA cert for TLS verification
+      HART_VAULT_ADDR:       https://vault.example.com:8200
+      HART_VAULT_TOKEN:      auth token (or use AppRole/K8s auth)
+      HART_VAULT_KEY_NAME:   name of the transit key (type: ed25519)
+      HART_VAULT_MOUNT:      transit mount path (default: transit)
+      HART_VAULT_CA_CERT:    (optional) CA cert for TLS verification
     """
 
     def __init__(self):
         super().__init__()
-        self._addr = os.environ.get('HYVE_VAULT_ADDR', '')
-        self._token = os.environ.get('HYVE_VAULT_TOKEN', '')
-        self._key_name = os.environ.get('HYVE_VAULT_KEY_NAME', 'hyve-master')
-        self._mount = os.environ.get('HYVE_VAULT_MOUNT', 'transit')
-        self._ca_cert = os.environ.get('HYVE_VAULT_CA_CERT', '')
+        self._addr = os.environ.get('HART_VAULT_ADDR', '')
+        self._token = os.environ.get('HART_VAULT_TOKEN', '')
+        self._key_name = os.environ.get('HART_VAULT_KEY_NAME', 'hart-master')
+        self._mount = os.environ.get('HART_VAULT_MOUNT', 'transit')
+        self._ca_cert = os.environ.get('HART_VAULT_CA_CERT', '')
         self._client = None
 
     def _get_client(self):
@@ -381,8 +381,8 @@ class EnvVarFallbackProvider(HSMProvider):
                 "\n" + "=" * 70 +
                 "\n  WARNING: Master key loaded from environment variable."
                 "\n  This is NOT hardware-protected. Use an HSM in production."
-                "\n  Set HYVE_GCP_KMS_KEY_PATH, HYVE_AZURE_VAULT_URL, or"
-                "\n  HYVE_VAULT_ADDR to enable HSM protection."
+                "\n  Set HART_GCP_KMS_KEY_PATH, HART_AZURE_VAULT_URL, or"
+                "\n  HART_VAULT_ADDR to enable HSM protection."
                 "\n" + "=" * 70 + "\n"
             )
             print(msg, file=sys.stderr)
@@ -468,9 +468,9 @@ def get_hsm_provider() -> HSMProvider:
 
         raise HSMUnavailableError(
             'No HSM backend available. Configure one of: '
-            'HYVE_GCP_KMS_KEY_PATH (Google), '
-            'HYVE_AZURE_VAULT_URL (Azure), '
-            'HYVE_VAULT_ADDR (HashiCorp Vault), '
+            'HART_GCP_KMS_KEY_PATH (Google), '
+            'HART_AZURE_VAULT_URL (Azure), '
+            'HART_VAULT_ADDR (HashiCorp Vault), '
             'or HEVOLVE_MASTER_PRIVATE_KEY (dev fallback).')
 
 

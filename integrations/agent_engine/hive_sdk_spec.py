@@ -9,8 +9,8 @@ guardrail integrity at boot.
 """
 
 HIVE_SDK_DEPENDENCY = (
-    "hyve-sdk @ git+https://github.com/hevolve/"
-    "hyve.git@main#subdirectory=sdk"
+    "hart-sdk @ git+https://github.com/hevolve/"
+    "hart.git@main#subdirectory=sdk"
 )
 
 MASTER_KEY_VERIFICATION_SNIPPET = '''\

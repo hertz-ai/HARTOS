@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # ============================================================
-# HyveOS Bundle Builder
+# HART OS Bundle Builder
 # Creates a signed tar.gz bundle for remote deployment.
 #
 # Usage:
 #   bash build_bundle.sh [--version X.Y.Z]
 #
 # Output:
-#   hyve-os-{version}-{arch}.tar.gz
-#   hyve-os-{version}-{arch}.tar.gz.sha256
+#   hart-os-{version}-{arch}.tar.gz
+#   hart-os-{version}-{arch}.tar.gz.sha256
 # ============================================================
 
 set -euo pipefail
@@ -21,10 +21,10 @@ fi
 ARCH=$(uname -m)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
-BUILD_DIR="/tmp/hyve-os-build-$$"
-BUNDLE_NAME="hyve-os-${VERSION}-${ARCH}"
+BUILD_DIR="/tmp/hart-os-build-$$"
+BUNDLE_NAME="hart-os-${VERSION}-${ARCH}"
 
-echo "[HyveOS] Building bundle: $BUNDLE_NAME"
+echo "[HART OS] Building bundle: $BUNDLE_NAME"
 
 # Clean previous builds
 rm -rf "$BUILD_DIR"
@@ -57,13 +57,13 @@ cp "$REPO_DIR/deploy/linux/install.sh" "$BUILD_DIR/$BUNDLE_NAME/deploy/linux/"
 cp "$REPO_DIR/requirements.txt" "$BUILD_DIR/$BUNDLE_NAME/"
 
 # Create manifest
-echo "[HyveOS] Computing manifest..."
+echo "[HART OS] Computing manifest..."
 cd "$BUILD_DIR"
 find "$BUNDLE_NAME" -type f | sort | xargs sha256sum > "${BUNDLE_NAME}.manifest"
 mv "${BUNDLE_NAME}.manifest" "$BUILD_DIR/$BUNDLE_NAME/"
 
 # Create tarball
-echo "[HyveOS] Creating tarball..."
+echo "[HART OS] Creating tarball..."
 tar czf "${BUNDLE_NAME}.tar.gz" "$BUNDLE_NAME/"
 
 # Compute checksum
@@ -77,7 +77,7 @@ mv "${BUNDLE_NAME}.tar.gz.sha256" "$REPO_DIR/dist/"
 # Clean up
 rm -rf "$BUILD_DIR"
 
-echo "[HyveOS] Bundle created:"
+echo "[HART OS] Bundle created:"
 echo "  $REPO_DIR/dist/${BUNDLE_NAME}.tar.gz"
 echo "  $REPO_DIR/dist/${BUNDLE_NAME}.tar.gz.sha256"
 BUNDLE_SIZE=$(du -h "$REPO_DIR/dist/${BUNDLE_NAME}.tar.gz" | cut -f1)

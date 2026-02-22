@@ -1,7 +1,7 @@
 """
-HyveOS Network Provisioner — Agent-driven remote installation via SSH.
+HART OS Network Provisioner — Agent-driven remote installation via SSH.
 
-When a user says "use 192.168.1.50 to install hyve" or "provision that network
+When a user says "use 192.168.1.50 to install hart" or "provision that network
 machine", the agent:
   1. SSHs into the target (using provided credentials)
   2. Runs system checks (OS, RAM, CPU, GPU, disk)
@@ -53,7 +53,7 @@ _USERNAME_RE = re.compile(r'^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,31}$')
 
 
 class NetworkProvisioner:
-    """SSH-based remote HyveOS installation and management."""
+    """SSH-based remote HART OS installation and management."""
 
     @staticmethod
     def _validate_params(target_host: str, ssh_user: str, backend_port: int = 6777):
@@ -296,11 +296,11 @@ class NetworkProvisioner:
             sftp = client.open_sftp()
 
             # Create remote temp directory
-            NetworkProvisioner._exec_remote(client, 'mkdir -p /tmp/hyve-install')
+            NetworkProvisioner._exec_remote(client, 'mkdir -p /tmp/hart-install')
 
             # Transfer install script
             if os.path.exists(INSTALL_SCRIPT_PATH):
-                sftp.put(INSTALL_SCRIPT_PATH, '/tmp/hyve-install/install.sh')
+                sftp.put(INSTALL_SCRIPT_PATH, '/tmp/hart-install/install.sh')
             else:
                 # Fallback: generate install script path from bundle
                 return {'success': False, 'error': 'install.sh not found locally'}
@@ -338,7 +338,7 @@ class NetworkProvisioner:
             # Transfer archive
             logger.info("Uploading archive to %s (%d bytes)...",
                          target_host, buf.getbuffer().nbytes)
-            sftp.putfo(buf, '/tmp/hyve-install/hyve-code.tar.gz')
+            sftp.putfo(buf, '/tmp/hart-install/hart-code.tar.gz')
             sftp.close()
 
             # Step 3: Extract and install on remote
@@ -347,20 +347,20 @@ class NetworkProvisioner:
             # Extract code
             NetworkProvisioner._exec_remote(
                 client,
-                'cd /tmp/hyve-install && mkdir -p code && '
-                'tar xzf hyve-code.tar.gz -C code',
+                'cd /tmp/hart-install && mkdir -p code && '
+                'tar xzf hart-code.tar.gz -C code',
                 timeout=60,
             )
 
             # Copy install script to extracted code
             NetworkProvisioner._exec_remote(
                 client,
-                'mkdir -p /tmp/hyve-install/code/deploy/linux && '
-                'cp /tmp/hyve-install/install.sh /tmp/hyve-install/code/deploy/linux/',
+                'mkdir -p /tmp/hart-install/code/deploy/linux && '
+                'cp /tmp/hart-install/install.sh /tmp/hart-install/code/deploy/linux/',
             )
 
             # Build install command
-            install_cmd = 'bash /tmp/hyve-install/code/deploy/linux/install.sh'
+            install_cmd = 'bash /tmp/hart-install/code/deploy/linux/install.sh'
             if join_peer:
                 install_cmd += f' --join-peer {join_peer}'
             if backend_port != 6777:
@@ -405,7 +405,7 @@ class NetworkProvisioner:
             # Step 5: Get node identity
             id_result = NetworkProvisioner._exec_remote(
                 client,
-                'cat /var/lib/hyve/node_public.key | xxd -p | tr -d "\\n"',
+                'cat /var/lib/hart/node_public.key | xxd -p | tr -d "\\n"',
             )
             node_id = id_result['stdout'][:64] if id_result['exit_code'] == 0 else 'unknown'
 
@@ -426,7 +426,7 @@ class NetworkProvisioner:
             # Read actual installed version from remote
             ver_result = NetworkProvisioner._exec_remote(
                 client,
-                'cat /opt/hyve/VERSION 2>/dev/null || echo "1.0.0"',
+                'cat /opt/hart/VERSION 2>/dev/null || echo "1.0.0"',
             )
             installed_version = ver_result['stdout'].strip() or '1.0.0'
 
@@ -441,7 +441,7 @@ class NetworkProvisioner:
             )
 
             # Clean up remote temp files
-            NetworkProvisioner._exec_remote(client, 'rm -rf /tmp/hyve-install')
+            NetworkProvisioner._exec_remote(client, 'rm -rf /tmp/hart-install')
 
             logger.info("Successfully provisioned %s — node_id=%s tier=%s",
                          target_host, node_id[:16], tier)
@@ -453,7 +453,7 @@ class NetworkProvisioner:
                 'target_host': target_host,
                 'backend_url': f'http://{target_host}:{backend_port}',
                 'system_info': preflight.get('system_info', {}),
-                'message': f'HyveOS installed on {target_host}. '
+                'message': f'HART OS installed on {target_host}. '
                            f'Node ID: {node_id[:16]}..., Tier: {tier}',
             }
 
@@ -571,7 +571,7 @@ class NetworkProvisioner:
     def check_remote_health(target_host: str, ssh_user: str = 'root',
                             ssh_key_path: str = None,
                             ssh_password: str = None) -> Dict:
-        """Check health of a provisioned HyveOS node via SSH."""
+        """Check health of a provisioned HART OS node via SSH."""
         if not PARAMIKO_AVAILABLE:
             return {'healthy': False, 'error': 'paramiko not installed'}
 
@@ -585,8 +585,8 @@ class NetworkProvisioner:
             health = {'target_host': target_host, 'services': {}}
 
             # Check each service
-            for svc in ['hyve-backend', 'hyve-discovery', 'hyve-agent-daemon',
-                        'hyve-vision', 'hyve-llm']:
+            for svc in ['hart-backend', 'hart-discovery', 'hart-agent-daemon',
+                        'hart-vision', 'hart-llm']:
                 result = NetworkProvisioner._exec_remote(
                     client, f'systemctl is-active {svc}.service')
                 health['services'][svc] = result['stdout'].strip()
@@ -598,7 +598,7 @@ class NetworkProvisioner:
 
             # Node ID
             result = NetworkProvisioner._exec_remote(
-                client, 'cat /var/lib/hyve/node_public.key | xxd -p | tr -d "\\n"')
+                client, 'cat /var/lib/hart/node_public.key | xxd -p | tr -d "\\n"')
             health['node_id'] = result['stdout'][:64] if result['exit_code'] == 0 else 'unknown'
 
             # Uptime
@@ -606,7 +606,7 @@ class NetworkProvisioner:
             health['uptime'] = result['stdout'].strip()
 
             health['healthy'] = (
-                health['services'].get('hyve-backend') == 'active' and
+                health['services'].get('hart-backend') == 'active' and
                 health['backend_responding']
             )
 
@@ -635,7 +635,7 @@ class NetworkProvisioner:
     def update_remote(target_host: str, ssh_user: str = 'root',
                       ssh_key_path: str = None,
                       ssh_password: str = None) -> Dict:
-        """Update HyveOS on a remote provisioned node.
+        """Update HART OS on a remote provisioned node.
 
         Uses rsync-over-SSH to transfer updated code (no git required).
         Falls back to full archive transfer if rsync is unavailable.
@@ -651,7 +651,7 @@ class NetworkProvisioner:
 
         try:
             # Stop services before update
-            NetworkProvisioner._exec_remote(client, 'systemctl stop hyve.target')
+            NetworkProvisioner._exec_remote(client, 'systemctl stop hart.target')
 
             # Build fresh archive and transfer
             logger.info("Transferring update to %s...", target_host)
@@ -682,30 +682,30 @@ class NetworkProvisioner:
 
             # Transfer and extract (preserve config and data)
             sftp = client.open_sftp()
-            sftp.putfo(buf, '/tmp/hyve-update.tar.gz')
+            sftp.putfo(buf, '/tmp/hart-update.tar.gz')
             sftp.close()
 
             NetworkProvisioner._exec_remote(
                 client,
-                'mkdir -p /tmp/hyve-update-extract && '
-                'tar xzf /tmp/hyve-update.tar.gz -C /tmp/hyve-update-extract && '
+                'mkdir -p /tmp/hart-update-extract && '
+                'tar xzf /tmp/hart-update.tar.gz -C /tmp/hart-update-extract && '
                 'rsync -a --exclude=.env --exclude="agent_data/*.db" '
                 '--exclude="agent_data/*.json" '
-                '/tmp/hyve-update-extract/ /opt/hyve/ && '
-                'rm -rf /tmp/hyve-update.tar.gz /tmp/hyve-update-extract',
+                '/tmp/hart-update-extract/ /opt/hart/ && '
+                'rm -rf /tmp/hart-update.tar.gz /tmp/hart-update-extract',
                 timeout=120,
             )
 
             # Update pip dependencies
             NetworkProvisioner._exec_remote(
                 client,
-                '/opt/hyve/venv/bin/pip install -r /opt/hyve/requirements.txt -q',
+                '/opt/hart/venv/bin/pip install -r /opt/hart/requirements.txt -q',
                 timeout=120,
             )
 
             # Restart services
             NetworkProvisioner._exec_remote(
-                client, 'systemctl daemon-reload && systemctl start hyve.target')
+                client, 'systemctl daemon-reload && systemctl start hart.target')
 
             # Wait for backend
             for _ in range(15):
@@ -714,7 +714,7 @@ class NetworkProvisioner:
                 if check['exit_code'] == 0:
                     # Update DB record
                     ver_result = NetworkProvisioner._exec_remote(
-                        client, 'cat /opt/hyve/VERSION 2>/dev/null || echo "unknown"')
+                        client, 'cat /opt/hart/VERSION 2>/dev/null || echo "unknown"')
                     try:
                         from integrations.social.models import get_db, ProvisionedNode
                         db = get_db()
@@ -740,7 +740,7 @@ class NetworkProvisioner:
             # Try to restart services even if update failed
             try:
                 NetworkProvisioner._exec_remote(
-                    client, 'systemctl start hyve.target')
+                    client, 'systemctl start hart.target')
             except Exception:
                 pass
             return {'success': False, 'error': str(e)}

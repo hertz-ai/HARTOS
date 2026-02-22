@@ -2,7 +2,7 @@
 Skill Registry - follows ServiceToolRegistry / MCPToolRegistry pattern.
 
 Ingests agent skills (Claude Code SKILL.md, plain Markdown, JSON) into the
-Hevolve pipeline so any Hyve agent can execute them during thought experiments.
+Hevolve pipeline so any HART agent can execute them during thought experiments.
 
 Design:
 - SkillInfo describes a skill's metadata, instructions, and capabilities
@@ -176,7 +176,7 @@ class SkillInfo:
 
 class SkillRegistry:
     """
-    Registry for agent skills - any skill definition becomes a Hyve tool.
+    Registry for agent skills - any skill definition becomes a HART tool.
 
     Mirrors ServiceToolRegistry pattern:
     - register_skill / unregister_skill
@@ -293,7 +293,7 @@ class SkillRegistry:
         try:
             req = urllib.request.Request(api_url, headers={
                 "Accept": "application/vnd.github.v3+json",
-                "User-Agent": "Hevolve-Hyvemind/1.0",
+                "User-Agent": "Hevolve-HARTmind/1.0",
             })
             with urllib.request.urlopen(req, timeout=10) as resp:
                 entries = json.loads(resp.read().decode())
@@ -310,7 +310,7 @@ class SkillRegistry:
                        f"/{branch}/{skills_path}/{skill_name}/SKILL.md")
             try:
                 req = urllib.request.Request(raw_url, headers={
-                    "User-Agent": "Hevolve-Hyvemind/1.0"
+                    "User-Agent": "Hevolve-HARTmind/1.0"
                 })
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     content = resp.read().decode("utf-8")
@@ -364,7 +364,7 @@ class SkillRegistry:
             _skill = skill
 
             def execute_skill(query: str, _s=_skill) -> str:
-                """Execute a Hyve skill by applying its instructions to the query."""
+                """Execute a HART skill by applying its instructions to the query."""
                 # Build the skill execution prompt
                 result = f"## Skill: {_s.name}\n\n"
                 result += f"{_s.instructions}\n\n"
@@ -372,10 +372,10 @@ class SkillRegistry:
                 return result
 
             tools.append(Tool(
-                name=f"hyve_skill_{name}",
+                name=f"hart_skill_{name}",
                 func=execute_skill,
                 description=(
-                    f"[Hyve Skill] {skill.description}. "
+                    f"[HART Skill] {skill.description}. "
                     f"Use this skill to help with: {', '.join(skill.tags) if skill.tags else skill.name}"
                 ),
             ))
@@ -397,7 +397,7 @@ class SkillRegistry:
             def execute(query: str, _s=_skill) -> str:
                 return f"## Skill: {_s.name}\n\n{_s.instructions}\n\n## User Request\n\n{query}\n"
 
-            func_name = f"hyve_skill_{name}"
+            func_name = f"hart_skill_{name}"
             execute.__name__ = func_name
             execute.__doc__ = skill.description
             functions[func_name] = execute

@@ -154,9 +154,16 @@ from integrations.expert_agents import (
 # Then add the 4 hooks to your get_response_group while loop
 # Then manually add the 4 hooks to your get_response_group while loop
 # Set up a dedicated logger that doesn't depend on Flask context
-log_dir = "logs"
-if not os.path.exists(log_dir):
-    os.makedirs(log_dir)
+# Use writable log dir: ~/Documents/Nunba/logs in bundled mode, else relative 'logs'
+if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
+    log_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'logs')
+else:
+    log_dir = "logs"
+try:
+    os.makedirs(log_dir, exist_ok=True)
+except PermissionError:
+    log_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'logs')
+    os.makedirs(log_dir, exist_ok=True)
 
 # Create a custom logger with timestamp in filename
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1609,7 +1616,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                 tool_logger.info(f'Response from call of {topic}: {response}')
 
                 if not response:
-                    return 'Ask UserProxy to go to hevolve.ai login and start Nunba - Your Local Hyve Companion App'
+                    return 'Ask UserProxy to go to hevolve.ai login and start Nunba - Your Local HART Companion App'
 
                 topic = 'com.hertzai.hevolve.action'
                 tool_logger.info(f'calling {topic} for 1800 seconds')
@@ -1897,10 +1904,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     OS: {os_to_control}
     Task: {instructions}
 
-    Nunba - Your Local Hyve Companion App is not running on your {os_to_control} device.
+    Nunba - Your Local HART Companion App is not running on your {os_to_control} device.
 
     STEPS TO RESOLVE:
-    1. Open Nunba - Your Local Hyve Companion App
+    1. Open Nunba - Your Local HART Companion App
     2. Ensure it's connected and running
     3. Try the command again
 
@@ -2349,6 +2356,15 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                         i['agent_to_perform_this_action'] = 'Executor'
                                     else:
                                         i['agent_to_perform_this_action'] = 'Assistant'
+                                # SECURITY: redact secrets before recipe persistence
+                                try:
+                                    from security.secret_redactor import redact_secrets
+                                    for _ri in json_obj.get('recipe', []):
+                                        for _rk in ('tool_input', 'task_description', 'output'):
+                                            if isinstance(_ri.get(_rk), str):
+                                                _ri[_rk], _ = redact_secrets(_ri[_rk])
+                                except ImportError:
+                                    pass
                                 with open(name, "w") as json_file:
                                     json.dump(json_obj, json_file)
                                 #setting the action from response as current action

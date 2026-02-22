@@ -1,8 +1,8 @@
 """
-Tests for HyveOS OTA Update Service (deploy/distro/update/hyve-update-service.py).
+Tests for HART OS OTA Update Service (deploy/distro/update/hart-update-service.py).
 
 Tests cover:
-- HyveUpdateService.__init__: version reading
+- HartUpdateService.__init__: version reading
 - _get_current_version: reads VERSION file, falls back to 1.0.0
 - check_for_updates: GitHub API parsing, version comparison, error handling
 - _verify_ed25519_signature: signature verification flow (mocked crypto)
@@ -10,7 +10,7 @@ Tests cover:
 - apply_update: backup, extract, pip, migrate, restart, health check, rollback
 - rollback: restore from backup
 - run: full update cycle
-- URL configuration: env var, hyve.env file, default fallback
+- URL configuration: env var, hart.env file, default fallback
 """
 
 import hashlib
@@ -32,13 +32,13 @@ sys.path.insert(0, UPDATE_DIR)
 
 import importlib.util
 _spec = importlib.util.spec_from_file_location(
-    'hyve_update_service',
-    os.path.join(UPDATE_DIR, 'hyve-update-service.py')
+    'hart_update_service',
+    os.path.join(UPDATE_DIR, 'hart-update-service.py')
 )
 ota = importlib.util.module_from_spec(_spec)
 # Patch module-level file reads before exec
 with patch('builtins.open', side_effect=FileNotFoundError):
-    with patch.dict(os.environ, {'HYVE_UPDATE_URL': 'https://test.example.com/releases/latest'}):
+    with patch.dict(os.environ, {'HART_UPDATE_URL': 'https://test.example.com/releases/latest'}):
         _spec.loader.exec_module(ota)
 
 
@@ -56,27 +56,27 @@ def version_file(tmp_path):
 
 @pytest.fixture
 def update_service(tmp_path):
-    """Create an HyveUpdateService with temp paths."""
+    """Create a HartUpdateService with temp paths."""
     with patch.object(ota, 'VERSION_FILE', str(tmp_path / 'VERSION')):
         with patch.object(ota, 'DATA_DIR', str(tmp_path / 'data')):
             with patch.object(ota, 'UPDATE_CHECK_FILE', str(tmp_path / 'data' / '.last-update-check')):
                 os.makedirs(str(tmp_path / 'data'), exist_ok=True)
                 (tmp_path / 'VERSION').write_text('1.5.0')
-                svc = ota.HyveUpdateService()
+                svc = ota.HartUpdateService()
                 return svc
 
 
 @pytest.fixture
 def fake_bundle(tmp_path):
     """Create a fake update bundle (tar.gz)."""
-    bundle_dir = tmp_path / 'hyve-os-2.0.0'
+    bundle_dir = tmp_path / 'hart-os-2.0.0'
     bundle_dir.mkdir()
     (bundle_dir / 'VERSION').write_text('2.0.0')
     (bundle_dir / 'langchain_gpt_api.py').write_text('# updated')
 
     bundle_path = str(tmp_path / 'update.tar.gz')
     with tarfile.open(bundle_path, 'w:gz') as tar:
-        tar.add(str(bundle_dir), arcname='hyve-os-2.0.0')
+        tar.add(str(bundle_dir), arcname='hart-os-2.0.0')
     return bundle_path
 
 
@@ -91,13 +91,13 @@ class TestVersionReading:
         vf = tmp_path / 'VERSION'
         vf.write_text('3.2.1')
         with patch.object(ota, 'VERSION_FILE', str(vf)):
-            svc = ota.HyveUpdateService()
+            svc = ota.HartUpdateService()
             assert svc.current_version == '3.2.1'
 
     def test_default_version_when_no_file(self, tmp_path):
         """Falls back to 1.0.0 when VERSION file doesn't exist."""
         with patch.object(ota, 'VERSION_FILE', str(tmp_path / 'nonexistent')):
-            svc = ota.HyveUpdateService()
+            svc = ota.HartUpdateService()
             assert svc.current_version == '1.0.0'
 
     def test_strips_whitespace(self, tmp_path):
@@ -105,7 +105,7 @@ class TestVersionReading:
         vf = tmp_path / 'VERSION'
         vf.write_text('  2.0.0  \n')
         with patch.object(ota, 'VERSION_FILE', str(vf)):
-            svc = ota.HyveUpdateService()
+            svc = ota.HartUpdateService()
             assert svc.current_version == '2.0.0'
 
 
@@ -122,12 +122,12 @@ class TestCheckForUpdates:
             'body': 'Release notes here',
             'assets': [
                 {
-                    'name': 'hyve-os-2.0.0.tar.gz',
-                    'browser_download_url': 'https://example.com/hyve-os-2.0.0.tar.gz'
+                    'name': 'hart-os-2.0.0.tar.gz',
+                    'browser_download_url': 'https://example.com/hart-os-2.0.0.tar.gz'
                 },
                 {
-                    'name': 'hyve-os-2.0.0.sha256',
-                    'browser_download_url': 'https://example.com/hyve-os-2.0.0.sha256'
+                    'name': 'hart-os-2.0.0.sha256',
+                    'browser_download_url': 'https://example.com/hart-os-2.0.0.sha256'
                 },
             ]
         }
@@ -145,7 +145,7 @@ class TestCheckForUpdates:
         assert result['available'] is True
         assert result['current'] == '1.5.0'
         assert result['latest'] == '2.0.0'
-        assert 'hyve-os-2.0.0.tar.gz' in result['download_url']
+        assert 'hart-os-2.0.0.tar.gz' in result['download_url']
         assert result['checksum_url'] is not None
 
     def test_no_update_when_same_version(self, tmp_path):
@@ -153,13 +153,13 @@ class TestCheckForUpdates:
         release = {
             'tag_name': 'v1.5.0',
             'assets': [
-                {'name': 'hyve-os-1.5.0.tar.gz', 'browser_download_url': 'https://x/a.tar.gz'}
+                {'name': 'hart-os-1.5.0.tar.gz', 'browser_download_url': 'https://x/a.tar.gz'}
             ]
         }
         with patch.object(ota, 'VERSION_FILE', str(tmp_path / 'VERSION')):
             with patch.object(ota, 'UPDATE_CHECK_FILE', str(tmp_path / '.check')):
                 (tmp_path / 'VERSION').write_text('1.5.0')
-                svc = ota.HyveUpdateService()
+                svc = ota.HartUpdateService()
                 with patch('urllib.request.urlopen') as mock_url:
                     mock_resp = MagicMock()
                     mock_resp.read.return_value = json.dumps(release).encode()
@@ -183,7 +183,7 @@ class TestCheckForUpdates:
         release = {
             'tag_name': 'v3.0.0-beta',
             'assets': [
-                {'name': 'hyve-os-3.0.0-beta.tar.gz', 'browser_download_url': 'https://x/a.tar.gz'}
+                {'name': 'hart-os-3.0.0-beta.tar.gz', 'browser_download_url': 'https://x/a.tar.gz'}
             ]
         }
         with patch.object(ota, 'UPDATE_CHECK_FILE', str(tmp_path / '.check')):
@@ -225,7 +225,7 @@ class TestDownloadUpdate:
 
     def test_downloads_bundle(self, update_service, monkeypatch):
         """download_update saves file to temp directory."""
-        monkeypatch.setenv('HYVE_UPDATE_REQUIRE_SIGNATURE', 'false')
+        monkeypatch.setenv('HART_UPDATE_REQUIRE_SIGNATURE', 'false')
         fake_data = b'fake tarball content' * 100
 
         with patch('urllib.request.urlopen') as mock_url:
@@ -250,7 +250,7 @@ class TestDownloadUpdate:
 
     def test_checksum_verification(self, update_service, tmp_path, monkeypatch):
         """Verifies SHA-256 checksum when provided."""
-        monkeypatch.setenv('HYVE_UPDATE_REQUIRE_SIGNATURE', 'false')
+        monkeypatch.setenv('HART_UPDATE_REQUIRE_SIGNATURE', 'false')
         content = b'test bundle data'
         expected_hash = hashlib.sha256(content).hexdigest()
 
@@ -399,7 +399,7 @@ class TestApplyUpdate:
         assert result is True
         # Verify systemctl stop was called
         stop_calls = [c for c in mock_run.call_args_list
-                      if 'stop' in str(c) and 'hyve.target' in str(c)]
+                      if 'stop' in str(c) and 'hart.target' in str(c)]
         assert len(stop_calls) >= 1
 
     @patch('subprocess.run')
@@ -498,16 +498,16 @@ class TestURLConfiguration:
 
     def test_module_constants(self):
         """Module has expected filesystem constants."""
-        assert ota.INSTALL_DIR == '/opt/hyve'
-        assert ota.DATA_DIR == '/var/lib/hyve'
-        assert ota.CONFIG_DIR == '/etc/hyve'
+        assert ota.INSTALL_DIR == '/opt/hart'
+        assert ota.DATA_DIR == '/var/lib/hart'
+        assert ota.CONFIG_DIR == '/etc/hart'
 
 
 # ──────────────────────────────────────────────────
 # Fleet Approval Tests (E5)
 # ──────────────────────────────────────────────────
 
-UPDATE_SERVICE_PATH = os.path.join(UPDATE_DIR, 'hyve-update-service.py')
+UPDATE_SERVICE_PATH = os.path.join(UPDATE_DIR, 'hart-update-service.py')
 
 
 class TestFleetApproval:

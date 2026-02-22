@@ -1,0 +1,10 @@
+[Unit]
+Description=HART OS Daily Backup Timer
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+RandomizedDelaySec=1800
+
+[Install]
+WantedBy=timers.target

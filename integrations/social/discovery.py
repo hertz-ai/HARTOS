@@ -229,6 +229,51 @@ def peer_federation_delta():
         return jsonify({'success': False, 'reason': str(e)}), 500
 
 
+@discovery_bp.route('/api/social/peers/embedding-delta', methods=['POST'])
+def peer_embedding_delta():
+    """Receive a compressed embedding delta from a federated peer.
+
+    Phase 1 gradient sync: peers submit embedding deltas via gossip.
+    Deltas are validated and fed to FederatedAggregator's embedding channel.
+    """
+    ip = request.remote_addr or '0.0.0.0'
+    if not _check_announce_rate(ip):
+        return jsonify({'success': False, 'reason': 'rate_limited'}), 429
+
+    body = request.get_json(silent=True) or {}
+    action = body.get('action', 'submit')
+
+    if action == 'witness_request':
+        # Witness validation request — validate and acknowledge
+        delta = body.get('delta', {})
+        submitter = body.get('submitter_node_id', '')
+        try:
+            from integrations.agent_engine.embedding_delta import validate_delta
+            valid, reason = validate_delta(delta)
+            return jsonify({
+                'success': valid,
+                'witness_ack': valid,
+                'reason': reason,
+                'submitter': submitter,
+            })
+        except Exception as e:
+            return jsonify({'success': False, 'reason': str(e)}), 500
+
+    # Default: submit embedding delta to aggregator
+    try:
+        from integrations.agent_engine.federated_aggregator import get_federated_aggregator
+        agg = get_federated_aggregator()
+        node_id = body.get('node_id', '')
+        delta = body.get('delta', body)
+        if node_id:
+            agg.receive_embedding_delta(node_id, delta)
+            return jsonify({'success': True, 'reason': 'accepted'})
+        else:
+            return jsonify({'success': False, 'reason': 'missing node_id'}), 400
+    except Exception as e:
+        return jsonify({'success': False, 'reason': str(e)}), 500
+
+
 # ════════════════════════════════════════════════════════════════
 # Federation Endpoints (Mastodon-style instance follows + content)
 # ════════════════════════════════════════════════════════════════
@@ -981,10 +1026,19 @@ def hierarchy_node_assignment(node_id):
 
 @discovery_bp.route('/api/social/hierarchy/sync', methods=['POST'])
 def hierarchy_sync():
-    """Receive sync batch from a child node."""
+    """Receive sync batch from a child node. Supports E2E encrypted envelopes."""
     from .models import get_db
     from .sync_engine import SyncEngine
     data = request.get_json(force=True, silent=True) or {}
+    # Decrypt E2E encrypted sync batch
+    if data.get('encrypted') and data.get('envelope'):
+        try:
+            from security.channel_encryption import decrypt_json_from_peer
+            decrypted = decrypt_json_from_peer(data['envelope'])
+            if decrypted:
+                data = decrypted
+        except Exception:
+            pass  # Decryption failed, try using data as-is
     items = data.get('items', [])
     if not items:
         return jsonify({'success': True, 'processed': [], 'errors': []})

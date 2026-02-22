@@ -3,10 +3,10 @@ autoinstall:
   version: 1
 
   identity:
-    hostname: hyve-node
-    username: hyve
-    # Password: "hyve" (change on first login)
-    password: "$6$rounds=4096$HyveOS$RJo8GhZFq0Hw/oLvzM5Z3t5Rn.xLjfZdNqBw8yK0sG7E6k4FtTkNQu2w9Y1vDgA6FxrQ3HjV1w0JzJcV8MJq."
+    hostname: hart-node
+    username: hart
+    # Password: "hart" (change on first login)
+    password: "$6$rounds=4096$HART OS$RJo8GhZFq0Hw/oLvzM5Z3t5Rn.xLjfZdNqBw8yK0sG7E6k4FtTkNQu2w9Y1vDgA6FxrQ3HjV1w0JzJcV8MJq."
 
   locale: en_US.UTF-8
 
@@ -43,23 +43,23 @@ autoinstall:
     - nvtop
 
   late-commands:
-    # Copy HyveOS from ISO media to target
-    - curtin in-target -- mkdir -p /opt/hyve
-    - cp -r /cdrom/hyve-os/ /target/opt/hyve/ || true
-    # Install HyveOS
-    - curtin in-target -- bash /opt/hyve/deploy/linux/install.sh --from-iso
+    # Copy HART OS from ISO media to target
+    - curtin in-target -- mkdir -p /opt/hart
+    - cp -r /cdrom/hart-os/ /target/opt/hart/ || true
+    # Install HART OS
+    - curtin in-target -- bash /opt/hart/deploy/linux/install.sh --from-iso
     # Enable first-boot wizard
-    - curtin in-target -- cp /opt/hyve/deploy/distro/first-boot/hyve-first-boot.service /etc/systemd/system/
-    - curtin in-target -- systemctl enable hyve-first-boot.service
+    - curtin in-target -- cp /opt/hart/deploy/distro/first-boot/hart-first-boot.service /etc/systemd/system/
+    - curtin in-target -- systemctl enable hart-first-boot.service
     # Install branding
-    - cp /opt/hyve/deploy/distro/branding/hyve-os-release /target/etc/os-release
-    - cp /opt/hyve/deploy/distro/branding/hyve-issue /target/etc/issue
-    - cp /opt/hyve/deploy/distro/branding/hyve-motd.sh /target/etc/update-motd.d/99-hyve
-    - chmod +x /target/etc/update-motd.d/99-hyve
+    - cp /opt/hart/deploy/distro/branding/hart-os-release /target/etc/os-release
+    - cp /opt/hart/deploy/distro/branding/hart-issue /target/etc/issue
+    - cp /opt/hart/deploy/distro/branding/hart-motd.sh /target/etc/update-motd.d/99-hart
+    - chmod +x /target/etc/update-motd.d/99-hart
     # Kernel tuning
-    - cp /opt/hyve/deploy/distro/kernel/99-hyve-sysctl.conf /target/etc/sysctl.d/
-    - cp /opt/hyve/deploy/distro/kernel/hyve-limits.conf /target/etc/security/limits.d/
+    - cp /opt/hart/deploy/distro/kernel/99-hart-sysctl.conf /target/etc/sysctl.d/
+    - cp /opt/hart/deploy/distro/kernel/hart-limits.conf /target/etc/security/limits.d/
 
   user-data:
     runcmd:
-      - systemctl enable hyve.target
+      - systemctl enable hart.target

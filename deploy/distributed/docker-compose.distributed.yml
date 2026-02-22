@@ -1,21 +1,21 @@
-# HyveOS Distributed Multi-Node Test
+# HART OS Distributed Multi-Node Test
 # Usage: docker-compose -f deploy/distributed/docker-compose.distributed.yml up
 #
-# Spins up 3 Hyve nodes + shared Redis for distributed task execution.
+# Spins up 3 HART nodes + shared Redis for distributed task execution.
 # Node 1 = central (submits goals), Node 2+3 = workers (claim + execute).
 #
 # Test: POST a goal to :6777, watch workers claim and execute it.
 
 version: '3.8'
 
-x-hyve-common: &hyve-common
+x-hart-common: &hart-common
   build:
     context: ../..
     dockerfile: deploy/cloud/Dockerfile
-  environment: &hyve-env
+  environment: &hart-env
     REDIS_HOST: redis
     REDIS_PORT: "6379"
-    HEVOLVE_DB_PATH: /var/lib/hyve/hyve.db
+    HEVOLVE_DB_PATH: /var/lib/hart/hart.db
     HEVOLVE_AGENT_ENGINE_ENABLED: "true"
     HEVOLVE_AGENT_POLL_INTERVAL: "10"
     HEVOLVE_WORKER_POLL_INTERVAL: "5"
@@ -45,45 +45,45 @@ services:
 
   # Central node — submits goals, runs agent daemon
   node-central:
-    <<: *hyve-common
-    container_name: hyve-central
-    hostname: hyve-central
+    <<: *hart-common
+    container_name: hart-central
+    hostname: hart-central
     ports:
       - "6777:6777"
     environment:
-      <<: *hyve-env
+      <<: *hart-env
       HEVOLVE_NODE_ID: node-central
-      HEVOLVE_NODE_NAME: hyve-central
-      HEVOLVE_BASE_URL: http://hyve-central:6777
-      HEVOLVE_SEED_PEERS: http://hyve-worker-1:6778,http://hyve-worker-2:6779
+      HEVOLVE_NODE_NAME: hart-central
+      HEVOLVE_BASE_URL: http://hart-central:6777
+      HEVOLVE_SEED_PEERS: http://hart-worker-1:6778,http://hart-worker-2:6779
 
   # Worker node 1 — claims tasks, executes via local /chat
   node-worker-1:
-    <<: *hyve-common
-    container_name: hyve-worker-1
-    hostname: hyve-worker-1
+    <<: *hart-common
+    container_name: hart-worker-1
+    hostname: hart-worker-1
     ports:
       - "6778:6777"
     environment:
-      <<: *hyve-env
+      <<: *hart-env
       HEVOLVE_NODE_ID: node-worker-1
-      HEVOLVE_NODE_NAME: hyve-worker-1
-      HEVOLVE_BASE_URL: http://hyve-worker-1:6777
-      HEVOLVE_SEED_PEERS: http://hyve-central:6777,http://hyve-worker-2:6779
+      HEVOLVE_NODE_NAME: hart-worker-1
+      HEVOLVE_BASE_URL: http://hart-worker-1:6777
+      HEVOLVE_SEED_PEERS: http://hart-central:6777,http://hart-worker-2:6779
 
   # Worker node 2 — claims tasks, executes via local /chat
   node-worker-2:
-    <<: *hyve-common
-    container_name: hyve-worker-2
-    hostname: hyve-worker-2
+    <<: *hart-common
+    container_name: hart-worker-2
+    hostname: hart-worker-2
     ports:
       - "6779:6777"
     environment:
-      <<: *hyve-env
+      <<: *hart-env
       HEVOLVE_NODE_ID: node-worker-2
-      HEVOLVE_NODE_NAME: hyve-worker-2
-      HEVOLVE_BASE_URL: http://hyve-worker-2:6777
-      HEVOLVE_SEED_PEERS: http://hyve-central:6777,http://hyve-worker-1:6778
+      HEVOLVE_NODE_NAME: hart-worker-2
+      HEVOLVE_BASE_URL: http://hart-worker-2:6777
+      HEVOLVE_SEED_PEERS: http://hart-central:6777,http://hart-worker-1:6778
 
 networks:
   hivenet:

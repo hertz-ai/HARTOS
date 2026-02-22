@@ -84,7 +84,7 @@ def sample_goal(db):
         description='Enable distributed thinking',
         repo_url='hertz-ai/Hevolve-Continual-Learner-Framework-Zero-Forgetting',
         repo_branch='main-withpycharmplugin-and-slowness',
-        target_path='src/crawl4ai/embodied_ai',
+        target_path='src/hevolveai/embodied_ai',
         status='active', created_by='admin',
     )
     db.add(goal)

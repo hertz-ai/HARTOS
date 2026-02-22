@@ -19,15 +19,20 @@ import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# ─── crawl4ai src is in a sibling project ───
-CRAWL4AI_SRC = os.path.normpath(os.path.join(
+# ─── Hevolve-Core src is in a sibling project ───
+HevolveAI_SRC = os.path.normpath(os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    '..', 'crawl4ai', 'src'
+    '..', 'hevolveai', 'src'
 ))
-if os.path.isdir(CRAWL4AI_SRC):
-    sys.path.insert(0, CRAWL4AI_SRC)
+if not os.path.isdir(HevolveAI_SRC):
+    HevolveAI_SRC = os.path.normpath(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        '..', 'hevolveai', 'src'  # legacy fallback
+    ))
+if os.path.isdir(HevolveAI_SRC):
+    sys.path.insert(0, HevolveAI_SRC)
 
-_crawl4ai_base = os.path.join(CRAWL4AI_SRC, 'crawl4ai', 'embodied_ai')
+_hevolveai_base = os.path.join(HevolveAI_SRC, 'hevolveai', 'embodied_ai')
 
 
 # ─── Direct-import helper (bypasses package __init__.py chains) ───
@@ -43,38 +48,38 @@ def _direct_import(module_name, file_path):
 
 # Ensure parent namespace packages exist
 for pkg in [
-    'crawl4ai',
-    'crawl4ai.embodied_ai',
-    'crawl4ai.embodied_ai.utils',
-    'crawl4ai.embodied_ai.config',
-    'crawl4ai.embodied_ai.models',
+    'hevolveai',
+    'hevolveai.embodied_ai',
+    'hevolveai.embodied_ai.utils',
+    'hevolveai.embodied_ai.config',
+    'hevolveai.embodied_ai.models',
 ]:
     if pkg not in sys.modules:
         m = types.ModuleType(pkg)
-        m.__path__ = [os.path.join(_crawl4ai_base, *pkg.split('.')[2:])]
+        m.__path__ = [os.path.join(_hevolveai_base, *pkg.split('.')[2:])]
         sys.modules[pkg] = m
 
 # Import context_logger first (dependency)
-_ctx_log_path = os.path.join(_crawl4ai_base, 'utils', 'context_logger.py')
-_ctx_mod = _direct_import('crawl4ai.embodied_ai.utils.context_logger', _ctx_log_path)
+_ctx_log_path = os.path.join(_hevolveai_base, 'utils', 'context_logger.py')
+_ctx_mod = _direct_import('hevolveai.embodied_ai.utils.context_logger', _ctx_log_path)
 
 # Import config
-_config_path = os.path.join(_crawl4ai_base, 'config', 'config.py')
-_config_mod = _direct_import('crawl4ai.embodied_ai.config.config', _config_path)
+_config_path = os.path.join(_hevolveai_base, 'config', 'config.py')
+_config_mod = _direct_import('hevolveai.embodied_ai.config.config', _config_path)
 DeploymentConfig = _config_mod.DeploymentConfig
 Config = _config_mod.Config
 
 # Import qwen_llamacpp_wrapper
-_wrapper_path = os.path.join(_crawl4ai_base, 'models', 'qwen_llamacpp_wrapper.py')
-_wrapper_mod = _direct_import('crawl4ai.embodied_ai.models.qwen_llamacpp_wrapper', _wrapper_path)
+_wrapper_path = os.path.join(_hevolveai_base, 'models', 'qwen_llamacpp_wrapper.py')
+_wrapper_mod = _direct_import('hevolveai.embodied_ai.models.qwen_llamacpp_wrapper', _wrapper_path)
 QwenLlamaCppEncoder = _wrapper_mod.QwenLlamaCppEncoder
 
 # Mock qwen_vl_wrapper (heavy deps: peft, newer transformers)
-sys.modules['crawl4ai.embodied_ai.models.qwen_vl_wrapper'] = MagicMock()
+sys.modules['hevolveai.embodied_ai.models.qwen_vl_wrapper'] = MagicMock()
 
 # Import qwen_auto_encoder
-_auto_path = os.path.join(_crawl4ai_base, 'models', 'qwen_auto_encoder.py')
-_auto_mod = _direct_import('crawl4ai.embodied_ai.models.qwen_auto_encoder', _auto_path)
+_auto_path = os.path.join(_hevolveai_base, 'models', 'qwen_auto_encoder.py')
+_auto_mod = _direct_import('hevolveai.embodied_ai.models.qwen_auto_encoder', _auto_path)
 get_qwen_encoder = _auto_mod.get_qwen_encoder
 
 
@@ -380,7 +385,7 @@ class TestTeacherRouting:
     def _get_func(self):
         """Import _messages_to_prompt if available."""
         try:
-            from crawl4ai.embodied_ai.rl_ef.learning_llm_provider import LearningLLMProvider
+            from hevolveai.embodied_ai.rl_ef.learning_llm_provider import LearningLLMProvider
             provider = MagicMock(spec=LearningLLMProvider)
             provider._messages_to_prompt = LearningLLMProvider._messages_to_prompt.__get__(provider)
             return provider._messages_to_prompt
@@ -889,28 +894,28 @@ class TestEncoderAdaptiveWrapping:
 # ════════════════════════════════════════════════════════════════════
 
 class TestEmbodiedInProcess:
-    """Test in-process learning pipeline (crawl4ai - zero HTTP overhead)."""
+    """Test in-process learning pipeline (Hevolve-Core - zero HTTP overhead)."""
 
     def test_init_learning_pipeline_success(self):
-        """Mock crawl4ai imports → verify provider + hivemind initialized."""
-        # Mock the crawl4ai modules
+        """Mock Hevolve-Core imports → verify provider + hivemind initialized."""
+        # Mock the Hevolve-Core modules
         mock_provider = MagicMock()
         mock_hive = MagicMock()
         mock_config = {'_provider': mock_provider}
 
         with patch.dict('sys.modules', {
-            'crawl4ai': MagicMock(),
-            'crawl4ai.embodied_ai': MagicMock(),
-            'crawl4ai.embodied_ai.rl_ef': MagicMock(
+            'hevolveai': MagicMock(),
+            'hevolveai.embodied_ai': MagicMock(),
+            'hevolveai.embodied_ai.rl_ef': MagicMock(
                 create_learning_llm_config=MagicMock(return_value=mock_config),
                 register_learning_provider=MagicMock(),
             ),
-            'crawl4ai.embodied_ai.monitoring': MagicMock(),
-            'crawl4ai.embodied_ai.monitoring.trace_recorder': MagicMock(
+            'hevolveai.embodied_ai.monitoring': MagicMock(),
+            'hevolveai.embodied_ai.monitoring.trace_recorder': MagicMock(
                 get_trace_recorder=MagicMock(),
             ),
-            'crawl4ai.embodied_ai.learning': MagicMock(),
-            'crawl4ai.embodied_ai.learning.hive_mind': MagicMock(
+            'hevolveai.embodied_ai.learning': MagicMock(),
+            'hevolveai.embodied_ai.learning.hive_mind': MagicMock(
                 HiveMind=MagicMock(return_value=mock_hive),
                 AgentCapability=MagicMock(
                     TEXT_GENERATION='text', REASONING='reasoning'),
@@ -946,9 +951,9 @@ class TestEmbodiedInProcess:
             lgapi._hive_mind = None
 
             with patch.dict('sys.modules', {
-                'crawl4ai': None,
-                'crawl4ai.embodied_ai': None,
-                'crawl4ai.embodied_ai.rl_ef': None,
+                'hevolveai': None,
+                'hevolveai.embodied_ai': None,
+                'hevolveai.embodied_ai.rl_ef': None,
             }):
                 # Should not crash
                 lgapi._init_learning_pipeline()
@@ -1008,9 +1013,9 @@ class TestEmbodiedInProcess:
         mock_rl_ef = MagicMock()
         mock_rl_ef.send_expert_correction = mock_send
         with patch.dict('sys.modules', {
-            'crawl4ai': MagicMock(),
-            'crawl4ai.embodied_ai': MagicMock(),
-            'crawl4ai.embodied_ai.rl_ef': mock_rl_ef,
+            'hevolveai': MagicMock(),
+            'hevolveai.embodied_ai': MagicMock(),
+            'hevolveai.embodied_ai.rl_ef': mock_rl_ef,
         }):
             result = bridge.submit_correction(
                 original_response='old answer',
@@ -1059,7 +1064,7 @@ class TestEmbodiedInProcess:
 # ════════════════════════════════════════════════════════════════════
 
 class TestInstallTimeDependencies:
-    """Verify the dependency declarations that wire crawl4ai into hevolve-backend.
+    """Verify the dependency declarations that wire Hevolve-Core into hevolve-backend.
 
     These tests guard the install-time contract:
       Nunba build.py → pip install hevolve-backend → pip resolves embodied-ai
@@ -1079,26 +1084,31 @@ class TestInstallTimeDependencies:
         # Must contain the git dependency for embodied-ai
         assert 'embodied-ai' in content, (
             "pyproject.toml must declare embodied-ai as a dependency. "
-            "Without it, crawl4ai won't be installed and the learning "
+            "Without it, Hevolve-Core won't be installed and the learning "
             "pipeline will silently fail on every node."
         )
-        assert 'git+https://github.com/hertz-ai/crawl4ai' in content, (
-            "embodied-ai must point to the crawl4ai git repo"
+        assert 'git+https://github.com/hertz-ai/hevolve-core' in content, (
+            "embodied-ai must point to the Hevolve-Core git repo"
         )
 
-    def test_crawl4ai_setup_uses_src_package_dir(self):
-        """crawl4ai's setup.py MUST use package_dir={'': 'src'}.
+    def test_hevolveai_setup_uses_src_package_dir(self):
+        """Hevolve-Core's setup.py MUST use package_dir={'': 'src'}.
 
-        Without this, pip install creates 'src.crawl4ai' import paths instead
-        of 'crawl4ai', breaking all in-process imports from world_model_bridge
+        Without this, pip install creates 'src.hevolveai' import paths instead
+        of 'hevolveai', breaking all in-process imports from world_model_bridge
         and langchain_gpt_api.
         """
         setup_path = os.path.normpath(os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            '..', 'crawl4ai', 'setup.py',
+            '..', 'hevolve-core', 'setup.py',
         ))
         if not os.path.exists(setup_path):
-            pytest.skip("crawl4ai repo not found as sibling")
+            setup_path = os.path.normpath(os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                '..', 'hevolveai', 'setup.py',  # legacy fallback
+            ))
+        if not os.path.exists(setup_path):
+            pytest.skip("Hevolve-Core repo not found as sibling")
 
         with open(setup_path, 'r') as f:
             content = f.read()
@@ -1108,25 +1118,30 @@ class TestInstallTimeDependencies:
         )
         assert "find_packages(where='src')" in content, (
             "setup.py must use find_packages(where='src') to export "
-            "'crawl4ai.*' not 'src.crawl4ai.*'"
+            "'hevolveai.*' not 'src.hevolveai.*'"
         )
 
-    def test_no_src_prefix_in_crawl4ai_source_imports(self):
-        """No source file under crawl4ai/src/ should import 'from src.crawl4ai'.
+    def test_no_src_prefix_in_hevolveai_source_imports(self):
+        """No source file under hevolve-core/src/ should import 'from src.hevolveai'.
 
-        After the import fix, all imports must be 'from crawl4ai.*'.
-        'from src.crawl4ai.*' only works with sys.path hacks and breaks
+        After the import fix, all imports must be 'from hevolveai.*'.
+        'from src.hevolveai.*' only works with sys.path hacks and breaks
         when pip-installed into another project.
         """
-        crawl4ai_src = os.path.normpath(os.path.join(
+        hevolveai_src = os.path.normpath(os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            '..', 'crawl4ai', 'src',
+            '..', 'hevolve-core', 'src',
         ))
-        if not os.path.isdir(crawl4ai_src):
-            pytest.skip("crawl4ai repo not found as sibling")
+        if not os.path.isdir(hevolveai_src):
+            hevolveai_src = os.path.normpath(os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                '..', 'hevolveai', 'src',  # legacy fallback
+            ))
+        if not os.path.isdir(hevolveai_src):
+            pytest.skip("Hevolve-Core repo not found as sibling")
 
         bad_files = []
-        for root, dirs, files in os.walk(crawl4ai_src):
+        for root, dirs, files in os.walk(hevolveai_src):
             dirs[:] = [d for d in dirs if d != '__pycache__']
             for f in files:
                 if not f.endswith('.py'):
@@ -1134,12 +1149,12 @@ class TestInstallTimeDependencies:
                 path = os.path.join(root, f)
                 with open(path, 'r', encoding='utf-8', errors='ignore') as fh:
                     for i, line in enumerate(fh, 1):
-                        if 'from src.crawl4ai' in line:
+                        if 'from src.hevolveai' in line:
                             bad_files.append(f"{path}:{i}")
 
         assert not bad_files, (
-            f"Found 'from src.crawl4ai' imports in source files "
-            f"(must be 'from crawl4ai'):\n" +
+            f"Found 'from src.hevolveai' imports in source files "
+            f"(must be 'from hevolveai'):\n" +
             "\n".join(bad_files[:10])
         )
 
@@ -1165,7 +1180,7 @@ class TestInstallTimeDependencies:
         import langchain_gpt_api as lgapi
         assert hasattr(lgapi, '_init_learning_pipeline'), (
             "langchain_gpt_api must have _init_learning_pipeline() for "
-            "in-process crawl4ai initialization"
+            "in-process Hevolve-Core initialization"
         )
         assert callable(lgapi._init_learning_pipeline)
 
@@ -1203,7 +1218,7 @@ class TestBuildInstallOrder:
         """build.py must have _install_embodied_ai function."""
         assert hasattr(build_module, '_install_embodied_ai'), (
             "build.py must define _install_embodied_ai() for local-first "
-            "crawl4ai installation"
+            "Hevolve-Core installation"
         )
 
     def test_install_embodied_ai_tries_local_first(self, build_module):
@@ -1213,10 +1228,10 @@ class TestBuildInstallOrder:
 
         # Must check for local sibling (setup.py existence)
         assert 'setup.py' in source, (
-            "_install_embodied_ai must check for local crawl4ai/setup.py"
+            "_install_embodied_ai must check for local hevolve-core/setup.py"
         )
         # Must have GitHub fallback
-        assert 'crawl4ai.git' in source, (
+        assert 'hevolve-core.git' in source, (
             "_install_embodied_ai must fall back to GitHub if no local sibling"
         )
 
@@ -1356,9 +1371,9 @@ class TestFlatModeBehavior:
 
         mock_send = MagicMock(return_value={'success': True})
         with patch.dict('sys.modules', {
-            'crawl4ai': MagicMock(),
-            'crawl4ai.embodied_ai': MagicMock(),
-            'crawl4ai.embodied_ai.rl_ef': MagicMock(
+            'hevolveai': MagicMock(),
+            'hevolveai.embodied_ai': MagicMock(),
+            'hevolveai.embodied_ai.rl_ef': MagicMock(
                 send_expert_correction=mock_send),
         }):
             with patch('integrations.agent_engine.world_model_bridge.requests'
@@ -1521,9 +1536,9 @@ class TestCentralModeBehavior:
       - hevolve-backend on port 6777
       - database on port 6006
       - llama.cpp on port 8080
-      - crawl4ai MAY run as separate process (HTTP mode)
+      - Hevolve-Core MAY run as separate process (HTTP mode)
 
-    When crawl4ai is NOT co-located (no in-process provider), the bridge
+    When Hevolve-Core is NOT co-located (no in-process provider), the bridge
     MUST fall back to HTTP calls. These tests guard that fallback.
     """
 
@@ -1644,7 +1659,7 @@ class TestCentralModeBehavior:
     def test_central_with_provider_still_uses_in_process(self):
         """Even in central mode, if provider IS co-located, use in-process.
 
-        This happens when central runs crawl4ai in the same process
+        This happens when central runs Hevolve-Core in the same process
         (e.g., single-machine deployment). In-process is always preferred.
         """
         with patch(
@@ -1783,18 +1798,18 @@ class TestStatusEndpointLearning:
 class TestNoExtraPortsInProcessMode:
     """Verify that flat/regional mode opens NO unnecessary ports.
 
-    When pip-installed (Nunba bundles hevolve-backend + crawl4ai):
+    When pip-installed (Nunba bundles hevolve-backend + Hevolve-Core):
       Port 5000: Flask GUI + API (served by Nunba app.py)
       Port 8080: llama.cpp raw inference (started by llama_config)
-      NO port 8000: crawl4ai api_server must NOT run
+      NO port 8000: Hevolve-Core api_server must NOT run
       NO port 6777: hevolve-backend must NOT run standalone
 
-    These tests MUST fail if someone re-introduces a crawl4ai HTTP server
+    These tests MUST fail if someone re-introduces a Hevolve-Core HTTP server
     or starts hevolve-backend on its own port in flat/regional mode.
     """
 
     def test_init_learning_pipeline_does_not_import_api_server(self):
-        """_init_learning_pipeline must NOT import crawl4ai.server.api_server.
+        """_init_learning_pipeline must NOT import Hevolve-Core's server.api_server.
 
         api_server.py starts a FastAPI+uvicorn server on port 8000.
         In flat/regional mode, we import learning functions directly -
@@ -1820,7 +1835,7 @@ class TestNoExtraPortsInProcessMode:
         assert 'api_server' not in code_only, (
             "_init_learning_pipeline must NOT import api_server. "
             "It should import learning functions directly from "
-            "crawl4ai.embodied_ai.rl_ef, not the server wrapper."
+            "hevolveai.embodied_ai.rl_ef, not the server wrapper."
         )
         assert 'uvicorn' not in code_only, (
             "_init_learning_pipeline must NOT reference uvicorn. "
@@ -1940,9 +1955,9 @@ class TestNoExtraPortsInProcessMode:
              patch('integrations.agent_engine.world_model_bridge.requests'
                    '.get') as mock_get, \
              patch.dict('sys.modules', {
-                 'crawl4ai': MagicMock(),
-                 'crawl4ai.embodied_ai': MagicMock(),
-                 'crawl4ai.embodied_ai.rl_ef': MagicMock(
+                 'hevolveai': MagicMock(),
+                 'hevolveai.embodied_ai': MagicMock(),
+                 'hevolveai.embodied_ai.rl_ef': MagicMock(
                      send_expert_correction=mock_send),
              }):
 
@@ -1995,9 +2010,9 @@ class TestNoExtraPortsInProcessMode:
              patch('integrations.agent_engine.world_model_bridge.requests'
                    '.get') as mock_get, \
              patch.dict('sys.modules', {
-                 'crawl4ai': MagicMock(),
-                 'crawl4ai.embodied_ai': MagicMock(),
-                 'crawl4ai.embodied_ai.rl_ef': MagicMock(
+                 'hevolveai': MagicMock(),
+                 'hevolveai.embodied_ai': MagicMock(),
+                 'hevolveai.embodied_ai.rl_ef': MagicMock(
                      send_expert_correction=mock_send),
              }):
 
@@ -2012,12 +2027,12 @@ class TestNoExtraPortsInProcessMode:
             mock_post.assert_not_called()
             mock_get.assert_not_called()
 
-    def test_only_crawl4ai_learning_modules_imported_not_server(self):
+    def test_only_hevolveai_learning_modules_imported_not_server(self):
         """_init_learning_pipeline must import ONLY learning functions.
 
-        Must import: crawl4ai.embodied_ai.rl_ef (learning provider)
-        Must import: crawl4ai.embodied_ai.learning.hive_mind (hivemind)
-        Must NOT import: crawl4ai.server (api_server, wamp, etc.)
+        Must import: Hevolve-Core's embodied_ai.rl_ef (learning provider)
+        Must import: Hevolve-Core's embodied_ai.learning.hive_mind (hivemind)
+        Must NOT import: Hevolve-Core's server (api_server, wamp, etc.)
 
         If api_server is imported, its module-level code starts the
         proof monitor and creates a FastAPI app - opening port 8000.
@@ -2027,16 +2042,16 @@ class TestNoExtraPortsInProcessMode:
         source = inspect.getsource(lgapi._init_learning_pipeline)
 
         # Must import learning functions
-        assert 'crawl4ai.embodied_ai.rl_ef' in source, (
+        assert 'hevolveai.embodied_ai.rl_ef' in source, (
             "Must import rl_ef for learning provider"
         )
-        assert 'crawl4ai.embodied_ai.learning.hive_mind' in source, (
+        assert 'hevolveai.embodied_ai.learning.hive_mind' in source, (
             "Must import hive_mind for collective intelligence"
         )
 
         # Must NOT import server modules
-        assert 'crawl4ai.server' not in source, (
-            "Must NOT import crawl4ai.server - that starts FastAPI on port 8000"
+        assert 'hevolveai.server' not in source, (
+            "Must NOT import Hevolve-Core's server module - that starts FastAPI on port 8000"
         )
         assert 'api_server' not in source, (
             "Must NOT import api_server - that binds port 8000"
@@ -2129,7 +2144,7 @@ class TestBootPhase:
         """Importing langchain_gpt_api must return immediately.
 
         _init_learning_pipeline runs in a background thread, so import
-        must not hang even if crawl4ai takes time to initialize.
+        must not hang even if Hevolve-Core takes time to initialize.
         """
         import time
         start = time.time()
@@ -2179,19 +2194,19 @@ class TestInitPhase:
             lgapi._hive_mind = None
 
             with patch.dict('sys.modules', {
-                'crawl4ai': MagicMock(),
-                'crawl4ai.embodied_ai': MagicMock(),
-                'crawl4ai.embodied_ai.rl_ef': MagicMock(
+                'hevolveai': MagicMock(),
+                'hevolveai.embodied_ai': MagicMock(),
+                'hevolveai.embodied_ai.rl_ef': MagicMock(
                     create_learning_llm_config=MagicMock(
                         return_value={'_provider': mock_provider}),
                     register_learning_provider=MagicMock(),
                 ),
-                'crawl4ai.embodied_ai.monitoring': MagicMock(),
-                'crawl4ai.embodied_ai.monitoring.trace_recorder': MagicMock(
+                'hevolveai.embodied_ai.monitoring': MagicMock(),
+                'hevolveai.embodied_ai.monitoring.trace_recorder': MagicMock(
                     get_trace_recorder=MagicMock(),
                 ),
-                'crawl4ai.embodied_ai.learning': MagicMock(),
-                'crawl4ai.embodied_ai.learning.hive_mind': MagicMock(
+                'hevolveai.embodied_ai.learning': MagicMock(),
+                'hevolveai.embodied_ai.learning.hive_mind': MagicMock(
                     HiveMind=MagicMock(return_value=mock_hive),
                     AgentCapability=MagicMock(
                         TEXT_GENERATION='t', REASONING='r'),
@@ -2208,7 +2223,7 @@ class TestInitPhase:
             lgapi._hive_mind = orig_h
 
     def test_init_leaves_none_on_import_error(self):
-        """On ImportError (crawl4ai not installed), globals stay None."""
+        """On ImportError (Hevolve-Core not installed), globals stay None."""
         import langchain_gpt_api as lgapi
         orig_p, orig_h = lgapi._learning_provider, lgapi._hive_mind
         try:
@@ -2216,9 +2231,9 @@ class TestInitPhase:
             lgapi._hive_mind = None
 
             with patch.dict('sys.modules', {
-                'crawl4ai': None,
-                'crawl4ai.embodied_ai': None,
-                'crawl4ai.embodied_ai.rl_ef': None,
+                'hevolveai': None,
+                'hevolveai.embodied_ai': None,
+                'hevolveai.embodied_ai.rl_ef': None,
             }):
                 lgapi._init_learning_pipeline()  # must not crash
 
@@ -2237,18 +2252,18 @@ class TestInitPhase:
             lgapi._hive_mind = None
 
             with patch.dict('sys.modules', {
-                'crawl4ai': MagicMock(),
-                'crawl4ai.embodied_ai': MagicMock(),
-                'crawl4ai.embodied_ai.rl_ef': MagicMock(
+                'hevolveai': MagicMock(),
+                'hevolveai.embodied_ai': MagicMock(),
+                'hevolveai.embodied_ai.rl_ef': MagicMock(
                     create_learning_llm_config=MagicMock(
                         side_effect=RuntimeError("GPU not available")),
                 ),
-                'crawl4ai.embodied_ai.monitoring': MagicMock(),
-                'crawl4ai.embodied_ai.monitoring.trace_recorder': MagicMock(
+                'hevolveai.embodied_ai.monitoring': MagicMock(),
+                'hevolveai.embodied_ai.monitoring.trace_recorder': MagicMock(
                     get_trace_recorder=MagicMock(),
                 ),
-                'crawl4ai.embodied_ai.learning': MagicMock(),
-                'crawl4ai.embodied_ai.learning.hive_mind': MagicMock(),
+                'hevolveai.embodied_ai.learning': MagicMock(),
+                'hevolveai.embodied_ai.learning.hive_mind': MagicMock(),
             }):
                 lgapi._init_learning_pipeline()  # must not crash
 
@@ -2424,15 +2439,15 @@ class TestBundledFlatCloudApiWorking:
              patch.dict('sys.modules', {'hevolve_backend_adapter': MagicMock()}), \
              patch.object(lgapi, '_wait_for_llm_server') as mock_wait, \
              patch.dict('sys.modules', {
-                 'crawl4ai': MagicMock(),
-                 'crawl4ai.embodied_ai': MagicMock(),
-                 'crawl4ai.embodied_ai.rl_ef': MagicMock(),
-                 'crawl4ai.embodied_ai.monitoring': MagicMock(),
-                 'crawl4ai.embodied_ai.monitoring.trace_recorder': MagicMock(),
-                 'crawl4ai.embodied_ai.learning': MagicMock(),
-                 'crawl4ai.embodied_ai.learning.hive_mind': MagicMock(),
+                 'hevolveai': MagicMock(),
+                 'hevolveai.embodied_ai': MagicMock(),
+                 'hevolveai.embodied_ai.rl_ef': MagicMock(),
+                 'hevolveai.embodied_ai.monitoring': MagicMock(),
+                 'hevolveai.embodied_ai.monitoring.trace_recorder': MagicMock(),
+                 'hevolveai.embodied_ai.learning': MagicMock(),
+                 'hevolveai.embodied_ai.learning.hive_mind': MagicMock(),
              }):
-            rl_ef = sys.modules['crawl4ai.embodied_ai.rl_ef']
+            rl_ef = sys.modules['hevolveai.embodied_ai.rl_ef']
             rl_ef.create_learning_llm_config.return_value = {}
             lgapi._learning_provider = None
             lgapi._hive_mind = None
@@ -2478,15 +2493,15 @@ class TestBundledFlatNunbaLlamaCppRunning:
              patch.dict('sys.modules', {'hevolve_backend_adapter': MagicMock()}), \
              patch.object(lgapi, '_wait_for_llm_server', return_value=True) as mock_wait, \
              patch.dict('sys.modules', {
-                 'crawl4ai': MagicMock(),
-                 'crawl4ai.embodied_ai': MagicMock(),
-                 'crawl4ai.embodied_ai.rl_ef': MagicMock(),
-                 'crawl4ai.embodied_ai.monitoring': MagicMock(),
-                 'crawl4ai.embodied_ai.monitoring.trace_recorder': MagicMock(),
-                 'crawl4ai.embodied_ai.learning': MagicMock(),
-                 'crawl4ai.embodied_ai.learning.hive_mind': MagicMock(),
+                 'hevolveai': MagicMock(),
+                 'hevolveai.embodied_ai': MagicMock(),
+                 'hevolveai.embodied_ai.rl_ef': MagicMock(),
+                 'hevolveai.embodied_ai.monitoring': MagicMock(),
+                 'hevolveai.embodied_ai.monitoring.trace_recorder': MagicMock(),
+                 'hevolveai.embodied_ai.learning': MagicMock(),
+                 'hevolveai.embodied_ai.learning.hive_mind': MagicMock(),
              }):
-            rl_ef = sys.modules['crawl4ai.embodied_ai.rl_ef']
+            rl_ef = sys.modules['hevolveai.embodied_ai.rl_ef']
             rl_ef.create_learning_llm_config.return_value = {
                 '_provider': MagicMock()}
             lgapi._learning_provider = None
@@ -2497,26 +2512,26 @@ class TestBundledFlatNunbaLlamaCppRunning:
             rl_ef.create_learning_llm_config.assert_called_once()
 
     def test_no_second_server_started(self):
-        """Bundled mode never triggers crawl4ai's auto-start path."""
+        """Bundled mode never triggers Hevolve-Core's auto-start path."""
         import langchain_gpt_api as lgapi
 
         with patch.dict(os.environ, {'HEVOLVE_LLM_ENDPOINT_URL': ''}), \
              patch.dict('sys.modules', {'hevolve_backend_adapter': MagicMock()}), \
              patch.object(lgapi, '_wait_for_llm_server', return_value=True), \
              patch.dict('sys.modules', {
-                 'crawl4ai': MagicMock(),
-                 'crawl4ai.embodied_ai': MagicMock(),
-                 'crawl4ai.embodied_ai.rl_ef': MagicMock(),
-                 'crawl4ai.embodied_ai.monitoring': MagicMock(),
-                 'crawl4ai.embodied_ai.monitoring.trace_recorder': MagicMock(),
-                 'crawl4ai.embodied_ai.learning': MagicMock(),
-                 'crawl4ai.embodied_ai.learning.hive_mind': MagicMock(),
-                 'crawl4ai.embodied_ai.models.auto_setup': MagicMock(),
+                 'hevolveai': MagicMock(),
+                 'hevolveai.embodied_ai': MagicMock(),
+                 'hevolveai.embodied_ai.rl_ef': MagicMock(),
+                 'hevolveai.embodied_ai.monitoring': MagicMock(),
+                 'hevolveai.embodied_ai.monitoring.trace_recorder': MagicMock(),
+                 'hevolveai.embodied_ai.learning': MagicMock(),
+                 'hevolveai.embodied_ai.learning.hive_mind': MagicMock(),
+                 'hevolveai.embodied_ai.models.auto_setup': MagicMock(),
              }):
-            rl_ef = sys.modules['crawl4ai.embodied_ai.rl_ef']
+            rl_ef = sys.modules['hevolveai.embodied_ai.rl_ef']
             rl_ef.create_learning_llm_config.return_value = {
                 '_provider': MagicMock()}
-            auto_setup = sys.modules['crawl4ai.embodied_ai.models.auto_setup']
+            auto_setup = sys.modules['hevolveai.embodied_ai.models.auto_setup']
             lgapi._learning_provider = None
             lgapi._hive_mind = None
             lgapi._trace_recorder = None
@@ -2549,15 +2564,15 @@ class TestBundledFlatNothingAvailable:
              patch.dict('sys.modules', {'hevolve_backend_adapter': MagicMock()}), \
              patch.object(lgapi, '_wait_for_llm_server', return_value=False), \
              patch.dict('sys.modules', {
-                 'crawl4ai': MagicMock(),
-                 'crawl4ai.embodied_ai': MagicMock(),
-                 'crawl4ai.embodied_ai.rl_ef': MagicMock(),
-                 'crawl4ai.embodied_ai.monitoring': MagicMock(),
-                 'crawl4ai.embodied_ai.monitoring.trace_recorder': MagicMock(),
-                 'crawl4ai.embodied_ai.learning': MagicMock(),
-                 'crawl4ai.embodied_ai.learning.hive_mind': MagicMock(),
+                 'hevolveai': MagicMock(),
+                 'hevolveai.embodied_ai': MagicMock(),
+                 'hevolveai.embodied_ai.rl_ef': MagicMock(),
+                 'hevolveai.embodied_ai.monitoring': MagicMock(),
+                 'hevolveai.embodied_ai.monitoring.trace_recorder': MagicMock(),
+                 'hevolveai.embodied_ai.learning': MagicMock(),
+                 'hevolveai.embodied_ai.learning.hive_mind': MagicMock(),
              }):
-            rl_ef = sys.modules['crawl4ai.embodied_ai.rl_ef']
+            rl_ef = sys.modules['hevolveai.embodied_ai.rl_ef']
             lgapi._learning_provider = None
             lgapi._hive_mind = None
             lgapi._trace_recorder = None
@@ -2598,7 +2613,7 @@ class TestBundledFlatCloudApiStoppedWorking:
     def test_cloud_url_set_but_key_expired(self):
         """HEVOLVE_LLM_ENDPOINT_URL is non-empty → _has_cloud_api() True.
 
-        crawl4ai's Priority 0 path will try the cloud endpoint, fail,
+        Hevolve-Core's Priority 0 path will try the cloud endpoint, fail,
         and fall through to local (or fail gracefully).  We don't
         auto-start a server - the user needs to fix their API key.
         """
@@ -2639,9 +2654,9 @@ class TestStandaloneLlamaCppRunning:
 
 
 class TestStandaloneNothingAvailable:
-    """Standalone + nothing on 8080 (crawl4ai should auto-start)."""
+    """Standalone + nothing on 8080 (Hevolve-Core should auto-start)."""
 
-    def test_short_wait_then_crawl4ai_auto_starts(self):
+    def test_short_wait_then_hevolveai_auto_starts(self):
         """5 s timeout, then create_learning_llm_config proceeds (auto_setup=True)."""
         import langchain_gpt_api as lgapi
 
@@ -2651,15 +2666,15 @@ class TestStandaloneNothingAvailable:
              patch.dict(os.environ, {'HEVOLVE_LLM_ENDPOINT_URL': ''}), \
              patch.object(lgapi, '_wait_for_llm_server', return_value=False) as mock_wait, \
              patch.dict('sys.modules', {
-                 'crawl4ai': MagicMock(),
-                 'crawl4ai.embodied_ai': MagicMock(),
-                 'crawl4ai.embodied_ai.rl_ef': MagicMock(),
-                 'crawl4ai.embodied_ai.monitoring': MagicMock(),
-                 'crawl4ai.embodied_ai.monitoring.trace_recorder': MagicMock(),
-                 'crawl4ai.embodied_ai.learning': MagicMock(),
-                 'crawl4ai.embodied_ai.learning.hive_mind': MagicMock(),
+                 'hevolveai': MagicMock(),
+                 'hevolveai.embodied_ai': MagicMock(),
+                 'hevolveai.embodied_ai.rl_ef': MagicMock(),
+                 'hevolveai.embodied_ai.monitoring': MagicMock(),
+                 'hevolveai.embodied_ai.monitoring.trace_recorder': MagicMock(),
+                 'hevolveai.embodied_ai.learning': MagicMock(),
+                 'hevolveai.embodied_ai.learning.hive_mind': MagicMock(),
              }):
-            rl_ef = sys.modules['crawl4ai.embodied_ai.rl_ef']
+            rl_ef = sys.modules['hevolveai.embodied_ai.rl_ef']
             rl_ef.create_learning_llm_config.return_value = {
                 '_provider': MagicMock()}
             lgapi._learning_provider = None
@@ -2668,11 +2683,11 @@ class TestStandaloneNothingAvailable:
             lgapi._init_learning_pipeline()
             # Standalone → short timeout
             mock_wait.assert_called_once_with(timeout=5)
-            # create_learning_llm_config IS called (crawl4ai auto-starts)
+            # create_learning_llm_config IS called (Hevolve-Core auto-starts)
             rl_ef.create_learning_llm_config.assert_called_once()
 
     def test_provider_set_after_auto_start(self):
-        """After crawl4ai auto-starts, _learning_provider is populated."""
+        """After Hevolve-Core auto-starts, _learning_provider is populated."""
         import langchain_gpt_api as lgapi
 
         mock_provider = MagicMock()
@@ -2682,15 +2697,15 @@ class TestStandaloneNothingAvailable:
              patch.dict(os.environ, {'HEVOLVE_LLM_ENDPOINT_URL': ''}), \
              patch.object(lgapi, '_wait_for_llm_server', return_value=False), \
              patch.dict('sys.modules', {
-                 'crawl4ai': MagicMock(),
-                 'crawl4ai.embodied_ai': MagicMock(),
-                 'crawl4ai.embodied_ai.rl_ef': MagicMock(),
-                 'crawl4ai.embodied_ai.monitoring': MagicMock(),
-                 'crawl4ai.embodied_ai.monitoring.trace_recorder': MagicMock(),
-                 'crawl4ai.embodied_ai.learning': MagicMock(),
-                 'crawl4ai.embodied_ai.learning.hive_mind': MagicMock(),
+                 'hevolveai': MagicMock(),
+                 'hevolveai.embodied_ai': MagicMock(),
+                 'hevolveai.embodied_ai.rl_ef': MagicMock(),
+                 'hevolveai.embodied_ai.monitoring': MagicMock(),
+                 'hevolveai.embodied_ai.monitoring.trace_recorder': MagicMock(),
+                 'hevolveai.embodied_ai.learning': MagicMock(),
+                 'hevolveai.embodied_ai.learning.hive_mind': MagicMock(),
              }):
-            rl_ef = sys.modules['crawl4ai.embodied_ai.rl_ef']
+            rl_ef = sys.modules['hevolveai.embodied_ai.rl_ef']
             rl_ef.create_learning_llm_config.return_value = {
                 '_provider': mock_provider}
             lgapi._learning_provider = None
@@ -2704,7 +2719,7 @@ class TestStandaloneLlamaCppUninstalled:
     """Standalone + llama.cpp NOT installed (can't auto-start)."""
 
     def test_create_learning_config_still_called(self):
-        """crawl4ai handles missing llama.cpp by falling back to transformers."""
+        """Hevolve-Core handles missing llama.cpp by falling back to transformers."""
         import langchain_gpt_api as lgapi
 
         mods = dict(sys.modules)
@@ -2713,15 +2728,15 @@ class TestStandaloneLlamaCppUninstalled:
              patch.dict(os.environ, {'HEVOLVE_LLM_ENDPOINT_URL': ''}), \
              patch.object(lgapi, '_wait_for_llm_server', return_value=False), \
              patch.dict('sys.modules', {
-                 'crawl4ai': MagicMock(),
-                 'crawl4ai.embodied_ai': MagicMock(),
-                 'crawl4ai.embodied_ai.rl_ef': MagicMock(),
-                 'crawl4ai.embodied_ai.monitoring': MagicMock(),
-                 'crawl4ai.embodied_ai.monitoring.trace_recorder': MagicMock(),
-                 'crawl4ai.embodied_ai.learning': MagicMock(),
-                 'crawl4ai.embodied_ai.learning.hive_mind': MagicMock(),
+                 'hevolveai': MagicMock(),
+                 'hevolveai.embodied_ai': MagicMock(),
+                 'hevolveai.embodied_ai.rl_ef': MagicMock(),
+                 'hevolveai.embodied_ai.monitoring': MagicMock(),
+                 'hevolveai.embodied_ai.monitoring.trace_recorder': MagicMock(),
+                 'hevolveai.embodied_ai.learning': MagicMock(),
+                 'hevolveai.embodied_ai.learning.hive_mind': MagicMock(),
              }):
-            rl_ef = sys.modules['crawl4ai.embodied_ai.rl_ef']
+            rl_ef = sys.modules['hevolveai.embodied_ai.rl_ef']
             # No provider returned - fallback to transformers
             rl_ef.create_learning_llm_config.return_value = {}
             lgapi._learning_provider = None
@@ -2742,7 +2757,7 @@ class TestStandaloneCloudApiBroken:
             'HEVOLVE_LLM_ENDPOINT_URL': 'https://broken.example.com/v1',
         }):
             assert lgapi._has_cloud_api() is True
-            # Cloud path → no local wait → crawl4ai tries cloud, fails gracefully
+            # Cloud path → no local wait → Hevolve-Core tries cloud, fails gracefully
 
 
 class TestServerStopsMidSession:
@@ -2796,13 +2811,13 @@ class TestTimeoutContracts:
              patch.dict('sys.modules', {'hevolve_backend_adapter': MagicMock()}), \
              patch.object(lgapi, '_wait_for_llm_server', return_value=False) as m, \
              patch.dict('sys.modules', {
-                 'crawl4ai': MagicMock(),
-                 'crawl4ai.embodied_ai': MagicMock(),
-                 'crawl4ai.embodied_ai.rl_ef': MagicMock(),
-                 'crawl4ai.embodied_ai.monitoring': MagicMock(),
-                 'crawl4ai.embodied_ai.monitoring.trace_recorder': MagicMock(),
-                 'crawl4ai.embodied_ai.learning': MagicMock(),
-                 'crawl4ai.embodied_ai.learning.hive_mind': MagicMock(),
+                 'hevolveai': MagicMock(),
+                 'hevolveai.embodied_ai': MagicMock(),
+                 'hevolveai.embodied_ai.rl_ef': MagicMock(),
+                 'hevolveai.embodied_ai.monitoring': MagicMock(),
+                 'hevolveai.embodied_ai.monitoring.trace_recorder': MagicMock(),
+                 'hevolveai.embodied_ai.learning': MagicMock(),
+                 'hevolveai.embodied_ai.learning.hive_mind': MagicMock(),
              }):
             lgapi._learning_provider = None
             lgapi._hive_mind = None
@@ -2819,15 +2834,15 @@ class TestTimeoutContracts:
              patch.dict(os.environ, {'HEVOLVE_LLM_ENDPOINT_URL': ''}), \
              patch.object(lgapi, '_wait_for_llm_server', return_value=False) as m, \
              patch.dict('sys.modules', {
-                 'crawl4ai': MagicMock(),
-                 'crawl4ai.embodied_ai': MagicMock(),
-                 'crawl4ai.embodied_ai.rl_ef': MagicMock(),
-                 'crawl4ai.embodied_ai.monitoring': MagicMock(),
-                 'crawl4ai.embodied_ai.monitoring.trace_recorder': MagicMock(),
-                 'crawl4ai.embodied_ai.learning': MagicMock(),
-                 'crawl4ai.embodied_ai.learning.hive_mind': MagicMock(),
+                 'hevolveai': MagicMock(),
+                 'hevolveai.embodied_ai': MagicMock(),
+                 'hevolveai.embodied_ai.rl_ef': MagicMock(),
+                 'hevolveai.embodied_ai.monitoring': MagicMock(),
+                 'hevolveai.embodied_ai.monitoring.trace_recorder': MagicMock(),
+                 'hevolveai.embodied_ai.learning': MagicMock(),
+                 'hevolveai.embodied_ai.learning.hive_mind': MagicMock(),
              }):
-            rl_ef = sys.modules['crawl4ai.embodied_ai.rl_ef']
+            rl_ef = sys.modules['hevolveai.embodied_ai.rl_ef']
             rl_ef.create_learning_llm_config.return_value = {}
             lgapi._learning_provider = None
             lgapi._hive_mind = None
@@ -2842,15 +2857,15 @@ class TestTimeoutContracts:
              patch.dict('sys.modules', {'hevolve_backend_adapter': MagicMock()}), \
              patch.object(lgapi, '_wait_for_llm_server') as m, \
              patch.dict('sys.modules', {
-                 'crawl4ai': MagicMock(),
-                 'crawl4ai.embodied_ai': MagicMock(),
-                 'crawl4ai.embodied_ai.rl_ef': MagicMock(),
-                 'crawl4ai.embodied_ai.monitoring': MagicMock(),
-                 'crawl4ai.embodied_ai.monitoring.trace_recorder': MagicMock(),
-                 'crawl4ai.embodied_ai.learning': MagicMock(),
-                 'crawl4ai.embodied_ai.learning.hive_mind': MagicMock(),
+                 'hevolveai': MagicMock(),
+                 'hevolveai.embodied_ai': MagicMock(),
+                 'hevolveai.embodied_ai.rl_ef': MagicMock(),
+                 'hevolveai.embodied_ai.monitoring': MagicMock(),
+                 'hevolveai.embodied_ai.monitoring.trace_recorder': MagicMock(),
+                 'hevolveai.embodied_ai.learning': MagicMock(),
+                 'hevolveai.embodied_ai.learning.hive_mind': MagicMock(),
              }):
-            rl_ef = sys.modules['crawl4ai.embodied_ai.rl_ef']
+            rl_ef = sys.modules['hevolveai.embodied_ai.rl_ef']
             rl_ef.create_learning_llm_config.return_value = {}
             lgapi._learning_provider = None
             lgapi._hive_mind = None

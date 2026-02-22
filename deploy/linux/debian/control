@@ -1,4 +1,4 @@
-Package: hyve-os
+Package: hart-os
 Version: 1.0.0
 Section: net
 Priority: optional
@@ -6,8 +6,8 @@ Architecture: amd64
 Depends: python3.10, python3.10-venv, python3-pip, ufw, curl
 Maintainer: Hevolve AI <team@hevolve.ai>
 Homepage: https://hevolve.ai
-Description: HyveOS - Crowdsourced Agentic Intelligence Platform
- HyveOS is a custom Linux distribution layer for running autonomous
+Description: HART OS - Crowdsourced Agentic Intelligence Platform
+ HART OS is a custom Linux distribution layer for running autonomous
  AI agents with crowdsourced compute, peer-to-peer federation,
  constitutional guardrails, and 90% revenue back to contributors.
  .

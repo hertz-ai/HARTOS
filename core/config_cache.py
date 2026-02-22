@@ -17,7 +17,7 @@ Configuration Loading Priority (highest to lowest):
 Deployment mode detection:
 - Bundled (Nunba): sys.frozen == True → looks for langchain_config.json next to .exe
 - Standalone: looks for config.json in repo root (parent of core/)
-- HyveOS: /etc/hyve/hyve.env loaded by systemd, no config.json needed
+- HART OS: /etc/hart/hart.env loaded by systemd, no config.json needed
 
 Note: Nunba's AIKeyVault loads encrypted keys into env vars BEFORE
 config_cache runs. get_secret() checks env vars first, so vault keys

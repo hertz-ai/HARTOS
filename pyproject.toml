@@ -3,17 +3,17 @@ requires = ["setuptools>=61.0", "wheel", "setuptools-scm>=8.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "hyve-backend"
+name = "hart-backend"
 dynamic = ["version"]
-description = "Hyve — Crowdsourced Agentic Intelligence Platform"
+description = "HART OS — Hevolve Agentic Runtime"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
 authors = [
-    {name = "Hyve Team", email = "contact@hevolve.ai"}
+    {name = "HART Team", email = "contact@hevolve.ai"}
 ]
 keywords = [
-    "hyve",
+    "hart",
     "hevolve",
     "ai",
     "agents",
@@ -91,7 +91,7 @@ dependencies = [
     "transformers>=4.30.0",
 
     # Embodied AI — learning pipeline, hivemind, distributed intelligence
-    "embodied-ai @ git+https://github.com/hertz-ai/crawl4ai.git@main",
+    "embodied-ai @ git+https://github.com/hertz-ai/hevolve-core.git@main",
 
     # Security
     "cryptography>=41.0.0",
@@ -144,6 +144,9 @@ dev = [
     "black>=23.0.0",
     "flake8>=6.0.0",
     "mypy>=1.0.0",
+    "bandit[toml]>=1.7.0",
+    "pip-audit>=2.6.0",
+    "pre-commit>=3.5.0",
 ]
 all = [
     "python-telegram-bot>=21.0",
@@ -158,18 +161,18 @@ all = [
 ]
 
 [project.scripts]
-hyve-server = "langchain_gpt_api:main"
-hyve-crossbar = "crossbar_server:main"
+hart-server = "langchain_gpt_api:main"
+hart-crossbar = "crossbar_server:main"
 
 [project.urls]
-Homepage = "https://github.com/hevolve/hyve"
+Homepage = "https://github.com/hevolve/hart"
 Documentation = "https://docs.hevolve.ai"
-Repository = "https://github.com/hevolve/hyve"
-Issues = "https://github.com/hevolve/hyve/issues"
+Repository = "https://github.com/hevolve/hart"
+Issues = "https://github.com/hevolve/hart/issues"
 
 [tool.setuptools]
 py-modules = [
-    "hyve_version",
+    "hart_version",
     "langchain_gpt_api",
     "helper",
     "helper_func",
@@ -196,7 +199,7 @@ exclude = ["venv*", "tests*", "docs*"]
 version_scheme = "guess-next-dev"
 local_scheme = "no-local-version"
 fallback_version = "0.0.0"
-write_to = "hyve_version.py"
+write_to = "hart_version.py"
 tag_regex = "^v(?P<version>\\d+\\.\\d+\\.\\d+)$"
 
 [tool.black]
@@ -248,3 +251,7 @@ exclude = [
     "dist",
 ]
 ignore = ["E501", "W503", "E203"]
+
+[tool.bandit]
+exclude_dirs = ["venv", "venv310", "tests", "autogen-0.2.37", ".pycharm_plugin", "build", "dist"]
+skips = ["B101", "B404", "B603", "B607"]

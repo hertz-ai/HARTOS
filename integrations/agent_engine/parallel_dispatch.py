@@ -8,6 +8,7 @@ Uses the existing SmartLedger primitives:
 
 ThreadPoolExecutor pattern reused from speculative_dispatcher.py.
 """
+import atexit
 import json
 import logging
 import os
@@ -30,7 +31,8 @@ def get_executor() -> ThreadPoolExecutor:
             if _executor is None:
                 _executor = ThreadPoolExecutor(
                     max_workers=MAX_PARALLEL_WORKERS,
-                    thread_name_prefix='hyve-parallel')
+                    thread_name_prefix='hart-parallel')
+                atexit.register(lambda: _executor.shutdown(wait=False))
     return _executor
 
 

@@ -44,7 +44,7 @@ _FALLBACK_NOUN = [
 RESERVED_WORDS = frozenset([
     'admin', 'root', 'system', 'bot', 'test', 'null', 'undefined',
     'anonymous', 'moderator', 'mod', 'staff', 'support', 'help',
-    'official', 'hevolve', 'hevolvebot', 'hyve', 'hyvebot', 'santaclaw', 'nunba', 'api',
+    'official', 'hevolve', 'hevolvebot', 'hart', 'hartbot', 'santaclaw', 'nunba', 'api',
     'webhook', 'internal', 'deleted', 'banned', 'suspended',
 ])
 

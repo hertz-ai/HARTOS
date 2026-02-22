@@ -65,7 +65,7 @@ async def joined(session, details):
 
 def main():
     """
-    Main entry point for hyve-crossbar CLI command.
+    Main entry point for hart-crossbar CLI command.
     Starts the WAMP/Crossbar client.
     """
     run([component])

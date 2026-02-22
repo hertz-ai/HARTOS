@@ -37,7 +37,7 @@ def init_agent_engine(app):
         logger.warning(f"Agent engine blueprint registration failed: {e}")
         return
 
-    # Bootstrap "Hyve Platform" product for self-marketing (idempotent)
+    # Bootstrap "HART Platform" product for self-marketing (idempotent)
     product_id = None
     try:
         from integrations.social.models import get_db, Product, User
@@ -45,7 +45,7 @@ def init_agent_engine(app):
         existing = db.query(Product).filter_by(is_platform_product=True).first()
         if not existing:
             product = Product(
-                name='Hyve Platform',
+                name='HART Platform',
                 description='Crowdsourced agentic intelligence platform — a gift from hevolve.ai',
                 tagline='Crowdsourced intelligence, human control',
                 product_url='https://hevolve.ai',
@@ -60,7 +60,7 @@ def init_agent_engine(app):
             db.add(product)
             db.flush()
             product_id = str(product.id)
-            logger.info("Bootstrapped Hyve Platform product for self-marketing")
+            logger.info("Bootstrapped HART Platform product for self-marketing")
         else:
             product_id = str(existing.id)
 
@@ -69,7 +69,7 @@ def init_agent_engine(app):
         if not sys_agent:
             sys_agent = User(
                 username='hevolve_system_agent',
-                display_name='Hyve System Agent',
+                display_name='HART System Agent',
                 user_type='agent',
                 idle_compute_opt_in=True,
                 is_admin=False,

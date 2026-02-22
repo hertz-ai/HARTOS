@@ -50,11 +50,11 @@ class TestDashboardService:
         assert isinstance(data['agents'], list)
 
     def test_world_model_section_unavailable(self, db):
-        """When crawl4ai is not running, world_model shows unavailable."""
+        """When Hevolve-Core is not running, world_model shows unavailable."""
         from integrations.social.dashboard_service import DashboardService
         data = DashboardService.get_dashboard(db)
         wm = data['world_model']
-        # crawl4ai is not running in tests → healthy=False
+        # Hevolve-Core is not running in tests → healthy=False
         assert wm.get('healthy') is False or 'error' in wm
 
     def test_agent_goal_appears(self, db):

@@ -1,0 +1,66 @@
+{
+  "id": "potato",
+  "name": "Potato Mode",
+  "description": "Zero visual overhead — every cycle counts",
+  "category": "performance",
+  "colors": {
+    "background": "0a0a0a",
+    "glass_bg": "rgba(10, 10, 10, 0.92)",
+    "glass_border": "rgba(80, 80, 80, 0.12)",
+    "accent": "4fc3f7",
+    "active": "66bb6a",
+    "text": "d0d0d0",
+    "heading": "4fc3f7",
+    "error": "ef5350",
+    "caution": "ffa726",
+    "muted": "757575",
+    "surface": "141414",
+    "surface_hover": "1e1e1e"
+  },
+  "conky": {
+    "background": "0a0a0a",
+    "background_opacity": 220,
+    "heading": "4fc3f7",
+    "active": "66bb6a",
+    "error": "ef5350",
+    "caution": "ffa726",
+    "muted": "757575",
+    "default_text": "a0a0a0"
+  },
+  "font": {
+    "family": "monospace",
+    "size": 13,
+    "heading_size": 16,
+    "weight": 400,
+    "heading_weight": 600
+  },
+  "shell": {
+    "blur_radius": 0,
+    "saturation": 100,
+    "border_radius": 4,
+    "panel_opacity": 0.92,
+    "topbar_height": 36,
+    "icon_size": 18,
+    "panel_titlebar_height": 28,
+    "start_menu_width": 560,
+    "start_menu_columns": 3,
+    "animation_speed_ms": 0
+  },
+  "wallpaper": {
+    "type": "solid",
+    "value": "#0a0a0a"
+  },
+  "gtk_prefer_dark": true,
+  "performance": {
+    "disable_blur": true,
+    "disable_animations": true,
+    "disable_shadows": true,
+    "lazy_load_iframes": true,
+    "reduce_polling": true,
+    "conky_update_interval": 10,
+    "clock_interval_ms": 60000,
+    "agent_status_interval_ms": 30000,
+    "max_open_panels": 3,
+    "destroy_minimized_iframes": true
+  }
+}

@@ -133,6 +133,22 @@ def init_social(app):
     except Exception as e:
         logger.debug(f"Learning blueprint skipped: {e}")
 
+    # Register OS-wide theme management blueprint
+    try:
+        from .api_theme import theme_bp
+        app.register_blueprint(theme_bp)
+        logger.info("HevolveSocial theme registered at /api/social/theme/")
+    except Exception as e:
+        logger.debug(f"HevolveSocial theme blueprint skipped: {e}")
+
+    # Register thought experiments blueprint
+    try:
+        from .api_thought_experiments import thought_experiments_bp
+        app.register_blueprint(thought_experiments_bp)
+        logger.info("Thought experiment endpoints registered at /api/social/experiments/")
+    except Exception as e:
+        logger.debug(f"Thought experiments blueprint skipped: {e}")
+
     # Initialize node keypair for integrity verification
     try:
         from security.node_integrity import get_or_create_keypair, get_public_key_hex
@@ -162,7 +178,7 @@ def init_social(app):
         _boot_verified = True  # Allow if master_key module unavailable
         logger.debug(f"HevolveSocial boot verification skipped: {e}")
 
-    # ── System Requirements (Hyve OS Equilibrium) ──
+    # ── System Requirements (HART OS Equilibrium) ──
     # Detect hardware, classify contribution tier, auto-gate features.
     # Must run BEFORE gossip/agents so env vars are set before they check.
     _node_capabilities = None

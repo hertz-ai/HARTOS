@@ -431,7 +431,7 @@ class ResponseConfigSchema:
 
 @dataclass
 class EmbodiedAIConfigSchema:
-    """Embodied AI / crawl4ai feed configuration."""
+    """Embodied AI / Hevolve-Core feed configuration."""
     enabled: bool = True
     # Visual feeds
     screen_capture_enabled: bool = True
@@ -452,8 +452,8 @@ class EmbodiedAIConfigSchema:
     exploration_safe_mode: bool = True
     exploration_max_actions_per_min: int = 10
     exploration_rate: float = 0.3
-    # crawl4ai connection
-    crawl4ai_url: str = 'http://localhost:8000'
+    # Hevolve-Core connection
+    hevolveai_url: str = 'http://localhost:8000'
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

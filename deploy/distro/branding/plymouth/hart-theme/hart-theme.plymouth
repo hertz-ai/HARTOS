@@ -1,0 +1,8 @@
+[Plymouth Theme]
+Name=HART OS
+Description=HART OS boot splash — Crowdsourced Agentic Intelligence
+ModuleName=script
+
+[script]
+ImageDir=/usr/share/plymouth/themes/hart-theme
+ScriptFile=/usr/share/plymouth/themes/hart-theme/hart-theme.script

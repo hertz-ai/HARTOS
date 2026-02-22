@@ -7,6 +7,7 @@ auto-restore evicted or expired entries from disk/Redis.
 """
 
 import os
+import sys
 import json
 import logging
 
@@ -16,10 +17,23 @@ def _resolve_agent_data_dir():
     db_path = os.environ.get('HEVOLVE_DB_PATH', '')
     if db_path and db_path != ':memory:' and os.path.isabs(db_path):
         return os.path.join(os.path.dirname(db_path), 'agent_data')
+    # Bundled/frozen mode: use writable user directory (Program Files is read-only)
+    if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
+        return os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data')
     return os.path.join(os.path.dirname(os.path.dirname(__file__)), 'agent_data')
 
 AGENT_DATA_DIR = _resolve_agent_data_dir()
-PROMPTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'prompts')
+
+def _resolve_prompts_dir():
+    base = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'prompts')
+    if os.path.isdir(base):
+        return base
+    # Bundled mode fallback: prompts next to agent_data
+    if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
+        return os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'prompts')
+    return base
+
+PROMPTS_DIR = _resolve_prompts_dir()
 
 
 def load_agent_data(prompt_id):

@@ -1,0 +1,9 @@
+# HART OS update service — allow hart user to restart services
+# Install: cp to /etc/sudoers.d/hart-update && chmod 440
+hart ALL=(root) NOPASSWD: /bin/systemctl restart hart.target
+hart ALL=(root) NOPASSWD: /bin/systemctl daemon-reload
+hart ALL=(root) NOPASSWD: /bin/systemctl restart hart-backend.service
+hart ALL=(root) NOPASSWD: /bin/systemctl restart hart-discovery.service
+hart ALL=(root) NOPASSWD: /bin/systemctl restart hart-agent-daemon.service
+hart ALL=(root) NOPASSWD: /bin/systemctl restart hart-vision.service
+hart ALL=(root) NOPASSWD: /bin/systemctl restart hart-llm.service

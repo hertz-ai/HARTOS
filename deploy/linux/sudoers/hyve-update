@@ -1,9 +1,0 @@
-# HyveOS update service — allow hyve user to restart services
-# Install: cp to /etc/sudoers.d/hyve-update && chmod 440
-hyve ALL=(root) NOPASSWD: /bin/systemctl restart hyve.target
-hyve ALL=(root) NOPASSWD: /bin/systemctl daemon-reload
-hyve ALL=(root) NOPASSWD: /bin/systemctl restart hyve-backend.service
-hyve ALL=(root) NOPASSWD: /bin/systemctl restart hyve-discovery.service
-hyve ALL=(root) NOPASSWD: /bin/systemctl restart hyve-agent-daemon.service
-hyve ALL=(root) NOPASSWD: /bin/systemctl restart hyve-vision.service
-hyve ALL=(root) NOPASSWD: /bin/systemctl restart hyve-llm.service

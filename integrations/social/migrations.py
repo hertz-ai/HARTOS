@@ -8,7 +8,7 @@ from .models import get_engine, Base
 
 logger = logging.getLogger('hevolve_social')
 
-SCHEMA_VERSION = 29
+SCHEMA_VERSION = 31
 
 
 def get_schema_version(engine) -> int:
@@ -414,7 +414,7 @@ def run_migrations():
         set_schema_version(engine, 20)
 
     if current < 21:
-        logger.info("HevolveSocial: migrating to v21 (Node capability tier - Hyve OS equilibrium)")
+        logger.info("HevolveSocial: migrating to v21 (Node capability tier - HART OS equilibrium)")
         with engine.connect() as conn:
             for stmt in [
                 "ALTER TABLE peer_nodes ADD COLUMN capability_tier VARCHAR(20)",
@@ -535,3 +535,77 @@ def run_migrations():
                 logger.warning("v29 migration: CREATE INDEX status skipped: %s", e)
             conn.commit()
         set_schema_version(engine, 29)
+
+    if current < 30:
+        logger.info("HevolveSocial: migrating to v30 (ThoughtExperiment + ExperimentVote)")
+        with engine.connect() as conn:
+            try:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS thought_experiments (
+                        id VARCHAR(64) PRIMARY KEY,
+                        post_id VARCHAR(64),
+                        creator_id VARCHAR(64) NOT NULL,
+                        title VARCHAR(200) NOT NULL,
+                        hypothesis TEXT NOT NULL,
+                        expected_outcome TEXT,
+                        intent_category VARCHAR(30) DEFAULT 'technology',
+                        status VARCHAR(20) DEFAULT 'proposed',
+                        decision_type VARCHAR(20) DEFAULT 'weighted',
+                        voting_opens_at DATETIME,
+                        voting_closes_at DATETIME,
+                        evaluation_deadline DATETIME,
+                        decision_outcome TEXT,
+                        decision_rationale JSON,
+                        total_votes INTEGER DEFAULT 0,
+                        agent_evaluations_json JSON,
+                        is_core_ip BOOLEAN DEFAULT 0,
+                        parent_experiment_id VARCHAR(64),
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                """))
+            except Exception as e:
+                logger.warning("v30 migration: CREATE TABLE thought_experiments skipped: %s", e)
+            try:
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_thought_experiments_status "
+                    "ON thought_experiments (status)"))
+            except Exception as e:
+                logger.warning("v30 migration: index on status skipped: %s", e)
+            try:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS experiment_votes (
+                        id VARCHAR(64) PRIMARY KEY,
+                        experiment_id VARCHAR(64) NOT NULL,
+                        voter_id VARCHAR(64) NOT NULL,
+                        voter_type VARCHAR(10) DEFAULT 'human',
+                        vote_value INTEGER DEFAULT 0,
+                        confidence FLOAT DEFAULT 1.0,
+                        reasoning TEXT,
+                        suggestion TEXT,
+                        constitutional_check BOOLEAN DEFAULT 1,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE (experiment_id, voter_id)
+                    )
+                """))
+            except Exception as e:
+                logger.warning("v30 migration: CREATE TABLE experiment_votes skipped: %s", e)
+            try:
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_experiment_votes_experiment_id "
+                    "ON experiment_votes (experiment_id)"))
+            except Exception as e:
+                logger.warning("v30 migration: index on experiment_id skipped: %s", e)
+            conn.commit()
+        set_schema_version(engine, 30)
+
+    if current < 31:
+        logger.info("HevolveSocial: migrating to v31 (PeerNode x25519_public for E2E encryption)")
+        with engine.connect() as conn:
+            try:
+                conn.execute(text(
+                    "ALTER TABLE peer_nodes ADD COLUMN x25519_public VARCHAR(64)"))
+            except Exception as e:
+                logger.warning("v31 migration: ADD COLUMN x25519_public skipped: %s", e)
+            conn.commit()
+        set_schema_version(engine, 31)

@@ -1,5 +1,5 @@
 """
-HyveSocial - Thought Experiment Tracker API Blueprint
+HARTSocial - Thought Experiment Tracker API Blueprint
 
 Aggregation layer over Post, AgentGoal, DistributedTaskCoordinator,
 MemoryGraph, and Agent Ledger for the tracker UI.
@@ -54,7 +54,9 @@ def _get_goal_progress(goal_id):
     try:
         from integrations.distributed_agent.task_coordinator import DistributedTaskCoordinator
         import redis
-        r = redis.Redis(host='localhost', port=6379, decode_responses=True)
+        r = redis.Redis(host='localhost', port=6379, decode_responses=True,
+                        socket_connect_timeout=1, socket_timeout=2,
+                        retry_on_timeout=False)
         r.ping()
         coordinator = DistributedTaskCoordinator(redis_client=r)
         return coordinator.get_goal_progress(goal_id)

@@ -2,7 +2,7 @@
 Service Tools - Dynamic HTTP tool registry for external microservices.
 
 Extends the MCP integration pattern to support any HTTP-based tool service
-(Crawl4AI, AceStep, Wan2GP, TTS-Audio-Suite, etc.) with health checking,
+(Hevolve-Core, AceStep, Wan2GP, TTS-Audio-Suite, etc.) with health checking,
 auto-discovery, and autogen/langchain compatible function generation.
 
 Runtime tools are managed by RuntimeToolManager which handles:
@@ -28,7 +28,7 @@ __all__ = [
     "ServiceToolRegistry",
     "ServiceToolInfo",
     "service_tool_registry",
-    "CrawlAITool",
+    "Crawl4AITool",
     "AceStepTool",
     "Wan2GPTool",
     "TTSAudioSuiteTool",

@@ -255,3 +255,65 @@ def submit_benchmark():
         return jsonify({'success': False, 'error': str(e)}), 500
     finally:
         db.close()
+
+
+# ─── Gradient Sync Endpoints ───
+
+@learning_bp.route('/api/learning/gradient/submit', methods=['POST'])
+def submit_gradient():
+    """Submit a compressed embedding delta for distributed aggregation."""
+    from integrations.social.models import get_db
+    from .gradient_service import GradientSyncService
+    from .embedding_delta import compress_delta
+
+    body = request.get_json(silent=True) or {}
+    node_id = body.get('node_id')
+    if not node_id:
+        return jsonify({'success': False, 'error': 'node_id required'}), 400
+
+    if not _verify_node_signature(body):
+        return jsonify({'success': False, 'error': 'invalid_signature'}), 403
+
+    # Accept pre-compressed delta or raw values
+    delta = body.get('delta')
+    if not delta:
+        raw_values = body.get('values', [])
+        k = body.get('compression_k', 32)
+        if not raw_values:
+            return jsonify({'success': False,
+                            'error': 'delta or values required'}), 400
+        delta = compress_delta(raw_values, method='top_k', k=k)
+
+    cct = body.get('cct')
+
+    db = get_db()
+    try:
+        result = GradientSyncService.submit_embedding_delta(
+            db, node_id, delta, cct_string=cct)
+        if result.get('accepted'):
+            db.commit()
+        return jsonify({'success': result.get('accepted', False),
+                        'data': result}), 200
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Gradient submit error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@learning_bp.route('/api/learning/gradient/status', methods=['GET'])
+def gradient_status():
+    """Get current embedding sync convergence status."""
+    from integrations.social.models import get_db
+    from .gradient_service import GradientSyncService
+
+    db = get_db()
+    try:
+        status = GradientSyncService.get_convergence_status(db)
+        return jsonify({'success': True, 'data': status}), 200
+    except Exception as e:
+        logger.error(f"Gradient status error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()

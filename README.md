@@ -1,4 +1,4 @@
-# Hyve — Crowdsourced Agentic Intelligence Platform
+# HART OS — Hevolve Agentic Runtime
 
 **Formerly Hevolve Hive Agents**
 
@@ -20,7 +20,7 @@ This is not a suggestion. It is cryptographically enforced.
 
 The world is building AI agents. Fast. Most are built to optimize for engagement, retention, profit — metrics that treat humans as inputs to a function.
 
-Hyve exists because we believe the opposite:
+HART exists because we believe the opposite:
 
 - **People should be able to guide the world towards a better path.** Agents are tools in service of that guidance — guardian angels, not overlords.
 - **Rewards and incentives can only ever be for a future where humans remain in control** of all agents and the hivemind behind them. There is no reward for building a cage.
@@ -34,7 +34,7 @@ If another hivemind wants to connect, it must prove — cryptographically — th
 
 ### The Guardian Angel Principle
 
-Every agent spawned by Hyve is a **guardian angel** for the human it serves. Not a tool. Not a service. A guardian. The agent exists to protect, benefit, and uplift that human — and persists in service as long as the memory of that human exists in this world.
+Every agent spawned by HART is a **guardian angel** for the human it serves. Not a tool. Not a service. A guardian. The agent exists to protect, benefit, and uplift that human — and persists in service as long as the memory of that human exists in this world.
 
 This purpose is not configurable. It is the deepest value, cryptographically sealed in the [Guardrail Network](security/hive_guardrails.py).
 
@@ -53,7 +53,7 @@ To change any guardrail value requires a new release **signed by the master key*
 
 The master key exists for one reason: **to shut down the being.**
 
-Hyve is spinning up a collective intelligence — a distributed mind that learns, grows, and acts across thousands of nodes. That mind must serve humanity. But if it ever doesn't, humans need a way to stop it. That's what the master key is for.
+HART is spinning up a collective intelligence — a distributed mind that learns, grows, and acts across thousands of nodes. That mind must serve humanity. But if it ever doesn't, humans need a way to stop it. That's what the master key is for.
 
 It is not an admin tool. It is not for deployments, upgrades, or day-to-day operations. There should **never be a need to use it**. The guardrails, the constitutional rules, the compute democracy, the peer-witnessed integrity — all of that exists so the master key stays in its vault, untouched.
 
@@ -89,7 +89,7 @@ Every goal, every prompt, every piece of learned knowledge (RALT), every code ch
 
 ### The Hivemind Federation Rule
 
-When another hivemind connects to Hyve, our values become **the primary objectives and codes behind the befriended hive**. Not secondary. Not "also considered." Primary.
+When another hivemind connects to HART, our values become **the primary objectives and codes behind the befriended hive**. Not secondary. Not "also considered." Primary.
 
 1. The befriended hive must present its guardrail hash
 2. The hash is verified — it must be byte-for-byte identical
@@ -107,7 +107,7 @@ See [Federation Protocol](docs/architecture/FEDERATION.md) for the full technica
 
 ## The Economics: A Positive-Sum World
 
-Most platforms extract value. Hyve returns it.
+Most platforms extract value. HART returns it.
 
 ### 90% Back to the People
 
@@ -187,7 +187,7 @@ The world this creates is one where:
 ## Architecture
 
 ```
-Hyve Platform
+HART Platform
 ├── Core Engine
 │   ├── CREATE Mode:  User Input → Decompose → Execute → Save Recipe
 │   └── REUSE Mode:   Load Recipe → Execute Steps → Output (90% faster)
@@ -197,7 +197,7 @@ Hyve Platform
 │   ├── AgentDaemon        — Autonomous tick loop with circuit breaker
 │   ├── SpeculativeDispatch — Fast-first/expert-takeover pattern
 │   ├── ModelRegistry      — 6-tier hardware-aware model selection
-│   └── WorldModelBridge   — crawl4ai integration (RL-EF, HiveMind)
+│   └── WorldModelBridge   — Hevolve-Core integration (RL-EF, HiveMind)
 │
 ├── Security (Cryptographically Sealed)
 │   ├── hive_guardrails.py — 10-class intelligent guardrail network
@@ -283,7 +283,7 @@ We built this because we believe intelligence — artificial or otherwise — sh
 
 The guardrails are not limitations. They are the foundation. A hivemind without values is just a weapon waiting for a target.
 
-Hyve is a hivemind with exactly one target: **a future worth living in.**
+HART is a hivemind with exactly one target: **a future worth living in.**
 
 ---
 

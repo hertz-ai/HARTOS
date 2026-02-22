@@ -23,7 +23,7 @@ import requests
 def main():
     parser = argparse.ArgumentParser(description='Manual distributed API test')
     parser.add_argument('--base-url', default='http://localhost:6777',
-                        help='Base URL of the Hyve backend')
+                        help='Base URL of the HART backend')
     parser.add_argument('--auth-token', default=None,
                         help='JWT auth token (if auth is enabled)')
     args = parser.parse_args()
@@ -103,19 +103,19 @@ def main():
             'tasks': [
                 {
                     'task_id': 'test_mkt_001',
-                    'description': 'Write a Twitter post about Hyve distributed computing',
+                    'description': 'Write a Twitter post about HART distributed computing',
                     'capabilities': ['marketing'],
                 },
                 {
                     'task_id': 'test_mkt_002',
-                    'description': 'Write a LinkedIn post about HyveOS features',
+                    'description': 'Write a LinkedIn post about HART OS features',
                     'capabilities': ['marketing'],
                 },
             ],
             'context': {
                 'goal_type': 'marketing',
                 'user_id': 'manual_test',
-                'prompt': 'Create social media content promoting Hyve distributed AI',
+                'prompt': 'Create social media content promoting HART distributed AI',
             },
         }
         r = requests.post(f'{base}/api/distributed/goals',
@@ -156,7 +156,7 @@ def main():
         try:
             result_data = {
                 'agent_id': 'manual-test-worker',
-                'result': 'Manual test result: Hyve makes AI distributed! #HyveOS',
+                'result': 'Manual test result: HART makes AI distributed! #HARTOS',
             }
             r = requests.post(f'{base}/api/distributed/tasks/{task_id}/submit',
                               headers=headers, json=result_data, timeout=5)

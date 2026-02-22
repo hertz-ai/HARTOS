@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# HyveOS Installer — Ubuntu Server 22.04+
+# HART OS Installer — Ubuntu Server 22.04+
 # Crowdsourced Agentic Intelligence Platform
 #
 # Usage:
@@ -13,20 +13,20 @@
 #   --no-vision     Skip MiniCPM vision service
 #   --no-llm        Skip llama.cpp local inference
 #   --from-iso      Called from ISO autoinstall (skip user prompts)
-#   --uninstall     Remove HyveOS completely
+#   --uninstall     Remove HART OS completely
 #   --help          Show this message
 # ============================================================
 
 set -euo pipefail
 
-HYVE_VERSION="1.0.0"
-INSTALL_DIR="/opt/hyve"
-CONFIG_DIR="/etc/hyve"
-DATA_DIR="/var/lib/hyve"
-LOG_DIR="/var/log/hyve"
+HART_VERSION="1.0.0"
+INSTALL_DIR="/opt/hart"
+CONFIG_DIR="/etc/hart"
+DATA_DIR="/var/lib/hart"
+LOG_DIR="/var/log/hart"
 SYSTEMD_DIR="/etc/systemd/system"
-HYVE_USER="hyve"
-HYVE_GROUP="hyve"
+HART_USER="hart"
+HART_GROUP="hart"
 
 # Defaults
 BACKEND_PORT=6777
@@ -44,10 +44,10 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-log_info()  { echo -e "${GREEN}[HyveOS]${NC} $1"; }
-log_warn()  { echo -e "${YELLOW}[HyveOS]${NC} $1"; }
-log_error() { echo -e "${RED}[HyveOS]${NC} $1"; }
-log_step()  { echo -e "${CYAN}[HyveOS]${NC} >>> $1"; }
+log_info()  { echo -e "${GREEN}[HART OS]${NC} $1"; }
+log_warn()  { echo -e "${YELLOW}[HART OS]${NC} $1"; }
+log_error() { echo -e "${RED}[HART OS]${NC} $1"; }
+log_step()  { echo -e "${CYAN}[HART OS]${NC} >>> $1"; }
 
 # ============================================================
 # Parse arguments
@@ -84,16 +84,16 @@ fi
 # Uninstall
 # ============================================================
 if $UNINSTALL; then
-    log_step "Uninstalling HyveOS..."
-    systemctl stop hyve.target 2>/dev/null || true
-    systemctl disable hyve.target 2>/dev/null || true
+    log_step "Uninstalling HART OS..."
+    systemctl stop hart.target 2>/dev/null || true
+    systemctl disable hart.target 2>/dev/null || true
 
-    rm -f "$SYSTEMD_DIR"/hyve-backend.service
-    rm -f "$SYSTEMD_DIR"/hyve-discovery.service
-    rm -f "$SYSTEMD_DIR"/hyve-vision.service
-    rm -f "$SYSTEMD_DIR"/hyve-llm.service
-    rm -f "$SYSTEMD_DIR"/hyve-agent-daemon.service
-    rm -f "$SYSTEMD_DIR"/hyve.target
+    rm -f "$SYSTEMD_DIR"/hart-backend.service
+    rm -f "$SYSTEMD_DIR"/hart-discovery.service
+    rm -f "$SYSTEMD_DIR"/hart-vision.service
+    rm -f "$SYSTEMD_DIR"/hart-llm.service
+    rm -f "$SYSTEMD_DIR"/hart-agent-daemon.service
+    rm -f "$SYSTEMD_DIR"/hart.target
     systemctl daemon-reload
 
     rm -rf "$INSTALL_DIR"
@@ -102,13 +102,13 @@ if $UNINSTALL; then
     # Preserve data dir — user must explicitly remove it
     log_warn "Data directory $DATA_DIR preserved. Remove manually if desired."
 
-    userdel "$HYVE_USER" 2>/dev/null || true
-    groupdel "$HYVE_GROUP" 2>/dev/null || true
+    userdel "$HART_USER" 2>/dev/null || true
+    groupdel "$HART_GROUP" 2>/dev/null || true
 
-    rm -f /usr/local/bin/hyve
-    rm -f /etc/ufw/applications.d/hyve
+    rm -f /usr/local/bin/hart
+    rm -f /etc/ufw/applications.d/hart
 
-    log_info "HyveOS uninstalled successfully."
+    log_info "HART OS uninstalled successfully."
     exit 0
 fi
 
@@ -122,7 +122,7 @@ ERRORS=0
 # OS check
 if [[ -f /etc/os-release ]]; then
     . /etc/os-release
-    if [[ "$ID" != "ubuntu" && "$ID_LIKE" != *"ubuntu"* && "$ID" != "debian" && "$ID" != "hyve-os" ]]; then
+    if [[ "$ID" != "ubuntu" && "$ID_LIKE" != *"ubuntu"* && "$ID" != "debian" && "$ID" != "hart-os" ]]; then
         log_error "Unsupported OS: $PRETTY_NAME (requires Ubuntu 22.04+ or Debian 12+)"
         ERRORS=$((ERRORS + 1))
     fi
@@ -171,10 +171,12 @@ for cmd in python3.10 python3.11 python3; do
         PY_VER=$("$cmd" --version 2>&1 | awk '{print $2}')
         PY_MAJOR=$(echo "$PY_VER" | cut -d. -f1)
         PY_MINOR=$(echo "$PY_VER" | cut -d. -f2)
-        if [[ "$PY_MAJOR" -eq 3 && "$PY_MINOR" -ge 10 ]]; then
+        if [[ "$PY_MAJOR" -eq 3 && "$PY_MINOR" -ge 10 && "$PY_MINOR" -le 11 ]]; then
             PYTHON_CMD="$cmd"
             log_info "Python: $PY_VER ($cmd) OK"
             break
+        elif [[ "$PY_MAJOR" -eq 3 && "$PY_MINOR" -ge 12 ]]; then
+            log_warn "Python $PY_VER detected but 3.12+ has pydantic 1.x compat issues. Prefer 3.10 or 3.11."
         fi
     fi
 done
@@ -240,22 +242,22 @@ fi
 # ============================================================
 # Create user and directories
 # ============================================================
-log_step "Creating hyve user and directories..."
+log_step "Creating hart user and directories..."
 
-if ! getent group "$HYVE_GROUP" &>/dev/null; then
-    groupadd --system "$HYVE_GROUP"
+if ! getent group "$HART_GROUP" &>/dev/null; then
+    groupadd --system "$HART_GROUP"
 fi
-if ! getent passwd "$HYVE_USER" &>/dev/null; then
-    useradd --system --gid "$HYVE_GROUP" --home-dir "$DATA_DIR" --shell /usr/sbin/nologin "$HYVE_USER"
+if ! getent passwd "$HART_USER" &>/dev/null; then
+    useradd --system --gid "$HART_GROUP" --home-dir "$DATA_DIR" --shell /usr/sbin/nologin "$HART_USER"
 fi
 
 mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR" "$INSTALL_DIR/models"
-chown -R "$HYVE_USER:$HYVE_GROUP" "$DATA_DIR" "$LOG_DIR"
+chown -R "$HART_USER:$HART_GROUP" "$DATA_DIR" "$LOG_DIR"
 
 # ============================================================
 # Copy application code
 # ============================================================
-log_step "Installing HyveOS application..."
+log_step "Installing HART OS application..."
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
@@ -276,7 +278,7 @@ else
     exit 1
 fi
 
-chown -R "$HYVE_USER:$HYVE_GROUP" "$INSTALL_DIR"
+chown -R "$HART_USER:$HART_GROUP" "$INSTALL_DIR"
 
 # ============================================================
 # Create virtual environment and install dependencies
@@ -322,7 +324,7 @@ with open('$DATA_DIR/node_public.key', 'wb') as f:
 os.chmod('$DATA_DIR/node_private.key', 0o600)
 print(f'Node ID: {public_bytes.hex()[:16]}...')
 "
-    chown "$HYVE_USER:$HYVE_GROUP" "$DATA_DIR/node_private.key" "$DATA_DIR/node_public.key"
+    chown "$HART_USER:$HART_GROUP" "$DATA_DIR/node_private.key" "$DATA_DIR/node_public.key"
     log_info "Node keypair generated."
 else
     log_info "Node keypair already exists."
@@ -341,27 +343,27 @@ log_info "Node ID: ${NODE_ID}..."
 # ============================================================
 log_step "Installing systemd services..."
 
-cp "$INSTALL_DIR/deploy/linux/systemd/hyve-backend.service" "$SYSTEMD_DIR/"
-cp "$INSTALL_DIR/deploy/linux/systemd/hyve-discovery.service" "$SYSTEMD_DIR/"
-cp "$INSTALL_DIR/deploy/linux/systemd/hyve-agent-daemon.service" "$SYSTEMD_DIR/"
-cp "$INSTALL_DIR/deploy/linux/systemd/hyve.target" "$SYSTEMD_DIR/"
+cp "$INSTALL_DIR/deploy/linux/systemd/hart-backend.service" "$SYSTEMD_DIR/"
+cp "$INSTALL_DIR/deploy/linux/systemd/hart-discovery.service" "$SYSTEMD_DIR/"
+cp "$INSTALL_DIR/deploy/linux/systemd/hart-agent-daemon.service" "$SYSTEMD_DIR/"
+cp "$INSTALL_DIR/deploy/linux/systemd/hart.target" "$SYSTEMD_DIR/"
 
 if ! $NO_VISION; then
-    cp "$INSTALL_DIR/deploy/linux/systemd/hyve-vision.service" "$SYSTEMD_DIR/"
+    cp "$INSTALL_DIR/deploy/linux/systemd/hart-vision.service" "$SYSTEMD_DIR/"
     log_info "Vision service installed."
 fi
 
 if ! $NO_LLM; then
-    cp "$INSTALL_DIR/deploy/linux/systemd/hyve-llm.service" "$SYSTEMD_DIR/"
+    cp "$INSTALL_DIR/deploy/linux/systemd/hart-llm.service" "$SYSTEMD_DIR/"
     log_info "LLM service installed."
 fi
 
 # D-Bus service (for desktop environments)
-if [[ -f "$INSTALL_DIR/deploy/linux/systemd/hyve-dbus.service" ]]; then
-    cp "$INSTALL_DIR/deploy/linux/systemd/hyve-dbus.service" "$SYSTEMD_DIR/"
-    if [[ -f "$INSTALL_DIR/deploy/linux/dbus/com.hyve.Agent.conf" ]]; then
+if [[ -f "$INSTALL_DIR/deploy/linux/systemd/hart-dbus.service" ]]; then
+    cp "$INSTALL_DIR/deploy/linux/systemd/hart-dbus.service" "$SYSTEMD_DIR/"
+    if [[ -f "$INSTALL_DIR/deploy/linux/dbus/com.hart.Agent.conf" ]]; then
         mkdir -p /etc/dbus-1/system.d
-        cp "$INSTALL_DIR/deploy/linux/dbus/com.hyve.Agent.conf" /etc/dbus-1/system.d/
+        cp "$INSTALL_DIR/deploy/linux/dbus/com.hart.Agent.conf" /etc/dbus-1/system.d/
     fi
     log_info "D-Bus service installed."
 fi
@@ -371,14 +373,14 @@ fi
 # ============================================================
 log_step "Configuring environment..."
 
-if [[ ! -f "$CONFIG_DIR/hyve.env" ]]; then
-    cp "$INSTALL_DIR/deploy/linux/hyve.env.template" "$CONFIG_DIR/hyve.env"
+if [[ ! -f "$CONFIG_DIR/hart.env" ]]; then
+    cp "$INSTALL_DIR/deploy/linux/hart.env.template" "$CONFIG_DIR/hart.env"
     # Set actual values
-    sed -i "s|^HEVOLVE_DB_PATH=.*|HEVOLVE_DB_PATH=$DATA_DIR/hevolve_database.db|" "$CONFIG_DIR/hyve.env"
-    sed -i "s|^HYVE_BACKEND_PORT=.*|HYVE_BACKEND_PORT=$BACKEND_PORT|" "$CONFIG_DIR/hyve.env"
-    chmod 600 "$CONFIG_DIR/hyve.env"
-    chown "$HYVE_USER:$HYVE_GROUP" "$CONFIG_DIR/hyve.env"
-    log_info "Environment configured at $CONFIG_DIR/hyve.env"
+    sed -i "s|^HEVOLVE_DB_PATH=.*|HEVOLVE_DB_PATH=$DATA_DIR/hevolve_database.db|" "$CONFIG_DIR/hart.env"
+    sed -i "s|^HART_BACKEND_PORT=.*|HART_BACKEND_PORT=$BACKEND_PORT|" "$CONFIG_DIR/hart.env"
+    chmod 600 "$CONFIG_DIR/hart.env"
+    chown "$HART_USER:$HART_GROUP" "$CONFIG_DIR/hart.env"
+    log_info "Environment configured at $CONFIG_DIR/hart.env"
 else
     log_info "Environment file exists, preserving."
 fi
@@ -389,13 +391,13 @@ fi
 log_step "Configuring firewall..."
 
 if command -v ufw &>/dev/null; then
-    cp "$INSTALL_DIR/deploy/linux/firewall/hyve-ufw.profile" /etc/ufw/applications.d/hyve 2>/dev/null || true
+    cp "$INSTALL_DIR/deploy/linux/firewall/hart-ufw.profile" /etc/ufw/applications.d/hart 2>/dev/null || true
     ufw allow "$BACKEND_PORT/tcp" >/dev/null 2>&1 || true
     ufw allow "6780/udp" >/dev/null 2>&1 || true
     log_info "UFW rules configured."
 elif command -v firewall-cmd &>/dev/null; then
-    cp "$INSTALL_DIR/deploy/linux/firewall/hyve-firewalld.xml" /etc/firewalld/services/hyve.xml 2>/dev/null || true
-    firewall-cmd --permanent --add-service=hyve 2>/dev/null || true
+    cp "$INSTALL_DIR/deploy/linux/firewall/hart-firewalld.xml" /etc/firewalld/services/hart.xml 2>/dev/null || true
+    firewall-cmd --permanent --add-service=hart 2>/dev/null || true
     firewall-cmd --reload 2>/dev/null || true
     log_info "firewalld rules configured."
 else
@@ -405,20 +407,20 @@ fi
 # ============================================================
 # Install CLI tool
 # ============================================================
-log_step "Installing HyveOS CLI..."
+log_step "Installing HART OS CLI..."
 
-cp "$INSTALL_DIR/deploy/linux/hyve-cli.py" /usr/local/bin/hyve
-chmod +x /usr/local/bin/hyve
-log_info "CLI installed: /usr/local/bin/hyve"
+cp "$INSTALL_DIR/deploy/linux/hart-cli.py" /usr/local/bin/hart
+chmod +x /usr/local/bin/hart
+log_info "CLI installed: /usr/local/bin/hart"
 
 # ============================================================
 # Enable and start services
 # ============================================================
-log_step "Enabling HyveOS services..."
+log_step "Enabling HART OS services..."
 
 systemctl daemon-reload
-systemctl enable hyve.target
-systemctl start hyve.target
+systemctl enable hart.target
+systemctl start hart.target
 
 # Wait for backend to come up
 log_info "Waiting for backend to start..."
@@ -446,22 +448,22 @@ fi
 # ============================================================
 echo ""
 echo "============================================================"
-echo -e "${GREEN}  HyveOS $HYVE_VERSION installed successfully!${NC}"
+echo -e "${GREEN}  HART OS $HART_VERSION installed successfully!${NC}"
 echo "============================================================"
 echo ""
 echo "  Node ID:    ${NODE_ID}..."
 echo "  Dashboard:  http://localhost:$BACKEND_PORT"
-echo "  Config:     $CONFIG_DIR/hyve.env"
+echo "  Config:     $CONFIG_DIR/hart.env"
 echo "  Data:       $DATA_DIR"
-echo "  Logs:       journalctl -u hyve-backend"
+echo "  Logs:       journalctl -u hart-backend"
 echo ""
 echo "  Commands:"
-echo "    hyve status     — check service status"
-echo "    hyve health     — node health report"
-echo "    hyve logs       — view logs"
-echo "    hyve join URL   — join a hive network"
+echo "    hart status     — check service status"
+echo "    hart health     — node health report"
+echo "    hart logs       — view logs"
+echo "    hart join URL   — join a hive network"
 echo ""
-echo "  Edit API keys:  sudo nano $CONFIG_DIR/hyve.env"
-echo "  Then restart:   sudo systemctl restart hyve.target"
+echo "  Edit API keys:  sudo nano $CONFIG_DIR/hart.env"
+echo "  Then restart:   sudo systemctl restart hart.target"
 echo ""
 log_info "Humans are always in control."

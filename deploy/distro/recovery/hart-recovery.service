@@ -1,0 +1,14 @@
+[Unit]
+Description=HART OS Recovery Mode
+DefaultDependencies=no
+After=local-fs.target
+# Only triggered manually via: systemctl start hart-recovery.service
+# or from GRUB recovery menu with kernel param hart.recovery=1
+ConditionKernelCommandLine=hart.recovery=1
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/hart/deploy/distro/recovery/hart-recovery.sh
+StandardOutput=journal+console
+StandardError=journal+console
+TimeoutStartSec=300

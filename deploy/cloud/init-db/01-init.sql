@@ -1,5 +1,5 @@
 -- =============================================================================
--- LLM-langchain_Chatbot-Agent Database Initialization
+-- HARTOS Database Initialization
 -- =============================================================================
 -- This script runs on first PostgreSQL container startup
 -- =============================================================================

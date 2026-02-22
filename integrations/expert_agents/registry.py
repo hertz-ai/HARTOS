@@ -543,7 +543,7 @@ class ExpertAgentRegistry:
                     AgentCapability("parsing", "Parse HTML/JSON", "Extract structured data"),
                     AgentCapability("automation", "Automate extraction", "Scheduled scraping"),
                 ],
-                endpoint="crawl4ai",  # Use Crawl4AI
+                endpoint="Crawl4AI",  # Use Crawl4AI
                 model_type="tool",
                 cost_per_call=0.0,
                 avg_latency_ms=2000,

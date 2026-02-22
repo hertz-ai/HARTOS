@@ -35,7 +35,9 @@ def _get_redis_client():
         import redis
         host = os.environ.get('REDIS_HOST', 'localhost')
         port = int(os.environ.get('REDIS_PORT', 6379))
-        return redis.Redis(host=host, port=port, decode_responses=True)
+        return redis.Redis(host=host, port=port, decode_responses=True,
+                           socket_connect_timeout=1, socket_timeout=1,
+                           retry_on_timeout=False)
     except Exception:
         return None
 
@@ -88,12 +90,22 @@ def _no_coordinator():
 @distributed_agent_bp.route('/api/distributed/tasks/announce', methods=['POST'])
 @require_auth
 def announce_tasks():
-    """Receive task announcements from peer nodes (gossip protocol)."""
+    """Receive task announcements from peer nodes (gossip protocol).
+    Supports E2E encrypted envelopes."""
     coordinator = _get_coordinator()
     if not coordinator:
         return _no_coordinator()
 
     data = request.get_json() or {}
+    # Decrypt E2E encrypted task announcement
+    if data.get('encrypted') and data.get('envelope'):
+        try:
+            from security.channel_encryption import decrypt_json_from_peer
+            decrypted = decrypt_json_from_peer(data['envelope'])
+            if decrypted:
+                data = decrypted
+        except Exception:
+            pass  # Decryption failed, try using data as-is
     goal_id = data.get('goal_id')
     objective = data.get('objective', '')
     tasks = data.get('tasks', [])

@@ -222,8 +222,8 @@ def register_finance_tools(helper, assistant, user_id: str):
                                 'Specific splits discussed per participant.',
                     },
                     'access_tiers': {
-                        'public': 'Hyve platform (this repo) — open, transparent',
-                        'private': 'Embodied AI core (crawl4ai downstream) — invite-only',
+                        'public': 'HART platform (this repo) — open, transparent',
+                        'private': 'Embodied AI core (Hevolve-Core downstream) — invite-only',
                     },
                     'status': 'active',
                 },

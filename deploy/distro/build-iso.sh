@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ============================================================
-# HyveOS ISO Builder
+# HART OS ISO Builder
 #
-# Builds a bootable HyveOS ISO based on Ubuntu Server 22.04 LTS.
+# Builds a bootable HART OS ISO based on Ubuntu Server 22.04 LTS.
 # Uses live-build for ISO customization.
 #
 # Prerequisites:
@@ -26,7 +26,7 @@ REPO_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 
 # Defaults
 VARIANT="server"
-HYVE_VERSION="1.0.0"
+HART_VERSION="1.0.0"
 OUTPUT_DIR="$REPO_DIR/dist"
 NO_CLEAN=false
 ARCH="amd64"
@@ -38,14 +38,14 @@ CYAN='\033[0;36m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-log() { echo -e "${CYAN}[HyveOS ISO]${NC} $1"; }
-warn() { echo -e "${YELLOW}[HyveOS ISO]${NC} $1"; }
+log() { echo -e "${CYAN}[HART OS ISO]${NC} $1"; }
+warn() { echo -e "${YELLOW}[HART OS ISO]${NC} $1"; }
 
 # Parse args
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --variant) VARIANT="$2"; shift 2 ;;
-        --version) HYVE_VERSION="$2"; shift 2 ;;
+        --version) HART_VERSION="$2"; shift 2 ;;
         --output)  OUTPUT_DIR="$2"; shift 2 ;;
         --no-clean) NO_CLEAN=true; shift ;;
         --help|-h)
@@ -56,12 +56,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-ISO_NAME="hyve-os-${HYVE_VERSION}-${VARIANT}-${ARCH}"
-BUILD_DIR="/tmp/hyve-iso-build-$$"
+ISO_NAME="hart-os-${HART_VERSION}-${VARIANT}-${ARCH}"
+BUILD_DIR="/tmp/hart-iso-build-$$"
 
-log "Building HyveOS ISO: $ISO_NAME"
+log "Building HART OS ISO: $ISO_NAME"
 log "  Variant: $VARIANT"
-log "  Version: $HYVE_VERSION"
+log "  Version: $HART_VERSION"
 log "  Base: Ubuntu $CODENAME ($ARCH)"
 
 # ─── Prerequisites ───
@@ -85,14 +85,14 @@ lb config \
     --distribution "$CODENAME" \
     --architectures "$ARCH" \
     --linux-flavours generic \
-    --bootappend-live "boot=live hostname=hyve-node username=hyve" \
+    --bootappend-live "boot=live hostname=hart-node username=hart" \
     --apt-recommends false \
     --binary-images iso-hybrid \
     --debian-installer live \
     --memtest none
 
 # ─── Parse variant config (INI files) ───
-VARIANT_CONF="$SCRIPT_DIR/variants/hyve-os-${VARIANT}.conf"
+VARIANT_CONF="$SCRIPT_DIR/variants/hart-os-${VARIANT}.conf"
 VARIANT_EXCLUDES=""
 VARIANT_EXTRA_PKGS=""
 if [[ -f "$VARIANT_CONF" ]]; then
@@ -118,7 +118,7 @@ log "Adding packages..."
 mkdir -p config/package-lists
 
 # Core packages (all variants)
-cat > config/package-lists/hyve-core.list.chroot <<EOF
+cat > config/package-lists/hart-core.list.chroot <<EOF
 python3.10
 python3.10-venv
 python3.10-dev
@@ -135,7 +135,7 @@ EOF
 
 # Desktop variant: add desktop environment + desktop integration
 if [[ "$VARIANT" == "desktop" ]]; then
-    cat > config/package-lists/hyve-desktop.list.chroot <<EOF
+    cat > config/package-lists/hart-desktop.list.chroot <<EOF
 ubuntu-desktop-minimal
 python3-dbus
 python3-gi
@@ -149,7 +149,7 @@ fi
 # Edge variant: strip unnecessary packages
 if [[ "$VARIANT" == "edge" ]]; then
     mkdir -p config/package-lists
-    cat > config/package-lists/hyve-edge-remove.list.chroot <<EOF
+    cat > config/package-lists/hart-edge-remove.list.chroot <<EOF
 !man-db
 !manpages
 !snapd
@@ -161,12 +161,12 @@ fi
 # Add any extra packages from variant config
 if [[ -n "$VARIANT_EXTRA_PKGS" ]]; then
     echo "$VARIANT_EXTRA_PKGS" | tr ' ' '\n' | sort -u \
-        > config/package-lists/hyve-variant-extra.list.chroot
+        > config/package-lists/hart-variant-extra.list.chroot
 fi
 
-# ─── Add HyveOS code ───
-log "Adding HyveOS application code..."
-mkdir -p config/includes.chroot/opt/hyve
+# ─── Add HART OS code ───
+log "Adding HART OS application code..."
+mkdir -p config/includes.chroot/opt/hart
 
 # Copy application (excluding dev artifacts)
 rsync -a \
@@ -174,44 +174,44 @@ rsync -a \
     --exclude='*.pyc' --exclude='tests/' --exclude='agent_data/*.db' \
     --exclude='.env' --exclude='*.egg-info' --exclude='.idea' \
     --exclude='autogen-*' --exclude='docs/' \
-    "$REPO_DIR/" config/includes.chroot/opt/hyve/
+    "$REPO_DIR/" config/includes.chroot/opt/hart/
 
 # ─── Add branding ───
 log "Adding branding..."
 
 # /etc/os-release
 mkdir -p config/includes.chroot/etc
-cp "$SCRIPT_DIR/branding/hyve-os-release" config/includes.chroot/etc/os-release
+cp "$SCRIPT_DIR/branding/hart-os-release" config/includes.chroot/etc/os-release
 
 # /etc/issue
-cp "$SCRIPT_DIR/branding/hyve-issue" config/includes.chroot/etc/issue
+cp "$SCRIPT_DIR/branding/hart-issue" config/includes.chroot/etc/issue
 
 # MOTD
 mkdir -p config/includes.chroot/etc/update-motd.d
-cp "$SCRIPT_DIR/branding/hyve-motd.sh" config/includes.chroot/etc/update-motd.d/99-hyve
-chmod +x config/includes.chroot/etc/update-motd.d/99-hyve
+cp "$SCRIPT_DIR/branding/hart-motd.sh" config/includes.chroot/etc/update-motd.d/99-hart
+chmod +x config/includes.chroot/etc/update-motd.d/99-hart
 
 # Plymouth theme
 if [[ -d "$SCRIPT_DIR/branding/plymouth" ]]; then
     mkdir -p config/includes.chroot/usr/share/plymouth/themes
-    cp -r "$SCRIPT_DIR/branding/plymouth/hyve-theme" \
+    cp -r "$SCRIPT_DIR/branding/plymouth/hart-theme" \
         config/includes.chroot/usr/share/plymouth/themes/
     # Generate logo if missing (requires Pillow in build env or fallback)
-    if [[ ! -f config/includes.chroot/usr/share/plymouth/themes/hyve-theme/hyve-logo.png ]]; then
-        python3 "$SCRIPT_DIR/branding/plymouth/hyve-theme/generate-logo.py" 2>/dev/null || \
+    if [[ ! -f config/includes.chroot/usr/share/plymouth/themes/hart-theme/hart-logo.png ]]; then
+        python3 "$SCRIPT_DIR/branding/plymouth/hart-theme/generate-logo.py" 2>/dev/null || \
             log "  Warning: Could not generate Plymouth logo (install Pillow)"
-        if [[ -f "$SCRIPT_DIR/branding/plymouth/hyve-theme/hyve-logo.png" ]]; then
-            cp "$SCRIPT_DIR/branding/plymouth/hyve-theme/hyve-logo.png" \
-                config/includes.chroot/usr/share/plymouth/themes/hyve-theme/
+        if [[ -f "$SCRIPT_DIR/branding/plymouth/hart-theme/hart-logo.png" ]]; then
+            cp "$SCRIPT_DIR/branding/plymouth/hart-theme/hart-logo.png" \
+                config/includes.chroot/usr/share/plymouth/themes/hart-theme/
         fi
     fi
 fi
 
 # GRUB
-if [[ -f "$SCRIPT_DIR/branding/grub/hyve-grub.cfg" ]]; then
+if [[ -f "$SCRIPT_DIR/branding/grub/hart-grub.cfg" ]]; then
     mkdir -p config/includes.chroot/etc/default/grub.d
-    cp "$SCRIPT_DIR/branding/grub/hyve-grub.cfg" \
-        config/includes.chroot/etc/default/grub.d/hyve.cfg
+    cp "$SCRIPT_DIR/branding/grub/hart-grub.cfg" \
+        config/includes.chroot/etc/default/grub.d/hart.cfg
 fi
 
 # ─── Add system configs ───
@@ -222,31 +222,31 @@ mkdir -p config/includes.chroot/etc/systemd/system
 cp "$REPO_DIR/deploy/linux/systemd/"* config/includes.chroot/etc/systemd/system/
 
 # First-boot service
-cp "$SCRIPT_DIR/first-boot/hyve-first-boot.sh" config/includes.chroot/opt/hyve/deploy/distro/first-boot/ 2>/dev/null || true
-cp "$SCRIPT_DIR/first-boot/hyve-first-boot.service" config/includes.chroot/etc/systemd/system/
+cp "$SCRIPT_DIR/first-boot/hart-first-boot.sh" config/includes.chroot/opt/hart/deploy/distro/first-boot/ 2>/dev/null || true
+cp "$SCRIPT_DIR/first-boot/hart-first-boot.service" config/includes.chroot/etc/systemd/system/
 
 # Kernel tuning
 mkdir -p config/includes.chroot/etc/sysctl.d
 mkdir -p config/includes.chroot/etc/security/limits.d
-cp "$SCRIPT_DIR/kernel/99-hyve-sysctl.conf" config/includes.chroot/etc/sysctl.d/
-cp "$SCRIPT_DIR/kernel/hyve-limits.conf" config/includes.chroot/etc/security/limits.d/
+cp "$SCRIPT_DIR/kernel/99-hart-sysctl.conf" config/includes.chroot/etc/sysctl.d/
+cp "$SCRIPT_DIR/kernel/hart-limits.conf" config/includes.chroot/etc/security/limits.d/
 
 # Firewall profile
 mkdir -p config/includes.chroot/etc/ufw/applications.d
-cp "$REPO_DIR/deploy/linux/firewall/hyve-ufw.profile" \
-    config/includes.chroot/etc/ufw/applications.d/hyve
+cp "$REPO_DIR/deploy/linux/firewall/hart-ufw.profile" \
+    config/includes.chroot/etc/ufw/applications.d/hart
 
 # CLI tool
 mkdir -p config/includes.chroot/usr/local/bin
-cp "$REPO_DIR/deploy/linux/hyve-cli.py" config/includes.chroot/usr/local/bin/hyve
-chmod +x config/includes.chroot/usr/local/bin/hyve
+cp "$REPO_DIR/deploy/linux/hart-cli.py" config/includes.chroot/usr/local/bin/hart
+chmod +x config/includes.chroot/usr/local/bin/hart
 
 # Environment template
-mkdir -p config/includes.chroot/etc/hyve
-cp "$REPO_DIR/deploy/linux/hyve.env.template" config/includes.chroot/etc/hyve/hyve.env
+mkdir -p config/includes.chroot/etc/hart
+cp "$REPO_DIR/deploy/linux/hart.env.template" config/includes.chroot/etc/hart/hart.env
 
-# Write variant to /etc/hyve/variant
-echo "$VARIANT" > config/includes.chroot/etc/hyve/variant
+# Write variant to /etc/hart/variant
+echo "$VARIANT" > config/includes.chroot/etc/hart/variant
 
 # ─── Add autoinstall for subiquity ───
 log "Adding autoinstall configuration..."
@@ -257,48 +257,48 @@ cp "$SCRIPT_DIR/autoinstall/vendor-data" config/includes.chroot/autoinstall/
 
 # ─── Add hook to enable services ───
 mkdir -p config/hooks/live
-cat > config/hooks/live/99-hyve-enable.hook.chroot <<'HOOKEOF'
+cat > config/hooks/live/99-hart-enable.hook.chroot <<'HOOKEOF'
 #!/bin/bash
 set -e
 
-# Enable HyveOS services
-systemctl enable hyve.target || true
-systemctl enable hyve-first-boot.service || true
+# Enable HART OS services
+systemctl enable hart.target || true
+systemctl enable hart-first-boot.service || true
 
-# Create hyve user if not exists
-getent group hyve >/dev/null || groupadd --system hyve
-getent passwd hyve >/dev/null || useradd --system --gid hyve --home-dir /var/lib/hyve --shell /usr/sbin/nologin hyve
+# Create hart user if not exists
+getent group hart >/dev/null || groupadd --system hart
+getent passwd hart >/dev/null || useradd --system --gid hart --home-dir /var/lib/hart --shell /usr/sbin/nologin hart
 
 # Create directories
-mkdir -p /var/lib/hyve /var/log/hyve /opt/hyve/agent_data /opt/hyve/models
-chown -R hyve:hyve /var/lib/hyve /var/log/hyve
+mkdir -p /var/lib/hart /var/log/hart /opt/hart/agent_data /opt/hart/models
+chown -R hart:hart /var/lib/hart /var/log/hart
 
 # Setup venv and install dependencies (FAIL if pip install fails)
 if command -v python3.10 &>/dev/null; then
-    python3.10 -m venv /opt/hyve/venv
-    /opt/hyve/venv/bin/pip install --upgrade pip -q
-    /opt/hyve/venv/bin/pip install -r /opt/hyve/requirements.txt -q
-    echo "[HyveOS] Python dependencies installed successfully."
+    python3.10 -m venv /opt/hart/venv
+    /opt/hart/venv/bin/pip install --upgrade pip -q
+    /opt/hart/venv/bin/pip install -r /opt/hart/requirements.txt -q
+    echo "[HART OS] Python dependencies installed successfully."
 else
-    echo "[HyveOS] ERROR: python3.10 not found in chroot!" >&2
+    echo "[HART OS] ERROR: python3.10 not found in chroot!" >&2
     exit 1
 fi
 
 # Plymouth theme activation
-if [ -f /usr/share/plymouth/themes/hyve-theme/hyve-theme.plymouth ]; then
+if [ -f /usr/share/plymouth/themes/hart-theme/hart-theme.plymouth ]; then
     update-alternatives --install /usr/share/plymouth/themes/default.plymouth \
-        default.plymouth /usr/share/plymouth/themes/hyve-theme/hyve-theme.plymouth 200 || true
+        default.plymouth /usr/share/plymouth/themes/hart-theme/hart-theme.plymouth 200 || true
     update-initramfs -u 2>/dev/null || true
-    echo "[HyveOS] Plymouth theme activated."
+    echo "[HART OS] Plymouth theme activated."
 fi
 
 # D-Bus service install (for desktop variant)
-if [ -f /opt/hyve/deploy/linux/dbus/com.hyve.Agent.conf ]; then
-    cp /opt/hyve/deploy/linux/dbus/com.hyve.Agent.conf /etc/dbus-1/system.d/ || true
-    echo "[HyveOS] D-Bus policy installed."
+if [ -f /opt/hart/deploy/linux/dbus/com.hart.Agent.conf ]; then
+    cp /opt/hart/deploy/linux/dbus/com.hart.Agent.conf /etc/dbus-1/system.d/ || true
+    echo "[HART OS] D-Bus policy installed."
 fi
 HOOKEOF
-chmod +x config/hooks/live/99-hyve-enable.hook.chroot
+chmod +x config/hooks/live/99-hart-enable.hook.chroot
 
 # ─── Build ISO ───
 log "Building ISO (this may take 15-30 minutes)..."
@@ -328,7 +328,7 @@ fi
 ISO_SIZE=$(du -h "$OUTPUT_DIR/${ISO_NAME}.iso" | cut -f1)
 log ""
 log "============================================================"
-log "  HyveOS ISO built successfully!"
+log "  HART OS ISO built successfully!"
 log "============================================================"
 log ""
 log "  ISO:      $OUTPUT_DIR/${ISO_NAME}.iso"

@@ -1,5 +1,5 @@
 """
-Hyve Skill Ingestion - ingest any agent skill into the Hevolve (Hyvemind) pipeline.
+HART Skill Ingestion - ingest any agent skill into the Hevolve (HARTmind) pipeline.
 
 Supports:
 - Claude Code skills (SKILL.md - YAML frontmatter + Markdown)
@@ -7,7 +7,7 @@ Supports:
 - Raw Markdown/text skill definitions
 - GitHub-hosted skill repos
 
-Skills become LangChain tools available to every Hyve agent, making thought
+Skills become LangChain tools available to every HART agent, making thought
 experiments executable through the hivemind.
 """
 

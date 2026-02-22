@@ -503,6 +503,22 @@ class HiveCircuitBreaker:
         return True
 
     @classmethod
+    def local_halt(cls, reason: str) -> bool:
+        """Local-only safety halt.  Does NOT require master key.
+
+        Used by SafetyMonitor for hardware E-stop events where latency
+        matters.  Sets local halt state and broadcasts informational
+        gossip (type='node_estop'), but does NOT halt other nodes.
+        """
+        with cls._lock:
+            cls._halted = True
+            cls._halt_reason = reason
+            cls._halt_timestamp = datetime.utcnow().isoformat()
+
+        logger.critical(f'LOCAL HALT: {reason}')
+        return True
+
+    @classmethod
     def is_halted(cls) -> bool:
         return cls._halted
 

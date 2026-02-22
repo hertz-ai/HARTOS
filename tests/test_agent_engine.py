@@ -527,7 +527,7 @@ class TestSelfMarketing:
             db.flush()
 
         product = Product(
-            name='Hyve Platform',
+            name='HART Platform',
             is_platform_product=True,
             category='platform',
         )
@@ -537,7 +537,7 @@ class TestSelfMarketing:
 
     def test_bootstrap_idempotent(self, db):
         # Create one
-        p1 = Product(name='Hyve Platform', is_platform_product=True)
+        p1 = Product(name='HART Platform', is_platform_product=True)
         db.add(p1)
         db.flush()
         # Check only one exists
@@ -546,7 +546,7 @@ class TestSelfMarketing:
 
     def test_platform_product_has_correct_fields(self, db):
         product = Product(
-            name='Hyve Platform',
+            name='HART Platform',
             description='AI-powered platform',
             category='platform',
             is_platform_product=True,
@@ -1553,9 +1553,9 @@ class TestSpeculativeDispatcher:
 # =============================================================================
 
 class TestWorldModelBridge:
-    """Tests for crawl4ai-integrated WorldModelBridge.
+    """Tests for Hevolve-Core-integrated WorldModelBridge.
 
-    The bridge forwards interactions to crawl4ai's real endpoints:
+    The bridge forwards interactions to Hevolve-Core's real endpoints:
     POST /v1/chat/completions, POST /v1/corrections, POST /v1/hivemind/think,
     GET /v1/stats, GET /v1/hivemind/stats, GET /v1/hivemind/agents, GET /health.
     """
@@ -2375,7 +2375,7 @@ class TestBootstrapGoals:
         if not existing:
             sys_agent = User(
                 username='hevolve_system_agent',
-                display_name='Hyve System Agent',
+                display_name='HART System Agent',
                 user_type='agent',
                 idle_compute_opt_in=True,
                 is_admin=False,
@@ -2480,7 +2480,7 @@ class TestBootstrapGoals:
         }
         prompt = _build_coding_prompt(goal)
         assert 'HIVE INTELLIGENCE EMBEDDING' in prompt
-        assert 'hyve-sdk' in prompt
+        assert 'hart-sdk' in prompt
         assert 'verify_master_key' in prompt
         assert 'verify_guardrail_integrity' in prompt
         assert 'WorldModelBridge' in prompt

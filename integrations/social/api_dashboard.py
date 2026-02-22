@@ -42,7 +42,7 @@ def get_agent_dashboard():
 
 @dashboard_bp.route('/api/social/dashboard/health', methods=['GET'])
 def get_node_health():
-    """Public health endpoint showing watchdog + crawl4ai status."""
+    """Public health endpoint showing watchdog + Hevolve-Core status."""
     data = {'watchdog': 'not_started', 'threads': {}, 'world_model': {}}
     try:
         from security.node_watchdog import get_watchdog
@@ -66,7 +66,7 @@ def get_node_health():
 @dashboard_bp.route('/api/social/node/capabilities', methods=['GET'])
 def get_node_capabilities():
     """Public endpoint: this node's hardware profile, contribution tier,
-    and enabled features.  Part of the Hyve OS equilibrium system."""
+    and enabled features.  Part of the HART OS equilibrium system."""
     try:
         from security.system_requirements import get_capabilities
         caps = get_capabilities()
@@ -97,9 +97,9 @@ def get_system_info():
         except Exception:
             data['tier'] = 'unknown'
 
-        # ─── Variant (HyveOS install variant) ───
+        # ─── Variant (HART OS install variant) ───
         try:
-            variant_path = '/etc/hyve/variant'
+            variant_path = '/etc/hart/variant'
             if os.path.isfile(variant_path):
                 with open(variant_path, 'r') as f:
                     data['variant'] = f.read().strip() or 'standalone'
@@ -110,13 +110,13 @@ def get_system_info():
 
         # ─── Deployment mode ───
         try:
-            if os.environ.get('HYVE_CENTRAL_NODE'):
+            if os.environ.get('HART_CENTRAL_NODE'):
                 data['deployment_mode'] = 'central'
-            elif os.environ.get('HYVE_REGIONAL_NODE'):
+            elif os.environ.get('HART_REGIONAL_NODE'):
                 data['deployment_mode'] = 'regional'
-            elif os.environ.get('HYVE_HEADLESS'):
+            elif os.environ.get('HART_HEADLESS'):
                 data['deployment_mode'] = 'headless'
-            elif os.environ.get('HYVE_BUNDLED'):
+            elif os.environ.get('HART_BUNDLED'):
                 data['deployment_mode'] = 'bundled'
             else:
                 data['deployment_mode'] = 'standalone'
@@ -183,8 +183,8 @@ def get_system_info():
         # ─── Services (systemctl status) ───
         services = {}
         service_names = [
-            'hyve-backend', 'hyve-discovery', 'hyve-agent-daemon',
-            'hyve-vision', 'hyve-llm', 'hyve-first-boot',
+            'hart-backend', 'hart-discovery', 'hart-agent-daemon',
+            'hart-vision', 'hart-llm', 'hart-first-boot',
         ]
         for svc in service_names:
             try:
@@ -204,7 +204,7 @@ def get_system_info():
         except Exception:
             try:
                 # Fallback: time since epoch minus a known boot marker
-                boot_marker = '/var/lib/hyve/.first-boot-done'
+                boot_marker = '/var/lib/hart/.first-boot-done'
                 if os.path.isfile(boot_marker):
                     data['uptime_seconds'] = round(
                         time.time() - os.path.getmtime(boot_marker), 1)

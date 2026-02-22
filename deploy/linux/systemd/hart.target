@@ -1,0 +1,8 @@
+[Unit]
+Description=HART OS Services
+Documentation=https://github.com/hevolve-ai/hart
+After=network-online.target
+Wants=hart-backend.service hart-discovery.service hart-agent-daemon.service
+
+[Install]
+WantedBy=multi-user.target

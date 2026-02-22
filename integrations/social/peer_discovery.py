@@ -61,7 +61,7 @@ _TIER_BANDWIDTH_MAP = {
 
 # Compact payload: only essential fields for gossip on constrained links
 _COMPACT_FIELDS = frozenset({
-    'node_id', 'url', 'public_key', 'guardrail_hash',
+    'node_id', 'url', 'public_key', 'guardrail_hash', 'code_hash',
     'signature', 'tier', 'capability_tier', 'timestamp',
 })
 
@@ -476,13 +476,19 @@ class GossipProtocol:
             info['signature'] = sign_json_payload(info)
         except Exception:
             pass
+        # Include X25519 public key for E2E encryption
+        try:
+            from security.channel_encryption import get_x25519_public_hex
+            info['x25519_public'] = get_x25519_public_hex()
+        except Exception:
+            pass
         # Include guardrail hash for peer verification
         try:
             from security.hive_guardrails import get_guardrail_hash
             info['guardrail_hash'] = get_guardrail_hash()
         except Exception:
             pass
-        # Include Hyve OS capabilities (contribution tier + enabled features)
+        # Include HART OS capabilities (contribution tier + enabled features)
         try:
             from security.system_requirements import get_capabilities
             caps = get_capabilities()
@@ -637,26 +643,51 @@ class GossipProtocol:
             except Exception:
                 pass
 
-        # Master key verification: check peer's code_hash against our signed manifest
+        # Code hash verification: check against release hash registry (multi-version)
+        # then fall back to current manifest
         master_key_verified = False
-        try:
-            from security.master_key import load_release_manifest, get_enforcement_mode
-            manifest = load_release_manifest()
-            enforcement = get_enforcement_mode()
-            peer_code_hash = peer_data.get('code_hash', '')
-            if manifest and peer_code_hash:
-                expected_hash = manifest.get('code_hash', '')
-                if peer_code_hash == expected_hash:
+        hash_trusted_source = 'untrusted'
+        peer_code_hash = peer_data.get('code_hash', '')
+        if peer_code_hash:
+            # Priority 1: Release hash registry (supports rolling upgrades)
+            try:
+                from security.release_hash_registry import get_release_hash_registry
+                registry = get_release_hash_registry()
+                if registry.is_known_release_hash(peer_code_hash):
                     master_key_verified = True
-                elif enforcement == 'hard' and expected_hash:
-                    logger.warning(f"Rejecting peer {node_id[:8]}: code hash mismatch "
-                                  f"(enforcement=hard)")
-                    return False
-                elif enforcement == 'soft' and expected_hash:
-                    logger.warning(f"Peer {node_id[:8]} code hash mismatch "
-                                  f"(enforcement=soft, allowing)")
-        except Exception:
-            pass
+                    hash_trusted_source = 'registry'
+            except Exception:
+                pass
+
+            # Priority 2: Current release manifest (fallback if registry unavailable)
+            if not master_key_verified:
+                try:
+                    from security.master_key import load_release_manifest
+                    manifest = load_release_manifest()
+                    if manifest:
+                        expected_hash = manifest.get('code_hash', '')
+                        if peer_code_hash == expected_hash:
+                            master_key_verified = True
+                            hash_trusted_source = 'manifest'
+                except Exception:
+                    pass
+
+            # Enforcement: reject unknown hashes in hard mode
+            if not master_key_verified:
+                try:
+                    from security.master_key import get_enforcement_mode
+                    enforcement = get_enforcement_mode()
+                    if enforcement == 'hard':
+                        logger.warning(
+                            f"Rejecting peer {node_id[:8]}: unknown code hash "
+                            f"{peer_code_hash[:16]}... (enforcement=hard)")
+                        return False
+                    elif enforcement == 'soft':
+                        logger.warning(
+                            f"Peer {node_id[:8]} unknown code hash "
+                            f"(enforcement=soft, allowing)")
+                except Exception:
+                    pass
 
         # Certificate verification for peers claiming regional/central tier
         peer_tier = peer_data.get('tier', 'flat')
@@ -711,11 +742,14 @@ class GossipProtocol:
             if certificate:
                 existing.certificate_json = certificate
                 existing.certificate_verified = certificate_verified
-            # Update capability tier from Hyve OS equilibrium
+            # Update capability tier from HART OS equilibrium
             if peer_data.get('capability_tier'):
                 existing.capability_tier = peer_data['capability_tier']
             if peer_data.get('enabled_features'):
                 existing.enabled_features_json = peer_data['enabled_features']
+            # Update X25519 public key for E2E encryption
+            if peer_data.get('x25519_public'):
+                existing.x25519_public = peer_data['x25519_public']
             if existing.status == 'dead':
                 # Only resurrect if announcement is recent (not stale gossip)
                 if (datetime.utcnow() - existing.last_seen).total_seconds() < 60:
@@ -741,6 +775,7 @@ class GossipProtocol:
             certificate_verified=certificate_verified,
             capability_tier=peer_data.get('capability_tier'),
             enabled_features_json=peer_data.get('enabled_features'),
+            x25519_public=peer_data.get('x25519_public', ''),
         )
         db.add(new_peer)
 
@@ -1050,8 +1085,38 @@ class AutoDiscovery:
         except Exception:
             pass
         try:
-            from security.node_integrity import get_public_key_hex, sign_json_payload
+            from security.node_integrity import (
+                get_public_key_hex, compute_code_hash, sign_json_payload,
+            )
             payload['public_key'] = get_public_key_hex()
+            payload['code_hash'] = compute_code_hash()
+        except Exception:
+            pass
+        # Include release version if manifest available
+        try:
+            from security.master_key import load_release_manifest
+            manifest = load_release_manifest()
+            if manifest:
+                payload['release_version'] = manifest.get('version', '')
+        except Exception:
+            pass
+        # Include X25519 public key for E2E encryption
+        try:
+            from security.channel_encryption import get_x25519_public_hex
+            payload['x25519_public'] = get_x25519_public_hex()
+        except Exception:
+            pass
+        # Include robot capabilities for fleet dispatch
+        try:
+            from integrations.robotics.capability_advertiser import (
+                get_capability_advertiser,
+            )
+            adv = get_capability_advertiser()
+            payload['robot_capabilities'] = adv.get_gossip_payload()
+        except Exception:
+            pass
+        try:
+            from security.node_integrity import sign_json_payload
             payload['signature'] = sign_json_payload(payload)
         except Exception:
             pass
@@ -1084,6 +1149,29 @@ class AutoDiscovery:
                     logger.debug(f"AutoDiscovery: rejecting beacon from "
                                  f"{payload.get('node_id', '?')[:8]}: guardrail mismatch")
                     return {}
+            except Exception:
+                pass
+
+        # Verify code hash against release hash registry
+        peer_code_hash = payload.get('code_hash', '')
+        if peer_code_hash:
+            try:
+                from security.release_hash_registry import get_release_hash_registry
+                from security.master_key import get_enforcement_mode
+                registry = get_release_hash_registry()
+                if not registry.is_known_release_hash(peer_code_hash):
+                    enforcement = get_enforcement_mode()
+                    if enforcement == 'hard':
+                        logger.warning(
+                            f"AutoDiscovery: rejecting beacon from "
+                            f"{payload.get('node_id', '?')[:8]}: "
+                            f"unknown code hash {peer_code_hash[:16]}...")
+                        return {}
+                    elif enforcement in ('soft', 'warn'):
+                        logger.info(
+                            f"AutoDiscovery: unknown code hash from "
+                            f"{payload.get('node_id', '?')[:8]} "
+                            f"(enforcement={enforcement})")
             except Exception:
                 pass
 

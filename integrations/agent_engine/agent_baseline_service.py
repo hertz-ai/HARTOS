@@ -22,7 +22,16 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger('hevolve_social')
 
-BASELINE_DIR = os.path.join('agent_data', 'baselines')
+def _resolve_baseline_dir():
+    import sys as _sys
+    db_path = os.environ.get('HEVOLVE_DB_PATH', '')
+    if db_path and db_path != ':memory:' and os.path.isabs(db_path):
+        return os.path.join(os.path.dirname(db_path), 'agent_data', 'baselines')
+    if os.environ.get('NUNBA_BUNDLED') or getattr(_sys, 'frozen', False):
+        return os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data', 'baselines')
+    return os.path.join('agent_data', 'baselines')
+
+BASELINE_DIR = _resolve_baseline_dir()
 
 # Deduplication: skip recipe_change if creation was <60s ago for same agent
 _recent_snapshots: Dict[str, float] = {}   # key → timestamp

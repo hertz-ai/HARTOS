@@ -1,17 +1,17 @@
-# HyveOS PXE Boot Menu
-# Served by hyve-pxe-server.py via TFTP
+# HART OS PXE Boot Menu
+# Served by hart-pxe-server.py via TFTP
 
-DEFAULT hyve-os
+DEFAULT hart-os
 TIMEOUT 100
 PROMPT 1
 
-LABEL hyve-os
-    MENU LABEL ^HyveOS 1.0 (Automated Install)
+LABEL hart-os
+    MENU LABEL ^HART OS 1.0 (Automated Install)
     KERNEL vmlinuz
     APPEND initrd=initrd ip=dhcp autoinstall ds=nocloud-net;s=http://${pxe_server}:8888/autoinstall/ ---
 
-LABEL hyve-os-manual
-    MENU LABEL HyveOS 1.0 (^Manual Install)
+LABEL hart-os-manual
+    MENU LABEL HART OS 1.0 (^Manual Install)
     KERNEL vmlinuz
     APPEND initrd=initrd ip=dhcp ---
 

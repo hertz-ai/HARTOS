@@ -100,13 +100,25 @@ class SyncEngine:
                 'payload': item.payload_json,
             })
 
-        # Send batch
+        # Send batch — E2E encrypt if target has X25519 key
         sent = 0
         failed = 0
+        send_payload = {'items': batch, 'node_id': node_id}
+        try:
+            target_x25519 = SyncEngine._get_target_x25519(db, target_url)
+            if target_x25519:
+                try:
+                    from security.channel_encryption import encrypt_json_for_peer
+                    send_payload = {'encrypted': True,
+                                    'envelope': encrypt_json_for_peer(send_payload, target_x25519)}
+                except Exception:
+                    pass  # Encryption unavailable, send plaintext
+        except Exception:
+            pass
         try:
             resp = requests.post(
                 f"{target_url}/api/social/hierarchy/sync",
-                json={'items': batch, 'node_id': node_id},
+                json=send_payload,
                 timeout=30,
             )
             if resp.status_code == 200:
@@ -150,6 +162,21 @@ class SyncEngine:
         ).count()
 
         return {'sent': sent, 'failed': failed, 'remaining': remaining}
+
+    @staticmethod
+    def _get_target_x25519(db, target_url: str) -> str:
+        """Look up X25519 public key for a target node by URL."""
+        try:
+            from .models import PeerNode
+            peer = db.query(PeerNode).filter(
+                PeerNode.url == target_url.rstrip('/'),
+                PeerNode.status == 'active',
+            ).first()
+            if peer and getattr(peer, 'x25519_public', None):
+                return peer.x25519_public
+        except Exception:
+            pass
+        return ''
 
     @staticmethod
     def receive_sync_batch(db, items: list) -> Dict:

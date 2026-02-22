@@ -1,4 +1,4 @@
-# Production Dockerfile for LLM-langchain_Chatbot-Agent
+# Production Dockerfile for HARTOS
 # Optimized for cloud deployment with gunicorn
 
 # Build stage for dependencies
@@ -39,9 +39,9 @@ RUN pip install --upgrade pip wheel setuptools && \
 FROM python:3.11-slim as production
 
 # Labels for container metadata
-LABEL maintainer="LLM-langchain_Chatbot-Agent Team"
+LABEL maintainer="HARTOS Team"
 LABEL version="1.0.0"
-LABEL description="Production build of LLM-langchain_Chatbot-Agent"
+LABEL description="Production build of HARTOS"
 
 # Create non-root user for security
 RUN groupadd -r appgroup && useradd -r -g appgroup appuser

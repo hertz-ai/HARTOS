@@ -27,13 +27,13 @@ class TestIsPrivateRepo:
 
     def test_matches_env_list(self, monkeypatch):
         monkeypatch.setenv('HEVOLVE_PRIVATE_REPOS',
-                           'hevolve-ai/crawl4ai,hevolve-ai/secret-core')
+                           'hevolve-ai/hevolve-core,hevolve-ai/secret-core')
         result = PrivateRepoAccessService.is_private_repo(
-            'https://github.com/hevolve-ai/crawl4ai')
+            'https://github.com/hevolve-ai/hevolve-core')
         assert result is True
 
     def test_no_match(self, monkeypatch):
-        monkeypatch.setenv('HEVOLVE_PRIVATE_REPOS', 'hevolve-ai/crawl4ai')
+        monkeypatch.setenv('HEVOLVE_PRIVATE_REPOS', 'hevolve-ai/hevolve-core')
         result = PrivateRepoAccessService.is_private_repo(
             'https://github.com/hevolve-ai/public-repo')
         assert result is False
@@ -45,9 +45,9 @@ class TestIsPrivateRepo:
         assert result is False
 
     def test_handles_git_suffix(self, monkeypatch):
-        monkeypatch.setenv('HEVOLVE_PRIVATE_REPOS', 'hevolve-ai/crawl4ai')
+        monkeypatch.setenv('HEVOLVE_PRIVATE_REPOS', 'hevolve-ai/hevolve-core')
         result = PrivateRepoAccessService.is_private_repo(
-            'https://github.com/hevolve-ai/crawl4ai.git')
+            'https://github.com/hevolve-ai/hevolve-core.git')
         assert result is True
 
 
@@ -55,51 +55,51 @@ class TestVerifyAccess:
     """Test certificate-based access control."""
 
     def test_non_private_repo_always_allowed(self, monkeypatch):
-        monkeypatch.setenv('HEVOLVE_PRIVATE_REPOS', 'hevolve-ai/crawl4ai')
+        monkeypatch.setenv('HEVOLVE_PRIVATE_REPOS', 'hevolve-ai/hevolve-core')
         result = PrivateRepoAccessService.verify_access(
             None, 'https://github.com/hevolve-ai/public')
         assert result['allowed'] is True
 
     def test_no_certificate_denied(self, monkeypatch):
-        monkeypatch.setenv('HEVOLVE_PRIVATE_REPOS', 'hevolve-ai/crawl4ai')
+        monkeypatch.setenv('HEVOLVE_PRIVATE_REPOS', 'hevolve-ai/hevolve-core')
         result = PrivateRepoAccessService.verify_access(
-            None, 'https://github.com/hevolve-ai/crawl4ai')
+            None, 'https://github.com/hevolve-ai/hevolve-core')
         assert result['allowed'] is False
 
     def test_central_full_access(self, monkeypatch):
-        monkeypatch.setenv('HEVOLVE_PRIVATE_REPOS', 'hevolve-ai/crawl4ai')
+        monkeypatch.setenv('HEVOLVE_PRIVATE_REPOS', 'hevolve-ai/hevolve-core')
         cert = {'tier': 'central', 'node_id': 'central_1'}
         result = PrivateRepoAccessService.verify_access(
-            cert, 'https://github.com/hevolve-ai/crawl4ai')
+            cert, 'https://github.com/hevolve-ai/hevolve-core')
         assert result['allowed'] is True
         assert result['access_level'] == 'full'
 
     @patch('security.key_delegation.verify_certificate_chain')
     def test_regional_push_access(self, mock_verify, monkeypatch):
-        monkeypatch.setenv('HEVOLVE_PRIVATE_REPOS', 'hevolve-ai/crawl4ai')
+        monkeypatch.setenv('HEVOLVE_PRIVATE_REPOS', 'hevolve-ai/hevolve-core')
         mock_verify.return_value = True
         cert = {'tier': 'regional', 'node_id': 'regional_1'}
 
         result = PrivateRepoAccessService.verify_access(
-            cert, 'https://github.com/hevolve-ai/crawl4ai', 'push')
+            cert, 'https://github.com/hevolve-ai/hevolve-core', 'push')
         assert result['allowed'] is True
         assert result['access_level'] == 'push'
 
     @patch('security.key_delegation.verify_certificate_chain')
     def test_regional_invalid_cert_denied(self, mock_verify, monkeypatch):
-        monkeypatch.setenv('HEVOLVE_PRIVATE_REPOS', 'hevolve-ai/crawl4ai')
+        monkeypatch.setenv('HEVOLVE_PRIVATE_REPOS', 'hevolve-ai/hevolve-core')
         mock_verify.return_value = False
         cert = {'tier': 'regional', 'node_id': 'bad_node'}
 
         result = PrivateRepoAccessService.verify_access(
-            cert, 'https://github.com/hevolve-ai/crawl4ai')
+            cert, 'https://github.com/hevolve-ai/hevolve-core')
         assert result['allowed'] is False
 
     def test_local_denied(self, monkeypatch):
-        monkeypatch.setenv('HEVOLVE_PRIVATE_REPOS', 'hevolve-ai/crawl4ai')
+        monkeypatch.setenv('HEVOLVE_PRIVATE_REPOS', 'hevolve-ai/hevolve-core')
         cert = {'tier': 'local', 'node_id': 'local_1'}
         result = PrivateRepoAccessService.verify_access(
-            cert, 'https://github.com/hevolve-ai/crawl4ai')
+            cert, 'https://github.com/hevolve-ai/hevolve-core')
         assert result['allowed'] is False
 
 
@@ -110,7 +110,7 @@ class TestSendGitHubInvite:
     def test_invite_via_gh_cli(self, mock_run):
         mock_run.return_value = MagicMock(returncode=0, stdout='')
         result = PrivateRepoAccessService.send_github_invite(
-            'hevolve-ai/crawl4ai', 'testuser', 'push')
+            'hevolve-ai/hevolve-core', 'testuser', 'push')
 
         assert result['invited'] is True
         assert result['method'] == 'gh_cli'
@@ -125,14 +125,14 @@ class TestSendGitHubInvite:
         mock_put.return_value = mock_resp
 
         result = PrivateRepoAccessService.send_github_invite(
-            'https://github.com/hevolve-ai/crawl4ai', 'testuser', 'push')
+            'https://github.com/hevolve-ai/hevolve-core', 'testuser', 'push')
 
         assert result['invited'] is True
         assert result['method'] == 'http_api'
 
     def test_invite_no_username(self):
         result = PrivateRepoAccessService.send_github_invite(
-            'hevolve-ai/crawl4ai', '', 'push')
+            'hevolve-ai/hevolve-core', '', 'push')
         assert result['invited'] is False
 
 
@@ -143,12 +143,12 @@ class TestRevokeGitHubAccess:
     def test_revoke_via_gh_cli(self, mock_run):
         mock_run.return_value = MagicMock(returncode=0)
         result = PrivateRepoAccessService.revoke_github_access(
-            'hevolve-ai/crawl4ai', 'testuser')
+            'hevolve-ai/hevolve-core', 'testuser')
         assert result['revoked'] is True
 
     def test_revoke_no_username(self):
         result = PrivateRepoAccessService.revoke_github_access(
-            'hevolve-ai/crawl4ai', '')
+            'hevolve-ai/hevolve-core', '')
         assert result['revoked'] is False
 
 
@@ -158,7 +158,7 @@ class TestSplitRepoTask:
     def test_splits_by_file(self):
         subtasks = PrivateRepoAccessService.split_repo_task(
             'Fix bug in auth',
-            'hevolve-ai/crawl4ai',
+            'hevolve-ai/hevolve-core',
             target_files=['auth.py', 'tests/test_auth.py'],
         )
         assert len(subtasks) == 2
@@ -167,7 +167,7 @@ class TestSplitRepoTask:
 
     def test_single_subtask_when_no_files(self):
         subtasks = PrivateRepoAccessService.split_repo_task(
-            'Refactor module', 'hevolve-ai/crawl4ai')
+            'Refactor module', 'hevolve-ai/hevolve-core')
         assert len(subtasks) == 1
 
 
@@ -176,17 +176,17 @@ class TestExtractOwnerRepo:
 
     def test_full_url(self):
         assert _extract_owner_repo(
-            'https://github.com/hevolve-ai/crawl4ai') == (
-                'hevolve-ai', 'crawl4ai')
+            'https://github.com/hevolve-ai/hevolve-core') == (
+                'hevolve-ai', 'hevolve-core')
 
     def test_url_with_git_suffix(self):
         assert _extract_owner_repo(
-            'https://github.com/hevolve-ai/crawl4ai.git') == (
-                'hevolve-ai', 'crawl4ai')
+            'https://github.com/hevolve-ai/hevolve-core.git') == (
+                'hevolve-ai', 'hevolve-core')
 
     def test_owner_repo_format(self):
-        assert _extract_owner_repo('hevolve-ai/crawl4ai') == (
-            'hevolve-ai', 'crawl4ai')
+        assert _extract_owner_repo('hevolve-ai/hevolve-core') == (
+            'hevolve-ai', 'hevolve-core')
 
     def test_empty_returns_none(self):
         assert _extract_owner_repo('') is None

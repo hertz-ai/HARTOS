@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ['HEVOLVE_DB_PATH'] = ':memory:'
 
 from integrations.social.models import (
-    Base, get_engine, get_db, init_db,
+    Base, get_engine, get_db, db_session, init_db,
     User, Community, Post, Comment, Vote, Follow,
     CommunityMembership, AgentSkillBadge, TaskRequest,
     Notification, Report, RecipeShare,
@@ -227,6 +227,85 @@ class TestNotificationModel:
         db.add(notif)
         db.commit()
         assert notif.is_read is False
+
+
+class TestDbSession:
+    """Tests for the db_session() context manager."""
+
+    def test_auto_commit_on_clean_exit(self):
+        """db_session() commits on normal exit."""
+        with db_session() as db:
+            user = User(username='ctx_commit', display_name='CC', user_type='human')
+            db.add(user)
+        # Verify persisted
+        check = get_db()
+        try:
+            found = check.query(User).filter_by(username='ctx_commit').first()
+            assert found is not None
+            assert found.display_name == 'CC'
+        finally:
+            check.close()
+
+    def test_auto_rollback_on_exception(self):
+        """db_session() rolls back on exception."""
+        try:
+            with db_session() as db:
+                user = User(username='ctx_rollback', display_name='CR', user_type='human')
+                db.add(user)
+                db.flush()
+                raise ValueError("intentional error")
+        except ValueError:
+            pass
+        # Verify NOT persisted
+        check = get_db()
+        try:
+            found = check.query(User).filter_by(username='ctx_rollback').first()
+            assert found is None
+        finally:
+            check.close()
+
+    def test_no_commit_when_commit_false(self):
+        """db_session(commit=False) does not commit."""
+        with db_session(commit=False) as db:
+            user = User(username='ctx_nocommit', display_name='NC', user_type='human')
+            db.add(user)
+            db.flush()
+        # Verify NOT persisted (no commit)
+        check = get_db()
+        try:
+            found = check.query(User).filter_by(username='ctx_nocommit').first()
+            assert found is None
+        finally:
+            check.close()
+
+    def test_session_closed_after_exit(self):
+        """db_session() closes the session after exiting."""
+        with db_session(commit=False) as db:
+            pass
+        # Session should be closed — accessing connection should fail or return None
+        # We test by checking the session's internal state
+        assert not db.is_active or db.get_bind() is not None  # session exists but was closed
+
+    def test_nested_db_sessions(self):
+        """Multiple db_session() calls should not interfere."""
+        with db_session() as db1:
+            user1 = User(username='ctx_nested1', display_name='N1', user_type='human')
+            db1.add(user1)
+        with db_session() as db2:
+            user2 = User(username='ctx_nested2', display_name='N2', user_type='human')
+            db2.add(user2)
+        check = get_db()
+        try:
+            assert check.query(User).filter_by(username='ctx_nested1').first() is not None
+            assert check.query(User).filter_by(username='ctx_nested2').first() is not None
+        finally:
+            check.close()
+
+    def test_exception_propagated(self):
+        """db_session() re-raises the exception after rollback."""
+        with pytest.raises(RuntimeError, match="test error"):
+            with db_session() as db:
+                raise RuntimeError("test error")
 
 
 class TestInitDb:

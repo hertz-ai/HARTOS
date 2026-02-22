@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-HyveOS Remote Unattended Installer
+HART OS Remote Unattended Installer
 
-Installs HyveOS on a remote machine over SSH (Linux) or SSH/WinRM (Windows).
+Installs HART OS on a remote machine over SSH (Linux) or SSH/WinRM (Windows).
 Supports both Windows and Linux targets. Fully unattended — no manual steps.
 
 Usage:
@@ -13,7 +13,7 @@ Usage:
     python deploy/remote/install_remote.py --host 192.168.1.60 --user admin --os windows --password "pass"
 
     # Install with SSH key:
-    python deploy/remote/install_remote.py --host 192.168.1.50 --user hyve --key ~/.ssh/id_ed25519
+    python deploy/remote/install_remote.py --host 192.168.1.50 --user hart --key ~/.ssh/id_ed25519
 
     # Join an existing hive after install:
     python deploy/remote/install_remote.py --host 192.168.1.50 --user root --os linux --join-peer http://central:6777
@@ -34,7 +34,7 @@ import tempfile
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-logger = logging.getLogger('hyve_remote_install')
+logger = logging.getLogger('hart_remote_install')
 
 # ═══════════════════════════════════════════════════════════════════════
 # SSH Connection
@@ -163,7 +163,7 @@ class SSHConnection:
 # ═══════════════════════════════════════════════════════════════════════
 
 class LinuxInstaller:
-    """Installs HyveOS on a remote Linux machine."""
+    """Installs HART OS on a remote Linux machine."""
 
     def __init__(self, ssh: SSHConnection, join_peer: str = None,
                  no_vision: bool = False, no_llm: bool = False):
@@ -254,12 +254,12 @@ class LinuxInstaller:
             code, _, _ = self.ssh.exec('python3.10 --version')
             result['steps'].append(('install_python310', code == 0))
 
-        # 3. Create hyve user and directories
-        logger.info("Creating hyve user and directories...")
+        # 3. Create hart user and directories
+        logger.info("Creating hart user and directories...")
         user_cmds = [
-            'id hyve 2>/dev/null || useradd -r -m -d /opt/hyve -s /bin/bash hyve',
-            'mkdir -p /opt/hyve /etc/hyve /var/lib/hyve /var/log/hyve',
-            'chown -R hyve:hyve /opt/hyve /var/lib/hyve /var/log/hyve',
+            'id hart 2>/dev/null || useradd -r -m -d /opt/hart -s /bin/bash hart',
+            'mkdir -p /opt/hart /etc/hart /var/lib/hart /var/log/hart',
+            'chown -R hart:hart /opt/hart /var/lib/hart /var/log/hart',
         ]
         for cmd in user_cmds:
             sudo_cmd = cmd if checks['is_root'] else f'sudo {cmd}'
@@ -267,7 +267,7 @@ class LinuxInstaller:
         result['steps'].append(('create_user_dirs', True))
 
         # 4. Upload code bundle
-        logger.info("Uploading HyveOS code...")
+        logger.info("Uploading HART OS code...")
         repo_root = Path(__file__).resolve().parent.parent.parent
         bundle_uploaded = self._upload_code_bundle(repo_root)
         result['steps'].append(('upload_code', bundle_uploaded))
@@ -277,9 +277,9 @@ class LinuxInstaller:
         # 5. Create venv and install dependencies
         logger.info("Creating venv and installing dependencies...")
         venv_cmds = [
-            'python3.10 -m venv /opt/hyve/venv',
-            '/opt/hyve/venv/bin/pip install --upgrade pip -q',
-            '/opt/hyve/venv/bin/pip install -r /opt/hyve/requirements.txt -q',
+            'python3.10 -m venv /opt/hart/venv',
+            '/opt/hart/venv/bin/pip install --upgrade pip -q',
+            '/opt/hart/venv/bin/pip install -r /opt/hart/requirements.txt -q',
         ]
         for cmd in venv_cmds:
             code, out, err = self.ssh.exec(cmd, timeout=600)
@@ -290,14 +290,14 @@ class LinuxInstaller:
         # 6. Generate Ed25519 keypair
         logger.info("Generating node identity...")
         keygen_cmd = (
-            '/opt/hyve/venv/bin/python -c "'
+            '/opt/hart/venv/bin/python -c "'
             'from security.node_integrity import get_node_identity; '
             'info = get_node_identity(); '
             'print(info.get(\\\"public_key\\\", \\\"unknown\\\")[:16])'
             '" 2>/dev/null || echo "keygen_later"'
         )
         code, node_id_preview, _ = self.ssh.exec(
-            f'cd /opt/hyve && {keygen_cmd}')
+            f'cd /opt/hart && {keygen_cmd}')
         result['node_id_preview'] = node_id_preview.strip()
         result['steps'].append(('generate_keypair', True))
 
@@ -314,8 +314,8 @@ class LinuxInstaller:
         # 9. Configure firewall
         logger.info("Configuring firewall...")
         fw_cmds = [
-            'ufw allow 6777/tcp comment "HyveOS backend" 2>/dev/null || true',
-            'ufw allow 6780/udp comment "HyveOS discovery" 2>/dev/null || true',
+            'ufw allow 6777/tcp comment "HART OS backend" 2>/dev/null || true',
+            'ufw allow 6780/udp comment "HART OS discovery" 2>/dev/null || true',
         ]
         for cmd in fw_cmds:
             sudo_cmd = cmd if checks['is_root'] else f'sudo {cmd}'
@@ -323,11 +323,11 @@ class LinuxInstaller:
         result['steps'].append(('firewall', True))
 
         # 10. Enable and start services
-        logger.info("Starting HyveOS services...")
+        logger.info("Starting HART OS services...")
         start_cmds = [
             'systemctl daemon-reload',
-            'systemctl enable hyve.target',
-            'systemctl start hyve.target',
+            'systemctl enable hart.target',
+            'systemctl start hart.target',
         ]
         for cmd in start_cmds:
             sudo_cmd = cmd if checks['is_root'] else f'sudo {cmd}'
@@ -338,7 +338,7 @@ class LinuxInstaller:
         if self.join_peer:
             logger.info(f"Joining hive peer: {self.join_peer}")
             join_cmd = (
-                f'/opt/hyve/venv/bin/python -c "'
+                f'/opt/hart/venv/bin/python -c "'
                 f'import requests; '
                 f'requests.post(\\\"{self.join_peer}/api/social/peers/announce\\\", '
                 f'json={{\\\"url\\\": \\\"http://{self.ssh.host}:6777\\\"}}, timeout=10)'
@@ -350,7 +350,7 @@ class LinuxInstaller:
         # 12. Verify
         logger.info("Verifying installation...")
         time.sleep(3)
-        code, out, _ = self.ssh.exec('systemctl is-active hyve-backend.service 2>/dev/null')
+        code, out, _ = self.ssh.exec('systemctl is-active hart-backend.service 2>/dev/null')
         backend_active = out.strip() == 'active'
         result['steps'].append(('verify', backend_active))
         result['success'] = backend_active
@@ -366,7 +366,7 @@ class LinuxInstaller:
 
         # Create a temp tarball
         import tarfile
-        bundle_path = os.path.join(tempfile.gettempdir(), 'hyve-bundle.tar.gz')
+        bundle_path = os.path.join(tempfile.gettempdir(), 'hart-bundle.tar.gz')
         try:
             with tarfile.open(bundle_path, 'w:gz') as tar:
                 for item in repo_root.rglob('*'):
@@ -380,15 +380,15 @@ class LinuxInstaller:
                         tar.add(str(item), arcname=str(rel))
 
             # Upload and extract
-            self.ssh.upload(bundle_path, '/tmp/hyve-bundle.tar.gz')
+            self.ssh.upload(bundle_path, '/tmp/hart-bundle.tar.gz')
             code, _, err = self.ssh.exec(
-                'rm -rf /opt/hyve/app && mkdir -p /opt/hyve/app && '
-                'tar xzf /tmp/hyve-bundle.tar.gz -C /opt/hyve/app && '
-                'chown -R hyve:hyve /opt/hyve/app && '
-                'rm /tmp/hyve-bundle.tar.gz',
+                'rm -rf /opt/hart/app && mkdir -p /opt/hart/app && '
+                'tar xzf /tmp/hart-bundle.tar.gz -C /opt/hart/app && '
+                'chown -R hart:hart /opt/hart/app && '
+                'rm /tmp/hart-bundle.tar.gz',
                 timeout=120)
-            # Copy requirements.txt to /opt/hyve for venv install
-            self.ssh.exec('cp /opt/hyve/app/requirements.txt /opt/hyve/requirements.txt 2>/dev/null || true')
+            # Copy requirements.txt to /opt/hart for venv install
+            self.ssh.exec('cp /opt/hart/app/requirements.txt /opt/hart/requirements.txt 2>/dev/null || true')
             return code == 0
         except Exception as e:
             logger.error(f"Bundle upload failed: {e}")
@@ -406,7 +406,7 @@ class LinuxInstaller:
             logger.warning(f"Systemd units not found at {units_dir}")
             return
 
-        for unit_file in units_dir.glob('hyve*'):
+        for unit_file in units_dir.glob('hart*'):
             remote_path = f'/etc/systemd/system/{unit_file.name}'
             self.ssh.upload(str(unit_file), f'/tmp/{unit_file.name}')
             cmd = f'mv /tmp/{unit_file.name} {remote_path} && chmod 644 {remote_path}'
@@ -414,12 +414,12 @@ class LinuxInstaller:
             self.ssh.exec(sudo_cmd)
 
     def _configure_environment(self, is_root: bool):
-        """Create /etc/hyve/hyve.env from template."""
-        env_content = f"""# HyveOS Environment Configuration
+        """Create /etc/hart/hart.env from template."""
+        env_content = f"""# HART OS Environment Configuration
 # Auto-generated by remote installer
-HEVOLVE_DB_PATH=/var/lib/hyve/hyve.db
+HEVOLVE_DB_PATH=/var/lib/hart/hart.db
 HEVOLVE_BASE_URL=http://{self.ssh.host}:6777
-HEVOLVE_NODE_NAME=hyve-{self.ssh.host.replace('.', '-')}
+HEVOLVE_NODE_NAME=hart-{self.ssh.host.replace('.', '-')}
 HEVOLVE_AGENT_ENGINE_ENABLED=true
 HEVOLVE_AGENT_POLL_INTERVAL=30
 HEVOLVE_WORKER_POLL_INTERVAL=15
@@ -433,11 +433,11 @@ PYTHONDONTWRITEBYTECODE=1
 # GROQ_API_KEY=
 """
         # Write locally, upload
-        env_path = os.path.join(tempfile.gettempdir(), 'hyve.env')
+        env_path = os.path.join(tempfile.gettempdir(), 'hart.env')
         with open(env_path, 'w') as f:
             f.write(env_content)
-        self.ssh.upload(env_path, '/tmp/hyve.env')
-        cmd = 'mv /tmp/hyve.env /etc/hyve/hyve.env && chmod 640 /etc/hyve/hyve.env'
+        self.ssh.upload(env_path, '/tmp/hart.env')
+        cmd = 'mv /tmp/hart.env /etc/hart/hart.env && chmod 640 /etc/hart/hart.env'
         sudo_cmd = cmd if is_root else f'sudo {cmd}'
         self.ssh.exec(sudo_cmd)
         os.unlink(env_path)
@@ -448,7 +448,7 @@ PYTHONDONTWRITEBYTECODE=1
 # ═══════════════════════════════════════════════════════════════════════
 
 class WindowsInstaller:
-    """Installs HyveOS on a remote Windows machine via SSH.
+    """Installs HART OS on a remote Windows machine via SSH.
 
     Windows requires OpenSSH server enabled (Settings → Apps → Optional Features).
     Uses NSSM for service management (no systemd).
@@ -522,20 +522,20 @@ class WindowsInstaller:
             return result
 
         # 2. Create directories
-        logger.info("Creating HyveOS directories...")
+        logger.info("Creating HART OS directories...")
         dir_cmds = [
-            'mkdir C:\\hyve 2>nul || echo exists',
-            'mkdir C:\\hyve\\app 2>nul || echo exists',
-            'mkdir C:\\hyve\\data 2>nul || echo exists',
-            'mkdir C:\\hyve\\logs 2>nul || echo exists',
-            'mkdir C:\\hyve\\venv 2>nul || echo exists',
+            'mkdir C:\\hart 2>nul || echo exists',
+            'mkdir C:\\hart\\app 2>nul || echo exists',
+            'mkdir C:\\hart\\data 2>nul || echo exists',
+            'mkdir C:\\hart\\logs 2>nul || echo exists',
+            'mkdir C:\\hart\\venv 2>nul || echo exists',
         ]
         for cmd in dir_cmds:
             self.ssh.exec(cmd)
         result['steps'].append(('create_dirs', True))
 
         # 3. Upload code
-        logger.info("Uploading HyveOS code...")
+        logger.info("Uploading HART OS code...")
         uploaded = self._upload_code_bundle()
         result['steps'].append(('upload_code', uploaded))
         if not uploaded:
@@ -545,9 +545,9 @@ class WindowsInstaller:
         logger.info("Creating Python venv and installing dependencies...")
         python_cmd = 'py -3.10' if checks.get('py310') else 'python'
         venv_cmds = [
-            f'{python_cmd} -m venv C:\\hyve\\venv',
-            'C:\\hyve\\venv\\Scripts\\pip install --upgrade pip -q',
-            'C:\\hyve\\venv\\Scripts\\pip install -r C:\\hyve\\app\\requirements.txt -q',
+            f'{python_cmd} -m venv C:\\hart\\venv',
+            'C:\\hart\\venv\\Scripts\\pip install --upgrade pip -q',
+            'C:\\hart\\venv\\Scripts\\pip install -r C:\\hart\\app\\requirements.txt -q',
         ]
         for cmd in venv_cmds:
             code, out, err = self.ssh.exec(cmd, timeout=600)
@@ -558,19 +558,19 @@ class WindowsInstaller:
         # 5. Create environment file
         logger.info("Creating environment configuration...")
         env_content = (
-            f'set HEVOLVE_DB_PATH=C:\\hyve\\data\\hyve.db\n'
+            f'set HEVOLVE_DB_PATH=C:\\hart\\data\\hart.db\n'
             f'set HEVOLVE_BASE_URL=http://{self.ssh.host}:6777\n'
-            f'set HEVOLVE_NODE_NAME=hyve-{self.ssh.host.replace(".", "-")}\n'
+            f'set HEVOLVE_NODE_NAME=hart-{self.ssh.host.replace(".", "-")}\n'
             f'set HEVOLVE_AGENT_ENGINE_ENABLED=true\n'
             f'set PYTHONDONTWRITEBYTECODE=1\n'
             f'REM Redis host — when set, this node auto-joins the distributed hive\n'
             f'REM set REDIS_HOST=\n'
             f'REM set REDIS_PORT=6379\n'
         )
-        env_path = os.path.join(tempfile.gettempdir(), 'hyve_env.bat')
+        env_path = os.path.join(tempfile.gettempdir(), 'hart_env.bat')
         with open(env_path, 'w') as f:
             f.write(env_content)
-        self.ssh.upload(env_path, 'C:\\hyve\\hyve_env.bat')
+        self.ssh.upload(env_path, 'C:\\hart\\hart_env.bat')
         os.unlink(env_path)
         result['steps'].append(('configure_env', True))
 
@@ -578,14 +578,14 @@ class WindowsInstaller:
         logger.info("Creating startup script...")
         startup = (
             '@echo off\n'
-            'call C:\\hyve\\hyve_env.bat\n'
-            'cd /d C:\\hyve\\app\n'
-            'C:\\hyve\\venv\\Scripts\\python langchain_gpt_api.py\n'
+            'call C:\\hart\\hart_env.bat\n'
+            'cd /d C:\\hart\\app\n'
+            'C:\\hart\\venv\\Scripts\\python langchain_gpt_api.py\n'
         )
-        startup_path = os.path.join(tempfile.gettempdir(), 'hyve_start.bat')
+        startup_path = os.path.join(tempfile.gettempdir(), 'hart_start.bat')
         with open(startup_path, 'w') as f:
             f.write(startup)
-        self.ssh.upload(startup_path, 'C:\\hyve\\hyve_start.bat')
+        self.ssh.upload(startup_path, 'C:\\hart\\hart_start.bat')
         os.unlink(startup_path)
         result['steps'].append(('create_startup', True))
 
@@ -597,23 +597,23 @@ class WindowsInstaller:
         # 8. Configure Windows Firewall
         logger.info("Configuring Windows Firewall...")
         fw_cmds = [
-            'netsh advfirewall firewall add rule name="HyveOS Backend" dir=in action=allow protocol=tcp localport=6777 2>nul',
-            'netsh advfirewall firewall add rule name="HyveOS Discovery" dir=in action=allow protocol=udp localport=6780 2>nul',
+            'netsh advfirewall firewall add rule name="HART OS Backend" dir=in action=allow protocol=tcp localport=6777 2>nul',
+            'netsh advfirewall firewall add rule name="HART OS Discovery" dir=in action=allow protocol=udp localport=6780 2>nul',
         ]
         for cmd in fw_cmds:
             self.ssh.exec(cmd)
         result['steps'].append(('firewall', True))
 
         # 9. Start service
-        logger.info("Starting HyveOS service...")
-        code, _, _ = self.ssh.exec('net start HyveOS 2>nul || sc start HyveOS')
+        logger.info("Starting HART OS service...")
+        code, _, _ = self.ssh.exec('net start HartOS 2>nul || sc start HartOS')
         result['steps'].append(('start_service', code == 0))
 
         # 10. Join peer
         if self.join_peer:
             logger.info(f"Joining hive: {self.join_peer}")
             join_cmd = (
-                f'C:\\hyve\\venv\\Scripts\\python -c "'
+                f'C:\\hart\\venv\\Scripts\\python -c "'
                 f'import requests; '
                 f'requests.post(\'{self.join_peer}/api/social/peers/announce\', '
                 f'json={{\'url\': \'http://{self.ssh.host}:6777\'}}, timeout=10)'
@@ -624,7 +624,7 @@ class WindowsInstaller:
 
         # 11. Verify
         time.sleep(5)
-        code, out, _ = self.ssh.exec('sc query HyveOS', timeout=10)
+        code, out, _ = self.ssh.exec('sc query HartOS', timeout=10)
         running = 'RUNNING' in out
         result['steps'].append(('verify', running))
         result['success'] = running
@@ -640,7 +640,7 @@ class WindowsInstaller:
                         'node_modules', '.github'}
         exclude_exts = {'.db', '.pyc', '.pyo', '.whl', '.tar.gz'}
 
-        bundle_path = os.path.join(tempfile.gettempdir(), 'hyve-bundle.tar.gz')
+        bundle_path = os.path.join(tempfile.gettempdir(), 'hart-bundle.tar.gz')
         try:
             with tarfile.open(bundle_path, 'w:gz') as tar:
                 for item in repo_root.rglob('*'):
@@ -653,13 +653,13 @@ class WindowsInstaller:
                             continue
                         tar.add(str(item), arcname=str(rel))
 
-            self.ssh.upload(bundle_path, 'C:\\hyve\\hyve-bundle.tar.gz')
+            self.ssh.upload(bundle_path, 'C:\\hart\\hart-bundle.tar.gz')
             # Extract using Python (tar not always available on Windows)
             code, _, err = self.ssh.exec(
-                'C:\\hyve\\venv\\Scripts\\python -c "'
+                'C:\\hart\\venv\\Scripts\\python -c "'
                 'import tarfile; '
-                "t = tarfile.open('C:\\\\hyve\\\\hyve-bundle.tar.gz', 'r:gz'); "
-                "t.extractall('C:\\\\hyve\\\\app'); "
+                "t = tarfile.open('C:\\\\hart\\\\hart-bundle.tar.gz', 'r:gz'); "
+                "t.extractall('C:\\\\hart\\\\app'); "
                 't.close()"',
                 timeout=120)
             if code != 0:
@@ -667,11 +667,11 @@ class WindowsInstaller:
                 self.ssh.exec(
                     'python -c "'
                     'import tarfile; '
-                    "t = tarfile.open(r'C:\\hyve\\hyve-bundle.tar.gz', 'r:gz'); "
-                    "t.extractall(r'C:\\hyve\\app'); "
+                    "t = tarfile.open(r'C:\\hart\\hart-bundle.tar.gz', 'r:gz'); "
+                    "t.extractall(r'C:\\hart\\app'); "
                     't.close()"',
                     timeout=120)
-            self.ssh.exec('del C:\\hyve\\hyve-bundle.tar.gz 2>nul')
+            self.ssh.exec('del C:\\hart\\hart-bundle.tar.gz 2>nul')
             return True
         except Exception as e:
             logger.error(f"Windows bundle upload failed: {e}")
@@ -683,13 +683,13 @@ class WindowsInstaller:
                 pass
 
     def _install_windows_service(self) -> bool:
-        """Install HyveOS as a Windows service using sc.exe."""
+        """Install HART OS as a Windows service using sc.exe."""
         # Use sc.exe (built-in) to create a service that runs the batch file
         cmd = (
-            'sc create HyveOS '
-            'binPath= "cmd.exe /c C:\\hyve\\hyve_start.bat" '
+            'sc create HartOS '
+            'binPath= "cmd.exe /c C:\\hart\\hart_start.bat" '
             'start= auto '
-            'DisplayName= "HyveOS Agentic Intelligence"'
+            'DisplayName= "HART OS Agentic Intelligence"'
         )
         code, out, err = self.ssh.exec(cmd)
         if code != 0 and 'exists' not in err.lower():
@@ -707,13 +707,13 @@ class WindowsInstaller:
             return False
 
         cmds = [
-            'nssm install HyveOS C:\\hyve\\venv\\Scripts\\python.exe',
-            'nssm set HyveOS AppDirectory C:\\hyve\\app',
-            'nssm set HyveOS AppParameters langchain_gpt_api.py',
-            'nssm set HyveOS AppEnvironmentExtra HEVOLVE_DISTRIBUTED_MODE=true HEVOLVE_AGENT_ENGINE_ENABLED=true HEVOLVE_DB_PATH=C:\\hyve\\data\\hyve.db PYTHONDONTWRITEBYTECODE=1',
-            'nssm set HyveOS Start SERVICE_AUTO_START',
-            'nssm set HyveOS AppStdout C:\\hyve\\logs\\hyve_stdout.log',
-            'nssm set HyveOS AppStderr C:\\hyve\\logs\\hyve_stderr.log',
+            'nssm install HartOS C:\\hart\\venv\\Scripts\\python.exe',
+            'nssm set HartOS AppDirectory C:\\hart\\app',
+            'nssm set HartOS AppParameters langchain_gpt_api.py',
+            'nssm set HartOS AppEnvironmentExtra HEVOLVE_DISTRIBUTED_MODE=true HEVOLVE_AGENT_ENGINE_ENABLED=true HEVOLVE_DB_PATH=C:\\hart\\data\\hart.db PYTHONDONTWRITEBYTECODE=1',
+            'nssm set HartOS Start SERVICE_AUTO_START',
+            'nssm set HartOS AppStdout C:\\hart\\logs\\hart_stdout.log',
+            'nssm set HartOS AppStderr C:\\hart\\logs\\hart_stderr.log',
         ]
         for cmd in cmds:
             self.ssh.exec(cmd)
@@ -726,7 +726,7 @@ class WindowsInstaller:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='HyveOS Remote Unattended Installer',
+        description='HART OS Remote Unattended Installer',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -768,7 +768,7 @@ Examples:
     logging.basicConfig(level=level, format='%(asctime)s [%(levelname)s] %(message)s')
 
     print(f"\n{'='*60}")
-    print(f"  HyveOS Remote Unattended Installer")
+    print(f"  HART OS Remote Unattended Installer")
     print(f"  Target: {args.user}@{args.host}:{args.port}")
     print(f"  OS: {args.os}")
     print(f"  Mode: {'DRY RUN' if args.dry_run else 'INSTALL'}")
@@ -827,7 +827,7 @@ Examples:
             print(f"\n  Node ID: {result['node_id_preview']}...")
 
         if result.get('success'):
-            print(f"\n  HyveOS installed successfully on {args.host}!")
+            print(f"\n  HART OS installed successfully on {args.host}!")
             print(f"  Dashboard: http://{args.host}:6777")
             if args.join_peer:
                 print(f"  Joined hive: {args.join_peer}")

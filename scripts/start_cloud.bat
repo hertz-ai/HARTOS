@@ -5,7 +5,7 @@ REM ============================================================
 REM Non-compute-heavy central server mode.
 REM Intelligence comes from GPT, Claude, and other cloud LLMs.
 REM No local llama.cpp needed. Standalone without Nunba app.
-REM crawl4ai pip-installed for world model bridge.
+REM Hevolve-Core pip-installed for world model bridge.
 REM
 REM Usage:
 REM   start_cloud.bat                          (uses OPENAI_API_KEY from .env)

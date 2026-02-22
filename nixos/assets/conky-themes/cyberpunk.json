@@ -1,0 +1,54 @@
+{
+  "id": "cyberpunk",
+  "name": "Cyberpunk",
+  "description": "Neon pink on black",
+  "category": "dark",
+  "colors": {
+    "background": "0a0a0a",
+    "glass_bg": "rgba(10, 10, 10, 0.75)",
+    "glass_border": "rgba(255, 0, 144, 0.2)",
+    "accent": "ff0090",
+    "active": "00ff41",
+    "text": "e0e0e0",
+    "heading": "ff0090",
+    "error": "ff1744",
+    "caution": "ffea00",
+    "muted": "616161",
+    "surface": "141414",
+    "surface_hover": "1e1e1e"
+  },
+  "conky": {
+    "background": "0a0a0a",
+    "background_opacity": 200,
+    "heading": "ff0090",
+    "active": "00ff41",
+    "error": "ff1744",
+    "caution": "ffea00",
+    "muted": "616161",
+    "default_text": "c0c0c0"
+  },
+  "font": {
+    "family": "JetBrains Mono",
+    "size": 13,
+    "heading_size": 18,
+    "weight": 400,
+    "heading_weight": 700
+  },
+  "shell": {
+    "blur_radius": 16,
+    "saturation": 160,
+    "border_radius": 12,
+    "panel_opacity": 0.75,
+    "topbar_height": 40,
+    "icon_size": 20,
+    "panel_titlebar_height": 32,
+    "start_menu_width": 720,
+    "start_menu_columns": 4,
+    "animation_speed_ms": 150
+  },
+  "wallpaper": {
+    "type": "gradient",
+    "value": "linear-gradient(135deg, #0a0a0a 0%, #1a0010 50%, #0a0a0a 100%)"
+  },
+  "gtk_prefer_dark": true
+}

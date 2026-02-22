@@ -1,5 +1,5 @@
 """
-HyveOS Provisioning API — REST endpoints for network provisioning.
+HART OS Provisioning API — REST endpoints for network provisioning.
 
 Blueprint mounted at /api/provision/
 
@@ -24,7 +24,7 @@ provision_bp = Blueprint('provision', __name__, url_prefix='/api/provision')
 
 @provision_bp.route('/deploy', methods=['POST'])
 def deploy():
-    """Trigger remote HyveOS provisioning via SSH."""
+    """Trigger remote HART OS provisioning via SSH."""
     data = request.get_json() or {}
 
     target_host = data.get('target_host')
@@ -62,7 +62,7 @@ def deploy():
 
 @provision_bp.route('/nodes', methods=['GET'])
 def list_nodes():
-    """List all provisioned HyveOS nodes."""
+    """List all provisioned HART OS nodes."""
     try:
         from integrations.social.models import get_db, ProvisionedNode
         db = get_db()
@@ -116,7 +116,7 @@ def scan_network():
 
 @provision_bp.route('/update/<int:node_id>', methods=['POST'])
 def update_node(node_id):
-    """Update HyveOS on a provisioned node."""
+    """Update HART OS on a provisioned node."""
     try:
         from integrations.social.models import get_db, ProvisionedNode
         from integrations.agent_engine.network_provisioner import NetworkProvisioner

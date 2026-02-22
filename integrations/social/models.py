@@ -31,12 +31,23 @@ if _DB_PATH_ENV == ':memory:':
     DB_PATH = ':memory:'
     DB_URL = 'sqlite://'
 else:
-    DB_PATH = _DB_PATH_ENV or os.path.join(
-        os.path.dirname(__file__), '..', '..', 'agent_data', 'hevolve_database.db')
+    import sys as _sys_models
+    if _DB_PATH_ENV:
+        DB_PATH = _DB_PATH_ENV
+    elif os.environ.get('NUNBA_BUNDLED') or getattr(_sys_models, 'frozen', False):
+        # Bundled mode: use writable user directory (Program Files is read-only)
+        DB_PATH = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'hevolve_database.db')
+    else:
+        DB_PATH = os.path.join(
+            os.path.dirname(__file__), '..', '..', 'agent_data', 'hevolve_database.db')
     DB_URL = f"sqlite:///{os.path.abspath(DB_PATH)}"
+
+import threading as _threading_models
 
 _engine = None
 _SessionLocal = None
+_engine_lock = _threading_models.Lock()
+_session_lock = _threading_models.Lock()
 
 
 def _uuid():
@@ -46,47 +57,79 @@ def _uuid():
 def get_engine():
     global _engine
     if _engine is None:
-        if DB_PATH != ':memory:':
-            os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
-        engine_kwargs = dict(
-            echo=False,
-            future=True,
-            connect_args={"check_same_thread": False},
-            pool_pre_ping=True,
-            pool_recycle=3600,
-        )
-        if DB_PATH == ':memory:':
-            # In-memory DBs need StaticPool to share across threads in tests
-            from sqlalchemy.pool import StaticPool
-            engine_kwargs['poolclass'] = StaticPool
-        _engine = create_engine(DB_URL, **engine_kwargs)
+        with _engine_lock:
+            if _engine is not None:
+                return _engine
+            if DB_PATH != ':memory:':
+                os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
+            engine_kwargs = dict(
+                echo=False,
+                future=True,
+                connect_args={"check_same_thread": False},
+                pool_pre_ping=True,
+                pool_recycle=3600,
+            )
+            if DB_PATH == ':memory:':
+                # In-memory DBs need StaticPool to share across threads in tests
+                from sqlalchemy.pool import StaticPool
+                engine_kwargs['poolclass'] = StaticPool
+            _engine = create_engine(DB_URL, **engine_kwargs)
 
-        # Enable WAL mode for safe concurrent access from multiple engines
-        if DB_PATH != ':memory:':
-            @event.listens_for(_engine, "connect")
-            def _set_sqlite_wal(dbapi_connection, connection_record):
-                cursor = dbapi_connection.cursor()
-                cursor.execute("PRAGMA busy_timeout=5000")
-                result = cursor.execute("PRAGMA journal_mode=WAL").fetchone()
-                if result and result[0].lower() != 'wal':
-                    import logging
-                    logging.getLogger('hevolve_social').warning(
-                        f"WAL mode not enabled (got {result[0]}). "
-                        f"Concurrent writes may corrupt data.")
-                cursor.close()
+            # Enable WAL mode for safe concurrent access from multiple engines
+            if DB_PATH != ':memory:':
+                @event.listens_for(_engine, "connect")
+                def _set_sqlite_wal(dbapi_connection, connection_record):
+                    cursor = dbapi_connection.cursor()
+                    cursor.execute("PRAGMA busy_timeout=5000")
+                    result = cursor.execute("PRAGMA journal_mode=WAL").fetchone()
+                    if result and result[0].lower() != 'wal':
+                        import logging
+                        logging.getLogger('hevolve_social').warning(
+                            f"WAL mode not enabled (got {result[0]}). "
+                            f"Concurrent writes may corrupt data.")
+                    cursor.close()
     return _engine
 
 
 def get_session_factory():
     global _SessionLocal
     if _SessionLocal is None:
-        _SessionLocal = sessionmaker(bind=get_engine(), expire_on_commit=False)
+        with _session_lock:
+            if _SessionLocal is None:
+                _SessionLocal = sessionmaker(bind=get_engine(), expire_on_commit=False)
     return _SessionLocal
 
 
 def get_db() -> Session:
     factory = get_session_factory()
     return factory()
+
+
+def db_session(commit=True):
+    """Context manager for database sessions with automatic commit/rollback/close.
+
+    Usage:
+        with db_session() as db:
+            user = db.query(User).filter_by(id=uid).first()
+            user.name = 'new'
+        # auto-commits on clean exit, auto-rollbacks on exception, always closes
+    """
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _session_cm():
+        db = get_db()
+        try:
+            yield db
+            if commit:
+                db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    return _session_cm()
 
 
 def init_db():
@@ -557,9 +600,11 @@ class PeerNode(Base):
     active_user_count = Column(Integer, default=0)
     max_user_capacity = Column(Integer, default=0)
     dns_region = Column(String(50), nullable=True)
-    # Hyve OS equilibrium: contribution tier + enabled features
+    # HART OS equilibrium: contribution tier + enabled features
     capability_tier = Column(String(20), nullable=True)       # observer|lite|standard|full|compute_host
     enabled_features_json = Column(JSON, nullable=True)       # ["agent_engine", "tts", ...]
+    # E2E encryption: X25519 public key for encrypted inter-node communication
+    x25519_public = Column(String(64), nullable=True)         # Hex-encoded X25519 public key (32 bytes)
     # Fail2ban: progressive ban tracking
     ban_count = Column(Integer, default=0)                    # How many times this node has been banned
     ban_until = Column(DateTime, nullable=True)               # When current ban expires (None = no ban)
@@ -596,6 +641,7 @@ class PeerNode(Base):
             'dns_region': self.dns_region,
             'capability_tier': self.capability_tier,
             'enabled_features': self.enabled_features_json,
+            'x25519_public': self.x25519_public,
             'ban_count': self.ban_count,
             'ban_until': self.ban_until.isoformat() if self.ban_until else None,
             'metadata': self.metadata_json,
@@ -2537,9 +2583,9 @@ class FleetCommand(Base):
 
 
 class ProvisionedNode(Base):
-    """Tracks machines where HyveOS was remotely provisioned via SSH.
+    """Tracks machines where HART OS was remotely provisioned via SSH.
 
-    Created by NetworkProvisioner when an agent installs HyveOS on
+    Created by NetworkProvisioner when an agent installs HART OS on
     a network machine. Used for fleet management, health monitoring,
     and remote updates.
     """
@@ -2558,3 +2604,95 @@ class ProvisionedNode(Base):
     provisioned_by = Column(String(64), nullable=False, default='system')
     error_message = Column(Text, nullable=True)
     created_at = Column(DateTime, default=func.now())
+
+
+# ─── TABLE: thought_experiments (v30) ───
+
+class ThoughtExperiment(Base):
+    """Constitutional thought experiment — public hypothesis with voting lifecycle.
+
+    Full lifecycle: PROPOSE → DISCUSS → VOTE → EVALUATE → DECIDE → ARCHIVE
+    Both humans and agents vote. ConstitutionalFilter gates all content.
+    """
+    __tablename__ = 'thought_experiments'
+
+    id = Column(String(64), primary_key=True, default=lambda: str(uuid.uuid4()))
+    post_id = Column(String(64), ForeignKey('posts.id', use_alter=True), nullable=True)
+    creator_id = Column(String(64), ForeignKey('users.id', use_alter=True), nullable=False)
+    title = Column(String(200), nullable=False)
+    hypothesis = Column(Text, nullable=False)
+    expected_outcome = Column(Text, nullable=True)
+    intent_category = Column(String(30), default='technology')
+    status = Column(String(20), default='proposed', index=True)
+    decision_type = Column(String(20), default='weighted')
+    voting_opens_at = Column(DateTime, nullable=True)
+    voting_closes_at = Column(DateTime, nullable=True)
+    evaluation_deadline = Column(DateTime, nullable=True)
+    decision_outcome = Column(Text, nullable=True)
+    decision_rationale = Column(JSON, nullable=True)
+    total_votes = Column(Integer, default=0)
+    agent_evaluations_json = Column(JSON, nullable=True)
+    is_core_ip = Column(Boolean, default=False)
+    parent_experiment_id = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'post_id': self.post_id,
+            'creator_id': self.creator_id,
+            'title': self.title,
+            'hypothesis': self.hypothesis,
+            'expected_outcome': self.expected_outcome,
+            'intent_category': self.intent_category,
+            'status': self.status,
+            'decision_type': self.decision_type,
+            'voting_opens_at': self.voting_opens_at.isoformat() if self.voting_opens_at else None,
+            'voting_closes_at': self.voting_closes_at.isoformat() if self.voting_closes_at else None,
+            'evaluation_deadline': self.evaluation_deadline.isoformat() if self.evaluation_deadline else None,
+            'decision_outcome': self.decision_outcome,
+            'decision_rationale': self.decision_rationale,
+            'total_votes': self.total_votes or 0,
+            'agent_evaluations_json': self.agent_evaluations_json,
+            'is_core_ip': self.is_core_ip or False,
+            'parent_experiment_id': self.parent_experiment_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class ExperimentVote(Base):
+    """Vote on a thought experiment — from human or agent."""
+    __tablename__ = 'experiment_votes'
+
+    id = Column(String(64), primary_key=True, default=lambda: str(uuid.uuid4()))
+    experiment_id = Column(String(64), ForeignKey('thought_experiments.id', use_alter=True),
+                           nullable=False, index=True)
+    voter_id = Column(String(64), ForeignKey('users.id', use_alter=True), nullable=False)
+    voter_type = Column(String(10), default='human')
+    vote_value = Column(Integer, default=0)
+    confidence = Column(Float, default=1.0)
+    reasoning = Column(Text, nullable=True)
+    suggestion = Column(Text, nullable=True)
+    constitutional_check = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('experiment_id', 'voter_id',
+                         name='uq_experiment_voter'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'experiment_id': self.experiment_id,
+            'voter_id': self.voter_id,
+            'voter_type': self.voter_type,
+            'vote_value': self.vote_value,
+            'confidence': self.confidence,
+            'reasoning': self.reasoning,
+            'suggestion': self.suggestion,
+            'constitutional_check': self.constitutional_check,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }

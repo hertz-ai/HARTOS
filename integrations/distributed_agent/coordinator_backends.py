@@ -17,6 +17,7 @@ A multi-node hive can use Redis OR peer gossip. Every drop counts.
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from datetime import datetime
@@ -160,6 +161,10 @@ class GossipTaskBridge:
                       tasks: List[Dict], context: Dict) -> int:
         """Announce a new goal to all known peers via HTTP POST.
 
+        If the peer has an X25519 public key, the payload is E2E encrypted
+        so neither network observers nor the hosting node see the task data.
+        Falls back to plaintext for peers without X25519 keys (old nodes).
+
         Returns number of peers notified.
         """
         notified = 0
@@ -178,9 +183,18 @@ class GossipTaskBridge:
                 continue
             try:
                 import requests
+                send_payload = payload
+                peer_x25519 = peer.get('x25519_public', '')
+                if peer_x25519:
+                    try:
+                        from security.channel_encryption import encrypt_json_for_peer
+                        send_payload = {'encrypted': True,
+                                        'envelope': encrypt_json_for_peer(payload, peer_x25519)}
+                    except Exception:
+                        pass  # Encryption unavailable, send plaintext
                 resp = requests.post(
                     f'{peer_url}/api/distributed/tasks/announce',
-                    json=payload,
+                    json=send_payload,
                     timeout=5,
                 )
                 if resp.status_code == 200:
@@ -195,7 +209,10 @@ class GossipTaskBridge:
         return notified
 
     def pull_tasks_from_peers(self) -> List[Dict]:
-        """Pull unclaimed tasks from known peers (gossip exchange)."""
+        """Pull unclaimed tasks from known peers (gossip exchange).
+
+        If the response is E2E encrypted, decrypts it using our X25519 key.
+        """
         tasks = []
         peers = self._get_active_peers()
 
@@ -211,6 +228,16 @@ class GossipTaskBridge:
                 )
                 if resp.status_code == 200:
                     data = resp.json()
+                    # Handle E2E encrypted response
+                    if data.get('encrypted') and data.get('envelope'):
+                        try:
+                            from security.channel_encryption import decrypt_json_from_peer
+                            decrypted = decrypt_json_from_peer(data['envelope'])
+                            if decrypted:
+                                tasks.extend(decrypted.get('tasks', []))
+                                continue
+                        except Exception:
+                            pass  # Decryption failed, try plaintext
                     tasks.extend(data.get('tasks', []))
             except Exception:
                 pass
@@ -219,7 +246,10 @@ class GossipTaskBridge:
 
     @staticmethod
     def _get_active_peers() -> List[Dict]:
-        """Get active peers from the PeerNode table."""
+        """Get active peers from the PeerNode table.
+
+        Includes x25519_public for E2E encryption of task payloads.
+        """
         try:
             from integrations.social.models import get_db, PeerNode
             db = get_db()
@@ -227,7 +257,8 @@ class GossipTaskBridge:
                 peers = db.query(PeerNode).filter(
                     PeerNode.status == 'active'
                 ).all()
-                return [{'host_url': p.url, 'node_id': p.node_id}
+                return [{'host_url': p.url, 'node_id': p.node_id,
+                         'x25519_public': getattr(p, 'x25519_public', '') or ''}
                         for p in peers if p.url]
             finally:
                 db.close()
@@ -254,10 +285,12 @@ def create_coordinator(agent_id: str = None):
     """
     agent_id = agent_id or os.environ.get('HEVOLVE_AGENT_ID', 'local')
 
-    # Try Redis first
-    coordinator = _try_redis_backend(agent_id)
-    if coordinator:
-        return coordinator, 'redis'
+    # In bundled/desktop mode, Redis is never available — skip the attempt
+    # entirely to avoid a 1-30s timeout stall on every startup.
+    if not os.environ.get('NUNBA_BUNDLED'):
+        coordinator = _try_redis_backend(agent_id)
+        if coordinator:
+            return coordinator, 'redis'
 
     # Fall back to in-memory + JSON file backend
     coordinator = _create_inmemory_backend(agent_id)
@@ -274,9 +307,10 @@ def _try_redis_backend(agent_id: str):
         host = os.environ.get('REDIS_HOST', 'localhost')
         port = int(os.environ.get('REDIS_PORT', 6379))
 
-        # Quick connectivity check (1 second timeout)
+        # Quick connectivity check — fail fast, no retries
         r = redis.Redis(host=host, port=port, decode_responses=True,
-                        socket_connect_timeout=1)
+                        socket_connect_timeout=1, socket_timeout=1,
+                        retry_on_timeout=False)
         r.ping()
 
         from agent_ledger import SmartLedger, RedisBackend
@@ -314,12 +348,16 @@ def _create_inmemory_backend(agent_id: str):
         from agent_ledger import SmartLedger, JSONBackend
         from agent_ledger.verification import TaskVerification, TaskBaseline
 
-        # Use agent_data directory for JSON persistence
+        # Use agent_data directory for JSON persistence (must be absolute
+        # and writable — never use relative paths, which resolve to the
+        # read-only install dir in bundled mode).
         db_path = os.environ.get('HEVOLVE_DB_PATH', '')
         if db_path and db_path != ':memory:' and os.path.isabs(db_path):
             storage_dir = os.path.join(os.path.dirname(db_path), 'distributed_tasks')
         else:
-            storage_dir = os.path.join('agent_data', 'distributed_tasks')
+            # Always fall back to user-writable Documents dir
+            storage_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data', 'distributed_tasks')
+        os.makedirs(storage_dir, exist_ok=True)
 
         backend = JSONBackend(storage_dir=storage_dir)
         ledger = SmartLedger(

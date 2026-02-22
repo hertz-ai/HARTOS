@@ -1,0 +1,54 @@
+{
+  "id": "minimal",
+  "name": "Minimal",
+  "description": "Pure dark with subtle gray",
+  "category": "dark",
+  "colors": {
+    "background": "121212",
+    "glass_bg": "rgba(18, 18, 18, 0.7)",
+    "glass_border": "rgba(158, 158, 158, 0.08)",
+    "accent": "9e9e9e",
+    "active": "bdbdbd",
+    "text": "e0e0e0",
+    "heading": "9e9e9e",
+    "error": "ef5350",
+    "caution": "ffa726",
+    "muted": "616161",
+    "surface": "1e1e1e",
+    "surface_hover": "2a2a2a"
+  },
+  "conky": {
+    "background": "121212",
+    "background_opacity": 190,
+    "heading": "9e9e9e",
+    "active": "bdbdbd",
+    "error": "ef5350",
+    "caution": "ffa726",
+    "muted": "616161",
+    "default_text": "a0a0a0"
+  },
+  "font": {
+    "family": "Inter",
+    "size": 13,
+    "heading_size": 18,
+    "weight": 300,
+    "heading_weight": 500
+  },
+  "shell": {
+    "blur_radius": 18,
+    "saturation": 100,
+    "border_radius": 12,
+    "panel_opacity": 0.7,
+    "topbar_height": 38,
+    "icon_size": 18,
+    "panel_titlebar_height": 30,
+    "start_menu_width": 680,
+    "start_menu_columns": 4,
+    "animation_speed_ms": 180
+  },
+  "wallpaper": {
+    "type": "solid",
+    "value": "#121212"
+  },
+  "gtk_prefer_dark": true
+}

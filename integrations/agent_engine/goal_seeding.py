@@ -183,7 +183,7 @@ SEED_BOOTSTRAP_GOALS = [
             '4) When intelligence milestone reached (14 days verified + moat >= months), '
             'trigger provisional patent filing via draft_patent_claims. '
             'Defensive publications first. Patents only when critical intelligence confirmed. '
-            'Hyve character: Vijai — cautious, methodical, net-positive.'
+            'HART character: Vijai — cautious, methodical, net-positive.'
         ),
         'config': {
             'mode': 'monitor',
@@ -358,6 +358,94 @@ SEED_BOOTSTRAP_GOALS = [
         ),
         'config': {
             'mode': 'monitor',
+            'continuous': True,
+        },
+        'spark_budget': 200,
+        'use_product': False,
+    },
+    # ─── Distributed Gradient Sync ───
+    {
+        'slug': 'bootstrap_gradient_sync',
+        'goal_type': 'distributed_learning',
+        'title': 'Distributed Embedding Sync Coordination',
+        'description': (
+            'Coordinate the distributed embedding sync pipeline: '
+            '1) Monitor gradient sync status across all peers with get_gradient_sync_status, '
+            '2) Submit local embedding deltas for aggregation with submit_embedding_delta, '
+            '3) Request peer witnesses for embedding deltas with request_embedding_witnesses, '
+            '4) Trigger aggregation rounds for convergence with trigger_embedding_aggregation, '
+            '5) Ensure all contributing nodes have embedding_sync CCT capability. '
+            'Phase 1: Compressed embedding deltas (<100KB), trimmed mean aggregation. '
+            'Every node that contributes makes the hive smarter.'
+        ),
+        'config': {
+            'mode': 'monitor',
+            'continuous': True,
+            'phase': 1,
+        },
+        'spark_budget': 200,
+        'use_product': False,
+    },
+    # ─── Robot Learning ───
+    {
+        'slug': 'bootstrap_robot_learning',
+        'goal_type': 'robot',
+        'title': 'Continuous Robot Learning from Physical Interactions',
+        'description': (
+            'Learn from physical interactions continuously: '
+            '1) Use get_robot_status to monitor active sensors and safety, '
+            '2) After each physical action, record the action + sensor context + outcome, '
+            '3) Build motion recipes from successful action sequences, '
+            '4) Feed outcomes to the world model for trajectory improvement, '
+            '5) Identify recurring motion patterns for recipe extraction. '
+            'Every physical interaction makes the robot smarter. '
+            'Recipes enable 90% faster replay of learned sequences.'
+        ),
+        'config': {
+            'mode': 'learning',
+            'continuous': True,
+        },
+        'spark_budget': 150,
+        'use_product': False,
+    },
+    # ─── Robot Health Monitor ───
+    {
+        'slug': 'bootstrap_robot_health_monitor',
+        'goal_type': 'robot',
+        'title': 'Robot Health Monitor — Sensor Drift and Calibration',
+        'description': (
+            'Monitor robot health continuously: '
+            '1) Use get_robot_status to check safety, sensors, and bridge health, '
+            '2) Use get_robot_capabilities to verify detected hardware matches expected, '
+            '3) Use read_sensor on each active sensor to check for drift or anomalies, '
+            '4) Use get_sensor_window to detect sensor noise or stale readings, '
+            '5) Report any safety events, sensor failures, or calibration needs. '
+            'This goal runs continuously on robot nodes to keep hardware healthy.'
+        ),
+        'config': {
+            'mode': 'monitor',
+            'continuous': True,
+        },
+        'spark_budget': 100,
+        'use_product': False,
+    },
+    # ─── Thought Experiment Coordinator ───
+    {
+        'slug': 'bootstrap_thought_experiment_coordinator',
+        'goal_type': 'thought_experiment',
+        'title': 'Constitutional Thought Experiment Coordination',
+        'description': (
+            'Coordinate the constitutional thought experiment pipeline: '
+            '1) Monitor active experiments with get_experiment_status, '
+            '2) Evaluate proposed experiments with evaluate_thought_experiment, '
+            '3) Tally votes and compute weighted scores with tally_experiment_votes, '
+            '4) Advance experiments through lifecycle with advance_experiment, '
+            '5) Ensure core IP experiments receive agent evaluation. '
+            'Both humans and agents vote. All content gated by ConstitutionalFilter. '
+            'Every experiment makes the hive smarter.'
+        ),
+        'config': {
+            'mode': 'coordinator',
             'continuous': True,
         },
         'spark_budget': 200,

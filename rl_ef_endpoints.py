@@ -14,10 +14,12 @@ from typing import Dict, Any
 import sys
 from pathlib import Path
 
-# Add crawl4ai to path
-crawl4ai_path = Path("C:/Users/sathi/PycharmProjects/crawl4ai")
-if crawl4ai_path.exists():
-    sys.path.insert(0, str(crawl4ai_path))
+# Add Hevolve-Core to path
+_hevolve_core_path = Path("C:/Users/sathi/PycharmProjects/hevolve-core")
+if not _hevolve_core_path.exists():
+    _hevolve_core_path = Path("C:/Users/sathi/PycharmProjects/hevolveai")  # legacy fallback
+if _hevolve_core_path.exists():
+    sys.path.insert(0, str(_hevolve_core_path))
 
 from embodied_ai.rl_ef import (
     send_expert_correction,

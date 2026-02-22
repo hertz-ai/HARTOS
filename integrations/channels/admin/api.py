@@ -25,7 +25,7 @@ from datetime import datetime
 from functools import wraps
 from typing import Optional, Dict, List, Any, Callable, TYPE_CHECKING
 
-from flask import Blueprint, request, jsonify, Response, current_app
+from flask import Blueprint, request, jsonify, Response, current_app, g
 
 from .schemas import (
     APIResponse,
@@ -1935,7 +1935,7 @@ def update_memory_config():
 @admin_bp.route("/config/embodied", methods=["GET"])
 @api_response
 def get_embodied_config():
-    """Get embodied AI / crawl4ai feed configuration."""
+    """Get embodied AI / Hevolve-Core feed configuration."""
     api = get_api()
     return api._global_config.embodied_ai.to_dict()
 
@@ -1943,7 +1943,7 @@ def get_embodied_config():
 @admin_bp.route("/config/embodied", methods=["PUT"])
 @api_response
 def update_embodied_config():
-    """Update embodied AI feed configuration and propagate to crawl4ai."""
+    """Update embodied AI feed configuration and propagate to Hevolve-Core."""
     api = get_api()
     data = request.get_json()
     if not data:
@@ -1951,7 +1951,7 @@ def update_embodied_config():
     api._global_config.embodied_ai = EmbodiedAIConfigSchema(**data)
     api._save_config()
 
-    # Propagate to crawl4ai runtime if reachable
+    # Propagate to Hevolve-Core runtime if reachable
     _propagate_embodied_config(api._global_config.embodied_ai)
     return api._global_config.embodied_ai.to_dict()
 
@@ -1994,16 +1994,16 @@ def toggle_embodied_feed():
 @admin_bp.route("/config/embodied/status", methods=["GET"])
 @api_response
 def get_embodied_status():
-    """Get live status of crawl4ai embodied AI system."""
+    """Get live status of Hevolve-Core embodied AI system."""
     import requests as req
     api = get_api()
-    url = api._global_config.embodied_ai.crawl4ai_url
+    url = api._global_config.embodied_ai.hevolveai_url
 
     try:
         resp = req.get(f"{url}/health", timeout=3)
         health = resp.json() if resp.ok else {"status": "unreachable"}
     except Exception:
-        health = {"status": "unreachable", "error": "Cannot connect to crawl4ai"}
+        health = {"status": "unreachable", "error": "Cannot connect to Hevolve-Core"}
 
     try:
         resp = req.get(f"{url}/v1/stats", timeout=3)
@@ -2013,18 +2013,18 @@ def get_embodied_status():
 
     return {
         "config": api._global_config.embodied_ai.to_dict(),
-        "crawl4ai_health": health,
+        "hevolve_core_health": health,
         "learning_stats": stats,
     }
 
 
 def _propagate_embodied_config(cfg: EmbodiedAIConfigSchema):
-    """Push config changes to crawl4ai runtime (best-effort)."""
+    """Push config changes to Hevolve-Core runtime (best-effort)."""
     import requests as req
     try:
-        # crawl4ai reads env vars at startup, but we can hit a
+        # Hevolve-Core reads env vars at startup, but we can hit a
         # runtime config endpoint if available, or set for next restart.
-        # For now, write to shared config file that crawl4ai watches.
+        # For now, write to shared config file that Hevolve-Core watches.
         config_path = os.path.join(
             os.path.dirname(__file__), '..', '..', '..',
             'agent_data', 'embodied_ai_config.json',

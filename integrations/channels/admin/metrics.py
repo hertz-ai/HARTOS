@@ -151,10 +151,14 @@ class MetricsConfig:
         """Get persistence path, defaulting to Docker-friendly location."""
         if self.persistence_path:
             return self.persistence_path
-        return os.environ.get(
-            "METRICS_DATA_PATH",
-            "/app/data/metrics" if os.path.exists("/app") else "./agent_data/metrics"
-        )
+        import sys as _sys
+        if os.environ.get('NUNBA_BUNDLED') or getattr(_sys, 'frozen', False):
+            _default = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data', 'metrics')
+        elif os.path.exists("/app"):
+            _default = "/app/data/metrics"
+        else:
+            _default = "./agent_data/metrics"
+        return os.environ.get("METRICS_DATA_PATH", _default)
 
 
 class MetricsCollector:

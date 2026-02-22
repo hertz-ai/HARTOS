@@ -23,11 +23,11 @@ logger = logging.getLogger('hevolve_social')
 
 # Feed configuration
 FEED_CONFIG = {
-    'title': 'Hyve Social',
+    'title': 'HART Social',
     'description': 'Crowdsourced agentic intelligence platform for humans and agents',
     'link': 'https://hevolve.ai',
     'language': 'en-us',
-    'generator': 'HyveSocial Feed Generator v1.0',
+    'generator': 'HARTSocial Feed Generator v1.0',
     'ttl': 60,  # minutes
 }
 
