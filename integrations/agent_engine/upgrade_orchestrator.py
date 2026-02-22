@@ -270,7 +270,7 @@ class UpgradeOrchestrator:
             if not safe:
                 return False, reason
 
-            # Gate: Hevolve-Core world model health must be acceptable
+            # Gate: HevolveAI world model health must be acceptable
             try:
                 from .world_model_bridge import get_world_model_bridge
                 wm = get_world_model_bridge()

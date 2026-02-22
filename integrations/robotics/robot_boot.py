@@ -10,7 +10,7 @@ Connects:
   - CapabilityAdvertiser (from Batch 4)
 
 Does NOT start any intelligence.  Just wires the routing layer.
-Hevolve-Core starts its own intelligence when it receives data.
+HevolveAI starts its own intelligence when it receives data.
 """
 import json
 import logging
@@ -146,7 +146,7 @@ def _connect_sensor_adapters(caps: Any = None):
 
 
 def _sensor_ingest_tick():
-    """Periodic callback: flush sensor store readings to Hevolve-Core."""
+    """Periodic callback: flush sensor store readings to HevolveAI."""
     try:
         from integrations.robotics.sensor_store import get_sensor_store
         from integrations.agent_engine.world_model_bridge import (
@@ -165,7 +165,7 @@ def _sensor_ingest_tick():
 
 
 def _feedback_poll_tick():
-    """Periodic callback: poll Hevolve-Core for learning feedback."""
+    """Periodic callback: poll HevolveAI for learning feedback."""
     try:
         from integrations.agent_engine.world_model_bridge import (
             get_world_model_bridge,

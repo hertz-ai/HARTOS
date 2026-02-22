@@ -223,7 +223,7 @@ def register_finance_tools(helper, assistant, user_id: str):
                     },
                     'access_tiers': {
                         'public': 'HART platform (this repo) — open, transparent',
-                        'private': 'Embodied AI core (Hevolve-Core downstream) — invite-only',
+                        'private': 'Embodied AI core (HevolveAI downstream) — invite-only',
                     },
                     'status': 'active',
                 },

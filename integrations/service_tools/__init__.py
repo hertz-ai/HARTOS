@@ -2,7 +2,7 @@
 Service Tools - Dynamic HTTP tool registry for external microservices.
 
 Extends the MCP integration pattern to support any HTTP-based tool service
-(Hevolve-Core, AceStep, Wan2GP, TTS-Audio-Suite, etc.) with health checking,
+(HevolveAI, AceStep, Wan2GP, TTS-Audio-Suite, etc.) with health checking,
 auto-discovery, and autogen/langchain compatible function generation.
 
 Runtime tools are managed by RuntimeToolManager which handles:

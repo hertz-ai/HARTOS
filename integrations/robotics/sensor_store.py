@@ -5,7 +5,7 @@ Follows the FrameStore pattern (RLock, per-key bounded deques, TTL).
 Stores SensorReadings from all modalities: IMU, GPS, LiDAR, encoders,
 force/torque, proximity, temperature, etc.
 
-Hevolve-Core's world model operates in one latent space — this store is the
+HevolveAI's world model operates in one latent space — this store is the
 buffer between hardware adapters and the WorldModelBridge that feeds
 sensor data into that unified latent space.
 

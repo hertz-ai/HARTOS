@@ -5,7 +5,7 @@
 # Non-compute-heavy central server mode.
 # Intelligence comes from GPT, Claude, and other cloud LLMs.
 # No local llama.cpp needed. Standalone without Nunba app.
-# Hevolve-Core pip-installed for world model bridge.
+# HevolveAI pip-installed for world model bridge.
 #
 # Usage:
 #   ./start_cloud.sh                          (uses OPENAI_API_KEY from .env)

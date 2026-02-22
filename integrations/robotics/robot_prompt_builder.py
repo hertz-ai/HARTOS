@@ -8,7 +8,7 @@ Injects:
   - Active sensor state (what the robot currently sees/feels)
 
 The prompt tells the LLM agent WHAT it can do.
-Hevolve-Core figures out HOW to do it.
+HevolveAI figures out HOW to do it.
 """
 import json
 import logging
@@ -28,7 +28,7 @@ def build_robot_prompt(goal_dict: Dict,
       4. Current sensor state (what's live right now)
       5. The goal itself
 
-    The agent decides WHAT to do.  Hevolve-Core decides HOW.
+    The agent decides WHAT to do.  HevolveAI decides HOW.
     """
     config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
 
@@ -45,7 +45,7 @@ def build_robot_prompt(goal_dict: Dict,
         f"YOU ARE A ROBOT TASK AGENT.\n\n"
         f"You control a physical robot through the HART platform. "
         f"You decide WHAT the robot should do. The native embodiment layer "
-        f"(Hevolve-Core) handles HOW — motor control, path planning, sensor fusion, "
+        f"(HevolveAI) handles HOW — motor control, path planning, sensor fusion, "
         f"kinematics. You never compute trajectories or PID values yourself.\n\n"
         f"{caps_section}\n"
         f"{safety_section}\n"

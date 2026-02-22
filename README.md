@@ -197,7 +197,7 @@ HART Platform
 │   ├── AgentDaemon        — Autonomous tick loop with circuit breaker
 │   ├── SpeculativeDispatch — Fast-first/expert-takeover pattern
 │   ├── ModelRegistry      — 6-tier hardware-aware model selection
-│   └── WorldModelBridge   — Hevolve-Core integration (RL-EF, HiveMind)
+│   └── WorldModelBridge   — HevolveAI integration (RL-EF, HiveMind)
 │
 ├── Security (Cryptographically Sealed)
 │   ├── hive_guardrails.py — 10-class intelligent guardrail network

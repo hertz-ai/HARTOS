@@ -156,7 +156,7 @@ class IPService:
         """Aggregate self-improving loop metrics from all live sources.
 
         Checks 5 flywheel components:
-        1. World model (Hevolve-Core) health + learning stats
+        1. World model (HevolveAI) health + learning stats
         2. Agent goal completion rates
         3. RALT skill propagation stats
         4. Recipe reuse adoption rate
@@ -472,7 +472,7 @@ class IPService:
         wm_healthy = health['world_model'].get('healthy', False)
         if wm_healthy:
             checks_passed += 1
-            evidence.append('World model (Hevolve-Core) is healthy and auto-learning')
+            evidence.append('World model (HevolveAI) is healthy and auto-learning')
         else:
             evidence.append('FAIL: World model not healthy or unreachable')
 

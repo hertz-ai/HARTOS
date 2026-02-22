@@ -2,7 +2,7 @@
 Unified Agent Goal Engine - Dynamic Benchmark Registry
 
 Benchmarks are adapters that wrap measurement suites. Built-in adapters
-reuse existing Hevolve-Core code. Dynamic adapters are installed by the
+reuse existing HevolveAI code. Dynamic adapters are installed by the
 coding agent at regional compute-heavy nodes via RuntimeToolManager pattern.
 
 Snapshots stored at agent_data/benchmarks/{version}.json.
@@ -179,7 +179,7 @@ class GuardrailAdapter(BenchmarkAdapter):
 
 
 class QuantiPhyAdapter(BenchmarkAdapter):
-    """QuantiPhy physics reasoning benchmark from Hevolve-Core."""
+    """QuantiPhy physics reasoning benchmark from HevolveAI."""
     name = 'quantiphy'
     source = 'builtin'
     requires_gpu = True
@@ -188,7 +188,7 @@ class QuantiPhyAdapter(BenchmarkAdapter):
 
     def is_available(self) -> bool:
         try:
-            # Check if Hevolve-Core quantiphy benchmark exists
+            # Check if HevolveAI quantiphy benchmark exists
             import importlib.util
             spec = importlib.util.find_spec('hevolveai')
             return spec is not None
@@ -216,7 +216,7 @@ class QuantiPhyAdapter(BenchmarkAdapter):
 
 
 class EmbodiedValidationAdapter(BenchmarkAdapter):
-    """Embodied AI validation benchmark from Hevolve-Core."""
+    """Embodied AI validation benchmark from HevolveAI."""
     name = 'embodied_validation'
     source = 'builtin'
     requires_gpu = True
@@ -259,7 +259,7 @@ class EmbodiedValidationAdapter(BenchmarkAdapter):
 
 
 class QwenEncoderAdapter(BenchmarkAdapter):
-    """Qwen encoder throughput benchmark from Hevolve-Core."""
+    """Qwen encoder throughput benchmark from HevolveAI."""
     name = 'qwen_encoder'
     source = 'builtin'
     requires_gpu = True

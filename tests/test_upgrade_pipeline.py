@@ -6,7 +6,7 @@ Verifies that:
 2. Upgrade tools exist and call the orchestrator
 3. Orchestrator stages advance correctly (BUILD→TEST→AUDIT→BENCHMARK→SIGN→CANARY→DEPLOY)
 4. BENCHMARK_DIR import bug is fixed in orchestrator
-5. Hevolve-Core world model health gates the benchmark stage
+5. HevolveAI world model health gates the benchmark stage
 6. Gossip beacon includes version info
 7. OTA service runs orchestrated upgrade before applying
 8. Peer witness post-update verification works
@@ -193,7 +193,7 @@ class TestBenchmarkDirFix:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 5. Hevolve-Core World Model Benchmark Gate
+# 5. HevolveAI World Model Benchmark Gate
 # ═══════════════════════════════════════════════════════════════
 
 class TestHevolveAIBenchmarkGate:

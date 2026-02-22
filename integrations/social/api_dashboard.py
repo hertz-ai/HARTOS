@@ -42,7 +42,7 @@ def get_agent_dashboard():
 
 @dashboard_bp.route('/api/social/dashboard/health', methods=['GET'])
 def get_node_health():
-    """Public health endpoint showing watchdog + Hevolve-Core status."""
+    """Public health endpoint showing watchdog + HevolveAI status."""
     data = {'watchdog': 'not_started', 'threads': {}, 'world_model': {}}
     try:
         from security.node_watchdog import get_watchdog

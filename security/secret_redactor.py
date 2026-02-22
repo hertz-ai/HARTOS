@@ -16,7 +16,7 @@ THREE-LAYER DEFENSE:
     Regex is correct here: structured secrets have known formats.
 
   Layer 2 - PER-USER ISOLATION (model-based PII + anonymization):
-    Local LLM (Hevolve-Core / llama.cpp) semantically detects PII in
+    Local LLM (HevolveAI / llama.cpp) semantically detects PII in
     free text: names, addresses, medical info, financial details.
     Falls back to regex for emails, phones, URLs, @mentions.
     user_id/prompt_id/node_id anonymized via SHA-256.

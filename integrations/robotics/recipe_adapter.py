@@ -5,7 +5,7 @@ Bridges the CREATE/REUSE recipe system with physical robot actions:
   - CREATE mode: records motor sequences with sensor context → recipe steps
   - REUSE mode: replays recipe steps → RobotAction commands via WorldModelBridge
 
-Hevolve-Core handles real-time adaptation during replay (pause on obstacle,
+HevolveAI handles real-time adaptation during replay (pause on obstacle,
 adjust trajectory).  This adapter just converts the data format.
 
 NO intelligence here.  Just format conversion between:
@@ -30,7 +30,7 @@ class RobotRecipeAdapter:
       - Sensor context at action time (what the robot "saw/felt")
       - Outcome (did it work? how far off was it?)
 
-    This lets REUSE mode replay physical sequences, with Hevolve-Core
+    This lets REUSE mode replay physical sequences, with HevolveAI
     providing real-time adaptation via its native intelligence.
     """
 
@@ -135,7 +135,7 @@ class RobotRecipeAdapter:
         """Extract action sequence from a recipe for replay.
 
         The caller (or WorldModelBridge) sends each action in order.
-        Hevolve-Core handles real-time adaptation during execution.
+        HevolveAI handles real-time adaptation during execution.
 
         Args:
             recipe: Recipe dict from record_motion_sequence()

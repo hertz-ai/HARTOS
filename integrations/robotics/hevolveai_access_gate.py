@@ -1,7 +1,7 @@
 """
-Hevolve-Core Access Gate — Feature-level access control.
+HevolveAI Access Gate — Feature-level access control.
 
-Gates specific Hevolve-Core features by:
+Gates specific HevolveAI features by:
   1. Certificate tier (central, regional, local)
   2. CCT capability (e.g. 'embodied_ai', 'sensor_fusion')
   3. Installation integrity (verified manifest)
@@ -24,7 +24,7 @@ logger = logging.getLogger('hevolve_security')
 
 
 def check_hevolveai_access(feature: str) -> Dict:
-    """Check if this node can use a specific Hevolve-Core feature.
+    """Check if this node can use a specific HevolveAI feature.
 
     Args:
         feature: Feature name (e.g. 'in_process', 'sensor_fusion')
@@ -71,7 +71,7 @@ def check_hevolveai_access(feature: str) -> Dict:
     # Integrity check (some features require verified install)
     if feature_rules.get('requires_integrity') and not integrity:
         result['reason'] = (
-            f"feature '{feature}' requires verified Hevolve-Core installation"
+            f"feature '{feature}' requires verified HevolveAI installation"
         )
         return result
 
@@ -152,7 +152,7 @@ def _get_node_tier() -> str:
 
 
 def _check_integrity() -> bool:
-    """Check if Hevolve-Core installation passes integrity verification."""
+    """Check if HevolveAI installation passes integrity verification."""
     try:
         from security.source_protection import SourceProtectionService
         result = SourceProtectionService.verify_hevolveai_integrity()

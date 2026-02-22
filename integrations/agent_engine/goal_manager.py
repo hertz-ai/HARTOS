@@ -565,7 +565,7 @@ def _build_ip_protection_prompt(goal_dict: Dict, product_dict: Optional[Dict] = 
 
     4 modes: monitor | draft | file | enforce
     The agent protects the self-improving loop architecture:
-      agents → world model → Hevolve-Core → coding agents improve Hevolve-Core → repeat
+      agents → world model → HevolveAI → coding agents improve HevolveAI → repeat
     """
     config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
     mode = config.get('mode', 'monitor')
@@ -610,10 +610,10 @@ def _build_ip_protection_prompt(goal_dict: Dict, product_dict: Optional[Dict] = 
         f"Description: {goal_dict.get('description', '')}\n\n"
         f"Instructions: {instructions}\n\n"
         f"THE SELF-IMPROVING LOOP YOU PROTECT:\n"
-        f"  1. Agents use the world model (Hevolve-Core) for tasks\n"
-        f"  2. Every interaction trains Hevolve-Core via POST /v1/chat/completions\n"
+        f"  1. Agents use the world model (HevolveAI) for tasks\n"
+        f"  2. Every interaction trains HevolveAI via POST /v1/chat/completions\n"
         f"  3. Expert corrections feed RL-EF via POST /v1/corrections\n"
-        f"  4. Coding agents improve Hevolve-Core source code itself\n"
+        f"  4. Coding agents improve HevolveAI source code itself\n"
         f"  5. World model gets better → agents get smarter → repeat\n"
         f"  All within master key security perimeter, Spark economy,\n"
         f"  ad revenue for compute providers, logarithmic fairness.\n\n"
@@ -663,7 +663,7 @@ def _build_finance_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) 
         f"- 10% → platform sustainability (OS development, infrastructure, founder family)\n"
         f"- Free tier: ALWAYS free. We do not gatekeep intelligence.\n\n"
         f"PRIVATE CORE ACCESS:\n"
-        f"- The embodied AI core (Hevolve-Core downstream) is invite-only\n"
+        f"- The embodied AI core (HevolveAI downstream) is invite-only\n"
         f"- Participation agreements are discussed per invitee\n"
         f"- Finance agent tracks agreements but NEVER auto-approves\n"
         f"- All participation changes require founder review\n\n"

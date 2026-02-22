@@ -25,7 +25,7 @@
 #   3. Local Whisper (STT)          → managed subprocess
 #   4. Local Piper (TTS)            → managed subprocess
 #   5. Compute mesh peer            → WireGuard tunnel
-#   6. Remote Hevolve-Core/hivemind  → world model bridge
+#   6. Remote HevolveAI/hivemind  → world model bridge
 #
 # Architecture:
 #
@@ -45,7 +45,7 @@
 #   │          │                                               │
 #   │  ┌───────┴──────────────────────────────────────────┐   │
 #   │  │  Backends: llama.cpp │ MiniCPM │ Whisper │ Piper │   │
-#   │  │           Mesh Peers │ Hevolve-Core/HiveMind      │   │
+#   │  │           Mesh Peers │ HevolveAI/HiveMind      │   │
 #   │  └──────────────────────────────────────────────────┘   │
 #   └─────────────────────────────────────────────────────────┘
 

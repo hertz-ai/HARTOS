@@ -1,17 +1,17 @@
 """
 Unified Agent Goal Engine - World Model Bridge
 
-Bridge between LLM-langchain orchestration and Hevolve-Core's embodied AI.
+Bridge between LLM-langchain orchestration and HevolveAI's embodied AI.
 Every agent interaction becomes training data for continuous learning.
 Skills distribute via gossip notification + local RALT ingestion.
 
 Dual-mode operation:
   IN-PROCESS (flat/regional): Direct Python calls — zero HTTP overhead.
-    Hevolve-Core is pip-installed, learning functions called directly.
-  HTTP FALLBACK (central standalone): REST calls to remote Hevolve-Core.
+    HevolveAI is pip-installed, learning functions called directly.
+  HTTP FALLBACK (central standalone): REST calls to remote HevolveAI.
     Used when services run as separate processes on different ports.
 
-Bootstrap: Hevolve-Core uses llama.cpp (Qwen3-VL-2B, Q4_K_XL, ~1.5GB) locally.
+Bootstrap: HevolveAI uses llama.cpp (Qwen3-VL-2B, Q4_K_XL, ~1.5GB) locally.
 No external API key needed.  Learning is local-first, distributed via RALT + WAMP.
 
 GUARDRAILS applied at every layer:
@@ -35,14 +35,14 @@ logger = logging.getLogger('hevolve_social')
 
 
 class WorldModelBridge:
-    """Bridge between LLM-langchain orchestration and Hevolve-Core embodied AI.
+    """Bridge between LLM-langchain orchestration and HevolveAI embodied AI.
 
-    Dual-mode: in-process direct Python calls when Hevolve-Core is co-located
+    Dual-mode: in-process direct Python calls when HevolveAI is co-located
     (flat/regional), HTTP fallback when running as separate processes (central).
 
     Two-tier thinking model:
     - Agent-level: Hevolve dispatches coarse-grained goals (task delegation)
-    - Tensor-level: Hevolve-Core fuses heterogeneous agent thoughts (HiveMind)
+    - Tensor-level: HevolveAI fuses heterogeneous agent thoughts (HiveMind)
     This bridge connects the two layers.
     """
 
@@ -97,15 +97,15 @@ class WorldModelBridge:
 
         self._init_in_process()
 
-        # Periodic Hevolve-Core integrity watcher (Gap 1 fix)
+        # Periodic HevolveAI integrity watcher (Gap 1 fix)
         self._crawl_watcher = None
         self._start_crawl_integrity_watcher()
 
     def _start_crawl_integrity_watcher(self) -> None:
-        """Start periodic Hevolve-Core integrity watcher if in-process mode active.
+        """Start periodic HevolveAI integrity watcher if in-process mode active.
 
         No-op if HTTP mode (nothing to watch — HTTP doesn't depend on
-        Hevolve-Core's local file state).
+        HevolveAI's local file state).
         """
         if not self._in_process:
             return
@@ -123,13 +123,13 @@ class WorldModelBridge:
                 f"[WorldModelBridge] CrawlIntegrityWatcher failed: {e}")
 
     def _on_crawl_tamper_detected(self) -> None:
-        """Callback: Hevolve-Core files changed post-boot.
+        """Callback: HevolveAI files changed post-boot.
 
         Disable in-process mode and fall back to HTTP.
         Does NOT halt the hive — that requires master key.
         """
         logger.critical(
-            "[WorldModelBridge] Hevolve-Core tampering detected — "
+            "[WorldModelBridge] HevolveAI tampering detected — "
             "disabling in-process mode, falling back to HTTP")
         with self._lock:
             self._in_process = False
@@ -221,14 +221,14 @@ class WorldModelBridge:
     def _init_in_process(self):
         """Try to connect to in-process learning pipeline (zero HTTP overhead).
 
-        When Hevolve-Core is pip-installed and _init_learning_pipeline() has run
+        When HevolveAI is pip-installed and _init_learning_pipeline() has run
         in langchain_gpt_api.py, we get direct references to the provider
         and hivemind instances. All subsequent calls bypass HTTP entirely.
 
         SECURITY: Integrity verification required before enabling in-process.
-        If Hevolve-Core files don't match the signed manifest, fall back to HTTP.
+        If HevolveAI files don't match the signed manifest, fall back to HTTP.
         """
-        # Integrity gate: verify Hevolve-Core installation before in-process
+        # Integrity gate: verify HevolveAI installation before in-process
         try:
             from security.source_protection import SourceProtectionService
             integrity = SourceProtectionService.verify_hevolveai_integrity()
@@ -236,7 +236,7 @@ class WorldModelBridge:
                 mismatched = integrity.get('mismatched_files', [])
                 if mismatched:
                     logger.warning(
-                        f"[WorldModelBridge] Hevolve-Core integrity FAILED: "
+                        f"[WorldModelBridge] HevolveAI integrity FAILED: "
                         f"{len(mismatched)} mismatched files — forcing HTTP mode")
                     logger.info(
                         f"[WorldModelBridge] HTTP mode: {self._api_url}")
@@ -268,16 +268,16 @@ class WorldModelBridge:
                            prompt: str, response: str,
                            model_id: str = None, latency_ms: float = 0,
                            node_id: str = None, goal_id: str = None):
-        """Record every agent interaction as training data for Hevolve-Core.
+        """Record every agent interaction as training data for HevolveAI.
 
         Called after EVERY /chat response.  Batches experiences and flushes
-        them to Hevolve-Core (in-process or HTTP).
-        Hevolve-Core auto-learns from every completion (3-priority queue:
+        them to HevolveAI (in-process or HTTP).
+        HevolveAI auto-learns from every completion (3-priority queue:
         expert > reality > distillation).
 
         GUARDRAIL: ConstitutionalFilter screens before storage.
         """
-        # Lazy in-process re-check: Hevolve-Core may have initialized after our __init__
+        # Lazy in-process re-check: HevolveAI may have initialized after our __init__
         if not self._in_process and not self._in_process_retry_done:
             self._in_process_retry_done = True
             self._init_in_process()
@@ -326,7 +326,7 @@ class WorldModelBridge:
                 self._flush_executor.submit(self._flush_to_world_model, batch)
 
     def _flush_to_world_model(self, batch: list):
-        """Flush experience batch to Hevolve-Core's learning provider.
+        """Flush experience batch to HevolveAI's learning provider.
 
         In-process mode: calls provider.create_chat_completion() directly.
         HTTP mode: POST /v1/chat/completions (OpenAI format).
@@ -363,7 +363,7 @@ class WorldModelBridge:
                     logger.debug(f"In-process flush error: {e}")
             return
 
-        # HTTP fallback (central standalone or Hevolve-Core not in-process)
+        # HTTP fallback (central standalone or HevolveAI not in-process)
         if self._cb_is_open():
             logger.debug("[WorldModelBridge] Circuit breaker open — skipping HTTP flush")
             return
@@ -431,12 +431,12 @@ class WorldModelBridge:
                           explanation: str = None,
                           context: dict = None,
                           valid_until: str = None) -> dict:
-        """Submit an expert correction to Hevolve-Core's RL-EF system.
+        """Submit an expert correction to HevolveAI's RL-EF system.
 
         In-process: calls send_expert_correction() directly.
         HTTP: POST /v1/corrections.
 
-        Hevolve-Core routes to:
+        HevolveAI routes to:
         - Kernel Continual Learner (instant, no gradient) for factual corrections
         - Orthogonal LoRA (gradient-based, forgetting-safe) for conceptual ones
 
@@ -524,12 +524,12 @@ class WorldModelBridge:
     def query_hivemind(self, query_text: str,
                        timeout_ms: int = 1000,
                        user_id: str = None) -> Optional[dict]:
-        """Query Hevolve-Core's HiveMind for distributed collective thinking.
+        """Query HevolveAI's HiveMind for distributed collective thinking.
 
         In-process: calls hive_mind.think_together_distributed() directly.
         HTTP: POST /v1/hivemind/think.
 
-        Hevolve-Core:
+        HevolveAI:
         1. Encodes query via frozen Qwen alignment layer (2048-D)
         2. Publishes local thought to WAMP
         3. Waits for remote agent responses (timeout_ms)
@@ -695,7 +695,7 @@ class WorldModelBridge:
 
         Gossip broadcasts a notification that a skill is available.
         Each receiving peer triggers RALT ingestion through their own
-        local Hevolve-Core instance.
+        local HevolveAI instance.
 
         GUARDRAILS:
         1. CCT gate — requires 'skill_distribution' capability
@@ -733,7 +733,7 @@ class WorldModelBridge:
             pass
 
         # Notify peers via gossip that a skill is available
-        # Each peer ingests via their local Hevolve-Core RALT receiver
+        # Each peer ingests via their local HevolveAI RALT receiver
         try:
             from integrations.social.peer_discovery import gossip
             gossip.broadcast({
@@ -760,7 +760,7 @@ class WorldModelBridge:
         """Check learning pipeline health.
 
         In-process: returns healthy if provider is available.
-        HTTP: GET /health on Hevolve-Core API.
+        HTTP: GET /health on HevolveAI API.
         """
         if self._in_process and self._provider:
             return {
@@ -813,7 +813,7 @@ class WorldModelBridge:
     # ─── Embodied interaction (same latent space) ────────────────
 
     def send_action(self, action: dict) -> bool:
-        """Send a motor/actuator command to Hevolve-Core's world model.
+        """Send a motor/actuator command to HevolveAI's world model.
 
         The world model operates in one latent space — text, sensors,
         motors are all representations of the same world.  Actions are
@@ -843,7 +843,7 @@ class WorldModelBridge:
         except ImportError:
             pass
 
-        # In-process: direct call to Hevolve-Core action stream
+        # In-process: direct call to HevolveAI action stream
         if self._in_process and self._provider:
             try:
                 from hevolveai.embodied_ai.action_stream import send_action
@@ -878,10 +878,10 @@ class WorldModelBridge:
             return False
 
     def ingest_sensor_batch(self, readings: list) -> int:
-        """Feed sensor data to Hevolve-Core's world model for learning.
+        """Feed sensor data to HevolveAI's world model for learning.
 
         The world model's latent space includes physical sensor state.
-        This method batches sensor readings and flushes them to Hevolve-Core
+        This method batches sensor readings and flushes them to HevolveAI
         for continuous learning — the same way text experiences are flushed.
 
         Args:
@@ -928,14 +928,14 @@ class WorldModelBridge:
             return 0
 
     def get_learning_feedback(self) -> Optional[Dict]:
-        """Poll Hevolve-Core for real-time learning feedback.
+        """Poll HevolveAI for real-time learning feedback.
 
         The world model continuously learns from sensor+action data.
         This method retrieves corrections/predictions — trajectory
         adjustments, new obstacle awareness, learned patterns.
 
         Returns:
-            Feedback dict from Hevolve-Core, or None if unavailable.
+            Feedback dict from HevolveAI, or None if unavailable.
         """
         # In-process
         if self._in_process:
@@ -988,9 +988,9 @@ class WorldModelBridge:
             self._stats['total_recorded'] = self._stats.get('total_recorded', 0) + 1
 
     def emergency_stop(self) -> bool:
-        """Send zero-velocity to all actuators via Hevolve-Core.
+        """Send zero-velocity to all actuators via HevolveAI.
 
-        This is the bridge-level emergency stop — it tells Hevolve-Core to
+        This is the bridge-level emergency stop — it tells HevolveAI to
         immediately halt all physical outputs.
         """
         estop_action = {
@@ -1036,8 +1036,8 @@ class WorldModelBridge:
     def apply_federation_update(self, aggregated: dict) -> bool:
         """Store aggregated network-wide metrics locally.
 
-        Does NOT push to Hevolve-Core — federation metrics are consumed
-        by BenchmarkRegistry and dashboard, not Hevolve-Core's learning pipeline.
+        Does NOT push to HevolveAI — federation metrics are consumed
+        by BenchmarkRegistry and dashboard, not HevolveAI's learning pipeline.
         """
         self._federation_aggregated = aggregated
         return True

@@ -76,7 +76,7 @@ class DashboardService:
             summary['by_type'][t] = summary['by_type'].get(t, 0) + 1
             summary['by_status'][s] = summary['by_status'].get(s, 0) + 1
 
-        # World model (Hevolve-Core) status
+        # World model (HevolveAI) status
         world_model = {'healthy': False, 'error': 'unavailable'}
         try:
             from integrations.agent_engine.world_model_bridge import (

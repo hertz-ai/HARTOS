@@ -1,8 +1,8 @@
 """
-Build Script: Compile Hevolve-Core for Nunba bundling.
+Build Script: Compile HevolveAI for Nunba bundling.
 
 Steps:
-  1. Find installed Hevolve-Core package
+  1. Find installed HevolveAI package
   2. Compile all .py → .pyc (compileall)
   3. Generate SHA-256 manifest of compiled files
   4. Sign manifest with node's Ed25519 key
@@ -26,15 +26,15 @@ from pathlib import Path
 
 
 def find_hevolveai_root() -> Path:
-    """Find the installed Hevolve-Core package root."""
+    """Find the installed HevolveAI package root."""
     try:
         spec = importlib.util.find_spec('hevolveai')
     except (ModuleNotFoundError, ValueError):
-        print("ERROR: Hevolve-Core not installed", file=sys.stderr)
+        print("ERROR: HevolveAI not installed", file=sys.stderr)
         sys.exit(1)
 
     if spec is None or not spec.submodule_search_locations:
-        print("ERROR: cannot locate Hevolve-Core package", file=sys.stderr)
+        print("ERROR: cannot locate HevolveAI package", file=sys.stderr)
         sys.exit(1)
 
     return Path(list(spec.submodule_search_locations)[0])
@@ -122,7 +122,7 @@ def strip_source(pkg_root: Path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Compile Hevolve-Core for Nunba bundling')
+        description='Compile HevolveAI for Nunba bundling')
     parser.add_argument('--strip-source', action='store_true',
                         help='Remove .py source after compilation')
     parser.add_argument('--output-dir', type=str, default=None,
@@ -133,7 +133,7 @@ def main():
     args = parser.parse_args()
 
     pkg_root = find_hevolveai_root()
-    print(f"Found Hevolve-Core at: {pkg_root}")
+    print(f"Found HevolveAI at: {pkg_root}")
 
     output = Path(args.output_dir) if args.output_dir else None
     target = compile_package(pkg_root, output)

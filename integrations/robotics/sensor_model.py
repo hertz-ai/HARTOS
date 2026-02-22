@@ -3,9 +3,9 @@ Sensor Data Model — Unified representation for all sensor types.
 
 Every sensor reading is a SensorReading dataclass with timestamps,
 frame IDs, covariance, and type-specific data.  This is the format
-that flows through SensorStore → WorldModelBridge → Hevolve-Core.
+that flows through SensorStore → WorldModelBridge → HevolveAI.
 
-Hevolve-Core's world model operates in one latent space: text, sensors,
+HevolveAI's world model operates in one latent space: text, sensors,
 motors are all representations of the same world.  This model ensures
 sensor data is structured consistently for that unified space.
 
@@ -95,7 +95,7 @@ class SensorReading:
     """Universal sensor data format.
 
     This is the atom of sensor data that flows through the system:
-    SensorStore → WorldModelBridge → Hevolve-Core latent space.
+    SensorStore → WorldModelBridge → HevolveAI latent space.
     """
     sensor_id: str              # e.g., 'imu_0', 'gps_0', 'lidar_front'
     sensor_type: str            # One of SENSOR_SCHEMAS keys

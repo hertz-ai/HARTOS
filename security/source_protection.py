@@ -1,14 +1,14 @@
 """
-Source Protection Service — Hevolve-Core integrity verification.
+Source Protection Service — HevolveAI integrity verification.
 
-Multi-layer defense for Hevolve-Core source code:
+Multi-layer defense for HevolveAI source code:
   1. pip install: SSH key required (git+ssh://)
   2. Nunba bundling: .pyc only (source stripped)
   3. Boot verification: hash manifest signed by build node
   4. Runtime gating: certificate tier + CCT gates feature access
 
 This module answers:
-  - Is Hevolve-Core installed? How? (SSH, HTTPS, wheel, bundled)
+  - Is HevolveAI installed? How? (SSH, HTTPS, wheel, bundled)
   - Is the source code visible? (Should be False in production)
   - Does the installed code match the known-good manifest?
 
@@ -34,15 +34,15 @@ _MANIFEST_PATH = os.environ.get(
 
 
 class SourceProtectionService:
-    """Verifies Hevolve-Core installation integrity.
+    """Verifies HevolveAI installation integrity.
 
-    Called at boot and periodically to ensure the installed Hevolve-Core
+    Called at boot and periodically to ensure the installed HevolveAI
     code matches the signed manifest.  Mismatch → HTTP fallback only.
     """
 
     @staticmethod
     def check_install_method() -> str:
-        """Detect how Hevolve-Core was installed.
+        """Detect how HevolveAI was installed.
 
         Returns one of:
             'git_ssh'       — pip install from SSH URL
@@ -50,7 +50,7 @@ class SourceProtectionService:
             'pip_wheel'     — installed from a wheel/sdist
             'bundled_pyc'   — .pyc only (Nunba build)
             'bundled_cython'— .so/.pyd (Cython compiled)
-            'not_installed' — Hevolve-Core not found
+            'not_installed' — HevolveAI not found
             'unknown'       — detected but method unclear
         """
         try:
@@ -106,7 +106,7 @@ class SourceProtectionService:
 
     @staticmethod
     def is_source_visible() -> bool:
-        """Check if Hevolve-Core .py source files are present.
+        """Check if HevolveAI .py source files are present.
 
         In production (Nunba builds), only .pyc should exist.
         Returns True if .py source is found (bad for production).
@@ -138,7 +138,7 @@ class SourceProtectionService:
 
     @staticmethod
     def verify_hevolveai_integrity() -> Dict:
-        """Verify installed Hevolve-Core against known-good manifest.
+        """Verify installed HevolveAI against known-good manifest.
 
         Returns:
             {
@@ -160,7 +160,7 @@ class SourceProtectionService:
         }
 
         if result['install_method'] == 'not_installed':
-            result['error'] = 'Hevolve-Core not installed'
+            result['error'] = 'HevolveAI not installed'
             return result
 
         # Load manifest
@@ -171,11 +171,11 @@ class SourceProtectionService:
             result['verified'] = False
             return result
 
-        # Find Hevolve-Core package root
+        # Find HevolveAI package root
         try:
             spec = importlib.util.find_spec('hevolveai')
             if spec is None or not spec.submodule_search_locations:
-                result['error'] = 'cannot locate Hevolve-Core package'
+                result['error'] = 'cannot locate HevolveAI package'
                 return result
             pkg_root = Path(list(spec.submodule_search_locations)[0])
         except Exception as e:
@@ -240,7 +240,7 @@ def compute_dependency_hash(package_name: str) -> Optional[str]:
     overall code hash for tamper detection.
 
     Args:
-        package_name: pip package name (e.g. 'hevolveai' / Hevolve-Core)
+        package_name: pip package name (e.g. 'hevolveai' / HevolveAI)
 
     Returns:
         hex digest string or None if package not found
@@ -272,9 +272,9 @@ def compute_dependency_hash(package_name: str) -> Optional[str]:
 
 
 class CrawlIntegrityWatcher:
-    """Periodic re-verification of Hevolve-Core package integrity post-boot.
+    """Periodic re-verification of HevolveAI package integrity post-boot.
 
-    Mirrors RuntimeIntegrityMonitor's pattern but scoped to the Hevolve-Core
+    Mirrors RuntimeIntegrityMonitor's pattern but scoped to the HevolveAI
     package only.  On tamper detection, fires registered callbacks instead
     of halting the hive — callers decide how to respond (e.g. disable
     in-process mode, fall back to HTTP).
@@ -320,7 +320,7 @@ class CrawlIntegrityWatcher:
             f"(interval={self._check_interval}s, "
             f"boot_hash={self._boot_hash[:16]}...)"
             if self._boot_hash else
-            "[CrawlIntegrityWatcher] Started (Hevolve-Core not installed)")
+            "[CrawlIntegrityWatcher] Started (HevolveAI not installed)")
 
     def stop(self) -> None:
         """Stop the watcher gracefully."""
@@ -337,7 +337,7 @@ class CrawlIntegrityWatcher:
     # ── Internal loop ────────────────────────────────────────────
 
     def _check_loop(self) -> None:
-        """Background loop: re-hash Hevolve-Core every interval."""
+        """Background loop: re-hash HevolveAI every interval."""
         if os.environ.get('HEVOLVE_TAMPER_CHECK_SKIP', '').lower() == 'true':
             logger.info(
                 "[CrawlIntegrityWatcher] Checks disabled "
@@ -353,7 +353,7 @@ class CrawlIntegrityWatcher:
                 if current and self._boot_hash and current != self._boot_hash:
                     logger.critical(
                         f"[CrawlIntegrityWatcher] TAMPERING DETECTED: "
-                        f"Hevolve-Core hash changed from "
+                        f"HevolveAI hash changed from "
                         f"{self._boot_hash[:16]}... "
                         f"to {current[:16]}...")
                     self._tampered = True
@@ -376,7 +376,7 @@ class CrawlIntegrityWatcher:
                     f"[CrawlIntegrityWatcher] Callback error: {e}")
 
     def _compute_current_hash(self) -> str:
-        """Compute combined SHA-256 over all Hevolve-Core package files."""
+        """Compute combined SHA-256 over all HevolveAI package files."""
         return compute_dependency_hash('hevolveai') or ''
 
     # ── Test helper ──────────────────────────────────────────────

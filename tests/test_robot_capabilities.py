@@ -11,7 +11,7 @@ Covers:
   - Device routing: 'robot' form factor
 
 Boundary enforcement: every test verifies that intelligence stays
-in Hevolve-Core and routing/orchestration stays here.
+in HevolveAI and routing/orchestration stays here.
 """
 import json
 import os
@@ -540,7 +540,7 @@ class TestGossipBeacon:
             pytest.skip("Robotics package not available")
 
 
-# ── Integration: Tool → Bridge → Hevolve-Core routing ───────────────
+# ── Integration: Tool → Bridge → HevolveAI routing ───────────────
 
 class TestToolBridgeIntegration:
     @patch('integrations.agent_engine.world_model_bridge.requests.post')
@@ -554,7 +554,7 @@ class TestToolBridgeIntegration:
         with patch('integrations.robotics.safety_monitor.get_safety_monitor',
                    return_value=mock_monitor):
             result = json.loads(navigate_to(x=1.0, y=2.0, z=0.0))
-        # Verify the POST was made (action routed to Hevolve-Core)
+        # Verify the POST was made (action routed to HevolveAI)
         assert mock_post.called or result.get('success') is not None
 
     def test_capability_advertiser_no_intelligence(self):

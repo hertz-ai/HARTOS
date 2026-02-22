@@ -1,5 +1,5 @@
 """
-Tests for Batch 5: Hevolve-Core Source Protection.
+Tests for Batch 5: HevolveAI Source Protection.
 
 Covers:
   - SourceProtectionService: install detection, source visibility, integrity
@@ -423,7 +423,7 @@ class TestCrawlIntegrityWatcher:
         assert watcher.is_healthy is True
 
     def test_hevolveai_not_installed_no_false_tamper(self):
-        """Empty hash from missing Hevolve-Core doesn't trigger false tamper."""
+        """Empty hash from missing HevolveAI doesn't trigger false tamper."""
         from security.source_protection import CrawlIntegrityWatcher
         with patch('security.source_protection.compute_dependency_hash',
                    return_value=None):

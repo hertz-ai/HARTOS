@@ -3,10 +3,10 @@ Action Data Model — Universal representation for robot actions.
 
 Actions are the world model's predictions tested against reality.
 They flow from LLM-langchain's agentic layer through WorldModelBridge
-to Hevolve-Core's native embodiment where the actual execution happens.
+to HevolveAI's native embodiment where the actual execution happens.
 
 This is a data model only — no intelligence.  The actual motor control,
-kinematics, PID loops live in Hevolve-Core (raw native intelligence).
+kinematics, PID loops live in HevolveAI (raw native intelligence).
 
 Action types:
     motor_velocity, servo_position, gpio_output, gripper,
@@ -21,7 +21,7 @@ from typing import Any, Dict, Optional
 class RobotAction:
     """Universal action format.
 
-    Flows: Agent goal → dispatch → RobotAction → WorldModelBridge → Hevolve-Core
+    Flows: Agent goal → dispatch → RobotAction → WorldModelBridge → HevolveAI
     """
     action_type: str            # motor_velocity, servo_position, gpio_output, etc.
     target: str                 # Actuator identifier (e.g., 'left_wheel', 'gripper_0')
@@ -32,7 +32,7 @@ class RobotAction:
     source: str = 'agent'       # 'agent', 'recipe', 'safety', 'fleet_command'
 
     def to_dict(self) -> Dict:
-        """Serialize for transport to Hevolve-Core via WorldModelBridge."""
+        """Serialize for transport to HevolveAI via WorldModelBridge."""
         return {
             'type': self.action_type,
             'target': self.target,

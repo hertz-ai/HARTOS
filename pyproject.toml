@@ -91,7 +91,7 @@ dependencies = [
     "transformers>=4.30.0",
 
     # Embodied AI — learning pipeline, hivemind, distributed intelligence
-    "embodied-ai @ git+https://github.com/hertz-ai/hevolve-core.git@main",
+    "embodied-ai @ git+https://github.com/hertz-ai/hevolveai.git@main",
 
     # Security
     "cryptography>=41.0.0",

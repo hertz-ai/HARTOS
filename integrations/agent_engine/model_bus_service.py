@@ -15,7 +15,7 @@ The bus routes to the best available backend:
   2. Local MiniCPM (vision)
   3. Local Whisper (STT) / Piper (TTS)
   4. Compute mesh peers (same user's other devices)
-  5. Remote Hevolve-Core/hivemind (world model)
+  5. Remote HevolveAI/hivemind (world model)
 """
 import json
 import logging

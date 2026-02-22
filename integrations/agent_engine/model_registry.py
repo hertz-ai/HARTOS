@@ -290,7 +290,7 @@ def _register_defaults():
     if hevolveai_url:
         model_registry.register(ModelBackend(
             model_id='hevolveai-learning',
-            display_name='Hevolve-Core World Model (Learning)',
+            display_name='HevolveAI World Model (Learning)',
             tier=ModelTier.BALANCED,
             config_list_entry={
                 'model': 'hevolveai-learning',

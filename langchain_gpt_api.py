@@ -266,7 +266,7 @@ class ChatQwen3VL(LLM):
             payload["stop"] = stop
 
         _log = logging.getLogger(__name__)
-        # Primary: Hevolve-Core embodied-ai on port 8000
+        # Primary: HevolveAI embodied-ai on port 8000
         try:
             response = pooled_post(
                 f"{self.base_url}/chat/completions",
@@ -413,7 +413,7 @@ else:
 handler = RotatingFileHandler(_langchain_log_path, maxBytes=5_000_000, backupCount=2)
 
 # Set the logging level for the file handler
-# Was ERROR — changed to INFO so that LangChain, Hevolve-Core, and other library
+# Was ERROR — changed to INFO so that LangChain, HevolveAI, and other library
 # logs are captured in Documents/Nunba/logs/langchain.log (not just errors).
 handler.setLevel(logging.INFO)
 
@@ -425,7 +425,7 @@ handler.setFormatter(formatter)
 stream_handler.setFormatter(formatter)
 
 # In bundled mode, also attach the file handler to the root logger so that ALL
-# module loggers (hevolve-core, langchain, etc.) write to Documents/Nunba/logs/langchain.log
+# module loggers (hevolveai, langchain, etc.) write to Documents/Nunba/logs/langchain.log
 if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
     _root = logging.getLogger()
     _root.addHandler(handler)
@@ -541,7 +541,7 @@ for _cfg_key in ('OPENAI_API_KEY', 'GOOGLE_CSE_ID', 'GOOGLE_API_KEY',
     else:
         os.environ.setdefault(_cfg_key, '')
 
-# Mode-aware inference: pass LLM endpoint to Hevolve-Core for non-flat deployments
+# Mode-aware inference: pass LLM endpoint to HevolveAI for non-flat deployments
 _node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
 _active_cloud = os.environ.get('HEVOLVE_ACTIVE_CLOUD_PROVIDER', '')
 if _node_tier in ('regional', 'central'):
@@ -551,7 +551,7 @@ if _node_tier in ('regional', 'central'):
 elif _active_cloud and os.environ.get('HEVOLVE_LLM_API_KEY'):
     # Wizard-configured cloud provider (flat mode desktop user).
     # Vault already populated HEVOLVE_LLM_* env vars via export_to_env() in app.py.
-    # Hevolve-Core's create_learning_llm_config() reads these automatically.
+    # HevolveAI's create_learning_llm_config() reads these automatically.
     pass
 # Cloud fallback for adaptive routing (flat mode — offload when local CPU overloaded)
 if config.get('CLOUD_FALLBACK_URL'):
@@ -577,7 +577,7 @@ RAG_API = config.get('RAG_API', '')
 DB_URL = config.get('DB_URL', _ip.get('database_url', ''))
 
 # ============================================================================
-# Embodied AI Learning Pipeline (Hevolve-Core — in-process, no extra port)
+# Embodied AI Learning Pipeline (HevolveAI — in-process, no extra port)
 # ============================================================================
 _learning_provider = None
 _hive_mind = None
@@ -607,11 +607,11 @@ def _wait_for_llm_server(url=None, timeout=15):
     """Wait for llama.cpp server, giving parent process time to start it.
 
     In Nunba (flat mode), the desktop app starts llama.cpp in a background
-    thread.  This function polls the health endpoint so Hevolve-Core sees an
+    thread.  This function polls the health endpoint so HevolveAI sees an
     existing server and reuses it instead of auto-starting a second one.
 
     In standalone mode nobody else starts the server, so after *timeout*
-    seconds we return False and let Hevolve-Core auto-start as usual.
+    seconds we return False and let HevolveAI auto-start as usual.
 
     Returns True if server found, False if timeout expired.
     """
@@ -631,12 +631,12 @@ def _wait_for_llm_server(url=None, timeout=15):
         time.sleep(1)
     _logger.info(
         f"[EmbodiedAI] No server on {url} after {timeout}s "
-        "\u2014 Hevolve-Core will auto-start")
+        "\u2014 HevolveAI will auto-start")
     return False
 
 
 def _init_learning_pipeline():
-    """Initialize Hevolve-Core's learning pipeline in-process.
+    """Initialize HevolveAI's learning pipeline in-process.
 
     Instead of starting a separate server on port 8000,
     we import and initialize the learning components directly.
@@ -654,11 +654,11 @@ def _init_learning_pipeline():
     **Standalone (start_with_tracing.bat, ``python langchain_gpt_api.py``):**
         Brief 5 s wait (in case user already has llama.cpp running).
         If nothing responds, ``create_learning_llm_config()`` calls
-        Hevolve-Core which auto-starts its own server.  Default behaviour,
+        HevolveAI which auto-starts its own server.  Default behaviour,
         no mode config needed.
 
     **Cloud API configured (``HEVOLVE_LLM_ENDPOINT_URL``):**
-        Skip local server wait entirely — Hevolve-Core's Priority 0 path
+        Skip local server wait entirely — HevolveAI's Priority 0 path
         routes to the external endpoint.
     """
     global _learning_provider, _hive_mind, _trace_recorder
@@ -680,7 +680,7 @@ def _init_learning_pipeline():
 
         # ── Decide how to handle the local llama.cpp server ──
         if cloud:
-            # Cloud endpoint configured — Hevolve-Core uses it directly,
+            # Cloud endpoint configured — HevolveAI uses it directly,
             # no need to wait for or start a local server.
             _logger.info(
                 "[EmbodiedAI] Cloud API configured — skipping local server wait")
@@ -694,7 +694,7 @@ def _init_learning_pipeline():
                     "— learning disabled (chat still works)")
                 return
         else:
-            # Standalone — brief courtesy wait then let Hevolve-Core auto-start.
+            # Standalone — brief courtesy wait then let HevolveAI auto-start.
             _wait_for_llm_server(timeout=5)
 
         # Trace recorder
@@ -732,7 +732,7 @@ def _init_learning_pipeline():
 
     except ImportError as e:
         logging.getLogger(__name__).warning(
-            f"[EmbodiedAI] Hevolve-Core not installed — learning disabled: {e}")
+            f"[EmbodiedAI] HevolveAI not installed — learning disabled: {e}")
     except Exception as e:
         logging.getLogger(__name__).error(
             f"[EmbodiedAI] Learning pipeline init failed: {e}")
@@ -809,7 +809,7 @@ def get_frame_store():
 
 
 def _wire_vision_to_learning():
-    """Connect FrameStore to Hevolve-Core's video learning pipeline.
+    """Connect FrameStore to HevolveAI's video learning pipeline.
 
     Waits up to 60s for both VisionService and LearningLLMProvider,
     then calls start_video_learning().
@@ -832,7 +832,7 @@ def _wire_vision_to_learning():
                 frame_store_user_id='default',
             )
             _logger.info(
-                "[Wiring] FrameStore → Hevolve-Core video learning connected")
+                "[Wiring] FrameStore → HevolveAI video learning connected")
         else:
             _logger.info(
                 "[Wiring] LearningProvider has no start_video_learning — skip")
@@ -845,7 +845,7 @@ threading.Thread(
     target=_init_vision_service, daemon=True,
     name='vision_init').start()
 
-# Wire FrameStore to Hevolve-Core after both subsystems are ready
+# Wire FrameStore to HevolveAI after both subsystems are ready
 threading.Thread(
     target=_wire_vision_to_learning, daemon=True,
     name='vision_learning_wire').start()
@@ -3771,7 +3771,7 @@ def status():
     result['llm_backend'] = _get_active_backend_info()
     result['node_tier'] = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
 
-    # Hevolve-Core health (non-blocking, fail-safe)
+    # HevolveAI health (non-blocking, fail-safe)
     try:
         from integrations.agent_engine.world_model_bridge import get_world_model_bridge
         bridge = get_world_model_bridge()
@@ -3838,7 +3838,7 @@ def health_readiness():
         checks['node_identity'] = f'fail: {e}'
         all_ok = False
 
-    # Check 3: Hevolve-Core bridge (optional — not critical)
+    # Check 3: HevolveAI bridge (optional — not critical)
     try:
         from integrations.agent_engine.world_model_bridge import get_world_model_bridge
         bridge = get_world_model_bridge()

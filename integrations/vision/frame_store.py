@@ -8,14 +8,14 @@ Camera descriptions are also persisted to DB (longer-lived context).
 Screen descriptions are short-lived TTL only (they go stale fast).
 
 Re-exports compute_frame_difference and decode_jpeg from
-Hevolve-Core's visual_encoding utilities (canonical source).
+HevolveAI's visual_encoding utilities (canonical source).
 """
 import threading
 import time
 from collections import deque
 from typing import Optional, Dict, Any, List, Tuple
 
-# Canonical frame utilities live in Hevolve-Core (downstream dep).
+# Canonical frame utilities live in HevolveAI (downstream dep).
 # Re-export here so VisionService imports stay clean.
 try:
     from hevolveai.embodied_ai.utils.visual_encoding import (
@@ -23,10 +23,10 @@ try:
         decode_jpeg,
     )
 except ImportError:
-    # Fallback if Hevolve-Core not installed (e.g. tests without full deps)
+    # Fallback if HevolveAI not installed (e.g. tests without full deps)
     import logging as _logging
     _logging.getLogger(__name__).warning(
-        "Hevolve-Core not installed — visual_encoding using numpy fallback")
+        "HevolveAI not installed — visual_encoding using numpy fallback")
     import numpy as np
 
     def compute_frame_difference(frame1: 'np.ndarray', frame2: 'np.ndarray') -> float:

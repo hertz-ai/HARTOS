@@ -1553,9 +1553,9 @@ class TestSpeculativeDispatcher:
 # =============================================================================
 
 class TestWorldModelBridge:
-    """Tests for Hevolve-Core-integrated WorldModelBridge.
+    """Tests for HevolveAI-integrated WorldModelBridge.
 
-    The bridge forwards interactions to Hevolve-Core's real endpoints:
+    The bridge forwards interactions to HevolveAI's real endpoints:
     POST /v1/chat/completions, POST /v1/corrections, POST /v1/hivemind/think,
     GET /v1/stats, GET /v1/hivemind/stats, GET /v1/hivemind/agents, GET /health.
     """

@@ -5,9 +5,9 @@ Answers: "What can this robot DO?" — by combining:
   1. system_requirements.py HardwareProfile (CPU, RAM, GPU, sensors)
   2. SensorStore.active_sensors() (what sensors are currently live)
   3. robot_config.json (static configuration — arm DOF, payload, form factor)
-  4. Hevolve-Core capability query via WorldModelBridge (what native skills exist)
+  4. HevolveAI capability query via WorldModelBridge (what native skills exist)
 
-This is DISCOVERY, not intelligence.  Hevolve-Core owns the actual capabilities.
+This is DISCOVERY, not intelligence.  HevolveAI owns the actual capabilities.
 We just ask it what it can do, and advertise that to the fleet.
 
 The match_score() method lets dispatch route tasks to the right robot:
@@ -33,7 +33,7 @@ class RobotCapabilityAdvertiser:
         self._detected = False
 
     def detect_capabilities(self) -> Dict[str, Any]:
-        """Detect all capabilities from hardware profile, sensors, config, Hevolve-Core.
+        """Detect all capabilities from hardware profile, sensors, config, HevolveAI.
 
         Returns a structured dict:
             locomotion: {type, max_speed, ...} or None
@@ -44,7 +44,7 @@ class RobotCapabilityAdvertiser:
             payload_kg: float or None
             battery: {voltage, capacity_wh} or None
             form_factor: str (rover, arm, drone, humanoid, stationary, unknown)
-            native_skills: [list from Hevolve-Core] or []
+            native_skills: [list from HevolveAI] or []
         """
         caps: Dict[str, Any] = {
             'locomotion': None,
@@ -67,7 +67,7 @@ class RobotCapabilityAdvertiser:
         # 3. Static config (robot_config.json)
         self._detect_from_config_file(caps)
 
-        # 4. Hevolve-Core native capabilities (via WorldModelBridge)
+        # 4. HevolveAI native capabilities (via WorldModelBridge)
         self._detect_from_hevolveai(caps)
 
         self._capabilities = caps
@@ -213,7 +213,7 @@ class RobotCapabilityAdvertiser:
             caps['actuators'] = config['actuators']
 
     def _detect_from_hevolveai(self, caps: Dict):
-        """Query Hevolve-Core for native capabilities via WorldModelBridge."""
+        """Query HevolveAI for native capabilities via WorldModelBridge."""
         try:
             from integrations.agent_engine.world_model_bridge import (
                 get_world_model_bridge,
@@ -225,7 +225,7 @@ class RobotCapabilityAdvertiser:
                 if isinstance(skills, list):
                     caps['native_skills'] = skills
         except Exception as e:
-            logger.debug(f"Hevolve-Core capability query skipped: {e}")
+            logger.debug(f"HevolveAI capability query skipped: {e}")
 
 
 # ── Singleton ─────────────────────────────────────────────────

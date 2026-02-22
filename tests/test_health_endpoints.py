@@ -63,7 +63,7 @@ class TestHealthReadiness:
         assert 'node_identity' in data['checks']
 
     def test_ready_includes_optional_checks(self, client):
-        """Readiness check includes optional Hevolve-Core and llm_backend."""
+        """Readiness check includes optional HevolveAI and llm_backend."""
         resp = client.get('/ready')
         data = resp.get_json()
         assert 'hevolve_core' in data['checks']

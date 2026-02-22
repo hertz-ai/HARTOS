@@ -14,8 +14,8 @@ from typing import Dict, Any
 import sys
 from pathlib import Path
 
-# Add Hevolve-Core to path
-_hevolve_core_path = Path("C:/Users/sathi/PycharmProjects/hevolve-core")
+# Add HevolveAI to path
+_hevolve_core_path = Path("C:/Users/sathi/PycharmProjects/hevolveai")
 if not _hevolve_core_path.exists():
     _hevolve_core_path = Path("C:/Users/sathi/PycharmProjects/hevolveai")  # legacy fallback
 if _hevolve_core_path.exists():

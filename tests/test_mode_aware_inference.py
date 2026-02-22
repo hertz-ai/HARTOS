@@ -19,7 +19,7 @@ import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# ─── Hevolve-Core src is in a sibling project ───
+# ─── HevolveAI src is in a sibling project ───
 HevolveAI_SRC = os.path.normpath(os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     '..', 'hevolveai', 'src'
@@ -894,11 +894,11 @@ class TestEncoderAdaptiveWrapping:
 # ════════════════════════════════════════════════════════════════════
 
 class TestEmbodiedInProcess:
-    """Test in-process learning pipeline (Hevolve-Core - zero HTTP overhead)."""
+    """Test in-process learning pipeline (HevolveAI - zero HTTP overhead)."""
 
     def test_init_learning_pipeline_success(self):
-        """Mock Hevolve-Core imports → verify provider + hivemind initialized."""
-        # Mock the Hevolve-Core modules
+        """Mock HevolveAI imports → verify provider + hivemind initialized."""
+        # Mock the HevolveAI modules
         mock_provider = MagicMock()
         mock_hive = MagicMock()
         mock_config = {'_provider': mock_provider}
@@ -1064,7 +1064,7 @@ class TestEmbodiedInProcess:
 # ════════════════════════════════════════════════════════════════════
 
 class TestInstallTimeDependencies:
-    """Verify the dependency declarations that wire Hevolve-Core into hevolve-backend.
+    """Verify the dependency declarations that wire HevolveAI into hevolve-backend.
 
     These tests guard the install-time contract:
       Nunba build.py → pip install hevolve-backend → pip resolves embodied-ai
@@ -1084,15 +1084,15 @@ class TestInstallTimeDependencies:
         # Must contain the git dependency for embodied-ai
         assert 'embodied-ai' in content, (
             "pyproject.toml must declare embodied-ai as a dependency. "
-            "Without it, Hevolve-Core won't be installed and the learning "
+            "Without it, HevolveAI won't be installed and the learning "
             "pipeline will silently fail on every node."
         )
-        assert 'git+https://github.com/hertz-ai/hevolve-core' in content, (
-            "embodied-ai must point to the Hevolve-Core git repo"
+        assert 'git+https://github.com/hertz-ai/hevolveai' in content, (
+            "embodied-ai must point to the HevolveAI git repo"
         )
 
     def test_hevolveai_setup_uses_src_package_dir(self):
-        """Hevolve-Core's setup.py MUST use package_dir={'': 'src'}.
+        """HevolveAI's setup.py MUST use package_dir={'': 'src'}.
 
         Without this, pip install creates 'src.hevolveai' import paths instead
         of 'hevolveai', breaking all in-process imports from world_model_bridge
@@ -1100,7 +1100,7 @@ class TestInstallTimeDependencies:
         """
         setup_path = os.path.normpath(os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            '..', 'hevolve-core', 'setup.py',
+            '..', 'hevolveai', 'setup.py',
         ))
         if not os.path.exists(setup_path):
             setup_path = os.path.normpath(os.path.join(
@@ -1108,7 +1108,7 @@ class TestInstallTimeDependencies:
                 '..', 'hevolveai', 'setup.py',  # legacy fallback
             ))
         if not os.path.exists(setup_path):
-            pytest.skip("Hevolve-Core repo not found as sibling")
+            pytest.skip("HevolveAI repo not found as sibling")
 
         with open(setup_path, 'r') as f:
             content = f.read()
@@ -1122,7 +1122,7 @@ class TestInstallTimeDependencies:
         )
 
     def test_no_src_prefix_in_hevolveai_source_imports(self):
-        """No source file under hevolve-core/src/ should import 'from src.hevolveai'.
+        """No source file under hevolveai/src/ should import 'from src.hevolveai'.
 
         After the import fix, all imports must be 'from hevolveai.*'.
         'from src.hevolveai.*' only works with sys.path hacks and breaks
@@ -1130,7 +1130,7 @@ class TestInstallTimeDependencies:
         """
         hevolveai_src = os.path.normpath(os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            '..', 'hevolve-core', 'src',
+            '..', 'hevolveai', 'src',
         ))
         if not os.path.isdir(hevolveai_src):
             hevolveai_src = os.path.normpath(os.path.join(
@@ -1138,7 +1138,7 @@ class TestInstallTimeDependencies:
                 '..', 'hevolveai', 'src',  # legacy fallback
             ))
         if not os.path.isdir(hevolveai_src):
-            pytest.skip("Hevolve-Core repo not found as sibling")
+            pytest.skip("HevolveAI repo not found as sibling")
 
         bad_files = []
         for root, dirs, files in os.walk(hevolveai_src):
@@ -1180,7 +1180,7 @@ class TestInstallTimeDependencies:
         import langchain_gpt_api as lgapi
         assert hasattr(lgapi, '_init_learning_pipeline'), (
             "langchain_gpt_api must have _init_learning_pipeline() for "
-            "in-process Hevolve-Core initialization"
+            "in-process HevolveAI initialization"
         )
         assert callable(lgapi._init_learning_pipeline)
 
@@ -1218,7 +1218,7 @@ class TestBuildInstallOrder:
         """build.py must have _install_embodied_ai function."""
         assert hasattr(build_module, '_install_embodied_ai'), (
             "build.py must define _install_embodied_ai() for local-first "
-            "Hevolve-Core installation"
+            "HevolveAI installation"
         )
 
     def test_install_embodied_ai_tries_local_first(self, build_module):
@@ -1228,10 +1228,10 @@ class TestBuildInstallOrder:
 
         # Must check for local sibling (setup.py existence)
         assert 'setup.py' in source, (
-            "_install_embodied_ai must check for local hevolve-core/setup.py"
+            "_install_embodied_ai must check for local hevolveai/setup.py"
         )
         # Must have GitHub fallback
-        assert 'hevolve-core.git' in source, (
+        assert 'hevolveai.git' in source, (
             "_install_embodied_ai must fall back to GitHub if no local sibling"
         )
 
@@ -1536,9 +1536,9 @@ class TestCentralModeBehavior:
       - hevolve-backend on port 6777
       - database on port 6006
       - llama.cpp on port 8080
-      - Hevolve-Core MAY run as separate process (HTTP mode)
+      - HevolveAI MAY run as separate process (HTTP mode)
 
-    When Hevolve-Core is NOT co-located (no in-process provider), the bridge
+    When HevolveAI is NOT co-located (no in-process provider), the bridge
     MUST fall back to HTTP calls. These tests guard that fallback.
     """
 
@@ -1659,7 +1659,7 @@ class TestCentralModeBehavior:
     def test_central_with_provider_still_uses_in_process(self):
         """Even in central mode, if provider IS co-located, use in-process.
 
-        This happens when central runs Hevolve-Core in the same process
+        This happens when central runs HevolveAI in the same process
         (e.g., single-machine deployment). In-process is always preferred.
         """
         with patch(
@@ -1798,18 +1798,18 @@ class TestStatusEndpointLearning:
 class TestNoExtraPortsInProcessMode:
     """Verify that flat/regional mode opens NO unnecessary ports.
 
-    When pip-installed (Nunba bundles hevolve-backend + Hevolve-Core):
+    When pip-installed (Nunba bundles hevolve-backend + HevolveAI):
       Port 5000: Flask GUI + API (served by Nunba app.py)
       Port 8080: llama.cpp raw inference (started by llama_config)
-      NO port 8000: Hevolve-Core api_server must NOT run
+      NO port 8000: HevolveAI api_server must NOT run
       NO port 6777: hevolve-backend must NOT run standalone
 
-    These tests MUST fail if someone re-introduces a Hevolve-Core HTTP server
+    These tests MUST fail if someone re-introduces a HevolveAI HTTP server
     or starts hevolve-backend on its own port in flat/regional mode.
     """
 
     def test_init_learning_pipeline_does_not_import_api_server(self):
-        """_init_learning_pipeline must NOT import Hevolve-Core's server.api_server.
+        """_init_learning_pipeline must NOT import HevolveAI's server.api_server.
 
         api_server.py starts a FastAPI+uvicorn server on port 8000.
         In flat/regional mode, we import learning functions directly -
@@ -2030,9 +2030,9 @@ class TestNoExtraPortsInProcessMode:
     def test_only_hevolveai_learning_modules_imported_not_server(self):
         """_init_learning_pipeline must import ONLY learning functions.
 
-        Must import: Hevolve-Core's embodied_ai.rl_ef (learning provider)
-        Must import: Hevolve-Core's embodied_ai.learning.hive_mind (hivemind)
-        Must NOT import: Hevolve-Core's server (api_server, wamp, etc.)
+        Must import: HevolveAI's embodied_ai.rl_ef (learning provider)
+        Must import: HevolveAI's embodied_ai.learning.hive_mind (hivemind)
+        Must NOT import: HevolveAI's server (api_server, wamp, etc.)
 
         If api_server is imported, its module-level code starts the
         proof monitor and creates a FastAPI app - opening port 8000.
@@ -2051,7 +2051,7 @@ class TestNoExtraPortsInProcessMode:
 
         # Must NOT import server modules
         assert 'hevolveai.server' not in source, (
-            "Must NOT import Hevolve-Core's server module - that starts FastAPI on port 8000"
+            "Must NOT import HevolveAI's server module - that starts FastAPI on port 8000"
         )
         assert 'api_server' not in source, (
             "Must NOT import api_server - that binds port 8000"
@@ -2144,7 +2144,7 @@ class TestBootPhase:
         """Importing langchain_gpt_api must return immediately.
 
         _init_learning_pipeline runs in a background thread, so import
-        must not hang even if Hevolve-Core takes time to initialize.
+        must not hang even if HevolveAI takes time to initialize.
         """
         import time
         start = time.time()
@@ -2223,7 +2223,7 @@ class TestInitPhase:
             lgapi._hive_mind = orig_h
 
     def test_init_leaves_none_on_import_error(self):
-        """On ImportError (Hevolve-Core not installed), globals stay None."""
+        """On ImportError (HevolveAI not installed), globals stay None."""
         import langchain_gpt_api as lgapi
         orig_p, orig_h = lgapi._learning_provider, lgapi._hive_mind
         try:
@@ -2512,7 +2512,7 @@ class TestBundledFlatNunbaLlamaCppRunning:
             rl_ef.create_learning_llm_config.assert_called_once()
 
     def test_no_second_server_started(self):
-        """Bundled mode never triggers Hevolve-Core's auto-start path."""
+        """Bundled mode never triggers HevolveAI's auto-start path."""
         import langchain_gpt_api as lgapi
 
         with patch.dict(os.environ, {'HEVOLVE_LLM_ENDPOINT_URL': ''}), \
@@ -2613,7 +2613,7 @@ class TestBundledFlatCloudApiStoppedWorking:
     def test_cloud_url_set_but_key_expired(self):
         """HEVOLVE_LLM_ENDPOINT_URL is non-empty → _has_cloud_api() True.
 
-        Hevolve-Core's Priority 0 path will try the cloud endpoint, fail,
+        HevolveAI's Priority 0 path will try the cloud endpoint, fail,
         and fall through to local (or fail gracefully).  We don't
         auto-start a server - the user needs to fix their API key.
         """
@@ -2654,7 +2654,7 @@ class TestStandaloneLlamaCppRunning:
 
 
 class TestStandaloneNothingAvailable:
-    """Standalone + nothing on 8080 (Hevolve-Core should auto-start)."""
+    """Standalone + nothing on 8080 (HevolveAI should auto-start)."""
 
     def test_short_wait_then_hevolveai_auto_starts(self):
         """5 s timeout, then create_learning_llm_config proceeds (auto_setup=True)."""
@@ -2683,11 +2683,11 @@ class TestStandaloneNothingAvailable:
             lgapi._init_learning_pipeline()
             # Standalone → short timeout
             mock_wait.assert_called_once_with(timeout=5)
-            # create_learning_llm_config IS called (Hevolve-Core auto-starts)
+            # create_learning_llm_config IS called (HevolveAI auto-starts)
             rl_ef.create_learning_llm_config.assert_called_once()
 
     def test_provider_set_after_auto_start(self):
-        """After Hevolve-Core auto-starts, _learning_provider is populated."""
+        """After HevolveAI auto-starts, _learning_provider is populated."""
         import langchain_gpt_api as lgapi
 
         mock_provider = MagicMock()
@@ -2719,7 +2719,7 @@ class TestStandaloneLlamaCppUninstalled:
     """Standalone + llama.cpp NOT installed (can't auto-start)."""
 
     def test_create_learning_config_still_called(self):
-        """Hevolve-Core handles missing llama.cpp by falling back to transformers."""
+        """HevolveAI handles missing llama.cpp by falling back to transformers."""
         import langchain_gpt_api as lgapi
 
         mods = dict(sys.modules)
@@ -2757,7 +2757,7 @@ class TestStandaloneCloudApiBroken:
             'HEVOLVE_LLM_ENDPOINT_URL': 'https://broken.example.com/v1',
         }):
             assert lgapi._has_cloud_api() is True
-            # Cloud path → no local wait → Hevolve-Core tries cloud, fails gracefully
+            # Cloud path → no local wait → HevolveAI tries cloud, fails gracefully
 
 
 class TestServerStopsMidSession:

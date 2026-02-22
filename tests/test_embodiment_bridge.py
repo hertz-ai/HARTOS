@@ -2,8 +2,8 @@
 Tests for WorldModelBridge embodied interaction extensions +
 action_model + control_loop.
 
-These test the agentic orchestration layer's routing to Hevolve-Core,
-NOT Hevolve-Core's native intelligence (sensor fusion, PID, SLAM).
+These test the agentic orchestration layer's routing to HevolveAI,
+NOT HevolveAI's native intelligence (sensor fusion, PID, SLAM).
 
 Covers:
   - WorldModelBridge.send_action() — safety check + routing
@@ -307,7 +307,7 @@ class TestActionSafetyIntegration:
 class TestNoMLTrainingCode:
     """This repo is the agentic orchestration layer.
 
-    Tensors, gradients, weights, layers, pytorch belong in Hevolve-Core
+    Tensors, gradients, weights, layers, pytorch belong in HevolveAI
     (the native intelligence repo), NEVER here.  These are training
     primitives.  This repo routes data — it does not train models.
     """

@@ -1935,7 +1935,7 @@ def update_memory_config():
 @admin_bp.route("/config/embodied", methods=["GET"])
 @api_response
 def get_embodied_config():
-    """Get embodied AI / Hevolve-Core feed configuration."""
+    """Get embodied AI / HevolveAI feed configuration."""
     api = get_api()
     return api._global_config.embodied_ai.to_dict()
 
@@ -1943,7 +1943,7 @@ def get_embodied_config():
 @admin_bp.route("/config/embodied", methods=["PUT"])
 @api_response
 def update_embodied_config():
-    """Update embodied AI feed configuration and propagate to Hevolve-Core."""
+    """Update embodied AI feed configuration and propagate to HevolveAI."""
     api = get_api()
     data = request.get_json()
     if not data:
@@ -1951,7 +1951,7 @@ def update_embodied_config():
     api._global_config.embodied_ai = EmbodiedAIConfigSchema(**data)
     api._save_config()
 
-    # Propagate to Hevolve-Core runtime if reachable
+    # Propagate to HevolveAI runtime if reachable
     _propagate_embodied_config(api._global_config.embodied_ai)
     return api._global_config.embodied_ai.to_dict()
 
@@ -1994,7 +1994,7 @@ def toggle_embodied_feed():
 @admin_bp.route("/config/embodied/status", methods=["GET"])
 @api_response
 def get_embodied_status():
-    """Get live status of Hevolve-Core embodied AI system."""
+    """Get live status of HevolveAI embodied AI system."""
     import requests as req
     api = get_api()
     url = api._global_config.embodied_ai.hevolveai_url
@@ -2003,7 +2003,7 @@ def get_embodied_status():
         resp = req.get(f"{url}/health", timeout=3)
         health = resp.json() if resp.ok else {"status": "unreachable"}
     except Exception:
-        health = {"status": "unreachable", "error": "Cannot connect to Hevolve-Core"}
+        health = {"status": "unreachable", "error": "Cannot connect to HevolveAI"}
 
     try:
         resp = req.get(f"{url}/v1/stats", timeout=3)
@@ -2019,12 +2019,12 @@ def get_embodied_status():
 
 
 def _propagate_embodied_config(cfg: EmbodiedAIConfigSchema):
-    """Push config changes to Hevolve-Core runtime (best-effort)."""
+    """Push config changes to HevolveAI runtime (best-effort)."""
     import requests as req
     try:
-        # Hevolve-Core reads env vars at startup, but we can hit a
+        # HevolveAI reads env vars at startup, but we can hit a
         # runtime config endpoint if available, or set for next restart.
-        # For now, write to shared config file that Hevolve-Core watches.
+        # For now, write to shared config file that HevolveAI watches.
         config_path = os.path.join(
             os.path.dirname(__file__), '..', '..', '..',
             'agent_data', 'embodied_ai_config.json',

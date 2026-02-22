@@ -3,7 +3,7 @@ Control Loop Bridge — Timing bridge between agentic and native layers.
 
 NOT a PID controller.  NOT intelligence.  Just timing.
 
-Hevolve-Core owns the actual control loops (PID, motor control, kinematics).
+HevolveAI owns the actual control loops (PID, motor control, kinematics).
 This bridge ensures the LLM-langchain side sends sensor data and receives
 feedback at the right cadence.  It's the clock that keeps the agentic
 and embodied sides in sync.

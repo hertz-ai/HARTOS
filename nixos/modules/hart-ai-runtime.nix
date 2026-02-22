@@ -112,7 +112,7 @@ in
 
     # ─── World Model ───
     worldModel = {
-      enable = lib.mkEnableOption "Shared world model (Hevolve-Core bridge)";
+      enable = lib.mkEnableOption "Shared world model (HevolveAI bridge)";
     };
 
     # ─── Semantic Intelligence Layer ───
@@ -414,7 +414,7 @@ in
     (lib.mkIf ai.worldModel.enable {
 
       systemd.services.hart-world-model = {
-        description = "HART OS World Model Bridge (Hevolve-Core)";
+        description = "HART OS World Model Bridge (HevolveAI)";
         after = [ "hart-backend.service" ];
         wants = [ "hart-backend.service" ];
         wantedBy = [ "hart.target" ];

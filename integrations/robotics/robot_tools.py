@@ -5,8 +5,8 @@ Every tool is a thin routing wrapper:
   validate input → WorldModelBridge → return result
 
 NO intelligence here.  No path planning.  No sensor fusion.
-Hevolve-Core owns those.  These tools let an LLM agent say "go there"
-and the bridge routes it to Hevolve-Core which figures out how.
+HevolveAI owns those.  These tools let an LLM agent say "go there"
+and the bridge routes it to HevolveAI which figures out how.
 
 Tool categories:
   - Query: get_robot_capabilities, read_sensor, get_sensor_window, get_robot_status
@@ -120,7 +120,7 @@ def navigate_to(x: float = 0.0, y: float = 0.0, z: float = 0.0,
                 **kwargs) -> str:
     """Send a navigate_to action through the world model bridge.
 
-    Hevolve-Core owns the actual path planning, obstacle avoidance, and
+    HevolveAI owns the actual path planning, obstacle avoidance, and
     motor control.  This tool just says "go to (x, y, z)".
 
     Args:
@@ -147,7 +147,7 @@ def move_joint(joint_id: str = '', position: float = 0.0,
                velocity: float = 0.0, **kwargs) -> str:
     """Send a joint move command through the world model bridge.
 
-    Hevolve-Core owns the actual kinematics and PID control.
+    HevolveAI owns the actual kinematics and PID control.
     This tool just says "move joint X to position Y".
 
     Args:
@@ -180,7 +180,7 @@ def move_joint(joint_id: str = '', position: float = 0.0,
 def execute_motion_sequence(steps: str = '[]', **kwargs) -> str:
     """Execute a sequence of actions through the world model bridge.
 
-    Each step is sent in order.  Hevolve-Core handles the actual execution,
+    Each step is sent in order.  HevolveAI handles the actual execution,
     timing, and real-time adaptation (pause on obstacle, etc.).
 
     Args:
@@ -217,7 +217,7 @@ def configure_sensor(sensor_id: str = '', config: str = '{}',
                      **kwargs) -> str:
     """Configure a sensor's parameters via the world model bridge.
 
-    The actual sensor configuration is handled by Hevolve-Core's native layer.
+    The actual sensor configuration is handled by HevolveAI's native layer.
     This tool routes the configuration request through the bridge.
 
     Args:
