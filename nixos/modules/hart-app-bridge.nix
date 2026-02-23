@@ -148,7 +148,7 @@ in
           APP_BRIDGE_DND = if bridge.dragAndDrop then "1" else "0";
           APP_BRIDGE_AI_FALLBACK = if bridge.aiFallback then "1" else "0";
           MODEL_BUS_HTTP_PORT = toString (config.hart.modelBus.ports.http or 6790);
-          HART_BACKEND_PORT = toString cfg.ports.backend;
+          HARTOS_BACKEND_PORT = toString cfg.ports.backend;
           PYTHONDONTWRITEBYTECODE = "1";
           PYTHONUNBUFFERED = "1";
         };

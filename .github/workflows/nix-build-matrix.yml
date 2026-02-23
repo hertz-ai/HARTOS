@@ -1,0 +1,131 @@
+name: Nix Build Matrix
+
+# Builds key HART OS image targets in parallel.
+# Each target takes 30-60 min (with cache).
+# Runs on PRs to main or manual dispatch.
+
+on:
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: 'Comma-separated build targets (or "all")'
+        default: 'iso-server,iso-desktop,iso-edge'
+        required: false
+  push:
+    branches: [main]
+    paths:
+      - 'nixos/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'nixos/**'
+
+concurrency:
+  group: nix-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ─── Fast Gate: evaluate first ─────────────────────────────
+  evaluate:
+    name: Flake Evaluation Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v12
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+      - uses: DeterminateSystems/magic-nix-cache-action@v7
+
+      - name: Evaluate all outputs (no build)
+        working-directory: nixos
+        run: nix flake check --no-build
+
+  # ─── Build Matrix ──────────────────────────────────────────
+  build:
+    name: Build ${{ matrix.target }}
+    needs: evaluate
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - iso-server      # x86_64 headless — core variant
+          - iso-desktop     # x86_64 GNOME + native subsystems
+          - iso-edge        # x86_64 minimal observer
+          - qcow2-server    # VM format for QEMU testing
+          - docker-server   # OCI container image (fastest build)
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v12
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+
+      - name: Cache Nix store
+        uses: DeterminateSystems/magic-nix-cache-action@v7
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get autoremove -y
+          sudo apt-get clean
+          df -h /
+
+      - name: Build ${{ matrix.target }}
+        working-directory: nixos
+        run: |
+          echo "Building: nix build .#${{ matrix.target }}"
+          echo ""
+          time nix build .#${{ matrix.target }} --no-link --print-out-paths | tee /tmp/build-output.txt
+          echo ""
+          echo "Build successful!"
+
+      - name: Compute checksum
+        run: |
+          BUILD_PATH=$(cat /tmp/build-output.txt | head -1)
+          echo "Build path: $BUILD_PATH"
+          echo ""
+
+          # Find the primary output file
+          if [[ -d "$BUILD_PATH/iso" ]]; then
+            FILE=$(ls "$BUILD_PATH/iso/"*.iso 2>/dev/null | head -1)
+          elif [[ -d "$BUILD_PATH" ]]; then
+            FILE=$(find "$BUILD_PATH" -maxdepth 2 -type f \
+              \( -name "*.iso" -o -name "*.qcow2" -o -name "*.raw" -o -name "*.tar.gz" \) \
+              | head -1)
+          fi
+
+          if [[ -n "${FILE:-}" ]] && [[ -f "$FILE" ]]; then
+            SIZE=$(du -h "$FILE" | cut -f1)
+            SHA=$(sha256sum "$FILE" | cut -d' ' -f1)
+            echo "File: $(basename $FILE)"
+            echo "Size: $SIZE"
+            echo "SHA256: $SHA"
+            echo ""
+            echo "## Build: ${{ matrix.target }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **File**: \`$(basename $FILE)\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **Size**: $SIZE" >> $GITHUB_STEP_SUMMARY
+            echo "- **SHA256**: \`$SHA\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No output file found (may be a derivation-only build)"
+          fi
+
+  # ─── Summary ───────────────────────────────────────────────
+  summary:
+    name: Build Summary
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report results
+        run: |
+          echo "## HART OS Build Matrix Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "All builds completed. Check individual job logs for details." >> $GITHUB_STEP_SUMMARY

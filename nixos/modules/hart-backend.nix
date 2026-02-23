@@ -21,7 +21,7 @@ in
 
       environment = {
         HEVOLVE_DB_PATH = "${cfg.dataDir}/hevolve_database.db";
-        HART_BACKEND_PORT = toString cfg.ports.backend;
+        HARTOS_BACKEND_PORT = toString cfg.ports.backend;
         HART_DISCOVERY_PORT = toString cfg.ports.discovery;
         HART_LLM_PORT = toString cfg.ports.llm;
         HART_VISION_PORT = toString cfg.ports.vision;

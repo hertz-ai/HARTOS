@@ -160,7 +160,7 @@ in
           MODEL_BUS_ROUTING = bus.routingStrategy;
           HART_LLM_PORT = toString cfg.ports.llm;
           HART_VISION_PORT = toString cfg.ports.vision;
-          HART_BACKEND_PORT = toString cfg.ports.backend;
+          HARTOS_BACKEND_PORT = toString cfg.ports.backend;
           PYTHONDONTWRITEBYTECODE = "1";
           PYTHONUNBUFFERED = "1";
         };

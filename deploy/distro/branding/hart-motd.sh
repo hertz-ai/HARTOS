@@ -44,7 +44,7 @@ echo -e "  Peers:      ${PEERS}"
 echo -e "  Uptime:     $(uptime -p 2>/dev/null || echo 'unknown')"
 
 # Dashboard
-PORT=$(grep HART_BACKEND_PORT /etc/hart/hart.env 2>/dev/null | cut -d= -f2 || echo 6777)
+PORT=$(grep HARTOS_BACKEND_PORT /etc/hart/hart.env 2>/dev/null | cut -d= -f2 || echo 6777)
 echo ""
 echo -e "  Dashboard:  http://$(hostname -I 2>/dev/null | awk '{print $1}'):${PORT:-6777}"
 echo -e "  CLI:        ${GREEN}hart status${NC}"

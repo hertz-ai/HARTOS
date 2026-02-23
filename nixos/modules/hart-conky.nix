@@ -84,7 +84,7 @@ in
 
       environment = {
         DISPLAY = ":0";
-        HART_BACKEND_PORT = toString cfg.ports.backend;
+        HARTOS_BACKEND_PORT = toString cfg.ports.backend;
         HART_DATA_DIR = toString cfg.dataDir;
         HEVOLVE_DATA_DIR = toString cfg.dataDir;
         HART_THEME_DIR = "${conkyConfigDir}/share/hart/conky-themes";

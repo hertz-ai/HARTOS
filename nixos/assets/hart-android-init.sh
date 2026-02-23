@@ -113,7 +113,7 @@ echo -e "  ${CYAN}[5/5]${NC} Applying HART OS integration settings..."
 
 # Set HART backend URL as Android system property
 # (Android apps can read this to connect to local HART backend)
-BACKEND_PORT="${HART_BACKEND_PORT:-6777}"
+BACKEND_PORT="${HARTOS_BACKEND_PORT:-6777}"
 waydroid prop set persist.hart.backend_url "http://10.0.0.2:${BACKEND_PORT}" 2>/dev/null || true
 echo "    HART backend bridge: 10.0.0.2:${BACKEND_PORT}"
 

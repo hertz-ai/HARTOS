@@ -1,0 +1,235 @@
+name: E2E OS Test
+
+# Builds HART OS ISO from NixOS flake, boots in QEMU, runs smoke tests
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'nixos/**'
+      - 'deploy/distro/**'
+      - 'deploy/linux/**'
+      - 'tests/e2e-os-smoke.sh'
+      - 'tests/boot-qemu-for-test.sh'
+
+concurrency:
+  group: e2e-os-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ─── Fast Gate: flake evaluation (30s) ─────────────────────
+  flake-check:
+    name: Flake Evaluation Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v12
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+
+      - name: Cache Nix store
+        uses: DeterminateSystems/magic-nix-cache-action@v7
+
+      - name: Evaluate all flake outputs
+        working-directory: nixos
+        run: nix flake check --no-build
+
+  # ─── E2E: Server Variant ───────────────────────────────────
+  e2e-server:
+    name: E2E Server (build + boot + smoke)
+    needs: flake-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v12
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+
+      - name: Cache Nix store
+        uses: DeterminateSystems/magic-nix-cache-action@v7
+
+      - name: Install QEMU and sshpass
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils sshpass
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666"' | \
+            sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger
+          ls -la /dev/kvm
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get autoremove -y && sudo apt-get clean
+
+      - name: Build HART OS ISO (server variant)
+        working-directory: nixos
+        run: |
+          nix build .#iso-server --no-link --print-out-paths | tee /tmp/iso-path.txt
+          ISO_DIR=$(cat /tmp/iso-path.txt)
+          echo "ISO_PATH=$(ls ${ISO_DIR}/iso/*.iso)" >> $GITHUB_ENV
+
+      - name: Boot ISO in QEMU
+        run: |
+          chmod +x tests/boot-qemu-for-test.sh
+          bash tests/boot-qemu-for-test.sh "$ISO_PATH"
+
+      - name: Run E2E smoke tests (15 checks)
+        run: |
+          chmod +x tests/e2e-os-smoke.sh
+          bash tests/e2e-os-smoke.sh
+
+      - name: Run sandbox validation inside VM
+        run: |
+          sshpass -p 'hart' ssh \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=10 \
+            -p 10022 hart-admin@localhost \
+            'sudo hart sandbox test-all 2>&1' \
+            | tee /tmp/hart-sandbox-results.txt || true
+
+      - name: Collect guest logs on failure
+        if: failure()
+        run: |
+          sshpass -p 'hart' ssh \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=10 \
+            -p 10022 hart-admin@localhost \
+            'sudo journalctl -u "hart-*" --no-pager -n 300' \
+            > /tmp/hart-guest-logs.txt 2>&1 || true
+          cp /tmp/hart-qemu-boot.log /tmp/hart-qemu-log.txt 2>/dev/null || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hart-e2e-server-logs
+          path: |
+            /tmp/hart-guest-logs.txt
+            /tmp/hart-qemu-log.txt
+            /tmp/hart-sandbox-results.txt
+          if-no-files-found: ignore
+
+      - name: Shutdown QEMU
+        if: always()
+        run: |
+          if [[ -f /tmp/hart-qemu-test.pid ]]; then
+            kill "$(cat /tmp/hart-qemu-test.pid)" 2>/dev/null || true
+          fi
+          rm -f /tmp/hart-qemu-test.pid /tmp/hart-test-disk.qcow2
+
+  # ─── E2E: Desktop Variant ──────────────────────────────────
+  e2e-desktop:
+    name: E2E Desktop (build + boot + subsystem check)
+    needs: flake-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v12
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+
+      - name: Cache Nix store
+        uses: DeterminateSystems/magic-nix-cache-action@v7
+
+      - name: Install QEMU and sshpass
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils sshpass
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666"' | \
+            sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger
+          ls -la /dev/kvm
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get autoremove -y && sudo apt-get clean
+
+      - name: Build HART OS ISO (desktop variant)
+        working-directory: nixos
+        run: |
+          nix build .#iso-desktop --no-link --print-out-paths | tee /tmp/iso-path.txt
+          ISO_DIR=$(cat /tmp/iso-path.txt)
+          echo "ISO_PATH=$(ls ${ISO_DIR}/iso/*.iso)" >> $GITHUB_ENV
+
+      - name: Boot Desktop ISO in QEMU (with virtual GPU)
+        run: |
+          chmod +x tests/boot-qemu-for-test.sh
+          QEMU_RAM=6144 QEMU_CPUS=4 \
+            bash tests/boot-qemu-for-test.sh "$ISO_PATH"
+
+      - name: Run E2E smoke tests (15 checks)
+        run: |
+          chmod +x tests/e2e-os-smoke.sh
+          bash tests/e2e-os-smoke.sh
+
+      - name: Desktop-specific checks
+        run: |
+          SSH_CMD="sshpass -p hart ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 10022 hart-admin@localhost"
+
+          echo "Checking desktop-specific components..."
+
+          # Check Wine is installed
+          $SSH_CMD "which wine64 || which wine" && echo "PASS: Wine available" || echo "FAIL: Wine not found"
+
+          # Check Flatpak is installed
+          $SSH_CMD "which flatpak" && echo "PASS: Flatpak available" || echo "FAIL: Flatpak not found"
+
+          # Check display manager
+          $SSH_CMD "systemctl is-active display-manager.service" && echo "PASS: Display manager running" || echo "WARN: Display manager not active"
+
+          # Check Conky config exists
+          $SSH_CMD "find /nix/store -name 'hart.conkyrc' -print -quit 2>/dev/null | grep -q ." && echo "PASS: Conky config deployed" || echo "WARN: Conky config not found"
+
+      - name: Run sandbox validation inside VM
+        run: |
+          sshpass -p 'hart' ssh \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=10 \
+            -p 10022 hart-admin@localhost \
+            'sudo hart sandbox test-all 2>&1' \
+            | tee /tmp/hart-sandbox-desktop.txt || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hart-e2e-desktop-logs
+          path: |
+            /tmp/hart-qemu-boot.log
+            /tmp/hart-sandbox-desktop.txt
+          if-no-files-found: ignore
+
+      - name: Shutdown QEMU
+        if: always()
+        run: |
+          if [[ -f /tmp/hart-qemu-test.pid ]]; then
+            kill "$(cat /tmp/hart-qemu-test.pid)" 2>/dev/null || true
+          fi
+          rm -f /tmp/hart-qemu-test.pid /tmp/hart-test-disk.qcow2

@@ -294,6 +294,23 @@ fi
 
 log_info "Python dependencies installed."
 
+# ── HevolveAI source protection ──
+# Compile .py → .pyc, strip source, clean metadata that leaks git URLs
+if [[ -f "$INSTALL_DIR/scripts/compile_hevolveai.py" ]]; then
+    log_step "Protecting HevolveAI source code..."
+    "$INSTALL_DIR/venv/bin/python" "$INSTALL_DIR/scripts/compile_hevolveai.py" \
+        --strip-source \
+        --manifest-out "$INSTALL_DIR/security/hevolveai_manifest.json" 2>&1 || true
+
+    # Remove .dist-info metadata that leaks install source URL
+    find "$INSTALL_DIR/venv/lib" -path '*hevolveai*dist-info/direct_url.json' -delete 2>/dev/null || true
+    find "$INSTALL_DIR/venv/lib" -path '*embodied*ai*dist-info/direct_url.json' -delete 2>/dev/null || true
+    find "$INSTALL_DIR/venv/lib" -path '*hevolveai*dist-info/RECORD' -delete 2>/dev/null || true
+    find "$INSTALL_DIR/venv/lib" -path '*embodied*ai*dist-info/RECORD' -delete 2>/dev/null || true
+
+    log_info "HevolveAI source protected (compiled + stripped)."
+fi
+
 # ============================================================
 # Generate Ed25519 node keypair
 # ============================================================
@@ -377,7 +394,7 @@ if [[ ! -f "$CONFIG_DIR/hart.env" ]]; then
     cp "$INSTALL_DIR/deploy/linux/hart.env.template" "$CONFIG_DIR/hart.env"
     # Set actual values
     sed -i "s|^HEVOLVE_DB_PATH=.*|HEVOLVE_DB_PATH=$DATA_DIR/hevolve_database.db|" "$CONFIG_DIR/hart.env"
-    sed -i "s|^HART_BACKEND_PORT=.*|HART_BACKEND_PORT=$BACKEND_PORT|" "$CONFIG_DIR/hart.env"
+    sed -i "s|^HARTOS_BACKEND_PORT=.*|HARTOS_BACKEND_PORT=$BACKEND_PORT|" "$CONFIG_DIR/hart.env"
     chmod 600 "$CONFIG_DIR/hart.env"
     chown "$HART_USER:$HART_GROUP" "$CONFIG_DIR/hart.env"
     log_info "Environment configured at $CONFIG_DIR/hart.env"

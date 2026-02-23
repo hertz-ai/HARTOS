@@ -20,7 +20,7 @@ const (
 	httpPostTimeout    = 30 * time.Second
 )
 
-// getBackendPort reads HART_BACKEND_PORT from /etc/hart/hart.env.
+// getBackendPort reads HARTOS_BACKEND_PORT from /etc/hart/hart.env.
 // Returns defaultBackendPort (6777) if the file doesn't exist or the key isn't found.
 func getBackendPort() int {
 	f, err := os.Open(envFilePath)
@@ -32,7 +32,7 @@ func getBackendPort() int {
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if strings.HasPrefix(line, "HART_BACKEND_PORT=") {
+		if strings.HasPrefix(line, "HARTOS_BACKEND_PORT=") {
 			val := strings.TrimSpace(strings.SplitN(line, "=", 2)[1])
 			if val == "" {
 				return defaultBackendPort
@@ -47,13 +47,13 @@ func getBackendPort() int {
 	return defaultBackendPort
 }
 
-// getBackendPortFromReader parses HART_BACKEND_PORT from an arbitrary reader.
+// getBackendPortFromReader parses HARTOS_BACKEND_PORT from an arbitrary reader.
 // Exported for testing.
 func getBackendPortFromReader(r io.Reader) int {
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if strings.HasPrefix(line, "HART_BACKEND_PORT=") {
+		if strings.HasPrefix(line, "HARTOS_BACKEND_PORT=") {
 			val := strings.TrimSpace(strings.SplitN(line, "=", 2)[1])
 			if val == "" {
 				return defaultBackendPort

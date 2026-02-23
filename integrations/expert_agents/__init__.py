@@ -20,12 +20,16 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+_experts_registered = False
+_registered_agents: Dict[str, "ExpertAgent"] = {}
+
 
 def register_all_experts(skill_registry) -> Dict[str, ExpertAgent]:
     """
     Register all 96 expert agents with the AgentSkillRegistry.
 
     This makes expert agents discoverable via the existing skill registry system.
+    Idempotent — safe to call multiple times (only registers once).
 
     Args:
         skill_registry: Instance of AgentSkillRegistry from internal_comm
@@ -33,6 +37,10 @@ def register_all_experts(skill_registry) -> Dict[str, ExpertAgent]:
     Returns:
         Dictionary of expert_id -> ExpertAgent
     """
+    global _experts_registered, _registered_agents
+    if _experts_registered:
+        return _registered_agents
+
     logger.info("Registering 96 expert agents with skill registry...")
 
     # Load expert registry
@@ -61,6 +69,8 @@ def register_all_experts(skill_registry) -> Dict[str, ExpertAgent]:
         skill_registry.register_agent(agent_id, skills)
 
     logger.info(f"Successfully registered {len(expert_registry.agents)} expert agents")
+    _experts_registered = True
+    _registered_agents = expert_registry.agents
     return expert_registry.agents
 
 

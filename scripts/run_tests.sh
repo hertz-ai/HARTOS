@@ -41,31 +41,31 @@ read -p "Enter choice (1-8): " choice
 case $choice in
     1)
         echo "Running all tests..."
-        $PYTHON_EXE -m pytest tests/ integrations/channels/tests/ -v --tb=short --color=yes
+        $PYTHON_EXE -m pytest tests/unit/ tests/integration/ -v --tb=short --color=yes
         ;;
     2)
         echo "Running HevolveBot channel regression tests..."
-        $PYTHON_EXE -m pytest integrations/channels/tests/test_e2e_regression.py -v --tb=short --color=yes
+        $PYTHON_EXE -m pytest tests/integration/test_channels_e2e_regression.py -v --tb=short --color=yes
         ;;
     3)
         echo "Running master test suite..."
-        $PYTHON_EXE test_master_suite.py
+        $PYTHON_EXE tests/standalone/test_master_suite.py
         ;;
     4)
         echo "Running autonomous agent suite..."
-        $PYTHON_EXE test_autonomous_agent_suite.py
+        $PYTHON_EXE tests/standalone/test_autonomous_agent_suite.py
         ;;
     5)
         echo "Running dynamic agents tests..."
-        $PYTHON_EXE -m pytest test_dynamic_agents.py -v --tb=short
+        $PYTHON_EXE -m pytest tests/unit/test_dynamic_agents.py -v --tb=short
         ;;
     6)
         echo "Running complex agent comprehensive tests..."
-        $PYTHON_EXE -m pytest test_complex_agent_comprehensive.py -v --tb=short
+        $PYTHON_EXE -m pytest tests/standalone/test_complex_agent_comprehensive.py -v --tb=short
         ;;
     7)
         echo "Running quick smoke test..."
-        $PYTHON_EXE -m pytest integrations/channels/tests/test_e2e_regression.py -k "TestModuleImports" -v --tb=short
+        $PYTHON_EXE -m pytest tests/integration/test_channels_e2e_regression.py -k "TestModuleImports" -v --tb=short
         ;;
     8)
         read -p "Enter pytest pattern (e.g. tests/test_file.py -k test_name): " pattern

@@ -185,12 +185,24 @@ class FederatedAggregator:
 
     def _get_benchmark_results(self) -> dict:
         """Pull latest benchmark results if BenchmarkRegistry exists."""
+        results = {}
         try:
             from .benchmark_registry import get_benchmark_registry
             registry = get_benchmark_registry()
-            return registry.get_latest_results()
+            results = registry.get_latest_results()
         except Exception:
-            return {}
+            pass
+
+        # Include coding agent benchmarks for hive tool routing intelligence
+        try:
+            from integrations.coding_agent.benchmark_tracker import get_benchmark_tracker
+            coding_delta = get_benchmark_tracker().export_learning_delta()
+            if coding_delta:
+                results['coding_benchmarks'] = coding_delta.get('coding_benchmarks', {})
+        except Exception:
+            pass
+
+        return results
 
     def broadcast_delta(self, delta: dict):
         """POST delta to all known active peers."""
@@ -327,6 +339,15 @@ class FederatedAggregator:
             bridge._federation_aggregated = aggregated
         except Exception:
             pass
+
+        # Feed hive-aggregated coding benchmarks back to local tool router
+        coding_data = aggregated.get('benchmark_results', {}).get('coding_benchmarks')
+        if coding_data:
+            try:
+                from integrations.coding_agent.benchmark_tracker import get_benchmark_tracker
+                get_benchmark_tracker().import_hive_delta({'coding_benchmarks': coding_data})
+            except Exception:
+                pass
 
     def track_convergence(self) -> float:
         """Variance-based convergence score across peer deltas.

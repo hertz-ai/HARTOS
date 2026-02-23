@@ -2,7 +2,7 @@
 
 **Date:** 2025-10-23
 **Status:** COMPLETED
-**Integration Agent:** Claude Code (Crawl4AI Integration)
+**Integration Agent:** Claude Code (HevolveAI Integration)
 
 ---
 
@@ -162,7 +162,7 @@ curl http://localhost:8000/health
 
 2. **Server Location:**
 ```
-C:\Users\sathi\PycharmProjects\crawl4ai\
+C:\Users\sathi\PycharmProjects\hevolveai\
 ```
 
 3. **Start Server:**
@@ -279,7 +279,7 @@ print(f"Price: {config_list[0]['price']}")
 
 ### Test Multimodal
 
-See `C:\Users\sathi\PycharmProjects\crawl4ai\examples\multimodal_api_example.py` for comprehensive multimodal examples.
+See `C:\Users\sathi\PycharmProjects\hevolveai\examples\multimodal_api_example.py` for comprehensive multimodal examples.
 
 ---
 
@@ -295,7 +295,7 @@ See `C:\Users\sathi\PycharmProjects\crawl4ai\examples\multimodal_api_example.py`
 curl http://localhost:8000/health
 
 # If not, start server
-cd C:\Users\sathi\PycharmProjects\crawl4ai
+cd C:\Users\sathi\PycharmProjects\hevolveai
 python run_server.py
 ```
 
@@ -304,7 +304,7 @@ python run_server.py
 **Issue:** Learning provider not loaded
 
 **Solution:**
-Check server logs in `C:\Users\sathi\PycharmProjects\crawl4ai\logs\`
+Check server logs in `C:\Users\sathi\PycharmProjects\hevolveai\logs\`
 
 ### Fallback to Azure OpenAI
 
@@ -385,10 +385,10 @@ If Qwen3-VL is unavailable, set `USE_QWEN3VL = False` in `langchain_gpt_api.py`
 
 ## References
 
-- **Qwen3-VL Server Repo:** `C:\Users\sathi\PycharmProjects\crawl4ai\`
-- **Multimodal Examples:** `crawl4ai\examples\multimodal_api_example.py`
-- **API Documentation:** `crawl4ai\STARTUP.md`
-- **Architecture Docs:** `crawl4ai\docs\architecture\RL_EF_ARCHITECTURE.md`
+- **Qwen3-VL Server Repo:** `C:\Users\sathi\PycharmProjects\hevolveai\`
+- **Multimodal Examples:** `hevolveai\examples\multimodal_api_example.py`
+- **API Documentation:** `hevolveai\STARTUP.md`
+- **Architecture Docs:** `hevolveai\docs\architecture\RL_EF_ARCHITECTURE.md`
 
 ---
 

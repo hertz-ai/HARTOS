@@ -221,13 +221,20 @@ FEATURE_TIER_MAP: Dict[str, Tuple[NodeTierLevel, str]] = {
     # Standard tier - full agent capabilities
     'agent_engine':         (NodeTierLevel.STANDARD,  'HEVOLVE_AGENT_ENGINE_ENABLED'),
     'coding_agent':         (NodeTierLevel.STANDARD,  'HEVOLVE_CODING_AGENT_ENABLED'),
+    'coding_aggregator':    (NodeTierLevel.STANDARD,  'HEVOLVE_CODING_AGGREGATOR_ENABLED'),
+    'vlm_computer_use':     (NodeTierLevel.STANDARD,  'HEVOLVE_VLM_COMPUTER_USE_ENABLED'),
     'tts':                  (NodeTierLevel.STANDARD,  'HEVOLVE_TTS_ENABLED'),
     'whisper':              (NodeTierLevel.STANDARD,  'HEVOLVE_WHISPER_ENABLED'),
+    # Lite tier - cloud-backed services
+    'crawl4ai':             (NodeTierLevel.LITE,      'HEVOLVE_CRAWL4AI_ENABLED'),
     # Full tier - GPU workloads
     'video_gen':            (NodeTierLevel.FULL,      'HEVOLVE_VIDEO_GEN_ENABLED'),
     'media_agent':          (NodeTierLevel.FULL,      'HEVOLVE_MEDIA_AGENT_ENABLED'),
     'speculative_dispatch': (NodeTierLevel.FULL,      'HEVOLVE_SPECULATIVE_ENABLED'),
     'local_llm':            (NodeTierLevel.FULL,      'HEVOLVE_LOCAL_LLM_ENABLED'),
+    'vlm_omniparser':       (NodeTierLevel.FULL,      'HEVOLVE_VLM_OMNIPARSER_ENABLED'),
+    'minicpm_vision':       (NodeTierLevel.FULL,      'HEVOLVE_MINICPM_ENABLED'),
+    'video_captioning':     (NodeTierLevel.FULL,      'HEVOLVE_VIDEO_CAPTIONING_ENABLED'),
     # Compute host tier - regional hosting
     'local_llm_large':      (NodeTierLevel.COMPUTE_HOST, 'HEVOLVE_LOCAL_LLM_LARGE_ENABLED'),
     'regional_host':        (NodeTierLevel.COMPUTE_HOST, 'HEVOLVE_REGIONAL_HOST_ELIGIBLE'),

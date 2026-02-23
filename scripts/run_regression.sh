@@ -32,37 +32,37 @@ echo ""
 # ===== DEFINE TEST GROUPS =====
 
 # Group 1: Core performance modules (34 tests)
-CORE_TESTS="tests/test_core_performance.py"
+CORE_TESTS="tests/unit/test_core_performance.py"
 
 # Group 2: State machine and lifecycle (12 tests)
-STATE_TESTS="tests/test_state_management.py"
+STATE_TESTS="tests/unit/test_state_management.py"
 
 # Group 3: Social naming and auth (90+ tests)
-SOCIAL_TESTS="tests/test_social_naming.py"
+SOCIAL_TESTS="tests/unit/test_social_naming.py"
 
 # Group 4: Channel infrastructure (rate limit, dedupe, debounce, retry, security)
-CHANNEL_INFRA_TESTS="tests/test_rate_limit.py tests/test_dedupe.py tests/test_debounce.py tests/test_retry.py tests/test_channel_security.py"
+CHANNEL_INFRA_TESTS="tests/unit/test_rate_limit.py tests/unit/test_dedupe.py tests/unit/test_debounce.py tests/unit/test_retry.py tests/unit/test_channel_security.py"
 
 # Group 5: Channel adapters
-CHANNEL_ADAPTER_TESTS="tests/test_discord_adapter.py tests/test_telegram_adapter.py tests/test_web_adapter.py tests/test_google_chat_adapter.py tests/test_signal_adapter.py tests/test_imessage_adapter.py tests/test_mattermost_adapter.py tests/test_nextcloud_adapter.py"
+CHANNEL_ADAPTER_TESTS="tests/unit/test_discord_adapter.py tests/unit/test_telegram_adapter.py tests/unit/test_web_adapter.py tests/unit/test_google_chat_adapter.py tests/unit/test_signal_adapter.py tests/unit/test_imessage_adapter.py tests/unit/test_mattermost_adapter.py tests/unit/test_nextcloud_adapter.py"
 
 # Group 6: Session, queue, streaming, preferences
-SESSION_TESTS="tests/test_session_manager.py tests/test_message_queue.py tests/test_response_streaming.py tests/test_preferences.py tests/test_builtin_commands.py"
+SESSION_TESTS="tests/unit/test_session_manager.py tests/unit/test_message_queue.py tests/unit/test_response_streaming.py tests/unit/test_preferences.py tests/unit/test_builtin_commands.py"
 
 # Group 7: Agent and recipe tests
-AGENT_TESTS="tests/test_agent_creation.py tests/test_recipe_generation.py tests/test_reuse_mode.py tests/test_action_execution.py tests/test_scheduler_creation.py"
+AGENT_TESTS="tests/unit/test_agent_creation.py tests/unit/test_recipe_generation.py tests/unit/test_reuse_mode.py tests/unit/test_action_execution.py tests/unit/test_scheduler_creation.py"
 
 # Group 8: VLM, coding, shell, file management
-TOOL_TESTS="tests/test_vlm_agent.py tests/test_coding_agent.py tests/test_shell_execution.py tests/test_file_manager.py tests/test_file_tracker.py"
+TOOL_TESTS="tests/unit/test_vlm_agent.py tests/unit/test_coding_agent.py tests/unit/test_shell_execution.py tests/unit/test_file_manager.py tests/unit/test_file_tracker.py"
 
 # Group 9: Embeddings, memory, image gen, TTS
-AI_TESTS="tests/test_embeddings.py tests/test_memory_search.py tests/test_image_gen.py tests/test_tts.py"
+AI_TESTS="tests/unit/test_embeddings.py tests/unit/test_memory_search.py tests/unit/test_image_gen.py tests/unit/test_tts.py"
 
 # Group 10: Concurrency
-CONCURRENCY_TESTS="tests/test_concurrency.py"
+CONCURRENCY_TESTS="tests/unit/test_concurrency.py"
 
 # Group 11: Channel e2e regression
-CHANNEL_E2E_TESTS="integrations/channels/tests/test_e2e_regression.py integrations/channels/tests/test_admin_dashboard.py integrations/channels/tests/test_gateway_protocol.py integrations/channels/tests/test_metrics_collector.py"
+CHANNEL_E2E_TESTS="tests/integration/test_channels_e2e_regression.py tests/integration/test_channels_admin_dashboard.py tests/integration/test_channels_gateway_protocol.py tests/integration/test_channels_metrics_collector.py"
 
 echo "Select regression scope:"
 echo "  1. FULL regression (all test groups)"

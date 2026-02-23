@@ -36,7 +36,7 @@ BACKEND_PORT = 6777
 try:
     with open('/etc/hart/hart.env') as _ef:
         for _line in _ef:
-            if _line.startswith('HART_BACKEND_PORT='):
+            if _line.startswith('HARTOS_BACKEND_PORT='):
                 BACKEND_PORT = int(_line.strip().split('=', 1)[1])
                 break
 except (FileNotFoundError, ValueError):

@@ -4,6 +4,9 @@ HevolveSocial - Coding Agent Daemon
 Background thread that finds active goals, detects idle agents,
 and dispatches work through the existing /chat pipeline.
 No separate task tracking — SmartLedger and ActionState handle that.
+
+Now also periodically syncs coding benchmark deltas via FederatedAggregator
+for hive-wide tool routing intelligence (torrent-like, never interrupts user).
 """
 import os
 import time
@@ -21,6 +24,7 @@ class CodingAgentDaemon:
         self._running = False
         self._thread = None
         self._lock = threading.Lock()
+        self._tick_count = 0
 
     def start(self):
         with self._lock:
@@ -62,6 +66,8 @@ class CodingAgentDaemon:
         from .goal_manager import CodingGoalManager
         from .task_distributor import dispatch_to_chat
 
+        self._tick_count += 1
+
         db = get_db()
         try:
             goals = db.query(CodingGoal).filter_by(status='active').all()
@@ -95,6 +101,27 @@ class CodingAgentDaemon:
             logger.debug(f"Coding daemon error: {e}")
         finally:
             db.close()
+
+        # Every 10 ticks (~5 min): sync benchmark deltas to hive
+        # Torrent-like: only during idle windows, never interrupts user
+        if self._tick_count % 10 == 0:
+            self._sync_benchmark_deltas()
+
+    def _sync_benchmark_deltas(self):
+        """Export coding benchmark deltas for hive learning.
+
+        Runs in the daemon thread (low priority, non-blocking).
+        FederatedAggregator picks up the delta on its next tick.
+        """
+        try:
+            from .benchmark_tracker import get_benchmark_tracker
+            tracker = get_benchmark_tracker()
+            delta = tracker.export_learning_delta()
+            if delta:
+                logger.debug(f"Coding benchmark delta exported: "
+                             f"{len(delta.get('coding_benchmarks', {}))} task types")
+        except Exception as e:
+            logger.debug(f"Benchmark delta sync skipped: {e}")
 
 
 # Module-level singleton

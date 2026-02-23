@@ -211,11 +211,26 @@ def _call_local_llm(messages: list) -> str:
 
     node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
 
-    if node_tier in ('regional', 'central') and os.environ.get('HEVOLVE_LLM_ENDPOINT_URL'):
+    # VLM-specific override takes priority, then global AutoGen LLM config,
+    # then node-tier aware defaults (same model the user configured)
+    if os.environ.get('HEVOLVE_VLM_ENDPOINT_URL'):
+        base_url = os.environ['HEVOLVE_VLM_ENDPOINT_URL']
+        model = os.environ.get('HEVOLVE_VLM_MODEL_NAME',
+                               os.environ.get('HEVOLVE_LLM_MODEL_NAME', 'gpt-4.1-mini'))
+        api_key = os.environ.get('HEVOLVE_VLM_API_KEY',
+                                 os.environ.get('HEVOLVE_LLM_API_KEY', 'dummy'))
+    elif os.environ.get('HEVOLVE_LLM_ENDPOINT_URL'):
+        # Use the same LLM config as AutoGen (user's configured model)
         base_url = os.environ['HEVOLVE_LLM_ENDPOINT_URL']
         model = os.environ.get('HEVOLVE_LLM_MODEL_NAME', 'gpt-4.1-mini')
         api_key = os.environ.get('HEVOLVE_LLM_API_KEY', 'dummy')
+    elif os.environ.get('OPENAI_API_KEY'):
+        # Fall back to OpenAI API if configured (common for standalone)
+        base_url = 'https://api.openai.com/v1'
+        model = os.environ.get('HEVOLVE_LLM_MODEL_NAME', 'gpt-4.1-mini')
+        api_key = os.environ['OPENAI_API_KEY']
     else:
+        # Last resort: local llama.cpp / Qwen3-VL
         llama_port = os.environ.get('LLAMA_CPP_PORT', '8080')
         base_url = f'http://localhost:{llama_port}/v1'
         model = 'Qwen3-VL-4B-Instruct'

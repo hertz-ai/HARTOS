@@ -95,15 +95,15 @@ read -p "Enter choice (1-6): " choice
 case $choice in
     1)
         echo "Running channel regression tests..."
-        $PYTHON_EXE -m pytest integrations/channels/tests/test_e2e_regression.py -v -s --tb=short
+        $PYTHON_EXE -m pytest tests/integration/test_channels_e2e_regression.py -v -s --tb=short
         ;;
     2)
         echo "Running master test suite..."
-        $PYTHON_EXE test_master_suite.py
+        $PYTHON_EXE tests/standalone/test_master_suite.py
         ;;
     3)
         echo "Running autonomous agent suite..."
-        $PYTHON_EXE test_autonomous_agent_suite.py
+        $PYTHON_EXE tests/standalone/test_autonomous_agent_suite.py
         ;;
     4)
         echo "Running Docker E2E tests..."
@@ -116,12 +116,12 @@ case $choice in
         ;;
     5)
         echo "Running ALL local tests..."
-        $PYTHON_EXE -m pytest tests/ integrations/channels/tests/ test_master_suite.py test_dynamic_agents.py test_complex_agent_comprehensive.py -v --tb=short --color=yes
+        $PYTHON_EXE -m pytest tests/unit/ tests/integration/ tests/e2e/ -v --tb=short --color=yes
         ;;
     6)
         echo "Running tests with coverage..."
         rm -rf htmlcov
-        $PYTHON_EXE -m pytest integrations/channels/tests/test_e2e_regression.py -v --tb=short \
+        $PYTHON_EXE -m pytest tests/integration/test_channels_e2e_regression.py -v --tb=short \
             --cov=integrations/channels \
             --cov-report=html:htmlcov \
             --cov-report=term-missing

@@ -42,7 +42,7 @@ RUN pip install --no-cache-dir pyautogen || true
 COPY . .
 
 # Create necessary directories
-RUN mkdir -p prompts logs tests/runtime_tests
+RUN mkdir -p prompts logs tests/e2e/runtime_tests
 
 # Set environment variables for testing
 ENV PYTHONPATH=/app
@@ -58,4 +58,4 @@ RUN useradd -m -u 1000 testuser && \
 USER testuser
 
 # Default command runs tests
-CMD ["pytest", "tests/runtime_tests/", "-v", "--tb=short"]
+CMD ["pytest", "tests/e2e/runtime_tests/", "-v", "--tb=short"]

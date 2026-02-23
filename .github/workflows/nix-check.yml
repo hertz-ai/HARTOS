@@ -1,0 +1,106 @@
+name: Nix Lint & Evaluate
+
+# Fast feedback: runs in ~30 seconds
+# Catches syntax errors, unused code, and evaluation failures
+# before the expensive 30-60 min ISO build.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'nixos/**'
+      - 'deploy/distro/**'
+  pull_request:
+    paths:
+      - 'nixos/**'
+      - 'deploy/distro/**'
+
+concurrency:
+  group: nix-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ─── Static Analysis (3 seconds) ───────────────────────────
+  lint:
+    name: Nix Lint (statix + deadnix)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v12
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+
+      - name: Run statix (antipattern detection)
+        run: |
+          nix-env -iA nixpkgs.statix
+          echo "::group::statix results"
+          statix check nixos/ 2>&1 || true
+          echo "::endgroup::"
+          # Fail on errors, warn on suggestions
+          statix check nixos/
+
+      - name: Run deadnix (unused code detection)
+        run: |
+          nix-env -iA nixpkgs.deadnix
+          echo "::group::deadnix results"
+          deadnix nixos/ 2>&1 || true
+          echo "::endgroup::"
+          deadnix nixos/
+
+  # ─── Flake Evaluation (10-30 seconds) ──────────────────────
+  flake-check:
+    name: Nix Flake Check (full evaluation)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v12
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+
+      - name: Cache Nix store
+        uses: DeterminateSystems/magic-nix-cache-action@v7
+
+      - name: Evaluate all flake outputs
+        working-directory: nixos
+        run: |
+          echo "Evaluating all nixosConfigurations, packages, and apps..."
+          nix flake check --no-build 2>&1
+          echo ""
+          echo "All flake outputs evaluate successfully."
+
+      - name: Show flake metadata
+        working-directory: nixos
+        run: |
+          echo "::group::Flake outputs"
+          nix flake show 2>&1
+          echo "::endgroup::"
+
+  # ─── Python Structural Validation ──────────────────────────
+  python-tests:
+    name: NixOS Config Structural Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install pytest
+        run: pip install pytest
+
+      - name: Run NixOS config tests
+        run: pytest tests/unit/test_nixos_configs.py -v

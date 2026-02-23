@@ -1928,6 +1928,42 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                             description="Processes user-defined commands on a personal Windows or Android system and returns detailed computer/mobile use agent execution context.")(execute_windows_or_android_command)
     assistant.register_for_execution(name="execute_windows_or_android_command")(execute_windows_or_android_command)
 
+    # Coding Agent Aggregator: Route coding tasks to best CLI tool
+    # This is a LEAF tool — calls external subprocess (kilocode/claude/opencode),
+    # never re-dispatches to /chat. Safe from callback loops.
+    async def execute_coding_task(
+        task: Annotated[str, "The coding task to execute (e.g., 'review this function for bugs', 'implement a login form')"],
+        task_type: Annotated[str, "Task type: code_review, feature, bug_fix, refactor, app_build, debugging, multi_session"] = "feature",
+        preferred_tool: Annotated[str, "Optional tool override: kilocode, claude_code, or opencode (empty = auto-select best)"] = "",
+    ) -> str:
+        """Execute a coding task using the best available coding agent tool (KiloCode, Claude Code, or OpenCode).
+
+        Routes to the best tool based on benchmarks and task type.
+        This is for writing, reviewing, refactoring, or debugging code —
+        NOT for GUI automation (use execute_windows_or_android_command for that).
+        """
+        try:
+            from integrations.coding_agent.orchestrator import get_coding_orchestrator
+            orchestrator = get_coding_orchestrator()
+            result = orchestrator.execute(
+                task=task,
+                task_type=task_type,
+                preferred_tool=preferred_tool,
+                user_id=user_prompt,
+                model=os.environ.get('HEVOLVE_CODING_MODEL', ''),
+                working_dir=os.environ.get('HEVOLVE_CODING_WORKDIR', ''),
+            )
+            import json
+            return json.dumps(result, indent=2)
+        except Exception as e:
+            return f"Coding task execution error: {e}"
+
+    helper.register_for_llm(
+        name="execute_coding_task",
+        description="Execute a coding task (write, review, refactor, debug code) using the best available coding agent tool. Routes to KiloCode, Claude Code, or OpenCode based on benchmarks."
+    )(execute_coding_task)
+    assistant.register_for_execution(name="execute_coding_task")(execute_coding_task)
+
     # MCP Integration: Load and register user-provided MCP server tools
     try:
         tool_logger.info("Loading user-provided MCP servers...")

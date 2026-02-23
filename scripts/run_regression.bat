@@ -55,119 +55,119 @@ REM ===== DEFINE TEST GROUPS =====
 
 REM Group 1: P2P Network, Security, Agent Engine (~960+ tests)
 set P2P_SECURITY_TESTS=^
-    tests/test_hierarchy_system.py ^
-    tests/test_integrity_system.py ^
-    tests/test_ad_hosting_rewards.py ^
-    tests/test_agent_network_resilience.py ^
-    tests/test_master_key_system.py ^
-    tests/test_coding_agent.py ^
-    tests/test_cache_restoration.py ^
-    tests/test_agent_engine.py ^
-    tests/test_node_watchdog.py ^
-    tests/test_auto_discovery.py ^
-    tests/test_agent_dashboard.py ^
-    tests/test_mode_aware_inference.py ^
-    tests/test_system_requirements.py ^
-    tests/test_commercial_ip_builds.py ^
-    tests/test_federation_upgrade.py ^
-    tests/test_continual_learner_gate.py ^
-    tests/test_gradient_sync.py ^
-    tests/test_thought_experiments.py
+    tests/unit/test_hierarchy_system.py ^
+    tests/unit/test_integrity_system.py ^
+    tests/unit/test_ad_hosting_rewards.py ^
+    tests/unit/test_agent_network_resilience.py ^
+    tests/unit/test_master_key_system.py ^
+    tests/unit/test_coding_agent.py ^
+    tests/unit/test_cache_restoration.py ^
+    tests/unit/test_agent_engine.py ^
+    tests/unit/test_node_watchdog.py ^
+    tests/unit/test_auto_discovery.py ^
+    tests/unit/test_agent_dashboard.py ^
+    tests/unit/test_mode_aware_inference.py ^
+    tests/unit/test_system_requirements.py ^
+    tests/unit/test_commercial_ip_builds.py ^
+    tests/unit/test_federation_upgrade.py ^
+    tests/unit/test_continual_learner_gate.py ^
+    tests/unit/test_gradient_sync.py ^
+    tests/unit/test_thought_experiments.py
 
 REM Group 2: Social Platform (~148 tests)
 set SOCIAL_TESTS=^
-    tests/test_social_regression.py ^
-    tests/test_social_models.py ^
-    tests/test_social_feed.py ^
-    tests/test_social_search.py ^
-    tests/test_social_karma.py ^
-    tests/test_social_api.py ^
-    tests/test_social_naming.py
+    tests/unit/test_social_regression.py ^
+    tests/unit/test_social_models.py ^
+    tests/unit/test_social_feed.py ^
+    tests/unit/test_social_search.py ^
+    tests/unit/test_social_karma.py ^
+    tests/unit/test_social_api.py ^
+    tests/unit/test_social_naming.py
 
 REM Group 3: Channel Infrastructure (~120 tests)
 set CHANNEL_INFRA_TESTS=^
-    tests/test_rate_limit.py ^
-    tests/test_dedupe.py ^
-    tests/test_debounce.py ^
-    tests/test_retry.py ^
-    tests/test_channel_security.py ^
-    tests/test_channel_integration.py
+    tests/unit/test_rate_limit.py ^
+    tests/unit/test_dedupe.py ^
+    tests/unit/test_debounce.py ^
+    tests/unit/test_retry.py ^
+    tests/unit/test_channel_security.py ^
+    tests/integration/test_channel_integration.py
 
 REM Group 4: Channel Adapters (~200 tests)
 set CHANNEL_ADAPTER_TESTS=^
-    tests/test_discord_adapter.py ^
-    tests/test_telegram_adapter.py ^
-    tests/test_web_adapter.py ^
-    tests/test_google_chat_adapter.py ^
-    tests/test_signal_adapter.py ^
-    tests/test_imessage_adapter.py ^
-    tests/test_mattermost_adapter.py ^
-    tests/test_nextcloud_adapter.py
+    tests/unit/test_discord_adapter.py ^
+    tests/unit/test_telegram_adapter.py ^
+    tests/unit/test_web_adapter.py ^
+    tests/unit/test_google_chat_adapter.py ^
+    tests/unit/test_signal_adapter.py ^
+    tests/unit/test_imessage_adapter.py ^
+    tests/unit/test_mattermost_adapter.py ^
+    tests/unit/test_nextcloud_adapter.py
 
 REM Group 5: Channel E2E (~172 tests)
 set CHANNEL_E2E_TESTS=^
-    integrations/channels/tests/test_e2e_regression.py ^
-    integrations/channels/tests/test_admin_dashboard.py ^
-    integrations/channels/tests/test_gateway_protocol.py ^
-    integrations/channels/tests/test_metrics_collector.py
+    tests/integration/test_channels_e2e_regression.py ^
+    tests/integration/test_channels_admin_dashboard.py ^
+    tests/integration/test_channels_gateway_protocol.py ^
+    tests/integration/test_channels_metrics_collector.py
 
 REM Group 6: Agent and Recipe Pipeline (~230+ tests)
 set AGENT_RECIPE_TESTS=^
-    tests/test_agent_creation.py ^
-    tests/test_recipe_generation.py ^
-    tests/test_reuse_mode.py ^
-    tests/test_action_execution.py ^
-    tests/test_scheduler_creation.py ^
-    tests/test_autonomous_agent_suite.py ^
-    tests/test_complex_agent_comprehensive.py ^
-    tests/test_dynamic_agents.py ^
-    tests/test_nested_tasks_direct.py ^
-    tests/test_complete_integration.py ^
-    tests/test_complete_e2e_integration.py ^
-    tests/test_e2e_pipelines.py ^
-    tests/test_recipe_experience_healing.py
+    tests/unit/test_agent_creation.py ^
+    tests/unit/test_recipe_generation.py ^
+    tests/unit/test_reuse_mode.py ^
+    tests/unit/test_action_execution.py ^
+    tests/unit/test_scheduler_creation.py ^
+    tests/standalone/test_autonomous_agent_suite.py ^
+    tests/standalone/test_complex_agent_comprehensive.py ^
+    tests/unit/test_dynamic_agents.py ^
+    tests/standalone/test_nested_tasks_direct.py ^
+    tests/integration/test_complete_integration.py ^
+    tests/e2e/test_complete_e2e_integration.py ^
+    tests/e2e/test_e2e_pipelines.py ^
+    tests/unit/test_recipe_experience_healing.py
 
 REM Group 7: Session and Messaging (~90 tests)
 set SESSION_TESTS=^
-    tests/test_session_manager.py ^
-    tests/test_message_queue.py ^
-    tests/test_response_streaming.py ^
-    tests/test_preferences.py ^
-    tests/test_builtin_commands.py
+    tests/unit/test_session_manager.py ^
+    tests/unit/test_message_queue.py ^
+    tests/unit/test_response_streaming.py ^
+    tests/unit/test_preferences.py ^
+    tests/unit/test_builtin_commands.py
 
 REM Group 8: Tools and AI (~320+ tests)
 set TOOLS_AI_TESTS=^
-    tests/test_vlm_agent.py ^
-    tests/test_shell_execution.py ^
-    tests/test_file_manager.py ^
-    tests/test_file_tracker.py ^
-    tests/test_vision_sidecar.py ^
-    tests/test_embeddings.py ^
-    tests/test_memory_search.py ^
-    tests/test_image_gen.py ^
-    tests/test_tts.py ^
-    tests/test_runtime_tools.py
+    tests/unit/test_vlm_agent.py ^
+    tests/unit/test_shell_execution.py ^
+    tests/unit/test_file_manager.py ^
+    tests/unit/test_file_tracker.py ^
+    tests/unit/test_vision_sidecar.py ^
+    tests/unit/test_embeddings.py ^
+    tests/unit/test_memory_search.py ^
+    tests/unit/test_image_gen.py ^
+    tests/unit/test_tts.py ^
+    tests/unit/test_runtime_tools.py
 
 REM Group 9: Core, Performance, and Concurrency (~150 tests)
 set CORE_PERF_TESTS=^
-    tests/test_core_performance.py ^
-    tests/test_state_management.py ^
-    tests/test_concurrency.py
+    tests/unit/test_core_performance.py ^
+    tests/unit/test_state_management.py ^
+    tests/unit/test_concurrency.py
 
 REM Group 10: Integration and Data (~50 tests)
 set INTEGRATION_TESTS=^
-    tests/test_integration.py ^
-    tests/test_redis_ledger.py
+    tests/integration/test_integration.py ^
+    tests/unit/test_redis_ledger.py
 
 REM Group 11: Distro, Security Hardening, Deployment (~469 tests)
 set DISTRO_TESTS=^
-    tests/test_distro_configs.py ^
-    tests/test_distro_tools.py ^
-    tests/test_pxe_server.py ^
-    tests/test_ota_update.py ^
-    tests/test_network_provisioner.py ^
-    tests/test_security_hardening_distro.py ^
-    tests/test_deployment_modes.py
+    tests/unit/test_distro_configs.py ^
+    tests/unit/test_distro_tools.py ^
+    tests/unit/test_pxe_server.py ^
+    tests/unit/test_ota_update.py ^
+    tests/unit/test_network_provisioner.py ^
+    tests/unit/test_security_hardening_distro.py ^
+    tests/unit/test_deployment_modes.py
 
 echo Select regression scope:
 echo.
@@ -193,8 +193,8 @@ if "%choice%"=="1" (
     REM  -s disables fd-capture (pytest's tmpfile gets closed by imports,
     REM     causing "ValueError: I/O operation on closed file" abort)
     "%PYTHON_EXE%" -m pytest ^
-        tests/ ^
-        integrations/channels/tests/ ^
+        tests/unit/ ^
+        tests/integration/ ^
         --override-ini="addopts=" ^
         --tb=line --color=no -q -s ^
         > regression_results.txt 2>&1
