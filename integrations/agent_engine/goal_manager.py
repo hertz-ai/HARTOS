@@ -1006,3 +1006,65 @@ def _build_robot_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) ->
 
 
 register_goal_type('robot', _build_robot_prompt, tool_tags=['robot'])
+
+
+def _build_trading_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
+    """Build prompt for paper/live trading agent.
+
+    Supports intraday (technical) and long_term (fundamental) strategies.
+    Paper trading by default; live trading requires constitutional vote.
+    """
+    title = _sanitize_goal_input(goal_dict.get('title', ''))
+    desc = _sanitize_goal_input(goal_dict.get('description', ''))
+    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    strategy = config.get('strategy', 'long_term')
+    paper = config.get('paper_trading', True)
+    market = config.get('market', 'crypto')
+    max_budget = config.get('max_budget', 10000)
+    max_loss_pct = config.get('max_loss_pct', 10)
+
+    mode_label = 'PAPER TRADING' if paper else 'LIVE TRADING'
+
+    if strategy == 'intraday':
+        strategy_block = (
+            f"STRATEGY: INTRADAY (minutes-to-hours horizon)\n"
+            f"- Use get_technical_indicators for RSI, MACD, Bollinger Bands\n"
+            f"- Enter on signal confluence (2+ indicators agree)\n"
+            f"- Max risk per trade: 2% of portfolio\n"
+            f"- Mandatory stop-loss on every position\n"
+            f"- Close all positions before market close (or 24h for crypto)\n"
+        )
+    else:
+        strategy_block = (
+            f"STRATEGY: LONG-TERM (weeks-to-months horizon)\n"
+            f"- Use get_market_sentiment for news-based sentiment analysis\n"
+            f"- Fundamental + sentiment analysis before entry\n"
+            f"- Diversify across at least 3 assets\n"
+            f"- Monthly rebalancing check\n"
+            f"- Position size: max 25% of portfolio per asset\n"
+        )
+
+    return (
+        f"YOU ARE A {mode_label} AGENT.\n\n"
+        f"Goal: {title}\n"
+        f"Description: {desc}\n"
+        f"Market: {market.upper()}\n"
+        f"Max budget: {max_budget} Spark\n\n"
+        f"{strategy_block}\n"
+        f"WORKFLOW:\n"
+        f"1. Use get_market_data to fetch price data for target symbols\n"
+        f"2. Analyze using get_technical_indicators and/or get_market_sentiment\n"
+        f"3. Use place_paper_trade to execute trades (symbol, side, amount, stop_loss)\n"
+        f"4. Monitor positions with get_portfolio_status\n"
+        f"5. Review history with get_trade_history\n\n"
+        f"NON-NEGOTIABLE RISK RULES:\n"
+        f"- Maximum budget: {max_budget} Spark — never exceed this\n"
+        f"- Stop-loss is MANDATORY on every trade\n"
+        f"- HALT all trading if cumulative loss exceeds {max_loss_pct}%\n"
+        f"- Paper-to-live transition requires constitutional vote\n"
+        f"- Never trade on margin or leverage\n"
+        f"- Log every trade decision with reasoning\n"
+    )
+
+
+register_goal_type('trading', _build_trading_prompt, tool_tags=['trading'])

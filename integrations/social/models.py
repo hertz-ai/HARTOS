@@ -589,7 +589,7 @@ class PeerNode(Base):
     master_key_verified = Column(Boolean, default=False)
     release_version = Column(String(20), nullable=True)
     # Hierarchy columns (v13)
-    tier = Column(String(20), default='flat')  # central|regional|local|flat
+    tier = Column(String(20), default='flat')  # TOPOLOGY MODE: central|regional|local|flat (NOT capability tier)
     parent_node_id = Column(String(64), nullable=True)
     certificate_json = Column(JSON, nullable=True)
     certificate_verified = Column(Boolean, default=False)
@@ -601,7 +601,7 @@ class PeerNode(Base):
     max_user_capacity = Column(Integer, default=0)
     dns_region = Column(String(50), nullable=True)
     # HART OS equilibrium: contribution tier + enabled features
-    capability_tier = Column(String(20), nullable=True)       # observer|lite|standard|full|compute_host
+    capability_tier = Column(String(20), nullable=True)       # CAPABILITY TIER: embedded|observer|lite|standard|full|compute_host
     enabled_features_json = Column(JSON, nullable=True)       # ["agent_engine", "tts", ...]
     # E2E encryption: X25519 public key for encrypted inter-node communication
     x25519_public = Column(String(64), nullable=True)         # Hex-encoded X25519 public key (32 bytes)
@@ -2625,6 +2625,7 @@ class ThoughtExperiment(Base):
     intent_category = Column(String(30), default='technology')
     status = Column(String(20), default='proposed', index=True)
     decision_type = Column(String(20), default='weighted')
+    decision_context = Column(String(50), nullable=True)
     voting_opens_at = Column(DateTime, nullable=True)
     voting_closes_at = Column(DateTime, nullable=True)
     evaluation_deadline = Column(DateTime, nullable=True)
@@ -2648,6 +2649,7 @@ class ThoughtExperiment(Base):
             'intent_category': self.intent_category,
             'status': self.status,
             'decision_type': self.decision_type,
+            'decision_context': self.decision_context,
             'voting_opens_at': self.voting_opens_at.isoformat() if self.voting_opens_at else None,
             'voting_closes_at': self.voting_closes_at.isoformat() if self.voting_closes_at else None,
             'evaluation_deadline': self.evaluation_deadline.isoformat() if self.evaluation_deadline else None,
@@ -2695,4 +2697,74 @@ class ExperimentVote(Base):
             'suggestion': self.suggestion,
             'constitutional_check': self.constitutional_check,
             'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class PaperPortfolio(Base):
+    """Simulated trading portfolio for paper trading agents."""
+    __tablename__ = 'paper_portfolios'
+
+    id = Column(String(64), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(64), nullable=False, index=True)
+    goal_id = Column(String(64), nullable=True)
+    strategy = Column(String(30), default='long_term')
+    initial_balance = Column(Float, default=10000.0)
+    current_balance = Column(Float, default=10000.0)
+    total_pnl = Column(Float, default=0.0)
+    total_trades = Column(Integer, default=0)
+    winning_trades = Column(Integer, default=0)
+    status = Column(String(20), default='active')
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'goal_id': self.goal_id,
+            'strategy': self.strategy,
+            'initial_balance': self.initial_balance,
+            'current_balance': self.current_balance,
+            'total_pnl': self.total_pnl,
+            'total_trades': self.total_trades,
+            'winning_trades': self.winning_trades,
+            'win_rate': round(self.winning_trades / self.total_trades, 4) if self.total_trades else 0.0,
+            'status': self.status,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class PaperTrade(Base):
+    """Individual paper trade record."""
+    __tablename__ = 'paper_trades'
+
+    id = Column(String(64), primary_key=True, default=lambda: str(uuid.uuid4()))
+    portfolio_id = Column(String(64), ForeignKey('paper_portfolios.id', use_alter=True),
+                          nullable=False, index=True)
+    symbol = Column(String(20), nullable=False)
+    side = Column(String(10), nullable=False)
+    quantity = Column(Float, nullable=False)
+    entry_price = Column(Float, nullable=False)
+    exit_price = Column(Float, nullable=True)
+    stop_loss = Column(Float, nullable=True)
+    pnl = Column(Float, default=0.0)
+    status = Column(String(20), default='open')
+    opened_at = Column(DateTime, default=func.now())
+    closed_at = Column(DateTime, nullable=True)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'portfolio_id': self.portfolio_id,
+            'symbol': self.symbol,
+            'side': self.side,
+            'quantity': self.quantity,
+            'entry_price': self.entry_price,
+            'exit_price': self.exit_price,
+            'stop_loss': self.stop_loss,
+            'pnl': self.pnl,
+            'status': self.status,
+            'opened_at': self.opened_at.isoformat() if self.opened_at else None,
+            'closed_at': self.closed_at.isoformat() if self.closed_at else None,
         }

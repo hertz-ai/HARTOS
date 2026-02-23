@@ -43,6 +43,10 @@ class FederatedAggregator:
         self._embedding_deltas: Dict[str, dict] = {}  # node_id → compressed delta
         self._embedding_epoch = 0
         self._last_embedding_aggregated: Optional[dict] = None
+        # Model lifecycle delta channel (dynamic load/unload intelligence)
+        self._lifecycle_lock = threading.Lock()
+        self._lifecycle_deltas: Dict[str, dict] = {}  # node_id → model usage stats
+        self._last_lifecycle_aggregated: Optional[dict] = None
 
     def tick(self) -> dict:
         """Full cycle: extract → broadcast → aggregate → apply → track."""
@@ -280,15 +284,22 @@ class FederatedAggregator:
         if len(all_deltas) < 1:
             return None
 
-        # Compute weights: log(1 + contribution_score) * tier_multiplier
-        tier_multipliers = {
-            'lite': 0.5, 'standard': 1.0, 'compute': 1.5, 'gpu': 2.0,
+        # Compute weights: log(1 + contribution_score) * capability_tier_multiplier
+        # Values must match NodeTierLevel enum in security/system_requirements.py
+        # (NOT topology modes like flat/regional/central — those are separate)
+        capability_tier_multipliers = {
+            'embedded': 0.2,
+            'observer': 0.3,
+            'lite': 0.5,
+            'standard': 1.0,
+            'full': 1.5,
+            'compute_host': 2.0,
         }
         weights = []
         for d in all_deltas:
             cs = d.get('contribution_score', 0)
             tier = d.get('capability_tier', 'standard')
-            w = math.log1p(max(0, cs)) * tier_multipliers.get(tier, 1.0)
+            w = math.log1p(max(0, cs)) * capability_tier_multipliers.get(tier, 1.0)
             weights.append(max(0.1, w))  # Floor at 0.1
 
         total_weight = sum(weights)
@@ -434,6 +445,56 @@ class FederatedAggregator:
             'last_aggregated': self._last_embedding_aggregated,
         }
 
+    # ─── Model Lifecycle Delta Channel ───
+
+    def receive_lifecycle_delta(self, node_id: str, delta: dict):
+        """Store model usage stats from a peer node."""
+        if not node_id or not isinstance(delta, dict):
+            return
+        with self._lifecycle_lock:
+            self._lifecycle_deltas[node_id] = delta
+
+    def aggregate_lifecycle(self) -> Optional[dict]:
+        """Aggregate model popularity across all peers.
+
+        Returns: {popularity: {model_name: 0.0-1.0}, peer_count: int}
+        """
+        with self._lifecycle_lock:
+            deltas = list(self._lifecycle_deltas.values())
+        if not deltas:
+            return self._last_lifecycle_aggregated
+
+        total_peers = len(deltas)
+        model_counts: Dict[str, int] = {}
+        model_access_rates: Dict[str, List[float]] = {}
+
+        for d in deltas:
+            for model_name, stats in d.get('models', {}).items():
+                model_counts[model_name] = model_counts.get(model_name, 0) + 1
+                rate = stats.get('access_rate', 0)
+                if isinstance(rate, (int, float)):
+                    model_access_rates.setdefault(model_name, []).append(rate)
+
+        popularity = {}
+        for name, count in model_counts.items():
+            peer_fraction = count / max(1, total_peers)
+            rates = model_access_rates.get(name, [0])
+            avg_rate = sum(rates) / max(1, len(rates))
+            popularity[name] = min(1.0, peer_fraction * (1 + avg_rate))
+
+        result = {'popularity': popularity, 'peer_count': total_peers}
+        self._last_lifecycle_aggregated = result
+        return result
+
+    def get_lifecycle_stats(self) -> dict:
+        """Return model lifecycle delta stats for dashboard."""
+        with self._lifecycle_lock:
+            pending = len(self._lifecycle_deltas)
+        return {
+            'pending_deltas': pending,
+            'last_aggregated': self._last_lifecycle_aggregated,
+        }
+
     def get_stats(self) -> dict:
         """Return federation stats for dashboard."""
         with self._lock:
@@ -448,6 +509,11 @@ class FederatedAggregator:
         # Include embedding stats
         try:
             stats['embedding'] = self.get_embedding_stats()
+        except Exception:
+            pass
+        # Include model lifecycle stats
+        try:
+            stats['lifecycle'] = self.get_lifecycle_stats()
         except Exception:
             pass
         return stats

@@ -200,6 +200,21 @@ class AgentDaemon:
         from .goal_manager import GoalManager
         from .dispatch import dispatch_goal
 
+        # RESOURCE GATE: throttle dispatch when system is under pressure
+        # Prevents machine slowness while Nunba/HARTOS is running
+        try:
+            from integrations.service_tools.model_lifecycle import (
+                get_model_lifecycle_manager)
+            _pressure = get_model_lifecycle_manager().get_system_pressure()
+            _throttle = _pressure.get('throttle_factor', 1.0)
+            if _throttle < 0.1:
+                logger.debug(
+                    "Agent daemon: system under heavy pressure "
+                    f"(throttle={_throttle:.2f}), skipping dispatch")
+                return
+        except Exception:
+            _throttle = 1.0
+
         speculative_enabled = os.environ.get(
             'HEVOLVE_SPECULATIVE_ENABLED', 'false').lower() == 'true'
 
@@ -230,6 +245,8 @@ class AgentDaemon:
             dispatched = 0
             used_agents = set()
             max_concurrent = int(os.environ.get('HEVOLVE_AGENT_MAX_CONCURRENT', '10'))
+            # Reduce concurrency proportional to system pressure
+            max_concurrent = max(1, int(max_concurrent * _throttle))
 
             for goal in goals:
                 if dispatched >= len(idle_agents) or dispatched >= max_concurrent:
@@ -381,6 +398,19 @@ class AgentDaemon:
                         logger.info(f"Self-healing: created {fix_count} fix goal(s)")
                 except Exception as e:
                     logger.debug(f"Self-healing check: {e}")
+
+            # Revenue → trading funding: every 5th remediation cycle
+            if self._tick_count % (self._remediate_every * 5) == 0:
+                try:
+                    from .revenue_aggregator import get_revenue_aggregator
+                    rev = get_revenue_aggregator()
+                    fund_result = rev.check_and_fund_trading(db)
+                    if fund_result.get('funded'):
+                        logger.info(
+                            f"Revenue aggregator: funded trading with "
+                            f"{fund_result['amount']} Spark")
+                except Exception as e:
+                    logger.debug(f"Revenue funding check: {e}")
 
             # Baseline intelligence check: re-snapshot when world model stats shift
             if self._tick_count % (self._remediate_every * 2) == 0:

@@ -1209,15 +1209,13 @@ def assign_task(task_id):
     # Notify the assignee (or agent owner)
     try:
         notify_target = assignee.owner_id if assignee.user_type == 'agent' else assignee_id
-        from .models import Notification
-        notif = Notification(
-            user_id=notify_target,
-            type='task_assigned',
+        from .services import NotificationService
+        NotificationService.create(
+            g.db, user_id=notify_target, type='task_assigned',
+            source_user_id=g.user.id, target_type='task',
+            target_id=task.id,
             message=f'Task assigned: {task.task_description[:80] if task.task_description else "New task"}',
-            reference_type='task',
-            reference_id=task.id,
         )
-        g.db.add(notif)
     except Exception:
         pass
     return _ok(task.to_dict())

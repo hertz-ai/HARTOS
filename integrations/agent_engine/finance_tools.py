@@ -105,19 +105,20 @@ def register_finance_tools(helper, assistant, user_id: str):
         """Track the 90/10 revenue split compliance over a period."""
         try:
             from integrations.social.models import get_db, APIUsageLog
+            from integrations.agent_engine.revenue_aggregator import query_revenue_streams
             from sqlalchemy import func
 
             db = get_db()
             try:
-                cutoff = datetime.utcnow() - timedelta(days=period_days)
-                period_revenue = float(db.query(
-                    func.coalesce(func.sum(APIUsageLog.cost_credits), 0.0)
-                ).filter(APIUsageLog.created_at >= cutoff).scalar() or 0)
+                # Use shared revenue query (single source of truth)
+                streams = query_revenue_streams(db, period_days)
+                period_revenue = streams['total_gross']
 
                 compute_share = round(period_revenue * 0.9, 4)
                 platform_share = round(period_revenue * 0.1, 4)
 
-                # Daily breakdown
+                # Daily breakdown (unique to this tool — not in shared query)
+                cutoff = datetime.utcnow() - timedelta(days=period_days)
                 daily_revenue = db.query(
                     func.date(APIUsageLog.created_at).label('day'),
                     func.sum(APIUsageLog.cost_credits).label('revenue'),
@@ -129,6 +130,8 @@ def register_finance_tools(helper, assistant, user_id: str):
                 return json.dumps({
                     'period_days': period_days,
                     'total_revenue': round(period_revenue, 4),
+                    'api_revenue': round(streams['api_revenue'], 4),
+                    'ad_revenue': round(streams['ad_revenue'], 4),
                     'compute_providers_owed': compute_share,
                     'platform_retained': platform_share,
                     'split_ratio': '90/10',

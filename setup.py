@@ -78,6 +78,9 @@ install_requires = [
     # Async utilities
     "asyncio-compat>=0.1.0;python_version<'3.10'",
 
+    # Speech-to-text (ONNX runtime — no PyTorch needed, CPU-optimized)
+    "sherpa-onnx>=1.11.0",
+
     # Other utilities
     "pytz>=2023.3",
     "python-multipart>=0.0.6",

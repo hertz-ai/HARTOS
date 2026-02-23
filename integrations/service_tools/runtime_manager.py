@@ -58,6 +58,24 @@ class RuntimeToolManager:
         self._processes: Dict[str, subprocess.Popen] = {}
         self._ports: Dict[str, int] = {}
         self._lock = Lock()
+        # Lifecycle hooks — ModelLifecycleManager subscribes to these
+        self._lifecycle_hooks = {
+            'on_tool_started': [],
+            'on_tool_stopped': [],
+        }
+
+    def register_lifecycle_hook(self, event: str, callback) -> None:
+        """Register a lifecycle event callback. Non-breaking addition."""
+        if event in self._lifecycle_hooks:
+            self._lifecycle_hooks[event].append(callback)
+
+    def _notify_hooks(self, event: str, tool_name: str, **kwargs) -> None:
+        """Fire all registered hooks for an event."""
+        for cb in self._lifecycle_hooks.get(event, []):
+            try:
+                cb(tool_name, **kwargs)
+            except Exception as e:
+                logger.debug(f"Lifecycle hook error ({event}, {tool_name}): {e}")
 
     # ── Tool lifecycle ───────────────────────────────────────────
 
@@ -128,16 +146,19 @@ class RuntimeToolManager:
         """Stop a tool's server and free VRAM."""
         config = TOOL_CONFIGS.get(tool_name)
         if config and config.get('is_inprocess'):
-            return self._stop_inprocess(tool_name)
+            result = self._stop_inprocess(tool_name)
+            self._notify_hooks('on_tool_stopped', tool_name)
+            return result
 
         self._kill_server(tool_name)
         self.vram.release(tool_name)
+        self._notify_hooks('on_tool_stopped', tool_name)
         self.save_state()
         return {'tool': tool_name, 'status': 'stopped'}
 
     def unload_tool(self, tool_name: str) -> Dict:
         """Stop + deregister a tool."""
-        self.stop_tool(tool_name)
+        self.stop_tool(tool_name)  # stop_tool already fires on_tool_stopped
         service_tool_registry.unregister_tool(tool_name)
         self.save_state()
         return {'tool': tool_name, 'status': 'unloaded'}
@@ -290,6 +311,8 @@ class RuntimeToolManager:
             self._register_tool_at_port(tool_name, port)
 
             logger.info(f"Started {tool_name} on port {port} (PID {proc.pid})")
+            self._notify_hooks('on_tool_started', tool_name,
+                               device='gpu', offload_mode=offload_mode)
             return {'running': True, 'port': port, 'pid': proc.pid}
 
         except Exception as e:
@@ -305,6 +328,8 @@ class RuntimeToolManager:
                 WhisperTool.register_functions()
                 self.vram.allocate(tool_name)
                 logger.info(f"Whisper registered in-process (model: {model_name})")
+                self._notify_hooks('on_tool_started', tool_name,
+                                   device='gpu', inprocess=True)
                 return {'running': True, 'inprocess': True, 'model': model_name}
             except Exception as e:
                 return {'error': f'Whisper init failed: {e}'}

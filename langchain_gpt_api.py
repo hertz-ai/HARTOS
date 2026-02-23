@@ -53,6 +53,7 @@ except (ImportError, AttributeError):
     # Requests might not be in langchain
     Requests = None
 from flask import Flask, jsonify, request
+from functools import wraps
 import json
 import os
 import re
@@ -4174,73 +4175,132 @@ Example response format:
         app.logger.error(f"Error in /zeroshot/ endpoint: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
+# ─── Shared error-handling decorator (DRY: replaces 12+ identical try/except blocks) ──
+
+def _json_endpoint(f):
+    """Wrap a Flask view so unhandled exceptions return ``{'error': ...}, 500``."""
+    @wraps(f)
+    def _wrapped(*args, **kwargs):
+        try:
+            return f(*args, **kwargs)
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    return _wrapped
+
+
 # ─── Runtime Media Tools API ──────────────────────────────────────────
 # Endpoints for managing runtime media tools (Wan2GP, TTS-Audio-Suite,
 # Whisper, OmniParser). Tools are downloaded, started, and registered
 # dynamically. See integrations/service_tools/runtime_manager.py.
 
 @app.route('/api/tools/status', methods=['GET'])
+@_json_endpoint
 def tools_status():
     """Get status of all runtime media tools."""
-    try:
-        from integrations.service_tools.runtime_manager import runtime_tool_manager
-        return jsonify(runtime_tool_manager.get_all_status())
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    from integrations.service_tools.runtime_manager import runtime_tool_manager
+    return jsonify(runtime_tool_manager.get_all_status())
 
 
 @app.route('/api/tools/<tool_name>/setup', methods=['POST'])
+@_json_endpoint
 def tools_setup(tool_name):
     """Download + start + register a runtime tool."""
-    try:
-        from integrations.service_tools.runtime_manager import runtime_tool_manager
-        result = runtime_tool_manager.setup_tool(tool_name)
-        code = 500 if 'error' in result else 200
-        return jsonify(result), code
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    from integrations.service_tools.runtime_manager import runtime_tool_manager
+    result = runtime_tool_manager.setup_tool(tool_name)
+    code = 500 if 'error' in result else 200
+    return jsonify(result), code
 
 
 @app.route('/api/tools/<tool_name>/start', methods=['POST'])
+@_json_endpoint
 def tools_start(tool_name):
     """Start an already-downloaded runtime tool."""
-    try:
-        from integrations.service_tools.runtime_manager import runtime_tool_manager
-        result = runtime_tool_manager.start_tool(tool_name)
-        code = 500 if 'error' in result else 200
-        return jsonify(result), code
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    from integrations.service_tools.runtime_manager import runtime_tool_manager
+    result = runtime_tool_manager.start_tool(tool_name)
+    code = 500 if 'error' in result else 200
+    return jsonify(result), code
 
 
 @app.route('/api/tools/<tool_name>/stop', methods=['POST'])
+@_json_endpoint
 def tools_stop(tool_name):
     """Stop a running runtime tool and free VRAM."""
-    try:
-        from integrations.service_tools.runtime_manager import runtime_tool_manager
-        return jsonify(runtime_tool_manager.stop_tool(tool_name))
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    from integrations.service_tools.runtime_manager import runtime_tool_manager
+    return jsonify(runtime_tool_manager.stop_tool(tool_name))
 
 
 @app.route('/api/tools/<tool_name>/unload', methods=['POST'])
+@_json_endpoint
 def tools_unload(tool_name):
     """Stop + deregister a runtime tool."""
-    try:
-        from integrations.service_tools.runtime_manager import runtime_tool_manager
-        return jsonify(runtime_tool_manager.unload_tool(tool_name))
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    from integrations.service_tools.runtime_manager import runtime_tool_manager
+    return jsonify(runtime_tool_manager.unload_tool(tool_name))
 
 
 @app.route('/api/tools/vram', methods=['GET'])
+@_json_endpoint
 def tools_vram():
     """Get VRAM usage dashboard."""
+    from integrations.service_tools.vram_manager import vram_manager
+    return jsonify(vram_manager.get_status())
+
+
+# ─── Model Lifecycle API ─────────────────────────────────────────────
+# Agentic model lifecycle management — dynamic load/unload/offload.
+
+@app.route('/api/tools/lifecycle', methods=['GET'])
+@_json_endpoint
+def tools_lifecycle():
+    """Model lifecycle dashboard: loaded models, priorities, VRAM pressure, hive hints."""
+    from integrations.service_tools.model_lifecycle import get_model_lifecycle_manager
+    mgr = get_model_lifecycle_manager()
+    return jsonify(mgr.get_status())
+
+
+@app.route('/api/tools/lifecycle/<model_name>/priority', methods=['POST'])
+@_json_endpoint
+def tools_lifecycle_priority(model_name):
+    """Manually set model priority (admin override)."""
+    from integrations.service_tools.model_lifecycle import get_model_lifecycle_manager
+    data = request.get_json() or {}
+    priority = data.get('priority', 'warm')
+    mgr = get_model_lifecycle_manager()
+    return jsonify(mgr.set_priority(model_name, priority))
+
+
+@app.route('/api/tools/lifecycle/<model_name>/offload', methods=['POST'])
+@_json_endpoint
+def tools_lifecycle_offload(model_name):
+    """Manually trigger GPU→CPU offload for a model."""
+    from integrations.service_tools.model_lifecycle import get_model_lifecycle_manager
+    mgr = get_model_lifecycle_manager()
+    return jsonify(mgr.manual_offload(model_name))
+
+
+@app.route('/api/system/pressure', methods=['GET'])
+@_json_endpoint
+def system_pressure():
+    """Real-time system pressure dashboard: VRAM, RAM, CPU, disk, throttle factor."""
+    from integrations.service_tools.model_lifecycle import get_model_lifecycle_manager
+    mgr = get_model_lifecycle_manager()
+    return jsonify(mgr.get_system_pressure())
+
+
+@app.route('/api/revenue/dashboard', methods=['GET'])
+@_json_endpoint
+def revenue_dashboard():
+    """Revenue pipeline dashboard: streams, trading P&L, compute borrowing."""
+    from integrations.agent_engine.revenue_aggregator import get_revenue_aggregator
+    from integrations.agent_engine.compute_borrowing import ComputeBorrowingService
+    from integrations.social.models import get_db
+    db = get_db()
     try:
-        from integrations.service_tools.vram_manager import vram_manager
-        return jsonify(vram_manager.get_status())
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        rev = get_revenue_aggregator()
+        dashboard = rev.get_dashboard(db)
+        dashboard['compute_borrowing'] = ComputeBorrowingService.get_status()
+        return jsonify(dashboard)
+    finally:
+        db.close()
 
 
 # ─── Coding Agent Aggregator API ──────────────────────────────────────
@@ -4248,92 +4308,84 @@ def tools_vram():
 # Tools execute as external CLI subprocesses — never re-dispatch to /chat.
 
 @app.route('/coding/tools', methods=['GET'])
+@_json_endpoint
 def coding_tools():
     """List installed coding tools, capabilities, and benchmarks."""
-    try:
-        from integrations.coding_agent.orchestrator import get_coding_orchestrator
-        return jsonify(get_coding_orchestrator().list_tools())
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    from integrations.coding_agent.orchestrator import get_coding_orchestrator
+    return jsonify(get_coding_orchestrator().list_tools())
 
 
 @app.route('/coding/execute', methods=['POST'])
+@_json_endpoint
 def coding_execute():
     """Execute a coding task via the best available tool.
 
     JSON body: {task, task_type?, preferred_tool?, model?, working_dir?}
     If 'encrypted' key present, decrypts E2E envelope first (hive offload).
     """
-    try:
-        data = request.get_json(force=True)
+    data = request.get_json(force=True)
 
-        # Handle encrypted envelope from hive peer
-        encrypted = data.get('encrypted')
-        if encrypted:
-            try:
-                from security.channel_encryption import (
-                    decrypt_json_from_peer, encrypt_json_for_peer,
-                    get_x25519_public_hex,
-                )
-                data = decrypt_json_from_peer(encrypted)
-                if not data:
-                    return jsonify({'error': 'Decryption failed'}), 400
-            except Exception as e:
-                return jsonify({'error': f'Envelope decryption error: {e}'}), 400
+    # Handle encrypted envelope from hive peer
+    encrypted = data.get('encrypted')
+    if encrypted:
+        try:
+            from security.channel_encryption import (
+                decrypt_json_from_peer, encrypt_json_for_peer,
+                get_x25519_public_hex,
+            )
+            data = decrypt_json_from_peer(encrypted)
+            if not data:
+                return jsonify({'error': 'Decryption failed'}), 400
+        except Exception as e:
+            return jsonify({'error': f'Envelope decryption error: {e}'}), 400
 
-        task = data.get('task', '')
-        if not task:
-            return jsonify({'error': 'task is required'}), 400
+    task = data.get('task', '')
+    if not task:
+        return jsonify({'error': 'task is required'}), 400
 
-        from integrations.coding_agent.orchestrator import get_coding_orchestrator
-        result = get_coding_orchestrator().execute(
-            task=task,
-            task_type=data.get('task_type', 'feature'),
-            preferred_tool=data.get('preferred_tool', ''),
-            user_id=data.get('user_id', ''),
-            model=data.get('model', ''),
-            working_dir=data.get('working_dir', ''),
-        )
+    from integrations.coding_agent.orchestrator import get_coding_orchestrator
+    result = get_coding_orchestrator().execute(
+        task=task,
+        task_type=data.get('task_type', 'feature'),
+        preferred_tool=data.get('preferred_tool', ''),
+        user_id=data.get('user_id', ''),
+        model=data.get('model', ''),
+        working_dir=data.get('working_dir', ''),
+    )
 
-        # If request came from hive peer, encrypt the response back
-        if encrypted:
-            try:
-                from security.channel_encryption import encrypt_json_for_peer
-                peer_pub = data.get('_reply_x25519', '')
-                if peer_pub:
-                    return jsonify({'encrypted': encrypt_json_for_peer(result, peer_pub)})
-            except Exception:
-                pass
+    # If request came from hive peer, encrypt the response back
+    if encrypted:
+        try:
+            from security.channel_encryption import encrypt_json_for_peer
+            peer_pub = data.get('_reply_x25519', '')
+            if peer_pub:
+                return jsonify({'encrypted': encrypt_json_for_peer(result, peer_pub)})
+        except Exception:
+            pass
 
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    return jsonify(result)
 
 
 @app.route('/coding/benchmarks', methods=['GET'])
+@_json_endpoint
 def coding_benchmarks():
     """Get coding tool benchmark dashboard data."""
-    try:
-        from integrations.coding_agent.orchestrator import get_coding_orchestrator
-        return jsonify(get_coding_orchestrator().get_benchmarks())
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    from integrations.coding_agent.orchestrator import get_coding_orchestrator
+    return jsonify(get_coding_orchestrator().get_benchmarks())
 
 
 @app.route('/coding/install', methods=['POST'])
+@_json_endpoint
 def coding_install():
     """Install a coding tool via npm. JSON body: {tool_name}"""
-    try:
-        data = request.get_json(force=True)
-        tool_name = data.get('tool_name', '')
-        if not tool_name:
-            return jsonify({'error': 'tool_name is required'}), 400
-        from integrations.coding_agent.installer import install
-        result = install(tool_name)
-        code = 200 if result.get('success') else 500
-        return jsonify(result), code
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    data = request.get_json(force=True)
+    tool_name = data.get('tool_name', '')
+    if not tool_name:
+        return jsonify({'error': 'tool_name is required'}), 400
+    from integrations.coding_agent.installer import install
+    result = install(tool_name)
+    code = 200 if result.get('success') else 500
+    return jsonify(result), code
 
 
 @app.route('/api/voice/transcribe', methods=['POST'])

@@ -344,6 +344,20 @@ def init_social(app):
         except Exception:
             pass
 
+        # Register model lifecycle manager
+        try:
+            from integrations.service_tools.model_lifecycle import get_model_lifecycle_manager
+            _lifecycle = get_model_lifecycle_manager()
+            _lifecycle.start()
+            if _lifecycle._running:
+                watchdog.register('model_lifecycle',
+                                  expected_interval=_lifecycle._interval,
+                                  restart_fn=_lifecycle.start,
+                                  stop_fn=_lifecycle.stop)
+                logger.info("Model lifecycle manager started")
+        except Exception as e:
+            logger.debug(f"Model lifecycle manager start skipped: {e}")
+
         watchdog.start()
         logger.info(f"NodeWatchdog started: monitoring "
                     f"{len(watchdog._threads)} threads")

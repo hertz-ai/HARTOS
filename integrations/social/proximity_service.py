@@ -128,15 +128,12 @@ class ProximityService:
 
             # Create notification for both users
             try:
-                from .models import Notification
+                from .services import NotificationService
                 for uid in [a_id, b_id]:
-                    notif = Notification(
-                        user_id=uid,
-                        notif_type='proximity_match',
-                        actor_id=None,  # Anonymous
+                    NotificationService.create(
+                        db, user_id=uid, type='proximity_match',
                         message='Someone is nearby! Check your encounters.',
                     )
-                    db.add(notif)
             except Exception:
                 pass  # Notifications optional
 

@@ -210,6 +210,46 @@ class VRAMManager:
         else:
             return "cpu_only"
 
+    # ── Pressure detection ────────────────────────────────────────
+
+    def get_actual_free_vram(self) -> float:
+        """Return ACTUAL free VRAM by refreshing nvidia-smi (not cached advisory).
+
+        Unlike get_free_vram(), this re-reads hardware state every call.
+        Used by ModelLifecycleManager for real-time pressure detection.
+        """
+        self.refresh_gpu_info()
+        info = self._gpu_info or {}
+        return info.get('free_gb', 0.0)
+
+    def get_vram_usage_pct(self) -> float:
+        """Return current VRAM usage as percentage (0-100).
+
+        Refreshes GPU info first for accuracy.
+        """
+        self.refresh_gpu_info()
+        info = self._gpu_info or {}
+        total = info.get('total_gb', 0)
+        free = info.get('free_gb', 0)
+        if total <= 0:
+            return 0.0
+        return ((total - free) / total) * 100
+
+    # ── CUDA Cache Clearing ─────────────────────────────────────
+
+    @staticmethod
+    def clear_cuda_cache() -> bool:
+        """Clear CUDA cache if torch is loaded. Returns True if cleared."""
+        if 'torch' in sys.modules:
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    return True
+            except Exception:
+                pass
+        return False
+
     # ── Dashboard ────────────────────────────────────────────────
 
     def get_status(self) -> Dict:
