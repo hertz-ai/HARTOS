@@ -49,7 +49,7 @@ def get_backend_port():
         with open(env_path) as f:
             for line in f:
                 line = line.strip()
-                if line.startswith("HART_BACKEND_PORT="):
+                if line.startswith("HARTOS_BACKEND_PORT="):
                     val = line.split("=", 1)[1].strip()
                     if val:
                         return int(val)

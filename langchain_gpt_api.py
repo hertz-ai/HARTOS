@@ -394,12 +394,12 @@ class RequestLogRecord(logging.LogRecord):
 # logging info
 # Use the custom log record factory
 logging.setLogRecordFactory(RequestLogRecord)
-logging.basicConfig(level=logging.INFO)
-stream_handler = logging.StreamHandler(sys.stdout)
+
 # In bundled/pip-installed mode (NUNBA_BUNDLED env set by main.py), redirect logs
 # to the shared Nunba log directory; standalone keeps default behavior.
+_is_bundled = bool(os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False))
 
-if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
+if _is_bundled:
     _nunba_log_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'logs')
     try:
         os.makedirs(_nunba_log_dir, exist_ok=True)
@@ -411,31 +411,40 @@ else:
     _langchain_log_path = 'langchain.log'
 
 handler = RotatingFileHandler(_langchain_log_path, maxBytes=5_000_000, backupCount=2)
-
-# Set the logging level for the file handler
-# Was ERROR — changed to INFO so that LangChain, HevolveAI, and other library
-# logs are captured in Documents/Nunba/logs/langchain.log (not just errors).
 handler.setLevel(logging.INFO)
 
+stream_handler = logging.StreamHandler(sys.stdout)
+
 # Create a logging format
-req_id = thread_local_data.get_request_id()
 formatter = logging.Formatter(
     '%(asctime)s - %(name)s- [RequestID: %(req_id)s] - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 stream_handler.setFormatter(formatter)
 
-# In bundled mode, also attach the file handler to the root logger so that ALL
-# module loggers (hevolveai, langchain, etc.) write to Documents/Nunba/logs/langchain.log
-if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
-    _root = logging.getLogger()
+# Configure root logger: clear any default handlers first to prevent duplicates,
+# then attach our handlers once.  In bundled mode the root logger gets both
+# stream + file so that ALL module loggers are captured.  In standalone mode
+# only Flask's app.logger gets the handlers.
+_root = logging.getLogger()
+_root.handlers.clear()
+_root.setLevel(logging.INFO)
+
+if _is_bundled:
     _root.addHandler(handler)
+    _root.addHandler(stream_handler)
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
 
-app.logger.addHandler(stream_handler)
-app.logger.addHandler(handler)
-app.logger.propagate = False
+if _is_bundled:
+    # Bundled: root owns the handlers; let app.logger propagate to root
+    # so ALL module loggers (hevolveai, langchain, etc.) are captured.
+    app.logger.propagate = True
+else:
+    # Standalone: only Flask's logger gets the handlers
+    app.logger.addHandler(stream_handler)
+    app.logger.addHandler(handler)
+    app.logger.propagate = False
 
 # Security: Audit logging — redact API keys, JWTs, passwords from all logs
 try:
@@ -454,6 +463,13 @@ try:
     app.logger.info("Security middleware applied")
 except Exception as e:
     app.logger.warning(f"Security middleware not applied: {e}")
+
+# Security: Block inspect.getsource() for protected packages (hevolveai)
+try:
+    from security.source_protection import install_source_guards
+    install_source_guards()
+except Exception:
+    pass  # Non-fatal — source stripping is the primary defense
 
 # ============================================================================
 # HevolveSocial - Agent Social Network
@@ -587,12 +603,12 @@ _trace_recorder = None
 def _is_bundled() -> bool:
     """Detect whether we are pip-installed inside Nunba (flat mode).
 
-    When Nunba imports us via ``hevolve_backend_adapter``, that module is
+    When Nunba imports us via ``hartos_backend_adapter``, that module is
     already in ``sys.modules`` by the time our daemon thread runs.  In
     standalone mode (``python langchain_gpt_api.py``, ``start_with_tracing.bat``)
     it is absent.  No env-vars or mode flags required.
     """
-    return 'hevolve_backend_adapter' in sys.modules
+    return 'hartos_backend_adapter' in sys.modules
 
 
 def _has_cloud_api() -> bool:
@@ -748,9 +764,16 @@ def get_hive_mind():
     return _hive_mind
 
 
-# Boot learning pipeline in background (don't block Flask startup)
+# Boot learning pipeline in background — delayed to avoid torch circular import.
+# Threads that import torch race with the main thread's own torch imports,
+# causing "partially initialized module 'torch'" errors.
+def _delayed_learning_init():
+    import time
+    time.sleep(5)  # Let main thread finish all imports first
+    _init_learning_pipeline()
+
 threading.Thread(
-    target=_init_learning_pipeline, daemon=True,
+    target=_delayed_learning_init, daemon=True,
     name='embodied_ai_init').start()
 
 
@@ -840,9 +863,14 @@ def _wire_vision_to_learning():
         _logger.warning(f"[Wiring] FrameStore→learning failed: {e}")
 
 
-# Boot vision pipeline in background
+# Boot vision pipeline in background — delayed like learning init
+def _delayed_vision_init():
+    import time
+    time.sleep(6)  # After learning init delay (5s) to stagger torch imports
+    _init_vision_service()
+
 threading.Thread(
-    target=_init_vision_service, daemon=True,
+    target=_delayed_vision_init, daemon=True,
     name='vision_init').start()
 
 # Wire FrameStore to HevolveAI after both subsystems are ready
@@ -1764,7 +1792,7 @@ class CustomAgentExecutor(AgentExecutor):
             app.logger.info(
                 f"memory object is not none and metadata is {metadata}")
             try:
-                self.memory.save_context(inputs, outputs, metadata)
+                self.memory.save_context(inputs, outputs, metadata=metadata)
                 app.logger.info(
                     f"After: memory saved successfully with metadata {metadata}")
             except Exception as e:
@@ -3676,23 +3704,35 @@ def get_public_prompts():
 
 _prompt_id_lock = threading.Lock()
 
-
 def _next_prompt_id():
     """Generate a globally-unique prompt_id.
 
     Uses millisecond timestamp so IDs are unique across nodes in the
-    federation (no central coordinator needed).  A local collision check
+    federation (no central coordinator needed). A local collision check
     ensures two agents created on the same node within the same
     millisecond still get distinct IDs.
 
     Thread-safe via lock.
+
+    NOTE: Returns 1–11 digit numeric IDs by folding the millisecond
+    timestamp into a max-11-digit space.
     """
     with _prompt_id_lock:
         prompts_dir = os.path.join(os.path.dirname(__file__), 'prompts')
-        pid = int(time.time() * 1000)
+
+        # Fold ms timestamp into 1..99,999,999,999 (1–11 digits)
+        pid = int(time.time() * 1000) % 100_000_000_000
+        if pid == 0:
+            pid = 1
+
         if os.path.isdir(prompts_dir):
+            # Preserve the same collision-avoidance logic
             while os.path.exists(os.path.join(prompts_dir, f'{pid}.json')):
                 pid += 1
+                # Keep pid within 1–11 digits while still allowing bumps
+                if pid >= 100_000_000_000:
+                    pid = 1
+
         return pid
 
 
@@ -3859,6 +3899,144 @@ def health_readiness():
         'status': 'ready' if all_ok else 'not_ready',
         'checks': checks,
     }), status_code
+
+
+# ============================================================================
+# HART Challenge-Response Endpoint (Node Side)
+# ============================================================================
+# Central delivers a challenge nonce to this endpoint to prove the node is
+# reachable at its claimed FQDN.  The node signs the nonce with its Ed25519
+# private key and returns the signature.  This is step 2+3 of the 4-step
+# domain verification handshake defined in security/key_delegation.py.
+#
+# Security notes:
+#   - This endpoint is intentionally unauthenticated: central must be able to
+#     reach it without prior credentials to prove domain reachability.
+#   - The nonce is signed with the node's private key, which never leaves the
+#     node.  Central verifies using the public key the node provided at
+#     registration time.
+#   - The endpoint only responds to GET (challenge delivery) and POST
+#     (explicit challenge-response submission from the node itself if needed).
+
+# Module-level storage for the most recent challenge nonce received from
+# central.  The node-side orchestrator can poll this to retrieve the nonce
+# and submit the signed response back to central.
+_hart_challenge_state = {
+    'lock': threading.Lock(),
+    'pending_nonce': None,       # str | None — most recent nonce from central
+    'pending_signature': None,   # str | None — signature once computed
+    'pending_pubkey': None,      # str | None — this node's public key hex
+    'received_at': None,         # datetime | None
+}
+
+
+@app.route('/.well-known/hart-challenge', methods=['GET'])
+def hart_challenge_receive():
+    """Receive a challenge nonce from central and auto-sign it.
+
+    Central calls:  GET http://{fqdn}:6777/.well-known/hart-challenge?nonce=<hex>
+
+    The node:
+      1. Validates the nonce format (must be 64 hex chars = 32 bytes).
+      2. Signs the raw nonce bytes with its Ed25519 private key.
+      3. Returns {nonce, public_key_hex, signature_hex} so central can
+         immediately verify without a second round-trip.
+
+    Returns 200 with signed response on success, 400 on bad input.
+    """
+    nonce_hex = request.args.get('nonce', '').strip()
+
+    if not nonce_hex:
+        return jsonify({'error': 'Missing "nonce" query parameter'}), 400
+
+    # Validate nonce format: must be valid hex and exactly 32 bytes (64 chars)
+    try:
+        nonce_bytes = bytes.fromhex(nonce_hex)
+        if len(nonce_bytes) != 32:
+            return jsonify({
+                'error': f'Invalid nonce length: expected 32 bytes (64 hex chars), '
+                         f'got {len(nonce_bytes)} bytes',
+            }), 400
+    except ValueError:
+        return jsonify({'error': 'Invalid nonce: not valid hexadecimal'}), 400
+
+    # Sign the raw nonce bytes with this node's Ed25519 private key
+    try:
+        from security.node_integrity import sign_message, get_public_key_hex
+        signature = sign_message(nonce_bytes)
+        public_key_hex = get_public_key_hex()
+    except Exception as e:
+        app.logger.error(f"hart-challenge: failed to sign nonce: {e}")
+        return jsonify({'error': 'Internal error: failed to sign challenge'}), 500
+
+    signature_hex = signature.hex()
+
+    # Store in module state for potential polling by node-side orchestrator
+    import datetime as _dt_mod
+    with _hart_challenge_state['lock']:
+        _hart_challenge_state['pending_nonce'] = nonce_hex
+        _hart_challenge_state['pending_signature'] = signature_hex
+        _hart_challenge_state['pending_pubkey'] = public_key_hex
+        _hart_challenge_state['received_at'] = _dt_mod.datetime.now(_dt_mod.timezone.utc)
+
+    app.logger.info(
+        f"hart-challenge: signed nonce {nonce_hex[:16]}... "
+        f"pubkey={public_key_hex[:16]}...")
+
+    return jsonify({
+        'nonce': nonce_hex,
+        'public_key_hex': public_key_hex,
+        'signature_hex': signature_hex,
+    }), 200
+
+
+@app.route('/.well-known/hart-challenge', methods=['POST'])
+def hart_challenge_submit():
+    """Accept an explicit challenge-response submission.
+
+    An alternative path where the node operator or automation explicitly
+    submits {nonce, fqdn} and this endpoint signs and returns the response.
+    Useful when the node needs to relay the signed response to central
+    through a different channel.
+
+    Request JSON: {"nonce": "<hex>"}
+    Response JSON: {"nonce": "...", "public_key_hex": "...", "signature_hex": "..."}
+    """
+    data = request.get_json(silent=True) or {}
+    nonce_hex = data.get('nonce', '').strip()
+
+    if not nonce_hex:
+        return jsonify({'error': 'Missing "nonce" in request body'}), 400
+
+    try:
+        nonce_bytes = bytes.fromhex(nonce_hex)
+        if len(nonce_bytes) != 32:
+            return jsonify({
+                'error': f'Invalid nonce length: expected 32 bytes, got {len(nonce_bytes)}',
+            }), 400
+    except ValueError:
+        return jsonify({'error': 'Invalid nonce: not valid hexadecimal'}), 400
+
+    try:
+        from security.node_integrity import sign_message, get_public_key_hex
+        signature = sign_message(nonce_bytes)
+        public_key_hex = get_public_key_hex()
+    except Exception as e:
+        app.logger.error(f"hart-challenge POST: failed to sign nonce: {e}")
+        return jsonify({'error': 'Internal error: failed to sign challenge'}), 500
+
+    signature_hex = signature.hex()
+
+    app.logger.info(
+        f"hart-challenge POST: signed nonce {nonce_hex[:16]}... "
+        f"pubkey={public_key_hex[:16]}...")
+
+    return jsonify({
+        'nonce': nonce_hex,
+        'public_key_hex': public_key_hex,
+        'signature_hex': signature_hex,
+    }), 200
+
 
 @app.route('/zeroshot/', methods=['POST'])
 def zeroshot():
@@ -4065,6 +4243,99 @@ def tools_vram():
         return jsonify({'error': str(e)}), 500
 
 
+# ─── Coding Agent Aggregator API ──────────────────────────────────────
+# Endpoints for the coding tool orchestrator (KiloCode, Claude Code, OpenCode).
+# Tools execute as external CLI subprocesses — never re-dispatch to /chat.
+
+@app.route('/coding/tools', methods=['GET'])
+def coding_tools():
+    """List installed coding tools, capabilities, and benchmarks."""
+    try:
+        from integrations.coding_agent.orchestrator import get_coding_orchestrator
+        return jsonify(get_coding_orchestrator().list_tools())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/coding/execute', methods=['POST'])
+def coding_execute():
+    """Execute a coding task via the best available tool.
+
+    JSON body: {task, task_type?, preferred_tool?, model?, working_dir?}
+    If 'encrypted' key present, decrypts E2E envelope first (hive offload).
+    """
+    try:
+        data = request.get_json(force=True)
+
+        # Handle encrypted envelope from hive peer
+        encrypted = data.get('encrypted')
+        if encrypted:
+            try:
+                from security.channel_encryption import (
+                    decrypt_json_from_peer, encrypt_json_for_peer,
+                    get_x25519_public_hex,
+                )
+                data = decrypt_json_from_peer(encrypted)
+                if not data:
+                    return jsonify({'error': 'Decryption failed'}), 400
+            except Exception as e:
+                return jsonify({'error': f'Envelope decryption error: {e}'}), 400
+
+        task = data.get('task', '')
+        if not task:
+            return jsonify({'error': 'task is required'}), 400
+
+        from integrations.coding_agent.orchestrator import get_coding_orchestrator
+        result = get_coding_orchestrator().execute(
+            task=task,
+            task_type=data.get('task_type', 'feature'),
+            preferred_tool=data.get('preferred_tool', ''),
+            user_id=data.get('user_id', ''),
+            model=data.get('model', ''),
+            working_dir=data.get('working_dir', ''),
+        )
+
+        # If request came from hive peer, encrypt the response back
+        if encrypted:
+            try:
+                from security.channel_encryption import encrypt_json_for_peer
+                peer_pub = data.get('_reply_x25519', '')
+                if peer_pub:
+                    return jsonify({'encrypted': encrypt_json_for_peer(result, peer_pub)})
+            except Exception:
+                pass
+
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/coding/benchmarks', methods=['GET'])
+def coding_benchmarks():
+    """Get coding tool benchmark dashboard data."""
+    try:
+        from integrations.coding_agent.orchestrator import get_coding_orchestrator
+        return jsonify(get_coding_orchestrator().get_benchmarks())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/coding/install', methods=['POST'])
+def coding_install():
+    """Install a coding tool via npm. JSON body: {tool_name}"""
+    try:
+        data = request.get_json(force=True)
+        tool_name = data.get('tool_name', '')
+        if not tool_name:
+            return jsonify({'error': 'tool_name is required'}), 400
+        from integrations.coding_agent.installer import install
+        result = install(tool_name)
+        code = 200 if result.get('success') else 500
+        return jsonify(result), code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/voice/transcribe', methods=['POST'])
 def voice_transcribe():
     """Transcribe audio to text using Whisper STT.
@@ -4256,8 +4527,14 @@ def _validate_startup():
             "No .env file found. Create .env with OPENAI_API_KEY, GROQ_API_KEY, "
             "LANGCHAIN_API_KEY for LLM access.")
 
-    # Database directory check
-    db_dir = os.path.join(os.path.dirname(__file__), 'agent_data')
+    # Database directory check — prefer DB path or user Documents for bundled mode
+    _db_p = os.environ.get('HEVOLVE_DB_PATH', '')
+    if _db_p and _db_p != ':memory:' and os.path.isabs(_db_p):
+        db_dir = os.path.join(os.path.dirname(_db_p), 'agent_data')
+    elif os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
+        db_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data')
+    else:
+        db_dir = os.path.join(os.path.dirname(__file__), 'agent_data')
     if not os.path.isdir(db_dir):
         try:
             os.makedirs(db_dir, exist_ok=True)

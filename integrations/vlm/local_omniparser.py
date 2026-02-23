@@ -73,20 +73,37 @@ def _parse_inprocess(screenshot_b64: str) -> dict:
 
 
 def _parse_http(screenshot_b64: str) -> dict:
-    """Parse via HTTP POST to OmniParser FastAPI server."""
+    """Parse via HTTP POST to OmniParser FastAPI server.
+
+    Falls back gracefully when OmniParser is unavailable — returns empty
+    parsed_content_list so the LLM reasons from the raw screenshot alone
+    (slower but functional).
+    """
     import time
     import requests
 
     omni_url = os.environ.get('OMNIPARSER_URL', 'http://localhost:8080')
     start = time.time()
 
-    resp = requests.post(
-        f'{omni_url.rstrip("/")}/parse/',
-        json={'base64_image': screenshot_b64},
-        timeout=30
-    )
-    resp.raise_for_status()
-    result = resp.json()
+    try:
+        resp = requests.post(
+            f'{omni_url.rstrip("/")}/parse/',
+            json={'base64_image': screenshot_b64},
+            timeout=30
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except (requests.RequestException, ValueError) as e:
+        logger.warning(
+            f"OmniParser unavailable ({e}), falling back to raw screenshot. "
+            f"LLM will reason without UI element labels."
+        )
+        result = {
+            'screen_info': '',
+            'parsed_content_list': [],
+            'som_image_base64': screenshot_b64,
+        }
+
     latency = time.time() - start
 
     if 'latency' not in result:

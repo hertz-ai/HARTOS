@@ -77,13 +77,13 @@ set /p choice="Enter choice (1-6): "
 
 if "%choice%"=="1" (
     echo Running channel regression tests...
-    "%PYTHON_EXE%" -m pytest integrations/channels/tests/test_e2e_regression.py -v -s --tb=short
+    "%PYTHON_EXE%" -m pytest tests/integration/test_channels_e2e_regression.py -v -s --tb=short
 ) else if "%choice%"=="2" (
     echo Running master test suite...
-    "%PYTHON_EXE%" test_master_suite.py
+    "%PYTHON_EXE%" tests/standalone/test_master_suite.py
 ) else if "%choice%"=="3" (
     echo Running autonomous agent suite...
-    "%PYTHON_EXE%" test_autonomous_agent_suite.py
+    "%PYTHON_EXE%" tests/standalone/test_autonomous_agent_suite.py
 ) else if "%choice%"=="4" (
     echo Running Docker E2E tests...
     echo Checking Docker availability...
@@ -97,11 +97,11 @@ if "%choice%"=="1" (
     docker-compose -f docker-compose.test.yml up --build --abort-on-container-exit
 ) else if "%choice%"=="5" (
     echo Running ALL local tests...
-    "%PYTHON_EXE%" -m pytest tests/ integrations/channels/tests/ test_master_suite.py test_dynamic_agents.py test_complex_agent_comprehensive.py -v --tb=short --color=yes
+    "%PYTHON_EXE%" -m pytest tests/unit/ tests/integration/ tests/e2e/ -v --tb=short --color=yes
 ) else if "%choice%"=="6" (
     echo Running tests with coverage...
     if exist htmlcov rmdir /s /q htmlcov
-    "%PYTHON_EXE%" -m pytest integrations/channels/tests/test_e2e_regression.py -v --tb=short ^
+    "%PYTHON_EXE%" -m pytest tests/integration/test_channels_e2e_regression.py -v --tb=short ^
         --cov=integrations/channels ^
         --cov-report=html:htmlcov ^
         --cov-report=term-missing

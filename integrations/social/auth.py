@@ -6,6 +6,7 @@ Uses security.jwt_manager for hardened token management.
 import hashlib
 import hmac
 import os
+import sys
 import stat
 import secrets
 import logging
@@ -47,6 +48,8 @@ if not SECRET_KEY:
         db_path = os.environ.get('HEVOLVE_DB_PATH', '')
         if db_path and db_path != ':memory:' and os.path.isabs(db_path):
             key_file = os.path.join(os.path.dirname(db_path), '.social_secret_key')
+        elif os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
+            key_file = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', '.social_secret_key')
         else:
             key_file = os.path.join('agent_data', '.social_secret_key')
         try:

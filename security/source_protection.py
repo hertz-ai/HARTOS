@@ -6,6 +6,7 @@ Multi-layer defense for HevolveAI source code:
   2. Nunba bundling: .pyc only (source stripped)
   3. Boot verification: hash manifest signed by build node
   4. Runtime gating: certificate tier + CCT gates feature access
+  5. inspect.getsource() blocking: prevents runtime source extraction
 
 This module answers:
   - Is HevolveAI installed? How? (SSH, HTTPS, wheel, bundled)
@@ -16,12 +17,17 @@ If integrity check fails → disable in-process mode, force HTTP fallback.
 """
 import hashlib
 import importlib
+import importlib.abc
+import importlib.machinery
+import inspect
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from pathlib import Path
+from types import ModuleType
 from typing import Callable, Dict, List, Optional
 
 logger = logging.getLogger('hevolve_security')
@@ -390,3 +396,74 @@ class CrawlIntegrityWatcher:
                 self._on_tamper_detected()
         except Exception:
             pass
+
+
+# ── Runtime Source Extraction Blocking ────────────────────────
+#
+# Even if .py files somehow survive stripping, this prevents
+# inspect.getsource(), inspect.getsourcelines(), and
+# inspect.getsourcefile() from returning hevolveai code.
+
+_PROTECTED_PACKAGES = ('hevolveai',)
+
+_original_getsource = inspect.getsource
+_original_getsourcelines = inspect.getsourcelines
+_original_getsourcefile = inspect.getsourcefile
+_original_findsource = inspect.findsource
+
+
+def _is_protected_object(obj) -> bool:
+    """Check if obj belongs to a protected package."""
+    module = getattr(obj, '__module__', None)
+    if module and any(module == pkg or module.startswith(pkg + '.')
+                      for pkg in _PROTECTED_PACKAGES):
+        return True
+    # For modules directly
+    if isinstance(obj, ModuleType):
+        name = getattr(obj, '__name__', '')
+        if any(name == pkg or name.startswith(pkg + '.')
+               for pkg in _PROTECTED_PACKAGES):
+            return True
+    return False
+
+
+def _guarded_getsource(obj):
+    """Replacement for inspect.getsource that blocks protected packages."""
+    if _is_protected_object(obj):
+        raise OSError(f"source code not available for {getattr(obj, '__name__', obj)}")
+    return _original_getsource(obj)
+
+
+def _guarded_getsourcelines(obj):
+    """Replacement for inspect.getsourcelines that blocks protected packages."""
+    if _is_protected_object(obj):
+        raise OSError(f"source code not available for {getattr(obj, '__name__', obj)}")
+    return _original_getsourcelines(obj)
+
+
+def _guarded_getsourcefile(obj):
+    """Replacement for inspect.getsourcefile that blocks protected packages."""
+    if _is_protected_object(obj):
+        return None
+    return _original_getsourcefile(obj)
+
+
+def _guarded_findsource(obj):
+    """Replacement for inspect.findsource that blocks protected packages."""
+    if _is_protected_object(obj):
+        raise OSError(f"source code not available for {getattr(obj, '__name__', obj)}")
+    return _original_findsource(obj)
+
+
+def install_source_guards():
+    """Monkey-patch inspect module to block source extraction for protected packages.
+
+    Call this at application boot (after imports, before serving requests).
+    Safe to call multiple times (idempotent).
+    """
+    inspect.getsource = _guarded_getsource
+    inspect.getsourcelines = _guarded_getsourcelines
+    inspect.getsourcefile = _guarded_getsourcefile
+    inspect.findsource = _guarded_findsource
+    logger.info("[SourceProtection] inspect.getsource() guards installed "
+                f"for packages: {_PROTECTED_PACKAGES}")

@@ -2638,7 +2638,7 @@ def theme_generate():
 
     # Try LLM generation first
     try:
-        from hevolve_backend_adapter import chat as _adapter_chat
+        from hartos_backend_adapter import chat as _adapter_chat
         schema_hint = '{"colors":{"background":"#hex","paper":"#hex","primary":"#hex","primary_light":"#hex","primary_dark":"#hex","secondary":"#hex","accent":"#hex","text_primary":"#hex"}}'
         system_prompt = (
             "You are a UI theme designer for a dark-mode social platform. "

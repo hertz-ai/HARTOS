@@ -170,7 +170,7 @@ in
           LIQUID_UI_CONTEXT_MS = toString ui.contextRefreshMs;
           LIQUID_UI_A2UI = if ui.enableA2UI then "1" else "0";
           MODEL_BUS_HTTP_PORT = toString (config.hart.modelBus.ports.http or 6790);
-          HART_BACKEND_PORT = toString cfg.ports.backend;
+          HARTOS_BACKEND_PORT = toString cfg.ports.backend;
           HART_THEME_DIR = "/run/current-system/sw/share/hart/conky-themes";
           HART_LIQUID_UI_PORT = toString ui.port;
           NUNBA_STATIC_DIR = lib.mkIf ui.embedNunba

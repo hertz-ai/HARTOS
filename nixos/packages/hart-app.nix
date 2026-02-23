@@ -64,6 +64,7 @@ pkgs.stdenv.mkDerivation {
         baseName == ".env" ||
         lib.hasSuffix ".pyc" baseName ||
         lib.hasSuffix ".egg-info" baseName ||
+        lib.hasSuffix ".dist-info" baseName ||
         (lib.hasPrefix "agent_data/" relPath && lib.hasSuffix ".db" baseName)
       );
   };

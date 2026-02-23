@@ -149,8 +149,8 @@ class AgentDaemon:
             user_id = str(goal.user_id) if hasattr(goal, 'user_id') else 'system'
 
             ledger = SmartLedger(agent_id=user_id, session_id=str(goal_id))
-            ledger_path = os.path.join(
-                'agent_data', f'ledger_{user_id}_{goal_id}.json')
+            # Use the ledger's resolved dir (handles bundled/read-only fallback)
+            ledger_path = str(ledger.ledger_file)
             if os.path.isfile(ledger_path):
                 ledger.load(ledger_path)
                 if len(ledger.tasks) > 1:

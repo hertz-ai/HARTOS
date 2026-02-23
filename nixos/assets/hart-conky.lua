@@ -8,7 +8,7 @@ local http = require("socket.http")
 local ltn12 = require("ltn12")
 
 -- Configuration
-local BACKEND_PORT = os.getenv("HART_BACKEND_PORT") or "6777"
+local BACKEND_PORT = os.getenv("HARTOS_BACKEND_PORT") or "6777"
 local DATA_DIR = os.getenv("HART_DATA_DIR") or os.getenv("HEVOLVE_DATA_DIR") or "/var/lib/hart"
 local BASE_URL = "http://localhost:" .. BACKEND_PORT
 

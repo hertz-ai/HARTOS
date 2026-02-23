@@ -9,7 +9,7 @@ Type=simple
 User=hart
 Group=hart
 WorkingDirectory=/opt/hart
-ExecStart=/opt/hart/venv/bin/python -m waitress --port=${HART_BACKEND_PORT:-6777} --threads=50 langchain_gpt_api:app
+ExecStart=/opt/hart/venv/bin/python -m waitress --port=${HARTOS_BACKEND_PORT:-6777} --threads=50 langchain_gpt_api:app
 EnvironmentFile=/etc/hart/hart.env
 Restart=on-failure
 RestartSec=5

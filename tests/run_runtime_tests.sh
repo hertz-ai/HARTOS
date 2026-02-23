@@ -37,7 +37,7 @@ fi
 echo -e "${GREEN}✓ Docker is running${NC}"
 
 # Parse command line arguments
-TEST_PATTERN="${1:-tests/runtime_tests/}"
+TEST_PATTERN="${1:-tests/e2e/runtime_tests/}"
 VERBOSE="${2:-}"
 
 echo -e "\n${BLUE}Starting test environment...${NC}"

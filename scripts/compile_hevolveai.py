@@ -120,6 +120,39 @@ def strip_source(pkg_root: Path):
     print(f"Stripped {removed} .py source files")
 
 
+def clean_dist_info(pkg_root: Path):
+    """Remove .dist-info metadata that leaks install source and file listing.
+
+    Targets:
+      - direct_url.json — records git+ssh:// or git+https:// origin URL
+      - RECORD — lists every installed file path with hashes
+      - top_level.txt — lists top-level package names (low risk but unnecessary)
+    """
+    # Walk up from package root to site-packages
+    site_packages = pkg_root.parent
+    removed = []
+
+    for dist_dir in site_packages.glob('*hevolveai*dist-info'):
+        for leak_file in ('direct_url.json', 'RECORD'):
+            target = dist_dir / leak_file
+            if target.exists():
+                target.unlink()
+                removed.append(str(target.relative_to(site_packages)))
+
+    # Also check for embodied_ai dist-info (the pip package name)
+    for dist_dir in site_packages.glob('*embodied*ai*dist-info'):
+        for leak_file in ('direct_url.json', 'RECORD'):
+            target = dist_dir / leak_file
+            if target.exists():
+                target.unlink()
+                removed.append(str(target.relative_to(site_packages)))
+
+    if removed:
+        print(f"Cleaned dist-info metadata: {', '.join(removed)}")
+    else:
+        print("No dist-info metadata found to clean.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Compile HevolveAI for Nunba bundling')
@@ -150,6 +183,7 @@ def main():
 
     if args.strip_source:
         strip_source(target)
+        clean_dist_info(target)
 
     print("Done.")
 

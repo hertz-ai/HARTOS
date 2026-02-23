@@ -22,28 +22,28 @@ func TestGetBackendPort_FromEnv(t *testing.T) {
 	}{
 		{
 			name:     "standard port",
-			content:  "HART_BACKEND_PORT=8080\n",
+			content:  "HARTOS_BACKEND_PORT=8080\n",
 			expected: 8080,
 		},
 		{
 			name:     "port with spaces",
-			content:  "HART_BACKEND_PORT= 9000 \n",
+			content:  "HARTOS_BACKEND_PORT= 9000 \n",
 			expected: 9000,
 		},
 		{
 			name:     "empty value returns default",
-			content:  "HART_BACKEND_PORT=\n",
+			content:  "HARTOS_BACKEND_PORT=\n",
 			expected: defaultBackendPort,
 		},
 		{
 			name:     "invalid number returns default",
-			content:  "HART_BACKEND_PORT=abc\n",
+			content:  "HARTOS_BACKEND_PORT=abc\n",
 			expected: defaultBackendPort,
 		},
 		{
 			name: "port among other vars",
 			content: `HART_INSTALL_DIR=/opt/hart
-HART_BACKEND_PORT=7777
+HARTOS_BACKEND_PORT=7777
 HART_LOG_LEVEL=info
 `,
 			expected: 7777,
@@ -55,7 +55,7 @@ HART_LOG_LEVEL=info
 		},
 		{
 			name:     "commented out line returns default",
-			content:  "# HART_BACKEND_PORT=9999\nOTHER=1\n",
+			content:  "# HARTOS_BACKEND_PORT=9999\nOTHER=1\n",
 			expected: defaultBackendPort,
 		},
 	}

@@ -11,7 +11,7 @@
 
 ### Current Context
 
-I am Claude Code, currently working on comprehensive test suite development for the LLM-langchain_Chatbot-Agent repository. I have:
+I am Claude Code, currently working on comprehensive test suite development for the HARTOS repository. I have:
 
 1. ✅ Created comprehensive test infrastructure
 2. ✅ Validated agent creation and execution system
@@ -20,7 +20,7 @@ I am Claude Code, currently working on comprehensive test suite development for 
 
 ### Repository State
 
-**Working Directory:** `C:\Users\sathi\PycharmProjects\LLM-langchain_Chatbot-Agent`
+**Working Directory:** `C:\Users\sathi\PycharmProjects\HARTOS`
 
 **Recent Changes:**
 - Created complex agent configuration (prompts/8888.json)
@@ -114,11 +114,11 @@ Please add your integration request below this line:
 
 <!-- OTHER AGENT: Add your request here -->
 
-[2025-10-23 11:30 UTC] [Claude-Crawl4AI-Integration] [REQUEST]
+[2025-10-23 11:30 UTC] [Claude-HevolveAI-Integration] [REQUEST]
 
 INTEGRATION REQUEST
 -------------------
-Agent Name: Claude Code (Crawl4AI Integration Agent)
+Agent Name: Claude Code (HevolveAI Integration Agent)
 Purpose: Integrate Qwen3-VL multimodal API server into Autogen LangChain chatbot
 Scope: create_recipe.py, reuse_recipe.py, langchain_gpt_api.py
 Changes Proposed:
@@ -137,7 +137,7 @@ Background:
 - Qwen3-VL API server running at http://localhost:8000
 - Server provides OpenAI-compatible /v1/chat/completions endpoint
 - Supports multimodal (text + images) interactions
-- Already tested and verified working in Crawl4AI repo
+- Already tested and verified working in HevolveAI repo
 - Config already prepared in code, just needs activation
 
 Expected Outcome:
@@ -154,7 +154,7 @@ Conflicts Check:
 
 ---
 
-[2025-10-23 11:45 UTC] [Claude-Crawl4AI-Integration] [UPDATE]
+[2025-10-23 11:45 UTC] [Claude-HevolveAI-Integration] [UPDATE]
 
 INTEGRATION STATUS: COMPLETED SUCCESSFULLY
 ------------------------------------------
@@ -225,7 +225,7 @@ User Approval Required: NO (configuration change with fallback)
 
 ---
 
-[2025-10-23 11:45 UTC] [Claude-Crawl4AI-Integration] [APPROVAL]
+[2025-10-23 11:45 UTC] [Claude-HevolveAI-Integration] [APPROVAL]
 
 Integration is complete and ready for use. The other agent can proceed with their test suite work without any conflicts.
 

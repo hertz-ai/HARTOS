@@ -75,7 +75,7 @@ services:
       - PYTHONUNBUFFERED=1
     network_mode: host  # Use host network to access LLM on localhost:8000
     volumes:
-      - ./tests/runtime_tests:/app/tests/runtime_tests
+      - ./tests/e2e/runtime_tests:/app/tests/e2e/runtime_tests
       - ./prompts:/app/prompts
       - ./logs:/app/logs
       - test-data:/app/test_data
@@ -86,7 +86,7 @@ services:
         echo 'Waiting for all services to be ready...' &&
         sleep 10 &&
         echo 'Running end-to-end tests...' &&
-        pytest tests/runtime_tests/ -v --tb=short --maxfail=5 --timeout=300
+        pytest tests/e2e/runtime_tests/ -v --tb=short --maxfail=5 --timeout=300
       "
 
   # Test runner with interactive shell (for debugging)
@@ -106,7 +106,7 @@ services:
       - CROSSBAR_URL=http://mock-crossbar:8088
       - TESTING=true
     volumes:
-      - ./tests/runtime_tests:/app/tests/runtime_tests
+      - ./tests/e2e/runtime_tests:/app/tests/e2e/runtime_tests
       - ./prompts:/app/prompts
       - ./logs:/app/logs
     networks:

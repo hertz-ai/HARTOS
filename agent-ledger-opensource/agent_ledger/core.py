@@ -901,7 +901,12 @@ class SmartLedger:
         self.session_id = session_id
         self.ledger_key = f"ledger_{agent_id}_{session_id}"
         self.ledger_dir = Path(ledger_dir)
-        self.ledger_dir.mkdir(exist_ok=True)
+        try:
+            self.ledger_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # Bundled/installed mode: relative path resolves to read-only dir
+            self.ledger_dir = Path.home() / 'Documents' / 'Nunba' / 'data' / 'agent_data'
+            self.ledger_dir.mkdir(parents=True, exist_ok=True)
         self.ledger_file = self.ledger_dir / f"ledger_{agent_id}_{session_id}.json"
         self.tasks: Dict[str, Task] = {}
         self.task_order: List[str] = []  # Track order of task creation
