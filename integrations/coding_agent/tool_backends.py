@@ -1,0 +1,231 @@
+"""
+Coding Agent Tool Backends — Subprocess wrappers for KiloCode, Claude Code, OpenCode.
+
+Each backend wraps a CLI tool via subprocess, captures JSON output, and returns
+structured results. The orchestrator calls exactly ONE backend per task (never all three).
+
+This is a leaf tool — it calls external processes, never re-dispatches to /chat.
+This eliminates callback loops and double-dispatch antipatterns.
+"""
+import json
+import logging
+import os
+import shutil
+import subprocess
+import time
+from abc import ABC, abstractmethod
+from typing import Dict, List, Optional
+
+logger = logging.getLogger('hevolve.coding_agent')
+
+
+class CodingToolBackend(ABC):
+    """Base class for coding tool subprocess wrappers."""
+
+    name: str = ''
+    binary: str = ''
+    strengths: List[str] = []
+
+    def is_installed(self) -> bool:
+        return shutil.which(self.binary) is not None
+
+    @abstractmethod
+    def build_command(self, task: str, context: Optional[Dict] = None) -> List[str]:
+        """Build the CLI command for execution."""
+
+    @abstractmethod
+    def parse_output(self, stdout: str, stderr: str, returncode: int) -> Dict:
+        """Parse subprocess output into structured result."""
+
+    def get_capabilities(self) -> Dict:
+        return {
+            'name': self.name,
+            'binary': self.binary,
+            'installed': self.is_installed(),
+            'strengths': self.strengths,
+        }
+
+    def get_env(self) -> Dict[str, str]:
+        """Build environment for subprocess — passes through user's API keys."""
+        env = os.environ.copy()
+        # Pass through all relevant API keys from HARTOS env
+        for key in ('OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GROQ_API_KEY',
+                     'GOOGLE_API_KEY', 'OPENROUTER_API_KEY'):
+            val = os.environ.get(key)
+            if val:
+                env[key] = val
+        return env
+
+    def execute(self, task: str, context: Optional[Dict] = None,
+                timeout: int = 300) -> Dict:
+        """Execute a coding task via subprocess.
+
+        This is a TERMINAL operation — calls external CLI process,
+        never re-dispatches to /chat or creates new agents.
+
+        Returns:
+            {success, output, tool, execution_time_s, error?}
+        """
+        if not self.is_installed():
+            return {
+                'success': False,
+                'output': '',
+                'tool': self.name,
+                'execution_time_s': 0,
+                'error': f'{self.name} not installed',
+            }
+
+        cmd = self.build_command(task, context)
+        logger.info(f"Executing {self.name}: {cmd[0]} ...")
+
+        start = time.time()
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=self.get_env(),
+                cwd=context.get('working_dir') if context else None,
+            )
+            elapsed = time.time() - start
+            parsed = self.parse_output(result.stdout, result.stderr, result.returncode)
+            parsed['tool'] = self.name
+            parsed['execution_time_s'] = round(elapsed, 2)
+            return parsed
+
+        except subprocess.TimeoutExpired:
+            elapsed = time.time() - start
+            return {
+                'success': False,
+                'output': '',
+                'tool': self.name,
+                'execution_time_s': round(elapsed, 2),
+                'error': f'Timeout after {timeout}s',
+            }
+        except (OSError, FileNotFoundError) as e:
+            return {
+                'success': False,
+                'output': '',
+                'tool': self.name,
+                'execution_time_s': 0,
+                'error': str(e),
+            }
+
+
+class KiloCodeBackend(CodingToolBackend):
+    """KiloCode CLI wrapper — Apache 2.0 licensed."""
+
+    name = 'kilocode'
+    binary = 'kilocode'
+    strengths = ['app_building', 'model_gateway', 'ide_integration', 'multi_provider']
+
+    def build_command(self, task: str, context: Optional[Dict] = None) -> List[str]:
+        cmd = [self.binary, '--auto', '--json-io']
+        if context and context.get('model'):
+            cmd.extend(['--model', context['model']])
+        cmd.extend(['--prompt', task])
+        return cmd
+
+    def parse_output(self, stdout: str, stderr: str, returncode: int) -> Dict:
+        try:
+            data = json.loads(stdout)
+            return {
+                'success': returncode == 0,
+                'output': data.get('result', data.get('output', stdout)),
+                'metadata': data,
+            }
+        except (json.JSONDecodeError, ValueError):
+            return {
+                'success': returncode == 0,
+                'output': stdout or stderr,
+            }
+
+
+class ClaudeCodeBackend(CodingToolBackend):
+    """Claude Code CLI wrapper — Proprietary (Anthropic Commercial ToS).
+
+    User must install themselves and provide their own ANTHROPIC_API_KEY.
+    """
+
+    name = 'claude_code'
+    binary = 'claude'
+    strengths = ['code_review', 'debugging', 'terminal_workflows', 'complex_reasoning']
+
+    def build_command(self, task: str, context: Optional[Dict] = None) -> List[str]:
+        cmd = [self.binary, '-p', task, '--output-format', 'json', '--print']
+        if context and context.get('model'):
+            cmd.extend(['--model', context['model']])
+        return cmd
+
+    def parse_output(self, stdout: str, stderr: str, returncode: int) -> Dict:
+        try:
+            data = json.loads(stdout)
+            # Claude Code JSON output has a 'result' field
+            output_text = data.get('result', '')
+            if not output_text and isinstance(data, list):
+                # Array format: extract text from content blocks
+                output_text = '\n'.join(
+                    item.get('text', '') for item in data
+                    if isinstance(item, dict) and item.get('type') == 'text'
+                )
+            return {
+                'success': returncode == 0,
+                'output': output_text or stdout,
+                'metadata': data,
+            }
+        except (json.JSONDecodeError, ValueError):
+            return {
+                'success': returncode == 0,
+                'output': stdout or stderr,
+            }
+
+
+class OpenCodeBackend(CodingToolBackend):
+    """OpenCode CLI wrapper — MIT licensed."""
+
+    name = 'opencode'
+    binary = 'opencode'
+    strengths = ['multi_session', 'lsp_integration', 'refactoring', 'session_sharing']
+
+    def build_command(self, task: str, context: Optional[Dict] = None) -> List[str]:
+        cmd = [self.binary, '-p', task, '-f', 'json']
+        if context and context.get('model'):
+            cmd.extend(['--model', context['model']])
+        return cmd
+
+    def parse_output(self, stdout: str, stderr: str, returncode: int) -> Dict:
+        try:
+            data = json.loads(stdout)
+            return {
+                'success': returncode == 0,
+                'output': data.get('result', data.get('output', stdout)),
+                'metadata': data,
+            }
+        except (json.JSONDecodeError, ValueError):
+            return {
+                'success': returncode == 0,
+                'output': stdout or stderr,
+            }
+
+
+# Registry of all backends
+BACKENDS = {
+    'kilocode': KiloCodeBackend,
+    'claude_code': ClaudeCodeBackend,
+    'opencode': OpenCodeBackend,
+}
+
+
+def get_available_backends() -> Dict[str, CodingToolBackend]:
+    """Return instantiated backends for installed tools only."""
+    return {
+        name: cls()
+        for name, cls in BACKENDS.items()
+        if cls().is_installed()
+    }
+
+
+def get_all_backends() -> Dict[str, CodingToolBackend]:
+    """Return all backend instances regardless of installation."""
+    return {name: cls() for name, cls in BACKENDS.items()}
