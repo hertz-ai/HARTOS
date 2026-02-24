@@ -60,6 +60,7 @@ jobs:
             tests/unit/test_goal_rate_limit.py \
             tests/unit/test_action_classifier.py \
             tests/unit/test_dlp_engine.py \
+            tests/unit/test_qwen3vl_computer_use.py \
             -v --noconftest --tb=short \
             --junitxml=_site/test-reports/junit/ws_security.xml \
             --cov=integrations --cov=security --cov=threadlocal \

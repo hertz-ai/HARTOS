@@ -52,6 +52,10 @@ def run_local_agentic_loop(
     """
     Local agentic loop: screenshot → parse → LLM reason → execute → repeat.
 
+    Supports two modes:
+        - Legacy (default): OmniParser screen parsing + separate LLM reasoning call
+        - Unified (HEVOLVE_VLM_UNIFIED=true): Single Qwen3-VL call for parsing + reasoning
+
     Args:
         message: dict with keys from execute_windows_or_android_command:
             - instruction_to_vlm_agent: str
@@ -66,7 +70,6 @@ def run_local_agentic_loop(
         {status, extracted_responses, execution_time_seconds}
     """
     from integrations.vlm.local_computer_tool import take_screenshot, execute_action
-    from integrations.vlm.local_omniparser import parse_screen
 
     instruction = message.get('instruction_to_vlm_agent', '')
     enhanced = message.get('enhanced_instruction', instruction)
@@ -74,10 +77,23 @@ def run_local_agentic_loop(
     prompt_id = message.get('prompt_id', '')
     max_eta = message.get('max_ETA_in_seconds', 1800)
 
-    logger.info(
-        f"Starting local VLM loop (tier={tier}, user={user_id}, "
-        f"prompt={prompt_id}): {instruction[:100]}"
-    )
+    # Detect unified Qwen3-VL mode
+    use_unified = os.environ.get('HEVOLVE_VLM_UNIFIED', '').lower() in ('1', 'true')
+
+    if use_unified:
+        from integrations.vlm.qwen3vl_backend import get_qwen3vl_backend
+        qwen3vl = get_qwen3vl_backend()
+        logger.info(
+            f"Starting unified VLM loop (Qwen3-VL, tier={tier}, user={user_id}, "
+            f"prompt={prompt_id}): {instruction[:100]}"
+        )
+    else:
+        from integrations.vlm.local_omniparser import parse_screen
+        qwen3vl = None
+        logger.info(
+            f"Starting local VLM loop (tier={tier}, user={user_id}, "
+            f"prompt={prompt_id}): {instruction[:100]}"
+        )
 
     # Build conversation messages for LLM
     messages = [
@@ -100,22 +116,38 @@ def run_local_agentic_loop(
             # 1. Take screenshot
             screenshot_b64 = take_screenshot(tier)
 
-            # 2. Parse UI elements
-            parsed = parse_screen(screenshot_b64, tier)
-            screen_info = parsed.get('screen_info', '')
+            if use_unified and qwen3vl is not None:
+                # ── Unified path: single Qwen3-VL call ──
+                result = qwen3vl.parse_and_reason(
+                    screenshot_b64, enhanced, history=messages
+                )
+                parsed = {
+                    'screen_info': result.get('screen_info', ''),
+                    'parsed_content_list': result.get('parsed_content_list', []),
+                }
+                action_json = result.get('action_json', {})
+                logger.info(
+                    f"Qwen3-VL unified: {action_json.get('Next Action', 'None')} "
+                    f"(latency={result.get('latency', 0):.1f}s)"
+                )
+            else:
+                # ── Legacy path: OmniParser + separate LLM call ──
+                # 2. Parse UI elements
+                parsed = parse_screen(screenshot_b64, tier)
+                screen_info = parsed.get('screen_info', '')
 
-            # 3. Build LLM prompt with current screen state
-            user_content = _build_vision_prompt(screen_info, screenshot_b64, iteration)
-            messages.append({"role": "user", "content": user_content})
+                # 3. Build LLM prompt with current screen state
+                user_content = _build_vision_prompt(screen_info, screenshot_b64, iteration)
+                messages.append({"role": "user", "content": user_content})
 
-            # 4. Call local LLM for reasoning
-            llm_response = _call_local_llm(messages)
-            action_json = _parse_vlm_response(llm_response)
+                # 4. Call local LLM for reasoning
+                llm_response = _call_local_llm(messages)
+                action_json = _parse_vlm_response(llm_response)
+
+                # Record the assistant response
+                messages.append({"role": "assistant", "content": llm_response})
 
             logger.info(f"VLM action: {action_json.get('Next Action', 'None')}")
-
-            # Record the assistant response
-            messages.append({"role": "assistant", "content": llm_response})
 
             # Check if task is complete
             next_action = action_json.get('Next Action', 'None')

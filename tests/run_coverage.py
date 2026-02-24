@@ -72,6 +72,7 @@ WS_SOURCES = [
     'integrations/social/hosting_reward_service.py',
     'integrations/social/models.py',
     'integrations/coding_agent/tool_backends.py',
+    'integrations/vlm/qwen3vl_backend.py',
     'security/immutable_audit_log.py',
     'security/action_classifier.py',
     'security/dlp_engine.py',
