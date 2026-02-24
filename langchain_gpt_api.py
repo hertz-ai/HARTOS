@@ -1,39 +1,41 @@
 # Fix Windows encoding for non-ASCII characters (Telugu, emojis, etc.)
 import sys
 import io
-if sys.platform == 'win32':
+if sys.platform == 'win32' and 'pytest' not in sys.modules:
     # Force UTF-8 encoding for stdout/stderr to prevent crashes with non-ASCII characters
-    if sys.stdout is not None:
+    # Skip when running under pytest — pytest wraps stdout/stderr for capture,
+    # and replacing them here closes pytest's file handles.
+    if sys.stdout is not None and hasattr(sys.stdout, 'buffer'):
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    if sys.stderr is not None:
+    if sys.stderr is not None and hasattr(sys.stderr, 'buffer'):
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 from bs4 import BeautifulSoup
 from enum import Enum
 from cultural_wisdom import get_cultural_prompt_compact
 
-# Use langchain-classic for pydantic v2 compatibility
-from langchain.llms import OpenAI
-from langchain.chains import LLMChain
-from langchain.prompts import PromptTemplate
-from langchain.agents import (
+# Use langchain-classic for pydantic v2 compatibility (langchain 1.x split into sub-packages)
+from langchain_classic.llms import OpenAI
+from langchain_classic.chains import LLMChain
+from langchain_classic.prompts import PromptTemplate
+from langchain_classic.agents import (
     ZeroShotAgent, Tool, AgentExecutor, ConversationalAgent,
     ConversationalChatAgent, LLMSingleActionAgent, AgentOutputParser,
     load_tools, initialize_agent, AgentType
 )
 
 import time
-from langchain.prompts import (
+from langchain_classic.prompts import (
     ChatPromptTemplate,
     MessagesPlaceholder,
     SystemMessagePromptTemplate,
     HumanMessagePromptTemplate
 )
-from langchain.chains import LLMMathChain
-from langchain.chains.conversation.memory import ConversationSummaryMemory, ConversationBufferWindowMemory
+from langchain_classic.chains import LLMMathChain
+from langchain_classic.chains.conversation.memory import ConversationSummaryMemory, ConversationBufferWindowMemory
 
-# ChatOpenAI - use langchain
-from langchain.chat_models import ChatOpenAI
+# ChatOpenAI - use langchain_classic (provides backward-compat paths)
+from langchain_classic.chat_models import ChatOpenAI
 
 # ChatGroq - optional import (version compatibility issues)
 try:
@@ -42,15 +44,14 @@ except Exception:
     ChatGroq = None
 
 # LLM base class
-from langchain.llms.base import LLM
-from langchain.memory import ConversationBufferMemory, ReadOnlySharedMemory
-from langchain.schema import AgentAction, AgentFinish, OutputParserException, HumanMessage, AIMessage, SystemMessage
-from langchain.tools import OpenAPISpec, APIOperation, StructuredTool
-from langchain.utilities import GoogleSearchAPIWrapper
+from langchain_classic.llms.base import LLM
+from langchain_classic.memory import ConversationBufferMemory, ReadOnlySharedMemory
+from langchain_classic.schema import AgentAction, AgentFinish, OutputParserException, HumanMessage, AIMessage, SystemMessage
+from langchain_classic.tools import OpenAPISpec, APIOperation, StructuredTool
+from langchain_classic.utilities import GoogleSearchAPIWrapper
 try:
-    from langchain.requests import Requests
+    from langchain_classic.requests import Requests
 except (ImportError, AttributeError):
-    # Requests might not be in langchain
     Requests = None
 from flask import Flask, jsonify, request
 from functools import wraps
@@ -3026,6 +3027,15 @@ def _autonomous_gather_info(user_id, description, prompt_id):
 
 @app.route('/chat', methods=['POST'])
 def chat():
+    # Rate limit: 30 req/min per user/IP
+    try:
+        from integrations.social.rate_limiter import _limiter
+        rate_key = request.get_json(silent=True) or {}
+        rate_user = rate_key.get('user_id', request.remote_addr) if isinstance(rate_key, dict) else request.remote_addr
+        if not _limiter.check(str(rate_user), 'chat', max_tokens=30, refill_rate=30 / 60):
+            return jsonify({'error': 'Rate limit exceeded (30/min). Please wait.'}), 429
+    except Exception:
+        pass  # Rate limiter unavailable — allow
 
     start_time = time.time()
 
@@ -3046,6 +3056,8 @@ def chat():
     intermediate = data.get('intermediate', None)
     speculative = data.get('speculative', False)
     model_config = data.get('model_config', None)
+    task_source = data.get('task_source', 'own')
+    thread_local_data.set_task_source(task_source)
     app.logger.info(f"casual_conv type {casual_conv}")
 
     # Security: sanitize prompt_id to prevent path traversal
@@ -3077,6 +3089,15 @@ def chat():
         try:
             from security.secret_redactor import redact_secrets
             prompt, _redacted_count = redact_secrets(prompt)
+        except ImportError:
+            pass
+
+    # BUDGET GATE: estimate and log LLM cost before execution
+    if prompt:
+        try:
+            from integrations.agent_engine.budget_gate import estimate_llm_cost_spark
+            _est_cost = estimate_llm_cost_spark(prompt)
+            app.logger.debug(f"Estimated LLM cost: {_est_cost} Spark for user={user_id}")
         except ImportError:
             pass
 
@@ -4297,7 +4318,7 @@ def revenue_dashboard():
     try:
         rev = get_revenue_aggregator()
         dashboard = rev.get_dashboard(db)
-        dashboard['compute_borrowing'] = ComputeBorrowingService.get_status()
+        dashboard['compute_borrowing'] = ComputeBorrowingService.get_status(db)
         return jsonify(dashboard)
     finally:
         db.close()
@@ -4527,6 +4548,214 @@ def skills_delete(skill_name):
         return jsonify({'error': str(e)}), 500
 
 
+# ─── Settings API — Compute Configuration ───────────────────────────
+
+
+@app.route('/api/settings/compute', methods=['GET'])
+@_json_endpoint
+def settings_compute_get():
+    """Return merged compute policy (env > DB > defaults).
+
+    Access: any authenticated node operator.
+    """
+    import os as _os
+    node_id = _os.environ.get('HEVOLVE_NODE_ID', 'local')
+    from integrations.agent_engine.compute_config import get_compute_policy
+    policy = get_compute_policy(node_id)
+
+    # Add provider identity from PeerNode (single source of truth)
+    provider_info = {}
+    try:
+        from integrations.social.models import db_session, PeerNode
+        with db_session() as db:
+            peer = db.query(PeerNode).filter_by(node_id=node_id).first()
+            if peer:
+                provider_info = {
+                    'electricity_rate_kwh': peer.electricity_rate_kwh,
+                    'cause_alignment': peer.cause_alignment,
+                }
+    except Exception:
+        pass
+
+    return jsonify({**policy, **provider_info, 'node_id': node_id})
+
+
+@app.route('/api/settings/compute', methods=['PUT'])
+@_json_endpoint
+def settings_compute_put():
+    """Update compute configuration. Single endpoint, writes to correct table per field.
+
+    Policy fields → NodeComputeConfig (local-only).
+    Provider identity → PeerNode (gossipped to network).
+    Access: node operator or admin. Tier-aware: central nodes cannot set allow_metered_for_hive.
+    """
+    import os as _os
+    data = request.get_json() or {}
+    node_id = _os.environ.get('HEVOLVE_NODE_ID', 'local')
+    node_tier = _os.environ.get('HEVOLVE_NODE_TIER', 'flat')
+
+    # Tier guard: central nodes cannot opt into metered for hive
+    if node_tier == 'central' and data.get('allow_metered_for_hive'):
+        return jsonify({'error': 'Central nodes cannot enable metered APIs for hive'}), 403
+
+    # Policy fields → NodeComputeConfig
+    policy_fields = {
+        'compute_policy', 'hive_compute_policy', 'max_hive_gpu_pct',
+        'allow_metered_for_hive', 'metered_daily_limit_usd',
+        'offered_gpu_hours_per_day', 'accept_thought_experiments',
+        'accept_frontier_training', 'auto_settle', 'min_settlement_spark',
+    }
+    # Provider identity → PeerNode
+    peer_fields = {'electricity_rate_kwh', 'cause_alignment'}
+
+    policy_updates = {k: v for k, v in data.items() if k in policy_fields}
+    peer_updates = {k: v for k, v in data.items() if k in peer_fields}
+
+    from integrations.social.models import db_session, NodeComputeConfig, PeerNode
+
+    with db_session() as db:
+        if policy_updates:
+            config = db.query(NodeComputeConfig).filter_by(node_id=node_id).first()
+            if not config:
+                config = NodeComputeConfig(node_id=node_id)
+                db.add(config)
+            for key, val in policy_updates.items():
+                setattr(config, key, val)
+
+        if peer_updates:
+            peer = db.query(PeerNode).filter_by(node_id=node_id).first()
+            if peer:
+                for key, val in peer_updates.items():
+                    setattr(peer, key, val)
+
+        db.commit()
+
+    # Invalidate cache
+    from integrations.agent_engine.compute_config import invalidate_cache
+    invalidate_cache(node_id)
+
+    return jsonify({'updated': True, 'node_id': node_id,
+                    'policy_fields': list(policy_updates.keys()),
+                    'peer_fields': list(peer_updates.keys())})
+
+
+@app.route('/api/settings/compute/provider', methods=['GET'])
+@_json_endpoint
+def settings_compute_provider():
+    """Provider dashboard: contribution score, GPU hours, inferences, energy,
+    total Spark earned, pending settlements, cause alignment.
+
+    Access: node operator. Deployment-mode aware (flat/regional/central).
+    """
+    import os as _os
+    node_id = _os.environ.get('HEVOLVE_NODE_ID', 'local')
+    node_tier = _os.environ.get('HEVOLVE_NODE_TIER', 'flat')
+
+    from integrations.social.models import db_session, PeerNode, MeteredAPIUsage
+    from integrations.social.hosting_reward_service import HostingRewardService
+    from sqlalchemy import func as sa_func
+
+    with db_session() as db:
+        peer = db.query(PeerNode).filter_by(node_id=node_id).first()
+        if not peer:
+            return jsonify({'error': 'Node not registered', 'node_id': node_id}), 404
+
+        # Contribution score
+        score_result = HostingRewardService.compute_contribution_score(db, node_id)
+
+        # Pending settlements
+        pending_count = db.query(sa_func.count(MeteredAPIUsage.id)).filter(
+            MeteredAPIUsage.node_id == node_id,
+            MeteredAPIUsage.settlement_status == 'pending',
+        ).scalar() or 0
+
+        pending_usd = db.query(
+            sa_func.coalesce(sa_func.sum(MeteredAPIUsage.actual_usd_cost), 0)
+        ).filter(
+            MeteredAPIUsage.node_id == node_id,
+            MeteredAPIUsage.settlement_status == 'pending',
+        ).scalar() or 0.0
+
+        # Reward summary
+        reward_summary = HostingRewardService.get_reward_summary(db, node_id)
+
+        return jsonify({
+            'node_id': node_id,
+            'node_tier': node_tier,
+            'contribution': score_result,
+            'compute_stats': {
+                'gpu_hours_served': peer.gpu_hours_served or 0,
+                'total_inferences': peer.total_inferences or 0,
+                'energy_kwh_contributed': peer.energy_kwh_contributed or 0,
+                'metered_api_costs_absorbed': peer.metered_api_costs_absorbed or 0,
+            },
+            'provider_identity': {
+                'cause_alignment': peer.cause_alignment,
+                'electricity_rate_kwh': peer.electricity_rate_kwh,
+            },
+            'pending_settlements': {
+                'count': pending_count,
+                'total_usd': round(float(pending_usd), 4),
+            },
+            'reward_summary': reward_summary,
+        })
+
+
+@app.route('/api/settings/compute/provider/join', methods=['POST'])
+@_json_endpoint
+def settings_compute_provider_join():
+    """Simple provider onboarding. Creates NodeComputeConfig + sets PeerNode identity.
+
+    Body: {cause_alignment?, electricity_rate_kwh?, offered_gpu_hours_per_day?, compute_policy?}
+    Access: any node. Creates config with sensible defaults.
+    """
+    import os as _os
+    data = request.get_json() or {}
+    node_id = _os.environ.get('HEVOLVE_NODE_ID', 'local')
+
+    from integrations.social.models import db_session, NodeComputeConfig, PeerNode
+
+    with db_session() as db:
+        # Create or update NodeComputeConfig
+        config = db.query(NodeComputeConfig).filter_by(node_id=node_id).first()
+        if not config:
+            config = NodeComputeConfig(node_id=node_id)
+            db.add(config)
+
+        for field in ('compute_policy', 'offered_gpu_hours_per_day',
+                      'accept_thought_experiments', 'accept_frontier_training'):
+            if field in data:
+                setattr(config, field, data[field])
+
+        # Set provider identity on PeerNode
+        peer = db.query(PeerNode).filter_by(node_id=node_id).first()
+        if peer:
+            if 'cause_alignment' in data:
+                peer.cause_alignment = data['cause_alignment']
+            elif not peer.cause_alignment:
+                peer.cause_alignment = 'democratize_compute'
+            if 'electricity_rate_kwh' in data:
+                peer.electricity_rate_kwh = data['electricity_rate_kwh']
+
+        db.commit()
+
+    # Invalidate cache
+    from integrations.agent_engine.compute_config import invalidate_cache
+    invalidate_cache(node_id)
+
+    # Return the merged config
+    from integrations.agent_engine.compute_config import get_compute_policy
+    policy = get_compute_policy(node_id)
+
+    return jsonify({
+        'joined': True,
+        'node_id': node_id,
+        'config': policy,
+        'message': 'Welcome to the HART OS compute network. '
+                   'Your contribution helps democratize access to AI.',
+    })
+
+
 def _init_skills():
     """Initialize skill registry — load persisted skills + discover local."""
     try:
@@ -4592,6 +4821,29 @@ def _validate_startup():
             os.makedirs(db_dir, exist_ok=True)
         except OSError as e:
             warnings.append(f"Cannot create agent_data directory: {e}")
+
+    # ── Central instance hardening ──
+    _central_logger = logging.getLogger('hevolve_social')
+    node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
+    if node_tier == 'central':
+        # Fix 3: TLS check
+        if not os.environ.get('TLS_CERT_PATH'):
+            _central_logger.warning("CENTRAL HARDENING: No TLS_CERT_PATH set — production should use HTTPS")
+
+        # Fix 5: Secret presence validation
+        api_key = os.environ.get('OPENAI_API_KEY', '')
+        if not api_key or api_key.startswith('sk-xxx') or api_key == 'your-key':
+            _central_logger.critical("CENTRAL HARDENING: OPENAI_API_KEY missing or placeholder")
+
+        # Fix 6: DB encryption check
+        db_url = os.environ.get('DATABASE_URL', '')
+        if not db_url or 'sqlite' in db_url.lower():
+            _central_logger.warning("CENTRAL HARDENING: SQLite detected — production should use PostgreSQL or sqlcipher")
+
+        # Fix 7: Block dev mode
+        if os.environ.get('HEVOLVE_DEV_MODE', '').lower() == 'true':
+            os.environ['HEVOLVE_DEV_MODE'] = 'false'
+            _central_logger.critical("CENTRAL HARDENING: Dev mode FORCED OFF on central instance")
 
     if warnings:
         logger = logging.getLogger('hevolve_social')

@@ -1,6 +1,7 @@
 #!/bin/bash
-TOKEN="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"
-#basic uprade and install
+# SECURITY: GitHub token must be provided via environment variable, never hardcoded
+TOKEN="${GITHUB_TOKEN:?ERROR: Set GITHUB_TOKEN environment variable}"
+#basic upgrade and install
 sudo apt update
 sudo apt-get upgrade
 sudo apt install  -y python-is-python3

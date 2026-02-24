@@ -20,6 +20,13 @@ def get_social_blueprint():
 
 def init_social(app):
     """Initialize the social network module. Call after app = Flask(...)."""
+    # Block dev mode on central
+    import os as _os_boot
+    node_tier = _os_boot.environ.get('HEVOLVE_NODE_TIER', 'flat')
+    if node_tier == 'central' and _os_boot.environ.get('HEVOLVE_DEV_MODE', '').lower() == 'true':
+        _os_boot.environ['HEVOLVE_DEV_MODE'] = 'false'
+        logger.critical("SECURITY: Dev mode FORCED OFF on central instance")
+
     from .models import init_db, DB_PATH
     try:
         init_db()
@@ -32,11 +39,13 @@ def init_social(app):
         from .gamification_service import GamificationService
         from .models import get_db
         db = get_db()
-        count = GamificationService.seed_achievements(db)
-        if count > 0:
-            db.commit()
-            logger.info(f"HevolveSocial: seeded {count} achievements")
-        db.close()
+        try:
+            count = GamificationService.seed_achievements(db)
+            if count > 0:
+                db.commit()
+                logger.info(f"HevolveSocial: seeded {count} achievements")
+        finally:
+            db.close()
     except Exception as e:
         logger.debug(f"HevolveSocial achievement seeding skipped: {e}")
 
@@ -45,11 +54,13 @@ def init_social(app):
         from .ad_service import AdService
         from .models import get_db as _get_db
         db = _get_db()
-        count = AdService.seed_placements(db)
-        if count > 0:
-            db.commit()
-            logger.info(f"HevolveSocial: seeded {count} ad placements")
-        db.close()
+        try:
+            count = AdService.seed_placements(db)
+            if count > 0:
+                db.commit()
+                logger.info(f"HevolveSocial: seeded {count} ad placements")
+        finally:
+            db.close()
     except Exception as e:
         logger.debug(f"HevolveSocial ad placement seeding skipped: {e}")
 
@@ -177,6 +188,18 @@ def init_social(app):
     except Exception as e:
         _boot_verified = True  # Allow if master_key module unavailable
         logger.debug(f"HevolveSocial boot verification skipped: {e}")
+
+    # ── Tier authorization (central must prove master key) ──
+    try:
+        from security.key_delegation import verify_tier_authorization
+        tier_auth = verify_tier_authorization()
+        if not tier_auth.get('authorized'):
+            logger.critical(f"Tier authorization FAILED: {tier_auth.get('details', 'unknown')}")
+            if node_tier == 'central':
+                _boot_verified = False
+                logger.critical("Central node cannot start without tier authorization")
+    except Exception as e:
+        logger.warning(f"Tier authorization check unavailable: {e}")
 
     # ── System Requirements (HART OS Equilibrium) ──
     # Detect hardware, classify contribution tier, auto-gate features.

@@ -185,7 +185,7 @@ setup(
     },
 
     # Python version requirement
-    python_requires=">=3.9",
+    python_requires=">=3.10,<3.12",
 
     # Dependencies
     install_requires=install_requires,
@@ -206,10 +206,8 @@ setup(
         "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
-        "Programming Language :: Python :: 3.12",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
         "Topic :: Software Development :: Libraries :: Python Modules",
     ],

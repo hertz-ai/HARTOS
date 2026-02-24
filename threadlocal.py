@@ -99,6 +99,19 @@ class ThreadLocalData:
     def clear_model_config_override(self):
         self._local.model_config_override = None
 
+    # --- Per-request task source (own | hive | idle) ---
+
+    def set_task_source(self, source: str):
+        """Set the task source for this thread/request (own, hive, idle)."""
+        self._local.task_source = source
+
+    def get_task_source(self) -> str:
+        """Get per-request task source, defaults to 'own'."""
+        return getattr(self._local, 'task_source', 'own')
+
+    def clear_task_source(self):
+        self._local.task_source = 'own'
+
 
 thread_local_data = ThreadLocalData()
 

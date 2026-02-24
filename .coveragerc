@@ -1,0 +1,43 @@
+[run]
+source =
+    integrations/agent_engine
+    integrations/social
+    integrations/coding_agent
+    integrations/channels
+    integrations/service_tools
+    security
+    langchain_gpt_api
+    threadlocal
+    helper
+    helper_func
+    helper_ledger
+    lifecycle_hooks
+    create_recipe
+    reuse_recipe
+data_file = test-reports/coverage/.coverage
+
+omit =
+    tests/*
+    venv*/*
+    .idea/*
+    autogen-*/*
+    docs/*
+    */migrations/*
+    */__pycache__/*
+
+[report]
+show_missing = true
+precision = 1
+fail_under = 0
+exclude_lines =
+    pragma: no cover
+    def __repr__
+    if __name__ == .__main__
+    raise NotImplementedError
+    pass
+    except ImportError
+    except Exception
+
+[html]
+directory = test-reports/coverage
+title = HART OS Code Coverage Report

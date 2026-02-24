@@ -275,6 +275,16 @@ class AgentDaemon:
                 # Build prompt using registered builder (guardrail: togetherness rewrite)
                 prompt = GoalManager.build_prompt(goal.to_dict(), product_dict)
 
+                # BUDGET GATE: check goal budget + platform affordability
+                try:
+                    from .budget_gate import pre_dispatch_budget_gate
+                    bg_allowed, bg_reason = pre_dispatch_budget_gate(goal.id, prompt)
+                    if not bg_allowed:
+                        logger.warning(f"Goal {goal.id} blocked by budget gate: {bg_reason}")
+                        continue
+                except ImportError:
+                    pass
+
                 # GUARDRAIL: full pre-dispatch gate
                 try:
                     from security.hive_guardrails import GuardrailEnforcer

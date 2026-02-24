@@ -608,6 +608,14 @@ class PeerNode(Base):
     # Fail2ban: progressive ban tracking
     ban_count = Column(Integer, default=0)                    # How many times this node has been banned
     ban_until = Column(DateTime, nullable=True)               # When current ban expires (None = no ban)
+    # Usage tracking (cumulative, periodically aggregated by aggregate_compute_stats)
+    gpu_hours_served = Column(Float, default=0.0)
+    total_inferences = Column(Integer, default=0)
+    energy_kwh_contributed = Column(Float, default=0.0)
+    metered_api_costs_absorbed = Column(Float, default=0.0)  # USD of metered API used for hive
+    # Provider identity (gossipped to network — single source of truth)
+    electricity_rate_kwh = Column(Float, nullable=True)
+    cause_alignment = Column(String(200), nullable=True)
 
     node_operator = relationship('User', foreign_keys=[node_operator_id])
 
@@ -644,6 +652,12 @@ class PeerNode(Base):
             'x25519_public': self.x25519_public,
             'ban_count': self.ban_count,
             'ban_until': self.ban_until.isoformat() if self.ban_until else None,
+            'gpu_hours_served': self.gpu_hours_served,
+            'total_inferences': self.total_inferences,
+            'energy_kwh_contributed': self.energy_kwh_contributed,
+            'metered_api_costs_absorbed': self.metered_api_costs_absorbed,
+            'electricity_rate_kwh': self.electricity_rate_kwh,
+            'cause_alignment': self.cause_alignment,
             'metadata': self.metadata_json,
         }
 
@@ -2768,3 +2782,125 @@ class PaperTrade(Base):
             'opened_at': self.opened_at.isoformat() if self.opened_at else None,
             'closed_at': self.closed_at.isoformat() if self.closed_at else None,
         }
+
+
+class ComputeEscrow(Base):
+    """Persistent compute lending escrow — replaces in-memory _compute_debts."""
+    __tablename__ = 'compute_escrow'
+
+    id = Column(Integer, primary_key=True)
+    debtor_node_id = Column(String(100), nullable=False, index=True)
+    creditor_node_id = Column(String(100), nullable=False, index=True)
+    request_id = Column(String(100), nullable=True)
+    task_type = Column(String(50), default='general')
+    spark_amount = Column(Integer, nullable=False)
+    status = Column(String(20), default='pending', index=True)  # pending|settled|expired
+    created_at = Column(DateTime, default=datetime.utcnow)
+    settled_at = Column(DateTime, nullable=True)
+    expires_at = Column(DateTime, nullable=True)
+
+
+class MeteredAPIUsage(Base):
+    """Per-call record of metered API consumption for cost recovery.
+
+    Tracks when hive/idle tasks consume a node operator's paid API credits
+    (GPT-4, Claude, Groq paid tier). Distinct from APIUsageLog which tracks
+    external commercial billing (customers paying us).
+    """
+    __tablename__ = 'metered_api_usage'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    node_id = Column(String(64), nullable=False, index=True)
+    operator_id = Column(String(64), nullable=True, index=True)
+    model_id = Column(String(100), nullable=False)
+    task_source = Column(String(30), nullable=False)                # own | hive | idle
+    goal_id = Column(String(64), nullable=True, index=True)
+    requester_node_id = Column(String(64), nullable=True)
+    tokens_in = Column(Integer, default=0)
+    tokens_out = Column(Integer, default=0)
+    cost_per_1k_tokens = Column(Float, default=0.0)
+    estimated_spark_cost = Column(Integer, default=0)
+    actual_usd_cost = Column(Float, default=0.0)
+    settlement_status = Column(String(20), default='pending', index=True)
+    created_at = Column(DateTime, default=func.now(), index=True)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'node_id': self.node_id,
+            'operator_id': self.operator_id,
+            'model_id': self.model_id,
+            'task_source': self.task_source,
+            'goal_id': self.goal_id,
+            'requester_node_id': self.requester_node_id,
+            'tokens_in': self.tokens_in,
+            'tokens_out': self.tokens_out,
+            'cost_per_1k_tokens': self.cost_per_1k_tokens,
+            'estimated_spark_cost': self.estimated_spark_cost,
+            'actual_usd_cost': self.actual_usd_cost,
+            'settlement_status': self.settlement_status,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class NodeComputeConfig(Base):
+    """Per-node LOCAL policy settings (not gossipped).
+
+    Controls how this node behaves: model routing, metered API opt-in,
+    feature flags, settlement. Provider identity fields (cause_alignment,
+    electricity_rate_kwh) live on PeerNode only — single source of truth.
+    """
+    __tablename__ = 'node_compute_config'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    node_id = Column(String(64), unique=True, nullable=False, index=True)
+    # Model routing (local policy)
+    compute_policy = Column(String(20), default='local_preferred')
+    hive_compute_policy = Column(String(20), default='local_preferred')
+    max_hive_gpu_pct = Column(Integer, default=50)
+    # Metered API opt-in (local policy)
+    allow_metered_for_hive = Column(Boolean, default=False)
+    metered_daily_limit_usd = Column(Float, default=0.0)
+    # Compute offer (local declaration)
+    offered_gpu_hours_per_day = Column(Float, default=0.0)
+    # Feature flags (local policy)
+    accept_thought_experiments = Column(Boolean, default=True)
+    accept_frontier_training = Column(Boolean, default=False)
+    # Settlement (local policy)
+    auto_settle = Column(Boolean, default=True)
+    min_settlement_spark = Column(Integer, default=10)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'node_id': self.node_id,
+            'compute_policy': self.compute_policy,
+            'hive_compute_policy': self.hive_compute_policy,
+            'max_hive_gpu_pct': self.max_hive_gpu_pct,
+            'allow_metered_for_hive': self.allow_metered_for_hive,
+            'metered_daily_limit_usd': self.metered_daily_limit_usd,
+            'offered_gpu_hours_per_day': self.offered_gpu_hours_per_day,
+            'accept_thought_experiments': self.accept_thought_experiments,
+            'accept_frontier_training': self.accept_frontier_training,
+            'auto_settle': self.auto_settle,
+            'min_settlement_spark': self.min_settlement_spark,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class AuditLogEntry(Base):
+    """Immutable audit log with hash-chain integrity (see security/immutable_audit_log.py)."""
+    __tablename__ = 'audit_log_entries'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_type = Column(String(50), nullable=False, index=True)
+    actor_id = Column(String(100), nullable=False, index=True)
+    target_id = Column(String(100), nullable=True)
+    action = Column(Text, nullable=False)
+    detail_json = Column(Text, nullable=True)
+    prev_hash = Column(String(64), nullable=False)
+    entry_hash = Column(String(64), nullable=False, unique=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

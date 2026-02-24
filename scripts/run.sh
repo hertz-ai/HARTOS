@@ -1,13 +1,13 @@
 #!/bin/bash
 # ============================================================
-# HevolveBot LangChain Agent - Server Startup Script
+# HART OS - Server Startup Script
 # ============================================================
 # This is the RECOMMENDED way to start the server.
 # Starts the Flask API server on port 6777 using Waitress.
 # ============================================================
 
 echo "========================================"
-echo " Starting HevolveBot LangChain Agent"
+echo " Starting HART OS"
 echo " Flask API Server (port 6777)"
 echo "========================================"
 echo ""

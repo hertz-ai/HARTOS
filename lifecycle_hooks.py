@@ -66,6 +66,16 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState')
     except Exception as e:
         logger.error(f"Failed to auto-sync to ledger: {e}", exc_info=True)
 
+    # Audit log: record state transition
+    try:
+        from security.immutable_audit_log import get_audit_log
+        get_audit_log().log_event(
+            'state_change', actor_id=user_prompt,
+            action=f'{task_id} → {state.value}',
+            detail={'action_id': action_id, 'state': state.value})
+    except Exception:
+        pass  # Audit log is best-effort, never blocks state transitions
+
 # Import ledger types for sync function (lazy import to avoid circular deps)
 def _get_ledger_task_status():
     """Lazy import to avoid circular dependencies"""
@@ -95,6 +105,8 @@ class ActionState(Enum):
     TERMINATED = "terminated"                     # 11. Action passed to chat instructor and Terminate issued
     EXECUTING_MOTION = "executing_motion"         # 12. Physical action executing via WorldModelBridge
     SENSOR_CONFIRM = "sensor_confirm"             # 13. Waiting for sensor confirmation of physical outcome
+    PREVIEW_PENDING = "preview_pending"           # 14. Destructive action awaiting user approval
+    PREVIEW_APPROVED = "preview_approved"         # 15. User approved destructive action, proceed
 
 
 # Add to lifecycle_hooks.py
@@ -303,7 +315,7 @@ def validate_state_transition(user_prompt: str, action_id: int, new_state: Actio
     current_state = get_action_state(user_prompt, action_id)
 
     valid_transitions = {
-        ActionState.ASSIGNED: [ActionState.IN_PROGRESS, ActionState.ASSIGNED],
+        ActionState.ASSIGNED: [ActionState.IN_PROGRESS, ActionState.ASSIGNED, ActionState.PREVIEW_PENDING],
         ActionState.IN_PROGRESS: [ActionState.STATUS_VERIFICATION_REQUESTED, ActionState.IN_PROGRESS],
         ActionState.STATUS_VERIFICATION_REQUESTED: [ActionState.COMPLETED, ActionState.PENDING, ActionState.ERROR, ActionState.STATUS_VERIFICATION_REQUESTED],
         ActionState.COMPLETED: [ActionState.FALLBACK_REQUESTED, ActionState.RECIPE_REQUESTED, ActionState.TERMINATED, ActionState.COMPLETED],  # Allow direct recipe request (autonomous) or termination
@@ -314,7 +326,10 @@ def validate_state_transition(user_prompt: str, action_id: int, new_state: Actio
         ActionState.FALLBACK_RECEIVED: [ActionState.RECIPE_REQUESTED, ActionState.FALLBACK_RECEIVED],
         ActionState.RECIPE_REQUESTED: [ActionState.RECIPE_RECEIVED, ActionState.RECIPE_REQUESTED],
         ActionState.RECIPE_RECEIVED: [ActionState.TERMINATED, ActionState.RECIPE_RECEIVED],
-        ActionState.TERMINATED: [ActionState.ASSIGNED]  # Final state but an entire actions can be updated and hence can go to assigned state again
+        ActionState.TERMINATED: [ActionState.ASSIGNED],  # Final state but an entire actions can be updated and hence can go to assigned state again
+        # Preview states (opt-in for destructive actions)
+        ActionState.PREVIEW_PENDING: [ActionState.PREVIEW_APPROVED, ActionState.ERROR, ActionState.TERMINATED],
+        ActionState.PREVIEW_APPROVED: [ActionState.IN_PROGRESS],
     }
 
     allowed = valid_transitions.get(current_state, [])

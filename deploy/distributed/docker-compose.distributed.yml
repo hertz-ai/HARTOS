@@ -11,7 +11,7 @@ version: '3.8'
 x-hart-common: &hart-common
   build:
     context: ../..
-    dockerfile: deploy/cloud/Dockerfile
+    dockerfile: deploy/cloud/Dockerfile.prod
   environment: &hart-env
     REDIS_HOST: redis
     REDIS_PORT: "6379"
@@ -54,8 +54,11 @@ services:
       <<: *hart-env
       HEVOLVE_NODE_ID: node-central
       HEVOLVE_NODE_NAME: hart-central
+      HEVOLVE_NODE_TIER: central
+      HEVOLVE_ENFORCEMENT_MODE: hard
+      HEVOLVE_DEV_MODE: "false"
       HEVOLVE_BASE_URL: http://hart-central:6777
-      HEVOLVE_SEED_PEERS: http://hart-worker-1:6778,http://hart-worker-2:6779
+      HEVOLVE_SEED_PEERS: http://hart-worker-1:6777,http://hart-worker-2:6777
 
   # Worker node 1 — claims tasks, executes via local /chat
   node-worker-1:
@@ -69,7 +72,7 @@ services:
       HEVOLVE_NODE_ID: node-worker-1
       HEVOLVE_NODE_NAME: hart-worker-1
       HEVOLVE_BASE_URL: http://hart-worker-1:6777
-      HEVOLVE_SEED_PEERS: http://hart-central:6777,http://hart-worker-2:6779
+      HEVOLVE_SEED_PEERS: http://hart-central:6777,http://hart-worker-2:6777
 
   # Worker node 2 — claims tasks, executes via local /chat
   node-worker-2:
@@ -83,7 +86,7 @@ services:
       HEVOLVE_NODE_ID: node-worker-2
       HEVOLVE_NODE_NAME: hart-worker-2
       HEVOLVE_BASE_URL: http://hart-worker-2:6777
-      HEVOLVE_SEED_PEERS: http://hart-central:6777,http://hart-worker-1:6778
+      HEVOLVE_SEED_PEERS: http://hart-central:6777,http://hart-worker-1:6777
 
 networks:
   hivenet:

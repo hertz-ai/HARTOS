@@ -145,7 +145,7 @@ class TestSparkSettlement:
 
 class TestProfitDistribution:
     def test_profit_distribution_with_profit(self):
-        """Profits split 90/10 between providers and platform."""
+        """Profits split 90/9/1 between users, infra, and central."""
         from integrations.agent_engine.revenue_aggregator import RevenueAggregator
 
         db = MagicMock()
