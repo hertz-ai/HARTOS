@@ -18,10 +18,27 @@ langchain.log
 __pycache__/
 venv_old/*
 
+# Test outputs (keep directory structure via .gitkeep)
+test-reports/junit/*.xml
+test-reports/coverage/*
+!test-reports/coverage/.gitkeep
+test-reports/logs/*.log
+test-reports/logs/*.txt
+htmlcov/
+.coverage
+test_results*.xml
+test_results*.txt
+regression_results.txt
+test_stdout.txt
+test_stderr.txt
+
 # Build artifacts (setuptools / pip)
 *.egg-info/
 dist/
 build/
+_site/
+_site_test/
+site/
 hevolve_version.py
 hart_version.py
 

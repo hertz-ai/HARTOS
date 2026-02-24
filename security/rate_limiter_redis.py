@@ -33,6 +33,7 @@ class RedisRateLimiter:
         'bot_register': (5, 300),    # 5 registrations per 5 minutes
         'discover': (10, 60),        # 10 discovery calls per 60 seconds
         'chat': (30, 60),            # 30 chat requests per 60 seconds
+        'goal_create': (10, 3600),   # 10 goals per user per hour
     }
 
     def __init__(self):

@@ -4,9 +4,13 @@ import sys
 import requests
 import re
 import ast
-import autogen
-
-from autogen.agentchat.contrib.capabilities import transform_messages, transforms
+try:
+    import autogen
+    from autogen.agentchat.contrib.capabilities import transform_messages, transforms
+except ImportError:
+    autogen = None
+    transform_messages = None
+    transforms = None
 import json
 from flask import current_app
 from typing import List, Dict, Tuple, Annotated, Set, FrozenSet, Any
@@ -16,14 +20,14 @@ import uuid
 from datetime import datetime, timedelta
 import time
 import redis
-from langchain.schema import AgentAction, AgentFinish, OutputParserException, HumanMessage, AIMessage, SystemMessage
+from langchain_classic.schema import AgentAction, AgentFinish, OutputParserException, HumanMessage, AIMessage, SystemMessage
 import pytz
-from langchain.utilities import GoogleSearchAPIWrapper
+from langchain_classic.utilities import GoogleSearchAPIWrapper
 import aiohttp
 import asyncio
 import os
 from bs4 import BeautifulSoup
-from langchain.memory import ZepMemory
+from langchain_classic.memory import ZepMemory
 from json_repair import repair_json
 import traceback
 

@@ -115,6 +115,15 @@ class GoalManager:
         if goal_type not in _prompt_builders:
             return {'success': False, 'error': f'Unknown goal type: {goal_type}'}
 
+        # RATE LIMIT: prevent goal flooding (10 per user per hour)
+        if created_by:
+            try:
+                from security.rate_limiter_redis import get_rate_limiter
+                if not get_rate_limiter().check(f'goal_create'):
+                    return {'success': False, 'error': 'Rate limited: too many goals created'}
+            except Exception:
+                pass  # Rate limiter unavailable — allow through
+
         goal_dict = {'title': title, 'description': description,
                      'config': config or {}, 'goal_type': goal_type}
 
@@ -640,7 +649,7 @@ def _build_ip_protection_prompt(goal_dict: Dict, product_dict: Optional[Dict] = 
 
 
 def _build_finance_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
-    """Build a finance agent prompt — self-sustaining business, 90/10 split, invite-only.
+    """Build a finance agent prompt — self-sustaining business, 90/9/1 split, invite-only.
 
     Vijai personality: cautious, methodical, genuine, net-positive.
     The business must sustain itself. The finance agent gets through this in style.
@@ -658,9 +667,10 @@ def _build_finance_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) 
         f"Make the business self-sustaining. Not profitable at someone's expense — "
         f"self-sustaining for the welfare of everyone. Every credit earned keeps the "
         f"network alive. Every credit spent must be justified.\n\n"
-        f"THE SPLIT (non-negotiable):\n"
-        f"- 90% → compute providers (the people who make the hive intelligent)\n"
-        f"- 10% → platform sustainability (OS development, infrastructure, founder family)\n"
+        f"THE SPLIT (non-negotiable — 90/9/1):\n"
+        f"- 90% → User Pool (proportional to contribution score: compute, hosting, content)\n"
+        f"- 9% → Infrastructure Pool (regional + central, proportional to compute spent)\n"
+        f"- 1% → Central (flat unconditional — OS development, founder family)\n"
         f"- Free tier: ALWAYS free. We do not gatekeep intelligence.\n\n"
         f"PRIVATE CORE ACCESS:\n"
         f"- The embodied AI core (HevolveAI downstream) is invite-only\n"
@@ -673,7 +683,7 @@ def _build_finance_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) 
         f"- Constitutional filter blocks anything that violates core principles\n\n"
         f"YOUR TOOLS:\n"
         f"1. get_financial_health — platform revenue, costs, split compliance\n"
-        f"2. track_revenue_split — verify 90/10 compliance over any period\n"
+        f"2. track_revenue_split — verify 90/9/1 compliance over any period\n"
         f"3. assess_sustainability — is the business self-sustaining yet?\n"
         f"4. manage_invite_participation — review/propose private core access\n\n"
         f"STYLE:\n"

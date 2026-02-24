@@ -1,28 +1,28 @@
-from langchain import OpenAI, LLMChain, PromptTemplate
-from langchain.agents import (
+from langchain_classic import OpenAI, LLMChain, PromptTemplate
+from langchain_classic.agents import (
     ZeroShotAgent, Tool, AgentExecutor, ConversationalAgent,
     ConversationalChatAgent, LLMSingleActionAgent, AgentOutputParser,
     load_tools, initialize_agent, AgentType
 )
-from langchain.prompts import (
+from langchain_classic.prompts import (
     ChatPromptTemplate,
     MessagesPlaceholder,
     SystemMessagePromptTemplate,
     HumanMessagePromptTemplate
 )
-from langchain.chains import LLMMathChain, OpenAPIEndpointChain
-from langchain.chains.conversation.memory import ConversationSummaryMemory, ConversationBufferWindowMemory
-from langchain.chains.openai_functions.openapi import get_openapi_chain
-from langchain.chat_models import ChatOpenAI
-from langchain.experimental.plan_and_execute import PlanAndExecute, load_agent_executor, load_chat_planner
-from langchain.llms import OpenAI, OpenAIChat
-from langchain.llms.base import LLM
-from langchain.memory import ConversationBufferMemory, ReadOnlySharedMemory, ZepMemory
-from langchain.requests import Requests
-from langchain.schema import AgentAction, AgentFinish, OutputParserException, HumanMessage, AIMessage, SystemMessage
-from langchain.tools import OpenAPISpec, APIOperation, StructuredTool
-from langchain.tools.python.tool import PythonREPLTool
-from langchain.utilities import GoogleSearchAPIWrapper
+from langchain_classic.chains import LLMMathChain, OpenAPIEndpointChain
+from langchain_classic.chains.conversation.memory import ConversationSummaryMemory, ConversationBufferWindowMemory
+from langchain_classic.chains.openai_functions.openapi import get_openapi_chain
+from langchain_classic.chat_models import ChatOpenAI
+from langchain_classic.experimental.plan_and_execute import PlanAndExecute, load_agent_executor, load_chat_planner
+from langchain_classic.llms import OpenAI, OpenAIChat
+from langchain_classic.llms.base import LLM
+from langchain_classic.memory import ConversationBufferMemory, ReadOnlySharedMemory, ZepMemory
+from langchain_classic.requests import Requests
+from langchain_classic.schema import AgentAction, AgentFinish, OutputParserException, HumanMessage, AIMessage, SystemMessage
+from langchain_classic.tools import OpenAPISpec, APIOperation, StructuredTool
+from langchain_classic.tools.python.tool import PythonREPLTool
+from langchain_classic.utilities import GoogleSearchAPIWrapper
 from flask import Flask, jsonify, request
 import json
 import os
@@ -32,7 +32,7 @@ import requests
 import pytz
 from datetime import datetime, timezone
 from typing import List, Union, Optional, Mapping, Any, Dict
-from langchain.agents.conversational_chat.output_parser import ConvoOutputParser
+from langchain_classic.agents.conversational_chat.output_parser import ConvoOutputParser
 import time
 import tiktoken
 from pytz import timezone
@@ -40,11 +40,11 @@ from datetime import datetime
 from waitress import serve
 from logging.handlers import RotatingFileHandler
 from typing import Union
-from langchain.agents import AgentOutputParser
-from langchain.agents.conversational_chat.prompt import FORMAT_INSTRUCTIONS
-from langchain.output_parsers.json import parse_json_markdown
-from langchain.schema import AgentAction, AgentFinish, OutputParserException
-from langchain.tools.requests.tool import RequestsGetTool, TextRequestsWrapper
+from langchain_classic.agents import AgentOutputParser
+from langchain_classic.agents.conversational_chat.prompt import FORMAT_INSTRUCTIONS
+from langchain_classic.output_parsers.json import parse_json_markdown
+from langchain_classic.schema import AgentAction, AgentFinish, OutputParserException
+from langchain_classic.tools.requests.tool import RequestsGetTool, TextRequestsWrapper
 from pydantic import BaseModel, Field, root_validator
 from threadlocal import thread_local_data
 

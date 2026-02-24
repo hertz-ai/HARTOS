@@ -1,33 +1,15 @@
 @echo off
 REM ============================================================
-REM HevolveBot — Master Regression Test Runner
+REM HART OS — Master Regression Test Runner
 REM ============================================================
-REM Runs ALL 2700+ unit/integration tests across the codebase.
+REM Runs ALL unit/integration tests across the codebase.
 REM
-REM Test groups:
-REM   P2P & Security       ~722 tests  (hierarchy, integrity, agent engine, etc.)
-REM   Social Platform       ~148 tests  (feed, search, karma, models, etc.)
-REM   Channel Infra         ~120 tests  (rate limit, dedupe, debounce, security)
-REM   Channel Adapters      ~200 tests  (discord, telegram, web, signal, etc.)
-REM   Channel E2E           ~172 tests  (regression, dashboard, gateway, metrics)
-REM   Agent & Recipe        ~200 tests  (create, reuse, recipe, scheduler, etc.)
-REM   Session & Messaging    ~90 tests  (session, queue, streaming, preferences)
-REM   Tools & AI            ~250 tests  (VLM, coding, embeddings, TTS, vision)
-REM   Core & Performance    ~150 tests  (core perf, naming, state, concurrency)
-REM   Integration            ~50 tests  (integration, redis ledger)
-REM   Distro & Hardening   ~469 tests  (distro configs, PXE, OTA, provisioner, security)
-REM
-REM Standalone scripts (not included — run directly with python):
-REM   test_nested_task_system.py, test_nested_tasks.py,
-REM   test_master_suite.py, test_agent_lightning_standalone.py,
-REM   run_integration_tests.py, run_manual_tests.py
-REM
-REM E2E tests requiring a live server: scripts/run_e2e_tests.bat
+REM CI Mode: set CI=true && scripts\run_regression.bat
+REM   Skips interactive menu, runs ALL groups.
 REM ============================================================
 
 echo ========================================
-echo  HevolveBot Master Regression Suite
-echo  2263 tests across 61 test files
+echo  HART OS Master Regression Suite
 echo ========================================
 
 cd /d %~dp0..
@@ -47,9 +29,15 @@ echo Using: %PYTHON_EXE%
 echo.
 
 REM ===== WINDOWS CONSOLE FIX =====
-REM Prevent "Error in sys.excepthook:" crash on Windows console
 set PYTHONIOENCODING=utf-8
 chcp 65001 >nul 2>&1
+
+REM ===== OUTPUT DIRECTORIES =====
+set REPORT_DIR=test-reports
+set JUNIT_DIR=%REPORT_DIR%\junit
+set LOGS_DIR=%REPORT_DIR%\logs
+if not exist "%JUNIT_DIR%" mkdir "%JUNIT_DIR%"
+if not exist "%LOGS_DIR%" mkdir "%LOGS_DIR%"
 
 REM ===== DEFINE TEST GROUPS =====
 
@@ -169,57 +157,149 @@ set DISTRO_TESTS=^
     tests/unit/test_security_hardening_distro.py ^
     tests/unit/test_deployment_modes.py
 
-echo Select regression scope:
-echo.
-echo   1. FULL regression (all 2700+ tests)
-echo   2. P2P Network + Security (722 tests - core infrastructure)
-echo   3. Social Platform (148 tests)
-echo   4. All Channels (infra + adapters + e2e)
-echo   5. Agent + Recipe Pipeline
-echo   6. Tools + AI (VLM, embeddings, TTS, vision)
-echo   7. Quick smoke (P2P security only - fastest)
-echo   8. Custom pytest pattern
-echo   9. Distro + Security Hardening (469 tests)
+REM Group 12: WS Workstream Tests (metered API, compute, budget, revenue)
+set WS_TESTS=^
+    tests/unit/test_budget_gate.py ^
+    tests/unit/test_boot_hardening.py ^
+    tests/unit/test_revenue_pipeline.py ^
+    tests/unit/test_compute_config.py ^
+    tests/unit/test_model_routing.py ^
+    tests/unit/test_metered_recovery.py ^
+    tests/unit/test_settings_api.py ^
+    tests/unit/test_ad_hosting_rewards.py
+
+REM Group 13: Security Hardening + Build Verification
+set SECURITY_HARDENING_TESTS=^
+    tests/unit/test_integrity_system.py ^
+    tests/unit/test_federation_upgrade.py ^
+    tests/unit/test_build_verification.py ^
+    tests/unit/test_immutable_audit_log.py ^
+    tests/unit/test_tool_allowlist.py ^
+    tests/unit/test_goal_rate_limit.py ^
+    tests/unit/test_action_classifier.py ^
+    tests/unit/test_dlp_engine.py
+
+REM ===== CI MODE =====
+if "%CI%"=="true" goto :ci_mode
+if "%CI%"=="1" goto :ci_mode
+if "%1"=="--ci" goto :ci_mode
+goto :interactive_mode
+
+:ci_mode
+echo CI MODE: Running ALL test groups
+echo ========================================
 echo.
 
-set /p choice="Enter choice (1-9): "
+echo --- WS Workstream Tests ---
+"%PYTHON_EXE%" -m pytest %WS_TESTS% --noconftest --tb=short --color=no -q --junitxml="%JUNIT_DIR%\ws_workstream.xml"
+echo.
+
+echo --- Security Hardening Tests ---
+"%PYTHON_EXE%" -m pytest %SECURITY_HARDENING_TESTS% --noconftest --tb=short --color=no -q --junitxml="%JUNIT_DIR%\security_hardening.xml"
+echo.
+
+echo --- Core + Performance ---
+"%PYTHON_EXE%" -m pytest %CORE_PERF_TESTS% --tb=short --color=no -q --junitxml="%JUNIT_DIR%\core_perf.xml"
+echo.
+
+echo --- Social ---
+"%PYTHON_EXE%" -m pytest %SOCIAL_TESTS% --tb=short --color=no -q --junitxml="%JUNIT_DIR%\social.xml"
+echo.
+
+echo --- P2P Security ---
+"%PYTHON_EXE%" -m pytest %P2P_SECURITY_TESTS% --tb=short --color=no -q --junitxml="%JUNIT_DIR%\p2p_security.xml"
+echo.
+
+echo --- Channel Infrastructure ---
+"%PYTHON_EXE%" -m pytest %CHANNEL_INFRA_TESTS% --tb=short --color=no -q --junitxml="%JUNIT_DIR%\channel_infra.xml"
+echo.
+
+echo --- Channel Adapters ---
+"%PYTHON_EXE%" -m pytest %CHANNEL_ADAPTER_TESTS% --tb=short --color=no -q --junitxml="%JUNIT_DIR%\channel_adapters.xml"
+echo.
+
+echo --- Channel E2E ---
+"%PYTHON_EXE%" -m pytest %CHANNEL_E2E_TESTS% --tb=short --color=no -q --junitxml="%JUNIT_DIR%\channel_e2e.xml"
+echo.
+
+echo --- Agent + Recipe ---
+"%PYTHON_EXE%" -m pytest %AGENT_RECIPE_TESTS% --tb=short --color=no -q --junitxml="%JUNIT_DIR%\agent_recipe.xml"
+echo.
+
+echo --- Session ---
+"%PYTHON_EXE%" -m pytest %SESSION_TESTS% --tb=short --color=no -q --junitxml="%JUNIT_DIR%\session.xml"
+echo.
+
+echo --- Tools + AI ---
+"%PYTHON_EXE%" -m pytest %TOOLS_AI_TESTS% --tb=short --color=no -q --junitxml="%JUNIT_DIR%\tools_ai.xml"
+echo.
+
+echo --- Integration ---
+"%PYTHON_EXE%" -m pytest %INTEGRATION_TESTS% --tb=short --color=no -q --junitxml="%JUNIT_DIR%\integration.xml"
+echo.
+
+echo --- Distro ---
+"%PYTHON_EXE%" -m pytest %DISTRO_TESTS% --tb=short --color=no -q --junitxml="%JUNIT_DIR%\distro.xml"
+echo.
+
+echo ========================================
+echo  CI Regression complete
+echo  JUnit XML: %JUNIT_DIR%\
+echo ========================================
+goto :eof
+
+:interactive_mode
+echo Select regression scope:
+echo.
+echo   1. FULL regression (all test groups)
+echo   2. P2P Network + Security
+echo   3. Social Platform
+echo   4. All Channels (infra + adapters + e2e)
+echo   5. Agent + Recipe Pipeline
+echo   6. Tools + AI
+echo   7. Quick smoke (P2P security only - fastest)
+echo   8. Custom pytest pattern
+echo   9. Distro + Security Hardening
+echo  10. WS Workstream Tests (metered API, compute, revenue)
+echo  11. Security Hardening Tests (audit, DLP, classifier, etc.)
+echo.
+
+set /p choice="Enter choice (1-11): "
 
 if "%choice%"=="1" (
     echo.
-    echo Running FULL regression suite [2263 tests]...
+    echo Running FULL regression suite...
     echo ========================================
-    echo Output saved to regression_results.txt
+    echo Output saved to %LOGS_DIR%\regression_full.txt
     echo.
-    REM  -s disables fd-capture (pytest's tmpfile gets closed by imports,
-    REM     causing "ValueError: I/O operation on closed file" abort)
     "%PYTHON_EXE%" -m pytest ^
         tests/unit/ ^
         tests/integration/ ^
         --override-ini="addopts=" ^
         --tb=line --color=no -q -s ^
-        > regression_results.txt 2>&1
+        > "%LOGS_DIR%\regression_full.txt" 2>&1
     echo.
     echo ---- SUMMARY ----
-    findstr /C:"passed" /C:"failed" /C:"error" regression_results.txt
+    findstr /C:"passed" /C:"failed" /C:"error" "%LOGS_DIR%\regression_full.txt"
     echo.
-    echo Full output: regression_results.txt
+    echo Full output: %LOGS_DIR%\regression_full.txt
 ) else if "%choice%"=="2" (
     echo.
-    echo Running P2P Network + Security [~722 tests]...
+    echo Running P2P Network + Security...
     echo ========================================
     "%PYTHON_EXE%" -m pytest ^
         %P2P_SECURITY_TESTS% ^
         --tb=short --color=yes -q
 ) else if "%choice%"=="3" (
     echo.
-    echo Running Social Platform [~148 tests]...
+    echo Running Social Platform...
     echo ========================================
     "%PYTHON_EXE%" -m pytest ^
         %SOCIAL_TESTS% ^
         --tb=short --color=yes -q
 ) else if "%choice%"=="4" (
     echo.
-    echo Running All Channels [~490 tests]...
+    echo Running All Channels...
     echo ========================================
     "%PYTHON_EXE%" -m pytest ^
         %CHANNEL_INFRA_TESTS% ^
@@ -248,16 +328,30 @@ if "%choice%"=="1" (
         %P2P_SECURITY_TESTS% ^
         --tb=short --color=yes -q --no-header
 ) else if "%choice%"=="8" (
-    set /p pattern="Enter pytest pattern (e.g. tests/test_file.py -k test_name): "
+    set /p pattern="Enter pytest pattern: "
     echo Running custom pattern...
     "%PYTHON_EXE%" -m pytest %pattern% --tb=short --color=yes
 ) else if "%choice%"=="9" (
     echo.
-    echo Running Distro + Security Hardening [~469 tests]...
+    echo Running Distro + Security Hardening...
     echo ========================================
     "%PYTHON_EXE%" -m pytest ^
         %DISTRO_TESTS% ^
         --tb=short --color=yes -q
+) else if "%choice%"=="10" (
+    echo.
+    echo Running WS Workstream Tests...
+    echo ========================================
+    "%PYTHON_EXE%" -m pytest ^
+        %WS_TESTS% ^
+        --noconftest --tb=short --color=yes -q
+) else if "%choice%"=="11" (
+    echo.
+    echo Running Security Hardening Tests...
+    echo ========================================
+    "%PYTHON_EXE%" -m pytest ^
+        %SECURITY_HARDENING_TESTS% ^
+        --noconftest --tb=short --color=yes -q
 ) else (
     echo Invalid choice
     pause

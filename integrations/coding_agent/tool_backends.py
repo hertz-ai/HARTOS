@@ -46,14 +46,33 @@ class CodingToolBackend(ABC):
         }
 
     def get_env(self) -> Dict[str, str]:
-        """Build environment for subprocess — passes through user's API keys."""
+        """Build environment for subprocess.
+
+        For 'own' tasks: passes through all API keys.
+        For 'hive'/'idle' tasks: strips metered API keys unless the node
+        operator explicitly opted in via compute policy (fail-closed).
+        """
         env = os.environ.copy()
-        # Pass through all relevant API keys from HARTOS env
-        for key in ('OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GROQ_API_KEY',
-                     'GOOGLE_API_KEY', 'OPENROUTER_API_KEY'):
+        task_source = os.environ.get('_CURRENT_TASK_SOURCE', 'own')
+        allow_metered = True
+
+        if task_source in ('hive', 'idle'):
+            try:
+                from integrations.agent_engine.compute_config import get_compute_policy
+                policy = get_compute_policy(os.environ.get('HEVOLVE_NODE_ID'))
+                allow_metered = policy.get('allow_metered_for_hive', False)
+            except ImportError:
+                allow_metered = False  # Fail-closed
+
+        metered_keys = ('OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GROQ_API_KEY',
+                        'GOOGLE_API_KEY', 'OPENROUTER_API_KEY')
+        for key in metered_keys:
             val = os.environ.get(key)
-            if val:
+            if val and (allow_metered or task_source == 'own'):
                 env[key] = val
+            else:
+                env.pop(key, None)
+
         return env
 
     def execute(self, task: str, context: Optional[Dict] = None,

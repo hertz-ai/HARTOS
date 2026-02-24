@@ -522,7 +522,7 @@ class TestImpressionWitness:
         )
         assert HOSTER_UNWITNESSED_SHARE < HOSTER_REVENUE_SHARE
         assert HOSTER_UNWITNESSED_SHARE == 0.50
-        assert HOSTER_REVENUE_SHARE == 0.70
+        assert HOSTER_REVENUE_SHARE == 0.90  # 90/9/1 split
 
 
 # =====================================================================

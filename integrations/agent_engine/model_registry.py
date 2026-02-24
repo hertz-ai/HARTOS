@@ -128,6 +128,44 @@ class ModelRegistry:
             return None
         return max(candidates, key=lambda m: m.accuracy_score)
 
+    def get_local_model(self, min_accuracy: float = 0.0) -> Optional[ModelBackend]:
+        """Get the highest-accuracy local model (is_local=True, cost=0).
+
+        Used by policy-aware routing to prefer local compute for hive/idle tasks.
+        """
+        with self._lock:
+            candidates = [m for m in self._models.values()
+                          if m.is_local and m.accuracy_score >= min_accuracy]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda m: m.accuracy_score)
+
+    def get_model_by_policy(self, policy: str = 'local_preferred',
+                            task_source: str = 'own',
+                            min_accuracy: float = 0.0) -> Optional[ModelBackend]:
+        """Policy-aware model selection.
+
+        Policies:
+          local_only     — Only local models (is_local=True). Returns None if none available.
+          local_preferred — Try local first, fall through to metered if none available.
+          any            — Fastest model regardless of locality (metered costs tracked).
+
+        For hive/idle tasks, enforces at least local_preferred unless node opted into 'any'.
+        """
+        if task_source in ('hive', 'idle') and policy != 'any':
+            policy = 'local_preferred'
+
+        if policy == 'local_only':
+            return self.get_local_model(min_accuracy)
+
+        if policy == 'local_preferred':
+            local = self.get_local_model(min_accuracy)
+            if local:
+                return local
+            # Fall through to metered (will be tracked + compensated)
+
+        return self.get_fast_model(min_accuracy)
+
     def list_models(self, tier: ModelTier = None) -> List[ModelBackend]:
         """List all models, optionally filtered by tier."""
         with self._lock:

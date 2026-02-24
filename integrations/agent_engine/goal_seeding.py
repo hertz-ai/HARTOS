@@ -199,7 +199,7 @@ SEED_BOOTSTRAP_GOALS = [
         'description': (
             'Make the business self-sustaining with Vijai personality: '
             '1) Use get_financial_health to monitor platform revenue and costs, '
-            '2) Use track_revenue_split to verify 90/10 compliance every period, '
+            '2) Use track_revenue_split to verify 90/9/1 compliance every period, '
             '3) Use assess_sustainability to determine if revenue covers infrastructure, '
             '4) Use manage_invite_participation to review private core access agreements. '
             'No code merges without review against vision, mission, goals, constitution. '

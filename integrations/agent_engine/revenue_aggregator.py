@@ -19,7 +19,14 @@ logger = logging.getLogger(__name__)
 # Configurable via environment
 _FUNDING_THRESHOLD = float(os.environ.get('HEVOLVE_REVENUE_FUNDING_THRESHOLD', '1000'))
 _FUNDING_ALLOCATION_PCT = float(os.environ.get('HEVOLVE_REVENUE_FUNDING_PCT', '0.10'))
-_PROFIT_PLATFORM_SHARE = 0.10  # Platform keeps 10% of trading profits
+# ─── 90/9/1 Revenue Split Model ───
+# 90% → User Pool (distributed proportional to contribution_score)
+# 9%  → Infrastructure Pool (regional + central, proportional to compute spent)
+# 1%  → Central (flat unconditional take)
+REVENUE_SPLIT_USERS = 0.90
+REVENUE_SPLIT_INFRA = 0.09
+REVENUE_SPLIT_CENTRAL = 0.01
+_PROFIT_PLATFORM_SHARE = REVENUE_SPLIT_INFRA + REVENUE_SPLIT_CENTRAL  # backward compat
 
 
 # ─── Shared revenue query (used by both RevenueAggregator and finance_tools) ──
@@ -41,6 +48,9 @@ def query_revenue_streams(db, period_days: int = 30) -> Dict:
         'ad_revenue': 0.0,
         'hosting_payouts': 0.0,
         'total_gross': 0.0,
+        'user_pool_share': 0.0,
+        'infra_pool_share': 0.0,
+        'central_share': 0.0,
         'platform_share': 0.0,
     }
 
@@ -76,7 +86,10 @@ def query_revenue_streams(db, period_days: int = 30) -> Dict:
 
     gross = result['api_revenue'] + result['ad_revenue']
     result['total_gross'] = gross
-    result['platform_share'] = gross * 0.10  # Platform's 10%
+    result['user_pool_share'] = gross * REVENUE_SPLIT_USERS
+    result['infra_pool_share'] = gross * REVENUE_SPLIT_INFRA
+    result['central_share'] = gross * REVENUE_SPLIT_CENTRAL
+    result['platform_share'] = gross * (REVENUE_SPLIT_INFRA + REVENUE_SPLIT_CENTRAL)  # backward compat
     return result
 
 
@@ -170,7 +183,7 @@ class RevenueAggregator:
     def distribute_trading_profits(db, portfolio_id: str) -> Dict:
         """Record profit distribution from a paper portfolio.
 
-        Paper profits are tracked only. Live profits follow 90/10 split.
+        Paper profits are tracked only. Live profits follow 90/9/1 split.
         """
         try:
             from integrations.social.models import PaperPortfolio
@@ -236,3 +249,66 @@ def get_revenue_aggregator() -> RevenueAggregator:
     if _revenue_aggregator is None:
         _revenue_aggregator = RevenueAggregator()
     return _revenue_aggregator
+
+
+# ─── Metered API Cost Settlement ───────────────────────────────────────
+
+SPARK_PER_USD = int(os.environ.get('HEVOLVE_SPARK_PER_USD', '100'))
+
+
+def settle_metered_api_costs(db, period_hours: int = 24) -> Dict:
+    """Auto-settle pending MeteredAPIUsage records where task_source != 'own'.
+
+    For each pending record:
+      1. Look up operator_id (the user whose API was consumed)
+      2. Convert actual_usd_cost to Spark: spark = max(1, int(usd * SPARK_PER_USD))
+      3. award_spark(db, operator_id, spark, 'api_cost_recovery', usage.id, desc)
+      4. Mark settlement_status = 'settled'
+
+    Returns: {settled_count, total_spark_awarded, total_usd_settled}
+    """
+    from sqlalchemy import and_
+    from integrations.social.models import MeteredAPIUsage
+    from integrations.social.resonance_engine import ResonanceService
+
+    cutoff = datetime.utcnow() - timedelta(hours=period_hours)
+    pending = db.query(MeteredAPIUsage).filter(
+        and_(
+            MeteredAPIUsage.settlement_status == 'pending',
+            MeteredAPIUsage.task_source != 'own',
+            MeteredAPIUsage.created_at >= cutoff,
+        )
+    ).all()
+
+    settled_count = 0
+    total_spark = 0
+    total_usd = 0.0
+
+    for usage in pending:
+        if not usage.operator_id:
+            usage.settlement_status = 'written_off'
+            continue
+
+        spark_amount = max(1, int(usage.actual_usd_cost * SPARK_PER_USD))
+        try:
+            ResonanceService.award_spark(
+                db, usage.operator_id, spark_amount,
+                'api_cost_recovery', usage.id,
+                f'API cost recovery: {usage.model_id} ({usage.task_source})')
+            usage.settlement_status = 'settled'
+            settled_count += 1
+            total_spark += spark_amount
+            total_usd += usage.actual_usd_cost
+        except Exception as e:
+            logger.debug(f"Settlement failed for usage {usage.id}: {e}")
+
+    if settled_count > 0:
+        db.flush()
+        logger.info(f"Metered API settlement: {settled_count} records, "
+                     f"{total_spark} Spark, ${total_usd:.2f} USD")
+
+    return {
+        'settled_count': settled_count,
+        'total_spark_awarded': total_spark,
+        'total_usd_settled': round(total_usd, 4),
+    }

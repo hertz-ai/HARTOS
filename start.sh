@@ -1,4 +1,4 @@
-#!bin/bash
+#!/bin/bash
 # pip install --upgrade pip
 # docker build -t langchain_gpt:v1 .
 # docker kill langchain

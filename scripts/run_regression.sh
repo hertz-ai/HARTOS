@@ -1,14 +1,17 @@
 #!/bin/bash
 # ============================================================
-# HevolveBot LangChain Agent - Full Regression Test Runner
+# HART OS - Full Regression Test Runner
 # ============================================================
 # Runs ALL unit and regression tests across the entire codebase.
 # Covers: core, security, channels, social, performance, and
 # integration tests (excluding tests that require live services).
+#
+# CI Mode: CI=true bash scripts/run_regression.sh
+#   Skips interactive menu, runs ALL groups, outputs JUnit XML.
 # ============================================================
 
 echo "========================================"
-echo " HevolveBot Full Regression Suite"
+echo " HART OS Full Regression Suite"
 echo "========================================"
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,13 +24,21 @@ elif [ -f "venv310/Scripts/python.exe" ]; then
     PYTHON_EXE="./venv310/Scripts/python.exe"
 elif command -v python3.10 &> /dev/null; then
     PYTHON_EXE="python3.10"
+elif command -v python &> /dev/null; then
+    PYTHON_EXE="python"
 else
-    echo "ERROR: Python 3.10 not found"
+    echo "ERROR: Python not found"
     exit 1
 fi
 
 echo "Using: $PYTHON_EXE"
 echo ""
+
+# ===== OUTPUT DIRECTORIES =====
+REPORT_DIR="test-reports"
+JUNIT_DIR="$REPORT_DIR/junit"
+LOGS_DIR="$REPORT_DIR/logs"
+mkdir -p "$JUNIT_DIR" "$LOGS_DIR"
 
 # ===== DEFINE TEST GROUPS =====
 
@@ -64,15 +75,75 @@ CONCURRENCY_TESTS="tests/unit/test_concurrency.py"
 # Group 11: Channel e2e regression
 CHANNEL_E2E_TESTS="tests/integration/test_channels_e2e_regression.py tests/integration/test_channels_admin_dashboard.py tests/integration/test_channels_gateway_protocol.py tests/integration/test_channels_metrics_collector.py"
 
+# Group 12: WS workstream tests (metered API, compute, budget, revenue)
+WS_TESTS="tests/unit/test_budget_gate.py tests/unit/test_boot_hardening.py tests/unit/test_revenue_pipeline.py tests/unit/test_compute_config.py tests/unit/test_model_routing.py tests/unit/test_metered_recovery.py tests/unit/test_settings_api.py tests/unit/test_ad_hosting_rewards.py"
+
+# Group 13: Security + Build verification
+SECURITY_TESTS="tests/unit/test_integrity_system.py tests/unit/test_federation_upgrade.py tests/unit/test_build_verification.py tests/unit/test_immutable_audit_log.py tests/unit/test_tool_allowlist.py tests/unit/test_goal_rate_limit.py tests/unit/test_action_classifier.py tests/unit/test_dlp_engine.py"
+
+# ===== CI MODE =====
+if [ "${CI:-}" = "true" ] || [ "${CI:-}" = "1" ] || [ "$1" = "--ci" ]; then
+    echo "CI MODE: Running ALL test groups"
+    echo "========================================"
+    TOTAL_PASS=0
+    TOTAL_FAIL=0
+    TOTAL_ERROR=0
+    EXIT_CODE=0
+
+    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    LOG_FILE="$LOGS_DIR/regression_ci_${TIMESTAMP}.log"
+
+    run_group() {
+        local group_name="$1"
+        shift
+        echo ""
+        echo "--- $group_name ---"
+        $PYTHON_EXE -m pytest $@ \
+            --noconftest --tb=short --color=no -q \
+            --junitxml="$JUNIT_DIR/${group_name// /_}_${TIMESTAMP}.xml" 2>&1 | tee -a "$LOG_FILE"
+        local rc=${PIPESTATUS[0]}
+        if [ $rc -ne 0 ]; then
+            EXIT_CODE=1
+        fi
+        return $rc
+    }
+
+    # Run all groups
+    run_group "WS_workstream" $WS_TESTS
+    run_group "Security" $SECURITY_TESTS
+    run_group "Core" $CORE_TESTS
+    run_group "State" $STATE_TESTS
+    run_group "Social" $SOCIAL_TESTS
+    run_group "Channel_infra" $CHANNEL_INFRA_TESTS
+    run_group "Channel_adapters" $CHANNEL_ADAPTER_TESTS
+    run_group "Session" $SESSION_TESTS
+    run_group "Agent" $AGENT_TESTS
+    run_group "Tools" $TOOL_TESTS
+    run_group "AI" $AI_TESTS
+    run_group "Concurrency" $CONCURRENCY_TESTS
+    run_group "Channel_e2e" $CHANNEL_E2E_TESTS
+
+    echo ""
+    echo "========================================"
+    echo " CI Regression complete (exit code: $EXIT_CODE)"
+    echo " JUnit XML: $JUNIT_DIR/"
+    echo " Log: $LOG_FILE"
+    echo "========================================"
+    exit $EXIT_CODE
+fi
+
+# ===== INTERACTIVE MODE =====
 echo "Select regression scope:"
 echo "  1. FULL regression (all test groups)"
 echo "  2. Core + Security only (fast)"
 echo "  3. Channels only"
 echo "  4. Agent + Recipe only"
 echo "  5. Quick smoke test (core + state + social)"
+echo "  6. WS workstream tests (metered API, compute, revenue)"
+echo "  7. Security hardening tests"
 echo ""
 
-read -p "Enter choice (1-5): " choice
+read -p "Enter choice (1-7): " choice
 
 case $choice in
     1)
@@ -91,6 +162,8 @@ case $choice in
             $AI_TESTS \
             $CONCURRENCY_TESTS \
             $CHANNEL_E2E_TESTS \
+            $WS_TESTS \
+            $SECURITY_TESTS \
             -v --tb=short --color=yes -q
         ;;
     2)
@@ -132,6 +205,22 @@ case $choice in
             $STATE_TESTS \
             $SOCIAL_TESTS \
             -v --tb=short --color=yes -q
+        ;;
+    6)
+        echo ""
+        echo "Running WS workstream tests..."
+        echo "========================================"
+        $PYTHON_EXE -m pytest \
+            $WS_TESTS \
+            -v --noconftest --tb=short --color=yes
+        ;;
+    7)
+        echo ""
+        echo "Running Security hardening tests..."
+        echo "========================================"
+        $PYTHON_EXE -m pytest \
+            $SECURITY_TESTS \
+            -v --noconftest --tb=short --color=yes
         ;;
     *)
         echo "Invalid choice"

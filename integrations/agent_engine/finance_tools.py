@@ -1,7 +1,7 @@
 """
 Finance Agent Tools — AutoGen tools for self-sustaining business operations.
 
-Handles: revenue split tracking (90/10), expense monitoring, financial health,
+Handles: revenue split tracking (90/9/1), expense monitoring, financial health,
 invite-only participation agreements, compute cost accounting.
 
 The business must be self-sustaining. The finance agent gets through this in style.
@@ -56,8 +56,16 @@ def register_finance_tools(helper, assistant, user_id: str):
                 ).filter(APIUsageLog.created_at >= cutoff_7d).scalar() or 0)
 
                 # Revenue split
-                compute_provider_share = round(total_revenue * 0.9, 4)
-                platform_share = round(total_revenue * 0.1, 4)
+                try:
+                    from integrations.agent_engine.revenue_aggregator import (
+                        REVENUE_SPLIT_USERS, REVENUE_SPLIT_INFRA, REVENUE_SPLIT_CENTRAL,
+                    )
+                except ImportError:
+                    REVENUE_SPLIT_USERS, REVENUE_SPLIT_INFRA, REVENUE_SPLIT_CENTRAL = 0.90, 0.09, 0.01
+                compute_provider_share = round(total_revenue * REVENUE_SPLIT_USERS, 4)
+                infra_share = round(total_revenue * REVENUE_SPLIT_INFRA, 4)
+                central_share = round(total_revenue * REVENUE_SPLIT_CENTRAL, 4)
+                platform_share = round(infra_share + central_share, 4)
 
                 # Build license revenue (count active licenses)
                 try:
@@ -85,6 +93,8 @@ def register_finance_tools(helper, assistant, user_id: str):
                     },
                     'revenue_split': {
                         'compute_providers_90pct': compute_provider_share,
+                        'infra_pool_9pct': infra_share,
+                        'central_1pct': central_share,
                         'platform_sustainability_10pct': platform_share,
                         'split_compliant': True,
                     },
@@ -102,7 +112,7 @@ def register_finance_tools(helper, assistant, user_id: str):
     def track_revenue_split(
         period_days: Annotated[int, "Number of days to analyze (default 30)"] = 30,
     ) -> str:
-        """Track the 90/10 revenue split compliance over a period."""
+        """Track the 90/9/1 revenue split compliance over a period."""
         try:
             from integrations.social.models import get_db, APIUsageLog
             from integrations.agent_engine.revenue_aggregator import query_revenue_streams
@@ -114,8 +124,16 @@ def register_finance_tools(helper, assistant, user_id: str):
                 streams = query_revenue_streams(db, period_days)
                 period_revenue = streams['total_gross']
 
-                compute_share = round(period_revenue * 0.9, 4)
-                platform_share = round(period_revenue * 0.1, 4)
+                try:
+                    from integrations.agent_engine.revenue_aggregator import (
+                        REVENUE_SPLIT_USERS, REVENUE_SPLIT_INFRA, REVENUE_SPLIT_CENTRAL,
+                    )
+                except ImportError:
+                    REVENUE_SPLIT_USERS, REVENUE_SPLIT_INFRA, REVENUE_SPLIT_CENTRAL = 0.90, 0.09, 0.01
+                compute_share = round(period_revenue * REVENUE_SPLIT_USERS, 4)
+                infra_share = round(period_revenue * REVENUE_SPLIT_INFRA, 4)
+                central_share = round(period_revenue * REVENUE_SPLIT_CENTRAL, 4)
+                platform_share = round(infra_share + central_share, 4)
 
                 # Daily breakdown (unique to this tool — not in shared query)
                 cutoff = datetime.utcnow() - timedelta(days=period_days)
@@ -133,8 +151,10 @@ def register_finance_tools(helper, assistant, user_id: str):
                     'api_revenue': round(streams['api_revenue'], 4),
                     'ad_revenue': round(streams['ad_revenue'], 4),
                     'compute_providers_owed': compute_share,
+                    'infra_pool_owed': infra_share,
+                    'central_retained': central_share,
                     'platform_retained': platform_share,
-                    'split_ratio': '90/10',
+                    'split_ratio': '90/9/1',
                     'compliant': True,
                     'daily_breakdown': [
                         {'date': str(d), 'revenue': round(float(r or 0), 4), 'calls': c}
@@ -247,7 +267,7 @@ def register_finance_tools(helper, assistant, user_id: str):
          'Get platform financial health: revenue, costs, runway, split compliance',
          get_financial_health),
         ('track_revenue_split',
-         'Track the 90/10 revenue split compliance over a period',
+         'Track the 90/9/1 revenue split compliance over a period',
          track_revenue_split),
         ('assess_sustainability',
          'Assess whether the platform is financially self-sustaining',
