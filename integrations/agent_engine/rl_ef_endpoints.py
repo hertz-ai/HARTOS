@@ -5,7 +5,7 @@ Flask endpoints for expert corrections and learning statistics.
 Add these to your existing Flask application.
 
 Usage:
-    from rl_ef_endpoints import rl_ef_blueprint
+    from integrations.agent_engine.rl_ef_endpoints import rl_ef_blueprint
     app.register_blueprint(rl_ef_blueprint)
 """
 
@@ -221,7 +221,7 @@ def health_check():
 # In your main Flask app file (e.g., app.py):
 
 from flask import Flask
-from rl_ef_endpoints import rl_ef_blueprint
+from integrations.agent_engine.rl_ef_endpoints import rl_ef_blueprint
 
 app = Flask(__name__)
 
@@ -262,7 +262,7 @@ if __name__ == "__main__":
     print()
     print("Integration:")
     print()
-    print("  from rl_ef_endpoints import rl_ef_blueprint")
+    print("  from integrations.agent_engine.rl_ef_endpoints import rl_ef_blueprint")
     print("  app.register_blueprint(rl_ef_blueprint)")
     print()
     print("Then start your Flask app and test:")

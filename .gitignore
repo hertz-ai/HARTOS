@@ -42,6 +42,38 @@ site/
 hevolve_version.py
 hart_version.py
 
+# Root junk artifacts
+nul
+=*
+
+# Additional test outputs
+test_full.txt
+test_fed.xml
+test_rtm.xml
+regression_*.txt
+test_ledger_json/
+
+# Java/runtime logs
+hs_err_pid*.log
+
+# agent_data test artifacts
+agent_data/ledger_test_*.json
+agent_data/ledger_user_1_goal_*.json
+agent_data/ledger_user1_goal*.json
+agent_data/snapshot_snap_test_*.json
+agent_data/lightning_traces/
+agent_data/upgrade_state.json
+agent_data/code_hash_cache.json
+agent_data/.social_secret_key
+agent_data/admin_config.json
+agent_data/coding_benchmarks.db
+agent_data/hevolve_database.db
+
+# IDE / build
+.idea/
+.pycharm_plugin/
+venv310/
+
 /venv310/Include/site/python3.10/greenlet/greenlet.h
 /venv310/Lib/site-packages/_distutils_hack/__init__.py
 /venv310/Lib/site-packages/_distutils_hack/override.py
