@@ -1603,7 +1603,7 @@ class TestVLMAgentIntegrationBridge:
 
     def test_vlm_context_status_summary(self):
         """get_status_summary() returns correct shape."""
-        from vlm_agent_integration import VLMAgentContext
+        from integrations.vlm.vlm_agent_integration import VLMAgentContext
         ctx = VLMAgentContext(vlm_server_url='http://localhost:5001',
                              omniparser_url='http://localhost:8080')
         with patch.object(ctx, 'is_vlm_available', return_value=False):
@@ -1618,7 +1618,7 @@ class TestVLMAgentIntegrationBridge:
 
     def test_inject_visual_context_unavailable(self):
         """VLM unavailable → graceful degrade in task context."""
-        from vlm_agent_integration import VLMAgentContext
+        from integrations.vlm.vlm_agent_integration import VLMAgentContext
         ctx = VLMAgentContext()
         with patch.object(ctx, 'get_screen_context', return_value=None):
             result = ctx.inject_visual_context_into_ledger_task({
@@ -1626,8 +1626,8 @@ class TestVLMAgentIntegrationBridge:
         assert result['visual_context']['has_screen_info'] is False
         assert 'not available' in result['visual_context']['note']
 
-    @patch('vlm_agent_integration.requests.post')
-    @patch('vlm_agent_integration.requests.get')
+    @patch('integrations.vlm.vlm_agent_integration.requests.post')
+    @patch('integrations.vlm.vlm_agent_integration.requests.get')
     def test_execute_windows_command_steps(self, mock_get, mock_post):
         """4-step Win+R sequence dispatched correctly."""
         # VLM server available
@@ -1641,7 +1641,7 @@ class TestVLMAgentIntegrationBridge:
         mock_action.json.return_value = {'status': 'success', 'output': 'ok'}
         mock_post.return_value = mock_action
 
-        from vlm_agent_integration import VLMAgentContext
+        from integrations.vlm.vlm_agent_integration import VLMAgentContext
         ctx = VLMAgentContext()
         result = ctx.execute_windows_command('notepad')
         assert result['status'] == 'success'

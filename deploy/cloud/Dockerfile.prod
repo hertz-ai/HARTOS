@@ -63,11 +63,8 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 # Copy application code
 COPY langchain_gpt_api.py .
-COPY config.py .
 COPY config.json .
 COPY helper.py .
-COPY helper_func.py .
-COPY models.py .
 COPY threadlocal.py .
 
 # Copy core modules

@@ -20,10 +20,8 @@ class TestCoreModulesImportable(unittest.TestCase):
     CORE_MODULES = [
         'threadlocal',
         'helper',
-        'helper_func',
         'helper_ledger',
         'lifecycle_hooks',
-        'config',
     ]
 
     def test_all_core_modules_import(self):
