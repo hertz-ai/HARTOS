@@ -39,11 +39,12 @@ user_id = 0
 
 #api and keys
 
-os.environ["OPENAI_API_KEY"] = "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"
-os.environ["GOOGLE_CSE_ID"] = "9589161c491c4493e"
-os.environ["GOOGLE_API_KEY"] = "AIzaSyCTEiyRiS8mfZlUp3Lc1JwmmyK4sZI_8Lo"
-os.environ["NEWS_API_KEY"] = "291350f6b8fd4df982f343888a4cabd5"
-os.environ["SERPAPI_API_KEY"] = "15916f6b8a0a976ab7f92ed1c4e3bc9bb40c73b40404ad2bbf219c5091394cb0"
+# SECURITY: API keys must come from environment or .env file, never hardcoded
+# Set these in your .env file or shell environment before running:
+#   OPENAI_API_KEY, GOOGLE_CSE_ID, GOOGLE_API_KEY, NEWS_API_KEY, SERPAPI_API_KEY
+for _key in ("OPENAI_API_KEY", "GOOGLE_CSE_ID", "GOOGLE_API_KEY", "NEWS_API_KEY", "SERPAPI_API_KEY"):
+    if not os.environ.get(_key):
+        raise EnvironmentError(f"Required environment variable {_key} is not set")
 search = GoogleSearchAPIWrapper(k=4)
 ZEP_API_URL = "http://4.224.46.164:8000"
 

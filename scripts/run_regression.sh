@@ -64,7 +64,7 @@ SESSION_TESTS="tests/unit/test_session_manager.py tests/unit/test_message_queue.
 AGENT_TESTS="tests/unit/test_agent_creation.py tests/unit/test_recipe_generation.py tests/unit/test_reuse_mode.py tests/unit/test_action_execution.py tests/unit/test_scheduler_creation.py"
 
 # Group 8: VLM, coding, shell, file management
-TOOL_TESTS="tests/unit/test_vlm_agent.py tests/unit/test_coding_agent.py tests/unit/test_shell_execution.py tests/unit/test_file_manager.py tests/unit/test_file_tracker.py"
+TOOL_TESTS="tests/unit/test_vlm_agent.py tests/unit/test_coding_agent.py tests/unit/test_shell_execution.py tests/unit/test_file_manager.py tests/unit/test_file_tracker.py tests/unit/test_qwen3vl_computer_use.py"
 
 # Group 9: Embeddings, memory, image gen, TTS
 AI_TESTS="tests/unit/test_embeddings.py tests/unit/test_memory_search.py tests/unit/test_image_gen.py tests/unit/test_tts.py"

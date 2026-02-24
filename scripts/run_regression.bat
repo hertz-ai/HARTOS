@@ -134,7 +134,8 @@ set TOOLS_AI_TESTS=^
     tests/unit/test_memory_search.py ^
     tests/unit/test_image_gen.py ^
     tests/unit/test_tts.py ^
-    tests/unit/test_runtime_tools.py
+    tests/unit/test_runtime_tools.py ^
+    tests/unit/test_qwen3vl_computer_use.py
 
 REM Group 9: Core, Performance, and Concurrency (~150 tests)
 set CORE_PERF_TESTS=^

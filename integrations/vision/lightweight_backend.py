@@ -274,6 +274,74 @@ class CLIPBackend(VisionBackend):
             return None
 
 
+class Qwen3VLVisionBackend(VisionBackend):
+    """Qwen3-VL as vision description backend — replaces MiniCPM.
+
+    Uses the same Qwen3-VL server already running for Computer Use,
+    so no additional process or VRAM is needed.
+    """
+
+    def __init__(self):
+        self._backend = None
+
+    @property
+    def name(self) -> str:
+        return 'qwen3vl'
+
+    @property
+    def requires_gpu(self) -> bool:
+        return True
+
+    @property
+    def ram_mb(self) -> int:
+        return 4000
+
+    def is_available(self) -> bool:
+        base_url = os.environ.get(
+            'HEVOLVE_VLM_ENDPOINT_URL',
+            os.environ.get('HEVOLVE_LLM_ENDPOINT_URL', '')
+        )
+        if not base_url:
+            return False
+        try:
+            resp = requests.get(
+                f'{base_url.rstrip("/")}/models', timeout=3
+            )
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    def start(self) -> bool:
+        try:
+            from integrations.vlm.qwen3vl_backend import get_qwen3vl_backend
+            self._backend = get_qwen3vl_backend()
+            logger.info("Qwen3-VL vision backend initialized")
+            return True
+        except Exception as e:
+            logger.error(f"Qwen3-VL vision backend start failed: {e}")
+            return False
+
+    def stop(self):
+        self._backend = None
+
+    def describe(self, frame_bytes: bytes, prompt: str = '') -> Optional[str]:
+        if self._backend is None:
+            try:
+                from integrations.vlm.qwen3vl_backend import get_qwen3vl_backend
+                self._backend = get_qwen3vl_backend()
+            except Exception:
+                return None
+        try:
+            import base64
+            b64 = base64.b64encode(frame_bytes).decode('utf-8')
+            return self._backend.describe_scene(
+                b64, prompt or 'Describe what you see in this image.'
+            )
+        except Exception as e:
+            logger.debug(f"Qwen3-VL describe error: {e}")
+            return None
+
+
 class NoneBackend(VisionBackend):
     """No-op backend — FrameStore only, zero overhead."""
 
@@ -299,6 +367,7 @@ class NoneBackend(VisionBackend):
 # ─── Backend Registry ───
 
 _BACKENDS = {
+    'qwen3vl': Qwen3VLVisionBackend,
     'minicpm': MiniCPMBackend,
     'mobilevlm': MobileVLMBackend,
     'clip': CLIPBackend,
@@ -323,7 +392,11 @@ def get_vision_backend(name: str = '') -> VisionBackend:
         cls = _BACKENDS.get(backend_name, NoneBackend)
         return cls()
 
-    # Auto-detect
+    # Auto-detect — prefer Qwen3-VL if its server is already running
+    qwen3vl = Qwen3VLVisionBackend()
+    if qwen3vl.is_available():
+        return qwen3vl
+
     try:
         from security.system_requirements import get_capabilities
         caps = get_capabilities()
