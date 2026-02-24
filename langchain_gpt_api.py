@@ -62,6 +62,9 @@ import threading
 import atexit
 import requests
 import pytz
+import hashlib
+from security.node_integrity import compute_code_hash, compute_file_manifest, verify_json_signature
+from security import master_key
 from core.http_pool import pooled_get, pooled_post
 from datetime import datetime, timezone
 from typing import List, Union, Optional, Mapping, Any, Dict
@@ -178,6 +181,49 @@ groq_api_key = os.environ.get('GROQ_API_KEY', '')
 # ============================================================================
 _memory_graphs = {}  # Cache: "user_id_prompt_id" → MemoryGraph instance
 _memory_graph_lock = threading.Lock()
+
+def hevolve_verify_boot():
+    mode = (os.getenv("HEVOLVE_ENFORCEMENT_MODE") or "warn").lower()
+    tier = (os.getenv("HEVOLVE_NODE_TIER") or "unknown").lower()
+
+    manifest_path = master_key.RELEASE_MANIFEST_FILENAME
+
+    if not os.path.exists(manifest_path):
+        msg = f"[HevolveIntegrity] release_manifest.json missing (tier={tier}, mode={mode})"
+        if mode == "hard":
+            raise RuntimeError(msg)
+        logger.warning(msg)
+        return
+
+    d = json.load(open(manifest_path))
+    # Verify signature
+    pub_hex = d.get("master_public_key")
+    sig_hex = d.get("master_signature")
+    payload_obj = {k: d[k] for k in d.keys() if k != "master_signature"}
+    payload_json = json.dumps(payload_obj, sort_keys=True, separators=(",", ":"))
+    verify_json_signature(pub_hex, payload_json, sig_hex)
+
+    # Verify code hash
+    current_code_hash = compute_code_hash()
+    if d.get("code_hash") != current_code_hash:
+        msg = f"[HevolveIntegrity] CODE_HASH mismatch"
+        if mode == "hard":
+            raise RuntimeError(msg)
+        logger.warning(msg)
+    fm = compute_file_manifest()
+    current_fm_hash = hashlib.sha256(
+        json.dumps(fm, sort_keys=True).encode()
+    ).hexdigest()
+
+    if d.get("file_manifest_hash") != current_fm_hash:
+        msg = f"[HevolveIntegrity] FILE_MANIFEST_HASH mismatch"
+        if mode == "hard":
+            raise RuntimeError(msg)
+        logger.warning(msg)
+
+    logger.info(f"[HevolveIntegrity] Boot verification OK (tier={tier}, mode={mode})")
+
+hevolve_verify_boot()
 
 
 def _get_or_create_graph(user_id, prompt_id=None):
