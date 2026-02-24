@@ -165,17 +165,13 @@ setup(
         "hart_version",
         "langchain_gpt_api",
         "helper",
-        "helper_func",
         "helper_ledger",
-        "models",
-        "config",
         "threadlocal",
         "crossbar_server",
         "create_recipe",
         "reuse_recipe",
         "gather_agentdetails",
         "lifecycle_hooks",
-        "tools_and_prompt",
     ],
 
     # Include non-Python files
