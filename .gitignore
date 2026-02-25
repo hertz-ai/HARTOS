@@ -88,6 +88,7 @@ venv310/
 .agent_ledger/
 .pytest_cache/
 .secrets.baseline
+.cache/
 
 # Vendored / one-off directories that should not be committed
 autogen-*/
@@ -95,4 +96,3 @@ framework/
 media/
 pycharm-plugin/
 hevolvebot-admin-dashboard/
-ltx2_requirements.txt

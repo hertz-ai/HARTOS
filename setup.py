@@ -172,6 +172,10 @@ setup(
         "reuse_recipe",
         "gather_agentdetails",
         "lifecycle_hooks",
+        "cultural_wisdom",
+        "exception_collector",
+        "recipe_experience",
+        "embedded_main",
     ],
 
     # Include non-Python files
