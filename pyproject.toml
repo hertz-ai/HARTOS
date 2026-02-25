@@ -185,6 +185,10 @@ py-modules = [
     "reuse_recipe",
     "gather_agentdetails",
     "lifecycle_hooks",
+    "cultural_wisdom",
+    "exception_collector",
+    "recipe_experience",
+    "embedded_main",
 ]
 
 [tool.setuptools.packages.find]

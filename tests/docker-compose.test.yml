@@ -22,7 +22,7 @@ services:
   mock-crossbar:
     build:
       context: .
-      dockerfile: Dockerfile.mock-crossbar
+      dockerfile: tests/Dockerfile.mock-crossbar
     ports:
       - "8088:8088"
     healthcheck:
@@ -37,7 +37,7 @@ services:
   mock-apis:
     build:
       context: .
-      dockerfile: Dockerfile.mock-apis
+      dockerfile: tests/Dockerfile.mock-apis
     ports:
       - "9890:9890"  # autogen_response endpoint
       - "5459:5459"  # txt2img endpoint

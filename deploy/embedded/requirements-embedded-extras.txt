@@ -1,0 +1,18 @@
+# HART Embedded Tier — Optional extras for hardware I/O
+# Install only the packages your device needs.
+#
+# Serial (USB-to-serial, UART):
+pyserial>=3.5
+#
+# WAMP IoT (uses existing Crossbar router — autobahn already in requirements.txt):
+# autobahn is already a core dependency, no extra install needed.
+#
+# GPIO (Raspberry Pi, embedded Linux boards):
+#   gpiod — modern Linux GPIO (preferred)
+#   RPi.GPIO — legacy Raspberry Pi GPIO
+# Uncomment the one that matches your hardware:
+# gpiod>=2.0
+# RPi.GPIO>=0.7.0
+#
+# msgpack (compact gossip payloads for bandwidth-constrained links):
+# msgpack>=1.0.0
