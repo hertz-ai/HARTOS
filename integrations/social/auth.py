@@ -207,7 +207,8 @@ def require_auth(f):
             db.commit()
             return result
         except Exception as e:
-            db.rollback()
+            if db.is_active:
+                db.rollback()
             raise
         finally:
             db.close()

@@ -492,7 +492,7 @@ class TestCompileScript:
         # but we can at least verify it parses
         import ast
         script_path = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)),
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
             'scripts', 'compile_hevolveai.py',
         )
         with open(script_path, 'r') as f:
@@ -504,7 +504,7 @@ class TestCompileScript:
     def test_manifest_placeholder_exists(self):
         """Verify the manifest placeholder file exists."""
         manifest_path = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)),
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
             'security', 'hevolveai_manifest.json',
         )
         assert os.path.exists(manifest_path)

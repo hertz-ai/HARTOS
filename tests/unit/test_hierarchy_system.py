@@ -905,7 +905,11 @@ class TestTierAwareGossip:
             },
         }
         with patch('security.key_delegation.verify_certificate_chain', return_value={'valid': True}), \
-             patch('security.master_key.get_enforcement_mode', return_value='hard'):
+             patch('security.master_key.get_enforcement_mode', return_value='hard'), \
+             patch('security.node_integrity.verify_json_signature', return_value=True):
+            # Provide signature+public_key so the enforcement gate sees a verified peer
+            peer_data['signature'] = 'test_sig'
+            peer_data['public_key'] = 'test_pk'
             is_new = g._merge_peer(db, peer_data)
         assert is_new is True
         stored = db.query(PeerNode).filter_by(node_id=peer_data['node_id']).first()

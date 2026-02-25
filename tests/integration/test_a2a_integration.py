@@ -12,6 +12,8 @@ No external servers required - all tests are unit tests
 """
 
 import json
+import pytest
+pytest.importorskip('a2a_protocol', reason='a2a_protocol module not available')
 from a2a_protocol import (
     AgentSkill, AgentSkillRegistry, A2AMessage, A2AContextExchange,
     skill_registry, a2a_context, register_agent_with_skills,

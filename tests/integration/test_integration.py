@@ -11,6 +11,8 @@ from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
+pytest.importorskip('autogen', reason='autogen not installed')
+
 
 class TestEndToEndCreationFlow:
     """Test complete creation mode flow"""

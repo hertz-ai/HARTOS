@@ -156,10 +156,11 @@ class TestCLIPBackend:
 class TestBackendRegistry:
     """Verify backend registry."""
 
-    def test_four_backends_registered(self):
-        assert len(_BACKENDS) == 4
+    def test_backends_registered(self):
+        assert len(_BACKENDS) == 5
 
     def test_all_names_present(self):
+        assert 'qwen3vl' in _BACKENDS
         assert 'minicpm' in _BACKENDS
         assert 'mobilevlm' in _BACKENDS
         assert 'clip' in _BACKENDS
@@ -167,7 +168,7 @@ class TestBackendRegistry:
 
     def test_list_available_backends(self):
         results = list_available_backends()
-        assert len(results) == 4
+        assert len(results) == 5
         names = [r['name'] for r in results]
         assert 'none' in names
         # NoneBackend is always available

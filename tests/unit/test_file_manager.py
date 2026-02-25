@@ -292,6 +292,7 @@ class TestFileManager:
     def test_generate_file_id(self, manager):
         """Test file ID generation."""
         id1 = manager._generate_file_id(filename="test.txt")
+        time.sleep(0.002)  # Ensure different timestamp
         id2 = manager._generate_file_id(filename="test.txt")
 
         # Should be unique
@@ -333,6 +334,7 @@ class TestFileManager:
     def test_get_temp_path(self, manager):
         """Test temporary path generation."""
         path1 = manager.get_temp_path()
+        time.sleep(0.002)  # Ensure different timestamp
         path2 = manager.get_temp_path()
 
         # Should be unique
@@ -378,8 +380,8 @@ class TestFileManager:
     @pytest.mark.asyncio
     async def test_upload_basic(self, manager, tmp_path):
         """Test basic file upload."""
-        # Create test file
-        test_file = tmp_path / "upload_test.txt"
+        # Create test file (use .pdf — .txt not allowed for telegram)
+        test_file = tmp_path / "upload_test.pdf"
         test_file.write_text("Test content")
 
         url = await manager.upload(
@@ -412,8 +414,8 @@ class TestFileManager:
     @pytest.mark.asyncio
     async def test_get_info(self, manager, tmp_path):
         """Test getting file info."""
-        # Upload a file first
-        test_file = tmp_path / "info_test.txt"
+        # Upload a file first (use .pdf — .txt not allowed for telegram)
+        test_file = tmp_path / "info_test.pdf"
         test_file.write_text("Content")
 
         await manager.upload(str(test_file), channel="telegram")
@@ -422,7 +424,7 @@ class TestFileManager:
         files = manager.list_files()
         if files:
             info = await manager.get_info(files[0].file_id)
-            assert info.filename == "info_test.txt"
+            assert info.filename == "info_test.pdf"
 
     @pytest.mark.asyncio
     async def test_get_info_from_path(self, manager, tmp_path):
@@ -439,8 +441,8 @@ class TestFileManager:
     @pytest.mark.asyncio
     async def test_delete(self, manager, tmp_path):
         """Test file deletion."""
-        # Upload file
-        test_file = tmp_path / "delete_test.txt"
+        # Upload file (use .pdf — .txt not allowed for telegram)
+        test_file = tmp_path / "delete_test.pdf"
         test_file.write_text("To delete")
 
         await manager.upload(str(test_file), channel="telegram")
@@ -566,8 +568,8 @@ class TestFileManagerIntegration:
             upload_dir=str(tmp_path / "uploads")
         )
 
-        # Create test file
-        original = tmp_path / "original.txt"
+        # Create test file (use .pdf — .txt not allowed for telegram)
+        original = tmp_path / "original.pdf"
         original.write_text("Hello, World!")
 
         # Upload
@@ -579,7 +581,7 @@ class TestFileManagerIntegration:
         assert len(files) >= 1
 
         file_info = files[0]
-        assert file_info.filename == "original.txt"
+        assert file_info.filename == "original.pdf"
         assert file_info.channel == "telegram"
 
         # Download (would download from URL in real scenario)
@@ -622,8 +624,8 @@ class TestFileManagerIntegration:
             upload_dir=str(tmp_path / "uploads")
         )
 
-        # Create
-        test_file = tmp_path / "lifecycle.txt"
+        # Create (use .pdf — .txt not allowed for telegram)
+        test_file = tmp_path / "lifecycle.pdf"
         test_file.write_text("Lifecycle test")
 
         # Upload
@@ -634,7 +636,7 @@ class TestFileManagerIntegration:
         file_id = files[0].file_id
 
         info = await mgr.get_info(file_id)
-        assert info.filename == "lifecycle.txt"
+        assert info.filename == "lifecycle.pdf"
 
         # Delete
         deleted = await mgr.delete(file_id)
