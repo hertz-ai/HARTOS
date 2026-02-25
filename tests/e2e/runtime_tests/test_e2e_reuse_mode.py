@@ -8,6 +8,8 @@ import requests
 import time
 import json
 import os
+
+pytest.importorskip('conftest_runtime', reason='Runtime tests require live server (conftest_runtime)')
 from conftest_runtime import APP_URL, MOCK_API_URL
 
 @pytest.mark.runtime

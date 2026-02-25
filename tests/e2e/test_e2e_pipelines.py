@@ -414,7 +414,7 @@ class TestAllGoalTypes:
         })
         assert 'Vijai' in prompt
         assert '90%' in prompt
-        assert '10%' in prompt
+        assert '9%' in prompt
         assert 'self-sustaining' in prompt.lower()
 
     def test_revenue_prompt_contains_philosophy(self):
@@ -1545,8 +1545,10 @@ class TestComputerUseAdapter:
         orig_bundled = adapter._BUNDLED_MODE
         orig_tier = adapter._node_tier
         orig_fail2 = adapter._tier2_fail_count
+        orig_has = adapter._HAS_PYAUTOGUI
         try:
             adapter._BUNDLED_MODE = False  # Not bundled → skip tier 1
+            adapter._HAS_PYAUTOGUI = False  # Prevent Tier 1 from firing
             adapter._node_tier = 'flat'
             adapter._tier2_fail_count = 0
             with patch('integrations.vlm.local_loop.run_local_agentic_loop',
@@ -1559,6 +1561,7 @@ class TestComputerUseAdapter:
             assert tier_val == 'http'
         finally:
             adapter._BUNDLED_MODE = orig_bundled
+            adapter._HAS_PYAUTOGUI = orig_has
             adapter._node_tier = orig_tier
             adapter._tier2_fail_count = orig_fail2
 

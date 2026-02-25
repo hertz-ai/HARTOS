@@ -11,6 +11,8 @@ import json
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
+pytest.importorskip('autogen', reason='autogen not installed')
+
 from create_recipe import scheduler, time_based_execution, visual_execution
 from reuse_recipe import create_schedule, time_based_execution as reuse_time_based_execution
 

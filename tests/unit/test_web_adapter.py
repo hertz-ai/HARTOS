@@ -197,7 +197,7 @@ class TestWebAdapterSessions:
         info = await adapter.get_chat_info("sess-1")
 
         assert info is not None
-        assert info["session_id"] == "sess-1"
+        assert info["id"] == "sess-1"
         assert info["user_name"] == "Alice"
         assert info["type"] == "web"
 

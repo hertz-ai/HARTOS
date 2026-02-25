@@ -347,6 +347,7 @@ class TestDockerDistributedDispatch:
 
     def test_worker_detects_capabilities_from_tier(self):
         """Worker loop detects capabilities based on system tier."""
+        pytest.importorskip('agent_ledger', reason='agent_ledger not installed')
         from integrations.distributed_agent.worker_loop import DistributedWorkerLoop
 
         wl = DistributedWorkerLoop()
@@ -462,6 +463,7 @@ class TestNoCoordinatorLocalFallback:
 
     def test_worker_loop_disabled_without_coordinator(self):
         """Worker loop does not start when no coordinator is reachable."""
+        pytest.importorskip('agent_ledger', reason='agent_ledger not installed')
         from integrations.distributed_agent.worker_loop import DistributedWorkerLoop
 
         with patch('integrations.distributed_agent.api._get_coordinator',

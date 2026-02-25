@@ -45,7 +45,10 @@ from lifecycle_hooks import (
     action_states, flow_lifecycle,
     initialize_deterministic_actions
 )
-from helper import Action
+try:
+    from helper import Action
+except ImportError:
+    Action = None  # autogen not installed — tests needing Action will skip
 
 
 def pytest_configure(config):

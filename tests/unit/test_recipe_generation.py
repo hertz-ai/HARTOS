@@ -14,6 +14,8 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
+pytest.importorskip('autogen', reason='autogen not installed')
+
 from helper import topological_sort, fix_json
 from lifecycle_hooks import lifecycle_hook_track_recipe_request, lifecycle_hook_track_recipe_completion
 

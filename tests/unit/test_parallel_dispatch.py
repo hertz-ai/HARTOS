@@ -20,6 +20,8 @@ from unittest.mock import patch, MagicMock
 # Ensure project root on path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+pytest.importorskip('agent_ledger', reason='agent_ledger not installed')
+
 from agent_ledger import SmartLedger, Task, TaskType, TaskStatus
 from agent_ledger.core import ExecutionMode
 from agent_ledger.backends import InMemoryBackend

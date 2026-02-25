@@ -15,6 +15,8 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
+pytest.importorskip('autogen', reason='autogen not installed')
+
 from helper import Action, retrieve_json
 from lifecycle_hooks import (
     ActionState,

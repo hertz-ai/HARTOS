@@ -25,6 +25,9 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+import pytest
+pytest.importorskip('agent_ledger', reason='agent_ledger not installed')
+
 from agent_ledger import SmartLedger, Task, TaskType, TaskStatus
 
 def print_test_header(test_num: int, test_name: str):

@@ -399,14 +399,17 @@ class TestGossipMasterKeyVerification:
             'url': 'http://peer1:6777',
             'name': 'test-peer',
             'code_hash': real_hash,
+            'signature': 'test_sig',
+            'public_key': 'test_pk',
         }
 
         with patch('security.master_key.load_release_manifest', return_value=manifest):
             with patch('security.master_key.get_enforcement_mode', return_value='hard'):
                 with patch('security.master_key.MASTER_PUBLIC_KEY_HEX',
                           master_keypair['public_hex']):
-                    is_new = g._merge_peer(db, peer_data)
-                    assert is_new is True
+                    with patch('security.node_integrity.verify_json_signature', return_value=True):
+                        is_new = g._merge_peer(db, peer_data)
+                        assert is_new is True
 
     def test_peer_rejected_mismatched_hash_hard(self, db, master_keypair):
         """Peers with mismatched code hash should be rejected in hard mode."""

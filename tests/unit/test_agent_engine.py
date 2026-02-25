@@ -429,16 +429,20 @@ class TestAgentDaemon:
         ]
 
         daemon = AgentDaemon()
-        with patch('integrations.social.models.get_db', return_value=db):
-            with patch('integrations.agent_engine.dispatch.requests.post') as mock_post:
-                with patch('security.secret_redactor._model_detect_pii',
-                           side_effect=lambda t: t):
-                    mock_post.return_value = MagicMock(
-                        status_code=200, json=lambda: {'response': 'ok'})
-                    daemon._tick()
-                    mock_post.assert_called_once()
-                    call_json = mock_post.call_args[1]['json']
-                    assert call_json['autonomous'] is True
+        with patch('integrations.social.models.get_db', return_value=db), \
+             patch('integrations.agent_engine.dispatch.requests.post') as mock_post, \
+             patch('security.secret_redactor._model_detect_pii',
+                   side_effect=lambda t: t), \
+             patch('integrations.agent_engine.budget_gate.pre_dispatch_budget_gate',
+                   return_value=(True, 'OK')), \
+             patch('security.hive_guardrails.GuardrailEnforcer.before_dispatch',
+                   side_effect=lambda prompt, *args: (True, '', prompt)):
+            mock_post.return_value = MagicMock(
+                status_code=200, json=lambda: {'response': 'ok'})
+            daemon._tick()
+            mock_post.assert_called_once()
+            call_json = mock_post.call_args[1]['json']
+            assert call_json['autonomous'] is True
 
     @patch('integrations.coding_agent.idle_detection.IdleDetectionService.get_idle_opted_in_agents')
     def test_daemon_tick_no_goals(self, mock_idle, db):
@@ -1857,6 +1861,7 @@ class TestModelConfigOverride:
         assert tld.get_model_config_override() is None
 
     def test_get_llm_config_uses_override(self):
+        pytest.importorskip('autogen', reason='autogen not installed')
         from threadlocal import thread_local_data
         override = [{'model': 'override-model', 'api_key': 'test'}]
         thread_local_data.set_model_config_override(override)
@@ -1866,6 +1871,7 @@ class TestModelConfigOverride:
         thread_local_data.clear_model_config_override()
 
     def test_get_llm_config_falls_back_to_global(self):
+        pytest.importorskip('autogen', reason='autogen not installed')
         from threadlocal import thread_local_data
         thread_local_data.clear_model_config_override()
         from create_recipe import get_llm_config
@@ -3090,9 +3096,11 @@ class TestVLMAdapter:
         orig_bundled = vlm_adapter._BUNDLED_MODE
         orig_tier = vlm_adapter._node_tier
         orig_t2 = vlm_adapter._tier2_fail_count
+        orig_has = vlm_adapter._HAS_PYAUTOGUI
 
         try:
             vlm_adapter._BUNDLED_MODE = False
+            vlm_adapter._HAS_PYAUTOGUI = False  # Prevent Tier 1 from firing
             vlm_adapter._node_tier = 'flat'
             vlm_adapter._tier2_fail_count = 0
 
@@ -3114,6 +3122,7 @@ class TestVLMAdapter:
                 assert tier_val == 'http'
         finally:
             vlm_adapter._BUNDLED_MODE = orig_bundled
+            vlm_adapter._HAS_PYAUTOGUI = orig_has
             vlm_adapter._node_tier = orig_tier
             vlm_adapter._tier2_fail_count = orig_t2
 
@@ -3122,9 +3131,11 @@ class TestVLMAdapter:
         from integrations.vlm import vlm_adapter
         orig_bundled = vlm_adapter._BUNDLED_MODE
         orig_tier = vlm_adapter._node_tier
+        orig_has = vlm_adapter._HAS_PYAUTOGUI
 
         try:
             vlm_adapter._BUNDLED_MODE = False
+            vlm_adapter._HAS_PYAUTOGUI = False  # Prevent Tier 1 from firing
             vlm_adapter._node_tier = 'central'
             vlm_adapter._tier2_fail_count = 0
 
@@ -3132,6 +3143,7 @@ class TestVLMAdapter:
             assert result is None  # Signals caller to use subscribe_and_return
         finally:
             vlm_adapter._BUNDLED_MODE = orig_bundled
+            vlm_adapter._HAS_PYAUTOGUI = orig_has
             vlm_adapter._node_tier = orig_tier
 
     def test_circuit_breaker_tier1(self):
