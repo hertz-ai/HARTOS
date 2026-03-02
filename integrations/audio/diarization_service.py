@@ -26,8 +26,9 @@ class DiarizationService:
     and provides lifecycle management (start/stop/health/status).
     """
 
-    def __init__(self, port: int = 8004):
-        self._port = int(os.environ.get('HEVOLVE_DIARIZATION_PORT', port))
+    def __init__(self, port: int = None):
+        from core.port_registry import get_port
+        self._port = int(os.environ.get('HEVOLVE_DIARIZATION_PORT', port or get_port('diarization')))
         self._process: Optional[subprocess.Popen] = None
         self._running = False
         self._ready = False

@@ -453,6 +453,300 @@ class LiquidUIService:
         )
         _CSS_NO_ANIMATIONS = '/* animations disabled for performance */ .panel{animation:none}'
 
+        # ── HART Design System (Material Design 3 inspired) ──
+        _CSS_DESIGN_SYSTEM = '''
+/* ═══ HART Design System ═══ */
+/* Content-first · Purposeful motion · 4dp grid */
+
+:root {
+  /* Typography tokens */
+  --ds-font-body: "Inter", -apple-system, "Segoe UI", Roboto, sans-serif;
+  --ds-font-mono: "JetBrains Mono", "Fira Code", monospace;
+
+  /* Spacing scale (4dp grid) */
+  --ds-space-0:0px; --ds-space-px:1px;
+  --ds-space-1:4px; --ds-space-2:8px; --ds-space-3:12px; --ds-space-4:16px;
+  --ds-space-5:20px; --ds-space-6:24px; --ds-space-8:32px; --ds-space-10:40px;
+  --ds-space-12:48px; --ds-space-16:64px;
+
+  /* Elevation (Material 3 dark-theme shadows) */
+  --ds-elevation-0: none;
+  --ds-elevation-1: 0 1px 3px 1px rgba(0,0,0,0.15), 0 1px 2px rgba(0,0,0,0.3);
+  --ds-elevation-2: 0 2px 6px 2px rgba(0,0,0,0.15), 0 1px 2px rgba(0,0,0,0.3);
+  --ds-elevation-3: 0 4px 8px 3px rgba(0,0,0,0.15), 0 1px 3px rgba(0,0,0,0.3);
+  --ds-elevation-4: 0 6px 10px 4px rgba(0,0,0,0.15), 0 2px 3px rgba(0,0,0,0.3);
+  --ds-elevation-5: 0 8px 12px 6px rgba(0,0,0,0.15), 0 4px 4px rgba(0,0,0,0.3);
+
+  /* Motion */
+  --ds-duration-short: 100ms; --ds-duration-medium: 200ms;
+  --ds-duration-long: 350ms; --ds-duration-extra-long: 500ms;
+  --ds-ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ds-ease-decelerate: cubic-bezier(0, 0, 0, 1);
+  --ds-ease-accelerate: cubic-bezier(0.3, 0, 1, 1);
+  --ds-ease-spring: cubic-bezier(0.175, 0.885, 0.32, 1.275);
+
+  /* Surface tones (elevation tint on dark) */
+  --ds-surface-dim: rgba(15,14,23,0.85);
+  --ds-surface-1: rgba(255,255,255,0.05);
+  --ds-surface-2: rgba(255,255,255,0.08);
+  --ds-surface-3: rgba(255,255,255,0.11);
+  --ds-surface-4: rgba(255,255,255,0.12);
+  --ds-surface-5: rgba(255,255,255,0.14);
+
+  /* State layers */
+  --ds-state-hover: rgba(255,255,255,0.08);
+  --ds-state-focus: rgba(255,255,255,0.12);
+  --ds-state-pressed: rgba(255,255,255,0.16);
+  --ds-state-dragged: rgba(255,255,255,0.16);
+
+  /* Border radius scale */
+  --ds-radius-xs:4px; --ds-radius-sm:8px; --ds-radius-md:12px;
+  --ds-radius-lg:16px; --ds-radius-xl:24px; --ds-radius-full:9999px;
+
+  /* Icon sizes */
+  --ds-icon-xs:16px; --ds-icon-sm:20px; --ds-icon-md:24px;
+  --ds-icon-lg:32px; --ds-icon-xl:48px;
+}
+
+/* ── Body font override: Inter for body, JetBrains Mono for code ── */
+html, body { font-family: var(--ds-font-body); line-height: 1.5 }
+
+/* ── Type Scale ── */
+.ds-display-lg{font-size:57px;line-height:64px;font-weight:400;letter-spacing:-0.25px}
+.ds-display-md{font-size:45px;line-height:52px;font-weight:400}
+.ds-display-sm{font-size:36px;line-height:44px;font-weight:400}
+.ds-headline-lg{font-size:32px;line-height:40px;font-weight:600}
+.ds-headline-md{font-size:28px;line-height:36px;font-weight:600}
+.ds-headline-sm{font-size:24px;line-height:32px;font-weight:600}
+.ds-title-lg{font-size:22px;line-height:28px;font-weight:500}
+.ds-title-md{font-size:16px;line-height:24px;font-weight:500;letter-spacing:0.15px}
+.ds-title-sm{font-size:14px;line-height:20px;font-weight:500;letter-spacing:0.1px}
+.ds-body-lg{font-size:16px;line-height:24px;font-weight:400;letter-spacing:0.5px}
+.ds-body-md{font-size:14px;line-height:20px;font-weight:400;letter-spacing:0.25px}
+.ds-body-sm{font-size:12px;line-height:16px;font-weight:400;letter-spacing:0.4px}
+.ds-label-lg{font-size:14px;line-height:20px;font-weight:500;letter-spacing:0.1px}
+.ds-label-md{font-size:12px;line-height:16px;font-weight:500;letter-spacing:0.5px}
+.ds-label-sm{font-size:11px;line-height:16px;font-weight:500;letter-spacing:0.5px}
+.ds-mono{font-family:var(--ds-font-mono)}
+
+/* ── Elevation ── */
+.ds-elevation-0{box-shadow:var(--ds-elevation-0)}
+.ds-elevation-1{box-shadow:var(--ds-elevation-1)}
+.ds-elevation-2{box-shadow:var(--ds-elevation-2)}
+.ds-elevation-3{box-shadow:var(--ds-elevation-3)}
+.ds-elevation-4{box-shadow:var(--ds-elevation-4)}
+.ds-elevation-5{box-shadow:var(--ds-elevation-5)}
+
+/* ── Button ── */
+.ds-btn{display:inline-flex;align-items:center;justify-content:center;gap:var(--ds-space-2);
+  padding:10px var(--ds-space-6);border-radius:var(--ds-radius-full);
+  font-family:var(--ds-font-body);font-size:14px;font-weight:500;letter-spacing:0.1px;
+  line-height:20px;cursor:pointer;border:none;outline:none;position:relative;overflow:hidden;
+  transition:box-shadow var(--ds-duration-medium) var(--ds-ease-standard),
+    background var(--ds-duration-short) var(--ds-ease-standard),
+    filter var(--ds-duration-short) var(--ds-ease-standard);
+  user-select:none;-webkit-tap-highlight-color:transparent}
+.ds-btn:focus-visible{outline:2px solid var(--hart-accent);outline-offset:2px}
+.ds-btn:disabled,.ds-btn[disabled]{opacity:0.38;pointer-events:none}
+.ds-btn .mi{font-size:18px}
+.ds-btn-primary{background:var(--hart-accent);color:#fff}
+.ds-btn-primary:hover{box-shadow:var(--ds-elevation-1);filter:brightness(1.1)}
+.ds-btn-primary:active{filter:brightness(0.9)}
+.ds-btn-secondary{background:transparent;color:var(--hart-accent);border:1px solid var(--hart-glass-border)}
+.ds-btn-secondary:hover{background:var(--ds-state-hover)}
+.ds-btn-secondary:active{background:var(--ds-state-pressed)}
+.ds-btn-text{background:transparent;color:var(--hart-accent);padding:10px var(--ds-space-3)}
+.ds-btn-text:hover{background:var(--ds-state-hover)}
+.ds-btn-tonal{background:var(--ds-surface-3);color:var(--hart-accent)}
+.ds-btn-tonal:hover{box-shadow:var(--ds-elevation-1);background:var(--ds-surface-4)}
+.ds-btn-danger{background:var(--hart-error);color:#fff}
+.ds-btn-danger:hover{box-shadow:var(--ds-elevation-1);filter:brightness(1.1)}
+.ds-btn-icon{padding:var(--ds-space-2);border-radius:var(--ds-radius-full);
+  min-width:40px;min-height:40px}
+.ds-btn-sm{padding:6px var(--ds-space-4);font-size:12px;line-height:16px}
+
+/* Ripple */
+.ds-ripple{position:absolute;border-radius:50%;background:rgba(255,255,255,0.2);
+  transform:scale(0);animation:ds-ripple-anim 500ms ease-out forwards;pointer-events:none}
+@keyframes ds-ripple-anim{to{transform:scale(2.5);opacity:0}}
+
+/* ── Input ── */
+.ds-input-wrap{position:relative;display:flex;flex-direction:column;gap:var(--ds-space-1)}
+.ds-input{width:100%;padding:var(--ds-space-3) var(--ds-space-4);
+  border-radius:var(--ds-radius-sm);border:1px solid var(--hart-glass-border);
+  background:var(--ds-surface-1);color:var(--hart-text);
+  font-family:var(--ds-font-body);font-size:14px;line-height:20px;outline:none;
+  transition:border-color var(--ds-duration-medium) var(--ds-ease-standard),
+    box-shadow var(--ds-duration-medium) var(--ds-ease-standard)}
+.ds-input:focus{border-color:var(--hart-accent);box-shadow:0 0 0 2px rgba(108,99,255,0.2)}
+.ds-input::placeholder{color:var(--hart-muted)}
+.ds-input-label{font-size:12px;font-weight:500;letter-spacing:0.5px;
+  color:var(--hart-muted);text-transform:uppercase}
+.ds-input-error{border-color:var(--hart-error)}
+.ds-input-error:focus{box-shadow:0 0 0 2px rgba(255,107,107,0.2)}
+.ds-input-help{font-size:12px;color:var(--hart-muted);margin-top:var(--ds-space-1)}
+
+/* ── Select ── */
+.ds-select{width:100%;padding:var(--ds-space-3) var(--ds-space-4);padding-right:var(--ds-space-8);
+  border-radius:var(--ds-radius-sm);border:1px solid var(--hart-glass-border);
+  background:var(--ds-surface-1);color:var(--hart-text);font-family:var(--ds-font-body);
+  font-size:14px;outline:none;appearance:none;cursor:pointer;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='%2378909c'%3E%3Cpath d='M7 10l5 5 5-5z'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 8px center;
+  transition:border-color var(--ds-duration-medium) var(--ds-ease-standard)}
+.ds-select:focus{border-color:var(--hart-accent)}
+.ds-select option{background:var(--hart-surface);color:var(--hart-text)}
+
+/* ── Slider ── */
+.ds-slider{-webkit-appearance:none;appearance:none;width:100%;height:4px;
+  background:var(--ds-surface-3);border-radius:var(--ds-radius-full);outline:none;
+  transition:background var(--ds-duration-medium)}
+.ds-slider::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:20px;height:20px;
+  border-radius:50%;background:var(--hart-accent);cursor:pointer;box-shadow:var(--ds-elevation-1);
+  transition:box-shadow var(--ds-duration-short) var(--ds-ease-standard),
+    transform var(--ds-duration-short) var(--ds-ease-spring)}
+.ds-slider::-webkit-slider-thumb:hover{box-shadow:var(--ds-elevation-2);transform:scale(1.15)}
+.ds-slider::-webkit-slider-thumb:active{box-shadow:var(--ds-elevation-3);transform:scale(1.25)}
+.ds-slider::-moz-range-thumb{width:20px;height:20px;border-radius:50%;
+  background:var(--hart-accent);cursor:pointer;border:none;box-shadow:var(--ds-elevation-1)}
+
+/* ── Card ── */
+.ds-card{background:var(--hart-surface);border-radius:var(--ds-radius-md);
+  padding:var(--ds-space-4);border:1px solid var(--hart-glass-border);
+  transition:box-shadow var(--ds-duration-medium) var(--ds-ease-standard),
+    transform var(--ds-duration-medium) var(--ds-ease-standard)}
+.ds-card-elevated{box-shadow:var(--ds-elevation-1)}
+.ds-card-interactive{cursor:pointer}
+.ds-card-interactive:hover{box-shadow:var(--ds-elevation-2);transform:translateY(-1px)}
+.ds-card-interactive:active{transform:translateY(0);box-shadow:var(--ds-elevation-1)}
+
+/* ── Status Chip ── */
+.ds-chip{display:inline-flex;align-items:center;gap:var(--ds-space-1);
+  padding:var(--ds-space-1) var(--ds-space-3);border-radius:var(--ds-radius-full);
+  font-size:12px;font-weight:500;letter-spacing:0.5px;line-height:16px;
+  border:1px solid var(--hart-glass-border);background:var(--ds-surface-1)}
+.ds-chip-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+.ds-chip-success .ds-chip-dot{background:var(--hart-active)}
+.ds-chip-warning .ds-chip-dot{background:var(--hart-caution)}
+.ds-chip-error .ds-chip-dot{background:var(--hart-error)}
+
+/* ── Progress Bar ── */
+.ds-progress{height:6px;background:var(--ds-surface-3);border-radius:var(--ds-radius-full);overflow:hidden}
+.ds-progress-fill{height:100%;border-radius:var(--ds-radius-full);
+  transition:width var(--ds-duration-long) var(--ds-ease-decelerate)}
+
+/* ── Skeleton Loader ── */
+.ds-skeleton{background:linear-gradient(90deg,var(--ds-surface-2) 25%,var(--ds-surface-4) 50%,var(--ds-surface-2) 75%);
+  background-size:200% 100%;border-radius:var(--ds-radius-sm);
+  animation:ds-shimmer 1.5s ease-in-out infinite}
+.ds-skeleton-text{height:14px;margin-bottom:var(--ds-space-2);border-radius:var(--ds-radius-xs)}
+.ds-skeleton-title{height:22px;width:50%;margin-bottom:var(--ds-space-3)}
+.ds-skeleton-circle{border-radius:50%}
+.ds-skeleton-bar{height:6px;border-radius:var(--ds-radius-full)}
+.ds-skeleton-card{height:64px;border-radius:var(--ds-radius-md);margin-bottom:var(--ds-space-2)}
+@keyframes ds-shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
+
+/* ── Modal ── */
+.ds-modal-overlay{position:fixed;inset:0;z-index:10000;display:flex;
+  align-items:center;justify-content:center;background:rgba(0,0,0,0.6);
+  opacity:0;visibility:hidden;
+  transition:opacity var(--ds-duration-medium) var(--ds-ease-standard),visibility var(--ds-duration-medium)}
+.ds-modal-overlay.ds-open{opacity:1;visibility:visible}
+.ds-modal{background:var(--hart-glass-bg);border:1px solid var(--hart-glass-border);
+  border-radius:var(--ds-radius-lg);padding:var(--ds-space-6);
+  max-width:480px;width:calc(100% - var(--ds-space-8));box-shadow:var(--ds-elevation-5);
+  backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);
+  transform:scale(0.92) translateY(20px);opacity:0;
+  transition:transform var(--ds-duration-long) var(--ds-ease-spring),
+    opacity var(--ds-duration-medium) var(--ds-ease-decelerate)}
+.ds-modal-overlay.ds-open .ds-modal{transform:scale(1) translateY(0);opacity:1}
+.ds-modal-title{font-size:22px;line-height:28px;font-weight:500;margin-bottom:var(--ds-space-4)}
+.ds-modal-body{font-size:14px;line-height:20px;color:var(--hart-muted);margin-bottom:var(--ds-space-6)}
+.ds-modal-actions{display:flex;justify-content:flex-end;gap:var(--ds-space-2)}
+
+/* ── Toast (upgraded) ── */
+.ds-toast{display:flex;align-items:flex-start;gap:var(--ds-space-3);padding:var(--ds-space-4);
+  border-radius:var(--ds-radius-md);background:var(--hart-glass-bg);
+  border:1px solid var(--hart-glass-border);box-shadow:var(--ds-elevation-3);
+  max-width:380px;pointer-events:auto;cursor:pointer;position:relative;overflow:hidden;
+  backdrop-filter:blur(16px) saturate(150%);-webkit-backdrop-filter:blur(16px) saturate(150%);
+  animation:ds-toast-in var(--ds-duration-long) var(--ds-ease-spring)}
+.ds-toast-icon{font-size:20px;flex-shrink:0;margin-top:1px}
+.ds-toast-content{flex:1;min-width:0}
+.ds-toast-title{font-size:14px;font-weight:500;line-height:20px}
+.ds-toast-message{font-size:12px;line-height:16px;color:var(--hart-muted);margin-top:2px}
+.ds-toast-progress{position:absolute;bottom:0;left:0;height:2px;background:var(--hart-accent);
+  animation:ds-toast-countdown 5s linear forwards}
+.ds-toast-exit{animation:ds-toast-out var(--ds-duration-medium) var(--ds-ease-accelerate) forwards}
+@keyframes ds-toast-in{from{transform:translateX(100%) scale(0.95);opacity:0}to{transform:translateX(0) scale(1);opacity:1}}
+@keyframes ds-toast-out{to{transform:translateX(30px);opacity:0}}
+@keyframes ds-toast-countdown{from{width:100%}to{width:0%}}
+
+/* ── Panel Content Layout ── */
+.ds-panel-grid{display:grid;gap:var(--ds-space-3)}
+.ds-panel-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:var(--ds-space-2)}
+.ds-panel-title{font-size:22px;line-height:28px;font-weight:500;color:var(--hart-heading)}
+.ds-panel-subtitle{font-size:14px;color:var(--hart-muted)}
+.ds-section-label{font-size:11px;font-weight:600;text-transform:uppercase;
+  letter-spacing:1.5px;color:var(--hart-muted);padding:var(--ds-space-2) 0}
+
+/* ── List Item ── */
+.ds-list-item{display:flex;align-items:center;gap:var(--ds-space-3);
+  padding:var(--ds-space-3);border-radius:var(--ds-radius-sm);background:var(--hart-surface);
+  transition:background var(--ds-duration-short) var(--ds-ease-standard),
+    transform var(--ds-duration-short) var(--ds-ease-standard)}
+.ds-list-item-interactive{cursor:pointer}
+.ds-list-item-interactive:hover{background:var(--hart-surface-hover);transform:translateY(-1px)}
+.ds-list-item-icon{font-size:var(--ds-icon-sm);flex-shrink:0}
+.ds-list-item-content{flex:1;min-width:0}
+.ds-list-item-primary{font-size:14px;line-height:20px}
+.ds-list-item-secondary{font-size:12px;line-height:16px;color:var(--hart-muted)}
+.ds-list-item-trailing{font-size:12px;flex-shrink:0}
+
+/* ── Metric Display ── */
+.ds-metric{text-align:center;padding:var(--ds-space-4)}
+.ds-metric-value{font-size:32px;font-weight:600;line-height:40px}
+.ds-metric-label{font-size:12px;color:var(--hart-muted);margin-top:var(--ds-space-1)}
+.ds-metric-icon{font-size:var(--ds-icon-xl);margin-bottom:var(--ds-space-2)}
+
+/* ── Dot / Divider ── */
+.ds-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.ds-divider{border:none;border-top:1px solid var(--hart-glass-border);margin:var(--ds-space-3) 0}
+
+/* ── Flex utilities ── */
+.ds-flex{display:flex}.ds-flex-col{flex-direction:column}
+.ds-flex-center{align-items:center;justify-content:center}
+.ds-flex-between{justify-content:space-between}.ds-flex-wrap{flex-wrap:wrap}
+.ds-gap-1{gap:var(--ds-space-1)}.ds-gap-2{gap:var(--ds-space-2)}
+.ds-gap-3{gap:var(--ds-space-3)}.ds-gap-4{gap:var(--ds-space-4)}
+.ds-flex-1{flex:1;min-width:0}
+
+/* ── Color utilities ── */
+.ds-text-accent{color:var(--hart-accent)}.ds-text-active{color:var(--hart-active)}
+.ds-text-error{color:var(--hart-error)}.ds-text-caution{color:var(--hart-caution)}
+.ds-text-muted{color:var(--hart-muted)}.ds-text-heading{color:var(--hart-heading)}
+
+/* ── Animations: fade-in, stagger ── */
+.ds-fade-in{animation:ds-content-enter var(--ds-duration-medium) var(--ds-ease-decelerate)}
+@keyframes ds-content-enter{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.ds-stagger>*{animation:ds-content-enter var(--ds-duration-medium) var(--ds-ease-decelerate) both}
+.ds-stagger>*:nth-child(1){animation-delay:0ms}
+.ds-stagger>*:nth-child(2){animation-delay:30ms}
+.ds-stagger>*:nth-child(3){animation-delay:40ms}
+.ds-stagger>*:nth-child(4){animation-delay:50ms}
+.ds-stagger>*:nth-child(5){animation-delay:60ms}
+.ds-stagger>*:nth-child(6){animation-delay:70ms}
+.ds-stagger>*:nth-child(7){animation-delay:80ms}
+.ds-stagger>*:nth-child(8){animation-delay:90ms}
+.ds-stagger>*:nth-child(n+9){animation-delay:100ms}
+
+/* ── Reduced motion ── */
+@media(prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation-duration:0.01ms!important;
+    animation-iteration-count:1!important;transition-duration:0.01ms!important}
+}
+'''
+
         return f'''<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -621,6 +915,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 
 /* ── Animations ── */
 {_CSS_ANIMATIONS if not is_potato else _CSS_NO_ANIMATIONS}
+{_CSS_DESIGN_SYSTEM}
 </style>
 </head>
 <body>
@@ -714,20 +1009,315 @@ let panelZ = 100;
 let startOpen = false;
 let focusedPanel = null;
 
-// ═══ Toast Notifications ═══
+// ═══════════════════════════════════════════════
+//  HART Design System — Component Library
+// ═══════════════════════════════════════════════
+
+// ── Ripple Effect ──
+function dsRipple(e) {{
+  if(PERF.potato) return;
+  const el = e.currentTarget;
+  const rect = el.getBoundingClientRect();
+  const ripple = document.createElement('span');
+  ripple.className = 'ds-ripple';
+  const size = Math.max(rect.width, rect.height) * 2;
+  ripple.style.width = ripple.style.height = size + 'px';
+  ripple.style.left = (e.clientX - rect.left - size/2) + 'px';
+  ripple.style.top = (e.clientY - rect.top - size/2) + 'px';
+  el.appendChild(ripple);
+  ripple.addEventListener('animationend', function(){{ ripple.remove(); }});
+}}
+
+// ── Button Component ──
+function dsBtn(label, opts) {{
+  opts = opts || {{}};
+  const variant = opts.variant || 'primary';
+  const icon = opts.icon || '';
+  const cls = opts.cls || '';
+  const disabled = opts.disabled ? ' disabled' : '';
+  const onclick = opts.onclick || '';
+  return '<button class="ds-btn ds-btn-'+variant+' '+cls+'"'+disabled+
+    ' onclick="dsRipple(event);'+(onclick.replace(/"/g,'&quot;'))+'">' +
+    (icon ? '<span class="mi material-icons-round">'+icon+'</span>' : '') +
+    '<span>'+label+'</span></button>';
+}}
+
+// ── Input Component ──
+function dsInput(opts) {{
+  opts = opts || {{}};
+  const type = opts.type || 'text';
+  const id = opts.id || '';
+  const label = opts.label || '';
+  const placeholder = opts.placeholder || '';
+  const value = opts.value || '';
+  const oninput = opts.oninput || '';
+  const onkeydown = opts.onkeydown || '';
+  const cls = opts.error ? 'ds-input ds-input-error' : 'ds-input';
+  let html = '<div class="ds-input-wrap">';
+  if(label) html += '<label class="ds-input-label"'+(id?' for="'+id+'"':'')+'>'+label+'</label>';
+  html += '<input class="'+cls+'" type="'+type+'"'+(id?' id="'+id+'"':'')+
+    ' placeholder="'+placeholder+'" value="'+value+'"'+
+    (oninput?' oninput="'+oninput.replace(/"/g,'&quot;')+'"':'') +
+    (onkeydown?' onkeydown="'+onkeydown.replace(/"/g,'&quot;')+'"':'') + '>';
+  if(opts.help) html += '<div class="ds-input-help">'+opts.help+'</div>';
+  if(opts.errorText) html += '<div class="ds-input-help" style="color:var(--hart-error)">'+opts.errorText+'</div>';
+  html += '</div>';
+  return html;
+}}
+
+// ── Select Component ──
+function dsSelect(opts) {{
+  opts = opts || {{}};
+  const id = opts.id || '';
+  const label = opts.label || '';
+  const options = opts.options || [];
+  const onchange = opts.onchange || '';
+  let html = '<div class="ds-input-wrap">';
+  if(label) html += '<label class="ds-input-label">'+label+'</label>';
+  html += '<select class="ds-select"'+(id?' id="'+id+'"':'')+
+    (onchange?' onchange="'+onchange.replace(/"/g,'&quot;')+'"':'')+'>';
+  options.forEach(function(o){{
+    const sel = o.selected ? ' selected' : '';
+    html += '<option value="'+o.value+'"'+sel+'>'+o.label+'</option>';
+  }});
+  html += '</select></div>';
+  return html;
+}}
+
+// ── Slider Component ──
+function dsSlider(opts) {{
+  opts = opts || {{}};
+  const id = opts.id || '';
+  const min = opts.min !== undefined ? opts.min : 0;
+  const max = opts.max !== undefined ? opts.max : 100;
+  const value = opts.value !== undefined ? opts.value : 50;
+  const label = opts.label || '';
+  const unit = opts.unit || '';
+  const oninput = opts.oninput || '';
+  let html = '<div class="ds-flex ds-gap-3" style="align-items:center">';
+  if(label) html += '<span class="ds-label-sm ds-text-muted" style="min-width:80px">'+label+'</span>';
+  html += '<input type="range" class="ds-slider" min="'+min+'" max="'+max+'" value="'+value+'"'+
+    (id?' id="'+id+'"':'')+
+    ' oninput="'+
+    (oninput?oninput.replace(/"/g,'&quot;')+';':'')+
+    (id?'document.getElementById(\\''+id+'-val\\').textContent=this.value+\\''+unit+'\\';':'')+
+    '">';
+  if(id) html += '<span class="ds-label-md" id="'+id+'-val" style="min-width:40px;text-align:right">'+value+unit+'</span>';
+  html += '</div>';
+  return html;
+}}
+
+// ── Skeleton Loader ──
+function dsSkeleton(type, count) {{
+  count = count || 3;
+  if(type === 'panel') {{
+    return '<div class="ds-panel-grid">' +
+      '<div class="ds-skeleton ds-skeleton-title"></div>' +
+      Array.from({{length:count}}).map(function(){{return '<div class="ds-skeleton ds-skeleton-card"></div>';}}).join('') +
+      '</div>';
+  }}
+  if(type === 'list') {{
+    return Array.from({{length:count}}).map(function(){{
+      return '<div class="ds-flex ds-gap-3" style="align-items:center;margin-bottom:8px">' +
+        '<div class="ds-skeleton ds-skeleton-circle" style="width:32px;height:32px"></div>' +
+        '<div style="flex:1"><div class="ds-skeleton ds-skeleton-text" style="width:70%"></div>' +
+        '<div class="ds-skeleton ds-skeleton-text" style="width:40%"></div></div></div>';
+    }}).join('');
+  }}
+  return Array.from({{length:count}}).map(function(){{return '<div class="ds-skeleton ds-skeleton-text"></div>';}}).join('');
+}}
+
+// ── Status Row (design system) ──
+function dsStatusRow(icon, label, value, color, opts) {{
+  opts = opts || {{}};
+  const sublabel = opts.sublabel || '';
+  const trailing = opts.trailing || '';
+  return '<div class="ds-list-item'+(opts.interactive?' ds-list-item-interactive':'')+'">'+
+    '<span class="mi material-icons-round ds-list-item-icon" style="color:'+color+'">'+icon+'</span>'+
+    '<div class="ds-list-item-content">'+
+    '<div class="ds-list-item-primary">'+label+'</div>'+
+    (sublabel?'<div class="ds-list-item-secondary">'+sublabel+'</div>':'')+
+    '</div>'+
+    '<span class="ds-list-item-trailing" style="color:'+color+'">'+value+'</span>'+
+    (trailing?trailing:'')+
+    '</div>';
+}}
+
+// ── Metric Bar (design system) ──
+function dsMetricBar(label, pct, unit, sub) {{
+  const color = pct>80?'var(--hart-error)':pct>60?'var(--hart-caution)':'var(--hart-active)';
+  const colorClass = pct>80?'ds-progress-error':pct>60?'ds-progress-warning':'ds-progress-active';
+  return '<div style="margin-bottom:var(--ds-space-2)">' +
+    '<div class="ds-flex ds-flex-between" style="margin-bottom:var(--ds-space-1)">'+
+    '<span class="ds-body-md">'+label+'</span>'+
+    '<span class="ds-label-lg" style="font-weight:600">'+pct+unit+'</span></div>'+
+    '<div class="ds-progress"><div class="ds-progress-fill '+colorClass+'" style="width:'+pct+'%"></div></div>'+
+    (sub?'<div class="ds-label-sm ds-text-muted" style="margin-top:var(--ds-space-1)">'+sub+'</div>':'')+
+    '</div>';
+}}
+
+// ── Card Component ──
+function dsCard(content, opts) {{
+  opts = opts || {{}};
+  const cls = 'ds-card'+(opts.elevated?' ds-card-elevated':'')+(opts.interactive?' ds-card-interactive':'');
+  const onclick = opts.onclick || '';
+  return '<div class="'+cls+'"'+(onclick?' onclick="dsRipple(event);'+onclick.replace(/"/g,'&quot;')+'"':'')+'>'+content+'</div>';
+}}
+
+// ── Modal System ──
+let _dsModalOverlay = null;
+function dsModal(opts) {{
+  opts = opts || {{}};
+  // Remove existing modal
+  if(_dsModalOverlay) {{ _dsModalOverlay.remove(); _dsModalOverlay = null; }}
+
+  const overlay = document.createElement('div');
+  overlay.className = 'ds-modal-overlay';
+  overlay.innerHTML = '<div class="ds-modal">'+
+    '<div class="ds-modal-title">'+(opts.title||'')+'</div>'+
+    '<div class="ds-modal-body" id="ds-modal-body">'+(opts.body||'')+'</div>'+
+    '<div class="ds-modal-actions" id="ds-modal-actions"></div></div>';
+
+  document.body.appendChild(overlay);
+  _dsModalOverlay = overlay;
+
+  // Close on overlay click (not modal body)
+  overlay.addEventListener('click', function(e){{
+    if(e.target === overlay) dsModalClose();
+  }});
+
+  // Close on ESC
+  const escHandler = function(e) {{
+    if(e.key === 'Escape') {{ dsModalClose(); document.removeEventListener('keydown', escHandler); }}
+  }};
+  document.addEventListener('keydown', escHandler);
+
+  // Add action buttons
+  const actions = document.getElementById('ds-modal-actions');
+  if(opts.actions) {{
+    opts.actions.forEach(function(a) {{
+      const btn = document.createElement('button');
+      btn.className = 'ds-btn ds-btn-'+(a.variant||'text');
+      btn.textContent = a.label;
+      btn.onclick = function(e){{ dsRipple(e); if(a.action) a.action(); }};
+      actions.appendChild(btn);
+    }});
+  }}
+
+  // Trigger open animation (next frame)
+  requestAnimationFrame(function(){{
+    requestAnimationFrame(function(){{ overlay.classList.add('ds-open'); }});
+  }});
+
+  // Focus trap: focus first input or first button
+  setTimeout(function(){{
+    const target = overlay.querySelector('input,select,textarea') || overlay.querySelector('.ds-btn');
+    if(target) target.focus();
+  }}, 100);
+
+  return overlay;
+}}
+
+function dsModalClose() {{
+  if(!_dsModalOverlay) return;
+  _dsModalOverlay.classList.remove('ds-open');
+  const el = _dsModalOverlay;
+  setTimeout(function(){{ el.remove(); }}, 250);
+  _dsModalOverlay = null;
+}}
+
+// ── Prompt Modal (replaces window.prompt) ──
+function dsPrompt(title, message, opts) {{
+  opts = opts || {{}};
+  const inputType = opts.type || 'text';
+  const placeholder = opts.placeholder || '';
+  const defaultValue = opts.defaultValue || '';
+
+  return new Promise(function(resolve) {{
+    const modal = dsModal({{
+      title: title,
+      body: '<div class="ds-body-md ds-text-muted" style="margin-bottom:var(--ds-space-4)">'+(message||'')+'</div>'+
+        '<input class="ds-input" type="'+inputType+'" id="ds-prompt-input" placeholder="'+placeholder+'" value="'+defaultValue+'"'+
+        ' onkeydown="if(event.key===\\'Enter\\')document.getElementById(\\'ds-prompt-ok\\').click()">',
+      actions: [
+        {{ label: 'Cancel', variant: 'text', action: function(){{ dsModalClose(); resolve(null); }} }},
+        {{ label: opts.okLabel||'OK', variant: 'primary', action: function(){{
+          const val = document.getElementById('ds-prompt-input').value;
+          dsModalClose(); resolve(val);
+        }} }}
+      ]
+    }});
+    // Add id for enter-key handling
+    setTimeout(function(){{
+      const btns = modal.querySelectorAll('.ds-btn-primary');
+      if(btns.length) btns[btns.length-1].id = 'ds-prompt-ok';
+    }}, 50);
+  }});
+}}
+
+// ── Confirm Modal (replaces window.confirm) ──
+function dsConfirm(title, message, opts) {{
+  opts = opts || {{}};
+  return new Promise(function(resolve) {{
+    dsModal({{
+      title: title,
+      body: message,
+      actions: [
+        {{ label: opts.cancelLabel||'Cancel', variant: 'text', action: function(){{ dsModalClose(); resolve(false); }} }},
+        {{ label: opts.okLabel||'Confirm', variant: opts.danger?'danger':'primary',
+          action: function(){{ dsModalClose(); resolve(true); }} }}
+      ]
+    }});
+  }});
+}}
+
+// ── Alert Modal (replaces window.alert) ──
+function dsAlert(title, message, severity) {{
+  const icons = {{info:'info',success:'check_circle',warning:'warning',error:'error'}};
+  const colors = {{info:'var(--hart-accent)',success:'var(--hart-active)',warning:'var(--hart-caution)',error:'var(--hart-error)'}};
+  const icon = icons[severity||'info']||'info';
+  const color = colors[severity||'info']||colors.info;
+  return new Promise(function(resolve) {{
+    dsModal({{
+      title: '<span class="mi material-icons-round" style="font-size:24px;color:'+color+';vertical-align:middle;margin-right:8px">'+icon+'</span>'+title,
+      body: message,
+      actions: [{{ label: 'OK', variant: 'primary', action: function(){{ dsModalClose(); resolve(); }} }}]
+    }});
+  }});
+}}
+
+// ═══ Toast Notifications (upgraded) ═══
 function showToast(title, message, severity) {{
   severity = severity || 'info';
   const container = document.getElementById('toast-container');
   if(!container) return;
-  const toast = document.createElement('div');
-  toast.className = 'toast glass';
+  const icons = {{info:'info',warning:'warning',error:'error',success:'check_circle'}};
   const colors = {{info:'var(--hart-accent)',warning:'var(--hart-caution)',error:'var(--hart-error)',success:'var(--hart-active)'}};
-  toast.style.borderLeft = '3px solid '+(colors[severity]||colors.info);
-  toast.innerHTML = '<div style="font-weight:600;margin-bottom:2px;color:'+(colors[severity]||colors.info)+'">'+title+'</div>'+
-    '<div style="color:var(--hart-text)">'+message+'</div>';
-  toast.onclick = function(){{ toast.remove(); }};
+  const icon = icons[severity]||icons.info;
+  const color = colors[severity]||colors.info;
+  const toast = document.createElement('div');
+  toast.className = PERF.potato ? 'toast glass' : 'ds-toast';
+  if(PERF.potato) {{
+    toast.style.borderLeft = '3px solid '+color;
+    toast.innerHTML = '<div style="font-weight:600;margin-bottom:2px;color:'+color+'">'+title+'</div>'+
+      '<div style="color:var(--hart-text)">'+message+'</div>';
+  }} else {{
+    toast.innerHTML = '<span class="mi material-icons-round ds-toast-icon" style="color:'+color+'">'+icon+'</span>'+
+      '<div class="ds-toast-content"><div class="ds-toast-title">'+title+'</div>'+
+      '<div class="ds-toast-message">'+message+'</div></div>'+
+      '<div class="ds-toast-progress" style="background:'+color+'"></div>';
+  }}
+  toast.onclick = function(){{
+    if(!PERF.potato) toast.classList.add('ds-toast-exit');
+    setTimeout(function(){{ toast.remove(); }}, PERF.potato?0:200);
+  }};
   container.appendChild(toast);
-  setTimeout(function(){{ if(toast.parentNode) toast.remove(); }}, 5000);
+  setTimeout(function(){{
+    if(toast.parentNode) {{
+      if(!PERF.potato) {{ toast.classList.add('ds-toast-exit'); setTimeout(function(){{ toast.remove(); }},200); }}
+      else toast.remove();
+    }}
+  }}, 5000);
 }}
 
 // ═══ Taskbar ═══
@@ -1026,10 +1616,11 @@ document.addEventListener('mousemove', e=>{{
 }});
 document.addEventListener('mouseup', ()=>{{ dragState=null; }});
 
-// ═══ System Panels (native content) ═══
+// ═══ System Panels (design system) ═══
 function loadSystemPanel(id, body) {{
   const apis = (SYSTEM_PANELS[id]||{{}}).apis || [];
-  body.innerHTML = '<div class="native-content" id="sys-'+id+'"><div style="color:var(--hart-muted)">Loading...</div></div>';
+  // Show skeleton loader while fetching
+  body.innerHTML = '<div class="native-content" id="sys-'+id+'">'+dsSkeleton('panel',3)+'</div>';
   const container = document.getElementById('sys-'+id);
 
   if(id==='hw_monitor') loadHardwareMonitor(container, apis);
@@ -1042,8 +1633,12 @@ function loadSystemPanel(id, body) {{
   else if(id==='power') loadPowerPanel(container);
   else if(id==='display') loadDisplayPanel(container);
   else if(id==='remote_desktop') loadRemoteDesktopPanel(container, apis);
-  else container.innerHTML = '<div style="color:var(--hart-muted)">Panel: '+id+'</div>';
+  else container.innerHTML = '<div class="ds-body-md ds-text-muted">Panel: '+id+'</div>';
 }}
+
+// Backward compat wrappers (used in old code references)
+function metricBar(l,p,u,s) {{ return dsMetricBar(l,p,u,s); }}
+function statusRow(i,l,v,c) {{ return dsStatusRow(i,l,v,c); }}
 
 function loadHardwareMonitor(el, apis) {{
   Promise.all(apis.map(u=>fetch(BACKEND+u,{{signal:AbortSignal.timeout(3000)}}).then(r=>r.json()).catch(()=>({{}}))))
@@ -1051,31 +1646,17 @@ function loadHardwareMonitor(el, apis) {{
       const cpu=sys.cpu_percent||0, ram_used=sys.ram_used_gb||0, ram_total=sys.ram_total_gb||0;
       const disk_used=sys.disk_used_gb||0, disk_total=sys.disk_total_gb||0;
       const tier=caps.tier_name||sys.tier||'unknown', uptime=sys.uptime||'';
-      el.innerHTML = `
-        <div style="display:grid;gap:12px">
-          <div style="display:flex;justify-content:space-between;align-items:center">
-            <span style="font-weight:var(--hart-heading-weight);font-size:var(--hart-heading-size);color:var(--hart-heading)">Hardware</span>
-            <span style="font-size:11px;color:var(--hart-muted)">Tier: ${{tier}}</span>
-          </div>
-          ${{metricBar('CPU', cpu, '%')}}
-          ${{metricBar('RAM', ram_total>0?Math.round(ram_used/ram_total*100):0, '%', ram_used.toFixed(1)+' / '+ram_total.toFixed(1)+' GB')}}
-          ${{metricBar('Disk', disk_total>0?Math.round(disk_used/disk_total*100):0, '%', disk_used.toFixed(0)+' / '+disk_total.toFixed(0)+' GB')}}
-          <div style="font-size:11px;color:var(--hart-muted)">Uptime: ${{uptime}}</div>
-        </div>`;
-    }});
-}}
-
-function metricBar(label, pct, unit, sub) {{
-  const color = pct>80?'var(--hart-error)':pct>60?'var(--hart-caution)':'var(--hart-active)';
-  return `<div>
-    <div style="display:flex;justify-content:space-between;margin-bottom:4px">
-      <span>${{label}}</span><span style="font-weight:600">${{pct}}${{unit}}</span>
-    </div>
-    <div style="height:6px;background:var(--hart-surface);border-radius:3px;overflow:hidden">
-      <div style="height:100%;width:${{pct}}%;background:${{color}};border-radius:3px;transition:width 0.5s"></div>
-    </div>
-    ${{sub?'<div style="font-size:10px;color:var(--hart-muted);margin-top:2px">'+sub+'</div>':''}}
-  </div>`;
+      el.innerHTML = '<div class="ds-panel-grid ds-fade-in">'+
+        '<div class="ds-panel-header">'+
+        '<span class="ds-panel-title">Hardware</span>'+
+        '<span class="ds-chip"><span class="ds-chip-dot" style="background:var(--hart-accent)"></span>'+tier+'</span>'+
+        '</div>'+
+        dsMetricBar('CPU', cpu, '%')+
+        dsMetricBar('RAM', ram_total>0?Math.round(ram_used/ram_total*100):0, '%', ram_used.toFixed(1)+' / '+ram_total.toFixed(1)+' GB')+
+        dsMetricBar('Disk', disk_total>0?Math.round(disk_used/disk_total*100):0, '%', disk_used.toFixed(0)+' / '+disk_total.toFixed(0)+' GB')+
+        '<div class="ds-label-sm ds-text-muted">Uptime: '+uptime+'</div>'+
+        '</div>';
+    }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted ds-flex ds-flex-center" style="height:100px"><span class="mi material-icons-round" style="margin-right:8px">error_outline</span>Hardware info unavailable</div>'; }});
 }}
 
 function loadSecurityCenter(el, apis) {{
@@ -1083,88 +1664,158 @@ function loadSecurityCenter(el, apis) {{
     .then(([health,guardrail])=>{{
       const ghash = guardrail.guardrail_hash||'unknown';
       const wm = health.world_model||{{}};
-      el.innerHTML = `
-        <div style="display:grid;gap:10px">
-          <div style="font-weight:var(--hart-heading-weight);font-size:var(--hart-heading-size);color:var(--hart-heading)">Security</div>
-          ${{statusRow('shield', 'Guardrail Hash', ghash.substring(0,16)+'...', 'var(--hart-active)')}}
-          ${{statusRow('verified_user', 'Integrity', health.status==='ok'?'Verified':'Check Required',
-              health.status==='ok'?'var(--hart-active)':'var(--hart-caution)')}}
-          ${{statusRow('psychology', 'World Model', wm.status||'disconnected',
-              wm.status==='healthy'?'var(--hart-active)':'var(--hart-muted)')}}
-        </div>`;
-    }});
+      el.innerHTML = '<div class="ds-panel-grid ds-fade-in">'+
+        '<div class="ds-panel-title">Security</div>'+
+        '<div class="ds-stagger">'+
+        dsStatusRow('shield', 'Guardrail Hash', ghash.substring(0,16)+'...', 'var(--hart-active)', {{sublabel:'Structural integrity verified'}})+
+        dsStatusRow('verified_user', 'Integrity', health.status==='ok'?'Verified':'Check Required',
+            health.status==='ok'?'var(--hart-active)':'var(--hart-caution)')+
+        dsStatusRow('psychology', 'World Model', wm.status||'disconnected',
+            wm.status==='healthy'?'var(--hart-active)':'var(--hart-muted)')+
+        '</div></div>';
+    }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted ds-flex ds-flex-center" style="height:100px"><span class="mi material-icons-round" style="margin-right:8px">error_outline</span>Security info unavailable</div>'; }});
 }}
 
-function statusRow(icon, label, value, color) {{
-  return `<div style="display:flex;align-items:center;gap:10px;padding:8px;border-radius:8px;background:var(--hart-surface)">
-    <span class="mi material-icons-round" style="font-size:20px;color:${{color}}">${{icon}}</span>
-    <span style="flex:1">${{label}}</span>
-    <span style="font-size:12px;color:${{color}}">${{value}}</span>
-  </div>`;
+function wifiConnect(ssid) {{
+  dsPrompt('Connect to WiFi', 'Enter password for <strong>'+ssid+'</strong><br><span class="ds-label-sm ds-text-muted">Leave empty for open networks</span>', {{
+    type:'password', placeholder:'Password', okLabel:'Connect'
+  }}).then(function(pwd){{
+    if(pwd===null) return;
+    const body = {{ssid: ssid}};
+    if(pwd) body.password = pwd;
+    showToast('WiFi', 'Connecting to '+ssid+'...', 'info');
+    fetch(SHELL+'/api/shell/network/wifi/connect', {{
+      method:'POST', headers:{{'Content-Type':'application/json'}},
+      body:JSON.stringify(body), signal:AbortSignal.timeout(35000)
+    }}).then(r=>r.json()).then(d=>{{
+      if(d.success) {{ showToast('WiFi', 'Connected to '+ssid, 'success'); loadNetworkPanel(document.getElementById('sys-network'),
+        (SYSTEM_PANELS['network']||{{}}).apis||[]); }}
+      else dsAlert('Connection Failed', d.error||'Unknown error', 'error');
+    }}).catch(e=>dsAlert('Connection Error', e.message, 'error'));
+  }});
+}}
+function wifiDisconnect() {{
+  dsConfirm('Disconnect WiFi', 'Are you sure you want to disconnect from WiFi?', {{okLabel:'Disconnect', danger:true}}).then(function(ok){{
+    if(!ok) return;
+    fetch(SHELL+'/api/shell/network/wifi/disconnect', {{
+      method:'POST', headers:{{'Content-Type':'application/json'}},
+      body:'{{}}', signal:AbortSignal.timeout(15000)
+    }}).then(r=>r.json()).then(d=>{{
+      if(d.success) {{ showToast('WiFi', 'Disconnected', 'info'); loadNetworkPanel(document.getElementById('sys-network'),
+        (SYSTEM_PANELS['network']||{{}}).apis||[]); }}
+      else dsAlert('Error', d.error||'Disconnect failed', 'error');
+    }}).catch(e=>dsAlert('Error', e.message, 'error'));
+  }});
 }}
 
 function loadNetworkPanel(el, apis) {{
   Promise.all([
     ...apis.map(u=>fetch(BACKEND+u,{{signal:AbortSignal.timeout(3000)}}).then(r=>r.json()).catch(()=>({{}}))),
-    fetch(SHELL+'/api/shell/network/wifi',{{signal:AbortSignal.timeout(3000)}}).then(r=>r.json()).catch(()=>({{}}))
+    fetch(SHELL+'/api/shell/network/wifi',{{signal:AbortSignal.timeout(3000)}}).then(r=>r.json()).catch(()=>({{}})),
+    fetch(SHELL+'/api/shell/network/status',{{signal:AbortSignal.timeout(3000)}}).then(r=>r.json()).catch(()=>({{}}))
   ]).then(results=>{{
       const topo = results[0]||{{}};
-      const wifi = results[results.length-1]||{{}};
+      const wifi = results[results.length-2]||{{}};
+      const netStatus = results[results.length-1]||{{}};
       const nodes = topo.nodes||[];
       const connected = wifi.connected||{{}};
       const networks = wifi.networks||[];
+      const gateway = netStatus.gateway||'';
       let wifiHtml = '';
       if(connected.ssid) {{
-        wifiHtml = '<div style="padding:10px;border-radius:8px;background:var(--hart-surface);flex:1;min-width:120px;text-align:center">'+
-          '<div style="font-size:14px;font-weight:600;color:var(--hart-active)">'+connected.ssid+'</div>'+
-          '<div style="font-size:11px;color:var(--hart-muted)">'+(connected.ip||'')+'</div></div>';
+        wifiHtml = dsCard(
+          '<div class="ds-flex ds-flex-center ds-flex-col ds-gap-2">'+
+          '<span class="mi material-icons-round ds-text-active" style="font-size:28px">wifi</span>'+
+          '<div class="ds-title-sm ds-text-active">'+connected.ssid+'</div>'+
+          '<div class="ds-label-sm ds-text-muted">'+(connected.ip||'')+(gateway?' &middot; GW '+gateway:'')+'</div>'+
+          dsBtn('Disconnect', {{variant:'secondary', cls:'ds-btn-sm', onclick:"wifiDisconnect()"}})+
+          '</div>', {{elevated:true}});
       }}
-      el.innerHTML = `
-        <div style="display:grid;gap:10px">
-          <div style="font-weight:var(--hart-heading-weight);font-size:var(--hart-heading-size);color:var(--hart-heading)">Network</div>
-          <div style="display:flex;gap:12px;flex-wrap:wrap">
-            <div style="padding:10px;border-radius:8px;background:var(--hart-surface);flex:1;min-width:120px;text-align:center">
-              <div style="font-size:24px;font-weight:600;color:var(--hart-accent)">${{nodes.length}}</div>
-              <div style="font-size:11px;color:var(--hart-muted)">Hive Peers</div>
-            </div>
-            ${{wifiHtml}}
-          </div>
-          <div style="font-size:12px;color:var(--hart-muted)">Discovery: UDP 6780</div>
-          ${{nodes.slice(0,6).map(n=>'<div style="font-size:12px;padding:4px 0;border-bottom:1px solid var(--hart-glass-border)">'
-            +(n.node_id||'').substring(0,12)+'... <span style="color:var(--hart-active)">'+
-            (n.status||'active')+'</span></div>').join('')}}
-          ${{networks.length>0?'<div style="font-size:11px;color:var(--hart-muted);margin-top:6px;text-transform:uppercase">Nearby WiFi</div>'+
-            networks.filter(n=>!n.active).slice(0,4).map(n=>'<div style="font-size:12px;padding:3px 0">'+n.ssid+
-              ' <span style="color:var(--hart-muted)">'+n.signal+'%</span></div>').join(''):''}};
-        </div>`;
-    }});
+      let html = '<div class="ds-panel-grid ds-fade-in">';
+      html += '<div class="ds-panel-title">Network</div>';
+      html += '<div class="ds-flex ds-gap-3 ds-flex-wrap">';
+      html += dsCard('<div class="ds-metric"><div class="ds-metric-value ds-text-accent">'+nodes.length+'</div><div class="ds-metric-label">Hive Peers</div></div>', {{elevated:true}});
+      html += wifiHtml;
+      html += '</div>';
+      if(nodes.length>0) {{
+        html += '<div class="ds-section-label">Connected Peers</div><div class="ds-stagger">';
+        html += nodes.slice(0,6).map(n=>
+          dsStatusRow('dns', (n.node_id||'').substring(0,12)+'...', n.status||'active',
+            'var(--hart-active)', {{sublabel:n.ip||''}})
+        ).join('');
+        html += '</div>';
+      }}
+      if(networks.length>0) {{
+        const available = networks.filter(n=>!n.active);
+        if(available.length>0) {{
+          html += '<div class="ds-section-label">Available WiFi Networks</div><div class="ds-stagger">';
+          html += available.slice(0,6).map(n=>
+            '<div class="ds-list-item ds-list-item-interactive" onclick="wifiConnect(\\''+n.ssid.replace(/'/g,"\\\\'")+'\\')">' +
+            '<span class="mi material-icons-round ds-list-item-icon ds-text-accent">wifi</span>' +
+            '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+n.ssid+'</div>'+
+            '<div class="ds-list-item-secondary">'+n.security+'</div></div>' +
+            '<span class="ds-list-item-trailing ds-text-muted">'+n.signal+'%</span></div>'
+          ).join('');
+          html += '</div>';
+        }}
+      }}
+      html += '</div>';
+      el.innerHTML = html;
+    }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted ds-flex ds-flex-center" style="height:100px"><span class="mi material-icons-round" style="margin-right:8px">error_outline</span>Network info unavailable</div>'; }});
 }}
 
 function loadEventLog(el) {{
   fetch(SHELL+'/api/shell/events',{{signal:AbortSignal.timeout(3000)}})
     .then(r=>r.json()).then(data=>{{
       const events = data.events||[];
-      el.innerHTML = '<div style="font-weight:var(--hart-heading-weight);font-size:var(--hart-heading-size);color:var(--hart-heading);margin-bottom:8px">Events</div>' +
-        events.slice(0,20).map(e=>'<div style="font-size:12px;padding:4px 0;border-bottom:1px solid var(--hart-glass-border)">'+
-          '<span style="color:var(--hart-muted)">'+e.time+'</span> '+e.message+'</div>').join('');
-    }}).catch(()=>{{ el.innerHTML='<div style="color:var(--hart-muted)">No events</div>'; }});
+      el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Events</div>'+
+        (events.length===0?'<div class="ds-body-md ds-text-muted">No events recorded</div>':
+        '<div class="ds-stagger">'+events.slice(0,20).map(e=>
+          '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon ds-text-muted">schedule</span>'+
+          '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+e.message+'</div>'+
+          '<div class="ds-list-item-secondary">'+e.time+'</div></div></div>'
+        ).join('')+'</div>')+
+        '</div>';
+    }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">No events</div>'; }});
 }}
 
 function loadDriversPanel(el) {{
   fetch(SHELL+'/api/shell/drivers',{{signal:AbortSignal.timeout(5000)}})
     .then(r=>r.json()).then(data=>{{
       const devs = data.devices||[];
-      el.innerHTML = '<div style="display:grid;gap:10px">' +
-        '<div style="font-weight:var(--hart-heading-weight);font-size:var(--hart-heading-size);color:var(--hart-heading)">Drivers & Devices</div>' +
-        (devs.length===0?'<div style="color:var(--hart-muted)">No devices detected</div>':
-        devs.slice(0,20).map(d=>
-          '<div style="display:flex;align-items:center;gap:8px;padding:6px;border-radius:6px;background:var(--hart-surface)">'+
-          '<span class="mi material-icons-round" style="font-size:16px;color:'+(d.type==='usb'?'var(--hart-active)':'var(--hart-accent)')+'">'+
-          (d.type==='usb'?'usb':'memory')+'</span>'+
-          '<span style="font-size:12px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+d.info+'</span>'+
-          '<span style="font-size:10px;color:var(--hart-muted);text-transform:uppercase">'+d.type+'</span></div>'
-        ).join('')) + '</div>';
-    }}).catch(()=>{{ el.innerHTML='<div style="color:var(--hart-muted)">Drivers panel unavailable</div>'; }});
+      el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Drivers &amp; Devices</div>'+
+        (devs.length===0?'<div class="ds-body-md ds-text-muted">No devices detected</div>':
+        '<div class="ds-stagger">'+devs.slice(0,20).map(d=>
+          dsStatusRow(d.type==='usb'?'usb':'memory', d.info, d.type.toUpperCase(),
+            d.type==='usb'?'var(--hart-active)':'var(--hart-accent)')
+        ).join('')+'</div>')+
+        '</div>';
+    }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted ds-flex ds-flex-center" style="height:100px"><span class="mi material-icons-round" style="margin-right:8px">error_outline</span>Drivers panel unavailable</div>'; }});
+}}
+
+function setVolume(sinkId, vol) {{
+  fetch(SHELL+'/api/shell/audio/volume', {{
+    method:'POST', headers:{{'Content-Type':'application/json'}},
+    body:JSON.stringify({{sink_id:sinkId, volume:vol}})
+  }}).catch(()=>{{}});
+}}
+function toggleMute(sinkId, muted) {{
+  fetch(SHELL+'/api/shell/audio/mute', {{
+    method:'POST', headers:{{'Content-Type':'application/json'}},
+    body:JSON.stringify({{sink_id:sinkId, muted:muted}})
+  }}).then(()=>loadAudioPanel(document.getElementById('sys-audio'))).catch(()=>{{}});
+}}
+function setDefaultSink(sinkId) {{
+  fetch(SHELL+'/api/shell/audio/default', {{
+    method:'POST', headers:{{'Content-Type':'application/json'}},
+    body:JSON.stringify({{sink_id:sinkId}})
+  }}).then(()=>loadAudioPanel(document.getElementById('sys-audio'))).catch(()=>{{}});
+}}
+function setSourceVolume(srcId, vol) {{
+  fetch(SHELL+'/api/shell/audio/source/volume', {{
+    method:'POST', headers:{{'Content-Type':'application/json'}},
+    body:JSON.stringify({{source_id:srcId, volume:vol}})
+  }}).catch(()=>{{}});
 }}
 
 function loadAudioPanel(el) {{
@@ -1172,28 +1823,49 @@ function loadAudioPanel(el) {{
     .then(r=>r.json()).then(data=>{{
       const sinks = data.sinks||[];
       const sources = data.sources||[];
-      el.innerHTML = '<div style="display:grid;gap:10px">' +
-        '<div style="font-weight:var(--hart-heading-weight);font-size:var(--hart-heading-size);color:var(--hart-heading)">Audio</div>' +
-        '<div style="font-size:11px;color:var(--hart-muted);text-transform:uppercase">Output</div>' +
-        (sinks.length===0?'<div style="color:var(--hart-muted)">No audio outputs</div>':
-        sinks.map(s=>statusRow('volume_up',s.name,s.mute?'Muted':'Active',s.mute?'var(--hart-caution)':'var(--hart-active)')).join('')) +
-        '<div style="font-size:11px;color:var(--hart-muted);text-transform:uppercase;margin-top:8px">Input</div>' +
-        (sources.length===0?'<div style="color:var(--hart-muted)">No audio inputs</div>':
-        sources.map(s=>statusRow('mic',s.name,'Available','var(--hart-active)')).join('')) +
-        '</div>';
-    }}).catch(()=>{{ el.innerHTML='<div style="color:var(--hart-muted)">Audio panel unavailable</div>'; }});
+      let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Audio</div>';
+      html += '<div class="ds-section-label">Output</div>';
+      if(sinks.length===0) html += '<div class="ds-body-sm ds-text-muted">No audio outputs</div>';
+      else html += '<div class="ds-stagger">'+sinks.map(s=>
+        '<div class="ds-card" style="margin-bottom:var(--ds-space-2)">'+
+        '<div class="ds-flex ds-gap-3" style="align-items:center;margin-bottom:var(--ds-space-3)">'+
+        '<span class="mi material-icons-round" style="font-size:24px;color:'+(s.mute?'var(--hart-caution)':'var(--hart-active)')+'">'+
+        (s.mute?'volume_off':'volume_up')+'</span>'+
+        '<div class="ds-flex-1"><div class="ds-title-sm">'+s.name+'</div>'+
+        (s.default?'<span class="ds-chip ds-chip-success" style="margin-top:2px"><span class="ds-chip-dot"></span>Default</span>':'')+
+        '</div>'+
+        dsBtn(s.mute?'Unmute':'Mute', {{variant:'secondary', cls:'ds-btn-sm', onclick:"toggleMute(\\'"+s.id+"\\',"+(!s.mute)+")"}})+
+        (!s.default?dsBtn('Set Default', {{variant:'text', cls:'ds-btn-sm', onclick:"setDefaultSink(\\'"+s.id+"\\')"}}):'')+
+        '</div>'+
+        dsSlider({{id:'vol-'+s.id.replace(/[^a-z0-9]/gi,''), min:0, max:150, value:s.volume, label:'Volume', unit:'%',
+          oninput:"setVolume(\\'"+s.id+"\\',this.value)"}})+
+        '</div>'
+      ).join('')+'</div>';
+      html += '<div class="ds-section-label" style="margin-top:var(--ds-space-3)">Input</div>';
+      if(sources.length===0) html += '<div class="ds-body-sm ds-text-muted">No audio inputs</div>';
+      else html += '<div class="ds-stagger">'+sources.map(s=>
+        '<div class="ds-card" style="margin-bottom:var(--ds-space-2)">'+
+        '<div class="ds-flex ds-gap-3" style="align-items:center;margin-bottom:var(--ds-space-3)">'+
+        '<span class="mi material-icons-round ds-text-active" style="font-size:24px">mic</span>'+
+        '<div class="ds-title-sm ds-flex-1">'+s.name+'</div></div>'+
+        dsSlider({{id:'src-'+s.id.replace(/[^a-z0-9]/gi,''), min:0, max:150, value:s.volume, label:'Volume', unit:'%',
+          oninput:"setSourceVolume(\\'"+s.id+"\\',this.value)"}})+
+        '</div>'
+      ).join('')+'</div>';
+      html += '</div>';
+      el.innerHTML = html;
+    }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted ds-flex ds-flex-center" style="height:100px"><span class="mi material-icons-round" style="margin-right:8px">error_outline</span>Audio panel unavailable</div>'; }});
 }}
 
 function loadBluetoothPanel(el) {{
   fetch(SHELL+'/api/shell/bluetooth',{{signal:AbortSignal.timeout(5000)}})
     .then(r=>r.json()).then(data=>{{
       const devs = data.devices||[];
-      el.innerHTML = '<div style="display:grid;gap:10px">' +
-        '<div style="font-weight:var(--hart-heading-weight);font-size:var(--hart-heading-size);color:var(--hart-heading)">Bluetooth</div>' +
-        (devs.length===0?'<div style="color:var(--hart-muted)">No Bluetooth devices found</div>':
-        devs.map(d=>statusRow('bluetooth',d.name,d.mac,'var(--hart-accent)')).join('')) +
+      el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Bluetooth</div>'+
+        (devs.length===0?'<div class="ds-body-md ds-text-muted ds-flex ds-flex-center" style="height:80px"><span class="mi material-icons-round" style="margin-right:8px;font-size:32px;opacity:0.3">bluetooth_disabled</span>No Bluetooth devices found</div>':
+        '<div class="ds-stagger">'+devs.map(d=>dsStatusRow('bluetooth',d.name,d.mac,'var(--hart-accent)')).join('')+'</div>')+
         '</div>';
-    }}).catch(()=>{{ el.innerHTML='<div style="color:var(--hart-muted)">Bluetooth unavailable</div>'; }});
+    }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Bluetooth unavailable</div>'; }});
 }}
 
 function loadPowerPanel(el) {{
@@ -1204,30 +1876,86 @@ function loadPowerPanel(el) {{
       const remaining = data.time_remaining||'';
       const icon = pct>80?'battery_full':pct>50?'battery_5_bar':pct>20?'battery_3_bar':'battery_1_bar';
       const color = pct>20?'var(--hart-active)':pct>10?'var(--hart-caution)':'var(--hart-error)';
-      el.innerHTML = '<div style="display:grid;gap:12px">' +
-        '<div style="font-weight:var(--hart-heading-weight);font-size:var(--hart-heading-size);color:var(--hart-heading)">Power</div>' +
-        '<div style="text-align:center;padding:16px">' +
-        '<span class="mi material-icons-round" style="font-size:64px;color:'+color+'">'+icon+'</span>' +
-        '<div style="font-size:32px;font-weight:600;margin-top:8px">'+pct+'%</div>' +
-        '<div style="font-size:12px;color:var(--hart-muted);margin-top:4px">'+state+(remaining?' &middot; '+remaining:'')+'</div></div>' +
-        metricBar('Battery', pct, '%') +
+      el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Power</div>'+
+        '<div class="ds-card ds-card-elevated">'+
+        '<div class="ds-metric">'+
+        '<span class="mi material-icons-round ds-metric-icon" style="color:'+color+'">'+icon+'</span>'+
+        '<div class="ds-metric-value" style="color:'+color+'">'+pct+'%</div>'+
+        '<div class="ds-metric-label">'+state+(remaining?' &middot; '+remaining:'')+'</div></div></div>'+
+        dsMetricBar('Battery', pct, '%')+
         '</div>';
-    }}).catch(()=>{{ el.innerHTML='<div style="color:var(--hart-muted)">Power info unavailable</div>'; }});
+    }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted ds-flex ds-flex-center" style="height:100px"><span class="mi material-icons-round" style="margin-right:8px">error_outline</span>Power info unavailable</div>'; }});
+}}
+
+function setResolution(output, res, rate) {{
+  fetch(SHELL+'/api/shell/display/resolution', {{
+    method:'POST', headers:{{'Content-Type':'application/json'}},
+    body:JSON.stringify({{output:output, resolution:res, rate:rate}})
+  }}).then(r=>r.json()).then(d=>{{
+    if(d.success) {{ showToast('Display', 'Resolution updated', 'success'); loadDisplayPanel(document.getElementById('sys-display')); }}
+    else dsAlert('Resolution Change Failed', d.error||'Unknown error', 'error');
+  }}).catch(e=>dsAlert('Error', e.message, 'error'));
+}}
+function setBrightness(output, val) {{
+  fetch(SHELL+'/api/shell/display/brightness', {{
+    method:'POST', headers:{{'Content-Type':'application/json'}},
+    body:JSON.stringify({{output:output, brightness:val}})
+  }}).catch(()=>{{}});
 }}
 
 function loadDisplayPanel(el) {{
   fetch(SHELL+'/api/shell/display',{{signal:AbortSignal.timeout(5000)}})
     .then(r=>r.json()).then(data=>{{
       const displays = data.displays||[];
-      el.innerHTML = '<div style="display:grid;gap:10px">' +
-        '<div style="font-weight:var(--hart-heading-weight);font-size:var(--hart-heading-size);color:var(--hart-heading)">Displays</div>' +
-        (displays.length===0?'<div style="color:var(--hart-muted)">No displays detected</div>':
-        displays.map(d=>statusRow('desktop_windows',d.name,d.resolution,'var(--hart-accent)')).join('')) +
-        '</div>';
-    }}).catch(()=>{{ el.innerHTML='<div style="color:var(--hart-muted)">Display info unavailable</div>'; }});
+      if(displays.length===0) {{ el.innerHTML='<div class="ds-body-md ds-text-muted ds-flex ds-flex-center" style="height:100px"><span class="mi material-icons-round" style="margin-right:8px;font-size:32px;opacity:0.3">desktop_access_disabled</span>No displays detected</div>'; return; }}
+      el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Displays</div>'+
+        '<div class="ds-stagger">'+displays.map(d=>{{
+          const modes = d.modes||[];
+          let html = '<div class="ds-card" style="margin-bottom:var(--ds-space-2)">';
+          html += '<div class="ds-flex ds-gap-3" style="align-items:center;margin-bottom:var(--ds-space-4)">'+
+            '<span class="mi material-icons-round ds-text-accent" style="font-size:28px">desktop_windows</span>'+
+            '<div class="ds-flex-1"><div class="ds-title-sm">'+d.name+'</div>'+
+            '<span class="ds-label-sm ds-text-active">'+d.resolution+'</span></div></div>';
+          if(modes.length>0) {{
+            const options = modes.map(m=>{{
+              const r = m.rates&&m.rates[0]?m.rates[0]:'';
+              return {{value:m.resolution+'@'+r, label:m.resolution+(r?' @ '+r+'Hz':'')+(m.active?' (current)':''), selected:m.active}};
+            }});
+            html += dsSelect({{label:'Resolution', options:options,
+              onchange:"const p=this.value.split(\\'@\\');setResolution(\\'"+d.name+"\\',p[0],p[1])"}});
+          }}
+          html += '<div style="margin-top:var(--ds-space-4)">'+
+            dsSlider({{id:'bright-'+d.name.replace(/[^a-z0-9]/gi,''), min:10, max:100, value:100, label:'Brightness', unit:'%',
+              oninput:"setBrightness(\\'"+d.name+"\\',this.value/100)"}})+
+            '</div></div>';
+          return html;
+        }}).join('')+'</div></div>';
+    }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted ds-flex ds-flex-center" style="height:100px"><span class="mi material-icons-round" style="margin-right:8px">error_outline</span>Display info unavailable</div>'; }});
 }}
 
 // ═══ Remote Desktop Panel ═══
+function rdStartHost() {{
+  showToast('Remote Desktop', 'Starting host session...', 'info');
+  fetch(BACKEND+'/api/remote-desktop/host',{{method:'POST',headers:{{'Content-Type':'application/json'}},
+    body:JSON.stringify({{engine:'auto'}})}}).then(r=>r.json()).then(d=>{{
+    dsAlert('Host Started', 'Device ID: <strong>'+d.formatted_id+'</strong><br>Password: <strong>'+d.password+'</strong><br><br><span class="ds-label-sm ds-text-muted">Share these with the person connecting</span>', 'success');
+  }}).catch(e=>dsAlert('Host Failed', e.message, 'error'));
+}}
+function rdConnect() {{
+  dsPrompt('Connect to Device', 'Enter the remote device ID', {{placeholder:'XXX-XXX-XXX', okLabel:'Next'}}).then(function(id){{
+    if(!id) return;
+    dsPrompt('Enter Password', 'Password for device <strong>'+id+'</strong>', {{type:'password', placeholder:'Password', okLabel:'Connect'}}).then(function(pw){{
+      if(!pw) return;
+      showToast('Remote Desktop', 'Connecting to '+id+'...', 'info');
+      fetch(BACKEND+'/api/remote-desktop/connect',{{method:'POST',headers:{{'Content-Type':'application/json'}},
+        body:JSON.stringify({{device_id:id,password:pw}})}}).then(r=>r.json()).then(d=>{{
+        if(d.error) dsAlert('Connection Failed', d.error, 'error');
+        else showToast('Remote Desktop', d.message||'Connected', 'success');
+      }}).catch(e=>dsAlert('Connection Failed', e.message, 'error'));
+    }});
+  }});
+}}
+
 function loadRemoteDesktopPanel(el, apis) {{
   Promise.all(apis.map(u=>fetch(BACKEND+u,{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).catch(()=>({{}}))))
     .then(([status,engines,sessions])=>{{
@@ -1237,54 +1965,54 @@ function loadRemoteDesktopPanel(el, apis) {{
       const sess = (sessions.sessions || status.active_sessions || []);
       const recs = engines.install_recommendations || status.install_recommendations || [];
 
-      let html = '<div style="display:grid;gap:12px">';
-      html += '<div style="display:flex;justify-content:space-between;align-items:center">';
-      html += '<span style="font-weight:var(--hart-heading-weight);font-size:var(--hart-heading-size);color:var(--hart-heading)">Remote Desktop</span>';
-      html += '<span class="mi material-icons-round" style="font-size:20px;color:var(--hart-active)">connected_tv</span>';
-      html += '</div>';
+      let html = '<div class="ds-panel-grid ds-fade-in">';
+      html += '<div class="ds-panel-header"><span class="ds-panel-title">Remote Desktop</span>'+
+        '<span class="mi material-icons-round ds-text-active" style="font-size:24px">connected_tv</span></div>';
 
-      html += '<div style="padding:16px;border-radius:12px;background:var(--hart-surface);text-align:center;cursor:pointer" onclick="navigator.clipboard.writeText(\\''+deviceId+'\\').then(()=>this.querySelector(\\'.copy-hint\\').textContent=\\'Copied!\\')" title="Click to copy">';
-      html += '<div style="font-size:11px;color:var(--hart-muted);margin-bottom:4px">Your Device ID</div>';
-      html += '<div style="font-size:24px;font-weight:700;letter-spacing:3px;color:var(--hart-heading)">'+did+'</div>';
-      html += '<div class="copy-hint" style="font-size:10px;color:var(--hart-muted);margin-top:4px">Click to copy</div>';
-      html += '</div>';
+      // Device ID card
+      html += '<div class="ds-card ds-card-elevated ds-card-interactive" onclick="navigator.clipboard.writeText(\\''+deviceId+'\\').then(()=>{{this.querySelector(\\'.copy-hint\\').textContent=\\'Copied!\\';setTimeout(()=>this.querySelector(\\'.copy-hint\\').textContent=\\'Click to copy\\',2000)}})" title="Click to copy">';
+      html += '<div class="ds-metric"><div class="ds-label-sm ds-text-muted">Your Device ID</div>';
+      html += '<div class="ds-headline-md ds-text-heading" style="letter-spacing:3px;margin:var(--ds-space-2) 0">'+did+'</div>';
+      html += '<div class="copy-hint ds-label-sm ds-text-muted">Click to copy</div></div></div>';
 
-      html += '<div style="font-weight:600;font-size:12px;color:var(--hart-muted);text-transform:uppercase;letter-spacing:1px">Engines</div>';
+      // Engines
+      html += '<div class="ds-section-label">Engines</div><div class="ds-stagger">';
       for(const [name,info] of Object.entries(engineList)) {{
         const avail = info.available;
-        const color = avail ? 'var(--hart-active)' : 'var(--hart-muted)';
-        const icon = avail ? 'check_circle' : 'cancel';
-        html += statusRow(icon, name.charAt(0).toUpperCase()+name.slice(1), avail?'Available':'Not installed', color);
+        html += dsStatusRow(avail?'check_circle':'cancel',
+          name.charAt(0).toUpperCase()+name.slice(1),
+          avail?'Available':'Not installed',
+          avail?'var(--hart-active)':'var(--hart-muted)');
       }}
+      html += '</div>';
 
+      // Sessions
       if(sess.length > 0) {{
-        html += '<div style="font-weight:600;font-size:12px;color:var(--hart-muted);text-transform:uppercase;letter-spacing:1px;margin-top:4px">Active Sessions ('+sess.length+')</div>';
+        html += '<div class="ds-section-label">Active Sessions ('+sess.length+')</div><div class="ds-stagger">';
         for(const s of sess) {{
-          html += '<div style="padding:8px;border-radius:8px;background:var(--hart-surface);display:flex;justify-content:space-between;align-items:center">';
-          html += '<span style="font-size:12px">'+s.session_id.substring(0,8)+' &mdash; '+s.mode+'</span>';
-          html += '<span style="font-size:11px;color:var(--hart-active)">'+s.state+'</span>';
-          html += '</div>';
+          html += dsStatusRow('cast_connected', s.session_id.substring(0,8)+' &mdash; '+s.mode, s.state, 'var(--hart-active)');
         }}
+        html += '</div>';
       }}
 
+      // Recommendations
       if(recs.length > 0) {{
-        html += '<div style="font-weight:600;font-size:12px;color:var(--hart-muted);text-transform:uppercase;letter-spacing:1px;margin-top:4px">Recommended</div>';
+        html += '<div class="ds-section-label">Recommended</div><div class="ds-stagger">';
         for(const r of recs) {{
-          html += '<div style="padding:8px;border-radius:8px;background:var(--hart-surface)">';
-          html += '<div style="font-size:12px;font-weight:600">'+r.engine+'</div>';
-          html += '<div style="font-size:11px;color:var(--hart-muted)">'+r.reason+'</div>';
-          html += '</div>';
+          html += dsStatusRow('recommend', r.engine, r.reason, 'var(--hart-accent)');
         }}
+        html += '</div>';
       }}
 
-      html += '<div style="display:flex;gap:8px;margin-top:8px">';
-      html += '<button onclick="fetch(BACKEND+\\'/api/remote-desktop/host\\',{{method:\\'POST\\',headers:{{\\'Content-Type\\':\\'application/json\\'}},body:JSON.stringify({{engine:\\'auto\\'}})}}).then(r=>r.json()).then(d=>alert(\\'Hosting started!\\\\nDevice ID: \\'+d.formatted_id+\\'\\\\nPassword: \\'+d.password))" style="flex:1;padding:10px;border:none;border-radius:8px;background:var(--hart-active);color:white;font-weight:600;cursor:pointer">Host</button>';
-      html += '<button onclick="const id=prompt(\\'Enter Device ID:\\');if(id){{const pw=prompt(\\'Password:\\');if(pw)fetch(BACKEND+\\'/api/remote-desktop/connect\\',{{method:\\'POST\\',headers:{{\\'Content-Type\\':\\'application/json\\'}},body:JSON.stringify({{device_id:id,password:pw}})}}).then(r=>r.json()).then(d=>alert(d.message||d.error||JSON.stringify(d)))}}" style="flex:1;padding:10px;border:none;border-radius:8px;background:var(--hart-surface);color:var(--hart-heading);font-weight:600;cursor:pointer;border:1px solid var(--hart-border)">Connect</button>';
+      // Action buttons
+      html += '<div class="ds-flex ds-gap-3" style="margin-top:var(--ds-space-2)">';
+      html += dsBtn('Host', {{variant:'primary', icon:'screen_share', onclick:'rdStartHost()'}});
+      html += dsBtn('Connect', {{variant:'secondary', icon:'cast', onclick:'rdConnect()'}});
       html += '</div>';
 
       html += '</div>';
       el.innerHTML = html;
-    }});
+    }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted ds-flex ds-flex-center" style="height:100px"><span class="mi material-icons-round" style="margin-right:8px">error_outline</span>Remote desktop unavailable</div>'; }});
 }}
 
 // ═══ Agent Pill ═══
@@ -1428,9 +2156,12 @@ function shellAction(action) {{
     document.getElementById('lock-pw').focus();
     return;
   }}
-  if(confirm('Are you sure you want to '+action+'?')) {{
-    fetch(SHELL+'/api/shell/session/'+action,{{method:'POST'}}).catch(()=>{{}});
-  }}
+  const labels = {{suspend:'put the system to sleep',restart:'restart the system',shutdown:'shut down the system'}};
+  dsConfirm(action.charAt(0).toUpperCase()+action.slice(1),
+    'Are you sure you want to '+(labels[action]||action)+'?',
+    {{okLabel:action.charAt(0).toUpperCase()+action.slice(1), danger:action==='shutdown'}}).then(function(ok){{
+    if(ok) fetch(SHELL+'/api/shell/session/'+action,{{method:'POST'}}).catch(()=>{{}});
+  }});
 }}
 function unlock() {{
   // In production: PAM verification. Dev mode: any password works.
@@ -1883,20 +2614,118 @@ if(!PERF.potato) {{
                 pass
             return jsonify({'networks': networks[:20], 'connected': connected})
 
+        @app.route('/api/shell/network/wifi/connect', methods=['POST'])
+        def shell_wifi_connect():
+            data = request.get_json(silent=True) or {}
+            ssid = data.get('ssid', '').strip()
+            password = data.get('password', '')
+            if not ssid:
+                return jsonify({'success': False, 'error': 'SSID required'}), 400
+            try:
+                cmd = ['nmcli', 'device', 'wifi', 'connect', ssid]
+                if password:
+                    cmd += ['password', password]
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                if r.returncode == 0:
+                    return jsonify({'success': True, 'message': f'Connected to {ssid}'})
+                return jsonify({'success': False, 'error': r.stderr.strip() or 'Connection failed'}), 400
+            except subprocess.TimeoutExpired:
+                return jsonify({'success': False, 'error': 'Connection timed out'}), 504
+            except Exception as e:
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @app.route('/api/shell/network/wifi/disconnect', methods=['POST'])
+        def shell_wifi_disconnect():
+            try:
+                r = subprocess.run(
+                    ['nmcli', 'device', 'disconnect', 'wlan0'],
+                    capture_output=True, text=True, timeout=10)
+                # Try common interface names if wlan0 fails
+                if r.returncode != 0:
+                    r = subprocess.run(
+                        ['nmcli', 'device', 'disconnect', 'wlp0s20f3'],
+                        capture_output=True, text=True, timeout=10)
+                if r.returncode == 0:
+                    return jsonify({'success': True, 'message': 'Disconnected from WiFi'})
+                return jsonify({'success': False, 'error': r.stderr.strip() or 'Disconnect failed'}), 400
+            except Exception as e:
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @app.route('/api/shell/network/status', methods=['GET'])
+        def shell_network_status():
+            status = {'interfaces': [], 'dns': [], 'gateway': ''}
+            try:
+                r = subprocess.run(
+                    ['nmcli', '-t', '-f', 'DEVICE,TYPE,STATE,CONNECTION',
+                     'device', 'status'],
+                    capture_output=True, text=True, timeout=5)
+                for line in r.stdout.strip().split('\n'):
+                    parts = line.split(':')
+                    if len(parts) >= 4:
+                        status['interfaces'].append({
+                            'device': parts[0], 'type': parts[1],
+                            'state': parts[2], 'connection': parts[3],
+                        })
+            except Exception:
+                pass
+            try:
+                r = subprocess.run(
+                    ['ip', 'route', 'show', 'default'],
+                    capture_output=True, text=True, timeout=3)
+                parts = r.stdout.strip().split()
+                if 'via' in parts:
+                    status['gateway'] = parts[parts.index('via') + 1]
+            except Exception:
+                pass
+            try:
+                r = subprocess.run(
+                    ['resolvectl', 'status', '--no-pager'],
+                    capture_output=True, text=True, timeout=3)
+                for line in r.stdout.split('\n'):
+                    if 'DNS Servers' in line:
+                        status['dns'] = line.split(':',1)[1].strip().split()
+                        break
+            except Exception:
+                pass
+            return jsonify(status)
+
         # ── Shell APIs: Audio ──
+        def _parse_volume(vol_info):
+            """Extract volume percentage from pactl volume info dict."""
+            if isinstance(vol_info, dict):
+                for ch in vol_info.values():
+                    if isinstance(ch, dict) and 'value_percent' in ch:
+                        return int(ch['value_percent'].rstrip('%'))
+                    if isinstance(ch, dict) and 'value' in ch:
+                        # value is 0-65536 scale
+                        return round(int(ch['value']) / 655.36)
+            return 100
+
         @app.route('/api/shell/audio', methods=['GET'])
         def shell_audio():
             sinks = []
             sources = []
+            default_sink = ''
+            try:
+                r = subprocess.run(
+                    ['pactl', 'get-default-sink'],
+                    capture_output=True, text=True, timeout=3)
+                default_sink = r.stdout.strip()
+            except Exception:
+                pass
             try:
                 r = subprocess.run(
                     ['pactl', '--format=json', 'list', 'sinks'],
                     capture_output=True, text=True, timeout=5)
                 if r.stdout.strip():
                     raw = json.loads(r.stdout)
-                    sinks = [{'name': s.get('description', ''),
-                              'mute': s.get('mute', False)}
-                             for s in raw]
+                    sinks = [{
+                        'id': s.get('name', ''),
+                        'name': s.get('description', ''),
+                        'mute': s.get('mute', False),
+                        'volume': _parse_volume(s.get('volume', {})),
+                        'default': s.get('name', '') == default_sink,
+                    } for s in raw]
             except Exception:
                 pass
             try:
@@ -1905,11 +2734,84 @@ if(!PERF.potato) {{
                     capture_output=True, text=True, timeout=5)
                 if r.stdout.strip():
                     raw = json.loads(r.stdout)
-                    sources = [{'name': s.get('description', '')}
-                               for s in raw]
+                    sources = [{
+                        'id': s.get('name', ''),
+                        'name': s.get('description', ''),
+                        'volume': _parse_volume(s.get('volume', {})),
+                    } for s in raw]
             except Exception:
                 pass
             return jsonify({'sinks': sinks, 'sources': sources})
+
+        @app.route('/api/shell/audio/volume', methods=['POST'])
+        def shell_audio_volume():
+            data = request.get_json(silent=True) or {}
+            sink_id = data.get('sink_id', '')
+            volume = data.get('volume')
+            if not sink_id or volume is None:
+                return jsonify({'success': False, 'error': 'sink_id and volume required'}), 400
+            volume = max(0, min(150, int(volume)))
+            try:
+                r = subprocess.run(
+                    ['pactl', 'set-sink-volume', sink_id, f'{volume}%'],
+                    capture_output=True, text=True, timeout=5)
+                if r.returncode == 0:
+                    return jsonify({'success': True, 'volume': volume})
+                return jsonify({'success': False, 'error': r.stderr.strip()}), 400
+            except Exception as e:
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @app.route('/api/shell/audio/mute', methods=['POST'])
+        def shell_audio_mute():
+            data = request.get_json(silent=True) or {}
+            sink_id = data.get('sink_id', '')
+            muted = data.get('muted', True)
+            if not sink_id:
+                return jsonify({'success': False, 'error': 'sink_id required'}), 400
+            try:
+                val = '1' if muted else '0'
+                r = subprocess.run(
+                    ['pactl', 'set-sink-mute', sink_id, val],
+                    capture_output=True, text=True, timeout=5)
+                if r.returncode == 0:
+                    return jsonify({'success': True, 'muted': muted})
+                return jsonify({'success': False, 'error': r.stderr.strip()}), 400
+            except Exception as e:
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @app.route('/api/shell/audio/default', methods=['POST'])
+        def shell_audio_default():
+            data = request.get_json(silent=True) or {}
+            sink_id = data.get('sink_id', '')
+            if not sink_id:
+                return jsonify({'success': False, 'error': 'sink_id required'}), 400
+            try:
+                r = subprocess.run(
+                    ['pactl', 'set-default-sink', sink_id],
+                    capture_output=True, text=True, timeout=5)
+                if r.returncode == 0:
+                    return jsonify({'success': True, 'default_sink': sink_id})
+                return jsonify({'success': False, 'error': r.stderr.strip()}), 400
+            except Exception as e:
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @app.route('/api/shell/audio/source/volume', methods=['POST'])
+        def shell_audio_source_volume():
+            data = request.get_json(silent=True) or {}
+            source_id = data.get('source_id', '')
+            volume = data.get('volume')
+            if not source_id or volume is None:
+                return jsonify({'success': False, 'error': 'source_id and volume required'}), 400
+            volume = max(0, min(150, int(volume)))
+            try:
+                r = subprocess.run(
+                    ['pactl', 'set-source-volume', source_id, f'{volume}%'],
+                    capture_output=True, text=True, timeout=5)
+                if r.returncode == 0:
+                    return jsonify({'success': True, 'volume': volume})
+                return jsonify({'success': False, 'error': r.stderr.strip()}), 400
+            except Exception as e:
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         # ── Shell APIs: Bluetooth ──
         @app.route('/api/shell/bluetooth', methods=['GET'])
@@ -1961,16 +2863,255 @@ if(!PERF.potato) {{
                 r = subprocess.run(
                     ['xrandr', '--current'],
                     capture_output=True, text=True, timeout=5)
+                current_display = None
                 for line in r.stdout.split('\n'):
                     if ' connected' in line:
                         parts = line.split()
-                        displays.append({
+                        # Find resolution: skip 'primary' keyword if present
+                        res = 'unknown'
+                        for p in parts[2:]:
+                            if 'x' in p and p[0].isdigit():
+                                res = p.split('+')[0]  # strip offset
+                                break
+                        current_display = {
                             'name': parts[0],
-                            'resolution': parts[2] if len(parts) > 2 else 'unknown',
-                        })
+                            'resolution': res,
+                            'modes': [],
+                        }
+                        displays.append(current_display)
+                    elif current_display and line.startswith('   '):
+                        # Mode line: "   1920x1080     60.00*+  50.00"
+                        mode_parts = line.strip().split()
+                        if mode_parts:
+                            mode = mode_parts[0]
+                            rates = []
+                            active = False
+                            for p in mode_parts[1:]:
+                                clean = p.replace('*', '').replace('+', '')
+                                if '*' in p:
+                                    active = True
+                                try:
+                                    rates.append(float(clean))
+                                except ValueError:
+                                    pass
+                            current_display['modes'].append({
+                                'resolution': mode,
+                                'rates': rates,
+                                'active': active,
+                            })
+                    elif not line.startswith(' '):
+                        current_display = None
             except Exception:
                 pass
             return jsonify({'displays': displays})
+
+        @app.route('/api/shell/display/resolution', methods=['POST'])
+        def shell_display_resolution():
+            data = request.get_json(silent=True) or {}
+            output = data.get('output', '')
+            resolution = data.get('resolution', '')
+            rate = data.get('rate')
+            if not output or not resolution:
+                return jsonify({'success': False, 'error': 'output and resolution required'}), 400
+            try:
+                cmd = ['xrandr', '--output', output, '--mode', resolution]
+                if rate:
+                    cmd += ['--rate', str(rate)]
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                if r.returncode == 0:
+                    return jsonify({'success': True, 'output': output, 'resolution': resolution})
+                return jsonify({'success': False, 'error': r.stderr.strip() or 'Failed to set resolution'}), 400
+            except Exception as e:
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @app.route('/api/shell/display/brightness', methods=['POST'])
+        def shell_display_brightness():
+            data = request.get_json(silent=True) or {}
+            output = data.get('output', '')
+            brightness = data.get('brightness')
+            if not output or brightness is None:
+                return jsonify({'success': False, 'error': 'output and brightness required'}), 400
+            brightness = max(0.1, min(1.0, float(brightness)))
+            try:
+                r = subprocess.run(
+                    ['xrandr', '--output', output, '--brightness', str(brightness)],
+                    capture_output=True, text=True, timeout=5)
+                if r.returncode == 0:
+                    return jsonify({'success': True, 'brightness': brightness})
+                return jsonify({'success': False, 'error': r.stderr.strip()}), 400
+            except Exception as e:
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @app.route('/api/shell/display/scale', methods=['POST'])
+        def shell_display_scale():
+            data = request.get_json(silent=True) or {}
+            output = data.get('output', '')
+            scale = data.get('scale')
+            if not output or scale is None:
+                return jsonify({'success': False, 'error': 'output and scale required'}), 400
+            scale = max(0.5, min(3.0, float(scale)))
+            try:
+                # xrandr scale is inverse: scale 2.0 means 0.5x transform
+                transform = str(round(1.0 / scale, 4))
+                r = subprocess.run(
+                    ['xrandr', '--output', output, '--scale', f'{transform}x{transform}'],
+                    capture_output=True, text=True, timeout=5)
+                if r.returncode == 0:
+                    return jsonify({'success': True, 'scale': scale})
+                return jsonify({'success': False, 'error': r.stderr.strip()}), 400
+            except Exception as e:
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        # ── Shell APIs: System Metrics ──
+        @app.route('/api/shell/system/metrics', methods=['GET'])
+        def shell_system_metrics():
+            metrics = {}
+            try:
+                import psutil
+                metrics['cpu_percent'] = psutil.cpu_percent(interval=0.5)
+                metrics['cpu_count'] = psutil.cpu_count()
+                mem = psutil.virtual_memory()
+                metrics['ram'] = {
+                    'total_gb': round(mem.total / (1024**3), 1),
+                    'used_gb': round(mem.used / (1024**3), 1),
+                    'percent': mem.percent,
+                }
+                disks = []
+                for part in psutil.disk_partitions():
+                    try:
+                        usage = psutil.disk_usage(part.mountpoint)
+                        disks.append({
+                            'mount': part.mountpoint,
+                            'device': part.device,
+                            'total_gb': round(usage.total / (1024**3), 1),
+                            'used_gb': round(usage.used / (1024**3), 1),
+                            'percent': usage.percent,
+                        })
+                    except (PermissionError, OSError):
+                        pass
+                metrics['disks'] = disks
+                net = psutil.net_io_counters()
+                metrics['network'] = {
+                    'bytes_sent': net.bytes_sent,
+                    'bytes_recv': net.bytes_recv,
+                }
+                metrics['load_avg'] = list(psutil.getloadavg()) if hasattr(psutil, 'getloadavg') else []
+                metrics['uptime_seconds'] = int(
+                    __import__('time').time() - psutil.boot_time())
+                # Temperatures if available
+                try:
+                    temps = psutil.sensors_temperatures()
+                    if temps:
+                        metrics['temperatures'] = {
+                            name: [{'label': s.label, 'current': s.current}
+                                   for s in sensors[:3]]
+                            for name, sensors in temps.items()
+                        }
+                except (AttributeError, Exception):
+                    pass
+            except ImportError:
+                metrics['error'] = 'psutil not installed'
+            # GPU via VRAMManager
+            try:
+                from integrations.service_tools.vram_manager import VRAMManager
+                gpu = VRAMManager.detect_gpu()
+                if gpu and gpu.get('name'):
+                    metrics['gpu'] = gpu
+            except Exception:
+                pass
+            return jsonify(metrics)
+
+        @app.route('/api/shell/system/processes', methods=['GET'])
+        def shell_system_processes():
+            procs = []
+            try:
+                import psutil
+                for p in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent']):
+                    try:
+                        info = p.info
+                        if info.get('cpu_percent', 0) > 0 or info.get('memory_percent', 0) > 0.1:
+                            procs.append({
+                                'pid': info['pid'],
+                                'name': info['name'],
+                                'cpu': round(info.get('cpu_percent', 0), 1),
+                                'mem': round(info.get('memory_percent', 0), 1),
+                            })
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+                procs.sort(key=lambda p: p['cpu'], reverse=True)
+            except ImportError:
+                pass
+            return jsonify({'processes': procs[:30]})
+
+        # ── Shell APIs: Log Viewer ──
+        @app.route('/api/shell/system/logs', methods=['GET'])
+        def shell_system_logs():
+            unit = request.args.get('unit', 'hart-*')
+            lines = int(request.args.get('lines', 100))
+            priority = request.args.get('priority', '')
+            since = request.args.get('since', '')
+            grep_pattern = request.args.get('grep', '')
+            lines = max(1, min(1000, lines))
+            try:
+                cmd = ['journalctl', '--output=json', '--no-pager',
+                       '-u', unit, '-n', str(lines)]
+                if priority:
+                    cmd += ['-p', priority]
+                if since:
+                    cmd += ['--since', since]
+                if grep_pattern:
+                    cmd += ['-g', grep_pattern]
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                entries = []
+                for line in r.stdout.strip().split('\n'):
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        entries.append({
+                            'timestamp': entry.get('__REALTIME_TIMESTAMP', ''),
+                            'unit': entry.get('_SYSTEMD_UNIT', ''),
+                            'priority': entry.get('PRIORITY', ''),
+                            'message': entry.get('MESSAGE', ''),
+                        })
+                    except json.JSONDecodeError:
+                        pass
+                return jsonify({'entries': entries, 'count': len(entries)})
+            except FileNotFoundError:
+                return jsonify({'entries': [], 'count': 0,
+                                'error': 'journalctl not available'}), 200
+            except Exception as e:
+                return jsonify({'entries': [], 'error': str(e)}), 500
+
+        @app.route('/api/shell/system/logs/stream', methods=['GET'])
+        def shell_system_logs_stream():
+            unit = request.args.get('unit', 'hart-*')
+            def generate():
+                try:
+                    proc = subprocess.Popen(
+                        ['journalctl', '--output=json', '--no-pager',
+                         '-f', '-u', unit],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        text=True)
+                    for line in proc.stdout:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            entry = json.loads(line)
+                            data = json.dumps({
+                                'timestamp': entry.get('__REALTIME_TIMESTAMP', ''),
+                                'unit': entry.get('_SYSTEMD_UNIT', ''),
+                                'message': entry.get('MESSAGE', ''),
+                            })
+                            yield f'data: {data}\n\n'
+                        except json.JSONDecodeError:
+                            pass
+                except Exception:
+                    yield 'data: {"error": "stream unavailable"}\n\n'
+            return Response(generate(), mimetype='text/event-stream',
+                            headers={'Cache-Control': 'no-cache',
+                                     'X-Accel-Buffering': 'no'})
 
         # ── Shell APIs: Recent Files ──
         @app.route('/api/shell/files/recent', methods=['GET'])

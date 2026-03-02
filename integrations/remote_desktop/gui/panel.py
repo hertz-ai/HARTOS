@@ -22,6 +22,7 @@ logger = logging.getLogger('hevolve.remote_desktop')
 def get_panel_data() -> Dict[str, Any]:
     """Aggregate all data needed by the remote desktop glass panel.
 
+    Tries orchestrator first (unified view), falls back to individual modules.
     Returns dict consumed by the JS panel renderer and the API endpoints.
     """
     result = {
@@ -30,8 +31,36 @@ def get_panel_data() -> Dict[str, Any]:
         'engines': {},
         'sessions': [],
         'install_recommendations': [],
+        'orchestrator_active': False,
     }
 
+    # Try orchestrator first (unified status)
+    try:
+        from integrations.remote_desktop.orchestrator import get_orchestrator
+        orch = get_orchestrator()
+        status = orch.get_status()
+        if status.get('started'):
+            result['orchestrator_active'] = True
+            result['device_id'] = status.get('device_id')
+            result['formatted_id'] = status.get('formatted_id')
+            result['sessions'] = status.get('sessions', [])
+            # Engine status from service manager
+            engine_data = status.get('engines', {})
+            result['engines'] = {
+                name: {
+                    'available': info.get('installed', False),
+                    'running': info.get('running', False),
+                    'healthy': info.get('healthy', False),
+                    'engine': name,
+                }
+                for name, info in engine_data.items()
+                if isinstance(info, dict)
+            }
+            return result
+    except Exception:
+        pass
+
+    # Fallback: individual module queries
     # Device identity
     try:
         from integrations.remote_desktop.device_id import get_device_id, format_device_id
