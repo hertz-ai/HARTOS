@@ -47,6 +47,16 @@
       ./modules/hart-compute-mesh.nix
       ./modules/hart-liquid-ui.nix
       ./modules/hart-app-bridge.nix
+      # Remote Desktop peripherals + casting
+      ./modules/hart-peripheral-bridge.nix
+      ./modules/hart-dlna.nix
+      # OS management
+      ./modules/hart-ota.nix
+      ./modules/hart-nvidia.nix
+      ./modules/hart-luks.nix
+      ./modules/hart-firewall.nix
+      ./modules/hart-power.nix
+      ./modules/hart-accessibility.nix
     ];
 
     # Common specialArgs passed to all modules

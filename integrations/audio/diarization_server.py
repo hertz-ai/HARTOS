@@ -204,11 +204,13 @@ async def main(port, device, output_dir, hf_token):
 
 
 if __name__ == "__main__":
+    from core.port_registry import get_port as _get_port
     parser = argparse.ArgumentParser(
         description='Speaker Diarization Sidecar')
     parser.add_argument(
         '--port', type=int,
-        default=int(os.environ.get('HEVOLVE_DIARIZATION_PORT', 8004)))
+        default=int(os.environ.get('HEVOLVE_DIARIZATION_PORT',
+                                     _get_port('diarization'))))
     parser.add_argument(
         '--device',
         default=os.environ.get('HEVOLVE_DIARIZATION_DEVICE', None))

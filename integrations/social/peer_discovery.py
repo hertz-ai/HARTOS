@@ -1029,7 +1029,10 @@ class AutoDiscovery:
     def __init__(self, gossip_protocol: GossipProtocol,
                  port: int = None, beacon_interval: int = None):
         self._gossip = gossip_protocol
-        self._port = port or int(os.environ.get('HEVOLVE_DISCOVERY_PORT', '6780'))
+        from core.port_registry import get_port
+        # Legacy env var takes precedence for backward compat
+        _legacy = os.environ.get('HEVOLVE_DISCOVERY_PORT')
+        self._port = port or (int(_legacy) if _legacy else get_port('discovery'))
         self._beacon_interval = beacon_interval or int(
             os.environ.get('HEVOLVE_DISCOVERY_INTERVAL', '30'))
         self._running = False

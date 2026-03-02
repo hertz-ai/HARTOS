@@ -30,6 +30,8 @@ class UseCase(Enum):
     FILE_TRANSFER = 'file_transfer'
     VLM_COMPUTER_USE = 'vlm_computer_use'
     GAMING = 'gaming'
+    PERIPHERAL_FORWARD = 'peripheral_forward'
+    SCREEN_CAST = 'screen_cast'
     GENERAL = 'general'
 
 
@@ -212,3 +214,67 @@ def get_available_engines() -> List[Engine]:
         result.append(Engine.MOONLIGHT)
     result.append(Engine.NATIVE)
     return result
+
+
+def recommend_engine_switch(current_engine: str,
+                            context: Optional[Dict] = None) -> Optional[Dict]:
+    """AI-native: Recommend switching to a better engine based on context.
+
+    Args:
+        current_engine: Currently active engine name (e.g., 'rustdesk')
+        context: Session context — {mode, fps, latency_ms, use_case, ...}
+
+    Returns:
+        {recommend: str, reason: str, current: str} or None.
+    """
+    if context is None:
+        context = {}
+
+    engines = _detect_engines()
+    mode = context.get('mode', 'full_control')
+    use_case = context.get('use_case', 'general')
+
+    # File transfer on Moonlight/Native → suggest RustDesk
+    if mode == 'file_transfer' and current_engine != 'rustdesk':
+        if engines.get('rustdesk'):
+            return {
+                'recommend': 'rustdesk',
+                'reason': 'RustDesk has native file transfer (drag-and-drop)',
+                'current': current_engine,
+            }
+
+    # Gaming/VLM on RustDesk → suggest Moonlight
+    if use_case in ('gaming', 'vlm_computer_use') and current_engine == 'rustdesk':
+        if engines.get('moonlight'):
+            return {
+                'recommend': 'moonlight',
+                'reason': 'Moonlight offers hardware-decoded 4K@120fps with <10ms latency',
+                'current': current_engine,
+            }
+
+    # High latency on WAMP relay → suggest installing engines
+    latency = context.get('latency_ms', 0)
+    if latency > 200 and current_engine == 'native':
+        if engines.get('rustdesk'):
+            return {
+                'recommend': 'rustdesk',
+                'reason': f'High latency ({latency}ms). RustDesk has better NAT traversal.',
+                'current': current_engine,
+            }
+
+    # Native fallback when engines available → suggest upgrade
+    if current_engine == 'native':
+        if engines.get('rustdesk'):
+            return {
+                'recommend': 'rustdesk',
+                'reason': 'RustDesk provides better quality, clipboard, and file transfer',
+                'current': current_engine,
+            }
+        if engines.get('moonlight'):
+            return {
+                'recommend': 'moonlight',
+                'reason': 'Moonlight provides hardware-accelerated streaming',
+                'current': current_engine,
+            }
+
+    return None

@@ -47,12 +47,16 @@ class TransportTier(Enum):
 
 
 class MessageType(Enum):
-    FRAME = 'frame'          # Binary screen frame (host→viewer)
-    INPUT = 'input'          # JSON mouse/keyboard event (viewer→host)
-    CLIPBOARD = 'clipboard'  # JSON clipboard content (bidirectional)
-    FILE_CTRL = 'file_ctrl'  # JSON file transfer control
-    FILE_DATA = 'file_data'  # Binary file chunk
-    CONTROL = 'control'      # JSON session control (both)
+    FRAME = 'frame'              # Binary screen frame (host→viewer)
+    INPUT = 'input'              # JSON mouse/keyboard event (viewer→host)
+    CLIPBOARD = 'clipboard'      # JSON clipboard content (bidirectional)
+    FILE_CTRL = 'file_ctrl'      # JSON file transfer control
+    FILE_DATA = 'file_data'      # Binary file chunk
+    CONTROL = 'control'          # JSON session control (both)
+    WINDOW_LIST = 'window_list'  # JSON list of available windows (host→viewer)
+    WINDOW_FRAME = 'window_frame'  # Binary frame for specific window session
+    DRAG_DROP = 'drag_drop'      # JSON drag-and-drop event (bidirectional)
+    PERIPHERAL = 'peripheral'    # JSON peripheral device event (bidirectional)
 
 
 # ── Transport Channel ABC ───────────────────────────────────────

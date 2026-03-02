@@ -72,8 +72,9 @@ class VisionBackend(ABC):
 class MiniCPMBackend(VisionBackend):
     """Full MiniCPM-V-2 backend — existing sidecar subprocess."""
 
-    def __init__(self, port: int = 9891):
-        self._port = int(os.environ.get('HEVOLVE_MINICPM_PORT', port))
+    def __init__(self, port: int = None):
+        from core.port_registry import get_port
+        self._port = int(os.environ.get('HEVOLVE_MINICPM_PORT', port or get_port('vision')))
 
     @property
     def name(self) -> str:

@@ -6,6 +6,7 @@ Provides:
 - http_pool: Connection-pooled HTTP sessions
 - event_loop: Singleton event loop management
 - session_cache: TTL-based session caching for global dicts
+- platform: OS platform layer (ServiceRegistry, EventBus, AppRegistry, etc.)
 """
 
 from core.config_cache import get_config, get_secret

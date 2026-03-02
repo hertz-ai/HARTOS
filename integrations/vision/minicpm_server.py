@@ -163,7 +163,8 @@ def main():
     parser.add_argument('--model_dir', default=os.path.join(
         os.path.expanduser('~'), '.hevolve', 'models', 'minicpm',
     ))
-    parser.add_argument('--port', type=int, default=9891)
+    from core.port_registry import get_port
+    parser.add_argument('--port', type=int, default=get_port('vision'))
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--log_file', default='minicpm_sidecar.log')

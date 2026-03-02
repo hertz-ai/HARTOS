@@ -40,8 +40,8 @@ class VisionService:
 
     def __init__(
         self,
-        minicpm_port: int = 9891,
-        ws_port: int = 5460,
+        minicpm_port: int = None,
+        ws_port: int = None,
         description_interval: float = 4.0,
         max_description_interval: float = 30.0,
         min_scene_change: float = 0.01,
@@ -51,8 +51,9 @@ class VisionService:
         callback_url: Optional[str] = None,
         trigger_manager=None,
     ):
-        self._minicpm_port = int(os.environ.get('HEVOLVE_MINICPM_PORT', minicpm_port))
-        self._ws_port = int(os.environ.get('VISION_WS_PORT', ws_port))
+        from core.port_registry import get_port
+        self._minicpm_port = int(os.environ.get('HEVOLVE_MINICPM_PORT', minicpm_port or get_port('vision')))
+        self._ws_port = int(os.environ.get('VISION_WS_PORT', ws_port or get_port('websocket')))
         self._description_interval = description_interval
         self._max_interval = max_description_interval
         self._min_scene_change = min_scene_change

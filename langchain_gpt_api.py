@@ -504,7 +504,8 @@ except Exception as e:
 # Initialize A2A server for cross-platform agent communication
 try:
     app.logger.info("Initializing Google A2A Protocol server...")
-    a2a_server = initialize_a2a_server(app, base_url="http://localhost:6777")
+    from core.port_registry import get_port as _a2a_get_port
+    a2a_server = initialize_a2a_server(app, base_url=f"http://localhost:{_a2a_get_port('backend')}")
     app.logger.info("Google A2A Protocol server initialized successfully")
 
     # Register all agents with A2A
@@ -1362,7 +1363,10 @@ def get_tools(req_tool, is_first: bool = False):
         tools += tool
         # Wrap all tool functions with logging
         for t in tools:
-            t.func = _with_tool_logging(t.func, t.name)
+            if hasattr(t, 'func') and callable(t.func):
+                t.func = _with_tool_logging(t.func, t.name)
+            elif hasattr(t, '_run') and callable(t._run):
+                t._run = _with_tool_logging(t._run, t.name)
         return tools
 
     else:
@@ -1502,6 +1506,8 @@ def get_tools(req_tool, is_first: bool = False):
         for t in tools:
             if hasattr(t, 'func') and callable(t.func):
                 t.func = _with_tool_logging(t.func, t.name)
+            elif hasattr(t, '_run') and callable(t._run):
+                t._run = _with_tool_logging(t._run, t.name)
 
         tool_strings = "\n".join(
             f"\n> {tool.name}: {tool.description}" for tool in tools)
@@ -3511,6 +3517,11 @@ def chat():
             created_json = json.load(file)
 
 
+        if chat_agent is None:
+            return jsonify({'response': 'Agent reuse module is unavailable. Please check server dependencies.',
+                            'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0,
+                            'history_request_id': []})
+
         response = chat_agent(user_id,prompt,prompt_id,file_id,request_id)
 
         # --- Step 17: Check if the reuse agent intelligently decided to create a new agent ---
@@ -3712,6 +3723,10 @@ def chat():
 
 
 def evaluate_agent_after_creation_in_review(file_id, prompt, prompt_id, request_id, user_id):
+    if chat_agent is None:
+        return jsonify({'response': 'Agent reuse module is unavailable. Please check server dependencies.',
+                        'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0,
+                        'history_request_id': [], 'Agent_status': 'Evaluation Mode'})
     response = chat_agent(user_id, prompt, prompt_id, file_id, request_id)
     _record_lifecycle('Evaluation Mode', user_id, prompt_id, 'Agent being evaluated after creation')
     _resonance = _tune_resonance_after_chat(user_id, prompt, response)
@@ -5287,7 +5302,8 @@ def main():
     skills_thread = threading.Thread(target=_init_skills, daemon=True)
     skills_thread.start()
 
-    serve(app, host='0.0.0.0', port=6777, threads=50)
+    from core.port_registry import get_port
+    serve(app, host='0.0.0.0', port=get_port('backend'), threads=50)
 
 
 if __name__ == '__main__':
