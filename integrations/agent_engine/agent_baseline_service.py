@@ -22,6 +22,11 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger('hevolve_social')
 
+try:
+    from helper import PROMPTS_DIR
+except ImportError:
+    PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'prompts'))
+
 def _resolve_baseline_dir():
     import sys as _sys
     db_path = os.environ.get('HEVOLVE_DB_PATH', '')
@@ -143,7 +148,7 @@ class AgentBaselineService:
     def _collect_recipe_metrics(prompt_id: str, flow_id: int) -> Dict:
         """Read recipe JSON and extract experience metrics."""
         try:
-            recipe_path = f'prompts/{prompt_id}_{flow_id}_recipe.json'
+            recipe_path = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow_id}_recipe.json')
             if not os.path.exists(recipe_path):
                 return {}
             with open(recipe_path, 'r') as f:

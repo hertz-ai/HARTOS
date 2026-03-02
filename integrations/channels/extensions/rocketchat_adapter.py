@@ -22,7 +22,11 @@ import logging
 import os
 import json
 import hashlib
-import aiohttp
+try:
+    import aiohttp
+    HAS_AIOHTTP = True
+except ImportError:
+    HAS_AIOHTTP = False
 from typing import Optional, List, Dict, Any, Callable
 from datetime import datetime
 from dataclasses import dataclass, field

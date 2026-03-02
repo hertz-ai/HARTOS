@@ -29,7 +29,11 @@ from typing import Optional, List, Dict, Any, Callable, Union
 from datetime import datetime
 from dataclasses import dataclass, field
 from enum import Enum
-import aiohttp
+try:
+    import aiohttp
+    HAS_AIOHTTP = True
+except ImportError:
+    HAS_AIOHTTP = False
 
 from ..base import (
     ChannelAdapter,

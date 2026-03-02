@@ -1,6 +1,16 @@
 from collections import deque
 import logging
 import sys
+
+_fallback_logger = logging.getLogger(__name__)
+
+
+def _safe_log(level, msg):
+    """Log via Flask current_app if available, else fallback to module logger."""
+    try:
+        getattr(current_app.logger, level)(msg)
+    except (RuntimeError, AttributeError):
+        getattr(_fallback_logger, level)(msg)
 import requests
 import re
 import ast
@@ -412,8 +422,8 @@ def topological_sort(actions):
     adj_list = {action["action_id"]: [] for action in actions}
     in_degree = {action["action_id"]: 0 for action in actions}
     action_map = {action["action_id"]: action for action in actions}  # Map ID to full action
-    current_app.logger.info(f'got the actions in topological function')
-    current_app.logger.info(f'the actions in topological function: - \n {actions}')
+    _safe_log('info', f'got the actions in topological function')
+    _safe_log('info', f'the actions in topological function: - \n {actions}')
     # Build the graph
     for action in actions:
 
@@ -594,10 +604,10 @@ def fix_json(json_text):
         response = pooled_post(url, headers=headers, data=payload)
         response = response.json()
         x = ast.literal_eval(response['text'])
-        current_app.logger.info(f'got json object')
+        _safe_log('info', f'got json object')
         return x
     except Exception as e:
-        current_app.logger.info(f'GOT ERROR WHILE JSON FIX:{e}')
+        _safe_log('info', f'GOT ERROR WHILE JSON FIX:{e}')
         return None
 
 
@@ -619,15 +629,15 @@ def retrieve_json(json_message):
     try:
         return json.loads(repair_json(json_message))
     except Exception as e:
-        current_app.logger.info(f'json_repair failed: {e}')
+        _safe_log('info', f'json_repair failed: {e}')
 
     # Try using ast.literal_eval which can handle Python dict syntax with single quotes
     try:
         json_obj = ast.literal_eval(json_message)
-        current_app.logger.info('got json object using ast.literal_eval')
+        _safe_log('info', 'got json object using ast.literal_eval')
         return json_obj
     except Exception as e:
-        current_app.logger.info(f'ast.literal_eval failed: {e}')
+        _safe_log('info', f'ast.literal_eval failed: {e}')
         json_obj = None
 
     # Fall back to regex + json.loads approach with more careful quote handling
@@ -643,11 +653,11 @@ def retrieve_json(json_message):
             processed_json = re.sub(r':\s*\'([^\']*)\'', r': "\1"', processed_json)
 
             json_obj = json.loads(processed_json)
-            current_app.logger.info('got json object')
+            _safe_log('info', 'got json object')
             return json_obj
         return None
     except Exception as e:
-        current_app.logger.info(f'json processing failed: {e}')
+        _safe_log('info', f'json processing failed: {e}')
         json_obj = fix_json(json_message)
         return json_obj
 

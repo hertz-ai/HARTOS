@@ -72,6 +72,14 @@ def init_social(app):
     except Exception as e:
         logger.warning(f"HevolveSocial gamification blueprint skipped: {e}")
 
+    # Register multiplayer games + compute lending blueprint
+    try:
+        from .api_games import games_bp
+        app.register_blueprint(games_bp)
+        logger.info("HevolveSocial games + compute endpoints registered at /api/social/games/, /api/social/compute/")
+    except Exception as e:
+        logger.warning(f"HevolveSocial games blueprint skipped: {e}")
+
     # Register discovery blueprint (.well-known/hevolve-social.json)
     try:
         from .discovery import discovery_bp

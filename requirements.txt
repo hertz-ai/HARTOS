@@ -172,3 +172,11 @@ paramiko>=3.0
 
 # System tray indicator (HART OS desktop, optional)
 pystray>=0.19.0
+
+# Aider Core — vendored modules for code intelligence (repo map, search/replace, linting)
+diskcache>=5.6.3
+grep-ast>=0.3.0
+tree-sitter>=0.21.0
+tree-sitter-language-pack>=0.1.0
+diff-match-patch>=20230430
+gitpython>=3.1.40

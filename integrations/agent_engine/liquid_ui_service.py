@@ -1041,6 +1041,7 @@ function loadSystemPanel(id, body) {{
   else if(id==='bluetooth') loadBluetoothPanel(container);
   else if(id==='power') loadPowerPanel(container);
   else if(id==='display') loadDisplayPanel(container);
+  else if(id==='remote_desktop') loadRemoteDesktopPanel(container, apis);
   else container.innerHTML = '<div style="color:var(--hart-muted)">Panel: '+id+'</div>';
 }}
 
@@ -1224,6 +1225,66 @@ function loadDisplayPanel(el) {{
         displays.map(d=>statusRow('desktop_windows',d.name,d.resolution,'var(--hart-accent)')).join('')) +
         '</div>';
     }}).catch(()=>{{ el.innerHTML='<div style="color:var(--hart-muted)">Display info unavailable</div>'; }});
+}}
+
+// ═══ Remote Desktop Panel ═══
+function loadRemoteDesktopPanel(el, apis) {{
+  Promise.all(apis.map(u=>fetch(BACKEND+u,{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).catch(()=>({{}}))))
+    .then(([status,engines,sessions])=>{{
+      const did = status.formatted_id || 'Unknown';
+      const deviceId = status.device_id || '';
+      const engineList = status.engines || engines.engines || {{}};
+      const sess = (sessions.sessions || status.active_sessions || []);
+      const recs = engines.install_recommendations || status.install_recommendations || [];
+
+      let html = '<div style="display:grid;gap:12px">';
+      html += '<div style="display:flex;justify-content:space-between;align-items:center">';
+      html += '<span style="font-weight:var(--hart-heading-weight);font-size:var(--hart-heading-size);color:var(--hart-heading)">Remote Desktop</span>';
+      html += '<span class="mi material-icons-round" style="font-size:20px;color:var(--hart-active)">connected_tv</span>';
+      html += '</div>';
+
+      html += '<div style="padding:16px;border-radius:12px;background:var(--hart-surface);text-align:center;cursor:pointer" onclick="navigator.clipboard.writeText(\\''+deviceId+'\\').then(()=>this.querySelector(\\'.copy-hint\\').textContent=\\'Copied!\\')" title="Click to copy">';
+      html += '<div style="font-size:11px;color:var(--hart-muted);margin-bottom:4px">Your Device ID</div>';
+      html += '<div style="font-size:24px;font-weight:700;letter-spacing:3px;color:var(--hart-heading)">'+did+'</div>';
+      html += '<div class="copy-hint" style="font-size:10px;color:var(--hart-muted);margin-top:4px">Click to copy</div>';
+      html += '</div>';
+
+      html += '<div style="font-weight:600;font-size:12px;color:var(--hart-muted);text-transform:uppercase;letter-spacing:1px">Engines</div>';
+      for(const [name,info] of Object.entries(engineList)) {{
+        const avail = info.available;
+        const color = avail ? 'var(--hart-active)' : 'var(--hart-muted)';
+        const icon = avail ? 'check_circle' : 'cancel';
+        html += statusRow(icon, name.charAt(0).toUpperCase()+name.slice(1), avail?'Available':'Not installed', color);
+      }}
+
+      if(sess.length > 0) {{
+        html += '<div style="font-weight:600;font-size:12px;color:var(--hart-muted);text-transform:uppercase;letter-spacing:1px;margin-top:4px">Active Sessions ('+sess.length+')</div>';
+        for(const s of sess) {{
+          html += '<div style="padding:8px;border-radius:8px;background:var(--hart-surface);display:flex;justify-content:space-between;align-items:center">';
+          html += '<span style="font-size:12px">'+s.session_id.substring(0,8)+' &mdash; '+s.mode+'</span>';
+          html += '<span style="font-size:11px;color:var(--hart-active)">'+s.state+'</span>';
+          html += '</div>';
+        }}
+      }}
+
+      if(recs.length > 0) {{
+        html += '<div style="font-weight:600;font-size:12px;color:var(--hart-muted);text-transform:uppercase;letter-spacing:1px;margin-top:4px">Recommended</div>';
+        for(const r of recs) {{
+          html += '<div style="padding:8px;border-radius:8px;background:var(--hart-surface)">';
+          html += '<div style="font-size:12px;font-weight:600">'+r.engine+'</div>';
+          html += '<div style="font-size:11px;color:var(--hart-muted)">'+r.reason+'</div>';
+          html += '</div>';
+        }}
+      }}
+
+      html += '<div style="display:flex;gap:8px;margin-top:8px">';
+      html += '<button onclick="fetch(BACKEND+\\'/api/remote-desktop/host\\',{{method:\\'POST\\',headers:{{\\'Content-Type\\':\\'application/json\\'}},body:JSON.stringify({{engine:\\'auto\\'}})}}).then(r=>r.json()).then(d=>alert(\\'Hosting started!\\\\nDevice ID: \\'+d.formatted_id+\\'\\\\nPassword: \\'+d.password))" style="flex:1;padding:10px;border:none;border-radius:8px;background:var(--hart-active);color:white;font-weight:600;cursor:pointer">Host</button>';
+      html += '<button onclick="const id=prompt(\\'Enter Device ID:\\');if(id){{const pw=prompt(\\'Password:\\');if(pw)fetch(BACKEND+\\'/api/remote-desktop/connect\\',{{method:\\'POST\\',headers:{{\\'Content-Type\\':\\'application/json\\'}},body:JSON.stringify({{device_id:id,password:pw}})}}).then(r=>r.json()).then(d=>alert(d.message||d.error||JSON.stringify(d)))}}" style="flex:1;padding:10px;border:none;border-radius:8px;background:var(--hart-surface);color:var(--hart-heading);font-weight:600;cursor:pointer;border:1px solid var(--hart-border)">Connect</button>';
+      html += '</div>';
+
+      html += '</div>';
+      el.innerHTML = html;
+    }});
 }}
 
 // ═══ Agent Pill ═══

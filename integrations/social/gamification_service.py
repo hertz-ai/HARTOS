@@ -122,6 +122,32 @@ SEED_ACHIEVEMENTS = [
      'criteria_json': json.dumps({'type': 'boost_count', 'threshold': 1})},
     {'slug': 'big_spender', 'name': 'Big Spender', 'description': 'Spend 1000 Spark on boosts', 'category': 'economy', 'rarity': 'rare', 'pulse_reward': 100, 'xp_reward': 150,
      'criteria_json': json.dumps({'type': 'spark_spent', 'threshold': 1000})},
+
+    # Multiplayer games
+    {'slug': 'first_game', 'name': 'Player One', 'description': 'Play your first multiplayer game', 'category': 'game', 'rarity': 'common', 'pulse_reward': 25, 'xp_reward': 20,
+     'criteria_json': json.dumps({'type': 'game_count', 'threshold': 1})},
+    {'slug': 'games_10', 'name': 'Regular Player', 'description': 'Play 10 games', 'category': 'game', 'rarity': 'uncommon', 'pulse_reward': 50, 'spark_reward': 25, 'xp_reward': 50,
+     'criteria_json': json.dumps({'type': 'game_count', 'threshold': 10})},
+    {'slug': 'games_50', 'name': 'Game Veteran', 'description': 'Play 50 games', 'category': 'game', 'rarity': 'rare', 'pulse_reward': 150, 'spark_reward': 75, 'xp_reward': 150,
+     'criteria_json': json.dumps({'type': 'game_count', 'threshold': 50})},
+    {'slug': 'game_win_streak_5', 'name': 'On Fire', 'description': 'Win 5 games in a row', 'category': 'game', 'rarity': 'rare', 'pulse_reward': 100, 'spark_reward': 50, 'xp_reward': 100,
+     'criteria_json': json.dumps({'type': 'game_win_streak', 'threshold': 5})},
+    {'slug': 'collab_master', 'name': 'Team Player', 'description': 'Complete 10 collaborative puzzles', 'category': 'game', 'rarity': 'uncommon', 'pulse_reward': 75, 'spark_reward': 50, 'xp_reward': 75,
+     'criteria_json': json.dumps({'type': 'collab_puzzle_count', 'threshold': 10})},
+
+    # Compute lending
+    {'slug': 'first_compute_share', 'name': 'Sharing is Caring', 'description': 'Enable compute sharing for the first time', 'category': 'compute', 'rarity': 'uncommon', 'pulse_reward': 50, 'spark_reward': 100, 'xp_reward': 100,
+     'criteria_json': json.dumps({'type': 'compute_opt_in'})},
+    {'slug': 'compute_1h', 'name': 'First Hour', 'description': 'Contribute 1 GPU-hour to the hive', 'category': 'compute', 'rarity': 'common', 'pulse_reward': 25, 'spark_reward': 50, 'xp_reward': 50,
+     'criteria_json': json.dumps({'type': 'compute_gpu_hours', 'threshold': 1})},
+    {'slug': 'compute_24h', 'name': 'Day Worker', 'description': 'Contribute 24 GPU-hours', 'category': 'compute', 'rarity': 'uncommon', 'pulse_reward': 100, 'spark_reward': 200, 'xp_reward': 200,
+     'criteria_json': json.dumps({'type': 'compute_gpu_hours', 'threshold': 24})},
+    {'slug': 'compute_100h', 'name': 'Hive Builder', 'description': 'Contribute 100 GPU-hours', 'category': 'compute', 'rarity': 'rare', 'pulse_reward': 300, 'spark_reward': 500, 'xp_reward': 500,
+     'criteria_json': json.dumps({'type': 'compute_gpu_hours', 'threshold': 100})},
+    {'slug': 'compute_1000h', 'name': 'Hive Pillar', 'description': 'Contribute 1000 GPU-hours', 'category': 'compute', 'rarity': 'legendary', 'pulse_reward': 1000, 'spark_reward': 2000, 'xp_reward': 2000,
+     'criteria_json': json.dumps({'type': 'compute_gpu_hours', 'threshold': 1000})},
+    {'slug': 'compute_helped_10', 'name': 'Helper', 'description': 'Your compute helped 10 different users', 'category': 'compute', 'rarity': 'uncommon', 'pulse_reward': 50, 'spark_reward': 75, 'xp_reward': 75,
+     'criteria_json': json.dumps({'type': 'compute_users_helped', 'threshold': 10})},
 ]
 
 

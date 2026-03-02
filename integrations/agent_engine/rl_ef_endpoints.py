@@ -21,10 +21,14 @@ if not _hevolve_core_path.exists():
 if _hevolve_core_path.exists():
     sys.path.insert(0, str(_hevolve_core_path))
 
-from embodied_ai.rl_ef import (
-    send_expert_correction,
-    get_learning_provider
-)
+try:
+    from embodied_ai.rl_ef import (
+        send_expert_correction,
+        get_learning_provider
+    )
+    _RL_EF_AVAILABLE = True
+except ImportError:
+    _RL_EF_AVAILABLE = False
 
 # Create blueprint
 rl_ef_blueprint = Blueprint('rl_ef', __name__, url_prefix='/api/rl_ef')
@@ -66,6 +70,8 @@ def submit_correction():
                 "confidence": 0.95
              }'
     """
+    if not _RL_EF_AVAILABLE:
+        return jsonify({'status': 'error', 'message': 'RL-EF not available (torch not installed)'}), 503
     try:
         data = request.json
 
@@ -138,6 +144,8 @@ def get_stats(domain: str):
     Example usage:
         curl http://localhost:5000/api/rl_ef/stats/medical
     """
+    if not _RL_EF_AVAILABLE:
+        return jsonify({'status': 'error', 'message': 'RL-EF not available (torch not installed)'}), 503
     try:
         provider = get_learning_provider(domain)
 
@@ -180,6 +188,8 @@ def list_domains():
     Example usage:
         curl http://localhost:5000/api/rl_ef/domains
     """
+    if not _RL_EF_AVAILABLE:
+        return jsonify({'status': 'error', 'message': 'RL-EF not available (torch not installed)'}), 503
     try:
         from embodied_ai.rl_ef.learning_llm_provider import _LEARNING_PROVIDERS
 
