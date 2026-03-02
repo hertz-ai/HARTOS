@@ -12,6 +12,11 @@ import os
 import threading
 from typing import Dict, Optional, Any
 
+try:
+    from helper import PROMPTS_DIR
+except ImportError:
+    PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
+
 logger = logging.getLogger(__name__)
 
 # Lock protecting _ledger_registry and action_states (accessed by multiple Waitress/Gunicorn threads)
@@ -341,8 +346,21 @@ def validate_state_transition(user_prompt: str, action_id: int, new_state: Actio
     return True
 
 
-def lifecycle_hook_track_action_assignment(user_prompt: str, user_tasks, group_chat) -> bool:
-    """1. Track when action is assigned from array"""
+def lifecycle_hook_track_action_assignment(user_prompt: str, user_tasks, group_chat=None) -> bool:
+    """1. Track when action is assigned from array.
+
+    Args:
+        user_prompt: The user prompt key (e.g. "123_456").
+        user_tasks: Either a dict of user tasks, an Action object with
+            .current_action, or a plain int action_id for simple state setting.
+        group_chat: Optional GroupChat object. When provided, checks messages
+            to determine if ChatInstructor assigned the action.
+    """
+    # Support simple (user_prompt, action_id) calls for direct state setting
+    if isinstance(user_tasks, int):
+        set_action_state(user_prompt, user_tasks, ActionState.ASSIGNED)
+        return True
+
     if isinstance(user_tasks, dict):
         current_tasks = user_tasks.get(user_prompt)
         if not current_tasks:
@@ -358,7 +376,7 @@ def lifecycle_hook_track_action_assignment(user_prompt: str, user_tasks, group_c
         return False
 
     # When ChatInstructor assigns action, move from ASSIGNED to IN_PROGRESS
-    if (group_chat.messages and
+    if (group_chat and group_chat.messages and
         group_chat.messages[-1]['name'] == 'ChatInstructor' and f'Action {current_action_id}' in group_chat.messages[-1]['content']):
 
         if validate_state_transition(user_prompt, current_action_id, ActionState.IN_PROGRESS):
@@ -368,8 +386,20 @@ def lifecycle_hook_track_action_assignment(user_prompt: str, user_tasks, group_c
     return False
 
 
-def lifecycle_hook_track_status_verification_request(user_prompt: str, user_tasks, group_chat) -> bool:
-    """3. Track when status verification is requested"""
+def lifecycle_hook_track_status_verification_request(user_prompt: str, user_tasks, group_chat=None) -> bool:
+    """3. Track when status verification is requested.
+
+    Args:
+        user_prompt: The user prompt key.
+        user_tasks: Dict, Action object, or plain int action_id.
+        group_chat: Optional GroupChat object.
+    """
+    # Support simple (user_prompt, action_id) calls
+    if isinstance(user_tasks, int):
+        force_state_through_valid_path(user_prompt, user_tasks, ActionState.STATUS_VERIFICATION_REQUESTED,
+                                       "direct status verification request")
+        return True
+
     if isinstance(user_tasks, dict):
         current_tasks = user_tasks.get(user_prompt)
         if not current_tasks:
@@ -379,7 +409,7 @@ def lifecycle_hook_track_status_verification_request(user_prompt: str, user_task
         current_action_id = user_tasks.current_action
 
     # When @StatusVerifier is mentioned, move to STATUS_VERIFICATION_REQUESTED
-    if (group_chat.messages and
+    if (group_chat and group_chat.messages and
         '@StatusVerifier' in group_chat.messages[-1]['content']):
 
         if validate_state_transition(user_prompt, current_action_id, ActionState.STATUS_VERIFICATION_REQUESTED):
@@ -649,7 +679,7 @@ def lifecycle_hook_validate_final_agent_creation(user_prompt: str, user_tasks, p
     missing_files = []
 
     for action_id in range(1, total_actions + 1):
-        recipe_file = f'prompts/{prompt_id}_{flow}_{action_id}.json'
+        recipe_file = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow}_{action_id}.json')
         if not os.path.exists(recipe_file):
             missing_files.append(recipe_file)
 
@@ -660,7 +690,7 @@ def lifecycle_hook_validate_final_agent_creation(user_prompt: str, user_tasks, p
         }
 
     # Check 3: Flow recipe exists
-    flow_recipe_file = f'prompts/{prompt_id}_{flow}_recipe.json'
+    flow_recipe_file = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow}_recipe.json')
     if not os.path.exists(flow_recipe_file):
         return {
             'action': 'block',

@@ -47,6 +47,11 @@ class FederatedAggregator:
         self._lifecycle_lock = threading.Lock()
         self._lifecycle_deltas: Dict[str, dict] = {}  # node_id → model usage stats
         self._last_lifecycle_aggregated: Optional[dict] = None
+        # Resonance tuning delta channel (personality tuning across nodes)
+        self._resonance_lock = threading.Lock()
+        self._resonance_deltas: Dict[str, dict] = {}  # node_id → anonymized tuning stats
+        self._resonance_epoch = 0
+        self._last_resonance_aggregated: Optional[dict] = None
 
     def tick(self) -> dict:
         """Full cycle: extract → broadcast → aggregate → apply → track."""
@@ -72,6 +77,11 @@ class FederatedAggregator:
             embedding_result = self.embedding_tick()
             if embedding_result.get('aggregated'):
                 result['embedding'] = embedding_result
+
+            # Resonance channel tick (personality tuning across nodes)
+            resonance_result = self.resonance_tick()
+            if resonance_result.get('aggregated'):
+                result['resonance'] = resonance_result
         except Exception as e:
             logger.debug(f"Federation tick error: {e}")
             result['error'] = str(e)
@@ -495,6 +505,108 @@ class FederatedAggregator:
             'last_aggregated': self._last_lifecycle_aggregated,
         }
 
+    # ─── Resonance Tuning Delta Channel ───
+
+    def receive_resonance_delta(self, node_id: str, delta: dict):
+        """Store anonymized resonance tuning stats from a peer node."""
+        if not node_id or not isinstance(delta, dict):
+            return
+        with self._resonance_lock:
+            self._resonance_deltas[node_id] = delta
+
+    def aggregate_resonance(self) -> Optional[dict]:
+        """Aggregate resonance deltas: weighted avg of tuning distributions."""
+        with self._resonance_lock:
+            deltas = list(self._resonance_deltas.values())
+        if not deltas:
+            return None
+
+        # Weighted by user_count (more users = more representative)
+        weights = []
+        for d in deltas:
+            uc = d.get('user_count', 1)
+            weights.append(max(1.0, float(uc)))
+        total_w = sum(weights)
+
+        n_dims = len(deltas[0].get('avg_tuning', []))
+        if n_dims == 0:
+            return None
+
+        avg_tuning = [0.0] * n_dims
+        for d, w in zip(deltas, weights):
+            at = d.get('avg_tuning', [0.5] * n_dims)
+            for i in range(min(n_dims, len(at))):
+                avg_tuning[i] += at[i] * w / total_w
+
+        result = {
+            'avg_tuning': avg_tuning,
+            'peer_count': len(deltas),
+            'total_users': sum(d.get('user_count', 0) for d in deltas),
+            'total_interactions': sum(d.get('total_interactions', 0) for d in deltas),
+            'timestamp': time.time(),
+        }
+        self._last_resonance_aggregated = result
+        self._resonance_epoch += 1
+        return result
+
+    def resonance_tick(self) -> dict:
+        """Resonance channel tick: extract local → aggregate → apply → clear."""
+        result = {'resonance_epoch': self._resonance_epoch, 'aggregated': False}
+        try:
+            # Extract local resonance delta
+            try:
+                from core.resonance_tuner import get_resonance_tuner
+                tuner = get_resonance_tuner()
+                local_delta = tuner.export_resonance_delta()
+                if local_delta:
+                    # Broadcast to peers (piggyback on existing gossip)
+                    self._broadcast_resonance(local_delta)
+            except ImportError:
+                pass
+
+            aggregated = self.aggregate_resonance()
+            if aggregated:
+                # Apply hive-aggregated tuning to local profiles
+                try:
+                    from core.resonance_tuner import get_resonance_tuner
+                    get_resonance_tuner().import_hive_resonance(aggregated)
+                except ImportError:
+                    pass
+
+                result.update({
+                    'aggregated': True,
+                    'resonance_epoch': self._resonance_epoch,
+                    'peer_count': aggregated.get('peer_count', 0),
+                    'total_users': aggregated.get('total_users', 0),
+                })
+                with self._resonance_lock:
+                    self._resonance_deltas.clear()
+        except Exception as e:
+            result['error'] = str(e)
+        return result
+
+    def _broadcast_resonance(self, delta: dict):
+        """Broadcast resonance delta to peers via gossip."""
+        try:
+            from integrations.social.peer_discovery import gossip
+            gossip.broadcast({
+                'type': 'resonance_delta',
+                'delta': delta,
+                'timestamp': time.time(),
+            })
+        except Exception:
+            pass
+
+    def get_resonance_stats(self) -> dict:
+        """Return resonance channel stats for dashboard."""
+        with self._resonance_lock:
+            pending = len(self._resonance_deltas)
+        return {
+            'resonance_epoch': self._resonance_epoch,
+            'pending_deltas': pending,
+            'last_aggregated': self._last_resonance_aggregated,
+        }
+
     def get_stats(self) -> dict:
         """Return federation stats for dashboard."""
         with self._lock:
@@ -514,6 +626,11 @@ class FederatedAggregator:
         # Include model lifecycle stats
         try:
             stats['lifecycle'] = self.get_lifecycle_stats()
+        except Exception:
+            pass
+        # Include resonance stats
+        try:
+            stats['resonance'] = self.get_resonance_stats()
         except Exception:
             pass
         return stats

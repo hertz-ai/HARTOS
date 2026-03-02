@@ -1874,9 +1874,10 @@ class TestModelConfigOverride:
         pytest.importorskip('autogen', reason='autogen not installed')
         from threadlocal import thread_local_data
         thread_local_data.clear_model_config_override()
-        from create_recipe import get_llm_config
+        from create_recipe import get_llm_config, config_list
         cfg = get_llm_config()
-        assert cfg['config_list'][0]['model'] == 'Qwen3-VL-4B-Instruct'
+        # Should fall back to global config_list (model name depends on env)
+        assert cfg['config_list'] == config_list
 
 
 # =============================================================================

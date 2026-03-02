@@ -93,6 +93,17 @@ async def diarization(websocket, diarize_model, output_dir, device):
                         _export_audio(
                             audio_data_bytes, user_id, output_dir)
 
+                        # Voice signature enrollment — dispatched to HevolveAI
+                        try:
+                            from core.resonance_identifier import ResonanceIdentifier
+                            if user_id:
+                                _identifier = ResonanceIdentifier()
+                                _identifier.enroll_voice(str(user_id), audio_data_bytes)
+                        except ImportError:
+                            pass
+                        except Exception:
+                            pass
+
                         res = {
                             "no_of_speaker": no_of_speakers,
                             "stop_mic": no_of_speakers > 1,

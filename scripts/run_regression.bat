@@ -180,6 +180,20 @@ set SECURITY_HARDENING_TESTS=^
     tests/unit/test_action_classifier.py ^
     tests/unit/test_dlp_engine.py
 
+REM Group 14: Resonance Tuning + Agent Personality (~100 tests)
+set RESONANCE_TESTS=^
+    tests/unit/test_resonance_profile.py ^
+    tests/unit/test_resonance_tuner.py ^
+    tests/unit/test_resonance_learning.py ^
+    tests/unit/test_resonance_integration.py ^
+    tests/unit/test_resonance_identifier.py ^
+    tests/unit/test_biometric_signatures.py ^
+    tests/unit/test_agent_personality.py
+
+REM Group 15: E2E Realworld Resonance (12 scenarios)
+set REALWORLD_TESTS=^
+    tests/realworld_resonance_test.py
+
 REM ===== CI MODE =====
 if "%CI%"=="true" goto :ci_mode
 if "%CI%"=="1" goto :ci_mode
@@ -243,9 +257,22 @@ echo --- Distro ---
 "%PYTHON_EXE%" -m pytest %DISTRO_TESTS% --tb=short --color=no -q --junitxml="%JUNIT_DIR%\distro.xml"
 echo.
 
+echo --- Resonance Tuning + Personality ---
+"%PYTHON_EXE%" -m pytest %RESONANCE_TESTS% --noconftest --tb=short --color=no -q --junitxml="%JUNIT_DIR%\resonance.xml"
+echo.
+
+echo --- E2E Realworld Resonance ---
+"%PYTHON_EXE%" -m pytest %REALWORLD_TESTS% --noconftest --tb=short --color=no -q --junitxml="%JUNIT_DIR%\realworld.xml"
+echo.
+
 echo ========================================
-echo  CI Regression complete
+echo  CI Regression complete — generating consolidated report...
+echo ========================================
+echo.
+"%PYTHON_EXE%" scripts\generate_regression_report.py --junit-dir "%JUNIT_DIR%" --output "%REPORT_DIR%\consolidated_report.txt"
+echo.
 echo  JUnit XML: %JUNIT_DIR%\
+echo  Report:    %REPORT_DIR%\consolidated_report.txt
 echo ========================================
 goto :eof
 
@@ -263,9 +290,11 @@ echo   8. Custom pytest pattern
 echo   9. Distro + Security Hardening
 echo  10. WS Workstream Tests (metered API, compute, revenue)
 echo  11. Security Hardening Tests (audit, DLP, classifier, etc.)
+echo  12. Resonance Tuning + Agent Personality
+echo  13. E2E Realworld Resonance Scenarios
 echo.
 
-set /p choice="Enter choice (1-11): "
+set /p choice="Enter choice (1-13): "
 
 if "%choice%"=="1" (
     echo.
@@ -352,6 +381,20 @@ if "%choice%"=="1" (
     echo ========================================
     "%PYTHON_EXE%" -m pytest ^
         %SECURITY_HARDENING_TESTS% ^
+        --noconftest --tb=short --color=yes -q
+) else if "%choice%"=="12" (
+    echo.
+    echo Running Resonance Tuning + Agent Personality...
+    echo ========================================
+    "%PYTHON_EXE%" -m pytest ^
+        %RESONANCE_TESTS% ^
+        --noconftest --tb=short --color=yes -q
+) else if "%choice%"=="13" (
+    echo.
+    echo Running E2E Realworld Resonance Scenarios...
+    echo ========================================
+    "%PYTHON_EXE%" -m pytest ^
+        %REALWORLD_TESTS% ^
         --noconftest --tb=short --color=yes -q
 ) else (
     echo Invalid choice

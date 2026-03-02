@@ -14,7 +14,7 @@ from bs4 import BeautifulSoup
 from enum import Enum
 from cultural_wisdom import get_cultural_prompt_compact
 
-# Use langchain-classic for pydantic v2 compatibility (langchain 1.x split into sub-packages)
+# langchain_classic — pydantic v2-compatible fork of langchain 0.0.230
 from langchain_classic.llms import OpenAI
 from langchain_classic.chains import LLMChain
 from langchain_classic.prompts import PromptTemplate
@@ -23,19 +23,20 @@ from langchain_classic.agents import (
     ConversationalChatAgent, LLMSingleActionAgent, AgentOutputParser,
     load_tools, initialize_agent, AgentType
 )
-
-import time
 from langchain_classic.prompts import (
-    ChatPromptTemplate,
-    MessagesPlaceholder,
-    SystemMessagePromptTemplate,
-    HumanMessagePromptTemplate
+    ChatPromptTemplate, MessagesPlaceholder,
+    SystemMessagePromptTemplate, HumanMessagePromptTemplate
 )
 from langchain_classic.chains import LLMMathChain
 from langchain_classic.chains.conversation.memory import ConversationSummaryMemory, ConversationBufferWindowMemory
-
-# ChatOpenAI - use langchain_classic (provides backward-compat paths)
 from langchain_classic.chat_models import ChatOpenAI
+from langchain_classic.llms.base import LLM
+from langchain_classic.memory import ConversationBufferMemory, ReadOnlySharedMemory
+from langchain_classic.schema import AgentAction, AgentFinish, OutputParserException, HumanMessage, AIMessage, SystemMessage
+from langchain_classic.tools import OpenAPISpec, APIOperation, StructuredTool
+from langchain_classic.utilities import GoogleSearchAPIWrapper
+
+import time
 
 # ChatGroq - optional import (version compatibility issues)
 try:
@@ -43,12 +44,6 @@ try:
 except Exception:
     ChatGroq = None
 
-# LLM base class
-from langchain_classic.llms.base import LLM
-from langchain_classic.memory import ConversationBufferMemory, ReadOnlySharedMemory
-from langchain_classic.schema import AgentAction, AgentFinish, OutputParserException, HumanMessage, AIMessage, SystemMessage
-from langchain_classic.tools import OpenAPISpec, APIOperation, StructuredTool
-from langchain_classic.utilities import GoogleSearchAPIWrapper
 try:
     from langchain_classic.requests import Requests
 except (ImportError, AttributeError):
@@ -68,35 +63,31 @@ from core.http_pool import pooled_get, pooled_post
 from datetime import datetime, timezone
 from typing import List, Union, Optional, Mapping, Any, Dict
 
-# Conversational chat imports from langchain-classic
+# Conversational chat imports
 try:
-    from langchain.agents.conversational_chat.output_parser import ConvoOutputParser
-    from langchain.agents.conversational_chat.prompt import FORMAT_INSTRUCTIONS
-    from langchain.output_parsers.json import parse_json_markdown
-except (ImportError, AttributeError) as e:
-    # These might not exist in langchain-classic
+    from langchain_classic.agents.conversational_chat.output_parser import ConvoOutputParser
+    from langchain_classic.agents.conversational_chat.prompt import FORMAT_INSTRUCTIONS
+    from langchain_classic.output_parsers.json import parse_json_markdown
+except (ImportError, AttributeError):
     ConvoOutputParser = None
     FORMAT_INSTRUCTIONS = None
     parse_json_markdown = None
 
-# Tools imports - try langchain_community first
+# Tools imports
 try:
-    from langchain_community.tools import RequestsGetTool
-except Exception:
-    try:
-        from langchain.tools.requests.tool import RequestsGetTool
-    except (ImportError, AttributeError):
-        RequestsGetTool = None
+    from langchain_classic.tools.requests.tool import RequestsGetTool
+except (ImportError, AttributeError):
+    RequestsGetTool = None
 
 try:
-    from langchain_community.utilities import TextRequestsWrapper
-except Exception:
-    try:
-        from langchain.utilities.requests import TextRequestsWrapper
-    except (ImportError, AttributeError):
-        TextRequestsWrapper = None
+    from langchain_classic.utilities.requests import TextRequestsWrapper
+except (ImportError, AttributeError):
+    TextRequestsWrapper = None
 
-import tiktoken
+try:
+    import tiktoken
+except ImportError:
+    tiktoken = None
 from pytz import timezone
 from datetime import datetime, timedelta
 from waitress import serve
@@ -157,9 +148,14 @@ except ImportError:
 import threading
 
 try:
-    from helper import retrieve_json
+    from helper import retrieve_json, PROMPTS_DIR, safe_prompt_path
 except Exception:
     retrieve_json = None
+    PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
+    safe_prompt_path = None
+
+# Ensure prompts directory exists (agent creation writes JSON here)
+os.makedirs(PROMPTS_DIR, exist_ok=True)
 
 # Google A2A integration (from gpt4.1)
 try:
@@ -1132,6 +1128,75 @@ def _response_signals_creation(response_text):
     return any(signal in lower for signal in _RESPONSE_CREATION_SIGNALS)
 
 
+def _handle_request_resource(input_text: str) -> str:
+    """Generic runtime resource request — agent calls this when ANY tool needs
+    a missing credential, API key, config value, or permission.
+
+    The agent provides a JSON string like:
+      {"resource_type": "api_key", "key_name": "GOOGLE_API_KEY",
+       "label": "Google API Key", "used_by": "Google Search tool",
+       "description": "Required for web search"}
+
+    Handler checks the vault first. If the key exists, returns the value
+    (making it available to the agent without the user re-entering it).
+    If not, returns a structured resource_request that the backend injects
+    into the response JSON so the frontend presents a secure input screen.
+    """
+    import json as _json
+    try:
+        req = _json.loads(input_text)
+    except (ValueError, TypeError):
+        # Plain-text fallback: agent just described what it needs
+        req = {
+            'resource_type': 'api_key',
+            'key_name': 'UNKNOWN',
+            'label': input_text[:100],
+            'description': input_text,
+            'used_by': 'Agent tool',
+        }
+
+    key_name = req.get('key_name', 'UNKNOWN')
+    resource_type = req.get('resource_type', 'api_key')
+
+    # Check vault first (tool keys + env vars)
+    import os
+    env_val = os.environ.get(key_name)
+    if env_val:
+        return f"Resource '{key_name}' is already configured and available."
+
+    try:
+        from desktop.ai_key_vault import AIKeyVault
+        vault = AIKeyVault.get_instance()
+        if resource_type == 'channel_secret':
+            val = vault.get_channel_secret(
+                req.get('channel_type', ''), key_name)
+        else:
+            val = vault.get_tool_key(key_name)
+        if val:
+            os.environ[key_name] = val  # Make available for current session
+            return f"Resource '{key_name}' loaded from vault and is now available."
+    except Exception:
+        pass
+
+    # Key not found — return a structured request for the frontend
+    # The backend will detect __SECRET_REQUEST__ and inject it into the response
+    secret_request = _json.dumps({
+        '__SECRET_REQUEST__': True,
+        'type': resource_type,
+        'key_name': key_name,
+        'label': req.get('label', key_name),
+        'description': req.get('description', f'{key_name} is required.'),
+        'used_by': req.get('used_by', 'Agent tool'),
+        'channel_type': req.get('channel_type', ''),
+    })
+    return (
+        f"I need the user to provide '{req.get('label', key_name)}'. "
+        f"This is required for {req.get('used_by', 'a tool')}. "
+        f"{req.get('description', '')} "
+        f"RESOURCE_REQUEST:{secret_request}"
+    )
+
+
 def _safe_load_google_search():
     """Load google-search tool, returning empty list if package is missing."""
     try:
@@ -1245,7 +1310,22 @@ def get_tools(req_tool, is_first: bool = False):
                     "If the user also says words like 'automatically', 'autonomous', 'do it for me', "
                     "'handle it', 'just create it', include those keywords in your input."
                 ),
-            )
+            ),
+            Tool(
+                name="Request_Resource",
+                func=_handle_request_resource,
+                description=(
+                    "Use this tool when you need an API key, credential, token, or any external "
+                    "resource that is not currently available. This handles ALL resource types: "
+                    "API keys (OpenAI, Google, Slack, Discord, etc.), OAuth tokens, service "
+                    "credentials, channel secrets, or any configuration value. "
+                    "Input should be a JSON string with: resource_type (api_key, channel_secret, "
+                    "token, config), key_name (e.g. GOOGLE_API_KEY), label (human-readable name), "
+                    "used_by (which tool/service needs it), description (why it's needed). "
+                    "If the resource is already configured, it returns immediately. "
+                    "If not, the user will be prompted securely."
+                ),
+            ),
 
         ]
 
@@ -2936,6 +3016,11 @@ review_agents = {"10077":True,10077:True}
 conversation_agent = {"10077":False,10077:False}
 _state_lock = threading.Lock()  # Protects review_agents, conversation_agent, first_promts
 
+# --- Interactive gather_info turn limit ---
+# After MAX_GATHER_TURNS without completion, force-complete with available data
+MAX_GATHER_TURNS = 12
+_gather_turn_counts = {}  # f'{user_id}_{prompt_id}' -> int
+
 # --- TTL-based cleanup for review_agents / conversation_agent (M2 fix) ---
 _AGENT_TTL = 3600  # 1 hour
 _agent_timestamps = {}  # user_id -> last-access epoch
@@ -2958,6 +3043,13 @@ def _cleanup_stale_agents():
             review_agents.pop(key, None)
             conversation_agent.pop(key, None)
             _agent_timestamps.pop(key, None)
+    # Also clean stale gather turn counters
+    # Turn key format: '{user_id}_{prompt_id}' — split from the RIGHT
+    # since user_id itself may contain underscores (e.g. 'test_user_1')
+    for tk in list(_gather_turn_counts.keys()):
+        uid = tk.rsplit('_', 1)[0] if '_' in tk else tk
+        if uid not in _agent_timestamps:
+            _gather_turn_counts.pop(tk, None)
 
 # Per-user locks to prevent race conditions when concurrent requests
 # for the same user modify review_agents / conversation_agent dicts.
@@ -2989,11 +3081,19 @@ def _autonomous_gather_info(user_id, description, prompt_id):
         try:
             new_response = response.replace('true', 'True').replace('false', 'False')
             parsed = retrieve_json(new_response)
-            if parsed.get('status', '').lower() == 'completed':
+            # Handle list-of-dicts response from LLM
+            if isinstance(parsed, list):
+                for item in reversed(parsed):
+                    if isinstance(item, dict) and 'status' in item:
+                        parsed = item
+                        break
+                else:
+                    parsed = {}
+            if isinstance(parsed, dict) and parsed.get('status', '').lower() == 'completed':
                 # Save agent config
                 parsed['prompt_id'] = prompt_id
                 parsed['creator_user_id'] = user_id
-                name = f'prompts/{prompt_id}.json'
+                name = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
                 with open(name, 'w') as f:
                     json.dump(parsed, f)
                 app.logger.info(f'Autonomous agent config saved to {name}')
@@ -3020,9 +3120,71 @@ def _autonomous_gather_info(user_id, description, prompt_id):
         response = gather_info(user_id, 'proceed', prompt_id, autonomous=True)
         iteration += 1
 
-    # Fallback: save whatever we have
-    app.logger.warning(f'Autonomous gather_info did not complete in {max_iterations} iterations')
-    return 'Autonomous gathering completed. Moving to review.'
+    # Fallback: save partial config so the pipeline can recover
+    app.logger.warning(f'Autonomous gather_info did not complete in {max_iterations} iterations, saving partial config')
+    partial = {
+        'status': 'completed',
+        'name': f'Agent {prompt_id}',
+        'agent_name': f'auto.agent{str(prompt_id)[-4:]}',
+        'goal': description or 'General assistant',
+        'broadcast_agent': 'no',
+        'personas': [{'name': 'Assistant', 'description': 'General purpose assistant'}],
+        'flows': [{'flow_name': 'main', 'persona': 'Assistant', 'actions': [{'action': 'Respond to user', 'action_id': 1, 'status': 'pending'}], 'sub_goal': description or 'Help the user'}],
+        'extra_information': f'Auto-generated after {max_iterations} autonomous gather iterations',
+        'prompt_id': prompt_id,
+        'creator_user_id': user_id,
+    }
+    name = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
+    try:
+        with open(name, 'w') as f:
+            json.dump(partial, f)
+        app.logger.info(f'Partial autonomous agent config saved to {name}')
+        # Sync to cloud DB (non-fatal)
+        try:
+            pooled_post(
+                f'{DB_URL}/createpromptlist',
+                json={'listprompts': [{
+                    'prompt_id': prompt_id,
+                    'prompt': partial.get('goal', ''),
+                    'user_id': user_id,
+                    'name': partial.get('name', ''),
+                    'is_active': True,
+                    'image_url': '',
+                }]},
+                timeout=5)
+        except Exception:
+            pass
+    except Exception as e:
+        app.logger.error(f'Failed to save partial autonomous config: {e}')
+    return 'Autonomous gathering completed with partial config. Moving to review.'
+
+
+# Resonance tuning post-response hook
+def _tune_resonance_after_chat(user_id, prompt_text, response_text):
+    """Tune resonance and return summary for crossbar/response piggyback.
+
+    Returns dict with resonance state (or empty dict on failure).
+    Sync — EMA math is <1ms, no LLM calls.
+    Also dispatches signals to HevolveAI async in background.
+    """
+    try:
+        from core.resonance_tuner import get_resonance_tuner
+        if user_id and prompt_text and response_text:
+            tuner = get_resonance_tuner()
+            profile = tuner.analyze_and_tune(
+                str(user_id), str(prompt_text), str(response_text))
+            return {
+                'resonance_confidence': round(profile.resonance_confidence, 2),
+                'resonance_tuning': {
+                    k: round(v, 3) for k, v in profile.tuning.items()
+                },
+                'resonance_interactions': profile.total_interactions,
+            }
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    return {}
 
 
 @app.route('/chat', methods=['POST'])
@@ -3139,16 +3301,16 @@ def chat():
         # Replaces the global _state_lock for better concurrency.
         _user_lock = _get_user_lock(user_id)
         with _user_lock:
-            if os.path.exists(f'prompts/{prompt_id}.json'):
+            if os.path.exists(os.path.join(PROMPTS_DIR, f'{prompt_id}.json')):
                 app.logger.info('GATHER JSON EXISTS')
-                if os.path.exists(f'prompts/{prompt_id}_0_recipe.json'):
+                if os.path.exists(os.path.join(PROMPTS_DIR, f'{prompt_id}_0_recipe.json')):
                     app.logger.info('0 Recipe JSON EXISTS')
-                    file_path = f'prompts/{prompt_id}.json'
+                    file_path = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
                     with open(file_path, 'r') as f:
                         data = json.load(f)
                         no_of_flow = len(data['flows'])-1
                         app.logger.info(f'GOT LEN OF FLOW AS {no_of_flow}')
-                    if os.path.exists(f'prompts/{prompt_id}_{no_of_flow}_recipe.json'):
+                    if os.path.exists(os.path.join(PROMPTS_DIR, f'{prompt_id}_{no_of_flow}_recipe.json')):
                         create_agent = set_flags_to_enter_review_mode(no_of_flow, user_id) #returns false
                     else:
                         app.logger.info(f'{no_of_flow} Recipe JSON doesnot EXISTS')
@@ -3206,69 +3368,120 @@ def chat():
                 _record_lifecycle('Review Mode', user_id, prompt_id, f'Autonomous creation via dispatch: {prompt[:100]}')
                 return jsonify({'response': auto_response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [], 'Agent_status': 'Review Mode', 'autonomous_creation': True, 'prompt_id': prompt_id})
             from gather_agentdetails import gather_info
-            response = gather_info(user_id,prompt,prompt_id)
+
+            # --- Turn counter: force-complete after MAX_GATHER_TURNS ---
+            turn_key = f'{user_id}_{prompt_id}'
+            _gather_turn_counts[turn_key] = _gather_turn_counts.get(turn_key, 0) + 1
+            turn_num = _gather_turn_counts[turn_key]
+            app.logger.info(f'gather_info turn {turn_num}/{MAX_GATHER_TURNS} for {turn_key}')
+
+            if turn_num >= MAX_GATHER_TURNS:
+                # Force completion: ask LLM to wrap up with whatever it has
+                app.logger.warning(f'gather_info hit max turns ({MAX_GATHER_TURNS}), forcing completion')
+                prompt = ('Please finalize and return the completed agent configuration NOW with '
+                          'status="completed". Use reasonable defaults for any missing fields. '
+                          'Return the full JSON immediately.')
+
+            response = gather_info(user_id, prompt, prompt_id)
             new_response = response.replace('true','True').replace("false", "False")
             app.logger.info('AFTER GATHER INFO')
+
+            # --- Helper: save completed agent config and transition to Review ---
+            def _save_and_enter_review(agent_config):
+                agent_config['prompt_id'] = prompt_id
+                agent_config['creator_user_id'] = user_id
+                with _user_lock:
+                    conversation_agent[user_id] = False
+                    _touch_agent_timestamp(user_id)
+                name = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
+                with open(name, "w") as json_file:
+                    json.dump(agent_config, json_file)
+                app.logger.info(f"Agent config saved to {name}")
+                # Sync to cloud DB (non-fatal)
+                try:
+                    pooled_post(
+                        f'{DB_URL}/createpromptlist',
+                        json={'listprompts': [{
+                            'prompt_id': prompt_id,
+                            'prompt': agent_config.get('goal', ''),
+                            'user_id': user_id,
+                            'name': agent_config.get('name', ''),
+                            'is_active': True,
+                            'image_url': agent_config.get('image_url', ''),
+                        }]},
+                        timeout=5)
+                except Exception:
+                    pass
+                with _user_lock:
+                    review_agents[user_id] = True
+                    _touch_agent_timestamp(user_id)
+                _gather_turn_counts.pop(turn_key, None)  # Reset turn counter
+                _record_lifecycle('Review Mode', user_id, prompt_id, 'Agent details gathered, entering review')
+
             try:
+                # Parse gather_info response
+                new_res = None
                 try:
                     new_res = retrieve_json(new_response)
                     app.logger.info(f"new_res: {new_res}")
                 except Exception as e:
                     app.logger.error(f'Got some error while will try with re match error:{e}')
                     json_match = re.search(r'{[\s\S]*}', response)
-                    app.logger.info(f'Json match result: {json_match}')
                     if json_match:
-                        app.logger.info(f'Inside json_match')
-                        json_part = json_match.group(0)
-                        app.logger.info(f'Before loads json_part:{json_part}')
-                        new_res = json.loads(json_part)
-                        app.logger.info(f'After loads new_res:{new_res}')
+                        new_res = json.loads(json_match.group(0))
                     else:
                         raise ValueError('No JSON in response')
-                app.logger.info('AFTER EVAL')
-                if new_res['status'] == 'pending':
+
+                # LLM sometimes returns a list of conversation turns instead of a single dict
+                if isinstance(new_res, list):
+                    app.logger.info(f'new_res is a list (len={len(new_res)}), extracting last dict with status')
+                    for item in reversed(new_res):
+                        if isinstance(item, dict) and 'status' in item:
+                            new_res = item
+                            break
+                    else:
+                        for item in reversed(new_res):
+                            if isinstance(item, dict):
+                                new_res = item
+                                break
+                        else:
+                            raise ValueError(f'List response has no usable dict: {new_res}')
+                    app.logger.info(f'Extracted dict: status={new_res.get("status")}')
+
+                if new_res is None:
+                    raise ValueError('new_res is None after parsing')
+
+                if new_res.get('status') == 'pending' and turn_num < MAX_GATHER_TURNS:
                     app.logger.info('PENDING STATUS')
-                    ans = new_res['question'] if 'question' in new_res else new_res['review_details']
-                    _record_lifecycle('Creation Mode', user_id, prompt_id, 'Agent creation started via gather_info')
+                    ans = new_res.get('question') or new_res.get('review_details', response)
+                    _record_lifecycle('Creation Mode', user_id, prompt_id, f'Agent creation turn {turn_num}')
                     return jsonify({'response': ans, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Creation Mode', 'prompt_id': prompt_id})
                 else:
+                    # Completed (or forced completion after max turns)
                     app.logger.info('COMPLETED STATUS')
-                    new_res['prompt_id'] = prompt_id
-                    new_res['creator_user_id'] = user_id
-                    with _user_lock:
-                        conversation_agent[user_id] = False
-                        _touch_agent_timestamp(user_id)
-                    app.logger.info(
-                        'Agent Created Successfully saving it and reusing it for further purpose')
-                    name = f'prompts/{prompt_id}.json'
-                    with open(name, "w") as json_file:
-                        json.dump(new_res, json_file)
-                    app.logger.info(f"Dictionary saved to {name}")
-                    # Sync to cloud DB so prompt_id matches
-                    try:
-                        pooled_post(
-                            f'{DB_URL}/createpromptlist',
-                            json={'listprompts': [{
-                                'prompt_id': prompt_id,
-                                'prompt': new_res.get('goal', ''),
-                                'user_id': user_id,
-                                'name': new_res.get('name', ''),
-                                'is_active': True,
-                                'image_url': new_res.get('image_url', ''),
-                            }]},
-                            timeout=5)
-                    except Exception as e:
-                        app.logger.debug(f"Cloud sync failed (non-fatal): {e}")
-                    with _user_lock:
-                        review_agents[user_id] = True
-                        _touch_agent_timestamp(user_id)
-                    _record_lifecycle('Review Mode', user_id, prompt_id, 'Agent details gathered, entering review')
+                    _save_and_enter_review(new_res)
                     return jsonify({'response': 'Got Agent details successfully lets move on to review them one at a time', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Review Mode', 'prompt_id': prompt_id})
+
             except Exception as e:
-                app.logger.error('GOT some error while eval and returning the response')
-                app.logger.error(e)
+                app.logger.error(f'gather_info parse error on turn {turn_num}: {e}')
+                # After repeated failures, salvage what we can and move forward
+                if turn_num >= MAX_GATHER_TURNS - 2:
+                    app.logger.warning('Too many gather_info failures, salvaging partial config')
+                    partial = {
+                        'status': 'completed',
+                        'name': f'Agent {prompt_id}',
+                        'agent_name': f'auto.agent{str(prompt_id)[-4:]}',
+                        'goal': prompt or 'General assistant',
+                        'broadcast_agent': 'no',
+                        'personas': [{'name': 'Assistant', 'description': 'General purpose assistant'}],
+                        'flows': [{'flow_name': 'main', 'persona': 'Assistant', 'actions': [{'action': 'Respond to user', 'action_id': 1, 'status': 'pending'}], 'sub_goal': prompt or 'Help the user'}],
+                        'extra_information': f'Auto-generated after {turn_num} gather turns'
+                    }
+                    _save_and_enter_review(partial)
+                    _record_lifecycle('Review Mode', user_id, prompt_id, f'Force-completed after {turn_num} failed turns')
+                    return jsonify({'response': 'Agent created with available details. Moving to review.', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Review Mode', 'prompt_id': prompt_id})
                 _record_lifecycle('Creation Mode', user_id, prompt_id, f'Creation continuing after parse error: {e}')
-                return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Creation Mode'})
+                return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Creation Mode', 'prompt_id': prompt_id})
         # Phase 2: Review Phase (re-snapshot flags under lock after Phase 1 may have mutated)
         with _user_lock:
             _in_review = user_id in review_agents and review_agents[user_id]
@@ -3292,9 +3505,9 @@ def chat():
         if _in_review and _in_convo:
             return evaluate_agent_after_creation_in_review(file_id, prompt, prompt_id, request_id, user_id)
 
-    if prompt_id and os.path.exists(f'prompts/{prompt_id}.json'):
+    if prompt_id and os.path.exists(os.path.join(PROMPTS_DIR, f'{prompt_id}.json')):
 
-        with open(f'prompts/{prompt_id}.json', "r") as file:
+        with open(os.path.join(PROMPTS_DIR, f'{prompt_id}.json'), "r") as file:
             created_json = json.load(file)
 
 
@@ -3357,7 +3570,8 @@ def chat():
                 })
 
         _record_lifecycle('Reuse Mode', user_id, prompt_id, 'Agent reused for conversation')
-        return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Reuse Mode'})
+        _resonance = _tune_resonance_after_chat(user_id, prompt, response)
+        return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Reuse Mode', **_resonance})
 
     if prompt_id:
         try:
@@ -3443,7 +3657,14 @@ def chat():
             new_response = response.replace('true', 'True').replace("false", "False")
             try:
                 new_res = retrieve_json(new_response)
-                if new_res.get('status') == 'pending':
+                if isinstance(new_res, list):
+                    for item in reversed(new_res):
+                        if isinstance(item, dict) and 'status' in item:
+                            new_res = item
+                            break
+                    else:
+                        new_res = {}
+                if isinstance(new_res, dict) and new_res.get('status') == 'pending':
                     resp_text = new_res.get('question', new_res.get('review_details', ans))
                 else:
                     resp_text = ans
@@ -3472,9 +3693,11 @@ def chat():
             'Content-Type': 'application/json'
         }
         action_response = pooled_post(f'{DB_URL}/create_action', headers=headers, data=payload)
+    _resonance = _tune_resonance_after_chat(user_id, prompt, ans) if ans else {}
     if ans != "":
         post_dict = {'user_id': user_id, 'status': 'FINISHED', 'task_name': "CHAT",
-                     'uid': request_id, 'task_id': f"CHAT_{str(request_id)}", 'request_id': request_id}
+                     'uid': request_id, 'task_id': f"CHAT_{str(request_id)}", 'request_id': request_id,
+                     **_resonance}
         publish_async('com.hertzai.longrunning.log', post_dict)
     else:
         post_dict = {'user_id': user_id, 'status': 'ERROR', 'task_name': "CHAT", 'uid': request_id,
@@ -3485,14 +3708,15 @@ def chat():
     elapsed_time = end_time - start_time
     app.logger.info(f"time taken for this full call is {elapsed_time}")
 
-    return jsonify({'response': ans, 'intent': thread_local_data.get_recognize_intents(), 'req_token_count': thread_local_data.get_req_token_count(), 'res_token_count': thread_local_data.get_res_token_count(), 'history_request_id': thread_local_data.get_reqid_list()})
+    return jsonify({'response': ans, 'intent': thread_local_data.get_recognize_intents(), 'req_token_count': thread_local_data.get_req_token_count(), 'res_token_count': thread_local_data.get_res_token_count(), 'history_request_id': thread_local_data.get_reqid_list(), **_resonance})
 
 
 def evaluate_agent_after_creation_in_review(file_id, prompt, prompt_id, request_id, user_id):
     response = chat_agent(user_id, prompt, prompt_id, file_id, request_id)
     _record_lifecycle('Evaluation Mode', user_id, prompt_id, 'Agent being evaluated after creation')
+    _resonance = _tune_resonance_after_chat(user_id, prompt, response)
     return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0,
-                    'history_request_id': [], 'Agent_status': 'Evaluation Mode'})
+                    'history_request_id': [], 'Agent_status': 'Evaluation Mode', **_resonance})
 
 
 def set_flags_to_enter_review_mode(no_of_flow, user_id):
@@ -3576,7 +3800,7 @@ def history():
 
 def _create_social_agent_from_prompt(user_id, prompt_id):
     """Read prompts/{prompt_id}.json and create a social User for this agent."""
-    prompt_file = f'prompts/{prompt_id}.json'
+    prompt_file = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
     if not os.path.exists(prompt_file):
         return
     with open(prompt_file, 'r') as f:
@@ -3772,7 +3996,7 @@ def create_prompts():
             item['prompt_id'] = pid
 
         # Save locally
-        local_path = f'prompts/{pid}.json'
+        local_path = os.path.join(PROMPTS_DIR, f'{pid}.json')
         local_data = {}
         if os.path.exists(local_path):
             with open(local_path, 'r') as f:
@@ -4754,6 +4978,197 @@ def settings_compute_provider_join():
         'message': 'Welcome to the HART OS compute network. '
                    'Your contribution helps democratize access to AI.',
     })
+
+
+# ─── Remote Desktop API ──────────────────────────────────────────
+# RustDesk + Sunshine/Moonlight bridge, session management,
+# engine selection, device identity.
+
+
+@app.route('/api/remote-desktop/status', methods=['GET'])
+@_json_endpoint
+def remote_desktop_api_status():
+    """Device ID, engine status, active sessions."""
+    from integrations.remote_desktop.engine_selector import get_all_status
+    from integrations.remote_desktop.device_id import get_device_id, format_device_id
+    from integrations.remote_desktop.session_manager import get_session_manager
+
+    device_id = get_device_id()
+    sm = get_session_manager()
+    sessions = sm.get_active_sessions()
+
+    status = get_all_status()
+    status['device_id'] = device_id
+    status['formatted_id'] = format_device_id(device_id)
+    status['active_sessions'] = [
+        {'session_id': s.session_id, 'host_device_id': s.host_device_id,
+         'mode': s.mode.value, 'state': s.state.value,
+         'viewers': s.viewer_device_ids}
+        for s in sessions
+    ]
+    return jsonify(status)
+
+
+@app.route('/api/remote-desktop/host', methods=['POST'])
+@_json_endpoint
+def remote_desktop_api_host():
+    """Start hosting. Body: {mode?, engine?}. Returns device_id + password."""
+    data = request.get_json() or {}
+    from integrations.remote_desktop.session_manager import (
+        get_session_manager, SessionMode,
+    )
+    from integrations.remote_desktop.device_id import get_device_id, format_device_id
+
+    device_id = get_device_id()
+    sm = get_session_manager()
+    mode_str = data.get('mode', 'full_control')
+    mode = SessionMode(mode_str) if mode_str in [m.value for m in SessionMode] else SessionMode.FULL_CONTROL
+    password = sm.generate_otp(device_id)
+    engine_pref = data.get('engine', 'auto')
+
+    result = {
+        'device_id': device_id,
+        'formatted_id': format_device_id(device_id),
+        'password': password,
+        'mode': mode.value,
+        'engine': engine_pref,
+    }
+
+    # Start RustDesk
+    if engine_pref in ('auto', 'rustdesk'):
+        try:
+            from integrations.remote_desktop.rustdesk_bridge import get_rustdesk_bridge
+            bridge = get_rustdesk_bridge()
+            if bridge.available:
+                bridge.set_password(password)
+                bridge.start_service()
+                rd_id = bridge.get_id()
+                if rd_id:
+                    result['rustdesk_id'] = rd_id
+                result['engine'] = 'rustdesk'
+        except Exception:
+            pass
+
+    # Start Sunshine
+    if engine_pref in ('auto', 'sunshine'):
+        try:
+            from integrations.remote_desktop.sunshine_bridge import get_sunshine_bridge
+            bridge = get_sunshine_bridge()
+            if bridge.available:
+                bridge.start_service()
+                result['sunshine_running'] = bridge.is_running()
+                if engine_pref == 'sunshine':
+                    result['engine'] = 'sunshine'
+        except Exception:
+            pass
+
+    return jsonify(result)
+
+
+@app.route('/api/remote-desktop/connect', methods=['POST'])
+@_json_endpoint
+def remote_desktop_api_connect():
+    """Connect to remote device. Body: {device_id, password, mode?, engine?}."""
+    data = request.get_json() or {}
+    device_id = data.get('device_id')
+    password = data.get('password')
+    if not device_id or not password:
+        return jsonify({'error': 'device_id and password required'}), 400
+
+    engine = data.get('engine', 'auto')
+    file_transfer = data.get('mode') == 'file_transfer'
+
+    # Try RustDesk
+    if engine in ('auto', 'rustdesk'):
+        try:
+            from integrations.remote_desktop.rustdesk_bridge import get_rustdesk_bridge
+            bridge = get_rustdesk_bridge()
+            if bridge.available:
+                ok, msg = bridge.connect(device_id, password=password,
+                                         file_transfer=file_transfer)
+                if ok:
+                    return jsonify({'success': True, 'engine': 'rustdesk',
+                                    'device_id': device_id, 'message': msg})
+        except Exception:
+            pass
+
+    # Try Moonlight
+    if engine in ('auto', 'moonlight'):
+        try:
+            from integrations.remote_desktop.sunshine_bridge import get_moonlight_bridge
+            bridge = get_moonlight_bridge()
+            if bridge.available:
+                ok, msg = bridge.stream(device_id)
+                if ok:
+                    return jsonify({'success': True, 'engine': 'moonlight',
+                                    'device_id': device_id, 'message': msg})
+        except Exception:
+            pass
+
+    return jsonify({'success': False, 'error': 'No engine available'}), 503
+
+
+@app.route('/api/remote-desktop/sessions', methods=['GET'])
+@_json_endpoint
+def remote_desktop_api_sessions():
+    """List active remote desktop sessions."""
+    from integrations.remote_desktop.session_manager import get_session_manager
+    sm = get_session_manager()
+    sessions = sm.get_active_sessions()
+    return jsonify({
+        'sessions': [
+            {'session_id': s.session_id, 'host_device_id': s.host_device_id,
+             'mode': s.mode.value, 'state': s.state.value,
+             'viewers': s.viewer_device_ids}
+            for s in sessions
+        ]
+    })
+
+
+@app.route('/api/remote-desktop/disconnect/<session_id>', methods=['POST'])
+@_json_endpoint
+def remote_desktop_api_disconnect(session_id):
+    """End a specific session."""
+    from integrations.remote_desktop.session_manager import get_session_manager
+    sm = get_session_manager()
+    sm.disconnect_session(session_id)
+    return jsonify({'disconnected': session_id})
+
+
+@app.route('/api/remote-desktop/engines', methods=['GET'])
+@_json_endpoint
+def remote_desktop_api_engines():
+    """List available engines with install commands."""
+    from integrations.remote_desktop.engine_selector import (
+        get_available_engines, get_all_status, Engine,
+    )
+    status = get_all_status()
+    available = get_available_engines()
+    return jsonify({
+        'available': [e.value for e in available],
+        'engines': status['engines'],
+        'install_recommendations': status.get('install_recommendations', []),
+    })
+
+
+@app.route('/api/remote-desktop/select-engine', methods=['POST'])
+@_json_endpoint
+def remote_desktop_api_select_engine():
+    """Auto-select best engine. Body: {use_case?, role?, prefer?}."""
+    data = request.get_json() or {}
+    from integrations.remote_desktop.engine_selector import (
+        select_engine, UseCase, Engine,
+    )
+
+    use_case_str = data.get('use_case', 'general')
+    role = data.get('role', 'viewer')
+    prefer_str = data.get('prefer')
+
+    uc = UseCase(use_case_str) if use_case_str in [u.value for u in UseCase] else UseCase.GENERAL
+    prefer = Engine(prefer_str) if prefer_str and prefer_str in [e.value for e in Engine] else None
+
+    engine = select_engine(uc, role=role, prefer=prefer)
+    return jsonify({'engine': engine.value, 'use_case': uc.value, 'role': role})
 
 
 def _init_skills():

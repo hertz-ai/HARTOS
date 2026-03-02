@@ -1,11 +1,11 @@
 """
-Coding Agent Tool Backends — Subprocess wrappers for KiloCode, Claude Code, OpenCode.
+Coding Agent Tool Backends — KiloCode, Claude Code, OpenCode, Aider Native.
 
-Each backend wraps a CLI tool via subprocess, captures JSON output, and returns
-structured results. The orchestrator calls exactly ONE backend per task (never all three).
+Subprocess backends wrap CLI tools via subprocess. AiderNativeBackend runs
+in-process using vendored Aider modules for zero-latency code intelligence.
 
-This is a leaf tool — it calls external processes, never re-dispatches to /chat.
-This eliminates callback loops and double-dispatch antipatterns.
+The orchestrator calls exactly ONE backend per task (never all three).
+This is a leaf tool — never re-dispatches to /chat.
 """
 import json
 import logging
@@ -228,11 +228,35 @@ class OpenCodeBackend(CodingToolBackend):
             }
 
 
+# Lazy import for AiderNativeBackend to avoid hard dependency
+def _get_aider_native_class():
+    from .aider_native_backend import AiderNativeBackend
+    return AiderNativeBackend
+
+
+class _LazyAiderNative:
+    """Lazy proxy so BACKENDS dict doesn't force-import aider_core at module load."""
+
+    _cls = None
+
+    def __call__(self):
+        if self._cls is None:
+            try:
+                self._cls = _get_aider_native_class()
+            except ImportError:
+                return None
+        return self._cls()
+
+    def __eq__(self, other):
+        return False  # Never matches shutil.which checks
+
+
 # Registry of all backends
 BACKENDS = {
     'kilocode': KiloCodeBackend,
     'claude_code': ClaudeCodeBackend,
     'opencode': OpenCodeBackend,
+    'aider_native': _get_aider_native_class,
 }
 
 

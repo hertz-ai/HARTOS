@@ -164,7 +164,7 @@ class TestVRAMManager:
             # Should return safe defaults
             assert 'cuda_available' in info
 
-    @patch('integrations.service_tools.vram_manager.subprocess.run', side_effect=FileNotFoundError)
+    @patch('subprocess.run', side_effect=FileNotFoundError)
     @patch('torch.cuda.is_available', return_value=True)
     @patch('torch.cuda.get_device_name', return_value='RTX 3070')
     @patch('torch.cuda.get_device_properties')

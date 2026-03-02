@@ -57,12 +57,9 @@ dependencies = [
     "SQLAlchemy>=2.0.0",
     "redis>=4.6.0",
 
-    # LangChain ecosystem (1.x split: core + community + openai + classic compat)
-    "langchain>=1.0.0",
-    "langchain-core>=1.0.0",
-    "langchain-classic>=1.0.0",
-    "langchain-community>=0.4.0",
-    "langchain-openai>=1.0.0",
+    # LangChain ecosystem (matches requirements.txt)
+    "langchain>=0.0.230",
+    "langchain-core>=0.1.0",
     "langchain-groq>=0.1.0",
     "langsmith>=0.1.0",
 
@@ -140,6 +137,12 @@ google = [
     "google-api-python-client>=2.90.0",
 ]
 memory = ["simplemem>=0.1.0"]
+remote-desktop = [
+    "mss>=9.0.0",
+    "websockets>=12.0",
+    "av>=12.0.0",
+    "pynput>=1.7.0",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
@@ -164,6 +167,7 @@ all = [
 ]
 
 [project.scripts]
+hart = "hart_cli:hart"
 hart-server = "langchain_gpt_api:main"
 hart-crossbar = "crossbar_server:main"
 

@@ -8,7 +8,7 @@ from .models import get_engine, Base
 
 logger = logging.getLogger('hevolve_social')
 
-SCHEMA_VERSION = 31
+SCHEMA_VERSION = 33
 
 
 def get_schema_version(engine) -> int:
@@ -609,3 +609,85 @@ def run_migrations():
                 logger.warning("v31 migration: ADD COLUMN x25519_public skipped: %s", e)
             conn.commit()
         set_schema_version(engine, 31)
+
+    if current < 32:
+        logger.info("HevolveSocial: migrating to v32 (multiplayer game tables)")
+        with engine.connect() as conn:
+            try:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS game_sessions (
+                        id VARCHAR(64) PRIMARY KEY,
+                        game_type VARCHAR(30) NOT NULL,
+                        status VARCHAR(20) DEFAULT 'waiting',
+                        host_user_id VARCHAR(64) NOT NULL REFERENCES users(id),
+                        encounter_id VARCHAR(64),
+                        community_id VARCHAR(64),
+                        challenge_id VARCHAR(64),
+                        max_players INTEGER DEFAULT 4,
+                        current_round INTEGER DEFAULT 0,
+                        total_rounds INTEGER DEFAULT 5,
+                        game_state JSON,
+                        config JSON,
+                        started_at DATETIME,
+                        ended_at DATETIME,
+                        expires_at DATETIME NOT NULL,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                """))
+            except Exception as e:
+                logger.warning("v32 migration: CREATE TABLE game_sessions skipped: %s", e)
+            try:
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_game_sessions_status ON game_sessions (status)"))
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_game_sessions_host ON game_sessions (host_user_id)"))
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_game_sessions_type ON game_sessions (game_type)"))
+            except Exception as e:
+                logger.warning("v32 migration: game_sessions indexes skipped: %s", e)
+            try:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS game_participants (
+                        id VARCHAR(64) PRIMARY KEY,
+                        game_session_id VARCHAR(64) NOT NULL REFERENCES game_sessions(id),
+                        user_id VARCHAR(64) NOT NULL REFERENCES users(id),
+                        score INTEGER DEFAULT 0,
+                        is_ready BOOLEAN DEFAULT 0,
+                        joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        finished_at DATETIME,
+                        result VARCHAR(20),
+                        spark_earned INTEGER DEFAULT 0,
+                        xp_earned INTEGER DEFAULT 0,
+                        UNIQUE (game_session_id, user_id)
+                    )
+                """))
+            except Exception as e:
+                logger.warning("v32 migration: CREATE TABLE game_participants skipped: %s", e)
+            try:
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_game_participants_session "
+                    "ON game_participants (game_session_id)"))
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_game_participants_user "
+                    "ON game_participants (user_id)"))
+            except Exception as e:
+                logger.warning("v32 migration: game_participants indexes skipped: %s", e)
+            conn.commit()
+        set_schema_version(engine, 32)
+
+    if current < 33:
+        logger.info("HevolveSocial: migrating to v33 (thought experiment discovery fields)")
+        with engine.connect() as conn:
+            for stmt in [
+                "ALTER TABLE thought_experiments ADD COLUMN experiment_type VARCHAR(20) DEFAULT 'traditional'",
+                "ALTER TABLE thought_experiments ADD COLUMN funding_total INTEGER DEFAULT 0",
+                "ALTER TABLE thought_experiments ADD COLUMN contributor_count INTEGER DEFAULT 0",
+                "ALTER TABLE thought_experiments ADD COLUMN camera_feed_url VARCHAR(500)",
+            ]:
+                try:
+                    conn.execute(text(stmt))
+                except Exception as e:
+                    col = stmt.split("ADD COLUMN ")[-1].split()[0]
+                    logger.warning("v33 migration: ADD COLUMN %s skipped: %s", col, e)
+            conn.commit()
+        set_schema_version(engine, 33)

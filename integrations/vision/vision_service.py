@@ -375,6 +375,29 @@ class VisionService:
         except Exception as e:
             logger.debug(f"Visual trigger evaluation error: {e}")
 
+    # ─── Face Signature Enrollment ───
+
+    def _enroll_face_signature(self, user_id: str, frame_bytes: bytes):
+        """Dispatch face enrollment to HevolveAI via WorldModelBridge.
+
+        Piggybacks on existing frame processing. Zero extra I/O.
+        Enrolls up to 5 face samples per user, then stops.
+        All ML (embedding extraction, matching) runs in HevolveAI.
+        """
+        try:
+            from core.resonance_profile import get_or_create_profile
+            profile = get_or_create_profile(user_id)
+            if profile.face_enrollment_count >= 5:
+                return  # Already enrolled enough samples
+            from core.resonance_identifier import ResonanceIdentifier
+            identifier = ResonanceIdentifier()
+            if identifier.enroll_face(user_id, frame_bytes):
+                logger.debug(f"Face enrollment dispatched to HevolveAI for user {user_id}")
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.debug(f"Face enrollment skipped: {e}")
+
     # ─── Sidecar Management ───
 
     def _start_minicpm(self):
@@ -530,6 +553,8 @@ class VisionService:
                     # Camera channel
                     frame_bytes = self.store.get_frame(user_id)
                     if frame_bytes:
+                        # Piggyback face signature enrollment (zero extra I/O)
+                        self._enroll_face_signature(user_id, frame_bytes)
                         if self._should_describe(user_id, frame_bytes, 'camera'):
                             desc = self._describe_frame(user_id, frame_bytes)
                             if desc:
