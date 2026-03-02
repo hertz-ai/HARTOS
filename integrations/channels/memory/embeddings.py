@@ -327,8 +327,8 @@ class SQLiteBackend:
         result = {}
 
         with self._lock:
-            # Build query for batch lookup
-            placeholders = ", ".join(["(?, ?)"] * len(keys))
+            # Use OR conditions — SQLite doesn't support multi-column IN with params
+            conditions = " OR ".join(["(text_hash = ? AND model = ?)"] * len(keys))
             params = []
             for text_hash, model in keys:
                 params.extend([text_hash, model])
@@ -337,7 +337,7 @@ class SQLiteBackend:
             rows = conn.execute(
                 f"""
                 SELECT text_hash, embedding FROM embeddings
-                WHERE (text_hash, model) IN ({placeholders}) AND expires_at > ?
+                WHERE ({conditions}) AND expires_at > ?
                 """,
                 params
             ).fetchall()

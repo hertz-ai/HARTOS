@@ -59,6 +59,15 @@ AWARD_TABLE = {
     'experiment_voted':         {'spark': 10, 'pulse': 5, 'xp': 15},
     'experiment_evaluated':     {'spark': 30, 'signal': 0.08, 'xp': 50},
     'experiment_suggestion':    {'spark': 15, 'signal': 0.05, 'xp': 20},
+    # Multiplayer games
+    'game_win':                 {'pulse': 15, 'spark': 10, 'xp': 30},
+    'game_participate':         {'pulse': 5, 'spark': 5, 'xp': 15},
+    'game_streak_3':            {'pulse': 10, 'spark': 15, 'xp': 25},
+    'multiplayer_encounter':    {'pulse': 5, 'xp': 10},
+    # Compute lending
+    'compute_opt_in':           {'pulse': 25, 'spark': 50, 'xp': 50},
+    'compute_hour':             {'spark': 10, 'xp': 20},
+    'compute_day_streak':       {'spark': 25, 'pulse': 10, 'xp': 40},
 }
 
 

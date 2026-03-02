@@ -14,15 +14,19 @@ from .tool_backends import CodingToolBackend, get_available_backends, get_all_ba
 
 logger = logging.getLogger('hevolve.coding_agent')
 
-# Heuristic defaults when no benchmark data exists
+# Heuristic defaults when no benchmark data exists.
+# aider_native preferred for tasks where in-process code intelligence excels.
+# Falls through to subprocess backends if aider_native isn't available.
 HEURISTIC_DEFAULTS = {
-    'code_review': 'claude_code',
-    'debugging': 'claude_code',
+    'code_review': 'aider_native',
+    'debugging': 'aider_native',
     'app_build': 'kilocode',
     'feature': 'kilocode',
-    'refactor': 'opencode',
-    'bug_fix': 'claude_code',
+    'refactor': 'aider_native',
+    'bug_fix': 'aider_native',
     'multi_session': 'opencode',
+    'multi_file_edit': 'aider_native',
+    'architecture': 'aider_native',
 }
 
 

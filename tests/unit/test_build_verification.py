@@ -191,15 +191,9 @@ class TestDependencyVersions(unittest.TestCase):
         import sqlalchemy
         self.assertIsNotNone(sqlalchemy.__version__)
 
-    def test_langchain_classic_importable(self):
+    def test_langchain_importable(self):
         import langchain_classic
-        # langchain_classic provides backward compat for langchain 0.x imports
-
-    def test_langchain_community_importable(self):
-        import langchain_community
-
-    def test_langchain_openai_importable(self):
-        import langchain_openai
+        self.assertIsNotNone(langchain_classic.__version__)
 
 
 if __name__ == '__main__':

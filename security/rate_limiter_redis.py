@@ -34,6 +34,8 @@ class RedisRateLimiter:
         'discover': (10, 60),        # 10 discovery calls per 60 seconds
         'chat': (30, 60),            # 30 chat requests per 60 seconds
         'goal_create': (10, 3600),   # 10 goals per user per hour
+        'remote_desktop': (30, 60),  # 30 connections per 60 seconds
+        'remote_desktop_auth': (5, 60),  # 5 failed auth attempts per 60 seconds
     }
 
     def __init__(self):

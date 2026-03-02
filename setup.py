@@ -105,6 +105,13 @@ extras_require = {
         "google-api-python-client>=2.90.0",
     ],
     "memory": ["simplemem>=0.1.0"],
+    # biometrics: ML deps (insightface, speechbrain) belong in HevolveAI, not HARTOS
+    "remote-desktop": [
+        "mss>=9.0.0",
+        "websockets>=12.0",
+        "av>=12.0.0",
+        "pynput>=1.7.0",
+    ],
     "dev": [
         "pytest>=7.0.0",
         "pytest-asyncio>=0.21.0",
@@ -185,7 +192,7 @@ setup(
     },
 
     # Python version requirement
-    python_requires=">=3.10,<3.12",
+    python_requires=">=3.9",
 
     # Dependencies
     install_requires=install_requires,
@@ -194,6 +201,7 @@ setup(
     # Entry points for console scripts
     entry_points={
         "console_scripts": [
+            "hart=hart_cli:hart",
             "hart-server=langchain_gpt_api:main",
             "hart-crossbar=crossbar_server:main",
         ],

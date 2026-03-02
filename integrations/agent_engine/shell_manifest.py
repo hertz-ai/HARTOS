@@ -320,6 +320,15 @@ SYSTEM_PANELS = {
         'group': 'System', 'default_size': [600, 400],
         'apis': ['/api/shell/display'],
     },
+    'remote_desktop': {
+        'title': 'Remote Desktop', 'icon': 'connected_tv',
+        'group': 'System', 'default_size': [800, 600],
+        'apis': [
+            '/api/remote-desktop/status',
+            '/api/remote-desktop/engines',
+            '/api/remote-desktop/sessions',
+        ],
+    },
 }
 
 

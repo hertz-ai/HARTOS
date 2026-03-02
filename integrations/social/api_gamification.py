@@ -1312,7 +1312,8 @@ def location_ping():
         return _err("Coordinates out of range", 400)
     db = get_db()
     try:
-        result = ProximityService.update_location(db, g.user_id, lat, lon, accuracy)
+        device_id = data.get('device_id')
+        result = ProximityService.update_location(db, g.user_id, lat, lon, accuracy, device_id=device_id)
         db.commit()
         return _ok(result)
     except Exception as e:

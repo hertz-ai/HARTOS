@@ -2,6 +2,7 @@
 Automated script to create Professional Coding Agent using create_recipe flow.
 This script interacts with the Flask server to create the agent recipe.
 """
+import os
 import requests
 import json
 import time
@@ -12,7 +13,7 @@ USER_ID = 10077
 PROMPT_ID = 9999  # Use unique ID for coding agent
 
 # Read the requirements
-with open("coding_agent_requirements.txt", "r") as f:
+with open(os.path.join(os.path.dirname(__file__), "coding_agent_requirements.txt"), "r") as f:
     requirements = f.read()
 
 print("=" * 80)

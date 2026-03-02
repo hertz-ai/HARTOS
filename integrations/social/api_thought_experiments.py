@@ -3,14 +3,17 @@ Thought Experiment API Blueprint — Constitutional thought experiment endpoints
 
 POST /api/social/experiments              — Create new experiment
 GET  /api/social/experiments              — List experiments (filter by status)
+GET  /api/social/experiments/discover     — Interest-based discovery with recommendations
+GET  /api/social/experiments/core-ip      — List core IP experiments
 GET  /api/social/experiments/<id>         — Get experiment detail
+GET  /api/social/experiments/<id>/metrics — Live metrics (camera, build stats, compute)
+POST /api/social/experiments/<id>/contribute — Record Spark investment
 POST /api/social/experiments/<id>/vote    — Cast vote
 POST /api/social/experiments/<id>/advance — Advance lifecycle
 POST /api/social/experiments/<id>/evaluate — Trigger agent evaluation
 POST /api/social/experiments/<id>/decide  — Record decision
 GET  /api/social/experiments/<id>/votes   — Get all votes
 GET  /api/social/experiments/<id>/timeline — Get lifecycle timeline
-GET  /api/social/experiments/core-ip      — List core IP experiments
 """
 import logging
 
@@ -97,6 +100,37 @@ def core_ip_experiments():
         return jsonify({'success': True, 'data': experiments}), 200
     except Exception as e:
         logger.error(f"Core IP experiments error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@thought_experiments_bp.route('/api/social/experiments/discover', methods=['GET'])
+def discover_experiments():
+    """Interest-based experiment discovery with personalised recommendations."""
+    from .models import get_db
+    from .experiment_discovery_service import ExperimentDiscoveryService
+
+    user_id = request.args.get('user_id')
+    intent = request.args.get('intent_category')
+    exp_type = request.args.get('experiment_type')
+    status = request.args.get('status')
+    limit = request.args.get('limit', 25, type=int)
+    offset = request.args.get('offset', 0, type=int)
+
+    db = get_db()
+    try:
+        result = ExperimentDiscoveryService.discover(
+            db, user_id=user_id, intent_filter=intent,
+            experiment_type=exp_type, status_filter=status,
+            limit=limit, offset=offset)
+        return jsonify({
+            'success': True,
+            'data': result['experiments'],
+            'meta': result['meta'],
+        }), 200
+    except Exception as e:
+        logger.error(f"Discover experiments error: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
     finally:
         db.close()
@@ -267,6 +301,57 @@ def experiment_timeline(experiment_id):
         return jsonify({'success': False, 'error': 'not_found'}), 404
     except Exception as e:
         logger.error(f"Timeline error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@thought_experiments_bp.route('/api/social/experiments/<experiment_id>/metrics',
+                               methods=['GET'])
+def experiment_metrics(experiment_id):
+    """Get live metrics for an experiment (camera feed, build stats, compute)."""
+    from .models import get_db
+    from .experiment_discovery_service import ExperimentDiscoveryService
+
+    db = get_db()
+    try:
+        metrics = ExperimentDiscoveryService.get_experiment_metrics(
+            db, experiment_id)
+        if metrics:
+            return jsonify({'success': True, 'data': metrics}), 200
+        return jsonify({'success': False, 'error': 'not_found'}), 404
+    except Exception as e:
+        logger.error(f"Experiment metrics error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@thought_experiments_bp.route('/api/social/experiments/<experiment_id>/contribute',
+                               methods=['POST'])
+def contribute_to_experiment(experiment_id):
+    """Record a Spark contribution to an experiment."""
+    from .models import get_db
+    from .experiment_discovery_service import ExperimentDiscoveryService
+
+    body = request.get_json(silent=True) or {}
+    user_id = body.get('user_id')
+    spark_amount = body.get('spark_amount', 0)
+
+    if not user_id:
+        return jsonify({'success': False, 'error': 'user_id required'}), 400
+
+    db = get_db()
+    try:
+        result = ExperimentDiscoveryService.record_contribution(
+            db, experiment_id, user_id, spark_amount)
+        if result:
+            db.commit()
+            return jsonify({'success': True, 'data': result}), 200
+        return jsonify({'success': False, 'error': 'not_found'}), 404
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Contribute error: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
     finally:
         db.close()

@@ -2649,6 +2649,10 @@ class ThoughtExperiment(Base):
     agent_evaluations_json = Column(JSON, nullable=True)
     is_core_ip = Column(Boolean, default=False)
     parent_experiment_id = Column(String(64), nullable=True)
+    experiment_type = Column(String(20), default='traditional')   # physical_ai | software | traditional
+    funding_total = Column(Integer, default=0)                    # Total Spark invested
+    contributor_count = Column(Integer, default=0)                # Unique believers
+    camera_feed_url = Column(String(500), nullable=True)          # WebSocket URL for physical_ai
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
@@ -2673,6 +2677,10 @@ class ThoughtExperiment(Base):
             'agent_evaluations_json': self.agent_evaluations_json,
             'is_core_ip': self.is_core_ip or False,
             'parent_experiment_id': self.parent_experiment_id,
+            'experiment_type': self.experiment_type or 'traditional',
+            'funding_total': self.funding_total or 0,
+            'contributor_count': self.contributor_count or 0,
+            'camera_feed_url': self.camera_feed_url,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }
@@ -2904,3 +2912,88 @@ class AuditLogEntry(Base):
     prev_hash = Column(String(64), nullable=False)
     entry_hash = Column(String(64), nullable=False, unique=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+# ─── Multiplayer Games ───
+
+class GameSession(Base):
+    """Multiplayer game session (trivia, word chain, collab puzzle, compute challenge)."""
+    __tablename__ = 'game_sessions'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    game_type = Column(String(30), nullable=False, index=True)       # trivia|word_chain|collab_puzzle|compute_challenge|quick_match
+    status = Column(String(20), default='waiting', index=True)       # waiting|active|completed|expired|cancelled
+    host_user_id = Column(String(64), ForeignKey('users.id'), nullable=False, index=True)
+    encounter_id = Column(String(64), nullable=True, index=True)     # if born from encounter
+    community_id = Column(String(64), nullable=True)                 # scoped to community
+    challenge_id = Column(String(64), nullable=True)                 # linked challenge
+    max_players = Column(Integer, default=4)
+    current_round = Column(Integer, default=0)
+    total_rounds = Column(Integer, default=5)
+    game_state = Column(JSON, default=dict)                          # game-type-specific state
+    config = Column(JSON, default=dict)                              # difficulty, categories, etc.
+    started_at = Column(DateTime, nullable=True)
+    ended_at = Column(DateTime, nullable=True)
+    expires_at = Column(DateTime, nullable=False)                    # auto-cleanup
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    participants = relationship('GameParticipant', back_populates='session',
+                                cascade='all, delete-orphan', lazy='joined')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'game_type': self.game_type,
+            'status': self.status,
+            'host_user_id': self.host_user_id,
+            'encounter_id': self.encounter_id,
+            'community_id': self.community_id,
+            'challenge_id': self.challenge_id,
+            'max_players': self.max_players,
+            'current_round': self.current_round,
+            'total_rounds': self.total_rounds,
+            'game_state': self.game_state,
+            'config': self.config,
+            'started_at': self.started_at.isoformat() if self.started_at else None,
+            'ended_at': self.ended_at.isoformat() if self.ended_at else None,
+            'expires_at': self.expires_at.isoformat() if self.expires_at else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'participants': [p.to_dict() for p in (self.participants or [])],
+            'player_count': len(self.participants or []),
+        }
+
+
+class GameParticipant(Base):
+    """Player in a game session, tracks score and result."""
+    __tablename__ = 'game_participants'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    game_session_id = Column(String(64), ForeignKey('game_sessions.id'), nullable=False, index=True)
+    user_id = Column(String(64), ForeignKey('users.id'), nullable=False, index=True)
+    score = Column(Integer, default=0)
+    is_ready = Column(Boolean, default=False)
+    joined_at = Column(DateTime, default=datetime.utcnow)
+    finished_at = Column(DateTime, nullable=True)
+    result = Column(String(20), nullable=True)                       # win|loss|draw|abandoned
+    spark_earned = Column(Integer, default=0)
+    xp_earned = Column(Integer, default=0)
+
+    session = relationship('GameSession', back_populates='participants')
+
+    __table_args__ = (
+        UniqueConstraint('game_session_id', 'user_id', name='uq_game_participant'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'game_session_id': self.game_session_id,
+            'user_id': self.user_id,
+            'score': self.score,
+            'is_ready': self.is_ready,
+            'joined_at': self.joined_at.isoformat() if self.joined_at else None,
+            'finished_at': self.finished_at.isoformat() if self.finished_at else None,
+            'result': self.result,
+            'spark_earned': self.spark_earned,
+            'xp_earned': self.xp_earned,
+        }

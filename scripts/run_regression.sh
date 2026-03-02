@@ -81,6 +81,12 @@ WS_TESTS="tests/unit/test_budget_gate.py tests/unit/test_boot_hardening.py tests
 # Group 13: Security + Build verification
 SECURITY_TESTS="tests/unit/test_integrity_system.py tests/unit/test_federation_upgrade.py tests/unit/test_build_verification.py tests/unit/test_immutable_audit_log.py tests/unit/test_tool_allowlist.py tests/unit/test_goal_rate_limit.py tests/unit/test_action_classifier.py tests/unit/test_dlp_engine.py"
 
+# Group 14: Resonance Tuning + Agent Personality (~100 tests)
+RESONANCE_TESTS="tests/unit/test_resonance_profile.py tests/unit/test_resonance_tuner.py tests/unit/test_resonance_learning.py tests/unit/test_resonance_integration.py tests/unit/test_resonance_identifier.py tests/unit/test_biometric_signatures.py tests/unit/test_agent_personality.py"
+
+# Group 15: E2E Realworld Resonance (12 scenarios)
+REALWORLD_TESTS="tests/realworld_resonance_test.py"
+
 # ===== CI MODE =====
 if [ "${CI:-}" = "true" ] || [ "${CI:-}" = "1" ] || [ "$1" = "--ci" ]; then
     echo "CI MODE: Running ALL test groups"
@@ -99,7 +105,7 @@ if [ "${CI:-}" = "true" ] || [ "${CI:-}" = "1" ] || [ "$1" = "--ci" ]; then
         echo ""
         echo "--- $group_name ---"
         $PYTHON_EXE -m pytest $@ \
-            --noconftest --tb=short --color=no -q \
+            --tb=short --color=no -q \
             --junitxml="$JUNIT_DIR/${group_name// /_}_${TIMESTAMP}.xml" 2>&1 | tee -a "$LOG_FILE"
         local rc=${PIPESTATUS[0]}
         if [ $rc -ne 0 ]; then
@@ -122,12 +128,19 @@ if [ "${CI:-}" = "true" ] || [ "${CI:-}" = "1" ] || [ "$1" = "--ci" ]; then
     run_group "AI" $AI_TESTS
     run_group "Concurrency" $CONCURRENCY_TESTS
     run_group "Channel_e2e" $CHANNEL_E2E_TESTS
+    run_group "Resonance" $RESONANCE_TESTS
+    run_group "Realworld" $REALWORLD_TESTS
 
     echo ""
     echo "========================================"
-    echo " CI Regression complete (exit code: $EXIT_CODE)"
+    echo " CI Regression complete — generating consolidated report..."
+    echo "========================================"
+    $PYTHON_EXE scripts/generate_regression_report.py \
+        --junit-dir "$JUNIT_DIR" \
+        --output "$REPORT_DIR/consolidated_report.txt"
+    echo ""
     echo " JUnit XML: $JUNIT_DIR/"
-    echo " Log: $LOG_FILE"
+    echo " Report:    $REPORT_DIR/consolidated_report.txt"
     echo "========================================"
     exit $EXIT_CODE
 fi
@@ -141,9 +154,11 @@ echo "  4. Agent + Recipe only"
 echo "  5. Quick smoke test (core + state + social)"
 echo "  6. WS workstream tests (metered API, compute, revenue)"
 echo "  7. Security hardening tests"
+echo "  8. Resonance Tuning + Agent Personality"
+echo "  9. E2E Realworld Resonance Scenarios"
 echo ""
 
-read -p "Enter choice (1-7): " choice
+read -p "Enter choice (1-9): " choice
 
 case $choice in
     1)
@@ -220,6 +235,22 @@ case $choice in
         echo "========================================"
         $PYTHON_EXE -m pytest \
             $SECURITY_TESTS \
+            -v --noconftest --tb=short --color=yes
+        ;;
+    8)
+        echo ""
+        echo "Running Resonance Tuning + Agent Personality..."
+        echo "========================================"
+        $PYTHON_EXE -m pytest \
+            $RESONANCE_TESTS \
+            -v --noconftest --tb=short --color=yes
+        ;;
+    9)
+        echo ""
+        echo "Running E2E Realworld Resonance Scenarios..."
+        echo "========================================"
+        $PYTHON_EXE -m pytest \
+            $REALWORLD_TESTS \
             -v --noconftest --tb=short --color=yes
         ;;
     *)

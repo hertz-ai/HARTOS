@@ -2,6 +2,7 @@
 Interactive agent creation script.
 Handles the conversational flow with the gather_info process.
 """
+import os
 import requests
 import json
 
@@ -10,7 +11,7 @@ USER_ID = 10077
 PROMPT_ID = 8888  # Changed to new ID for fresh start
 
 # Read requirements
-with open("coding_agent_requirements.txt", "r") as f:
+with open(os.path.join(os.path.dirname(__file__), "coding_agent_requirements.txt"), "r") as f:
     requirements = f.read()
 
 # Predefined answers to common questions
