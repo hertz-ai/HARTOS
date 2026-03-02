@@ -41,31 +41,54 @@ in
       description = "The HART application package (set in variant config)";
     };
 
+    # OS-mode ports: privileged (<1024) — HART OS owns the machine.
+    # This frees user-space ports (1024-65535) for user applications.
+    # App-mode ports (6777, 6780, etc.) are used when running alongside other software.
     ports = {
       backend = lib.mkOption {
         type = lib.types.port;
-        default = 6777;
-        description = "Backend API port";
+        default = 677;
+        description = "Backend API port (OS-mode: 677, app-mode: 6777)";
       };
       discovery = lib.mkOption {
         type = lib.types.port;
-        default = 6780;
-        description = "UDP peer discovery port";
+        default = 678;
+        description = "UDP peer discovery port (OS-mode: 678, app-mode: 6780)";
       };
       llm = lib.mkOption {
         type = lib.types.port;
-        default = 8080;
-        description = "Local LLM inference port";
+        default = 808;
+        description = "Local LLM inference port (OS-mode: 808, app-mode: 8080)";
       };
       vision = lib.mkOption {
         type = lib.types.port;
-        default = 9891;
-        description = "Vision sidecar port";
+        default = 989;
+        description = "Vision sidecar port (OS-mode: 989, app-mode: 9891)";
       };
       websocket = lib.mkOption {
         type = lib.types.port;
-        default = 5460;
-        description = "WebSocket port for frame streaming";
+        default = 546;
+        description = "WebSocket port for frame streaming (OS-mode: 546, app-mode: 5460)";
+      };
+      diarization = lib.mkOption {
+        type = lib.types.port;
+        default = 800;
+        description = "Speaker diarization port (OS-mode: 800, app-mode: 8004)";
+      };
+      dlna_stream = lib.mkOption {
+        type = lib.types.port;
+        default = 855;
+        description = "DLNA MJPEG stream port (OS-mode: 855, app-mode: 8554)";
+      };
+      mesh_wg = lib.mkOption {
+        type = lib.types.port;
+        default = 679;
+        description = "WireGuard mesh port (OS-mode: 679, app-mode: 6795)";
+      };
+      mesh_relay = lib.mkOption {
+        type = lib.types.port;
+        default = 680;
+        description = "Mesh relay port (OS-mode: 680, app-mode: 6796)";
       };
     };
   };

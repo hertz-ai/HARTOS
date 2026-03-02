@@ -315,7 +315,8 @@ elif _active_cloud and os.environ.get('HEVOLVE_LLM_API_KEY'):
     config_list = [_cloud_cfg]
 else:
     # Dynamic: reads from user's LLM Setup Wizard config (set by Nunba app.py)
-    _llama_port = os.environ.get('LLAMA_CPP_PORT', '8080')
+    from core.port_registry import get_port as _get_llm_port
+    _llama_port = os.environ.get('LLAMA_CPP_PORT', str(_get_llm_port('llm')))
     _local_llm_url = os.environ.get('HEVOLVE_LOCAL_LLM_URL', f'http://localhost:{_llama_port}/v1')
     config_list = [{
         "model": os.environ.get('HEVOLVE_LOCAL_LLM_MODEL', 'local'),

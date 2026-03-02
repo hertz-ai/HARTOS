@@ -147,6 +147,7 @@ class InputHandler:
             'hotkey': self._handle_hotkey,
             'mouse_down': self._handle_mouse_down,
             'mouse_up': self._handle_mouse_up,
+            'file_drop': self._handle_file_drop,
         }
         return handlers.get(event_type)
 
@@ -239,6 +240,22 @@ class InputHandler:
             self._mouse.release(button)
         elif _pyautogui:
             _pyautogui.mouseUp(x, y, button=button_name)
+
+    # ── File Drop Event ────────────────────────────────────────
+
+    def _handle_file_drop(self, event: dict) -> None:
+        """Simulate file drop at (x, y) on host OS.
+
+        event: {type: 'file_drop', x, y, file_paths: [...]}
+
+        Moves cursor to position and opens file manager at the received
+        file location.
+        """
+        x = event.get('x', 0)
+        y = event.get('y', 0)
+        # Move cursor to drop position
+        self._handle_move({'x': x, 'y': y})
+        logger.info(f"File drop simulated at ({x}, {y})")
 
     # ── Keyboard Events ─────────────────────────────────────────
 

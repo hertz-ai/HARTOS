@@ -1839,7 +1839,8 @@ if _node_tier in ('regional', 'central') and os.environ.get('HEVOLVE_LLM_ENDPOIN
         "price": [0.0025, 0.01]
     }]
 else:
-    _llama_port = os.environ.get('LLAMA_CPP_PORT', '8080')
+    from core.port_registry import get_port as _get_llm_port
+    _llama_port = os.environ.get('LLAMA_CPP_PORT', str(_get_llm_port('llm')))
     config_list = [{
         "model": 'Qwen3-VL-4B-Instruct',
         "api_key": 'dummy',

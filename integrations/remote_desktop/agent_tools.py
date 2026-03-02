@@ -37,35 +37,19 @@ def build_remote_desktop_tools(ctx) -> List[Tuple[str, str, Any]]:
     ) -> str:
         """Start hosting this device for remote desktop. Returns Device ID + password."""
         try:
-            from integrations.remote_desktop.device_id import get_device_id, format_device_id
-            from integrations.remote_desktop.session_manager import (
-                get_session_manager, SessionMode,
+            from integrations.remote_desktop.orchestrator import get_orchestrator
+            result = get_orchestrator().start_hosting(
+                allow_control=allow_control,
+                user_id=user_id,
             )
-
-            device_id = get_device_id()
-            sm = get_session_manager()
-            mode = SessionMode.FULL_CONTROL if allow_control else SessionMode.VIEW_ONLY
-            password = sm.generate_otp(device_id)
-
-            # Try to start RustDesk
-            engine = 'native'
-            try:
-                from integrations.remote_desktop.rustdesk_bridge import get_rustdesk_bridge
-                bridge = get_rustdesk_bridge()
-                if bridge.available:
-                    bridge.set_password(password)
-                    bridge.start_service()
-                    engine = 'rustdesk'
-            except Exception:
-                pass
-
-            formatted = format_device_id(device_id)
+            if result.get('status') == 'error':
+                return f"Failed to start hosting: {result.get('error')}"
             return (
                 f"Remote desktop hosting started.\n"
-                f"Device ID: {formatted}\n"
-                f"Password: {password}\n"
-                f"Mode: {mode.value}\n"
-                f"Engine: {engine}\n"
+                f"Device ID: {result.get('formatted_id', 'Unknown')}\n"
+                f"Password: {result.get('password', 'N/A')}\n"
+                f"Mode: {result.get('mode', 'full_control')}\n"
+                f"Engine: {result.get('engine', 'auto')}\n"
                 f"Share Device ID + Password with the viewer to connect."
             )
         except Exception as e:
@@ -85,14 +69,18 @@ def build_remote_desktop_tools(ctx) -> List[Tuple[str, str, Any]]:
     ) -> str:
         """Connect to a remote device in view-only mode."""
         try:
-            from integrations.remote_desktop.rustdesk_bridge import get_rustdesk_bridge
-            bridge = get_rustdesk_bridge()
-            if bridge.available:
-                ok, msg = bridge.connect(device_id, password=password)
-                if ok:
-                    return f"Connected to {device_id} (view-only): {msg}"
-                return f"Connection failed: {msg}"
-            return "No remote desktop engine available. Install RustDesk."
+            from integrations.remote_desktop.orchestrator import get_orchestrator
+            result = get_orchestrator().connect(
+                device_id=device_id,
+                password=password,
+                mode='view_only',
+                gui=False,
+                user_id=user_id,
+            )
+            if result.get('status') == 'connected':
+                return (f"Connected to {device_id} (view-only) "
+                        f"via {result.get('engine', 'auto')}")
+            return f"Connection failed: {result.get('error', 'Unknown error')}"
         except Exception as e:
             return f"Connection error: {e}"
 
@@ -238,6 +226,190 @@ def build_remote_desktop_tools(ctx) -> List[Tuple[str, str, Any]]:
         "disconnect_remote",
         "Disconnect a specific remote desktop session or all sessions.",
         disconnect_remote,
+    ))
+
+    # ── list_remote_windows ──────────────────────────────────
+
+    def list_remote_windows() -> str:
+        """List available application windows on this host for per-window streaming."""
+        try:
+            from integrations.remote_desktop.orchestrator import get_orchestrator
+            windows = get_orchestrator().list_remote_windows()
+            if not windows:
+                return "No application windows found."
+            lines = [f"Available windows ({len(windows)}):"]
+            for w in windows:
+                lines.append(
+                    f"  hwnd={w.get('hwnd')} \"{w.get('title', 'Untitled')}\" "
+                    f"({w.get('process_name', 'unknown')})"
+                )
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Error listing windows: {e}"
+
+    tools.append((
+        "list_remote_windows",
+        "List available application windows on the host for per-window streaming (tab detach).",
+        list_remote_windows,
+    ))
+
+    # ── stream_remote_window ──────────────────────────────────
+
+    def stream_remote_window(
+        window_title: Annotated[str, "Window title or pattern to stream"],
+    ) -> str:
+        """Start streaming a specific application window from the host."""
+        try:
+            from integrations.remote_desktop.window_capture import WindowEnumerator
+            enum = WindowEnumerator()
+            winfo = enum.get_window_by_title(window_title)
+            if not winfo:
+                return f"No window matching '{window_title}' found."
+
+            from integrations.remote_desktop.orchestrator import get_orchestrator
+            result = get_orchestrator().stream_window(
+                window_hwnd=winfo.hwnd,
+                window_title=winfo.title,
+            )
+            if result.get('status') == 'error':
+                return f"Failed: {result.get('error')}"
+            return (
+                f"Streaming window: {result.get('window_title')}\n"
+                f"Session: {result.get('session_id')}\n"
+                f"Process: {result.get('process_name', 'unknown')}"
+            )
+        except Exception as e:
+            return f"Error streaming window: {e}"
+
+    tools.append((
+        "stream_remote_window",
+        "Start streaming a specific application window from the host (tab detach).",
+        stream_remote_window,
+    ))
+
+    # ── list_peripherals ───────────────────────────────────────
+
+    def list_peripherals(
+        types: Annotated[Optional[str], "Filter by type: usb,bluetooth,gamepad (comma-sep, or None for all)"] = None,
+    ) -> str:
+        """List local peripheral devices available for forwarding to remote host."""
+        try:
+            from integrations.remote_desktop.orchestrator import get_orchestrator
+            type_list = [t.strip() for t in types.split(',')] if types else None
+            peripherals = get_orchestrator().list_peripherals(types=type_list)
+            if not peripherals:
+                return "No peripherals found."
+            lines = [f"Peripherals ({len(peripherals)}):"]
+            for p in peripherals:
+                fwd = " [FORWARDING]" if p.get('forwarded') else ""
+                lines.append(
+                    f"  {p.get('peripheral_id')} {p.get('name')} "
+                    f"type={p.get('type')}{fwd}"
+                )
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Error listing peripherals: {e}"
+
+    tools.append((
+        "list_peripherals",
+        "List local peripheral devices (USB, Bluetooth, gamepad) available for remote forwarding.",
+        list_peripherals,
+    ))
+
+    # ── forward_peripheral ─────────────────────────────────────
+
+    def forward_peripheral(
+        peripheral_id: Annotated[str, "Peripheral ID to forward"],
+        session_id: Annotated[Optional[str], "Remote session ID (auto-detect if empty)"] = None,
+    ) -> str:
+        """Forward a local peripheral device to the connected remote host."""
+        try:
+            from integrations.remote_desktop.orchestrator import get_orchestrator
+            orch = get_orchestrator()
+
+            # Auto-detect session if not provided
+            if not session_id:
+                sessions = orch.get_status().get('active_sessions', [])
+                if sessions:
+                    session_id = sessions[0].get('session_id', '')
+                else:
+                    return "No active session. Connect to a remote host first."
+
+            result = orch.forward_peripheral(session_id, peripheral_id)
+            if result.get('success'):
+                return (
+                    f"Forwarding {result.get('type', 'device')}: {result.get('name')}\n"
+                    f"Peripheral ID: {result.get('peripheral_id')}"
+                )
+            return f"Forward failed: {result.get('error', 'Unknown error')}"
+        except Exception as e:
+            return f"Forward error: {e}"
+
+    tools.append((
+        "forward_peripheral",
+        "Forward a local peripheral (USB, Bluetooth, gamepad) to the connected remote host.",
+        forward_peripheral,
+    ))
+
+    # ── discover_cast_targets ──────────────────────────────────
+
+    def discover_cast_targets() -> str:
+        """Discover DLNA/UPnP renderers (smart TVs, speakers) on the local network."""
+        try:
+            from integrations.remote_desktop.orchestrator import get_orchestrator
+            targets = get_orchestrator().discover_cast_targets()
+            if not targets:
+                return "No DLNA/UPnP renderers found on the network."
+            lines = [f"Cast targets ({len(targets)}):"]
+            for t in targets:
+                lines.append(
+                    f"  {t.get('device_id', 'unknown')[:12]} "
+                    f"\"{t.get('friendly_name', 'Unknown')}\" "
+                    f"at {t.get('ip', '?')}:{t.get('port', '?')}"
+                )
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Error discovering cast targets: {e}"
+
+    tools.append((
+        "discover_cast_targets",
+        "Discover DLNA/UPnP renderers (smart TVs, speakers) for screen casting.",
+        discover_cast_targets,
+    ))
+
+    # ── cast_to_tv ─────────────────────────────────────────────
+
+    def cast_to_tv(
+        renderer_id: Annotated[str, "DLNA renderer device ID to cast to"],
+        session_id: Annotated[Optional[str], "Session to cast (auto-detect if empty)"] = None,
+    ) -> str:
+        """Cast a remote desktop session to a DLNA/UPnP renderer (smart TV)."""
+        try:
+            from integrations.remote_desktop.orchestrator import get_orchestrator
+            orch = get_orchestrator()
+
+            if not session_id:
+                sessions = orch.get_status().get('active_sessions', [])
+                if sessions:
+                    session_id = sessions[0].get('session_id', '')
+                else:
+                    return "No active session to cast."
+
+            result = orch.cast_to_device(session_id, renderer_id)
+            if result.get('success'):
+                return (
+                    f"Casting to: {result.get('renderer_name', 'Unknown')}\n"
+                    f"Stream URL: {result.get('stream_url', 'N/A')}\n"
+                    f"Cast session: {result.get('cast_session_id', 'N/A')}"
+                )
+            return f"Cast failed: {result.get('error', 'Unknown error')}"
+        except Exception as e:
+            return f"Cast error: {e}"
+
+    tools.append((
+        "cast_to_tv",
+        "Cast a remote desktop session to a smart TV or DLNA/UPnP renderer.",
+        cast_to_tv,
     ))
 
     return tools

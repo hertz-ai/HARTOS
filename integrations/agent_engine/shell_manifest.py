@@ -329,6 +329,61 @@ SYSTEM_PANELS = {
             '/api/remote-desktop/sessions',
         ],
     },
+    'file_manager': {
+        'title': 'Files', 'icon': 'folder',
+        'group': 'System', 'default_size': [800, 600],
+        'apis': ['/api/shell/files/browse', '/api/shell/files/recent'],
+    },
+    'terminal': {
+        'title': 'Terminal', 'icon': 'terminal',
+        'group': 'System', 'default_size': [800, 500],
+        'apis': ['/api/shell/terminal/exec', '/api/shell/terminal/sessions'],
+    },
+    'user_accounts': {
+        'title': 'User Accounts', 'icon': 'group',
+        'group': 'System', 'default_size': [600, 500],
+        'apis': ['/api/shell/users'],
+    },
+    'notifications': {
+        'title': 'Notifications', 'icon': 'notifications',
+        'group': 'System', 'default_size': [500, 600],
+        'apis': ['/api/shell/notifications'],
+    },
+    'updates': {
+        'title': 'Updates', 'icon': 'system_update',
+        'group': 'System', 'default_size': [600, 400],
+        'apis': ['/api/upgrades/status'],
+    },
+    'backup': {
+        'title': 'Backup & Restore', 'icon': 'backup',
+        'group': 'System', 'default_size': [600, 500],
+        'apis': ['/api/shell/backup/list', '/api/shell/backup/restore'],
+    },
+    'devices': {
+        'title': 'Devices & Mesh', 'icon': 'devices_other',
+        'group': 'System', 'default_size': [700, 500],
+        'apis': ['/api/shell/devices'],
+    },
+    'i18n': {
+        'title': 'Language & Region', 'icon': 'language',
+        'group': 'System', 'default_size': [500, 400],
+        'apis': ['/api/shell/i18n/locales', '/api/shell/i18n/strings'],
+    },
+    'accessibility': {
+        'title': 'Accessibility', 'icon': 'accessibility',
+        'group': 'System', 'default_size': [500, 500],
+        'apis': ['/api/shell/accessibility'],
+    },
+    'screenshot': {
+        'title': 'Screenshot & Recording', 'icon': 'screenshot_monitor',
+        'group': 'System', 'default_size': [500, 400],
+        'apis': ['/api/shell/screenshot', '/api/shell/recording/start'],
+    },
+    'firewall': {
+        'title': 'Firewall & Firmware', 'icon': 'security',
+        'group': 'System', 'default_size': [600, 500],
+        'apis': [],
+    },
 }
 
 
