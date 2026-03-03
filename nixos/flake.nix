@@ -61,6 +61,8 @@
       ./modules/hart-cups.nix
       ./modules/hart-nightlight.nix
       ./modules/hart-ime.nix
+      ./modules/hart-gaming.nix
+      ./modules/hart-devtools.nix
     ];
 
     # Common specialArgs passed to all modules
@@ -95,6 +97,7 @@
     forAllSystems = nixpkgs.lib.genAttrs [
       "x86_64-linux"
       "aarch64-linux"
+      "riscv64-linux"
     ];
 
     # Go package builder helper
@@ -125,6 +128,18 @@
       hart-server-arm  = mkSystem { system = "aarch64-linux"; variant = "server"; };
       hart-desktop-arm = mkSystem { system = "aarch64-linux"; variant = "desktop"; };
       hart-edge-arm    = mkSystem { system = "aarch64-linux"; variant = "edge"; };
+
+      # ─── riscv64 (RISC-V: StarFive, SiFive, edge) ───
+      hart-server-riscv = mkSystem {
+        system = "riscv64-linux";
+        variant = "server";
+        extraModules = [ ./hardware/riscv-generic.nix ];
+      };
+      hart-edge-riscv = mkSystem {
+        system = "riscv64-linux";
+        variant = "edge";
+        extraModules = [ ./hardware/riscv-generic.nix ];
+      };
 
       # ─── Phone (PinePhone / PinePhone Pro) ───
       hart-phone = mkSystem {

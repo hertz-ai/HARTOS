@@ -72,6 +72,14 @@ def init_social(app):
     except Exception as e:
         logger.warning(f"HevolveSocial gamification blueprint skipped: {e}")
 
+    # Register sharing blueprint (short URLs, OG metadata, consent-gated links)
+    try:
+        from .api_sharing import sharing_bp
+        app.register_blueprint(sharing_bp)
+        logger.info("HevolveSocial sharing endpoints registered at /api/social/share/")
+    except Exception as e:
+        logger.warning(f"HevolveSocial sharing blueprint skipped: {e}")
+
     # Register multiplayer games + compute lending blueprint
     try:
         from .api_games import games_bp

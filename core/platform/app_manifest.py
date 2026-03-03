@@ -64,6 +64,7 @@ class AppManifest:
     auto_start: bool = False                    # Start with OS?
     tags: List[str] = field(default_factory=list)          # Search tags
     description: str = ''                       # Short description
+    ai_capabilities: List[Dict[str, Any]] = field(default_factory=list)  # AICapability dicts
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to dict (for API responses, JSON storage)."""
@@ -85,6 +86,7 @@ class AppManifest:
             'auto_start': self.auto_start,
             'tags': self.tags,
             'description': self.description,
+            'ai_capabilities': self.ai_capabilities,
         }
 
     @classmethod

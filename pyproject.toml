@@ -99,8 +99,8 @@ dependencies = [
     "tiktoken>=0.5.0,<1.0.0",
     "transformers>=5.0.0,<6.0.0",
 
-    # Embodied AI — optional, install separately (git+ssh clone is slow)
-    # "embodied-ai @ git+ssh://git@github.com/hertz-ai/hevolveai.git@main",
+    # Embodied AI — learning pipeline, hivemind, distributed intelligence
+    "embodied-ai @ git+ssh://git@github.com/hertz-ai/hevolveai.git@main",
 
     # Security
     "cryptography>=41.0.0,<47.0.0",
@@ -142,6 +142,8 @@ remote-desktop = [
     "av>=12.0.0",
     "pynput>=1.7.0",
 ]
+sdk = []
+mobile = []
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
@@ -195,7 +197,7 @@ py-modules = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["core*", "integrations*", "security*"]
+include = ["core*", "integrations*", "security*", "hart_sdk*"]
 exclude = ["venv*", "tests*", "docs*"]
 
 [tool.setuptools.package-data]

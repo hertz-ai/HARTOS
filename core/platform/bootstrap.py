@@ -21,6 +21,7 @@ from typing import Optional
 
 from core.platform.registry import ServiceRegistry, get_registry
 from core.platform.events import EventBus
+from core.platform.cache import CacheService
 from core.platform.app_manifest import AppManifest, AppType
 from core.platform.app_registry import AppRegistry
 from core.platform.extensions import ExtensionRegistry
@@ -52,6 +53,9 @@ def bootstrap_platform(extensions_dir: Optional[str] = None) -> ServiceRegistry:
     registry.register('events', EventBus, singleton=True)
     bus = registry.get('events')
 
+    # CacheService — unified in-memory + optional disk cache
+    registry.register('cache', CacheService, singleton=True)
+
     # AppRegistry — central app catalog (wired to EventBus)
     registry.register('apps', lambda: AppRegistry(event_emitter=bus.emit),
                        singleton=True)
@@ -60,6 +64,32 @@ def bootstrap_platform(extensions_dir: Optional[str] = None) -> ServiceRegistry:
     # ExtensionRegistry — platform extension lifecycle
     registry.register('extensions',
                        lambda: ExtensionRegistry(
+                           service_registry=registry,
+                           event_emitter=bus.emit),
+                       singleton=True)
+
+    # CapabilityRouter — resolves AI capability intents to backends
+    def _make_capability_router():
+        from core.platform.ai_capabilities import CapabilityRouter
+        mr, vm = None, None
+        try:
+            from integrations.agent_engine.model_registry import model_registry
+            mr = model_registry
+        except ImportError:
+            pass
+        try:
+            from integrations.service_tools.vram_manager import vram_manager
+            vm = vram_manager
+        except ImportError:
+            pass
+        return CapabilityRouter(model_registry=mr, vram_manager=vm)
+
+    registry.register('capability_router', _make_capability_router, singleton=True)
+
+    # EnvironmentManager — agent execution environments
+    from core.platform.agent_environment import EnvironmentManager
+    registry.register('environments',
+                       lambda: EnvironmentManager(
                            service_registry=registry,
                            event_emitter=bus.emit),
                        singleton=True)

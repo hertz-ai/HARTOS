@@ -219,6 +219,19 @@ def set_action_state(user_prompt: str, action_id: int, state: ActionState, reaso
     # Auto-sync to ledger if registered
     _auto_sync_to_ledger(user_prompt, action_id, state)
 
+    # Advisory consent check — log when data_access consent is missing (never blocks)
+    if state == ActionState.IN_PROGRESS:
+        try:
+            from integrations.social.consent_service import ConsentService
+            from integrations.social.models import db_session
+            with db_session(commit=False) as db:
+                if not ConsentService.check_consent(db, user_prompt, 'data_access'):
+                    logger.info(
+                        f"[CONSENT] No data_access consent for user={user_prompt}, "
+                        f"action={action_id} (advisory only)")
+        except Exception:
+            pass  # Consent check is advisory, never blocks execution
+
     # Telemetry recording for recipe experience
     try:
         from recipe_experience import RecipeExperienceRecorder as RER

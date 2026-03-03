@@ -198,8 +198,8 @@ class FederatedAggregator:
 
             # Sign the delta
             try:
-                from security.node_integrity import sign_payload
-                delta['signature'] = sign_payload(delta)
+                from security.node_integrity import sign_json_payload
+                delta['signature'] = sign_json_payload(delta)
             except Exception:
                 delta['signature'] = ''
 
@@ -280,8 +280,9 @@ class FederatedAggregator:
         sig = delta.get('signature', '')
         if sig:
             try:
-                from security.node_integrity import verify_signed_payload
-                if not verify_signed_payload(delta, delta.get('public_key', '')):
+                from security.node_integrity import verify_json_signature
+                if not verify_json_signature(delta.get('public_key', ''),
+                                             delta, sig):
                     return False, 'invalid signature'
             except Exception:
                 pass  # Verification module unavailable — accept

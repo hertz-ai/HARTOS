@@ -2698,3 +2698,56 @@ def theme_get_user(user_id):
     finally:
         if db:
             db.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+# AGENT OBSERVATION & DISPATCH (fire-and-forget)
+# ═══════════════════════════════════════════════════════════════
+
+@social_bp.route('/agent/observe', methods=['POST'])
+@require_auth
+def agent_observe():
+    """Receive frontend observations for agent self-critique."""
+    try:
+        data = request.get_json(silent=True) or {}
+        user_id = g.user.id
+
+        # Store observation via MemoryGraph if available
+        try:
+            from integrations.channels.memory.memory_graph import MemoryGraph
+            graph = MemoryGraph(user_id=str(user_id))
+            graph.register(
+                content=f"[{data.get('event', 'unknown')}] page={data.get('page', '?')} outcome={data.get('outcome', '?')} duration={data.get('duration_ms', 0)}ms",
+                metadata={'memory_type': 'observation', 'source': 'frontend',
+                          **{k: v for k, v in data.items() if k not in ('_useBeacon',)}},
+            )
+        except Exception:
+            pass  # MemoryGraph optional
+
+        return jsonify({'success': True}), 200
+    except Exception:
+        return jsonify({'success': True}), 200  # Always return success (fire-and-forget)
+
+
+@social_bp.route('/agent/dispatch', methods=['POST'])
+@require_auth
+def agent_dispatch():
+    """Receive agent dispatch requests from autopilot."""
+    try:
+        data = request.get_json(silent=True) or {}
+        user_id = g.user.id
+
+        # Store dispatch as observation for agent to pick up
+        try:
+            from integrations.channels.memory.memory_graph import MemoryGraph
+            graph = MemoryGraph(user_id=str(user_id))
+            graph.register(
+                content=f"[dispatch] agent={data.get('agent', '?')} action={data.get('action', '?')} mode={data.get('mode', 'suggest')}",
+                metadata={'memory_type': 'dispatch', 'source': 'autopilot', **data},
+            )
+        except Exception:
+            pass
+
+        return jsonify({'success': True}), 200
+    except Exception:
+        return jsonify({'success': True}), 200

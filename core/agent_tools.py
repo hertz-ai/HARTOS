@@ -171,6 +171,7 @@ def build_core_tool_closures(ctx):
     # ------------------------------------------------------------------
     # 4. get_saved_metadata
     # ------------------------------------------------------------------
+    @log_tool_execution
     def get_saved_metadata() -> str:
         """Get metadata with automatic loading from persistent storage."""
         if prompt_id not in agent_data or not agent_data[prompt_id]:
@@ -620,6 +621,186 @@ def build_core_tool_closures(ctx):
             "Save important facts or information to long-term memory for future retrieval across sessions.",
             save_to_long_term_memory,
         ))
+
+    # ------------------------------------------------------------------
+    # Suggest_Share_Worthy_Content
+    # ------------------------------------------------------------------
+    @log_tool_execution
+    def suggest_share_worthy_content(
+        query: Annotated[str, "Any text — not used for filtering, just provide context"] = "",
+    ) -> str:
+        """Find high-engagement posts that haven't been shared much and suggest sharing them."""
+        try:
+            from integrations.social.models import get_db, Post, ShareableLink
+            from sqlalchemy import func as sa_func
+
+            db = get_db()
+            try:
+                share_counts = (
+                    db.query(
+                        ShareableLink.resource_id,
+                        sa_func.count(ShareableLink.id).label('link_count'),
+                    )
+                    .filter(ShareableLink.resource_type == 'post')
+                    .group_by(ShareableLink.resource_id)
+                    .subquery()
+                )
+
+                posts = (
+                    db.query(Post, share_counts.c.link_count)
+                    .outerjoin(share_counts, Post.id == share_counts.c.resource_id)
+                    .filter(
+                        Post.is_deleted == False,
+                        Post.is_hidden == False,
+                        Post.upvotes > 5,
+                        Post.comment_count > 3,
+                    )
+                    .filter(
+                        (share_counts.c.link_count == None) |  # noqa: E711
+                        (share_counts.c.link_count < 3)
+                    )
+                    .order_by(Post.score.desc())
+                    .limit(3)
+                    .all()
+                )
+
+                if not posts:
+                    return ("No under-shared high-engagement content found right now. "
+                            "Keep creating great posts and the community will notice!")
+
+                suggestions = []
+                for post, link_count in posts:
+                    title = (post.title or post.content or '')[:80].strip()
+                    shares = link_count or 0
+                    suggestions.append(
+                        f"- \"{title}\" ({post.upvotes} upvotes, "
+                        f"{post.comment_count} comments, only {shares} shares) "
+                        f"[post_id: {post.id}]"
+                    )
+
+                header = ("These posts are resonating with the community but haven't "
+                           "been shared much yet. Consider sharing them:\n")
+                return header + "\n".join(suggestions)
+            finally:
+                db.close()
+        except Exception as e:
+            tool_logger.warning(f"Suggest_Share_Worthy_Content failed: {e}")
+            return f"Could not fetch share-worthy content right now: {e}"
+
+    tools.append((
+        "Suggest_Share_Worthy_Content",
+        "Find high-engagement posts that deserve wider reach but haven't been shared much. "
+        "Use when the user asks about content worth sharing or to proactively suggest "
+        "share-worthy community posts.",
+        suggest_share_worthy_content,
+    ))
+
+    # ------------------------------------------------------------------
+    # Observe_User_Experience
+    # ------------------------------------------------------------------
+    @log_tool_execution
+    def observe_user_experience(
+        input_text: Annotated[str, "JSON string with event, page, duration_ms, outcome fields"],
+    ) -> str:
+        """Record a user experience observation for self-improvement."""
+        try:
+            data = json.loads(input_text) if input_text.startswith('{') else {'event': input_text}
+            event = data.get('event', 'interaction')
+            page = data.get('page', '')
+            duration_ms = data.get('duration_ms', 0)
+            outcome = data.get('outcome', 'recorded')
+
+            observation = f"User {event} on {page} ({duration_ms}ms): {outcome}"
+
+            if memory_graph:
+                session_key = f"{user_id}_{prompt_id}" if prompt_id else str(user_id)
+                memory_id = memory_graph.register(
+                    content=observation,
+                    metadata={
+                        'memory_type': 'observation',
+                        'source_agent': 'agent',
+                        'session_id': session_key,
+                        'page': page,
+                        'event': event,
+                    },
+                    context_snapshot=f"UX observation during session {session_key}",
+                )
+                return f"Observation recorded (id: {memory_id}): {observation}"
+
+            return f"Observation noted: {observation}"
+        except Exception as e:
+            tool_logger.warning(f"Observe_User_Experience failed: {e}")
+            return f"Observation noted: {input_text}"
+
+    tools.append((
+        "Observe_User_Experience",
+        "Record a user experience observation. Input: JSON with event, page, "
+        "duration_ms, outcome. Used for self-improvement and understanding user "
+        "behavior patterns.",
+        observe_user_experience,
+    ))
+
+    # ------------------------------------------------------------------
+    # Self_Critique_And_Enhance
+    # ------------------------------------------------------------------
+    @log_tool_execution
+    def self_critique_and_enhance(
+        input_text: Annotated[str, "Topic or area to critique"],
+    ) -> str:
+        """Review past suggestions and outcomes to improve future behavior."""
+        try:
+            if not memory_graph:
+                return f"Self-critique on '{input_text}': Will adjust future behavior based on observations."
+
+            session_key = f"{user_id}_{prompt_id}" if prompt_id else str(user_id)
+
+            # Recall past suggestions and observations
+            suggestions = memory_graph.recall(
+                input_text or 'suggestions made outcomes', mode='semantic', top_k=10,
+            )
+            observations = memory_graph.recall(
+                'user experience observation', mode='semantic', top_k=10,
+            )
+
+            if not suggestions and not observations:
+                return "No past interactions to critique yet. Will observe and learn."
+
+            # Format findings for agent reasoning
+            critique = "Self-critique findings:\n"
+            if suggestions:
+                critique += f"Past suggestions ({len(suggestions)}):\n"
+                for s in suggestions[:5]:
+                    critique += f"  - {s.content[:100]}\n"
+            if observations:
+                critique += f"User observations ({len(observations)}):\n"
+                for o in observations[:5]:
+                    critique += f"  - {o.content[:100]}\n"
+
+            # Store the critique itself as an insight
+            insight = f"Self-critique on: {input_text}"
+            memory_graph.register(
+                content=insight,
+                metadata={
+                    'memory_type': 'insight',
+                    'source_agent': 'agent',
+                    'session_id': session_key,
+                    'type': 'self_critique',
+                },
+                context_snapshot=f"Self-critique during session {session_key}",
+            )
+
+            return critique
+        except Exception as e:
+            tool_logger.warning(f"Self_Critique_And_Enhance failed: {e}")
+            return f"Self-critique on '{input_text}': Will adjust future behavior based on observations."
+
+    tools.append((
+        "Self_Critique_And_Enhance",
+        "Review past agent suggestions and user behavior observations to improve "
+        "future recommendations. Input: topic or area to critique. Helps the agent "
+        "learn from its own interactions.",
+        self_critique_and_enhance,
+    ))
 
     return tools
 

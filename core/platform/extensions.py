@@ -32,6 +32,7 @@ Usage:
 """
 
 import importlib
+import importlib.util
 import logging
 import sys
 import threading
@@ -143,6 +144,16 @@ class ExtensionRegistry:
             TypeError: If no Extension subclass found.
             ValueError: If extension ID already loaded.
         """
+        # Sandbox analysis before import — block dangerous patterns
+        from core.platform.extension_sandbox import ExtensionSandbox
+        spec = importlib.util.find_spec(module_path)
+        if spec and spec.origin and spec.origin.endswith('.py'):
+            safe, violations = ExtensionSandbox.analyze_file(spec.origin)
+            if not safe:
+                raise ImportError(
+                    f"Extension '{module_path}' blocked by sandbox: "
+                    f"{'; '.join(violations)}")
+
         try:
             module = importlib.import_module(module_path)
         except ImportError as e:

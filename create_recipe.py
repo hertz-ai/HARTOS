@@ -977,6 +977,26 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     helper.register_for_llm(name="validate_json_response", description="Checks and corrects if the tool response is not JSON but expected to be.")(validate_json_response)
     assistant.register_for_execution(name="validate_json_response")(validate_json_response)
 
+    # Expert agent consultation tool — domain-specific guidance on demand
+    @log_tool_execution
+    def consult_expert(task_description: Annotated[str, "Describe what expertise you need"]) -> str:
+        """Consult a domain expert agent for specialized guidance on the current task.
+        Returns expert recommendations. The user will be informed which expert was consulted."""
+        try:
+            from integrations.expert_agents import match_expert_for_context
+            match = match_expert_for_context(task_description, top_k=3, min_score=2)
+            if not match:
+                return "No domain expert matched this task. Proceeding with general knowledge."
+            send_message_to_user1(user_id,
+                f"Consulting expert: {match['name']}",
+                "Expert consultation", prompt_id)
+            return f"Expert guidance from {match['name']}:\n{match['prompt_block']}"
+        except Exception as e:
+            return f"Expert consultation unavailable: {str(e)}"
+    helper.register_for_llm(name="consult_expert",
+        description="Consult a specialized domain expert for the current task")(consult_expert)
+    assistant.register_for_execution(name="consult_expert")(consult_expert)
+
     @log_tool_execution
     async def execute_windows_or_android_command(
             instructions: Annotated[
@@ -2352,6 +2372,18 @@ def instantiate_assistant_agent(list_of_persona, user_prompt, personality=None, 
             )
         except Exception:
             pass
+    # Expert agent guidance — domain-specific prompt enhancement
+    _expert_block = ""
+    try:
+        from integrations.expert_agents import match_expert_for_context
+        _actions_text = str(user_tasks.get(user_prompt, Action("")).actions) if user_prompt in user_tasks else ""
+        _expert_match = match_expert_for_context(_actions_text)
+        if _expert_match:
+            _expert_block = _expert_match['prompt_block']
+            tool_logger.info(f"Expert match: {_expert_match['name']} (score={_expert_match['score']})")
+    except Exception:
+        pass
+
     if not _personality_block:
         try:
             from cultural_wisdom import get_cultural_prompt_compact
@@ -2439,7 +2471,7 @@ def instantiate_assistant_agent(list_of_persona, user_prompt, personality=None, 
         •Working Directory: {os.getcwd()}/ - CRITICAL: Always use os.path.join(os.getcwd(), filename) for file paths. NEVER use hardcoded absolute paths.
 
         •Reminder: If camera input is needed, ask the user to turn on their camera. All responses should be played via TTS with a talking-head animation.
-        """ + _personality_block + f"\nExtra Information: below are the list of actions the chat_manager is gonna give you keep this in mind but dont use this directly\n{user_tasks[user_prompt].actions}",
+        """ + _personality_block + _expert_block + f"\nExtra Information: below are the list of actions the chat_manager is gonna give you keep this in mind but dont use this directly\n{user_tasks[user_prompt].actions}",
         is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
     )
     return assistant
@@ -3123,7 +3155,18 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             message = user_tasks[user_prompt].get_action(current_action_id - 1)
             current_state = get_action_state(user_prompt, current_action_id)
 
-            message = f'Execute Action {user_tasks[user_prompt].current_action}: {message} '+f',Latest User message: {text}'
+            # Expert hint for current action (higher threshold — only inject on strong match)
+            _action_expert_hint = ""
+            try:
+                from integrations.expert_agents import match_expert_for_context
+                _action_match = match_expert_for_context(str(message), min_score=6)
+                if _action_match:
+                    _caps = ', '.join(c['name'] for c in _action_match['capabilities'][:2])
+                    _action_expert_hint = f"\n[Expert Tip from {_action_match['name']}]: Focus on {_caps}"
+            except Exception:
+                pass
+
+            message = f'Execute Action {user_tasks[user_prompt].current_action}: {message} '+f',Latest User message: {text}' + _action_expert_hint
             publish_to_crossbar_new_action_start(message, user_id)
             task_time[prompt_id] = {'timer':time.time(),'times':[]}
 

@@ -1789,6 +1789,24 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         scheduler.add_job(send_message_to_user1, 'date', run_date=run_time, args=[user_id, text, '', prompt_id])
         return 'Message scheduled successfully'
 
+    # Expert agent consultation tool — domain-specific guidance on demand
+    @assistant.register_for_execution()
+    @helper.register_for_llm(api_style="function",
+                             description="Consult a specialized domain expert for the current task")
+    def consult_expert(task_description: Annotated[str, "Describe what expertise you need"]) -> str:
+        """Consult a domain expert agent for specialized guidance on the current task."""
+        try:
+            from integrations.expert_agents import match_expert_for_context
+            match = match_expert_for_context(task_description, top_k=3, min_score=2)
+            if not match:
+                return "No domain expert matched this task. Proceeding with general knowledge."
+            send_message_to_user1(user_id,
+                f"Consulting expert: {match['name']}",
+                "Expert consultation", prompt_id)
+            return f"Expert guidance from {match['name']}:\n{match['prompt_block']}"
+        except Exception as e:
+            return f"Expert consultation unavailable: {str(e)}"
+
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",
                              description="Retrieve the user's visual camera input from the past specified minutes.")
