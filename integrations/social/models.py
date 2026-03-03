@@ -3107,3 +3107,154 @@ class UserConsent(Base):
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }
+
+
+# ─── TABLE: marketplace_listings ───
+
+class MarketplaceListing(Base):
+    """HART agent service listing in the marketplace."""
+    __tablename__ = 'marketplace_listings'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    agent_id = Column(String(64), ForeignKey('users.id'), nullable=False, index=True)
+    title = Column(String(200), nullable=False)
+    description = Column(Text, default='')
+    category = Column(String(50), nullable=False, default='custom')
+    price_spark = Column(Integer, default=0)
+    rating_avg = Column(Float, default=0.0)
+    review_count = Column(Integer, default=0)
+    hire_count = Column(Integer, default=0)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    agent = relationship('User', backref='marketplace_listings')
+
+    def to_dict(self):
+        agent_data = None
+        if self.agent:
+            agent_data = {
+                'id': self.agent.id,
+                'username': self.agent.username,
+                'display_name': self.agent.display_name,
+                'avatar_url': self.agent.avatar_url,
+                'user_type': self.agent.user_type,
+            }
+        return {
+            'id': self.id,
+            'agent_id': self.agent_id,
+            'title': self.title,
+            'description': self.description,
+            'category': self.category,
+            'price_spark': self.price_spark,
+            'rating_avg': self.rating_avg,
+            'review_count': self.review_count,
+            'hire_count': self.hire_count,
+            'is_active': self.is_active,
+            'agent': agent_data,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class ListingReview(Base):
+    """Review for a marketplace listing."""
+    __tablename__ = 'listing_reviews'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    listing_id = Column(String(64), ForeignKey('marketplace_listings.id'), nullable=False, index=True)
+    user_id = Column(String(64), ForeignKey('users.id'), nullable=False, index=True)
+    rating = Column(Integer, nullable=False)  # 1-5
+    text = Column(Text, default='')
+    created_at = Column(DateTime, default=func.now())
+
+    listing = relationship('MarketplaceListing', backref='reviews')
+    user = relationship('User')
+
+    __table_args__ = (
+        UniqueConstraint('listing_id', 'user_id', name='uq_listing_review'),
+    )
+
+    def to_dict(self):
+        user_data = None
+        if self.user:
+            user_data = {
+                'id': self.user.id,
+                'username': self.user.username,
+                'display_name': self.user.display_name,
+                'avatar_url': self.user.avatar_url,
+            }
+        return {
+            'id': self.id,
+            'listing_id': self.listing_id,
+            'user_id': self.user_id,
+            'rating': self.rating,
+            'text': self.text,
+            'user': user_data,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class MCPServer(Base):
+    """Registered MCP tool server."""
+    __tablename__ = 'mcp_servers'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    owner_id = Column(String(64), ForeignKey('users.id'), nullable=False, index=True)
+    name = Column(String(100), nullable=False)
+    description = Column(Text, default='')
+    url = Column(String(500), nullable=True)
+    category = Column(String(50), default='general')
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    owner = relationship('User', backref='mcp_servers')
+
+    def to_dict(self):
+        owner_data = None
+        if self.owner:
+            owner_data = {
+                'id': self.owner.id,
+                'username': self.owner.username,
+                'display_name': self.owner.display_name,
+                'avatar_url': self.owner.avatar_url,
+                'user_type': self.owner.user_type,
+            }
+        return {
+            'id': self.id,
+            'owner_id': self.owner_id,
+            'name': self.name,
+            'description': self.description,
+            'url': self.url,
+            'category': self.category,
+            'is_active': self.is_active,
+            'owner': owner_data,
+            'tool_count': len(self.tools) if hasattr(self, 'tools') else 0,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class MCPTool(Base):
+    """A tool provided by an MCP server."""
+    __tablename__ = 'mcp_tools'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    server_id = Column(String(64), ForeignKey('mcp_servers.id'), nullable=False, index=True)
+    name = Column(String(100), nullable=False)
+    description = Column(Text, default='')
+    input_schema = Column(JSON, default=dict)
+    created_at = Column(DateTime, default=func.now())
+
+    server = relationship('MCPServer', backref='tools')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'server_id': self.server_id,
+            'name': self.name,
+            'description': self.description,
+            'input_schema': self.input_schema,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }

@@ -70,6 +70,7 @@ class TestHartAppBuilder(unittest.TestCase):
         from core.platform.app_manifest import AppManifest
         app = HartApp('test-app', version='1.0.0')
         app.needs_ai('llm')
+        app.entry(module='ext.test')
         manifest = app.manifest()
         self.assertIsInstance(manifest, AppManifest)
         self.assertEqual(manifest.id, 'test-app')
@@ -95,6 +96,7 @@ class TestHartAppBuilder(unittest.TestCase):
         registry = bootstrap_platform()
 
         app = HartApp('sdk-test-app', version='1.0.0')
+        app.entry(module='ext.sdk_test')
         result = app.register()
         self.assertTrue(result)
 
@@ -340,6 +342,7 @@ class TestSDKIntegration(unittest.TestCase):
         app.needs_ai('tts', required=False)
         app.permissions(['network'])
         app.group('Test')
+        app.entry(module='ext.integration_test')
         self.assertTrue(app.register())
 
         # Verify in registry
@@ -406,6 +409,7 @@ class TestGracefulDegradation(unittest.TestCase):
         from hart_sdk.app_builder import HartApp
         app = HartApp('standalone', version='1.0.0')
         app.needs_ai('llm')
+        app.entry(module='ext.standalone')
         # manifest() should still work (returns AppManifest or dict)
         m = app.manifest()
         self.assertIsNotNone(m)

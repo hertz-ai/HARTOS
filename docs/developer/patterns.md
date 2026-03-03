@@ -117,6 +117,55 @@ from integrations.agent_engine.revenue_aggregator import query_revenue_streams
 data = query_revenue_streams(db, period_days=30)
 ```
 
+## ServiceRegistry Pattern
+
+Register services as lazy singletons:
+
+```python
+from core.platform.registry import get_registry
+registry = get_registry()
+registry.register('my_service', lambda: MyService(), singleton=True)
+svc = registry.get('my_service')  # Instantiated on first access
+```
+
+## EventBus Pattern
+
+Emit events from anywhere:
+
+```python
+from core.platform.events import emit_event
+emit_event('my.topic', {'key': 'value'})
+```
+
+Subscribe:
+
+```python
+bus = registry.get('event_bus')
+bus.on('my.topic', lambda topic, data: handle(data))
+```
+
+## ManifestValidator Pattern
+
+All validators return `(bool, errors)`:
+
+```python
+from core.platform.manifest_validator import ManifestValidator
+valid, errors = ManifestValidator.validate(manifest)
+if not valid:
+    raise ValueError(f"Invalid: {'; '.join(errors)}")
+```
+
+## AI Capability Declaration
+
+Apps declare AI needs, OS resolves:
+
+```python
+from hart_sdk import HartApp
+app = HartApp('translator', version='1.0.0')
+app.needs_ai('llm', min_accuracy=0.7)
+app.needs_ai('tts', required=False)
+```
+
 ## See Also
 
 - [architecture.md](architecture.md) -- System architecture

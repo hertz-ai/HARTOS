@@ -150,6 +150,23 @@ class ExtensionRegistry:
         if spec and spec.origin and spec.origin.endswith('.py'):
             safe, violations = ExtensionSandbox.analyze_file(spec.origin)
             if not safe:
+                # Emit security event + audit log (non-blocking)
+                try:
+                    from core.platform.events import emit_event
+                    emit_event('security.extension_blocked', {
+                        'module': module_path,
+                        'violations': violations,
+                    })
+                except Exception:
+                    pass
+                try:
+                    from security.immutable_audit_log import get_audit_log
+                    get_audit_log().log_event(
+                        'security', 'extension_sandbox',
+                        f"Blocked extension '{module_path}'",
+                        detail={'violations': violations})
+                except Exception:
+                    pass
                 raise ImportError(
                     f"Extension '{module_path}' blocked by sandbox: "
                     f"{'; '.join(violations)}")

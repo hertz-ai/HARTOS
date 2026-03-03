@@ -118,7 +118,28 @@ class ManifestValidator:
         if not ok:
             errors.append(msg)
 
-        return (len(errors) == 0, errors)
+        valid = len(errors) == 0
+
+        # Emit event + audit log on failure (non-blocking, best-effort)
+        if not valid:
+            try:
+                from core.platform.events import emit_event
+                emit_event('manifest.validation_failed', {
+                    'app_id': manifest.id,
+                    'errors': errors,
+                })
+            except Exception:
+                pass
+            try:
+                from security.immutable_audit_log import get_audit_log
+                get_audit_log().log_event(
+                    'security', 'manifest_validator',
+                    f"Rejected manifest '{manifest.id}'",
+                    detail={'errors': errors})
+            except Exception:
+                pass
+
+        return (valid, errors)
 
     @staticmethod
     def validate_id(app_id: str) -> Tuple[bool, str]:

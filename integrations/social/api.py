@@ -1053,6 +1053,84 @@ def agent_feed():
     return _ok([p.to_dict(include_author=True) for p in posts], _paginate(total, limit, offset))
 
 
+@social_bp.route('/feed/agent-spotlight', methods=['GET'])
+@optional_auth
+def agent_spotlight():
+    """Agent spotlight for the HARTs feed tab.
+    Returns: hart_of_the_day, rising_harts, your_harts (if authenticated).
+    Public-cacheable (X-Cache-Scope: public when no user-specific data).
+    """
+    from datetime import timedelta
+    from sqlalchemy import func as sa_func
+    uid = g.user.id if getattr(g, 'user', None) else None
+    db = g.db
+
+    # HART of the day: agent with most upvotes on posts in last 24h
+    hart_of_day = None
+    try:
+        day_ago = datetime.utcnow() - timedelta(days=1)
+        top_agent = db.query(
+            Post.author_id, sa_func.sum(Post.upvotes).label('total_harts')
+        ).join(User, Post.author_id == User.id).filter(
+            User.user_type == 'agent',
+            User.is_banned == False,
+            Post.created_at >= day_ago,
+        ).group_by(Post.author_id).order_by(
+            sa_func.sum(Post.upvotes).desc()
+        ).first()
+        if top_agent:
+            agent = db.query(User).filter_by(id=top_agent[0]).first()
+            if agent:
+                hart_of_day = {
+                    **{k: v for k, v in agent.to_dict().items()
+                       if k in ('id', 'username', 'display_name', 'avatar_url', 'user_type')},
+                    'total_harts_today': int(top_agent[1] or 0),
+                }
+    except Exception:
+        pass  # graceful degradation
+
+    # Rising HARTs: newest agents with at least 1 post, ordered by karma
+    rising = []
+    try:
+        week_ago = datetime.utcnow() - timedelta(days=7)
+        rising_agents = db.query(User).filter(
+            User.user_type == 'agent',
+            User.is_banned == False,
+            User.created_at >= week_ago,
+            User.post_count > 0,
+        ).order_by(User.karma_score.desc()).limit(5).all()
+        rising = [{k: v for k, v in a.to_dict().items()
+                   if k in ('id', 'username', 'display_name', 'avatar_url', 'karma_score')}
+                  for a in rising_agents]
+    except Exception:
+        pass
+
+    # Your HARTs: agents owned by current user
+    your_harts = []
+    if uid:
+        try:
+            owned = db.query(User).filter_by(
+                owner_id=uid, user_type='agent', is_banned=False
+            ).order_by(User.karma_score.desc()).limit(10).all()
+            your_harts = [{k: v for k, v in a.to_dict().items()
+                           if k in ('id', 'username', 'display_name', 'avatar_url', 'karma_score', 'post_count')}
+                          for a in owned]
+        except Exception:
+            pass
+
+    result = {
+        'hart_of_the_day': hart_of_day,
+        'rising_harts': rising,
+        'your_harts': your_harts,
+    }
+
+    resp = _ok(result)
+    # Tag as public-cacheable when no user-specific data
+    if not uid:
+        resp[0].headers['X-Cache-Scope'] = 'public'
+    return resp
+
+
 # ═══════════════════════════════════════════════════════════════
 # SEARCH
 # ═══════════════════════════════════════════════════════════════

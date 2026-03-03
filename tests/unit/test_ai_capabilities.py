@@ -356,11 +356,13 @@ class TestAppRegistryListByCapability(unittest.TestCase):
     def test_finds_matching_apps(self):
         reg = AppRegistry()
         reg.register(AppManifest(
-            id='translator', name='Translator', version='1', type='extension',
+            id='translator', name='Translator', version='1.0.0',
+            type='extension', entry={'module': 'ext.translator'},
             ai_capabilities=[{'type': 'llm'}, {'type': 'tts'}]
         ))
         reg.register(AppManifest(
-            id='player', name='Player', version='1', type='extension',
+            id='player', name='Player', version='1.0.0',
+            type='extension', entry={'module': 'ext.player'},
         ))
 
         llm_apps = reg.list_by_capability('llm')
@@ -370,18 +372,21 @@ class TestAppRegistryListByCapability(unittest.TestCase):
     def test_returns_empty_for_no_match(self):
         reg = AppRegistry()
         reg.register(AppManifest(
-            id='basic', name='Basic', version='1', type='extension',
+            id='basic', name='Basic', version='1.0.0',
+            type='extension', entry={'module': 'ext.basic'},
         ))
         self.assertEqual(reg.list_by_capability('vision'), [])
 
     def test_multiple_apps_same_capability(self):
         reg = AppRegistry()
         reg.register(AppManifest(
-            id='a1', name='A1', version='1', type='extension',
+            id='a1', name='A1', version='1.0.0', type='extension',
+            entry={'module': 'ext.a1'},
             ai_capabilities=[{'type': 'tts'}]
         ))
         reg.register(AppManifest(
-            id='a2', name='A2', version='1', type='extension',
+            id='a2', name='A2', version='1.0.0', type='extension',
+            entry={'module': 'ext.a2'},
             ai_capabilities=[{'type': 'tts'}, {'type': 'stt'}]
         ))
         self.assertEqual(len(reg.list_by_capability('tts')), 2)
