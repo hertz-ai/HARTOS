@@ -415,9 +415,59 @@ _GAME_TYPES = {
 }
 
 
+def _ensure_extended_types():
+    """Lazy-register extended game type engines."""
+    if 'opentdb_trivia' in _GAME_TYPES:
+        return  # already registered
+    try:
+        from .game_types_extended import (
+            OpenTDBTriviaGame, BoardGameType, PhaserGameType,
+            WordScrambleGame, WordSearchGame, SudokuGame,
+        )
+        _GAME_TYPES.update({
+            'opentdb_trivia': OpenTDBTriviaGame(),
+            'boardgame': BoardGameType(),
+            'phaser': PhaserGameType(),
+            'word_scramble': WordScrambleGame(),
+            'word_search': WordSearchGame(),
+            'sudoku': SudokuGame(),
+        })
+        logger.info("Extended game types registered: %d total engines",
+                     len(_GAME_TYPES))
+    except ImportError as e:
+        logger.warning("Could not load extended game types: %s", e)
+
+
 def get_game_type(game_type: str) -> BaseGameType:
-    """Get handler for a game type."""
+    """Get handler for a game type (engine name or catalog ID)."""
+    _ensure_extended_types()
+
+    # Direct engine match
     handler = _GAME_TYPES.get(game_type)
-    if not handler:
-        raise ValueError(f"Unknown game type: {game_type}")
-    return handler
+    if handler:
+        return handler
+
+    # Try resolving via catalog (catalog ID → engine name)
+    try:
+        from .game_catalog import get_engine_for_catalog_entry
+        engine = get_engine_for_catalog_entry(game_type)
+        if engine:
+            handler = _GAME_TYPES.get(engine)
+            if handler:
+                return handler
+    except ImportError:
+        pass
+
+    raise ValueError(f"Unknown game type: {game_type}")
+
+
+def is_valid_game_type(game_type: str) -> bool:
+    """Check if a game type or catalog ID is valid."""
+    _ensure_extended_types()
+    if game_type in _GAME_TYPES:
+        return True
+    try:
+        from .game_catalog import get_catalog_entry
+        return get_catalog_entry(game_type) is not None
+    except ImportError:
+        return False

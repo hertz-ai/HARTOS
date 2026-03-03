@@ -18,7 +18,6 @@ logger = logging.getLogger('hevolve_social')
 
 # ─── Constants ───
 
-VALID_GAME_TYPES = ('trivia', 'word_chain', 'collab_puzzle', 'compute_challenge', 'quick_match')
 VALID_STATUSES = ('waiting', 'active', 'completed', 'expired', 'cancelled')
 DEFAULT_EXPIRY_MINUTES = 30
 MIN_PLAYERS = 2
@@ -39,20 +38,40 @@ class GameService:
                        total_rounds: int = 5,
                        expiry_minutes: int = DEFAULT_EXPIRY_MINUTES) -> Dict:
         """Create a new game session in 'waiting' state. Host auto-joins."""
-        if game_type not in VALID_GAME_TYPES:
-            raise ValueError(f"Invalid game_type '{game_type}'. Must be one of {VALID_GAME_TYPES}")
+        from .game_types import is_valid_game_type
+        if not is_valid_game_type(game_type):
+            raise ValueError(f"Invalid game_type '{game_type}'")
+
+        # Resolve catalog entry → merge engine_config into session config
+        resolved_type = game_type
+        merged_config = config or {}
+        try:
+            from .game_catalog import get_catalog_entry, get_config_for_catalog_entry
+            catalog_entry = get_catalog_entry(game_type)
+            if catalog_entry:
+                resolved_type = catalog_entry['engine']
+                merged_config = get_config_for_catalog_entry(game_type, config)
+                # Use catalog defaults if not specified
+                if total_rounds == 5 and catalog_entry.get('default_rounds'):
+                    total_rounds = catalog_entry['default_rounds']
+                if max_players == 4 and catalog_entry.get('max_players'):
+                    max_players = catalog_entry['max_players']
+        except ImportError:
+            pass
+
         max_players = min(max(MIN_PLAYERS, max_players), MAX_PLAYERS_CAP)
 
         session = GameSession(
-            game_type=game_type,
+            game_type=resolved_type,
             host_user_id=host_user_id,
             encounter_id=encounter_id,
             community_id=community_id,
             challenge_id=challenge_id,
             max_players=max_players,
             total_rounds=total_rounds,
-            config=config or {},
-            game_state={'round_data': [], 'moves': []},
+            config=merged_config,
+            game_state={'round_data': [], 'moves': [],
+                        'catalog_id': game_type if game_type != resolved_type else None},
             expires_at=datetime.utcnow() + timedelta(minutes=expiry_minutes),
         )
         db.add(session)
@@ -327,8 +346,18 @@ class GameService:
     def quick_match(db: Session, user_id: str,
                     game_type: str = 'trivia') -> Dict:
         """Auto-matchmake: join an open session or create a new one."""
+        # Resolve catalog ID to engine name for open session search
+        search_type = game_type
+        try:
+            from .game_catalog import get_catalog_entry
+            entry = get_catalog_entry(game_type)
+            if entry:
+                search_type = entry['engine']
+        except ImportError:
+            pass
+
         open_sessions = GameService.find_open_sessions(
-            db, user_id, game_type=game_type, limit=5)
+            db, user_id, game_type=search_type, limit=5)
         # Prefer sessions we haven't joined yet
         for s in open_sessions:
             if not s.get('already_joined'):

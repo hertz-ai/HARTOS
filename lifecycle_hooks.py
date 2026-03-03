@@ -81,6 +81,17 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState')
     except Exception:
         pass  # Audit log is best-effort, never blocks state transitions
 
+    # Broadcast state change to EventBus
+    try:
+        from core.platform.events import emit_event
+        emit_event('action_state.changed', {
+            'action_id': action_id,
+            'state': state.value,
+            'prompt': user_prompt,
+        })
+    except Exception:
+        pass
+
 # Import ledger types for sync function (lazy import to avoid circular deps)
 def _get_ledger_task_status():
     """Lazy import to avoid circular dependencies"""

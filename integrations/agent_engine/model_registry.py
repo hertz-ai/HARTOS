@@ -253,6 +253,25 @@ def _register_defaults():
         gpu_tdp_watts=170.0,
     ))
 
+    # 1b. Local Qwen3.5-4B text-only (always available — 256K context, llama.cpp b8148+)
+    model_registry.register(ModelBackend(
+        model_id='qwen3.5-4b-local',
+        display_name='Qwen3.5 4B (Local)',
+        tier=ModelTier.FAST,
+        config_list_entry={
+            'model': 'Qwen3.5-4B-Instruct',
+            'api_key': 'dummy',
+            'base_url': f'http://localhost:{os.environ.get("LLAMA_CPP_PORT", "8080")}/v1',
+            'price': [0, 0],
+        },
+        avg_latency_ms=700.0,
+        accuracy_score=0.60,
+        cost_per_1k_tokens=0.0,
+        is_local=True,
+        hardware_dependent=True,
+        gpu_tdp_watts=170.0,
+    ))
+
     # 2. Groq (fast API — if key set)
     if os.environ.get('GROQ_API_KEY'):
         model_registry.register(ModelBackend(
@@ -361,6 +380,67 @@ def _register_defaults():
             is_local=True,
             hardware_dependent=True,
             gpu_tdp_watts=0.0,  # CPU-only, no GPU power draw
+        ))
+
+    # 8. Pocket TTS — offline, CPU, 100M params, MIT (always available)
+    model_registry.register(ModelBackend(
+        model_id='pocket-tts-100m',
+        display_name='Pocket TTS 100M (Offline)',
+        tier=ModelTier.FAST,
+        config_list_entry={
+            'model': 'pocket-tts-100m',
+            'api_key': 'local',
+            'base_url': 'inprocess://pocket_tts',
+            'price': [0, 0],
+        },
+        avg_latency_ms=200.0,
+        accuracy_score=0.85,
+        cost_per_1k_tokens=0.0,
+        is_local=True,
+        hardware_dependent=False,
+        gpu_tdp_watts=0.0,
+    ))
+
+    # 9. Whisper STT — offline, sherpa-onnx or openai-whisper (always available)
+    model_registry.register(ModelBackend(
+        model_id='whisper-stt-local',
+        display_name='Whisper STT (sherpa-onnx / Local)',
+        tier=ModelTier.FAST,
+        config_list_entry={
+            'model': 'whisper-stt',
+            'api_key': 'local',
+            'base_url': 'inprocess://whisper',
+            'price': [0, 0],
+        },
+        avg_latency_ms=500.0,
+        accuracy_score=0.88,
+        cost_per_1k_tokens=0.0,
+        is_local=True,
+        hardware_dependent=True,
+        gpu_tdp_watts=0.0,
+    ))
+
+    # 10. MakeItTalk Cloud — TTS + video generation (if MAKEITTALK_API_URL set)
+    #     Cloud service: Flask+Celery, 7 TTS backends, lip-sync animation
+    #     POST /video-gen/ for full pipeline, audio_generation for TTS only
+    makeittalk_url = os.environ.get('MAKEITTALK_API_URL')
+    if makeittalk_url:
+        model_registry.register(ModelBackend(
+            model_id='makeittalk-cloud',
+            display_name='MakeItTalk Cloud (TTS + Video)',
+            tier=ModelTier.BALANCED,
+            config_list_entry={
+                'model': 'makeittalk',
+                'api_key': 'cloud',
+                'base_url': makeittalk_url,
+                'price': [0, 0],  # internal service
+            },
+            avg_latency_ms=5000.0,
+            accuracy_score=0.92,
+            cost_per_1k_tokens=0.0,
+            is_local=False,
+            hardware_dependent=False,
+            gpu_tdp_watts=0.0,
         ))
 
     logger.info(f"ModelRegistry: {len(model_registry._models)} backends registered")
