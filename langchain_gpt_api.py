@@ -982,14 +982,8 @@ except Exception:
 
 # app.logger.info(llm.invoke("hi how are you?"))
 
-if spec is not None:
-    try:
-        chain = get_openapi_chain(spec)
-    except Exception as e:
-        app.logger.warning(f"Could not create OpenAPI chain: {e}")
-        chain = None
-else:
-    chain = None
+# OpenAPI chain — deprecated (get_openapi_chain removed from langchain)
+chain = None
 
 
 client = crossbarhttp.Client('http://aws_rasa.hertzai.com:8088/publish') if crossbarhttp else None
@@ -4684,6 +4678,72 @@ def voice_transcribe():
 
     except ImportError as e:
         return jsonify({'error': f'Whisper not available: {e}'}), 503
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/voice/speak', methods=['POST'])
+def voice_speak():
+    """Synthesize text to speech using Pocket TTS (offline).
+
+    Accepts JSON with 'text', optional 'voice' (default 'alba'),
+    optional 'output_path' (auto-generated if omitted).
+    """
+    try:
+        from integrations.service_tools.pocket_tts_tool import pocket_tts_synthesize
+        import json as _json
+
+        data = request.get_json() or {}
+        text = data.get('text', '')
+        if not text:
+            return jsonify({'error': 'text is required'}), 400
+
+        voice = data.get('voice', 'alba')
+        output_path = data.get('output_path')
+        result = pocket_tts_synthesize(text, voice, output_path)
+        parsed = _json.loads(result)
+        code = 200 if 'error' not in parsed else 500
+        return jsonify(parsed), code
+
+    except ImportError as e:
+        return jsonify({'error': f'TTS not available: {e}'}), 503
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/voice/voices', methods=['GET'])
+def voice_list_voices():
+    """List available TTS voices (built-in + cloned)."""
+    try:
+        from integrations.service_tools.pocket_tts_tool import pocket_tts_list_voices
+        import json as _json
+        return jsonify(_json.loads(pocket_tts_list_voices()))
+    except ImportError as e:
+        return jsonify({'error': f'TTS not available: {e}'}), 503
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/voice/clone', methods=['POST'])
+def voice_clone():
+    """Clone a voice from an audio sample (5+ seconds recommended)."""
+    try:
+        from integrations.service_tools.pocket_tts_tool import pocket_tts_clone_voice
+        import json as _json
+
+        data = request.get_json() or {}
+        audio_path = data.get('audio_path', '')
+        name = data.get('name', '')
+        if not audio_path or not name:
+            return jsonify({'error': 'audio_path and name required'}), 400
+
+        result = pocket_tts_clone_voice(audio_path, name)
+        parsed = _json.loads(result)
+        code = 200 if 'error' not in parsed else 500
+        return jsonify(parsed), code
+
+    except ImportError as e:
+        return jsonify({'error': f'TTS not available: {e}'}), 503
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

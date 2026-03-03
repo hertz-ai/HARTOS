@@ -409,13 +409,7 @@ def init_social(app):
                 logger.debug(f"HevolveSocial agent sync skipped: {e}")
 
 
-# For direct import: from integrations.social import social_bp, init_social
-@property
-def social_bp(self):
-    return get_social_blueprint()
-
-
-# Module-level lazy property workaround
+# Module-level lazy attribute: from integrations.social import social_bp
 def __getattr__(name):
     if name == 'social_bp':
         return get_social_blueprint()

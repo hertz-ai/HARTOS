@@ -30,7 +30,7 @@
 
 **Files**:
 - `professional_coding_agent.py` - Complete agent implementation
-- `coding_agent_requirements.txt` - Detailed requirements
+- `examples/coding_agent_requirements.txt` - Detailed requirements
 
 ### ✅ 3. Requirements Gathered (COMPLETE)
 Comprehensive requirements document covering:
@@ -51,7 +51,7 @@ Comprehensive requirements document covering:
 ### Step 1: Create Agent Recipe
 **Tool**: `create_recipe.py`
 **Action**: Register ProfessionalCodingAgent in the system
-**Input**: Requirements from `coding_agent_requirements.txt`
+**Input**: Requirements from `examples/coding_agent_requirements.txt`
 
 **Expected**:
 - Agent recipe saved to `prompts/` directory

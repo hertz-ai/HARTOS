@@ -84,6 +84,12 @@ def bootstrap_platform(extensions_dir: Optional[str] = None) -> ServiceRegistry:
     if os.path.isdir(extensions_dir):
         ext_reg.load_from_directory(extensions_dir)
 
+    # ── Connect EventBus to Crossbar WAMP (if configured) ────
+
+    cburl = os.environ.get('CBURL')
+    if cburl:
+        bus.connect_wamp(cburl, os.environ.get('CBREALM', 'realm1'))
+
     # ── Start Lifecycle Services ──────────────────────────────
 
     registry.start_all()
