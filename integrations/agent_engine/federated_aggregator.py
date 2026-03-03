@@ -52,6 +52,16 @@ class FederatedAggregator:
         self._resonance_deltas: Dict[str, dict] = {}  # node_id → anonymized tuning stats
         self._resonance_epoch = 0
         self._last_resonance_aggregated: Optional[dict] = None
+        # Recipe sharing channel (trained task intelligence)
+        self._recipe_lock = threading.Lock()
+        self._recipe_deltas: Dict[str, dict] = {}  # node_id → recipe catalog
+        self._last_recipe_aggregated: Optional[dict] = None
+        # EventBus counters (fed by real-time events)
+        self._event_counters_lock = threading.Lock()
+        self._event_counters: Dict[str, int] = {}
+
+        # Subscribe to EventBus (if platform is bootstrapped)
+        self._subscribe_to_eventbus()
 
     def tick(self) -> dict:
         """Full cycle: extract → broadcast → aggregate → apply → track."""
@@ -183,6 +193,7 @@ class FederatedAggregator:
                 'benchmark_results': self._get_benchmark_results(),
                 'capability_tier': capability_tier,
                 'contribution_score': contribution_score,
+                'event_counters': self.get_event_counters(),
             }
 
             # Sign the delta
@@ -294,23 +305,21 @@ class FederatedAggregator:
         if len(all_deltas) < 1:
             return None
 
-        # Compute weights: log(1 + contribution_score) * capability_tier_multiplier
-        # Values must match NodeTierLevel enum in security/system_requirements.py
-        # (NOT topology modes like flat/regional/central — those are separate)
-        capability_tier_multipliers = {
-            'embedded': 0.2,
-            'observer': 0.3,
-            'lite': 0.5,
-            'standard': 1.0,
-            'full': 1.5,
-            'compute_host': 2.0,
-        }
+        # Equal voice: every node's intelligence counts the same.
+        # Weight by data quality (interactions observed) not hardware tier.
+        # A Raspberry Pi that served 10,000 users has more insight than
+        # a GPU server that served 10. No one entity owns the built
+        # intelligence — everyone is equal for this hive being.
         weights = []
         for d in all_deltas:
-            cs = d.get('contribution_score', 0)
-            tier = d.get('capability_tier', 'standard')
-            w = math.log1p(max(0, cs)) * capability_tier_multipliers.get(tier, 1.0)
-            weights.append(max(0.1, w))  # Floor at 0.1
+            interactions = (
+                d.get('experience_stats', {}).get('total_recorded', 0) +
+                d.get('quality_metrics', {}).get('goal_throughput', 0)
+            )
+            # Weight by log of interactions — diminishing returns prevents
+            # any single high-traffic node from dominating
+            w = math.log1p(max(0, interactions))
+            weights.append(max(1.0, w))  # Floor at 1.0 — every node counts
 
         total_weight = sum(weights)
 
@@ -358,6 +367,16 @@ class FederatedAggregator:
             from .world_model_bridge import get_world_model_bridge
             bridge = get_world_model_bridge()
             bridge._federation_aggregated = aggregated
+        except Exception:
+            pass
+
+        # Broadcast to EventBus — hive intelligence updated
+        try:
+            from core.platform.events import emit_event
+            emit_event('federation.aggregated', {
+                'epoch': aggregated.get('epoch', 0),
+                'peer_count': aggregated.get('peer_count', 0),
+            })
         except Exception:
             pass
 
@@ -607,6 +626,107 @@ class FederatedAggregator:
             'last_aggregated': self._last_resonance_aggregated,
         }
 
+    # ─── EventBus Integration ───
+
+    def _subscribe_to_eventbus(self):
+        """Subscribe to EventBus events so learning signals flow into federation.
+
+        Events consumed: inference.completed, resonance.tuned, memory.item_added,
+        action_state.changed. Counters are included in the next extract_local_delta().
+        """
+        try:
+            from core.platform.events import emit_event
+            from core.platform.registry import get_registry
+            registry = get_registry()
+            if not registry.has('events'):
+                return
+            bus = registry.get('events')
+            bus.on('inference.completed', self._on_event)
+            bus.on('resonance.tuned', self._on_event)
+            bus.on('memory.item_added', self._on_event)
+            bus.on('action_state.changed', self._on_event)
+        except Exception:
+            pass  # Platform not bootstrapped yet — will be wired on next tick
+
+    def _on_event(self, topic: str, data):
+        """Accumulate event counts for federation delta."""
+        with self._event_counters_lock:
+            self._event_counters[topic] = self._event_counters.get(topic, 0) + 1
+
+    def get_event_counters(self) -> dict:
+        """Return and reset event counters for inclusion in federation delta."""
+        with self._event_counters_lock:
+            counters = dict(self._event_counters)
+            self._event_counters.clear()
+        return counters
+
+    # ─── Recipe Sharing Channel ───
+
+    def receive_recipe_delta(self, node_id: str, delta: dict):
+        """Store recipe catalog summary from a peer node.
+
+        Delta format: {recipes: [{id, name, action_count, success_rate, reuse_count}]}
+        No proprietary data — just catalog metadata for discovery.
+        """
+        if not node_id or not isinstance(delta, dict):
+            return
+        with self._recipe_lock:
+            self._recipe_deltas[node_id] = delta
+
+    def aggregate_recipes(self) -> Optional[dict]:
+        """Aggregate recipe catalogs — build hive recipe index.
+
+        Every node's recipes are equally discoverable. No node gets priority
+        in the index regardless of its hardware tier.
+        """
+        with self._recipe_lock:
+            deltas = list(self._recipe_deltas.values())
+        if not deltas:
+            return self._last_recipe_aggregated
+
+        # Build unified catalog — every recipe listed equally
+        hive_recipes = {}
+        for d in deltas:
+            node_id = d.get('node_id', 'unknown')
+            for recipe in d.get('recipes', []):
+                rid = recipe.get('id', '')
+                if rid:
+                    if rid not in hive_recipes:
+                        hive_recipes[rid] = {
+                            'id': rid,
+                            'name': recipe.get('name', ''),
+                            'action_count': recipe.get('action_count', 0),
+                            'nodes': [],
+                            'total_reuse_count': 0,
+                            'avg_success_rate': 0.0,
+                        }
+                    entry = hive_recipes[rid]
+                    entry['nodes'].append(node_id)
+                    entry['total_reuse_count'] += recipe.get('reuse_count', 0)
+                    # Running average of success rates
+                    n = len(entry['nodes'])
+                    old_avg = entry['avg_success_rate']
+                    new_rate = recipe.get('success_rate', 0.0)
+                    entry['avg_success_rate'] = old_avg + (new_rate - old_avg) / n
+
+        result = {
+            'recipes': list(hive_recipes.values()),
+            'total_recipes': len(hive_recipes),
+            'peer_count': len(deltas),
+            'timestamp': time.time(),
+        }
+        self._last_recipe_aggregated = result
+        return result
+
+    def get_recipe_stats(self) -> dict:
+        """Return recipe sharing stats for dashboard."""
+        with self._recipe_lock:
+            pending = len(self._recipe_deltas)
+        return {
+            'pending_deltas': pending,
+            'last_aggregated': self._last_recipe_aggregated,
+        }
+
     def get_stats(self) -> dict:
         """Return federation stats for dashboard."""
         with self._lock:
@@ -631,6 +751,11 @@ class FederatedAggregator:
         # Include resonance stats
         try:
             stats['resonance'] = self.get_resonance_stats()
+        except Exception:
+            pass
+        # Include recipe sharing stats
+        try:
+            stats['recipes'] = self.get_recipe_stats()
         except Exception:
             pass
         return stats

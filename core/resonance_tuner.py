@@ -285,6 +285,17 @@ class ResonanceTuner:
             save_resonance_profile(profile, base_dir)
         with self._lock:
             self._stats['total_tunings'] += 1
+
+        # Broadcast resonance tuning to EventBus
+        try:
+            from core.platform.events import emit_event
+            emit_event('resonance.tuned', {
+                'user_id': user_id,
+                'confidence': profile.resonance_confidence,
+            })
+        except Exception:
+            pass
+
         return profile
 
     def analyze_and_tune_async(self, user_id: str, user_message: str,

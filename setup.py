@@ -18,76 +18,75 @@ except FileNotFoundError:
     long_description = "HART OS - Hevolve Agentic Runtime"
 
 # Core dependencies required for the server to run
+# Pin versions with upper bounds to prevent pip backtracking.
+# Updated 2026-03-03 to match installed versions.
 install_requires = [
     # Web framework
-    "Flask>=2.3.0",
-    "waitress>=2.1.0",
-    "fastapi>=0.98.0",
-    "uvicorn>=0.22.0",
-    "starlette>=0.27.0",
+    "Flask>=3.0.0,<4.0.0",
+    "waitress>=3.0.0,<4.0.0",
+    "fastapi>=0.100.0,<1.0.0",
+    "uvicorn>=0.30.0,<1.0.0",
+    "starlette>=0.40.0,<1.0.0",
 
     # Database
-    "SQLAlchemy>=2.0.0",
-    "redis>=4.6.0",
+    "SQLAlchemy>=2.0.0,<3.0.0",
+    "redis>=7.0.0,<8.0.0",
 
-    # LangChain ecosystem
-    "langchain>=0.0.230",
-    "langchain-core>=0.1.0",
-    "langchain-groq>=0.1.0",
-    "langsmith>=0.1.0",
+    # LangChain ecosystem — pinned to avoid pip backtracking (40+ version checks)
+    "langchain-classic>=1.0.0,<2.0.0",
+    "langchain-core>=1.2.0,<2.0.0",
+    "langchain-text-splitters>=1.0.0,<2.0.0",
+    "langsmith>=0.3.0,<1.0.0",
 
     # LLM providers
-    "openai>=0.27.0",
-    "groq>=0.5.0",
+    "openai>=2.0.0,<3.0.0",
+    "groq>=0.5.0,<1.0.0",
 
-    # ML/Vector stores
-    "chromadb>=0.3.0",
-    "faiss-cpu>=1.7.0",
-    "sentence-transformers>=2.2.0",
+    # ML/Vector stores (optional heavy deps — install separately if needed)
+    # "chromadb>=0.3.0",
+    # "faiss-cpu>=1.7.0",
+    # "sentence-transformers>=2.2.0",
 
     # Core utilities
-    "python-dotenv>=1.0.0",
-    "pydantic>=1.10.0",
-    "aiohttp>=3.9.0",
-    "aiofiles>=23.2.0",
-    "requests>=2.31.0",
-    "httpx>=0.27.0,<1",
+    "python-dotenv>=1.0.0,<2.0.0",
+    "pydantic>=2.0.0,<3.0.0",
+    "aiohttp>=3.9.0,<4.0.0",
+    "aiofiles>=23.2.0,<26.0.0",
+    "requests>=2.31.0,<3.0.0",
+    "httpx>=0.27.0,<1.0.0",
 
     # Data processing
-    "numpy>=1.25.0",
-    "pandas>=2.0.0",
-    "beautifulsoup4>=4.12.0",
-    "PyPDF2>=3.0.0",
+    "numpy>=1.25.0,<2.0.0",
+    "pandas>=2.0.0,<4.0.0",
+    "beautifulsoup4>=4.12.0,<5.0.0",
+    "PyPDF2>=3.0.0,<4.0.0",
 
     # Tokenization
-    "tiktoken>=0.5.0",
-    "transformers>=4.30.0",
+    "tiktoken>=0.5.0,<1.0.0",
+    "transformers>=5.0.0,<6.0.0",
 
     # Security
-    "cryptography>=41.0.0",
-    "PyJWT>=2.7.0",
+    "cryptography>=41.0.0,<47.0.0",
+    "PyJWT>=2.7.0,<3.0.0",
 
     # Communication
-    "crossbarhttp3>=1.1",
-    "websockets>=11.0.0",
+    "crossbarhttp3>=1.1,<2.0",
+    "websockets>=11.0.0,<17.0",
 
     # Image processing
-    "Pillow>=9.5.0",
+    "Pillow>=9.5.0,<13.0.0",
     "opencv-python",
-
-    # Async utilities
-    "asyncio-compat>=0.1.0;python_version<'3.10'",
 
     # Speech-to-text (ONNX runtime — no PyTorch needed, CPU-optimized)
     "sherpa-onnx>=1.11.0",
 
     # Other utilities
     "pytz>=2023.3",
-    "python-multipart>=0.0.6",
-    "tenacity>=8.2.0",
-    "tqdm>=4.65.0",
-    "coloredlogs>=15.0.0",
-    "PyYAML>=6.0",
+    "python-multipart>=0.0.6,<1.0.0",
+    "tenacity>=8.2.0,<10.0.0",
+    "tqdm>=4.65.0,<5.0.0",
+    "coloredlogs>=15.0.0,<16.0.0",
+    "PyYAML>=6.0,<7.0",
 ]
 
 # Optional dependencies for specific features

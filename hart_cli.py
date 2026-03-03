@@ -81,6 +81,8 @@ Recipes:
 Vision / Voice:
     hart vision describe "prompt"   Visual agent task
     hart voice transcribe <file>    Transcribe audio file
+    hart voice speak "text"          Text-to-speech (Pocket TTS)
+    hart voice voices                List available TTS voices
 
 Entry point: hart (registered in setup.py / pyproject.toml)
 """
@@ -2054,6 +2056,76 @@ def voice_transcribe(ctx, audio_file, language):
                 click.echo(text)
             else:
                 click.echo(json.dumps(result, indent=2, default=str))
+
+    except requests.ConnectionError:
+        _error_exit(f'Cannot connect to server at {server}', json_output)
+    except Exception as e:
+        _error_exit(str(e), json_output)
+
+
+@voice.command('speak')
+@click.argument('text')
+@click.option('--voice-name', default='alba', help='Voice name (default: alba)')
+@click.option('--output', '-o', default=None, help='Output .wav path')
+@click.pass_context
+def voice_speak(ctx, text, voice_name, output):
+    """Synthesize text to speech (offline via Pocket TTS)."""
+    server = ctx.obj['server']
+    json_output = ctx.obj['json_output']
+
+    import requests
+
+    try:
+        payload = {'text': text, 'voice': voice_name}
+        if output:
+            payload['output_path'] = output
+        resp = requests.post(
+            f'{server}/api/voice/speak',
+            json=payload, timeout=120,
+        )
+        result = resp.json()
+
+        if json_output:
+            click.echo(json.dumps(result, indent=2, default=str))
+        else:
+            path = result.get('path', '')
+            engine = result.get('engine', '')
+            duration = result.get('duration', 0)
+            if path:
+                click.echo(f'Audio saved: {path} ({duration}s, {engine})')
+            elif 'error' in result:
+                click.echo(f'Error: {result["error"]}', err=True)
+            else:
+                click.echo(json.dumps(result, indent=2, default=str))
+
+    except requests.ConnectionError:
+        _error_exit(f'Cannot connect to server at {server}', json_output)
+    except Exception as e:
+        _error_exit(str(e), json_output)
+
+
+@voice.command('voices')
+@click.pass_context
+def voice_list(ctx):
+    """List available TTS voices."""
+    server = ctx.obj['server']
+    json_output = ctx.obj['json_output']
+
+    import requests
+
+    try:
+        resp = requests.get(f'{server}/api/voice/voices', timeout=30)
+        result = resp.json()
+
+        if json_output:
+            click.echo(json.dumps(result, indent=2, default=str))
+        else:
+            engine = result.get('engine', 'unknown')
+            click.echo(f'Engine: {engine}')
+            click.echo(f'Voices ({result.get("count", 0)}):')
+            for v in result.get('voices', []):
+                vtype = v.get('type', 'builtin')
+                click.echo(f'  {v["id"]:15s}  {v["name"]:15s}  [{vtype}]')
 
     except requests.ConnectionError:
         _error_exit(f'Cannot connect to server at {server}', json_output)

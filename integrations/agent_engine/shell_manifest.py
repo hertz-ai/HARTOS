@@ -344,8 +344,8 @@ SYSTEM_PANELS = {
         'group': 'System', 'default_size': [600, 500],
         'apis': ['/api/shell/users'],
     },
-    'notifications': {
-        'title': 'Notifications', 'icon': 'notifications',
+    'notification_center': {
+        'title': 'Notification Center', 'icon': 'notifications_active',
         'group': 'System', 'default_size': [500, 600],
         'apis': ['/api/shell/notifications'],
     },
@@ -354,7 +354,7 @@ SYSTEM_PANELS = {
         'group': 'System', 'default_size': [600, 400],
         'apis': ['/api/upgrades/status'],
     },
-    'backup': {
+    'backup_restore': {
         'title': 'Backup & Restore', 'icon': 'backup',
         'group': 'System', 'default_size': [600, 500],
         'apis': ['/api/shell/backup/list', '/api/shell/backup/restore'],
@@ -382,7 +382,86 @@ SYSTEM_PANELS = {
     'firewall': {
         'title': 'Firewall & Firmware', 'icon': 'security',
         'group': 'System', 'default_size': [600, 500],
-        'apis': [],
+        'apis': ['/api/shell/power/profiles'],  # Uses power API for system status
+    },
+
+    # ─── Desktop Experience ───
+    'default_apps': {
+        'title': 'Default Apps', 'icon': 'open_in_browser',
+        'group': 'System', 'default_size': [600, 500],
+        'apis': ['/api/shell/default-apps'],
+    },
+    'font_manager': {
+        'title': 'Fonts', 'icon': 'font_download',
+        'group': 'System', 'default_size': [700, 500],
+        'apis': ['/api/shell/fonts'],
+    },
+    'sound_manager': {
+        'title': 'Sounds', 'icon': 'music_note',
+        'group': 'System', 'default_size': [600, 500],
+        'apis': ['/api/shell/sounds/themes', '/api/shell/sounds/events'],
+    },
+    'clipboard_manager': {
+        'title': 'Clipboard', 'icon': 'content_paste',
+        'group': 'System', 'default_size': [500, 600],
+        'apis': ['/api/shell/clipboard/history'],
+    },
+    'datetime': {
+        'title': 'Date & Time', 'icon': 'schedule',
+        'group': 'System', 'default_size': [500, 400],
+        'apis': ['/api/shell/datetime'],
+    },
+    'wallpaper_manager': {
+        'title': 'Wallpaper', 'icon': 'wallpaper',
+        'group': 'System', 'default_size': [800, 600],
+        'apis': ['/api/shell/wallpaper', '/api/shell/wallpaper/collection'],
+    },
+    'input_methods': {
+        'title': 'Keyboard & Input', 'icon': 'keyboard',
+        'group': 'System', 'default_size': [600, 500],
+        'apis': ['/api/shell/input-methods'],
+    },
+    'nightlight': {
+        'title': 'Night Light', 'icon': 'nightlight',
+        'group': 'System', 'default_size': [500, 400],
+        'apis': ['/api/shell/nightlight'],
+    },
+    'workspaces': {
+        'title': 'Workspaces', 'icon': 'view_carousel',
+        'group': 'System', 'default_size': [700, 500],
+        'apis': ['/api/shell/workspaces'],
+    },
+
+    # ─── System Management ───
+    'task_manager': {
+        'title': 'Task Manager', 'icon': 'monitoring',
+        'group': 'System', 'default_size': [800, 600],
+        'apis': ['/api/shell/tasks/processes', '/api/shell/tasks/resources'],
+    },
+    'storage_manager': {
+        'title': 'Storage', 'icon': 'storage',
+        'group': 'System', 'default_size': [700, 500],
+        'apis': ['/api/shell/storage', '/api/shell/storage/cleanup'],
+    },
+    'startup_apps': {
+        'title': 'Startup Apps', 'icon': 'play_circle',
+        'group': 'System', 'default_size': [600, 500],
+        'apis': ['/api/shell/startup'],
+    },
+    'bluetooth_manager': {
+        'title': 'Bluetooth Manager', 'icon': 'bluetooth_connected',
+        'group': 'System', 'default_size': [600, 500],
+        'apis': ['/api/shell/bluetooth/status'],
+    },
+    'print_manager': {
+        'title': 'Printers', 'icon': 'print',
+        'group': 'System', 'default_size': [700, 500],
+        'apis': ['/api/shell/printers'],
+    },
+    'media_library': {
+        'title': 'Media Library', 'icon': 'perm_media',
+        'group': 'System', 'default_size': [800, 600],
+        'apis': ['/api/shell/media/status', '/api/shell/media/photos'],
     },
 }
 

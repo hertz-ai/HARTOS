@@ -1,5 +1,5 @@
 """
-Event Bus — Topic-based pub/sub for decoupled communication.
+Event Bus — Topic-based pub/sub with Crossbar WAMP bridge.
 
 Decouples HART OS subsystems without direct imports. Any module can
 emit events, any other can subscribe — config changes, app lifecycle,
@@ -12,11 +12,13 @@ Design decisions:
 - Optional async_emit() for non-blocking (uses core/event_loop.py)
 - Events are plain dicts — no custom event classes
 - Thread-safe via threading.Lock
-- Transport-agnostic: future phases can add WAMP/Redis/D-Bus without API change
+- WAMP bridge: local events optionally publish to Crossbar; WAMP events
+  fire local callbacks. Topic mapping: 'theme.changed' ↔ 'com.hartos.event.theme.changed'
 
 Generalizes patterns from:
 - model_bus_service.py (multi-transport routing concept)
-- core/event_loop.py (async dispatch)
+- crossbar_server.py (WAMP component lifecycle)
+- wamp_bridge.py (Crossbar topic conventions)
 
 Usage:
     bus = EventBus()
@@ -24,21 +26,45 @@ Usage:
     bus.on('theme.*', handle_any_theme_event)
     bus.emit('config.display.scale', {'old': 1.0, 'new': 1.5})
     bus.off('config.display.scale', handle_scale_change)
+
+    # Optional WAMP bridge (cross-process / cross-device)
+    bus.connect_wamp('ws://localhost:8088/ws', 'realm1')
 """
 
+import asyncio
 import fnmatch
+import json
 import logging
+import os
 import threading
 from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger('hevolve.platform')
 
+# WAMP topic prefix — matches crossbar_server.py / wamp_bridge.py convention
+WAMP_TOPIC_PREFIX = 'com.hartos.event'
+
+
+def _local_to_wamp(topic: str) -> str:
+    """Convert local dot-topic to WAMP URI.  theme.changed → com.hartos.event.theme.changed"""
+    return f'{WAMP_TOPIC_PREFIX}.{topic}'
+
+
+def _wamp_to_local(uri: str) -> Optional[str]:
+    """Convert WAMP URI to local dot-topic.  com.hartos.event.theme.changed → theme.changed"""
+    prefix = WAMP_TOPIC_PREFIX + '.'
+    if uri.startswith(prefix):
+        return uri[len(prefix):]
+    return None
+
 
 class EventBus:
-    """Topic-based pub/sub event bus.
+    """Topic-based pub/sub event bus with optional Crossbar WAMP bridge.
 
     The decoupling layer for HART OS — subsystems communicate through
-    events instead of direct imports.
+    events instead of direct imports.  When a WAMP session is connected,
+    every local emit() also publishes to Crossbar, and WAMP subscriptions
+    fire local callbacks, enabling cross-process and cross-device events.
     """
 
     def __init__(self):
@@ -46,6 +72,13 @@ class EventBus:
         self._wildcard_listeners: Dict[str, List[Callable]] = {}
         self._lock = threading.Lock()
         self._emit_count: int = 0
+        # WAMP bridge state
+        self._wamp_session = None
+        self._wamp_connected = False
+        self._wamp_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._wamp_thread: Optional[threading.Thread] = None
+        self._wamp_subscribed_topics: set = set()
+        self._bridged_topics: set = set()  # topics currently bridged to WAMP
 
     def on(self, topic: str, callback: Callable) -> None:
         """Subscribe to a topic.
@@ -94,12 +127,14 @@ class EventBus:
             callback(t, data)
         self.on(topic, wrapper)
 
-    def emit(self, topic: str, data: Any = None) -> int:
+    def emit(self, topic: str, data: Any = None, _from_wamp: bool = False) -> int:
         """Emit an event synchronously.
 
         Args:
             topic: Event topic (e.g., 'config.display.scale').
             data: Event payload (any JSON-serializable value, typically dict).
+            _from_wamp: Internal flag — True when event originated from WAMP
+                        (prevents echo loop back to Crossbar).
 
         Returns:
             Number of listeners that were called.
@@ -128,6 +163,10 @@ class EventBus:
                 called += 1
             except Exception as e:
                 logger.warning("Wildcard listener error on '%s': %s", topic, e)
+
+        # Bridge to WAMP (skip if event already came from WAMP → no echo)
+        if not _from_wamp and self._wamp_connected and self._wamp_session:
+            self._publish_to_wamp(topic, data)
 
         return called
 
@@ -162,6 +201,122 @@ class EventBus:
             self._listeners.clear()
             self._wildcard_listeners.clear()
 
+    # ─── WAMP / Crossbar Bridge ─────────────────────────────
+
+    def connect_wamp(self, url: str = None, realm: str = None) -> bool:
+        """Connect EventBus to Crossbar WAMP router.
+
+        Local events are published to WAMP; WAMP events fire local callbacks.
+        Uses autobahn (same as crossbar_server.py / wamp_bridge.py).
+
+        Args:
+            url:   WebSocket URL (default: CBURL env or ws://localhost:8088/ws)
+            realm: WAMP realm  (default: CBREALM env or realm1)
+
+        Returns:
+            True if connection initiated (async — may not be connected yet).
+        """
+        try:
+            from autobahn.asyncio.component import Component
+        except ImportError:
+            logger.warning("autobahn not installed — WAMP bridge unavailable")
+            return False
+
+        url = url or os.environ.get('CBURL', 'ws://localhost:8088/ws')
+        realm = realm or os.environ.get('CBREALM', 'realm1')
+
+        component = Component(transports=url, realm=realm)
+        bus = self  # closure capture
+
+        @component.on_join
+        async def on_join(session, details):
+            bus._wamp_session = session
+            bus._wamp_connected = True
+            logger.info("EventBus WAMP bridge connected to %s (realm=%s)", url, realm)
+
+            # Subscribe to the wildcard topic for all HARTOS events
+            wamp_wildcard = f'{WAMP_TOPIC_PREFIX}.'
+            try:
+                await session.subscribe(bus._on_wamp_event, wamp_wildcard,
+                                        options={'match': 'prefix'})
+                logger.info("EventBus subscribed to WAMP prefix: %s", wamp_wildcard)
+            except Exception as e:
+                logger.warning("WAMP wildcard subscribe failed: %s", e)
+
+        @component.on_leave
+        async def on_leave(session, details):
+            bus._wamp_connected = False
+            bus._wamp_session = None
+            logger.info("EventBus WAMP bridge disconnected")
+
+        # Run WAMP component in a background thread with its own event loop
+        def _run():
+            loop = asyncio.new_event_loop()
+            bus._wamp_loop = loop
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(component.start(loop=loop))
+            except Exception as e:
+                logger.warning("WAMP component exited: %s", e)
+            finally:
+                bus._wamp_loop = None
+
+        self._wamp_thread = threading.Thread(target=_run, daemon=True, name='eventbus-wamp')
+        self._wamp_thread.start()
+        return True
+
+    def disconnect_wamp(self):
+        """Disconnect from Crossbar WAMP router."""
+        self._wamp_connected = False
+        session = self._wamp_session
+        self._wamp_session = None
+        if session and self._wamp_loop:
+            try:
+                asyncio.run_coroutine_threadsafe(session.leave(), self._wamp_loop)
+            except Exception:
+                pass
+        logger.info("EventBus WAMP bridge disconnected")
+
+    def _publish_to_wamp(self, topic: str, data: Any):
+        """Publish a local event to WAMP (fire-and-forget)."""
+        session = self._wamp_session
+        loop = self._wamp_loop
+        if not session or not loop:
+            return
+        wamp_uri = _local_to_wamp(topic)
+        # Serialize data to JSON-safe dict for WAMP transport
+        try:
+            payload = json.loads(json.dumps(data, default=str)) if data is not None else {}
+        except (TypeError, ValueError):
+            payload = {'value': str(data)}
+        try:
+            asyncio.run_coroutine_threadsafe(
+                session.publish(wamp_uri, payload), loop
+            )
+        except Exception as e:
+            logger.debug("WAMP publish failed for %s: %s", wamp_uri, e)
+
+    async def _on_wamp_event(self, *args, **kwargs):
+        """Handle incoming WAMP event → dispatch to local listeners."""
+        # autobahn passes positional args; first is payload, details in kwargs
+        payload = args[0] if args else kwargs
+        details = kwargs.get('details')
+        # Extract the WAMP topic from details
+        wamp_topic = getattr(details, 'topic', None) if details else None
+        if not wamp_topic:
+            return
+        local_topic = _wamp_to_local(wamp_topic)
+        if local_topic:
+            # Dispatch locally, but mark _from_wamp to prevent echo
+            self.emit(local_topic, payload, _from_wamp=True)
+
+    @property
+    def wamp_connected(self) -> bool:
+        """Whether the WAMP bridge is currently connected."""
+        return self._wamp_connected
+
+    # ─── Properties & Health ──────────────────────────────────
+
     @property
     def emit_count(self) -> int:
         """Total number of emit() calls since creation."""
@@ -177,4 +332,32 @@ class EventBus:
             'listeners': exact_count + wild_count,
             'topics': len(self._listeners) + len(self._wildcard_listeners),
             'total_emits': self._emit_count,
+            'wamp_connected': self._wamp_connected,
         }
+
+
+# ─── Module-level helper — safe emit without circular imports ─────
+
+def emit_event(topic: str, data: Any = None, async_: bool = True) -> None:
+    """Emit an event on the platform EventBus (if bootstrapped).
+
+    Safe to call from anywhere — no-ops if the platform hasn't been bootstrapped.
+    Uses emit_async by default to avoid blocking the caller.
+
+    Args:
+        topic: Dot-separated topic (e.g., 'theme.changed', 'resonance.tuned')
+        data:  JSON-serializable payload
+        async_: If True (default), emit in a background thread
+    """
+    try:
+        from core.platform.registry import get_registry
+        registry = get_registry()
+        if not registry.has('events'):
+            return
+        bus = registry.get('events')
+        if async_:
+            bus.emit_async(topic, data)
+        else:
+            bus.emit(topic, data)
+    except Exception:
+        pass  # Never block callers — event emission is best-effort

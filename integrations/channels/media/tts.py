@@ -21,6 +21,7 @@ APP_TEMP_DIR = os.environ.get("APP_TEMP_DIR", "/app/temp")
 
 class TTSProvider(Enum):
     """Supported TTS providers."""
+    POCKET = "pocket"      # Offline: Pocket TTS (Kyutai) — 100M params, CPU, MIT
     OPENAI = "openai"
     ELEVENLABS = "elevenlabs"
     EDGE = "edge"
@@ -127,6 +128,7 @@ class TTSEngine:
 
     # Default voices per provider
     DEFAULT_VOICES = {
+        TTSProvider.POCKET: "alba",
         TTSProvider.OPENAI: "alloy",
         TTSProvider.ELEVENLABS: "21m00Tcm4TlvDq8ikWAM",  # Rachel
         TTSProvider.EDGE: "en-US-AriaNeural",
@@ -136,6 +138,7 @@ class TTSEngine:
 
     # Models per provider
     DEFAULT_MODELS = {
+        TTSProvider.POCKET: "pocket-100m",
         TTSProvider.OPENAI: "tts-1",
         TTSProvider.ELEVENLABS: "eleven_monolingual_v1",
         TTSProvider.EDGE: "neural",
@@ -243,7 +246,9 @@ class TTSEngine:
         logger.info(f"Synthesizing {len(text)} chars with voice {voice}")
 
         # Provider-specific synthesis
-        if self.provider == TTSProvider.OPENAI:
+        if self.provider == TTSProvider.POCKET:
+            return await self._synthesize_pocket(text, voice, format, speed)
+        elif self.provider == TTSProvider.OPENAI:
             return await self._synthesize_openai(text, voice, format, speed)
         elif self.provider == TTSProvider.ELEVENLABS:
             return await self._synthesize_elevenlabs(text, voice, format)
@@ -254,8 +259,43 @@ class TTSEngine:
         elif self.provider == TTSProvider.AMAZON:
             return await self._synthesize_amazon(text, voice, format)
 
-        # Placeholder - actual implementation would call provider API
         return b""
+
+    async def _synthesize_pocket(
+        self,
+        text: str,
+        voice: str,
+        format: AudioFormat,
+        speed: float
+    ) -> bytes:
+        """Synthesize using Pocket TTS (offline, CPU, 100M params).
+
+        Uses integrations.service_tools.pocket_tts_tool for actual synthesis,
+        then reads the output WAV file and returns raw bytes.
+        """
+        import json as _json
+        try:
+            from integrations.service_tools.pocket_tts_tool import pocket_tts_synthesize
+            result = _json.loads(pocket_tts_synthesize(text, voice))
+            if 'error' in result:
+                logger.warning(f"Pocket TTS error: {result['error']}")
+                return b""
+            wav_path = result.get('path', '')
+            if wav_path and os.path.isfile(wav_path):
+                with open(wav_path, 'rb') as f:
+                    audio_bytes = f.read()
+                # WAV is native format; convert if needed
+                if format == AudioFormat.WAV:
+                    return audio_bytes
+                # For other formats, return WAV (caller can convert)
+                return audio_bytes
+            return b""
+        except ImportError:
+            logger.warning("pocket_tts_tool not available")
+            return b""
+        except Exception as e:
+            logger.warning(f"Pocket TTS synthesis failed: {e}")
+            return b""
 
     async def _synthesize_openai(
         self,
@@ -345,9 +385,8 @@ class TTSEngine:
         # Provider-specific SSML synthesis
         # Most providers support SSML with varying feature sets
 
-        if self.provider == TTSProvider.OPENAI:
-            # OpenAI doesn't support SSML directly, would need to parse and apply
-            # Extract text and apply parameters where possible
+        if self.provider in [TTSProvider.POCKET, TTSProvider.OPENAI]:
+            # Pocket TTS and OpenAI don't support SSML — synthesize plain text
             pass
         elif self.provider in [TTSProvider.GOOGLE, TTSProvider.AMAZON, TTSProvider.EDGE]:
             # These providers support SSML natively
@@ -397,7 +436,25 @@ class TTSEngine:
         """Fetch available voices from provider."""
         voices = []
 
-        if self.provider == TTSProvider.OPENAI:
+        if self.provider == TTSProvider.POCKET:
+            # Pocket TTS built-in + cloned voices
+            try:
+                import json as _json
+                from integrations.service_tools.pocket_tts_tool import pocket_tts_list_voices
+                data = _json.loads(pocket_tts_list_voices())
+                for v in data.get('voices', []):
+                    voices.append(VoiceInfo(
+                        id=v['id'], name=v['name'], language="en",
+                        provider="pocket", metadata={"type": v.get('type', 'builtin')},
+                    ))
+            except (ImportError, Exception):
+                # Fallback: static list
+                for name in ["alba", "alicia", "aurora", "benjamin", "carol",
+                             "daniel", "emily", "henry", "jessica", "michael"]:
+                    voices.append(VoiceInfo(
+                        id=name, name=name.title(), language="en", provider="pocket",
+                    ))
+        elif self.provider == TTSProvider.OPENAI:
             # OpenAI has fixed voices
             voices = [
                 VoiceInfo(id="alloy", name="Alloy", language="en-US", gender="neutral", provider="openai"),
@@ -458,6 +515,7 @@ class TTSEngine:
     def get_supported_formats(self) -> List[str]:
         """Get list of supported output formats."""
         formats = {
+            TTSProvider.POCKET: ["wav"],
             TTSProvider.OPENAI: ["mp3", "opus", "aac", "flac", "wav", "pcm"],
             TTSProvider.ELEVENLABS: ["mp3", "wav", "ogg"],
             TTSProvider.EDGE: ["mp3", "wav", "ogg"],
@@ -469,6 +527,7 @@ class TTSEngine:
     def get_max_text_length(self) -> int:
         """Get maximum text length for single request."""
         limits = {
+            TTSProvider.POCKET: 10000,   # Local — no API limits, just memory
             TTSProvider.OPENAI: 4096,
             TTSProvider.ELEVENLABS: 5000,
             TTSProvider.EDGE: 10000,

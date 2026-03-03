@@ -33,6 +33,47 @@ def _get_json():
 
 
 # ═══════════════════════════════════════════════════════════════
+# GAME CATALOG
+# ═══════════════════════════════════════════════════════════════
+
+@games_bp.route('/games/catalog', methods=['GET'])
+@require_auth
+def game_catalog():
+    """Browse the full game catalog with filters."""
+    from .game_catalog import list_catalog, get_catalog_entry
+
+    # Single game lookup
+    game_id = request.args.get('id')
+    if game_id:
+        entry = get_catalog_entry(game_id)
+        if not entry:
+            return _err("Game not found in catalog", 404)
+        return _ok(entry)
+
+    # Filtered list
+    try:
+        result = list_catalog(
+            audience=request.args.get('audience'),
+            category=request.args.get('category'),
+            multiplayer=request.args.get('multiplayer', type=lambda v: v.lower() == 'true')
+                if 'multiplayer' in request.args else None,
+            featured=request.args.get('featured', type=lambda v: v.lower() == 'true')
+                if 'featured' in request.args else None,
+            tag=request.args.get('tag'),
+            search=request.args.get('search'),
+            limit=min(int(request.args.get('limit', 50)), 200),
+            offset=int(request.args.get('offset', 0)),
+        )
+        return _ok(result['items'], meta={
+            'total': result['total'],
+            'categories': result['categories'],
+        })
+    except Exception as e:
+        logger.exception("Error fetching game catalog")
+        return _err("Failed to fetch catalog", 500)
+
+
+# ═══════════════════════════════════════════════════════════════
 # GAME SESSIONS (12 endpoints)
 # ═══════════════════════════════════════════════════════════════
 

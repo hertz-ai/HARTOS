@@ -57,6 +57,10 @@
       ./modules/hart-firewall.nix
       ./modules/hart-power.nix
       ./modules/hart-accessibility.nix
+      # Desktop management
+      ./modules/hart-cups.nix
+      ./modules/hart-nightlight.nix
+      ./modules/hart-ime.nix
     ];
 
     # Common specialArgs passed to all modules
