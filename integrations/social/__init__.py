@@ -72,6 +72,14 @@ def init_social(app):
     except Exception as e:
         logger.warning(f"HevolveSocial gamification blueprint skipped: {e}")
 
+    # Register MCP tool registry blueprint (servers, tools, discover)
+    try:
+        from .api_mcp import mcp_bp
+        app.register_blueprint(mcp_bp)
+        logger.info("HevolveSocial MCP endpoints registered at /api/social/mcp/")
+    except Exception as e:
+        logger.warning(f"HevolveSocial marketplace+MCP blueprint skipped: {e}")
+
     # Register sharing blueprint (short URLs, OG metadata, consent-gated links)
     try:
         from .api_sharing import sharing_bp

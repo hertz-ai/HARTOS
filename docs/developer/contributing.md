@@ -96,6 +96,30 @@ Use `try`/`except ImportError` for optional dependencies. Never crash on missing
 
 See [testing.md](testing.md) for detailed test instructions.
 
+## Code Quality Thresholds
+
+All code merged into HART OS must meet these thresholds (enforced by PR Guardian):
+
+| Metric | Max | Tool |
+|--------|-----|------|
+| Cyclomatic Complexity | 15 per function | `core.platform.pr_guardian.CodeMetrics` |
+| Function Length | 100 lines | AST-based |
+| Nesting Depth | 5 levels | AST-based |
+| File Length | 1000 lines | Line count |
+
+### Protected Files
+
+These files must NEVER be modified by automated agents or external PRs:
+- `security/hive_guardrails.py` -- Structural immutability
+- `security/master_key.py` -- Trust anchor (Ed25519 public key)
+- `core/platform/manifest_validator.py` -- OS contracts
+- `core/platform/extension_sandbox.py` -- Import sandbox
+
+### Manifest Validation
+
+Every AppManifest must pass `ManifestValidator.validate()` before registration.
+Required fields per AppType are defined in `ENTRY_SCHEMA` (manifest_validator.py).
+
 ## See Also
 
 - [architecture.md](architecture.md) -- System architecture

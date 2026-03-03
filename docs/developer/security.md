@@ -98,6 +98,35 @@ Monitors all background daemon threads via heartbeat protocol:
 - Rate limit 30/min on `/chat`, TLS check, secret validation, DB encryption check
 - `HEVOLVE_ENFORCEMENT_MODE=hard` default in `start_cloud.sh`
 
+## Extension Sandbox
+
+Before any extension is loaded via `importlib.import_module()`, the source
+file is analyzed using AST-based static analysis (`core/platform/extension_sandbox.py`).
+
+Blocked patterns:
+- Function calls: `eval()`, `exec()`, `compile()`, `__import__()`
+- Imports: `subprocess`, `ctypes`, `multiprocessing`
+- Attributes: `os.system`, `os.popen`, `subprocess.run`, `shutil.rmtree`
+
+## Manifest Validation
+
+Every app registered in HART OS passes `ManifestValidator.validate()`:
+- ID: alphanumeric/hyphens/underscores, 1-64 chars
+- Type: must be valid AppType enum value
+- Version: semver X.Y.Z or 'auto'
+- Entry: required keys per AppType (route for panels, exec for desktop_app, etc.)
+- Permissions: must be in KNOWN_PERMISSIONS (16 allowed)
+- AI Capabilities: valid type, no NaN/Inf, accuracy 0-1
+
+## PR Guardian
+
+Autonomous PR review via `core/platform/pr_guardian.py`:
+- Cyclomatic complexity per function (max 15)
+- Function length (max 100 lines)
+- Nesting depth (max 5 levels)
+- Blocked import detection
+- PR checklist validation
+
 ## See Also
 
 - [architecture.md](architecture.md) -- System architecture
