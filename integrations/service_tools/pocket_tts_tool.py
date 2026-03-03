@@ -35,8 +35,8 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════
 
 _BUILTIN_VOICES = [
-    "alba", "alicia", "aurora", "benjamin", "carol",
-    "daniel", "emily", "henry", "jessica", "michael",
+    "alba", "marius", "javert", "jean",
+    "fantine", "cosette", "eponine", "azelma",
 ]
 
 # ═══════════════════════════════════════════════════════════════

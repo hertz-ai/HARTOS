@@ -153,6 +153,8 @@ setup(
             "integrations.*",
             "security",
             "security.*",
+            "hart_sdk",
+            "hart_sdk.*",
         ],
         exclude=[
             "venv",

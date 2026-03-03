@@ -38,6 +38,7 @@ APP_PORTS = {
     'dlna_stream':  8554,
     'mesh_wg':      6795,
     'mesh_relay':   6796,
+    'model_bus':    6790,
 }
 
 # OS mode: privileged ports (HART OS is the operating system)
@@ -51,6 +52,7 @@ OS_PORTS = {
     'dlna_stream':  855,
     'mesh_wg':      679,
     'mesh_relay':   680,
+    'model_bus':    681,
 }
 
 # Environment variable overrides (takes precedence over both modes)
@@ -64,6 +66,7 @@ ENV_OVERRIDES = {
     'dlna_stream':  'HART_DLNA_PORT',
     'mesh_wg':      'HART_MESH_WG_PORT',
     'mesh_relay':   'HART_MESH_RELAY_PORT',
+    'model_bus':    'HART_MODEL_BUS_PORT',
 }
 
 

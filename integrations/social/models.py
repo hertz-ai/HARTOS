@@ -2997,3 +2997,113 @@ class GameParticipant(Base):
             'spark_earned': self.spark_earned,
             'xp_earned': self.xp_earned,
         }
+
+
+# ─── TABLE: shareable_links ───
+
+class ShareableLink(Base):
+    """Universal share token for any resource — posts, profiles, recipes, agents, etc."""
+    __tablename__ = 'shareable_links'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    token = Column(String(12), unique=True, nullable=False, index=True)
+    resource_type = Column(String(30), nullable=False)
+    resource_id = Column(String(64), nullable=False)
+    created_by = Column(String(64), ForeignKey('users.id'), nullable=True)
+    referral_code = Column(String(20), nullable=True)
+    is_private = Column(Boolean, default=False)
+    consent_token = Column(String(32), nullable=True)
+    view_count = Column(Integer, default=0)
+    share_count = Column(Integer, default=0)
+    created_at = Column(DateTime, default=func.now())
+    expires_at = Column(DateTime, nullable=True)
+    metadata_json = Column(Text, nullable=True)
+
+    creator = relationship('User', foreign_keys=[created_by])
+
+    __table_args__ = (
+        Index('ix_share_resource', 'resource_type', 'resource_id', 'created_by'),
+    )
+
+    def to_dict(self):
+        import json as _json
+        og = {}
+        if self.metadata_json:
+            try:
+                og = _json.loads(self.metadata_json)
+            except Exception:
+                pass
+        return {
+            'id': self.id,
+            'token': self.token,
+            'resource_type': self.resource_type,
+            'resource_id': self.resource_id,
+            'referral_code': self.referral_code,
+            'is_private': self.is_private,
+            'view_count': self.view_count,
+            'share_count': self.share_count,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'og': og,
+        }
+
+
+# ─── TABLE: share_events ───
+
+class ShareEvent(Base):
+    """Track share views, clicks, and consent grants."""
+    __tablename__ = 'share_events'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    link_id = Column(String(64), ForeignKey('shareable_links.id'), nullable=False, index=True)
+    event_type = Column(String(20), nullable=False)  # view|share|consent
+    viewer_id = Column(String(64), ForeignKey('users.id'), nullable=True)
+    ip_hash = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=func.now())
+
+    link = relationship('ShareableLink')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'link_id': self.link_id,
+            'event_type': self.event_type,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+# ─── TABLE: user_consents ───
+
+class UserConsent(Base):
+    """Track explicit user consent for data access, revenue sharing, and public exposure."""
+    __tablename__ = 'user_consents'
+
+    id = Column(String(64), primary_key=True)
+    user_id = Column(String(64), nullable=False, index=True)
+    agent_id = Column(String(64), nullable=True, index=True)
+    consent_type = Column(String(30), nullable=False, index=True)  # data_access|revenue_share|public_exposure
+    scope = Column(String(100), nullable=False, default='*')
+    granted = Column(Boolean, default=False, nullable=False)
+    granted_at = Column(DateTime, nullable=True)
+    revoked_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint('user_id', 'agent_id', 'consent_type', 'scope',
+                         name='uq_user_consent'),
+        Index('ix_user_consent_lookup', 'user_id', 'consent_type', 'scope', 'granted'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'agent_id': self.agent_id,
+            'consent_type': self.consent_type,
+            'scope': self.scope,
+            'granted': self.granted,
+            'granted_at': self.granted_at.isoformat() if self.granted_at else None,
+            'revoked_at': self.revoked_at.isoformat() if self.revoked_at else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }

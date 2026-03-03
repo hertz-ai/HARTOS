@@ -97,10 +97,10 @@ class TestPocketTTSListVoices(unittest.TestCase):
         result = json.loads(pocket_tts_list_voices())
         self.assertIn('voices', result)
         self.assertGreater(result['count'], 0)
-        self.assertEqual(result['builtin_count'], 10)
+        self.assertEqual(result['builtin_count'], 8)
         names = [v['id'] for v in result['voices']]
         self.assertIn('alba', names)
-        self.assertIn('michael', names)
+        self.assertIn('marius', names)
 
     def test_all_builtin_voices_have_language(self):
         from integrations.service_tools.pocket_tts_tool import pocket_tts_list_voices

@@ -420,7 +420,44 @@ def _register_defaults():
         gpu_tdp_watts=0.0,
     ))
 
-    # 10. MakeItTalk Cloud — TTS + video generation (if MAKEITTALK_API_URL set)
+    # 10. LuxTTS — 48kHz voice cloning TTS (GPU-accelerated, Apache 2.0)
+    #     150x realtime on GPU, >1x on CPU, <1GB VRAM
+    #     ZipVoice-distilled, 4-step diffusion, voice cloning from 3s audio
+    _luxtts_available = False
+    try:
+        from zipvoice.luxvoice import LuxTTS as _LuxCheck  # noqa: F401
+        _luxtts_available = True
+    except ImportError:
+        pass
+
+    if _luxtts_available:
+        # Detect GPU for latency estimate
+        _luxtts_has_gpu = False
+        try:
+            import torch as _torch_check
+            _luxtts_has_gpu = _torch_check.cuda.is_available()
+        except ImportError:
+            pass
+
+        model_registry.register(ModelBackend(
+            model_id='luxtts-48k',
+            display_name='LuxTTS 48kHz (Voice Cloning)',
+            tier=ModelTier.FAST,
+            config_list_entry={
+                'model': 'luxtts-48k',
+                'api_key': 'local',
+                'base_url': 'inprocess://luxtts',
+                'price': [0, 0],
+            },
+            avg_latency_ms=50.0 if _luxtts_has_gpu else 800.0,
+            accuracy_score=0.93,
+            cost_per_1k_tokens=0.0,
+            is_local=True,
+            hardware_dependent=True,
+            gpu_tdp_watts=170.0 if _luxtts_has_gpu else 0.0,
+        ))
+
+    # 11. MakeItTalk Cloud — TTS + video generation (if MAKEITTALK_API_URL set)
     #     Cloud service: Flask+Celery, 7 TTS backends, lip-sync animation
     #     POST /video-gen/ for full pipeline, audio_generation for TTS only
     makeittalk_url = os.environ.get('MAKEITTALK_API_URL')

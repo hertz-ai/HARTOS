@@ -49,8 +49,14 @@ class AppRegistry:
             manifest: The app manifest to register.
 
         Raises:
-            ValueError: If app ID already registered.
+            ValueError: If manifest invalid or app ID already registered.
         """
+        from core.platform.manifest_validator import ManifestValidator
+        valid, errors = ManifestValidator.validate(manifest)
+        if not valid:
+            raise ValueError(
+                f"Invalid manifest '{manifest.id}': {'; '.join(errors)}")
+
         with self._lock:
             if manifest.id in self._apps:
                 raise ValueError(f"App '{manifest.id}' already registered")
@@ -103,6 +109,16 @@ class AppRegistry:
         """
         return [m for m in self._apps.values()
                 if m.group.lower() == group.lower()]
+
+    def list_by_capability(self, capability_type: str) -> List[AppManifest]:
+        """Return apps that declare a specific AI capability type.
+
+        Args:
+            capability_type: 'llm', 'tts', 'vision', etc.
+        """
+        return [m for m in self._apps.values()
+                if any(c.get('type') == capability_type
+                       for c in m.ai_capabilities)]
 
     def search(self, query: str) -> List[AppManifest]:
         """Fuzzy search across app name, ID, description, tags.

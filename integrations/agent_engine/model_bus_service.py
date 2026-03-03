@@ -329,25 +329,64 @@ class ModelBusService:
         return {'error': 'No vision backend available', 'response': None}
 
     def _route_tts(self, prompt: str, options: dict) -> dict:
-        """Route TTS: MakeItTalk cloud → Pocket TTS offline fallback.
+        """Route TTS through fallback chain:
 
-        Strategy:
-        - HART OS offline mode (HART_OS_MODE set, no MAKEITTALK_API_URL):
-          use Pocket TTS directly (zero latency overhead).
-        - Cloud mode (MAKEITTALK_API_URL set):
-          try MakeItTalk first, fallback to Pocket TTS on failure.
+        1. LuxTTS (local, GPU/CPU, 48kHz, 150x RT on GPU) — if installed
+        2. MakeItTalk cloud (lip-sync video) — if MAKEITTALK_API_URL set
+        3. Pocket TTS (local, CPU, 24kHz) — always available
+        4. espeak-ng (robotic, instant) — ultimate fallback inside Pocket TTS
+
+        HART OS offline mode skips cloud backends.
         """
-        # Check if cloud TTS available
         makeittalk_url = os.environ.get('MAKEITTALK_API_URL')
         is_offline = (os.environ.get('HART_OS_MODE') and not makeittalk_url)
 
+        # 1. LuxTTS (highest quality, 48kHz, voice cloning)
+        result = self._try_luxtts(prompt, options)
+        if result and 'error' not in result:
+            return result
+
+        # 2. MakeItTalk cloud (if configured and not offline)
         if makeittalk_url and not is_offline:
             result = self._try_makeittalk_tts(prompt, options, makeittalk_url)
             if result and 'error' not in result:
                 return result
             logger.info("MakeItTalk cloud unavailable, falling back to Pocket TTS")
 
+        # 3. Pocket TTS (always available, CPU)
         return self._try_pocket_tts(prompt, options)
+
+    def _try_luxtts(self, prompt: str, options: dict) -> dict:
+        """Try LuxTTS (48kHz, GPU/CPU, voice cloning)."""
+        t0 = time.time()
+        try:
+            from integrations.service_tools.luxtts_tool import luxtts_synthesize
+            voice = options.get('voice_audio') or options.get('voice')
+            device = options.get('device')
+            result = json.loads(luxtts_synthesize(
+                prompt, voice_audio=voice, device=device,
+            ))
+            latency = (time.time() - t0) * 1000
+            if 'error' in result:
+                logger.info(f"LuxTTS unavailable: {result['error']}")
+                return result
+            return {
+                'response': result.get('path', ''),
+                'model': 'luxtts-48k',
+                'backend': f"local_tts_{result.get('device', 'cpu')}",
+                'voice': result.get('voice', ''),
+                'duration': result.get('duration', 0),
+                'sample_rate': 48000,
+                'engine': 'luxtts',
+                'rtf': result.get('rtf', 0),
+                'realtime_factor': result.get('realtime_factor', 0),
+                'latency_ms': round(latency, 1),
+            }
+        except ImportError:
+            return {'error': 'LuxTTS not installed'}
+        except Exception as e:
+            logger.warning(f"LuxTTS failed: {e}")
+            return {'error': f'LuxTTS error: {e}'}
 
     def _try_makeittalk_tts(self, prompt: str, options: dict, base_url: str) -> dict:
         """Try MakeItTalk cloud TTS (POST /video-gen/ with text, no image = audio-only)."""
@@ -493,6 +532,23 @@ class ModelBusService:
                 'status': 'ready',
                 'peers': self._backends['mesh'].get('peers', 0),
             })
+
+        # TTS — LuxTTS (if installed, GPU/CPU, 48kHz voice cloning)
+        try:
+            from zipvoice.luxvoice import LuxTTS as _LuxCheck  # noqa: F401
+            import torch as _t
+            _lux_device = 'cuda' if _t.cuda.is_available() else 'cpu'
+            models.append({
+                'id': 'luxtts-48k',
+                'type': 'tts',
+                'backend': 'luxtts',
+                'local': True,
+                'status': 'ready',
+                'device': _lux_device,
+                'features': ['voice_cloning', '48khz', 'gpu_accelerated', 'offline'],
+            })
+        except ImportError:
+            pass
 
         # TTS — MakeItTalk cloud (if configured)
         makeittalk_url = os.environ.get('MAKEITTALK_API_URL')

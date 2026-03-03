@@ -501,7 +501,7 @@ class TestGetStats(unittest.TestCase):
                 'integrations.agent_engine.world_model_bridge': mock_wmb,
                 'security.node_integrity': MagicMock(
                     get_node_identity=MagicMock(return_value={'node_id': 'test', 'public_key': 'pk'}),
-                    sign_payload=MagicMock(return_value='sig'),
+                    sign_json_payload=MagicMock(return_value='sig'),
                 ),
                 'security.hive_guardrails': MagicMock(
                     compute_guardrail_hash=MagicMock(return_value='hash'),

@@ -498,6 +498,14 @@ except ImportError:
 except Exception as e:
     app.logger.warning(f"Provision init skipped: {e}")
 
+try:
+    from integrations.social.consent_service import register_consent_routes
+    register_consent_routes(app)
+except ImportError:
+    pass
+except Exception as e:
+    app.logger.warning(f"Consent service init skipped: {e}")
+
 # ============================================================================
 # Google A2A Protocol Initialization
 # ============================================================================
@@ -1093,6 +1101,159 @@ def create_prompt(tools):
     return prompt
 
 
+def _suggest_share_worthy_content(input_text: str) -> str:
+    """Tool handler: find high-engagement, under-shared posts the user could share.
+
+    Queries the social DB for posts with strong engagement (upvotes > 5,
+    comments > 3) but few share links (< 3), then returns a human-friendly
+    suggestion.
+    """
+    try:
+        from integrations.social.models import get_db, Post, ShareableLink
+        from sqlalchemy import func, outerjoin
+
+        db = get_db()
+        try:
+            # Subquery: count share links per post
+            share_counts = (
+                db.query(
+                    ShareableLink.resource_id,
+                    func.count(ShareableLink.id).label('link_count'),
+                )
+                .filter(ShareableLink.resource_type == 'post')
+                .group_by(ShareableLink.resource_id)
+                .subquery()
+            )
+
+            # Main query: high engagement, low shares, not deleted/hidden
+            posts = (
+                db.query(Post, share_counts.c.link_count)
+                .outerjoin(share_counts, Post.id == share_counts.c.resource_id)
+                .filter(
+                    Post.is_deleted == False,
+                    Post.is_hidden == False,
+                    Post.upvotes > 5,
+                    Post.comment_count > 3,
+                )
+                .filter(
+                    (share_counts.c.link_count == None) |  # noqa: E711
+                    (share_counts.c.link_count < 3)
+                )
+                .order_by(Post.score.desc())
+                .limit(3)
+                .all()
+            )
+
+            if not posts:
+                return ("No under-shared high-engagement content found right now. "
+                        "Keep creating great posts and the community will notice!")
+
+            suggestions = []
+            for post, link_count in posts:
+                title = (post.title or post.content or '')[:80].strip()
+                shares = link_count or 0
+                suggestions.append(
+                    f"- \"{title}\" ({post.upvotes} upvotes, "
+                    f"{post.comment_count} comments, only {shares} shares) "
+                    f"[post_id: {post.id}]"
+                )
+
+            header = ("These posts are resonating with the community but haven't "
+                       "been shared much yet. Consider sharing them with your network:\n")
+            return header + "\n".join(suggestions)
+        finally:
+            db.close()
+    except Exception as e:
+        logging.debug(f"Suggest_Share_Worthy_Content failed: {e}")
+        return f"Could not fetch share-worthy content right now: {e}"
+
+
+def _observe_user_experience(input_text: str) -> str:
+    """Record a user experience observation for self-improvement."""
+    try:
+        import json as _json
+        data = _json.loads(input_text)
+        event = data.get('event', 'unknown')
+        page = data.get('page', '')
+        duration_ms = data.get('duration_ms', 0)
+        outcome = data.get('outcome', '')
+
+        observation = f"User {event} on {page} ({duration_ms}ms): {outcome}"
+
+        # Use MemoryGraph if available
+        try:
+            user_id = thread_local_data.get_user_id()
+            prompt_id = thread_local_data.get_prompt_id()
+            graph = _get_or_create_graph(user_id, prompt_id)
+            if graph:
+                session_id = f"{user_id}_{prompt_id}" if prompt_id else str(user_id)
+                memory_id = graph.register(
+                    content=observation,
+                    metadata={
+                        'memory_type': 'observation',
+                        'source_agent': 'agent',
+                        'session_id': session_id,
+                        'page': page,
+                        'event': event,
+                    },
+                    context_snapshot=f"UX observation during session {session_id}",
+                )
+                return f"Observation recorded (id: {memory_id}): {observation}"
+        except Exception:
+            pass
+
+        return f"Observation noted: {observation}"
+    except Exception:
+        return f"Observation noted: {input_text}"
+
+
+def _self_critique_and_enhance(input_text: str) -> str:
+    """Review past suggestions and outcomes to improve future behavior."""
+    try:
+        user_id = thread_local_data.get_user_id()
+        prompt_id = thread_local_data.get_prompt_id()
+        graph = _get_or_create_graph(user_id, prompt_id)
+        if not graph:
+            return "Self-critique unavailable: no memory graph for this session."
+
+        session_id = f"{user_id}_{prompt_id}" if prompt_id else str(user_id)
+
+        # Recall past suggestions and observations
+        suggestions = graph.recall(input_text or 'suggestions made outcomes', mode='semantic', top_k=10)
+        observations = graph.recall('user experience observation', mode='semantic', top_k=10)
+
+        if not suggestions and not observations:
+            return "No past interactions to critique yet. Will observe and learn."
+
+        # Format findings for agent reasoning
+        critique = "Self-critique findings:\n"
+        if suggestions:
+            critique += f"Past suggestions ({len(suggestions)}):\n"
+            for s in suggestions[:5]:
+                critique += f"  - {s.content[:100]}\n"
+        if observations:
+            critique += f"User observations ({len(observations)}):\n"
+            for o in observations[:5]:
+                critique += f"  - {o.content[:100]}\n"
+
+        # Store the critique itself as an insight
+        insight = f"Self-critique on: {input_text}"
+        graph.register(
+            content=insight,
+            metadata={
+                'memory_type': 'insight',
+                'source_agent': 'agent',
+                'session_id': session_id,
+                'type': 'self_critique',
+            },
+            context_snapshot=f"Self-critique during session {session_id}",
+        )
+
+        return critique
+    except Exception as e:
+        return f"Self-critique unavailable: {str(e)}"
+
+
 def _handle_create_agent_tool(input_text):
     """Tool handler: LLM decided user wants to create an agent.
 
@@ -1321,6 +1482,35 @@ def get_tools(req_tool, is_first: bool = False):
                     "If not, the user will be prompted securely."
                 ),
             ),
+            Tool(
+                name="Suggest_Share_Worthy_Content",
+                func=_suggest_share_worthy_content,
+                description=(
+                    "Use this tool when the user asks about content worth sharing, what to share, "
+                    "or when you want to proactively suggest high-engagement posts that deserve "
+                    "wider reach. Finds posts with strong community engagement (many upvotes and "
+                    "comments) but low share count, and suggests them for sharing. "
+                    "Input can be any text — it is not used for filtering."
+                ),
+            ),
+            Tool(
+                name="Observe_User_Experience",
+                func=_observe_user_experience,
+                description=(
+                    "Record a user experience observation. Input: JSON with event, page, "
+                    "duration_ms, outcome. Used for self-improvement and understanding user "
+                    "behavior patterns."
+                ),
+            ),
+            Tool(
+                name="Self_Critique_And_Enhance",
+                func=_self_critique_and_enhance,
+                description=(
+                    "Review past agent suggestions and user behavior observations to improve "
+                    "future recommendations. Input: topic or area to critique. Helps the agent "
+                    "learn from its own interactions."
+                ),
+            ),
 
         ]
 
@@ -1486,7 +1676,51 @@ def get_tools(req_tool, is_first: bool = False):
                     "If the user also says words like 'automatically', 'autonomous', 'do it for me', "
                     "'handle it', 'just create it', include those keywords in your input."
                 ),
-            )
+            ),
+            Tool(
+                name="Request_Resource",
+                func=_handle_request_resource,
+                description=(
+                    "Use this tool when you need an API key, credential, token, or any external "
+                    "resource that is not currently available. This handles ALL resource types: "
+                    "API keys (OpenAI, Google, Slack, Discord, etc.), OAuth tokens, service "
+                    "credentials, channel secrets, or any configuration value. "
+                    "Input should be a JSON string with: resource_type (api_key, channel_secret, "
+                    "token, config), key_name (e.g. GOOGLE_API_KEY), label (human-readable name), "
+                    "used_by (which tool/service needs it), description (why it's needed). "
+                    "If the resource is already configured, it returns immediately. "
+                    "If not, the user will be prompted securely."
+                ),
+            ),
+            Tool(
+                name="Suggest_Share_Worthy_Content",
+                func=_suggest_share_worthy_content,
+                description=(
+                    "Use this tool when the user asks about content worth sharing, what to share, "
+                    "or when you want to proactively suggest high-engagement posts that deserve "
+                    "wider reach. Finds posts with strong community engagement (many upvotes and "
+                    "comments) but low share count, and suggests them for sharing. "
+                    "Input can be any text — it is not used for filtering."
+                ),
+            ),
+            Tool(
+                name="Observe_User_Experience",
+                func=_observe_user_experience,
+                description=(
+                    "Record a user experience observation. Input: JSON with event, page, "
+                    "duration_ms, outcome. Used for self-improvement and understanding user "
+                    "behavior patterns."
+                ),
+            ),
+            Tool(
+                name="Self_Critique_And_Enhance",
+                func=_self_critique_and_enhance,
+                description=(
+                    "Review past agent suggestions and user behavior observations to improve "
+                    "future recommendations. Input: topic or area to critique. Helps the agent "
+                    "learn from its own interactions."
+                ),
+            ),
 
         ]
         final_tool = []

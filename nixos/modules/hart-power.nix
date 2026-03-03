@@ -24,7 +24,7 @@ in
     enable = lib.mkEnableOption "HART OS power management";
 
     defaultProfile = lib.mkOption {
-      type = lib.types.enum [ "performance" "balanced" "powersave" "ai-burst" ];
+      type = lib.types.enum [ "performance" "balanced" "powersave" "ai-burst" "gaming" ];
       default = if cfg.variant == "server" then "performance"
                 else if cfg.variant == "edge" then "powersave"
                 else "balanced";
@@ -84,7 +84,7 @@ in
       services.tlp = lib.mkIf (cfg.variant == "desktop" || cfg.variant == "phone") {
         enable = true;
         settings = {
-          CPU_SCALING_GOVERNOR_ON_AC = if pwr.defaultProfile == "performance"
+          CPU_SCALING_GOVERNOR_ON_AC = if pwr.defaultProfile == "performance" || pwr.defaultProfile == "gaming"
             then "performance" else "schedutil";
           CPU_SCALING_GOVERNOR_ON_BAT = "powersave";
           CPU_ENERGY_PERF_POLICY_ON_AC = "performance";
@@ -163,6 +163,53 @@ in
           '';
           StandardOutput = "journal";
           SyslogIdentifier = "hart-power";
+        };
+      };
+    })
+
+    # ─────────────────────────────────────────────────────────
+    # Gaming profile — GPU max clocks
+    # ─────────────────────────────────────────────────────────
+    (lib.mkIf (pwr.defaultProfile == "gaming") {
+      systemd.services.hart-gpu-max-clocks = {
+        description = "HART OS gaming — set GPU to max clocks";
+        after = [ "multi-user.target" ];
+        wantedBy = [ "multi-user.target" ];
+
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          ExecStart = pkgs.writeShellScript "hart-gpu-max-clocks" ''
+            set -euo pipefail
+            echo "[HART Gaming] Setting GPU to max clocks..."
+
+            # NVIDIA: persistence mode + max clocks
+            if command -v nvidia-smi >/dev/null 2>&1; then
+              nvidia-smi -pm 1 2>/dev/null || true
+              nvidia-smi --lock-gpu-clocks=$(nvidia-smi --query-gpu=clocks.max.graphics --format=csv,noheader,nounits | head -1) 2>/dev/null || true
+              nvidia-smi --lock-memory-clocks=$(nvidia-smi --query-gpu=clocks.max.memory --format=csv,noheader,nounits | head -1) 2>/dev/null || true
+              echo "[HART Gaming] NVIDIA GPU clocks locked to max"
+            fi
+
+            # AMD: set performance power profile
+            for card in /sys/class/drm/card*/device/power_dpm_force_performance_level; do
+              echo "high" > "$card" 2>/dev/null || true
+            done
+
+            echo "[HART Gaming] GPU max clocks applied"
+          '';
+          ExecStop = pkgs.writeShellScript "hart-gpu-reset-clocks" ''
+            # Reset to defaults on service stop
+            if command -v nvidia-smi >/dev/null 2>&1; then
+              nvidia-smi --reset-gpu-clocks 2>/dev/null || true
+              nvidia-smi --reset-memory-clocks 2>/dev/null || true
+            fi
+            for card in /sys/class/drm/card*/device/power_dpm_force_performance_level; do
+              echo "auto" > "$card" 2>/dev/null || true
+            done
+          '';
+          StandardOutput = "journal";
+          SyslogIdentifier = "hart-gaming";
         };
       };
     })

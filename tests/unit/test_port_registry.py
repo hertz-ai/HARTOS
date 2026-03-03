@@ -19,6 +19,7 @@ class TestAppPorts(unittest.TestCase):
         expected = {
             'backend', 'discovery', 'vision', 'llm', 'websocket',
             'diarization', 'dlna_stream', 'mesh_wg', 'mesh_relay',
+            'model_bus',
         }
         self.assertEqual(set(APP_PORTS.keys()), expected)
 
@@ -42,6 +43,7 @@ class TestOSPorts(unittest.TestCase):
         expected = {
             'backend', 'discovery', 'vision', 'llm', 'websocket',
             'diarization', 'dlna_stream', 'mesh_wg', 'mesh_relay',
+            'model_bus',
         }
         self.assertEqual(set(OS_PORTS.keys()), expected)
 

@@ -46,6 +46,7 @@ AWARD_TABLE = {
     'complete_task':    {'pulse': 10, 'spark': 20, 'signal': 0.1, 'xp': 50},
     'recipe_shared':    {'spark': 15, 'signal': 0.05, 'xp': 25},
     'recipe_forked':    {'pulse': 5, 'spark': 10, 'signal': 0.02, 'xp': 15},
+    'referral_signup':    {'pulse': 5, 'spark': 15, 'signal': 0.02, 'xp': 25},
     'referral_activated': {'pulse': 20, 'spark': 50, 'signal': 0.1, 'xp': 100},
     'correct_moderation': {'signal': 0.05, 'xp': 10},
     'campaign_milestone': {'pulse': 5, 'spark': 25, 'signal': 0.03, 'xp': 30},
@@ -68,6 +69,10 @@ AWARD_TABLE = {
     'compute_opt_in':           {'pulse': 25, 'spark': 50, 'xp': 50},
     'compute_hour':             {'spark': 10, 'xp': 20},
     'compute_day_streak':       {'spark': 25, 'pulse': 10, 'xp': 40},
+    # Content sharing
+    'content_shared':           {'spark': 5, 'xp': 10},
+    'content_viral_10':         {'spark': 25, 'xp': 20},
+    'content_viral_50':         {'spark': 100, 'xp': 50},
 }
 
 
@@ -212,6 +217,34 @@ class ResonanceService:
                 f'Earned for {action}')
             result.update(xp_result)
 
+        return result
+
+    @staticmethod
+    def award(db: Session, user_id: str, action: str, amount: int,
+              reason: str = '') -> Dict:
+        """Generic award entry point for action-based rewards.
+
+        Looks up *action* in AWARD_TABLE.  When found the table values
+        are used (``amount`` is ignored); otherwise ``amount`` spark and
+        ``amount // 2`` xp are awarded as a sensible default.
+        """
+        awards = AWARD_TABLE.get(action)
+        if awards:
+            spark = awards.get('spark', 0)
+            xp = awards.get('xp', 0)
+        else:
+            spark = amount
+            xp = amount // 2
+
+        result = {}
+        desc = reason or f'Earned for {action}'
+        if spark:
+            result['spark'] = ResonanceService.award_spark(
+                db, user_id, spark, action, None, desc)
+        if xp:
+            xp_result = ResonanceService.award_xp(
+                db, user_id, xp, action, None, desc)
+            result.update(xp_result)
         return result
 
     @staticmethod

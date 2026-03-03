@@ -1,8 +1,12 @@
 # Production Dockerfile for HARTOS
 # Optimized for cloud deployment with gunicorn
 
+# Multi-arch build args (docker buildx)
+ARG TARGETPLATFORM
+ARG BUILDPLATFORM
+
 # Build stage for dependencies
-FROM python:3.11-slim as builder
+FROM --platform=$BUILDPLATFORM python:3.11-slim as builder
 
 WORKDIR /build
 
@@ -44,6 +48,7 @@ FROM python:3.11-slim as production
 LABEL maintainer="HARTOS Team"
 LABEL version="1.0.0"
 LABEL description="Production build of HARTOS"
+LABEL org.opencontainers.image.platforms="linux/amd64,linux/arm64"
 
 # Create non-root user for security
 RUN groupadd -r appgroup && useradd -r -g appgroup appuser

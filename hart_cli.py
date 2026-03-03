@@ -1485,9 +1485,9 @@ def expert_list(ctx, category):
     json_output = ctx.obj['json_output']
 
     try:
-        from integrations.expert_agents.registry import EXPERT_REGISTRY
+        from integrations.expert_agents.registry import ExpertAgentRegistry
 
-        agents = EXPERT_REGISTRY
+        agents = ExpertAgentRegistry().agents
         if category:
             agents = {k: v for k, v in agents.items()
                       if v.category.value.lower() == category.lower()}
@@ -1515,7 +1515,7 @@ def expert_find(ctx, task, top):
     json_output = ctx.obj['json_output']
 
     try:
-        from integrations.expert_agents.registry import recommend_experts_for_dream
+        from integrations.expert_agents import recommend_experts_for_dream
 
         experts = recommend_experts_for_dream(task, top_k=top)
 
@@ -1542,7 +1542,7 @@ def expert_info(ctx, agent_id):
     json_output = ctx.obj['json_output']
 
     try:
-        from integrations.expert_agents.registry import get_expert_info
+        from integrations.expert_agents import get_expert_info
 
         info = get_expert_info(agent_id)
         if not info:

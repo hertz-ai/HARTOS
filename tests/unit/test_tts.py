@@ -127,8 +127,8 @@ class TestTTSEngine:
 
     @pytest.fixture
     def engine(self):
-        """Create TTS engine for testing."""
-        return TTSEngine(provider=TTSProvider.OPENAI)
+        """Create TTS engine for testing (POCKET — default offline provider)."""
+        return TTSEngine(provider=TTSProvider.POCKET)
 
     @pytest.fixture
     def engine_elevenlabs(self):
@@ -137,9 +137,9 @@ class TestTTSEngine:
 
     def test_engine_initialization(self, engine):
         """Test engine initialization."""
-        assert engine.provider == TTSProvider.OPENAI
-        assert engine.model == "tts-1"
-        assert engine.default_voice == "alloy"
+        assert engine.provider == TTSProvider.POCKET
+        assert engine.model == "pocket-100m"
+        assert engine.default_voice == "alba"
 
     def test_engine_initialization_from_string(self):
         """Test engine initialization from string."""
@@ -170,11 +170,11 @@ class TestTTSEngine:
         """Test getting supported formats."""
         formats = engine.get_supported_formats()
         assert isinstance(formats, list)
-        assert "mp3" in formats
+        assert "wav" in formats
 
     def test_get_max_text_length(self, engine):
         """Test getting max text length."""
-        assert engine.get_max_text_length() == 4096
+        assert engine.get_max_text_length() == 10000
 
     def test_estimate_duration(self, engine):
         """Test duration estimation."""
@@ -226,8 +226,8 @@ class TestTTSEngine:
         """Test getting provider information."""
         info = engine.get_provider_info()
 
-        assert info["provider"] == "openai"
-        assert info["model"] == "tts-1"
+        assert info["provider"] == "pocket"
+        assert info["model"] == "pocket-100m"
         assert "max_text_length" in info
         assert "supported_formats" in info
         assert "ssml_support" in info
@@ -263,8 +263,8 @@ class TestTTSEngine:
         voices = await engine.list_voices()
         assert isinstance(voices, list)
 
-        # OpenAI has predefined voices
-        if engine.provider == TTSProvider.OPENAI:
+        # Pocket TTS has built-in voices (fallback list)
+        if engine.provider == TTSProvider.POCKET:
             assert len(voices) > 0
             assert all(isinstance(v, VoiceInfo) for v in voices)
 

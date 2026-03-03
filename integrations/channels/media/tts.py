@@ -1,7 +1,9 @@
 """
 Text-to-Speech System for audio synthesis.
 
-Supports multiple providers: openai, elevenlabs, edge, google, amazon
+Active providers: LuxTTS (offline, 24kHz, voice cloning), Pocket TTS (offline, CPU, MIT).
+Cloud providers (openai, elevenlabs, edge, google, amazon) are disabled — HART OS is
+offline-first with no closed-source TTS dependencies.
 """
 
 import asyncio
@@ -21,12 +23,14 @@ APP_TEMP_DIR = os.environ.get("APP_TEMP_DIR", "/app/temp")
 
 class TTSProvider(Enum):
     """Supported TTS providers."""
+    LUXTTS = "luxtts"      # Offline: LuxTTS 24kHz — GPU/CPU, voice cloning, Apache 2.0
     POCKET = "pocket"      # Offline: Pocket TTS (Kyutai) — 100M params, CPU, MIT
-    OPENAI = "openai"
-    ELEVENLABS = "elevenlabs"
-    EDGE = "edge"
-    GOOGLE = "google"
-    AMAZON = "amazon"
+    # Cloud providers — kept for config compatibility, disabled at runtime
+    OPENAI = "openai"           # Disabled: closed-source cloud API
+    ELEVENLABS = "elevenlabs"   # Disabled: closed-source cloud API
+    EDGE = "edge"               # Disabled: closed-source cloud API
+    GOOGLE = "google"           # Disabled: closed-source cloud API
+    AMAZON = "amazon"           # Disabled: closed-source cloud API
 
 
 class AudioFormat(Enum):
@@ -128,6 +132,7 @@ class TTSEngine:
 
     # Default voices per provider
     DEFAULT_VOICES = {
+        TTSProvider.LUXTTS: "default",
         TTSProvider.POCKET: "alba",
         TTSProvider.OPENAI: "alloy",
         TTSProvider.ELEVENLABS: "21m00Tcm4TlvDq8ikWAM",  # Rachel
@@ -138,6 +143,7 @@ class TTSEngine:
 
     # Models per provider
     DEFAULT_MODELS = {
+        TTSProvider.LUXTTS: "luxtts-48k",
         TTSProvider.POCKET: "pocket-100m",
         TTSProvider.OPENAI: "tts-1",
         TTSProvider.ELEVENLABS: "eleven_monolingual_v1",
@@ -148,7 +154,7 @@ class TTSEngine:
 
     def __init__(
         self,
-        provider: Union[TTSProvider, str] = TTSProvider.OPENAI,
+        provider: Union[TTSProvider, str] = TTSProvider.POCKET,
         api_key: Optional[str] = None,
         model: Optional[str] = None,
         default_voice: Optional[str] = None,
@@ -200,21 +206,11 @@ class TTSEngine:
         if self._initialized:
             return
 
-        if self.provider == TTSProvider.OPENAI:
-            # Would initialize OpenAI client
-            pass
-        elif self.provider == TTSProvider.ELEVENLABS:
-            # Would initialize ElevenLabs client
-            pass
-        elif self.provider == TTSProvider.EDGE:
-            # Would initialize Edge TTS client
-            pass
-        elif self.provider == TTSProvider.GOOGLE:
-            # Would initialize Google Cloud TTS client
-            pass
-        elif self.provider == TTSProvider.AMAZON:
-            # Would initialize Amazon Polly client
-            pass
+        if self.provider in (TTSProvider.OPENAI, TTSProvider.ELEVENLABS,
+                             TTSProvider.EDGE, TTSProvider.GOOGLE,
+                             TTSProvider.AMAZON):
+            logger.info("%s provider selected but disabled (closed-source). "
+                        "Synthesis calls will return empty audio.", self.provider.value)
 
         self._initialized = True
 
@@ -246,20 +242,51 @@ class TTSEngine:
         logger.info(f"Synthesizing {len(text)} chars with voice {voice}")
 
         # Provider-specific synthesis
-        if self.provider == TTSProvider.POCKET:
+        if self.provider == TTSProvider.LUXTTS:
+            return await self._synthesize_luxtts(text, voice, format, speed)
+        elif self.provider == TTSProvider.POCKET:
             return await self._synthesize_pocket(text, voice, format, speed)
-        elif self.provider == TTSProvider.OPENAI:
-            return await self._synthesize_openai(text, voice, format, speed)
-        elif self.provider == TTSProvider.ELEVENLABS:
-            return await self._synthesize_elevenlabs(text, voice, format)
-        elif self.provider == TTSProvider.EDGE:
-            return await self._synthesize_edge(text, voice, format, speed)
-        elif self.provider == TTSProvider.GOOGLE:
-            return await self._synthesize_google(text, voice, format, speed)
-        elif self.provider == TTSProvider.AMAZON:
-            return await self._synthesize_amazon(text, voice, format)
+        elif self.provider in (TTSProvider.OPENAI, TTSProvider.ELEVENLABS,
+                               TTSProvider.EDGE, TTSProvider.GOOGLE,
+                               TTSProvider.AMAZON):
+            return await self._synthesize_cloud_disabled(self.provider.value)
 
         return b""
+
+    async def _synthesize_luxtts(
+        self,
+        text: str,
+        voice: str,
+        format: AudioFormat,
+        speed: float
+    ) -> bytes:
+        """Synthesize using LuxTTS (offline, GPU/CPU, 48kHz, voice cloning).
+
+        Uses integrations.service_tools.luxtts_tool for actual synthesis,
+        then reads the output WAV file and returns raw bytes.
+        """
+        import json as _json
+        try:
+            from integrations.service_tools.luxtts_tool import luxtts_synthesize
+            result = _json.loads(luxtts_synthesize(
+                text,
+                voice_audio=voice if voice != "default" else None,
+                speed=speed,
+            ))
+            if 'error' in result:
+                logger.warning(f"LuxTTS error: {result['error']}")
+                return b""
+            wav_path = result.get('path', '')
+            if wav_path and os.path.isfile(wav_path):
+                with open(wav_path, 'rb') as f:
+                    return f.read()
+            return b""
+        except ImportError:
+            logger.warning("luxtts_tool not available")
+            return b""
+        except Exception as e:
+            logger.warning(f"LuxTTS synthesis failed: {e}")
+            return b""
 
     async def _synthesize_pocket(
         self,
@@ -297,65 +324,16 @@ class TTSEngine:
             logger.warning(f"Pocket TTS synthesis failed: {e}")
             return b""
 
-    async def _synthesize_openai(
-        self,
-        text: str,
-        voice: str,
-        format: AudioFormat,
-        speed: float
-    ) -> bytes:
-        """Synthesize using OpenAI TTS."""
-        # Would use OpenAI API:
-        # response = await self._client.audio.speech.create(
-        #     model=self.model,
-        #     voice=voice,
-        #     input=text,
-        #     response_format=format.value,
-        #     speed=speed
-        # )
-        # return response.content
-        return b""
+    async def _synthesize_cloud_disabled(self, provider_name: str) -> bytes:
+        """Return empty bytes for disabled cloud TTS providers.
 
-    async def _synthesize_elevenlabs(
-        self,
-        text: str,
-        voice: str,
-        format: AudioFormat
-    ) -> bytes:
-        """Synthesize using ElevenLabs."""
-        # Would use ElevenLabs API
-        return b""
-
-    async def _synthesize_edge(
-        self,
-        text: str,
-        voice: str,
-        format: AudioFormat,
-        speed: float
-    ) -> bytes:
-        """Synthesize using Microsoft Edge TTS (free)."""
-        # Would use edge-tts library
-        return b""
-
-    async def _synthesize_google(
-        self,
-        text: str,
-        voice: str,
-        format: AudioFormat,
-        speed: float
-    ) -> bytes:
-        """Synthesize using Google Cloud TTS."""
-        # Would use Google Cloud TTS API
-        return b""
-
-    async def _synthesize_amazon(
-        self,
-        text: str,
-        voice: str,
-        format: AudioFormat
-    ) -> bytes:
-        """Synthesize using Amazon Polly."""
-        # Would use AWS Polly
+        HART OS is offline-first — no closed-source TTS APIs.
+        Use TTSProvider.POCKET or TTSProvider.LUXTTS instead.
+        """
+        logger.warning(
+            "%s TTS is disabled (closed-source cloud API). "
+            "Use POCKET or LUXTTS for offline synthesis.", provider_name
+        )
         return b""
 
     async def synthesize_ssml(
@@ -385,14 +363,16 @@ class TTSEngine:
         # Provider-specific SSML synthesis
         # Most providers support SSML with varying feature sets
 
-        if self.provider in [TTSProvider.POCKET, TTSProvider.OPENAI]:
-            # Pocket TTS and OpenAI don't support SSML — synthesize plain text
-            pass
-        elif self.provider in [TTSProvider.GOOGLE, TTSProvider.AMAZON, TTSProvider.EDGE]:
-            # These providers support SSML natively
-            pass
+        if self.provider in (TTSProvider.LUXTTS, TTSProvider.POCKET):
+            # LuxTTS and Pocket TTS don't support SSML — strip tags, synthesize plain text
+            import re
+            plain = re.sub(r'<[^>]+>', '', ssml).strip()
+            if plain:
+                return await self.synthesize(plain, voice, format)
+            return b""
 
-        # Placeholder - actual implementation would call provider API
+        # Cloud providers: disabled
+        logger.warning("SSML synthesis not available (cloud providers disabled)")
         return b""
 
     async def list_voices(
@@ -436,7 +416,24 @@ class TTSEngine:
         """Fetch available voices from provider."""
         voices = []
 
-        if self.provider == TTSProvider.POCKET:
+        if self.provider == TTSProvider.LUXTTS:
+            # LuxTTS cloned voices
+            try:
+                import json as _json
+                from integrations.service_tools.luxtts_tool import luxtts_list_voices
+                data = _json.loads(luxtts_list_voices())
+                for v in data.get('voices', []):
+                    voices.append(VoiceInfo(
+                        id=v['id'], name=v['name'], language="en",
+                        provider="luxtts", sample_rate=24000,
+                        metadata={"type": v.get('type', 'cloned')},
+                    ))
+            except (ImportError, Exception):
+                voices.append(VoiceInfo(
+                    id="default", name="Default", language="en",
+                    provider="luxtts", sample_rate=24000,
+                ))
+        elif self.provider == TTSProvider.POCKET:
             # Pocket TTS built-in + cloned voices
             try:
                 import json as _json
@@ -448,34 +445,13 @@ class TTSEngine:
                         provider="pocket", metadata={"type": v.get('type', 'builtin')},
                     ))
             except (ImportError, Exception):
-                # Fallback: static list
-                for name in ["alba", "alicia", "aurora", "benjamin", "carol",
-                             "daniel", "emily", "henry", "jessica", "michael"]:
+                # Fallback: correct 8 built-in voices (pocket-tts 1.1.1)
+                for name in ["alba", "marius", "javert", "jean",
+                             "fantine", "cosette", "eponine", "azelma"]:
                     voices.append(VoiceInfo(
                         id=name, name=name.title(), language="en", provider="pocket",
                     ))
-        elif self.provider == TTSProvider.OPENAI:
-            # OpenAI has fixed voices
-            voices = [
-                VoiceInfo(id="alloy", name="Alloy", language="en-US", gender="neutral", provider="openai"),
-                VoiceInfo(id="echo", name="Echo", language="en-US", gender="male", provider="openai"),
-                VoiceInfo(id="fable", name="Fable", language="en-US", gender="neutral", provider="openai"),
-                VoiceInfo(id="onyx", name="Onyx", language="en-US", gender="male", provider="openai"),
-                VoiceInfo(id="nova", name="Nova", language="en-US", gender="female", provider="openai"),
-                VoiceInfo(id="shimmer", name="Shimmer", language="en-US", gender="female", provider="openai"),
-            ]
-        elif self.provider == TTSProvider.ELEVENLABS:
-            # Would fetch from ElevenLabs API
-            pass
-        elif self.provider == TTSProvider.EDGE:
-            # Would fetch from Edge TTS
-            pass
-        elif self.provider == TTSProvider.GOOGLE:
-            # Would fetch from Google Cloud TTS API
-            pass
-        elif self.provider == TTSProvider.AMAZON:
-            # Would fetch from Amazon Polly
-            pass
+        # Cloud providers: disabled, no voices to list
 
         return voices
 
@@ -515,6 +491,7 @@ class TTSEngine:
     def get_supported_formats(self) -> List[str]:
         """Get list of supported output formats."""
         formats = {
+            TTSProvider.LUXTTS: ["wav"],
             TTSProvider.POCKET: ["wav"],
             TTSProvider.OPENAI: ["mp3", "opus", "aac", "flac", "wav", "pcm"],
             TTSProvider.ELEVENLABS: ["mp3", "wav", "ogg"],
@@ -527,6 +504,7 @@ class TTSEngine:
     def get_max_text_length(self) -> int:
         """Get maximum text length for single request."""
         limits = {
+            TTSProvider.LUXTTS: 10000,   # Local — no API limits, just memory
             TTSProvider.POCKET: 10000,   # Local — no API limits, just memory
             TTSProvider.OPENAI: 4096,
             TTSProvider.ELEVENLABS: 5000,
@@ -706,15 +684,15 @@ class TTSEngine:
 
     def get_provider_info(self) -> Dict[str, Any]:
         """Get information about the current provider."""
+        _cloud = (TTSProvider.OPENAI, TTSProvider.ELEVENLABS,
+                  TTSProvider.EDGE, TTSProvider.GOOGLE, TTSProvider.AMAZON)
         return {
             "provider": self.provider.value,
             "model": self.model,
             "default_voice": self.default_voice,
             "max_text_length": self.get_max_text_length(),
             "supported_formats": self.get_supported_formats(),
-            "ssml_support": self.provider in [
-                TTSProvider.GOOGLE,
-                TTSProvider.AMAZON,
-                TTSProvider.EDGE
-            ]
+            "ssml_support": False,  # No active provider supports SSML
+            "offline": self.provider not in _cloud,
+            "disabled": self.provider in _cloud,
         }
