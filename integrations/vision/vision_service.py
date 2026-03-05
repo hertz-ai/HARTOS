@@ -408,8 +408,20 @@ class VisionService:
             logger.error("MiniCPM not installed — cannot start sidecar")
             return
 
+        # In frozen builds (cx_Freeze), sys.executable is Nunba.exe — using it
+        # with -m would launch a full GUI instance instead of the module.
+        # Use the bundled python interpreter from python-embed/ instead.
+        python_exe = sys.executable
+        if getattr(sys, 'frozen', False):
+            app_dir = os.path.dirname(sys.executable)
+            embed_python = os.path.join(app_dir, 'python-embed', 'python.exe')
+            if os.path.isfile(embed_python):
+                python_exe = embed_python
+            else:
+                logger.warning("python-embed/python.exe not found — minicpm sidecar may not start correctly")
+
         cmd = [
-            sys.executable, '-m', 'integrations.vision.minicpm_server',
+            python_exe, '-m', 'integrations.vision.minicpm_server',
             '--model_dir', model_dir,
             '--port', str(self._minicpm_port),
         ]
