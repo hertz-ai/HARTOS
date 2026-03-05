@@ -279,6 +279,13 @@ class RuntimeToolManager:
         env[f"{tool_name.upper()}_OFFLOAD"] = offload_mode
 
         python_exe = sys.executable
+        # In frozen builds (cx_Freeze), sys.executable is Nunba.exe — not a
+        # Python interpreter. Use the bundled python-embed/ instead.
+        if getattr(sys, 'frozen', False):
+            app_dir = os.path.dirname(sys.executable)
+            embed_python = os.path.join(app_dir, 'python-embed', 'python.exe')
+            if os.path.isfile(embed_python):
+                python_exe = embed_python
 
         try:
             _popen_kwargs = dict(
