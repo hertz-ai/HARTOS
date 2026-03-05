@@ -4,189 +4,143 @@ execution and routes from LangChain to autogen.
 
 Used by the LangChain Agentic_Router tool. When a prompt is classified as
 agentic, this module:
-1. Searches ExpertAgentRegistry (96 agents) + user recipes for a match
-2. Generates a plan (3-7 steps) for the task
+1. Uses the LLM to semantically match against 96 expert agents + user recipes
+2. Uses the LLM to generate a real execution plan (3-7 steps)
 3. Returns structured plan data for the frontend Plan Mode UI
+
+Intent classification itself is handled by the LLM deciding whether to call
+the Agentic_Router tool — no keyword heuristics needed.
 """
 
 import json
 import logging
 import os
-import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Keywords that strongly signal a multi-step / agentic task
-_AGENTIC_KEYWORDS = [
-    r'\bbuild\s+(?:me\s+)?(?:a|an|the)\b',
-    r'\bcreate\s+(?:a|an|the)\b.*(?:app|website|system|tool|pipeline|agent)',
-    r'\bwrite\s+(?:a|an|the|some)?\s*(?:code|script|program|function|class)',
-    r'\bresearch\s+and\s+(?:compile|summarize|report)',
-    r'\banalyze\s+(?:and|then)\b',
-    r'\bstep[- ]by[- ]step\b',
-    r'\bplan\s+(?:for|to|out)\b',
-    r'\bdesign\s+(?:a|an|the)\b',
-    r'\bimplement\b',
-    r'\bdevelop\s+(?:a|an|the)\b',
-    r'\bgenerate\s+(?:a|an|the)\b.*(?:report|analysis|strategy|campaign)',
-    r'\bset\s*up\b.*(?:project|environment|pipeline|workflow)',
-    r'\brefactor\b',
-    r'\bdeploy\b',
-    r'\bintegrate\b.*\bwith\b',
-    r'\bmulti[- ]?step\b',
-    r'\bcomplex\s+task\b',
-]
-
-# Simple Q&A patterns that should NOT be routed to autogen
-_SIMPLE_PATTERNS = [
-    r'^(?:what|who|when|where|why|how)\s+(?:is|are|was|were|do|does|did|can|could|would|should)\b',
-    r'^(?:tell\s+me|explain|describe|define)\b',
-    r'^(?:hi|hello|hey|thanks|thank\s+you|bye|goodbye)\b',
-    r'^(?:yes|no|ok|okay|sure|nope)\b',
-]
-
-# Minimum score threshold for agent matching
-AGENT_MATCH_THRESHOLD = 8
-
-
-def classify_intent(prompt: str) -> bool:
-    """Return True if the prompt requires agentic (multi-step) execution.
-
-    Uses keyword heuristics. LLM-based classification happens via the
-    Agentic_Router tool itself (LLM decides whether to call the tool).
-    """
-    if not prompt or len(prompt.strip()) < 15:
-        return False
-
-    prompt_lower = prompt.lower().strip()
-
-    # Check simple patterns first — fast exit
-    for pattern in _SIMPLE_PATTERNS:
-        if re.match(pattern, prompt_lower):
-            return False
-
-    # Check agentic keywords
-    for pattern in _AGENTIC_KEYWORDS:
-        if re.search(pattern, prompt_lower):
-            return True
-
-    return False
-
 
 def find_matching_agent(prompt: str, prompts_dir: str = None) -> Optional[Dict]:
-    """Search 96 expert agents + user recipes for the best match.
+    """Use LLM to semantically match prompt against available agents + recipes.
 
-    Returns: {agent_id, name, score, source: 'expert'|'recipe'} or None.
+    Sends agent summaries to the LLM and asks it to select the best match.
+    Falls back to None if LLM fails or no match found.
     """
-    best_match = None
-    best_score = 0
+    agent_summaries = _build_agent_catalog(prompts_dir)
+    if not agent_summaries:
+        return None
 
-    # 1) Search ExpertAgentRegistry
+    try:
+        from langchain_gpt_api import get_llm
+        llm = get_llm(temperature=0.1, max_tokens=300)
+
+        catalog_text = "\n".join(
+            f"- ID:{a['id']} | {a['name']} | {a['source']} | {a['description'][:120]}"
+            for a in agent_summaries[:50]
+        )
+
+        result = llm.invoke(
+            f"Given this user task, select the single best matching agent from the catalog below. "
+            f"If no agent is a good semantic match, respond with just 'NONE'.\n"
+            f"Otherwise respond with ONLY the agent ID.\n\n"
+            f"User task: {prompt}\n\n"
+            f"Agent catalog:\n{catalog_text}"
+        )
+
+        text = (result.content if hasattr(result, 'content') else str(result)).strip()
+
+        if text.upper() == 'NONE' or not text:
+            return None
+
+        for a in agent_summaries:
+            if a['id'] in text:
+                return {
+                    'agent_id': a['id'],
+                    'name': a['name'],
+                    'score': 15,
+                    'source': a['source'],
+                    'description': a['description'],
+                }
+        return None
+    except Exception as e:
+        logger.warning(f"LLM agent matching failed: {e}")
+        return None
+
+
+def _build_agent_catalog(prompts_dir: str = None) -> List[Dict]:
+    """Build unified catalog of expert agents + user recipes for LLM matching."""
+    catalog = []
+
     try:
         from integrations.expert_agents.registry import ExpertAgentRegistry
         registry = ExpertAgentRegistry()
-        scored = registry.score_match(prompt)
-        if scored:
-            top_agent, top_score = scored[0]
-            if top_score >= AGENT_MATCH_THRESHOLD:
-                best_match = {
-                    'agent_id': top_agent.agent_id,
-                    'name': top_agent.name,
-                    'score': top_score,
-                    'source': 'expert',
-                    'description': top_agent.description,
-                }
-                best_score = top_score
-    except Exception as e:
-        logger.debug(f"ExpertAgentRegistry search failed: {e}")
+        for agent in registry.agents.values():
+            catalog.append({
+                'id': agent.agent_id,
+                'name': agent.name,
+                'description': agent.description,
+                'source': 'expert',
+            })
+    except Exception:
+        pass
 
-    # 2) Scan user-created recipes in prompts/ directory
     if prompts_dir and os.path.isdir(prompts_dir):
         try:
-            prompt_lower = prompt.lower()
-            prompt_words = [w for w in prompt_lower.split() if len(w) > 3]
-
             for fname in os.listdir(prompts_dir):
                 if not fname.endswith('.json') or '_recipe' in fname:
                     continue
-                fpath = os.path.join(prompts_dir, fname)
                 try:
-                    with open(fpath, 'r') as f:
+                    with open(os.path.join(prompts_dir, fname)) as f:
                         recipe = json.load(f)
-                    goal = (recipe.get('goal', '') or '').lower()
-                    name = (recipe.get('name', '') or '').lower()
-                    score = 0
-                    for word in prompt_words:
-                        if word in goal:
-                            score += 3
-                        if word in name:
-                            score += 2
-                    if score > best_score and score >= AGENT_MATCH_THRESHOLD:
-                        prompt_id = fname.replace('.json', '')
-                        best_match = {
-                            'agent_id': prompt_id,
-                            'name': recipe.get('name', prompt_id),
-                            'score': score,
-                            'source': 'recipe',
-                            'description': recipe.get('goal', ''),
-                        }
-                        best_score = score
+                    catalog.append({
+                        'id': fname.replace('.json', ''),
+                        'name': recipe.get('name', fname),
+                        'description': recipe.get('goal', ''),
+                        'source': 'recipe',
+                    })
                 except Exception:
                     continue
-        except Exception as e:
-            logger.debug(f"Recipe scan failed: {e}")
+        except Exception:
+            pass
 
-    return best_match
+    return catalog
 
 
 def generate_plan_steps(prompt: str, matched_agent: Optional[Dict] = None) -> List[Dict]:
-    """Generate plan steps for an agentic task.
+    """Generate plan steps using the LLM. Falls back to generic steps on failure."""
+    try:
+        from langchain_gpt_api import get_llm
+        llm = get_llm(temperature=0.3, max_tokens=800)
 
-    Returns a list of step dicts: [{step_num, description, tool_or_agent}].
-    Uses heuristic decomposition. The LLM refines this in its response.
-    """
-    steps = []
-    prompt_lower = prompt.lower()
+        agent_context = ""
+        if matched_agent:
+            agent_context = (f"\nMatched expert: {matched_agent['name']} — "
+                             f"{matched_agent.get('description', '')}")
 
-    # Step 1: Always start with understanding/analysis
-    steps.append({
-        'step_num': 1,
-        'description': 'Analyze requirements and gather context',
-        'tool_or_agent': 'requirement_analysis',
-    })
+        result = llm.invoke(
+            f"Generate a 3-7 step execution plan for this task. "
+            f"Return ONLY a JSON array: "
+            f'[{{"step_num": 1, "description": "...", "tool_or_agent": "..."}}]'
+            f"{agent_context}\n\nTask: {prompt}"
+        )
 
-    # Domain-specific intermediate steps
-    if any(kw in prompt_lower for kw in ['code', 'build', 'implement', 'develop', 'script', 'program']):
-        steps.append({'step_num': 2, 'description': 'Design architecture and components', 'tool_or_agent': 'design'})
-        steps.append({'step_num': 3, 'description': 'Implement core functionality', 'tool_or_agent': 'coding'})
-        steps.append({'step_num': 4, 'description': 'Test and validate output', 'tool_or_agent': 'testing'})
-    elif any(kw in prompt_lower for kw in ['research', 'analyze', 'report', 'compile']):
-        steps.append({'step_num': 2, 'description': 'Research and gather information', 'tool_or_agent': 'research'})
-        steps.append({'step_num': 3, 'description': 'Synthesize findings', 'tool_or_agent': 'synthesis'})
-        steps.append({'step_num': 4, 'description': 'Compile final report', 'tool_or_agent': 'reporting'})
-    elif any(kw in prompt_lower for kw in ['marketing', 'campaign', 'strategy', 'content']):
-        steps.append({'step_num': 2, 'description': 'Define target audience and goals', 'tool_or_agent': 'strategy'})
-        steps.append({'step_num': 3, 'description': 'Create content and materials', 'tool_or_agent': 'content_creation'})
-        steps.append({'step_num': 4, 'description': 'Review and optimize', 'tool_or_agent': 'optimization'})
-    else:
-        steps.append({'step_num': 2, 'description': 'Plan execution approach', 'tool_or_agent': 'planning'})
-        steps.append({'step_num': 3, 'description': 'Execute task', 'tool_or_agent': 'execution'})
+        text = result.content if hasattr(result, 'content') else str(result)
+        import re
+        match = re.search(r'\[.*\]', text, re.DOTALL)
+        if match:
+            steps = json.loads(match.group())
+            if isinstance(steps, list) and len(steps) >= 2:
+                return steps
+    except Exception as e:
+        logger.warning(f"LLM plan generation failed, using fallback: {e}")
 
-    # If matched to an agent, note it
-    if matched_agent:
-        for step in steps:
-            if step['tool_or_agent'] in ('coding', 'execution', 'content_creation', 'reporting', 'synthesis'):
-                step['tool_or_agent'] = matched_agent.get('name', step['tool_or_agent'])
-
-    # Final step: always deliver
-    steps.append({
-        'step_num': len(steps) + 1,
-        'description': 'Deliver results and get feedback',
-        'tool_or_agent': 'delivery',
-    })
-
-    return steps
+    agent_name = matched_agent['name'] if matched_agent else 'execution'
+    return [
+        {'step_num': 1, 'description': 'Analyze requirements and gather context', 'tool_or_agent': 'analysis'},
+        {'step_num': 2, 'description': 'Plan approach and identify resources', 'tool_or_agent': 'planning'},
+        {'step_num': 3, 'description': 'Execute the task', 'tool_or_agent': agent_name},
+        {'step_num': 4, 'description': 'Deliver results and get feedback', 'tool_or_agent': 'delivery'},
+    ]
 
 
 def should_auto_create_agent(prompt: str, prompts_dir: str = None) -> bool:
@@ -199,7 +153,7 @@ def should_auto_create_agent(prompt: str, prompts_dir: str = None) -> bool:
 
 
 def build_agentic_plan(prompt: str, prompts_dir: str = None) -> Dict:
-    """Full pipeline: classify → match → plan. Returns structured plan dict."""
+    """Full pipeline: match → plan. Returns structured plan dict."""
     matched_agent = find_matching_agent(prompt, prompts_dir)
     plan_steps = generate_plan_steps(prompt, matched_agent)
 
@@ -209,6 +163,6 @@ def build_agentic_plan(prompt: str, prompts_dir: str = None) -> Dict:
         'matched_agent_id': matched_agent['agent_id'] if matched_agent else None,
         'matched_agent_name': matched_agent['name'] if matched_agent else None,
         'matched_agent_source': matched_agent['source'] if matched_agent else None,
-        'confidence': 'high' if matched_agent and matched_agent['score'] >= 12 else 'medium',
+        'confidence': 'high' if matched_agent else 'medium',
         'requires_new_agent': matched_agent is None,
     }

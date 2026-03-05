@@ -22,6 +22,16 @@
   boot.supportedFilesystems.zfs = lib.mkForce false;
   nixpkgs.config.allowBroken = false;
 
+  # ─── Workaround: systemd-hwdb update fails on WSL2 build hosts ───
+  # Replace the hwdb.bin derivation with a minimal stub.
+  # The real hwdb.bin will be regenerated on first boot by udev.
+  environment.etc."udev/hwdb.bin".source = lib.mkForce (
+    pkgs.runCommand "hwdb-stub" {} ''
+      # Create minimal valid hwdb binary (KSLP magic + empty index)
+      printf 'KSLP\x00\x00\x00\x00' > $out
+    ''
+  );
+
   # ─── HART OS Core Services ───
   hart = {
     enable = true;
@@ -93,10 +103,25 @@
     isoName = lib.mkForce "hart-os-${config.hart.version}-server-${pkgs.system}.iso";
     volumeID = lib.mkForce "HART_OS";
     appendToMenuLabel = " HART OS Server";
+    # EFI-only: skip legacy BIOS/syslinux (empty isolinux.bin on WSL2 builds)
+    makeBiosBootable = lib.mkForce false;
   };
 
   # Boot configuration
   boot.loader.timeout = lib.mkForce 5;
+
+  # Serial console for headless/QEMU boot
+  boot.kernelParams = [ "console=ttyS0,115200n8" ];
+
+  # SSH for remote access (NixOS live env)
+  services.openssh = {
+    enable = true;
+    settings.PermitRootLogin = "yes";
+    settings.PermitEmptyPasswords = "yes";
+  };
+
+  # Set empty root password for live ISO access
+  users.users.root.initialHashedPassword = "";
 
   # Headless: no desktop
   services.xserver.enable = false;

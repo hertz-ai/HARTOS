@@ -574,6 +574,8 @@ class VisionService:
                                 self.store.put_description(user_id, desc)
                                 self._post_description_to_db(user_id, desc)
                                 self._record_to_world_model(user_id, desc, 'camera')
+                                self._save_to_memory_graph(user_id, desc, 'camera')
+                                self._emit_perception_event(user_id, desc, 'camera')
                                 self._evaluate_visual_triggers(
                                     user_id, desc, 'camera'
                                 )
@@ -597,6 +599,8 @@ class VisionService:
                                     zeroshot_label='Screen Reasoning',
                                 )
                                 self._record_to_world_model(user_id, desc, 'screen')
+                                self._save_to_memory_graph(user_id, desc, 'screen')
+                                self._emit_perception_event(user_id, desc, 'screen')
                                 self._evaluate_visual_triggers(
                                     user_id, desc, 'screen'
                                 )
@@ -683,6 +687,33 @@ class VisionService:
                 user_id=user_id, prompt_id=f'vision_{channel}',
                 prompt=f'[{channel}] describe what you see',
                 response=description, model_id=model_id)
+        except Exception:
+            pass
+
+    # ─── Temporal Perception ───
+
+    def _save_to_memory_graph(self, user_id: str, description: str, channel: str):
+        """Auto-save visual description to MemoryGraph for long-term recall."""
+        try:
+            from langchain_gpt_api import _get_or_create_graph
+            graph = _get_or_create_graph(user_id)
+            if graph:
+                graph.add(
+                    content=description,
+                    metadata={'channel': channel, 'type': 'visual_context'},
+                    tags=['visual', channel],
+                )
+        except Exception:
+            pass
+
+    def _emit_perception_event(self, user_id: str, description: str, channel: str):
+        """Emit present-tense perception event on EventBus."""
+        try:
+            from core.platform.events import emit_event
+            emit_event('perception.vision.present', {
+                'user_id': user_id, 'channel': channel,
+                'content': description, 'timestamp': time.time(),
+            })
         except Exception:
             pass
 
