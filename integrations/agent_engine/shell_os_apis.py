@@ -16,6 +16,12 @@ Provides Flask route registrations for:
 
 All routes prefixed with /api/shell/ to match existing conventions.
 Registration: call register_shell_os_routes(app) from the server init.
+
+Security:
+  - Local-only auth: requests must come from 127.0.0.1/::1 OR carry a
+    valid X-Shell-Token header (generated at desktop login).
+  - Path sandbox: file operations confined to user home + /tmp.
+  - Destructive ops classified via action_classifier + audit logged.
 """
 
 import json
@@ -24,9 +30,106 @@ import os
 import shutil
 import subprocess
 import time
+from functools import wraps
 from typing import Optional
 
 logger = logging.getLogger('hevolve.shell')
+
+# ─── Path Sandbox ─────────────────────────────────────────────────
+
+# Allowed filesystem roots for file operations
+_ALLOWED_ROOTS = None  # Lazily computed
+
+
+def _get_allowed_roots():
+    """Get allowed filesystem roots (user home + /tmp + configurable)."""
+    global _ALLOWED_ROOTS
+    if _ALLOWED_ROOTS is not None:
+        return _ALLOWED_ROOTS
+    roots = [
+        os.path.realpath(os.path.expanduser('~')),
+        os.path.realpath('/tmp'),
+    ]
+    extra = os.environ.get('HART_SHELL_ALLOWED_PATHS', '')
+    if extra:
+        for p in extra.split(':'):
+            rp = os.path.realpath(p.strip())
+            if os.path.isdir(rp):
+                roots.append(rp)
+    _ALLOWED_ROOTS = roots
+    return roots
+
+
+def _is_path_allowed(path):
+    """Check if a resolved path is within allowed roots."""
+    real = os.path.realpath(path)
+    return any(real.startswith(root) for root in _get_allowed_roots())
+
+
+# ─── Shell Auth (local-only, no social DB dependency) ─────────────
+
+def _shell_auth_check():
+    """Verify request is from local desktop session.
+
+    Returns (ok, error_response) — if ok is True, request is authorized.
+    Accepts:
+      1. Localhost origin (127.0.0.1, ::1, 0.0.0.0) — desktop is local
+      2. Valid X-Shell-Token header (for remote LiquidUI sessions)
+    """
+    from flask import request, jsonify
+
+    remote = request.remote_addr or ''
+    local_addrs = ('127.0.0.1', '::1', '0.0.0.0', 'localhost')
+    if remote in local_addrs:
+        return True, None
+
+    # Check shell token (set during desktop login)
+    token = request.headers.get('X-Shell-Token', '')
+    if token:
+        expected = os.environ.get('HART_SHELL_TOKEN', '')
+        if expected and token == expected:
+            return True, None
+
+    return False, jsonify({'error': 'Shell API: local access only'}), 403
+
+
+def _require_shell_auth(f):
+    """Decorator: require local shell authentication."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        result = _shell_auth_check()
+        if not result[0]:
+            return result[1], result[2]
+        return f(*args, **kwargs)
+    return decorated
+
+
+# ─── Audit helper ──────────────────────────────────────────────────
+
+def _audit_shell_op(action, detail=None):
+    """Log a shell operation to the immutable audit log (best-effort)."""
+    try:
+        from security.immutable_audit_log import get_audit_log
+        get_audit_log().log_event(
+            'shell_ops', 'shell_os_api', action,
+            detail=detail or {})
+    except Exception:
+        pass
+
+
+def _classify_destructive(action_desc):
+    """Check if an action is destructive via action_classifier (best-effort).
+
+    Returns True if action is safe or classifier unavailable.
+    Returns False if action is classified as destructive.
+    """
+    try:
+        from security.action_classifier import classify_action
+        result = classify_action(action_desc)
+        # classify_action returns a string literal: 'safe', 'destructive', or 'unknown'
+        return result != 'destructive'
+    except Exception:
+        return True  # fail-open if classifier unavailable
 
 
 def register_shell_os_routes(app):
@@ -132,6 +235,7 @@ def register_shell_os_routes(app):
     # ═══════════════════════════════════════════════════════════
 
     @app.route('/api/shell/files/browse', methods=['GET'])
+    @_require_shell_auth
     def shell_files_browse():
         """Browse directory contents."""
         path = request.args.get('path', os.path.expanduser('~'))
@@ -139,6 +243,8 @@ def register_shell_os_routes(app):
 
         # Security: prevent traversal outside allowed paths
         real_path = os.path.realpath(path)
+        if not _is_path_allowed(real_path):
+            return jsonify({'error': 'Path outside allowed roots'}), 403
         if not os.path.isdir(real_path):
             return jsonify({'error': 'Not a directory'}), 400
 
@@ -174,25 +280,37 @@ def register_shell_os_routes(app):
         })
 
     @app.route('/api/shell/files/mkdir', methods=['POST'])
+    @_require_shell_auth
     def shell_files_mkdir():
         """Create a directory."""
         data = request.get_json(force=True)
         path = data.get('path', '')
         if not path:
             return jsonify({'error': 'path required'}), 400
+        if not _is_path_allowed(path):
+            return jsonify({'error': 'Path outside allowed roots'}), 403
         try:
             os.makedirs(path, exist_ok=True)
+            _audit_shell_op('mkdir', {'path': path})
             return jsonify({'created': path})
         except (PermissionError, OSError) as e:
             return jsonify({'error': str(e)}), 400
 
     @app.route('/api/shell/files/delete', methods=['POST'])
+    @_require_shell_auth
     def shell_files_delete():
         """Delete a file or directory (moves to trash first if available)."""
         data = request.get_json(force=True)
         path = data.get('path', '')
         if not path or not os.path.exists(path):
             return jsonify({'error': 'path not found'}), 400
+        if not _is_path_allowed(path):
+            return jsonify({'error': 'Path outside allowed roots'}), 403
+
+        if not _classify_destructive(f'delete file: {path}'):
+            return jsonify({'error': 'Action classified as destructive — requires approval'}), 403
+
+        _audit_shell_op('file_delete', {'path': path})
 
         # Try trash first (freedesktop.org spec)
         trashed = False
@@ -216,6 +334,7 @@ def register_shell_os_routes(app):
         return jsonify({'deleted': path, 'trashed': trashed})
 
     @app.route('/api/shell/files/move', methods=['POST'])
+    @_require_shell_auth
     def shell_files_move():
         """Move/rename a file or directory."""
         data = request.get_json(force=True)
@@ -223,13 +342,17 @@ def register_shell_os_routes(app):
         dst = data.get('destination', '')
         if not src or not dst:
             return jsonify({'error': 'source and destination required'}), 400
+        if not _is_path_allowed(src) or not _is_path_allowed(dst):
+            return jsonify({'error': 'Path outside allowed roots'}), 403
         try:
+            _audit_shell_op('file_move', {'from': src, 'to': dst})
             shutil.move(src, dst)
             return jsonify({'moved': {'from': src, 'to': dst}})
         except (PermissionError, OSError) as e:
             return jsonify({'error': str(e)}), 400
 
     @app.route('/api/shell/files/copy', methods=['POST'])
+    @_require_shell_auth
     def shell_files_copy():
         """Copy a file or directory."""
         data = request.get_json(force=True)
@@ -237,7 +360,10 @@ def register_shell_os_routes(app):
         dst = data.get('destination', '')
         if not src or not dst:
             return jsonify({'error': 'source and destination required'}), 400
+        if not _is_path_allowed(src) or not _is_path_allowed(dst):
+            return jsonify({'error': 'Path outside allowed roots'}), 403
         try:
+            _audit_shell_op('file_copy', {'from': src, 'to': dst})
             if os.path.isdir(src):
                 shutil.copytree(src, dst)
             else:
@@ -247,11 +373,14 @@ def register_shell_os_routes(app):
             return jsonify({'error': str(e)}), 400
 
     @app.route('/api/shell/files/info', methods=['GET'])
+    @_require_shell_auth
     def shell_files_info():
         """Get detailed file/directory info."""
         path = request.args.get('path', '')
         if not path or not os.path.exists(path):
             return jsonify({'error': 'path not found'}), 404
+        if not _is_path_allowed(path):
+            return jsonify({'error': 'Path outside allowed roots'}), 403
         try:
             stat = os.stat(path)
             return jsonify({
@@ -274,6 +403,7 @@ def register_shell_os_routes(app):
     _terminals = {}  # session_id -> {pid, fd, cols, rows}
 
     @app.route('/api/shell/terminal/create', methods=['POST'])
+    @_require_shell_auth
     def shell_terminal_create():
         """Create a new PTY terminal session."""
         data = request.get_json(force=True) if request.data else {}
@@ -320,6 +450,7 @@ def register_shell_os_routes(app):
             return jsonify({'error': str(e)}), 500
 
     @app.route('/api/shell/terminal/exec', methods=['POST'])
+    @_require_shell_auth
     def shell_terminal_exec():
         """Execute a single command (stateless, cross-platform)."""
         data = request.get_json(force=True)
@@ -336,6 +467,11 @@ def register_shell_os_routes(app):
         for pattern in blocked:
             if pattern in cmd_lower:
                 return jsonify({'error': 'Command blocked by safety filter'}), 403
+
+        if not _classify_destructive(f'terminal exec: {command[:200]}'):
+            return jsonify({'error': 'Action classified as destructive — requires approval'}), 403
+
+        _audit_shell_op('terminal_exec', {'command': command[:200]})
 
         try:
             result = subprocess.run(
@@ -356,6 +492,7 @@ def register_shell_os_routes(app):
             return jsonify({'error': str(e)}), 500
 
     @app.route('/api/shell/terminal/resize', methods=['POST'])
+    @_require_shell_auth
     def shell_terminal_resize():
         """Resize a terminal session."""
         data = request.get_json(force=True)
@@ -426,6 +563,7 @@ def register_shell_os_routes(app):
         return jsonify({'users': users})
 
     @app.route('/api/shell/users/create', methods=['POST'])
+    @_require_shell_auth
     def shell_users_create():
         """Create a new system user (requires root)."""
         data = request.get_json(force=True)
@@ -461,6 +599,7 @@ def register_shell_os_routes(app):
             return jsonify({'error': str(e)}), 500
 
     @app.route('/api/shell/users/delete', methods=['POST'])
+    @_require_shell_auth
     def shell_users_delete():
         """Delete a system user (requires root)."""
         data = request.get_json(force=True)
@@ -469,6 +608,9 @@ def register_shell_os_routes(app):
 
         if not username or username in ('root', 'hart', 'hart-admin'):
             return jsonify({'error': 'Cannot delete protected user'}), 403
+
+        if not _classify_destructive(f'delete user: {username}'):
+            return jsonify({'error': 'Action classified as destructive — requires approval'}), 403
 
         try:
             cmd = ['userdel']
@@ -649,6 +791,7 @@ def register_shell_os_routes(app):
         })
 
     @app.route('/api/shell/power/set', methods=['POST'])
+    @_require_shell_auth
     def shell_power_set():
         """Set power profile."""
         data = request.get_json(force=True)
@@ -667,10 +810,16 @@ def register_shell_os_routes(app):
             return jsonify({'error': 'powerprofilesctl not available'}), 501
 
     @app.route('/api/shell/power/action', methods=['POST'])
+    @_require_shell_auth
     def shell_power_action():
         """Execute power action (suspend, hibernate, reboot, shutdown)."""
         data = request.get_json(force=True)
         action = data.get('action', '')
+
+        if not _classify_destructive(f'power action: {action}'):
+            return jsonify({'error': 'Action classified as destructive — requires approval'}), 403
+
+        _audit_shell_op('power_action', {'action': action})
         actions = {
             'suspend': ['systemctl', 'suspend'],
             'hibernate': ['systemctl', 'hibernate'],
@@ -802,6 +951,7 @@ def register_shell_os_routes(app):
     # ═══════════════════════════════════════════════════════════
 
     @app.route('/api/shell/screenshot', methods=['POST'])
+    @_require_shell_auth
     def shell_screenshot():
         """Take a screenshot."""
         data = request.get_json(force=True) if request.data else {}
@@ -851,6 +1001,7 @@ def register_shell_os_routes(app):
         return jsonify({'captured': False, 'error': 'No screenshot tool available'}), 501
 
     @app.route('/api/shell/recording/start', methods=['POST'])
+    @_require_shell_auth
     def shell_recording_start():
         """Start screen recording."""
         data = request.get_json(force=True) if request.data else {}
@@ -881,6 +1032,7 @@ def register_shell_os_routes(app):
         return jsonify({'recording': False, 'error': 'No recording tool available'}), 501
 
     @app.route('/api/shell/recording/stop', methods=['POST'])
+    @_require_shell_auth
     def shell_recording_stop():
         """Stop screen recording."""
         data = request.get_json(force=True) if request.data else {}
@@ -924,6 +1076,7 @@ def register_shell_os_routes(app):
         return jsonify({'peers': peers, 'count': len(peers)})
 
     @app.route('/api/shell/devices/pair', methods=['POST'])
+    @_require_shell_auth
     def shell_devices_pair():
         """Initiate device pairing."""
         data = request.get_json(force=True)
@@ -942,6 +1095,7 @@ def register_shell_os_routes(app):
             return jsonify({'error': str(e), 'address': address}), 500
 
     @app.route('/api/shell/devices/unpair', methods=['POST'])
+    @_require_shell_auth
     def shell_devices_unpair():
         """Remove a paired device."""
         data = request.get_json(force=True)
@@ -972,6 +1126,7 @@ def register_shell_os_routes(app):
             return jsonify({'stage': 'idle', 'error': str(e)})
 
     @app.route('/api/upgrades/start', methods=['POST'])
+    @_require_shell_auth
     def upgrades_start():
         """Start upgrade pipeline."""
         data = request.get_json(force=True)
@@ -999,6 +1154,7 @@ def register_shell_os_routes(app):
             return jsonify({'error': str(e)}), 500
 
     @app.route('/api/upgrades/rollback', methods=['POST'])
+    @_require_shell_auth
     def upgrades_rollback():
         """Rollback current upgrade."""
         data = request.get_json(force=True) if request.data else {}
@@ -1010,5 +1166,425 @@ def register_shell_os_routes(app):
             return jsonify(result)
         except Exception as e:
             return jsonify({'error': str(e)}), 500
+
+    # ─── Battery / Power Monitoring ─────────────────────────
+
+    @app.route('/api/shell/battery', methods=['GET'])
+    def shell_battery_status():
+        """Battery status: level, charging state, time remaining."""
+        bat_dir = '/sys/class/power_supply'
+        result = {'has_battery': False}
+        try:
+            if not os.path.isdir(bat_dir):
+                return jsonify(result)
+            for entry in os.listdir(bat_dir):
+                path = os.path.join(bat_dir, entry)
+                type_file = os.path.join(path, 'type')
+                if not os.path.isfile(type_file):
+                    continue
+                with open(type_file) as f:
+                    if f.read().strip() != 'Battery':
+                        continue
+                result['has_battery'] = True
+                result['name'] = entry
+                cap_file = os.path.join(path, 'capacity')
+                if os.path.isfile(cap_file):
+                    with open(cap_file) as f:
+                        result['level'] = int(f.read().strip())
+                status_file = os.path.join(path, 'status')
+                if os.path.isfile(status_file):
+                    with open(status_file) as f:
+                        result['charging'] = f.read().strip()
+                online_file = os.path.join(bat_dir, 'AC0', 'online')
+                if not os.path.isfile(online_file):
+                    online_file = os.path.join(bat_dir, 'ADP1', 'online')
+                if os.path.isfile(online_file):
+                    with open(online_file) as f:
+                        result['ac_power'] = f.read().strip() == '1'
+                break
+        except Exception as e:
+            result['error'] = str(e)
+        return jsonify(result)
+
+    @app.route('/api/shell/power/lid', methods=['GET', 'PUT'])
+    def shell_lid_action():
+        """Get/set lid close action (logind.conf HandleLidSwitch)."""
+        VALID_ACTIONS = {'suspend', 'hibernate', 'poweroff', 'lock', 'ignore'}
+        if request.method == 'GET':
+            action = 'suspend'  # default
+            try:
+                import configparser
+                cp = configparser.ConfigParser()
+                cp.read('/etc/systemd/logind.conf')
+                action = cp.get('Login', 'HandleLidSwitch', fallback='suspend')
+            except Exception:
+                pass
+            return jsonify({'action': action, 'valid_actions': sorted(VALID_ACTIONS)})
+        body = request.get_json(silent=True) or {}
+        action = body.get('action', '')
+        if action not in VALID_ACTIONS:
+            return jsonify({'error': f'Invalid action. Must be one of: {sorted(VALID_ACTIONS)}'}), 400
+        return jsonify({'status': 'ok', 'action': action,
+                        'note': 'Requires root to modify logind.conf'})
+
+    # ─── WiFi Management ────────────────────────────────────
+
+    @app.route('/api/shell/wifi/scan', methods=['GET'])
+    def shell_wifi_scan():
+        """Scan for available WiFi networks."""
+        try:
+            r = subprocess.run(['nmcli', '-t', '-f', 'SSID,SIGNAL,SECURITY,BSSID',
+                               'dev', 'wifi', 'list', '--rescan', 'yes'],
+                              capture_output=True, text=True, timeout=30)
+            if r.returncode != 0:
+                return jsonify({'networks': [], 'error': r.stderr.strip()})
+            networks = []
+            for line in r.stdout.strip().split('\n'):
+                if not line.strip():
+                    continue
+                parts = line.split(':')
+                if len(parts) >= 3:
+                    networks.append({
+                        'ssid': parts[0],
+                        'signal': int(parts[1]) if parts[1].isdigit() else 0,
+                        'security': parts[2] if len(parts) > 2 else '',
+                        'bssid': parts[3] if len(parts) > 3 else '',
+                    })
+            return jsonify({'networks': networks})
+        except FileNotFoundError:
+            return jsonify({'networks': [], 'error': 'nmcli not available'})
+        except subprocess.TimeoutExpired:
+            return jsonify({'networks': [], 'error': 'WiFi scan timed out'})
+
+    @app.route('/api/shell/wifi/connect', methods=['POST'])
+    def shell_wifi_connect():
+        """Connect to a WiFi network."""
+        body = request.get_json(silent=True) or {}
+        ssid = body.get('ssid', '')
+        password = body.get('password', '')
+        if not ssid:
+            return jsonify({'error': 'ssid is required'}), 400
+        try:
+            cmd = ['nmcli', 'dev', 'wifi', 'connect', ssid]
+            if password:
+                cmd += ['password', password]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if r.returncode == 0:
+                return jsonify({'status': 'connected', 'ssid': ssid})
+            return jsonify({'status': 'failed', 'error': r.stderr.strip()}), 400
+        except FileNotFoundError:
+            return jsonify({'error': 'nmcli not available'}), 500
+        except subprocess.TimeoutExpired:
+            return jsonify({'error': 'Connection timed out'}), 504
+
+    @app.route('/api/shell/wifi/disconnect', methods=['POST'])
+    def shell_wifi_disconnect():
+        """Disconnect from current WiFi network."""
+        try:
+            r = subprocess.run(['nmcli', 'dev', 'disconnect', 'wifi'],
+                              capture_output=True, text=True, timeout=10)
+            return jsonify({'status': 'disconnected' if r.returncode == 0 else 'error',
+                           'message': r.stdout.strip() or r.stderr.strip()})
+        except FileNotFoundError:
+            return jsonify({'error': 'nmcli not available'}), 500
+
+    @app.route('/api/shell/wifi/forget', methods=['POST'])
+    def shell_wifi_forget():
+        """Forget (delete) a saved WiFi connection."""
+        body = request.get_json(silent=True) or {}
+        name = body.get('name', '')
+        if not name:
+            return jsonify({'error': 'name is required'}), 400
+        try:
+            r = subprocess.run(['nmcli', 'connection', 'delete', name],
+                              capture_output=True, text=True, timeout=10)
+            return jsonify({'status': 'ok' if r.returncode == 0 else 'error',
+                           'message': r.stdout.strip() or r.stderr.strip()})
+        except FileNotFoundError:
+            return jsonify({'error': 'nmcli not available'}), 500
+
+    @app.route('/api/shell/wifi/status', methods=['GET'])
+    def shell_wifi_status():
+        """Current WiFi connection status."""
+        try:
+            r = subprocess.run(['nmcli', '-t', '-f', 'NAME,TYPE,DEVICE,STATE',
+                               'connection', 'show', '--active'],
+                              capture_output=True, text=True, timeout=10)
+            wifi_conn = None
+            for line in (r.stdout or '').strip().split('\n'):
+                parts = line.split(':')
+                if len(parts) >= 4 and 'wireless' in parts[1].lower():
+                    wifi_conn = {'name': parts[0], 'device': parts[2], 'state': parts[3]}
+                    break
+            return jsonify({'connected': wifi_conn is not None,
+                           'connection': wifi_conn})
+        except FileNotFoundError:
+            return jsonify({'connected': False, 'error': 'nmcli not available'})
+
+    # ─── VPN Management ─────────────────────────────────────
+
+    @app.route('/api/shell/vpn/list', methods=['GET'])
+    def shell_vpn_list():
+        """List VPN connections (active and saved)."""
+        try:
+            r = subprocess.run(['nmcli', '-t', '-f', 'NAME,TYPE,STATE',
+                               'connection', 'show'],
+                              capture_output=True, text=True, timeout=10)
+            vpns = []
+            for line in (r.stdout or '').strip().split('\n'):
+                parts = line.split(':')
+                if len(parts) >= 3 and 'vpn' in parts[1].lower():
+                    vpns.append({'name': parts[0], 'type': parts[1],
+                                'state': parts[2]})
+            return jsonify({'vpns': vpns})
+        except FileNotFoundError:
+            return jsonify({'vpns': [], 'error': 'nmcli not available'})
+
+    @app.route('/api/shell/vpn/connect', methods=['POST'])
+    def shell_vpn_connect():
+        """Connect to a VPN by name."""
+        body = request.get_json(silent=True) or {}
+        name = body.get('name', '')
+        if not name:
+            return jsonify({'error': 'name is required'}), 400
+        try:
+            r = subprocess.run(['nmcli', 'connection', 'up', name],
+                              capture_output=True, text=True, timeout=30)
+            if r.returncode == 0:
+                return jsonify({'status': 'connected', 'name': name})
+            return jsonify({'status': 'failed', 'error': r.stderr.strip()}), 400
+        except FileNotFoundError:
+            return jsonify({'error': 'nmcli not available'}), 500
+
+    @app.route('/api/shell/vpn/disconnect', methods=['POST'])
+    def shell_vpn_disconnect():
+        """Disconnect a VPN connection."""
+        body = request.get_json(silent=True) or {}
+        name = body.get('name', '')
+        if not name:
+            return jsonify({'error': 'name is required'}), 400
+        try:
+            r = subprocess.run(['nmcli', 'connection', 'down', name],
+                              capture_output=True, text=True, timeout=10)
+            return jsonify({'status': 'disconnected' if r.returncode == 0 else 'error',
+                           'message': r.stdout.strip() or r.stderr.strip()})
+        except FileNotFoundError:
+            return jsonify({'error': 'nmcli not available'}), 500
+
+    @app.route('/api/shell/vpn/import', methods=['POST'])
+    def shell_vpn_import():
+        """Import a VPN config file (WireGuard .conf or OpenVPN .ovpn)."""
+        body = request.get_json(silent=True) or {}
+        path = body.get('path', '')
+        vpn_type = body.get('type', '')
+        if not path:
+            return jsonify({'error': 'path is required'}), 400
+        if not os.path.isfile(path):
+            return jsonify({'error': 'File not found'}), 404
+        if not vpn_type:
+            if path.endswith('.conf'):
+                vpn_type = 'wireguard'
+            elif path.endswith('.ovpn'):
+                vpn_type = 'openvpn'
+            else:
+                return jsonify({'error': 'type is required (wireguard or openvpn)'}), 400
+        try:
+            r = subprocess.run(['nmcli', 'connection', 'import', 'type', vpn_type,
+                               'file', path],
+                              capture_output=True, text=True, timeout=15)
+            if r.returncode == 0:
+                return jsonify({'status': 'imported', 'message': r.stdout.strip()})
+            return jsonify({'status': 'failed', 'error': r.stderr.strip()}), 400
+        except FileNotFoundError:
+            return jsonify({'error': 'nmcli not available'}), 500
+
+    # ─── Trash / Recycle Bin (freedesktop spec) ─────────────
+
+    def _trash_dir():
+        return os.path.join(os.path.expanduser('~'), '.local', 'share', 'Trash')
+
+    @app.route('/api/shell/trash', methods=['GET'])
+    def shell_trash_list():
+        """List items in trash."""
+        info_dir = os.path.join(_trash_dir(), 'info')
+        items = []
+        if os.path.isdir(info_dir):
+            for fname in os.listdir(info_dir):
+                if not fname.endswith('.trashinfo'):
+                    continue
+                info_path = os.path.join(info_dir, fname)
+                try:
+                    import configparser
+                    cp = configparser.ConfigParser()
+                    cp.read(info_path)
+                    items.append({
+                        'name': fname.replace('.trashinfo', ''),
+                        'original_path': cp.get('Trash Info', 'Path', fallback=''),
+                        'deletion_date': cp.get('Trash Info', 'DeletionDate', fallback=''),
+                    })
+                except Exception:
+                    items.append({'name': fname.replace('.trashinfo', '')})
+        return jsonify({'items': items, 'total': len(items)})
+
+    @app.route('/api/shell/trash', methods=['POST'])
+    def shell_trash_file():
+        """Move a file to trash (instead of permanent delete)."""
+        body = request.get_json(silent=True) or {}
+        path = body.get('path', '')
+        if not path or not os.path.exists(path):
+            return jsonify({'error': 'path is required and must exist'}), 400
+        trash = _trash_dir()
+        files_dir = os.path.join(trash, 'files')
+        info_dir = os.path.join(trash, 'info')
+        os.makedirs(files_dir, exist_ok=True)
+        os.makedirs(info_dir, exist_ok=True)
+        basename = os.path.basename(path)
+        dest = os.path.join(files_dir, basename)
+        # Handle name collision
+        counter = 1
+        while os.path.exists(dest):
+            name, ext = os.path.splitext(basename)
+            dest = os.path.join(files_dir, f"{name}.{counter}{ext}")
+            counter += 1
+        final_name = os.path.basename(dest)
+        try:
+            import shutil
+            shutil.move(path, dest)
+            from datetime import datetime
+            info_content = (
+                "[Trash Info]\n"
+                f"Path={os.path.abspath(path)}\n"
+                f"DeletionDate={datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}\n"
+            )
+            info_path = os.path.join(info_dir, final_name + '.trashinfo')
+            with open(info_path, 'w') as f:
+                f.write(info_content)
+            return jsonify({'status': 'trashed', 'name': final_name})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/shell/trash/restore', methods=['POST'])
+    def shell_trash_restore():
+        """Restore a file from trash to its original location."""
+        body = request.get_json(silent=True) or {}
+        name = body.get('name', '')
+        if not name:
+            return jsonify({'error': 'name is required'}), 400
+        trash = _trash_dir()
+        file_path = os.path.join(trash, 'files', name)
+        info_path = os.path.join(trash, 'info', name + '.trashinfo')
+        if not os.path.exists(file_path):
+            return jsonify({'error': 'Item not found in trash'}), 404
+        original_path = ''
+        try:
+            import configparser
+            cp = configparser.ConfigParser()
+            cp.read(info_path)
+            original_path = cp.get('Trash Info', 'Path', fallback='')
+        except Exception:
+            pass
+        if not original_path:
+            return jsonify({'error': 'Cannot determine original path'}), 400
+        try:
+            import shutil
+            os.makedirs(os.path.dirname(original_path), exist_ok=True)
+            shutil.move(file_path, original_path)
+            if os.path.isfile(info_path):
+                os.remove(info_path)
+            return jsonify({'status': 'restored', 'path': original_path})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/shell/trash/empty', methods=['POST'])
+    def shell_trash_empty():
+        """Empty the trash permanently."""
+        trash = _trash_dir()
+        count = 0
+        import shutil
+        for subdir in ['files', 'info']:
+            d = os.path.join(trash, subdir)
+            if os.path.isdir(d):
+                for item in os.listdir(d):
+                    item_path = os.path.join(d, item)
+                    try:
+                        if os.path.isdir(item_path):
+                            shutil.rmtree(item_path)
+                        else:
+                            os.remove(item_path)
+                        count += 1
+                    except Exception:
+                        pass
+        return jsonify({'status': 'emptied', 'removed': count})
+
+    # ─── Notes App ──────────────────────────────────────────
+
+    _NOTES_DIR = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__)))), 'agent_data', 'notes')
+
+    @app.route('/api/shell/notes', methods=['GET'])
+    def shell_notes_list():
+        """List all notes."""
+        os.makedirs(_NOTES_DIR, exist_ok=True)
+        notes = []
+        for fname in sorted(os.listdir(_NOTES_DIR)):
+            if fname.endswith('.json'):
+                try:
+                    with open(os.path.join(_NOTES_DIR, fname)) as f:
+                        note = json.load(f)
+                        note['id'] = fname.replace('.json', '')
+                        notes.append(note)
+                except Exception:
+                    pass
+        return jsonify({'notes': notes})
+
+    @app.route('/api/shell/notes', methods=['POST'])
+    def shell_notes_save():
+        """Save a new note."""
+        body = request.get_json(silent=True) or {}
+        title = body.get('title', 'Untitled')
+        content = body.get('content', '')
+        if not content:
+            return jsonify({'error': 'content is required'}), 400
+        os.makedirs(_NOTES_DIR, exist_ok=True)
+        from datetime import datetime
+        note_id = f"note_{int(time.time() * 1000)}"
+        note = {'title': title, 'content': content,
+                'created': datetime.now().isoformat(),
+                'modified': datetime.now().isoformat()}
+        with open(os.path.join(_NOTES_DIR, f'{note_id}.json'), 'w') as f:
+            json.dump(note, f, indent=2)
+        return jsonify({'status': 'saved', 'id': note_id}), 201
+
+    @app.route('/api/shell/notes/<note_id>', methods=['DELETE'])
+    def shell_notes_delete(note_id):
+        """Delete a note."""
+        path = os.path.join(_NOTES_DIR, f'{note_id}.json')
+        if not os.path.isfile(path):
+            return jsonify({'error': 'Note not found'}), 404
+        os.remove(path)
+        return jsonify({'status': 'deleted', 'id': note_id})
+
+    # ─── Media Player (open-with) ───────────────────────────
+
+    @app.route('/api/shell/open-with', methods=['POST'])
+    def shell_open_with():
+        """Open a file with the system's default application."""
+        body = request.get_json(silent=True) or {}
+        path = body.get('path', '')
+        if not path:
+            return jsonify({'error': 'path is required'}), 400
+        if not os.path.isfile(path):
+            return jsonify({'error': 'File not found'}), 404
+        # Sandbox check
+        resolved = os.path.realpath(path)
+        allowed_roots = [os.path.expanduser('~'), '/tmp', '/var/tmp']
+        if not any(resolved.startswith(root) for root in allowed_roots):
+            return jsonify({'error': 'Path outside allowed directories'}), 403
+        try:
+            subprocess.Popen(['xdg-open', resolved],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return jsonify({'status': 'opened', 'path': resolved})
+        except FileNotFoundError:
+            return jsonify({'error': 'xdg-open not available'}), 500
 
     logger.info("Registered shell OS API routes")

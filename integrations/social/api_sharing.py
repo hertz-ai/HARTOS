@@ -129,6 +129,17 @@ def create_share_link():
         if not resource_type or not resource_id:
             return _err("resource_type and resource_id required")
 
+        # DLP scan outbound content (best-effort)
+        try:
+            from security.dlp_engine import get_dlp_engine
+            dlp = get_dlp_engine()
+            content_to_check = data.get('title', '') + ' ' + data.get('description', '')
+            allowed, reason = dlp.check_outbound(content_to_check)
+            if not allowed:
+                return _err("Content blocked by DLP policy: contains sensitive data", 403)
+        except (ImportError, Exception):
+            pass
+
         valid_types = ('post', 'comment', 'profile', 'community', 'agent',
                        'recipe', 'game', 'kids_game', 'challenge', 'chat', 'media')
         if resource_type not in valid_types:
@@ -421,8 +432,12 @@ def grant_consent(token):
 # ═══════════════════════════════════════════════════════════════
 
 @sharing_bp.route('/og-image/<resource_type>/<resource_id>', methods=['GET'])
+@optional_auth
 def og_image_endpoint(resource_type, resource_id):
     """Generate or serve cached OG preview image (1200x630)."""
+    valid_types = ('post', 'comment', 'profile', 'community')
+    if resource_type not in valid_types:
+        return _err("Unsupported resource type", 400)
     try:
         from .og_image import generate_og_image
         image_path = generate_og_image(resource_type, resource_id)
@@ -543,6 +558,7 @@ border-radius:8px;transition:all 0.2s ease}}
 
 
 @sharing_bp.route('/embed/<resource_type>/<resource_id>', methods=['GET'])
+@optional_auth
 def embed_card(resource_type, resource_id):
     """Return an embeddable HTML content card (like a tweet embed).
 

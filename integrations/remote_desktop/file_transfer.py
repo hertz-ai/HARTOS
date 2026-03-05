@@ -285,8 +285,8 @@ class FileTransfer:
                 'actual': actual_hash,
             }
 
-        # Save file
-        save_path = os.path.join(self._save_dir, filename)
+        # Save file — basename() prevents directory traversal from sender
+        save_path = os.path.join(self._save_dir, os.path.basename(filename))
         try:
             with open(save_path, 'wb') as f:
                 f.write(self._receive_buffer)

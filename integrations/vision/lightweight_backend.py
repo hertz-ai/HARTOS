@@ -202,7 +202,17 @@ class CLIPBackend(VisionBackend):
     def ram_mb(self) -> int:
         return 400
 
+    def _torch_functional(self) -> bool:
+        """Check that torch is real (not a frozen build stub)."""
+        try:
+            import torch
+            return not getattr(torch, '_is_stub', False) and hasattr(torch, 'Tensor')
+        except (ImportError, AttributeError, OSError, RuntimeError):
+            return False
+
     def is_available(self) -> bool:
+        if not self._torch_functional():
+            return False
         try:
             import clip
             return True
@@ -215,6 +225,9 @@ class CLIPBackend(VisionBackend):
             return False
 
     def start(self) -> bool:
+        if not self._torch_functional():
+            logger.warning("CLIP backend unavailable: torch not functional")
+            return False
         try:
             import clip
             import torch
@@ -222,7 +235,7 @@ class CLIPBackend(VisionBackend):
             self._model, self._preprocess = clip.load('ViT-B/16', device=device)
             logger.info("CLIP ViT-B/16 backend loaded (CPU)")
             return True
-        except ImportError:
+        except (ImportError, AttributeError, RuntimeError):
             pass
         try:
             import open_clip

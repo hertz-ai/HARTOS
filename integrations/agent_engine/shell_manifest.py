@@ -463,6 +463,67 @@ SYSTEM_PANELS = {
         'group': 'System', 'default_size': [800, 600],
         'apis': ['/api/shell/media/status', '/api/shell/media/photos'],
     },
+    # ─── OS Feature Panels ───
+    'calculator': {
+        'title': 'Calculator', 'icon': 'calculate',
+        'group': 'System', 'default_size': [350, 500],
+        'apis': [],
+    },
+    'image_viewer': {
+        'title': 'Image Viewer', 'icon': 'photo',
+        'group': 'System', 'default_size': [800, 600],
+        'apis': ['/api/shell/files/browse'],
+    },
+    'notes_app': {
+        'title': 'Notes', 'icon': 'sticky_note_2',
+        'group': 'System', 'default_size': [600, 500],
+        'apis': ['/api/shell/notes'],
+    },
+    'app_store': {
+        'title': 'App Store', 'icon': 'storefront',
+        'group': 'System', 'default_size': [900, 700],
+        'apis': ['/api/apps/search', '/api/apps/install'],
+    },
+    'app_permissions': {
+        'title': 'App Permissions', 'icon': 'admin_panel_settings',
+        'group': 'System', 'default_size': [700, 500],
+        'apis': ['/api/apps/installed'],
+    },
+    'battery_monitor': {
+        'title': 'Battery', 'icon': 'battery_full',
+        'group': 'System', 'default_size': [400, 300],
+        'apis': ['/api/shell/battery'],
+    },
+    'wifi_manager': {
+        'title': 'WiFi', 'icon': 'wifi',
+        'group': 'System', 'default_size': [500, 400],
+        'apis': ['/api/shell/wifi/scan', '/api/shell/wifi/status'],
+    },
+    'vpn_manager': {
+        'title': 'VPN', 'icon': 'vpn_key',
+        'group': 'System', 'default_size': [500, 400],
+        'apis': ['/api/shell/vpn/list'],
+    },
+    'trash_bin': {
+        'title': 'Trash', 'icon': 'delete',
+        'group': 'System', 'default_size': [600, 500],
+        'apis': ['/api/shell/trash'],
+    },
+    'webcam_viewer': {
+        'title': 'Camera', 'icon': 'videocam',
+        'group': 'System', 'default_size': [640, 520],
+        'apis': ['/api/shell/webcam/list'],
+    },
+    'scanner': {
+        'title': 'Scanner', 'icon': 'scanner',
+        'group': 'System', 'default_size': [600, 500],
+        'apis': ['/api/shell/scanner/list'],
+    },
+    'weather_widget': {
+        'title': 'Weather', 'icon': 'cloud',
+        'group': 'System', 'default_size': [400, 350],
+        'apis': [],
+    },
 }
 
 

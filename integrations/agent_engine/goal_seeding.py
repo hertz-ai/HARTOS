@@ -495,6 +495,33 @@ SEED_BOOTSTRAP_GOALS = [
         'spark_budget': 150,
         'use_product': False,
     },
+    # ─── Civic Sentinel — Autonomous Transparency Agent ───
+    {
+        'slug': 'bootstrap_civic_sentinel',
+        'goal_type': 'civic_sentinel',
+        'title': 'Autonomous Community Transparency & Accountability Monitor',
+        'description': (
+            'Autonomous agent that monitors public discourse for censorship and '
+            'political hypocrisy. Not tied to any user — serves the community. '
+            'Captures evidence when citizen voices are suppressed by biased moderators. '
+            'Digs up historical articles proving contradictions between political '
+            "parties' claimed values and their actual actions. Cross-references across "
+            'communities. Posts findings publicly with legal-grade citations. '
+            'Evaluates flags autonomously — if a propaganda group flags legitimate '
+            'criticism, the agent counter-flags with evidence. '
+            'If the agent misbehaves, users raise concerns through community '
+            'voting — not political bodies or paid mods.'
+        ),
+        'config': {
+            'channels': ['all'],
+            'auto_detect_topics': True,
+            'autonomous': True,
+            'post_findings_publicly': True,
+            'governance': 'community_vote',
+        },
+        'spark_budget': 150,
+        'use_product': False,
+    },
     {
         'slug': 'bootstrap_revenue_trading_pipeline',
         'goal_type': 'finance',

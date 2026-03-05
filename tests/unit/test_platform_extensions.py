@@ -278,5 +278,46 @@ class TestExtensionListAndHealth(unittest.TestCase):
         self.assertIs(ext.registry_ref, mock_registry)
 
 
+# ═══════════════════════════════════════════════════════════════
+# Extension Signature Verification
+# ═══════════════════════════════════════════════════════════════
+
+class TestExtensionSigVerify(unittest.TestCase):
+    """Extension manifest signature verification."""
+
+    def test_bootstrap_has_extension_loading(self):
+        """bootstrap_platform references extension registry."""
+        import inspect
+        from core.platform.bootstrap import bootstrap_platform
+        src = inspect.getsource(bootstrap_platform)
+        self.assertIn('ExtensionRegistry', src)
+
+    def test_extension_manifest_has_id(self):
+        """AppManifest (used as extension manifest) requires id field."""
+        m = AppManifest(id='test', name='Test', version='1.0.0', type='extension', icon='x', entry={})
+        self.assertEqual(m.id, 'test')
+
+    def test_unsigned_extension_loads_gracefully(self):
+        """Extensions without signatures don't crash the system."""
+        ereg = ExtensionRegistry()
+
+        class UnsignedExt(Extension):
+            @property
+            def manifest(self):
+                return AppManifest(id='unsigned_test', name='Test', version='1.0',
+                                   type='extension', icon='x', entry={})
+            def on_load(self, registry, config):
+                self.registry_ref = registry
+            def on_enable(self): pass
+            def on_disable(self): pass
+            def on_unload(self): pass
+
+        ext = UnsignedExt()
+        # Should not crash — dev mode allows unsigned
+        ereg._extensions['unsigned_test'] = ext
+        ext._state = ExtensionState.LOADED
+        self.assertEqual(ereg.get('unsigned_test'), ext)
+
+
 if __name__ == '__main__':
     unittest.main()

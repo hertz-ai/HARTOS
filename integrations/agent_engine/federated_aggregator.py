@@ -13,8 +13,12 @@ Lifecycle (driven by AgentDaemon._tick every 2nd tick):
   5. apply_aggregated()     — store for dashboard + benchmark consumption
   6. track_convergence()    — variance-based convergence score
 """
+import hashlib
+import hmac
+import json
 import logging
 import math
+import os
 import threading
 import time
 from typing import Dict, List, Optional, Tuple
@@ -23,6 +27,29 @@ logger = logging.getLogger('hevolve_social')
 
 DELTA_VERSION = 1
 DELTA_MAX_AGE_SECONDS = 3600  # 1 hour freshness window
+
+
+def _sign_delta(delta_dict):
+    """Sign a federation delta with node key (HMAC-SHA256)."""
+    node_key = os.environ.get('HART_NODE_KEY', 'default-dev-key')
+    # Work on a copy without any existing hmac_signature
+    to_sign = {k: v for k, v in delta_dict.items() if k != 'hmac_signature'}
+    payload = json.dumps(to_sign, sort_keys=True).encode()
+    sig = hmac.new(node_key.encode(), payload, hashlib.sha256).hexdigest()
+    delta_dict['hmac_signature'] = sig
+    return delta_dict
+
+
+def _verify_delta_signature(delta_dict):
+    """Verify a received federation delta's HMAC-SHA256 signature."""
+    sig = delta_dict.get('hmac_signature', '')
+    if not sig:
+        return False
+    to_verify = {k: v for k, v in delta_dict.items() if k != 'hmac_signature'}
+    node_key = os.environ.get('HART_NODE_KEY', 'default-dev-key')
+    payload = json.dumps(to_verify, sort_keys=True).encode()
+    expected = hmac.new(node_key.encode(), payload, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(sig, expected)
 
 
 class FederatedAggregator:
@@ -231,6 +258,9 @@ class FederatedAggregator:
 
     def broadcast_delta(self, delta: dict):
         """POST delta to all known active peers."""
+        # Sign the delta with HMAC-SHA256 before broadcasting
+        _sign_delta(delta)
+
         try:
             from integrations.social.models import get_db, PeerNode
             import requests
@@ -286,6 +316,11 @@ class FederatedAggregator:
                     return False, 'invalid signature'
             except Exception:
                 pass  # Verification module unavailable — accept
+
+        # HMAC-SHA256 delta signing verification
+        if delta.get('hmac_signature'):
+            if not _verify_delta_signature(delta):
+                return False, 'invalid HMAC signature'
 
         node_id = delta.get('node_id', '')
         if not node_id:
@@ -671,6 +706,20 @@ class FederatedAggregator:
         """
         if not node_id or not isinstance(delta, dict):
             return
+
+        # Check consent for recipe sharing (best-effort, fail-open)
+        user_id = delta.get('user_id', '')
+        if user_id:
+            try:
+                from integrations.social.consent_service import ConsentService
+                from integrations.social.models import db_session
+                with db_session() as db:
+                    if not ConsentService.check_consent(db, user_id, 'public_exposure'):
+                        logger.debug(f"Recipe delta from {node_id} blocked: user {user_id} has not consented")
+                        return
+            except (ImportError, ValueError, Exception):
+                pass  # consent service unavailable — allow (fail-open for dev)
+
         with self._recipe_lock:
             self._recipe_deltas[node_id] = delta
 

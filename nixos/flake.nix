@@ -63,6 +63,7 @@
       ./modules/hart-ime.nix
       ./modules/hart-gaming.nix
       ./modules/hart-devtools.nix
+      ./modules/hart-osk.nix
     ];
 
     # Common specialArgs passed to all modules

@@ -250,6 +250,32 @@ class PlatformConfig:
                 logger.warning("Config listener error for %s.%s: %s",
                                self._namespace, key, e)
 
+    # ── Settings Export / Import (for sync) ─────────────────
+
+    def export_settings(self) -> Dict[str, Any]:
+        """Export all config values as a JSON-serializable dict.
+
+        Used for cross-device settings sync via federation.
+        """
+        return {
+            'namespace': self._namespace,
+            'values': self.get_all(),
+            'exported_at': time.time(),
+        }
+
+    def import_settings(self, data: Dict[str, Any]) -> int:
+        """Import settings from an exported dict.
+
+        Returns the number of keys updated.
+        """
+        values = data.get('values', {})
+        count = 0
+        for key, val in values.items():
+            if key in self._defaults:
+                self.set(key, val)
+                count += 1
+        return count
+
     @property
     def namespace(self) -> str:
         """Return the config namespace."""

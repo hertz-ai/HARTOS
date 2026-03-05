@@ -44,7 +44,20 @@ def _save_json(path, data):
 
 
 def _is_wayland():
-    return bool(os.environ.get('WAYLAND_DISPLAY'))
+    """Detect Wayland compositor — env var check + GNOME session fallback."""
+    if os.environ.get('WAYLAND_DISPLAY'):
+        return True
+    # Fallback: some GNOME sessions don't set WAYLAND_DISPLAY
+    if os.environ.get('XDG_SESSION_TYPE', '').lower() == 'wayland':
+        return True
+    try:
+        r = subprocess.run(['pgrep', '-x', 'sway|labwc|hyprland'],
+                          capture_output=True, text=True, timeout=3)
+        if r.returncode == 0:
+            return True
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return False
 
 
 def _run(cmd, timeout=10, **kw):
@@ -919,4 +932,162 @@ def register_shell_desktop_routes(app):
             return jsonify({'snapped': True, 'position': position})
         return jsonify({'snapped': False, 'error': f'{comp}: snap not supported'}), 500
 
-    logger.info("Registered shell desktop routes (9 features)")
+    # ─── Multi-Monitor Management ──────────────────────────
+
+    @app.route('/api/shell/displays', methods=['GET'])
+    def shell_displays_list():
+        """List connected displays with resolution and position."""
+        displays = []
+        if _is_wayland():
+            r = _run(['swaymsg', '-t', 'get_outputs', '-r'], timeout=5)
+            if r and r.returncode == 0:
+                try:
+                    outputs = json.loads(r.stdout)
+                    for out in outputs:
+                        displays.append({
+                            'name': out.get('name', ''),
+                            'make': out.get('make', ''),
+                            'model': out.get('model', ''),
+                            'resolution': f"{out.get('rect', {}).get('width', 0)}x{out.get('rect', {}).get('height', 0)}",
+                            'position': f"{out.get('rect', {}).get('x', 0)},{out.get('rect', {}).get('y', 0)}",
+                            'scale': out.get('scale', 1.0),
+                            'active': out.get('active', False),
+                        })
+                except (json.JSONDecodeError, KeyError):
+                    pass
+        else:
+            r = _run(['xrandr', '--query'], timeout=5)
+            if r and r.returncode == 0:
+                import re
+                for line in r.stdout.split('\n'):
+                    m = re.match(r'^(\S+)\s+(connected|disconnected)\s*(primary)?\s*(\d+x\d+\+\d+\+\d+)?', line)
+                    if m and m.group(2) == 'connected':
+                        displays.append({
+                            'name': m.group(1),
+                            'primary': m.group(3) == 'primary',
+                            'geometry': m.group(4) or '',
+                            'connected': True,
+                        })
+        return jsonify({'displays': displays, 'compositor': 'wayland' if _is_wayland() else 'x11'})
+
+    @app.route('/api/shell/displays/arrange', methods=['PUT'])
+    def shell_displays_arrange():
+        """Arrange displays (position, resolution, scale)."""
+        body = request.get_json(silent=True) or {}
+        display = body.get('display', '')
+        if not display:
+            return jsonify({'error': 'display name is required'}), 400
+        if _is_wayland():
+            cmd = ['swaymsg', 'output', display]
+            if 'position' in body:
+                cmd += ['position', str(body['position'])]
+            if 'resolution' in body:
+                cmd += ['resolution', str(body['resolution'])]
+            if 'scale' in body:
+                cmd += ['scale', str(body['scale'])]
+            r = _run(cmd, timeout=5)
+            ok = r and r.returncode == 0
+        else:
+            cmd = ['xrandr', '--output', display]
+            if 'resolution' in body:
+                cmd += ['--mode', str(body['resolution'])]
+            if 'position' in body:
+                cmd += ['--pos', str(body['position'])]
+            r = _run(cmd, timeout=5)
+            ok = r and r.returncode == 0
+        return jsonify({'status': 'ok' if ok else 'error',
+                       'message': (r.stderr if r else 'Command failed') if not ok else ''})
+
+    # ─── HiDPI Scaling ─────────────────────────────────────
+
+    @app.route('/api/shell/display/scale', methods=['GET', 'PUT'])
+    def shell_display_scale():
+        """Get or set display scale factor."""
+        if request.method == 'GET':
+            scale = 1.0
+            if _is_wayland():
+                r = _run(['swaymsg', '-t', 'get_outputs', '-r'], timeout=5)
+                if r and r.returncode == 0:
+                    try:
+                        outputs = json.loads(r.stdout)
+                        if outputs:
+                            scale = outputs[0].get('scale', 1.0)
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+            else:
+                gdk_scale = os.environ.get('GDK_SCALE', '1')
+                try:
+                    scale = float(gdk_scale)
+                except ValueError:
+                    scale = 1.0
+            return jsonify({'scale': scale, 'compositor': 'wayland' if _is_wayland() else 'x11'})
+        # PUT
+        body = request.get_json(silent=True) or {}
+        scale = body.get('scale', 1.0)
+        display = body.get('display', '')
+        if _is_wayland() and display:
+            r = _run(['swaymsg', 'output', display, 'scale', str(scale)], timeout=5)
+            ok = r and r.returncode == 0
+        else:
+            # X11 fallback: set GDK_SCALE env
+            os.environ['GDK_SCALE'] = str(int(scale))
+            ok = True
+        return jsonify({'status': 'ok' if ok else 'error', 'scale': scale})
+
+    # ─── Per-App Volume Control ────────────────────────────
+
+    @app.route('/api/shell/audio/apps', methods=['GET'])
+    def shell_audio_per_app():
+        """List audio streams with per-app volume."""
+        apps = []
+        r = _run(['pw-cli', 'list-objects'], timeout=5)
+        if r and r.returncode == 0:
+            current = {}
+            for line in r.stdout.split('\n'):
+                line = line.strip()
+                if line.startswith('id '):
+                    if current.get('type') == 'PipeWire:Interface:Node':
+                        apps.append(current)
+                    current = {'id': line.split()[1].rstrip(',')}
+                elif 'type' in line and 'PipeWire:Interface:Node' in line:
+                    current['type'] = 'PipeWire:Interface:Node'
+                elif 'application.name' in line:
+                    current['name'] = line.split('=', 1)[1].strip().strip('"')
+                elif 'node.name' in line:
+                    current['node_name'] = line.split('=', 1)[1].strip().strip('"')
+            if current.get('type') == 'PipeWire:Interface:Node':
+                apps.append(current)
+        # Filter to only app nodes
+        app_nodes = [a for a in apps if a.get('name') or a.get('node_name')]
+        return jsonify({'apps': app_nodes})
+
+    @app.route('/api/shell/audio/apps/<node_id>/volume', methods=['PUT'])
+    def shell_audio_per_app_volume(node_id):
+        """Set volume for a specific app/node."""
+        body = request.get_json(silent=True) or {}
+        volume = body.get('volume', 1.0)
+        if not isinstance(volume, (int, float)) or volume < 0 or volume > 2.0:
+            return jsonify({'error': 'volume must be 0.0 to 2.0'}), 400
+        r = _run(['pw-cli', 'set-param', node_id, 'Props',
+                  json.dumps({'volume': volume})], timeout=5)
+        if r and r.returncode == 0:
+            return jsonify({'status': 'ok', 'node_id': node_id, 'volume': volume})
+        return jsonify({'error': r.stderr if r else 'pw-cli not available'}), 500
+
+    # ─── RTL Layout Support ────────────────────────────────
+
+    _RTL_LOCALES = {'ar', 'he', 'fa', 'ur', 'yi', 'ps', 'sd'}
+
+    @app.route('/api/shell/rtl/status', methods=['GET'])
+    def shell_rtl_status():
+        """Check if current locale requires RTL layout."""
+        locale_val = os.environ.get('LANG', 'en_US.UTF-8')
+        lang_code = locale_val.split('_')[0].lower()
+        is_rtl = lang_code in _RTL_LOCALES
+        return jsonify({
+            'rtl': is_rtl,
+            'locale': locale_val,
+            'css_direction': 'rtl' if is_rtl else 'ltr',
+        })
+
+    logger.info("Registered shell desktop routes (13 features)")

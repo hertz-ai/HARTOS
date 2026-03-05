@@ -65,7 +65,10 @@ def register_shell_system_routes(app):
     # ─── 10. Task / Process Manager ────────────────────────
 
     _PROTECTED_NAMES = {'init', 'systemd', 'hart-backend', 'hart-agent',
-                        'hart-liquid', 'sshd', 'dbus-daemon'}
+                        'hart-liquid', 'sshd', 'dbus-daemon',
+                        'dockerd', 'containerd', 'kubelet', 'kube-apiserver',
+                        'kube-controller', 'kube-scheduler', 'etcd',
+                        'podman', 'crio', 'runc'}
 
     @app.route('/api/shell/tasks/processes', methods=['GET'])
     def shell_tasks_processes():
@@ -872,5 +875,68 @@ Hidden=false
             'videos': videos[start:start + per_page],
             'total': len(videos), 'page': page,
         })
+
+    # ─── 16. Webcam / Camera ───────────────────────────────────
+
+    @app.route('/api/shell/webcam/list', methods=['GET'])
+    def shell_webcam_list():
+        """List available webcam/camera devices."""
+        devices = []
+        try:
+            import glob as _glob
+            for dev in sorted(_glob.glob('/dev/video*')):
+                info = {'device': dev}
+                r = _run(['v4l2-ctl', '--device', dev, '--info'], timeout=5)
+                if r and r.returncode == 0:
+                    for line in r.stdout.split('\n'):
+                        if 'Card type' in line:
+                            info['name'] = line.split(':', 1)[1].strip()
+                        elif 'Driver name' in line:
+                            info['driver'] = line.split(':', 1)[1].strip()
+                devices.append(info)
+        except Exception:
+            pass
+        return jsonify({'devices': devices})
+
+    @app.route('/api/shell/webcam/capture', methods=['POST'])
+    def shell_webcam_capture():
+        """Capture a single frame from webcam."""
+        body = request.get_json(silent=True) or {}
+        device = body.get('device', '/dev/video0')
+        import tempfile
+        out_path = os.path.join(tempfile.gettempdir(), f'hart_webcam_{int(time.time())}.jpg')
+        r = _run(['ffmpeg', '-f', 'v4l2', '-i', device, '-frames:v', '1',
+                   '-y', out_path], timeout=10)
+        if r and r.returncode == 0 and os.path.isfile(out_path):
+            return jsonify({'status': 'ok', 'path': out_path})
+        return jsonify({'status': 'error',
+                       'error': r.stderr if r else 'ffmpeg not available'}), 500
+
+    # ─── 17. Scanner ──────────────────────────────────────────
+
+    @app.route('/api/shell/scanner/list', methods=['GET'])
+    def shell_scanner_list():
+        """List available scanners via SANE."""
+        r = _run(['scanimage', '-L'], timeout=15)
+        scanners = []
+        if r and r.returncode == 0:
+            for line in r.stdout.strip().split('\n'):
+                if 'device' in line.lower():
+                    scanners.append({'raw': line.strip()})
+        return jsonify({'scanners': scanners})
+
+    @app.route('/api/shell/scanner/scan', methods=['POST'])
+    def shell_scanner_scan():
+        """Scan a document/image."""
+        body = request.get_json(silent=True) or {}
+        fmt = body.get('format', 'png')
+        import tempfile
+        out_path = os.path.join(tempfile.gettempdir(), f'hart_scan_{int(time.time())}.{fmt}')
+        r = _run(['scanimage', f'--format={fmt}', f'--output-file={out_path}'],
+                  timeout=60)
+        if r and r.returncode == 0 and os.path.isfile(out_path):
+            return jsonify({'status': 'ok', 'path': out_path})
+        return jsonify({'status': 'error',
+                       'error': r.stderr if r else 'scanimage not available'}), 500
 
     logger.info("Registered shell system routes (6 features)")

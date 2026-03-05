@@ -112,7 +112,13 @@ def bootstrap_platform(extensions_dir: Optional[str] = None) -> ServiceRegistry:
 
     ext_reg = registry.get('extensions')
     if os.path.isdir(extensions_dir):
+        # Verify extension signatures before loading (WS14)
+        _verify_extension_signatures(extensions_dir)
         ext_reg.load_from_directory(extensions_dir)
+
+    # ── Register Orchestrator Services (lazy, fail-open) ─────
+
+    _register_orchestrator_services(registry)
 
     # ── Connect EventBus to Crossbar WAMP (if configured) ────
 
@@ -219,3 +225,100 @@ def _register_native_apps(apps: AppRegistry) -> None:
 
     if detected:
         logger.info("Detected %d native apps", detected)
+
+
+def _register_orchestrator_services(registry: ServiceRegistry) -> None:
+    """Register agent orchestrator services as lazy platform services.
+
+    These are production services (AgentDaemon, FederatedAggregator) that
+    participate in the platform lifecycle. Lazy-loaded so tests and minimal
+    environments don't pay the import cost.
+    """
+    # AgentDaemon — background goal dispatch
+    def _make_agent_daemon():
+        try:
+            from integrations.agent_engine.agent_daemon import agent_daemon
+            return agent_daemon
+        except ImportError:
+            logger.debug("AgentDaemon not available — skipping")
+            return None
+
+    try:
+        registry.register('agent_daemon', _make_agent_daemon, singleton=True)
+    except Exception:
+        pass
+
+    # FederatedAggregator — hive learning aggregation
+    def _make_federated_aggregator():
+        try:
+            from integrations.agent_engine.federated_aggregator import (
+                get_federated_aggregator,
+            )
+            return get_federated_aggregator()
+        except ImportError:
+            logger.debug("FederatedAggregator not available — skipping")
+            return None
+
+    try:
+        registry.register('federation', _make_federated_aggregator, singleton=True)
+    except Exception:
+        pass
+
+
+def _verify_extension_signatures(extensions_dir: str) -> None:
+    """Verify extension manifest signatures before loading.
+
+    Logs a warning for unsigned or invalid-signed extensions.
+    Does NOT block loading — verification is advisory for now.
+    Production environments should set HART_REQUIRE_SIGNED_EXTENSIONS=1
+    to enforce signatures.
+    """
+    require_signed = os.environ.get('HART_REQUIRE_SIGNED_EXTENSIONS', '') == '1'
+
+    for entry in os.listdir(extensions_dir):
+        ext_path = os.path.join(extensions_dir, entry)
+        if not os.path.isdir(ext_path):
+            continue
+
+        manifest_path = os.path.join(ext_path, 'manifest.json')
+        sig_path = os.path.join(ext_path, 'manifest.sig')
+
+        if not os.path.isfile(manifest_path):
+            continue
+
+        if not os.path.isfile(sig_path):
+            if require_signed:
+                logger.warning(
+                    "Extension '%s' has no signature — skipping (HART_REQUIRE_SIGNED_EXTENSIONS=1)",
+                    entry)
+                # Remove from directory listing so load_from_directory skips it
+                try:
+                    os.rename(ext_path, ext_path + '.unsigned')
+                except OSError:
+                    pass
+            else:
+                logger.debug("Extension '%s' is unsigned (advisory)", entry)
+            continue
+
+        # Verify signature using master public key
+        try:
+            from security.master_key import verify_release
+            import json
+            with open(manifest_path, 'rb') as f:
+                manifest_bytes = f.read()
+            with open(sig_path, 'rb') as f:
+                sig_bytes = f.read()
+
+            if not verify_release(manifest_bytes, sig_bytes):
+                logger.warning(
+                    "Extension '%s' has INVALID signature — %s",
+                    entry, "skipping" if require_signed else "loading anyway (advisory)")
+                if require_signed:
+                    try:
+                        os.rename(ext_path, ext_path + '.badsig')
+                    except OSError:
+                        pass
+        except ImportError:
+            logger.debug("master_key not available — skipping signature verification")
+        except Exception as e:
+            logger.warning("Extension '%s' signature check error: %s", entry, e)

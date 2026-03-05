@@ -35,13 +35,53 @@ _MODEL_COST_MAP = {
 }
 
 
+def _is_local_model() -> bool:
+    """Detect whether the active LLM is a local model (zero Spark cost).
+
+    Returns True if any of these signals indicate a local/self-hosted backend:
+    - HEVOLVE_LOCAL_LLM_URL is set (explicit local endpoint override)
+    - LLAMA_CPP_PORT is set (llama.cpp running locally)
+    - HEVOLVE_LOCAL_LLM_MODEL is set (local model name configured)
+
+    When Nunba starts llama.cpp on port 8080, it typically sets LLAMA_CPP_PORT.
+    """
+    return bool(
+        os.environ.get('HEVOLVE_LOCAL_LLM_URL')
+        or os.environ.get('LLAMA_CPP_PORT')
+        or os.environ.get('HEVOLVE_LOCAL_LLM_MODEL')
+    )
+
+
 def estimate_llm_cost_spark(prompt: str, model_name: str = 'gpt-4o') -> int:
     """Estimate Spark cost for an LLM call before execution.
 
     Uses tiktoken if available (already in codebase), falls back to word-count
-    heuristic (~1.3 tokens per word).  Returns integer Spark cost (min 1).
+    heuristic (~1.3 tokens per word).  Returns integer Spark cost (min 1 for
+    paid models, 0 for local/self-hosted models).
+
+    If the active LLM is local (detected via HEVOLVE_LOCAL_LLM_URL env var),
+    cost is always 0 — local inference has no metered Spark cost.
     """
-    # Token count
+    # Local models cost nothing regardless of the model_name parameter.
+    # Check env var first (definitive signal that a local backend is active).
+    if _is_local_model():
+        return 0
+
+    # Map model to per-1K cost (check BEFORE token counting — skip work for free models)
+    cost_per_1k = 2  # default for unknown cloud models
+    model_lower = (model_name or '').lower()
+    for prefix, cost in _MODEL_COST_MAP.items():
+        if prefix in model_lower:
+            cost_per_1k = cost
+            break
+
+    # Free-tier and local models cost 0 Spark even without the env var.
+    # This catches cases where model_name is 'qwen', 'llama', 'phi', etc.
+    # but HEVOLVE_LOCAL_LLM_URL is not explicitly set.
+    if cost_per_1k == 0:
+        return 0
+
+    # Token count (only computed for paid models)
     token_count = 0
     try:
         import tiktoken
@@ -50,14 +90,6 @@ def estimate_llm_cost_spark(prompt: str, model_name: str = 'gpt-4o') -> int:
     except Exception:
         # Fallback: ~1.3 tokens per word on average
         token_count = max(1, int(len(prompt.split()) * 1.3))
-
-    # Map model to per-1K cost
-    cost_per_1k = 2  # default
-    model_lower = (model_name or '').lower()
-    for prefix, cost in _MODEL_COST_MAP.items():
-        if prefix in model_lower:
-            cost_per_1k = cost
-            break
 
     spark_cost = max(1, int((token_count / 1000) * cost_per_1k))
     return spark_cost
@@ -145,17 +177,43 @@ def check_platform_affordability() -> Tuple[bool, Dict]:
 
 # ── Combined gate ────────────────────────────────────────────────────
 
+def _resolve_model_name(model_name: str) -> str:
+    """Resolve the effective model name for cost estimation.
+
+    If the caller passes the default 'gpt-4o' but a local model is actually
+    active, return the local model name so pricing is correct (0 Spark).
+    """
+    # If caller provided an explicit non-default model name, trust it
+    if model_name and model_name != 'gpt-4o':
+        return model_name
+
+    # Check if a local model is configured — override the default 'gpt-4o'
+    local_model = os.environ.get('HEVOLVE_LOCAL_LLM_MODEL', '')
+    if local_model:
+        return local_model
+
+    # If HEVOLVE_LOCAL_LLM_URL or LLAMA_CPP_PORT is set, the active model
+    # is local even though we don't know the exact name — use 'llama'
+    # which maps to 0 Spark in _MODEL_COST_MAP.
+    if _is_local_model():
+        return 'llama'
+
+    return model_name
+
+
 def pre_dispatch_budget_gate(goal_id: Optional[str],
                              prompt: str,
                              model_name: str = 'gpt-4o') -> Tuple[bool, str]:
     """Combined pre-dispatch budget gate.
 
-    1. Estimate LLM cost
-    2. Check goal budget (atomic deduction)
-    3. Check platform affordability (cached)
+    1. Resolve effective model name (local vs cloud)
+    2. Estimate LLM cost
+    3. Check goal budget (atomic deduction)
+    4. Check platform affordability (cached)
 
     Returns: (allowed, reason)
     """
+    model_name = _resolve_model_name(model_name)
     estimated_cost = estimate_llm_cost_spark(prompt, model_name)
 
     # Goal-level budget
