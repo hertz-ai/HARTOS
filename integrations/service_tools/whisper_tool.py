@@ -426,6 +426,8 @@ def unload_whisper():
         import torch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
     except ImportError:
         pass
     logger.info("STT models unloaded")

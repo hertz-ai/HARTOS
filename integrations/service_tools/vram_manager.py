@@ -96,7 +96,7 @@ class VRAMManager:
                 import torch
                 if torch.cuda.is_available():
                     props = torch.cuda.get_device_properties(0)
-                    total = props.total_mem / (1024 ** 3)
+                    total = props.total_memory / (1024 ** 3)
                     allocated = torch.cuda.memory_allocated(0) / (1024 ** 3)
                     info.update({
                         "name": torch.cuda.get_device_name(0),
@@ -247,12 +247,15 @@ class VRAMManager:
 
     @staticmethod
     def clear_cuda_cache() -> bool:
-        """Clear CUDA cache if torch is loaded. Returns True if cleared."""
+        """Clear GPU cache (CUDA or MPS) if torch is loaded. Returns True if cleared."""
         if 'torch' in sys.modules:
             try:
                 import torch
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+                    return True
+                elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
                     return True
             except Exception:
                 pass

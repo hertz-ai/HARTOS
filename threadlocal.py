@@ -99,6 +99,33 @@ class ThreadLocalData:
     def clear_model_config_override(self):
         self._local.model_config_override = None
 
+    # --- Agentic routing signals (set by LangChain Agentic_Router tool) ---
+
+    def set_agentic_routing(self, task_description=None, plan_steps=None, matched_agent_id=None):
+        """Signal that LangChain detected an agentic task needing autogen."""
+        self._local.agentic_requested = True
+        self._local.agentic_task_description = task_description
+        self._local.agentic_plan_steps = plan_steps or []
+        self._local.agentic_matched_agent_id = matched_agent_id
+
+    def get_agentic_requested(self):
+        return getattr(self._local, 'agentic_requested', False)
+
+    def get_agentic_task_description(self):
+        return getattr(self._local, 'agentic_task_description', None)
+
+    def get_agentic_plan_steps(self):
+        return getattr(self._local, 'agentic_plan_steps', [])
+
+    def get_agentic_matched_agent_id(self):
+        return getattr(self._local, 'agentic_matched_agent_id', None)
+
+    def clear_agentic_flags(self):
+        self._local.agentic_requested = False
+        self._local.agentic_task_description = None
+        self._local.agentic_plan_steps = []
+        self._local.agentic_matched_agent_id = None
+
     # --- Per-request task source (own | hive | idle) ---
 
     def set_task_source(self, source: str):

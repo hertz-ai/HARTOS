@@ -104,27 +104,28 @@ in
       ];
 
       # Kernel sysctl: multi-platform workload tuning
+      # mkForce — kernel module is the most specialized layer
       boot.kernel.sysctl = {
         # IPC: support high-throughput binder + agent communication
-        "kernel.shmmax" = 68719476736;        # 64GB shared memory max
-        "kernel.shmall" = 4294967296;          # Max shared memory pages
-        "kernel.msgmnb" = 65536;               # Message queue max bytes
-        "kernel.msgmax" = 65536;               # Single message max
+        "kernel.shmmax" = lib.mkForce 68719476736;
+        "kernel.shmall" = lib.mkForce 4294967296;
+        "kernel.msgmnb" = lib.mkForce 65536;
+        "kernel.msgmax" = lib.mkForce 65536;
 
         # Memory: optimize for multi-runtime memory pressure
-        "vm.overcommit_memory" = 1;            # Allow overcommit (models + Android + Wine)
-        "vm.max_map_count" = 1048576;          # Wine + Android need high mmap count
-        "vm.vfs_cache_pressure" = 50;          # Keep dentries/inodes in cache
+        "vm.overcommit_memory" = lib.mkForce 1;
+        "vm.max_map_count" = lib.mkForce 1048576;
+        "vm.vfs_cache_pressure" = lib.mkForce 50;
 
         # Network: agent-to-agent + P2P gossip
-        "net.core.rmem_max" = 26214400;
-        "net.core.wmem_max" = 26214400;
-        "net.core.netdev_max_backlog" = 5000;
+        "net.core.rmem_max" = lib.mkForce 26214400;
+        "net.core.wmem_max" = lib.mkForce 26214400;
+        "net.core.netdev_max_backlog" = lib.mkForce 5000;
 
         # File handles: multi-runtime concurrent I/O
-        "fs.file-max" = 2097152;
-        "fs.inotify.max_user_instances" = 8192;
-        "fs.inotify.max_user_watches" = 1048576;
+        "fs.file-max" = lib.mkForce 2097152;
+        "fs.inotify.max_user_instances" = lib.mkForce 8192;
+        "fs.inotify.max_user_watches" = lib.mkForce 1048576;
       };
     }
 
@@ -214,7 +215,7 @@ in
 
       # Higher vm.max_map_count for Wine (Windows apps use many memory mappings)
       boot.kernel.sysctl = {
-        "vm.max_map_count" = 2097152;    # Wine recommends >= 1M, we set 2M
+        "vm.max_map_count" = lib.mkForce 2097152;    # Wine recommends >= 1M, we set 2M
       };
     })
 
@@ -242,7 +243,7 @@ in
       # Transparent Huge Pages: 2MB pages for model loading
       boot.kernel.sysctl = {
         # THP: always use huge pages (models benefit from fewer TLB misses)
-        "vm.nr_hugepages" = kernelCfg.aiCompute.hugePagesCount;
+        "vm.nr_hugepages" = lib.mkForce kernelCfg.aiCompute.hugePagesCount;
       };
 
       # Static huge pages (optional, for dedicated model memory)
@@ -327,7 +328,7 @@ in
 
       # Seccomp: agent syscall filtering support
       boot.kernel.sysctl = {
-        "kernel.unprivileged_userns_clone" = 1;  # Namespace-based isolation
+        "kernel.unprivileged_userns_clone" = lib.mkForce 1;  # Namespace-based isolation
       };
 
       # Agent data directories with proper permissions

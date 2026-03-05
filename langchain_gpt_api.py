@@ -1284,6 +1284,46 @@ def _response_signals_creation(response_text):
     return any(signal in lower for signal in _RESPONSE_CREATION_SIGNALS)
 
 
+def _handle_agentic_router_tool(input_text):
+    """Tool handler: LLM detected a multi-step agentic task.
+
+    Called by the LangChain agent when a prompt needs multi-step execution.
+    Builds a plan using ExpertAgentRegistry + user recipes, sets thread-local
+    flags that the /chat handler checks after get_ans() returns.
+    """
+    try:
+        from integrations.agentic_router import build_agentic_plan
+        plan = build_agentic_plan(input_text, PROMPTS_DIR)
+
+        thread_local_data.set_agentic_routing(
+            task_description=plan['task_description'],
+            plan_steps=plan['steps'],
+            matched_agent_id=plan.get('matched_agent_id'),
+        )
+
+        # Build a human-readable summary for the LLM's response
+        steps_text = "\n".join(
+            f"  {s['step_num']}. {s['description']}"
+            for s in plan['steps']
+        )
+        agent_note = ""
+        if plan.get('matched_agent_name'):
+            agent_note = f"\nMatched agent: {plan['matched_agent_name']} ({plan['matched_agent_source']})"
+        elif plan.get('requires_new_agent'):
+            agent_note = "\nNo existing agent matches — a new agent will be created if you approve."
+
+        return (
+            f"I've analyzed your request and prepared a plan:\n\n"
+            f"Task: {input_text}\n\n"
+            f"Steps:\n{steps_text}\n"
+            f"{agent_note}\n\n"
+            f"Would you like me to proceed with this plan?"
+        )
+    except Exception as e:
+        app.logger.error(f"Agentic router failed: {e}")
+        return f"I'll help you with: {input_text}. Let me work on this directly."
+
+
 def _handle_request_resource(input_text: str) -> str:
     """Generic runtime resource request — agent calls this when ANY tool needs
     a missing credential, API key, config value, or permission.
@@ -1511,6 +1551,18 @@ def get_tools(req_tool, is_first: bool = False):
                     "learn from its own interactions."
                 ),
             ),
+            Tool(
+                name="Agentic_Router",
+                func=_handle_agentic_router_tool,
+                description=(
+                    "Use when the user's request requires multi-step execution such as building "
+                    "an application, writing code, conducting research, creating a marketing "
+                    "campaign, or any complex task that cannot be answered in a single response. "
+                    "Input: the user's full request describing what they want accomplished. "
+                    "Output: a structured plan with steps. Do NOT use for simple questions, "
+                    "greetings, or tasks that can be answered directly."
+                ),
+            ),
 
         ]
 
@@ -1719,6 +1771,18 @@ def get_tools(req_tool, is_first: bool = False):
                     "Review past agent suggestions and user behavior observations to improve "
                     "future recommendations. Input: topic or area to critique. Helps the agent "
                     "learn from its own interactions."
+                ),
+            ),
+            Tool(
+                name="Agentic_Router",
+                func=_handle_agentic_router_tool,
+                description=(
+                    "Use when the user's request requires multi-step execution such as building "
+                    "an application, writing code, conducting research, creating a marketing "
+                    "campaign, or any complex task that cannot be answered in a single response. "
+                    "Input: the user's full request describing what they want accomplished. "
+                    "Output: a structured plan with steps. Do NOT use for simple questions, "
+                    "greetings, or tasks that can be answered directly."
                 ),
             ),
 
@@ -2095,9 +2159,7 @@ class CustomAgentExecutor(AgentExecutor):
 
     def prep_outputs(self, inputs: Dict[str, str],
                      outputs: Dict[str, str],
-                     metadata: Optional[Dict[str, Any]] = None,
                      return_only_outputs: bool = False) -> Dict[str, str]:
-        # pdb.set_trace()
         self._validate_outputs(outputs)
         req_id = thread_local_data.get_request_id()
         prom_id = thread_local_data.get_prompt_id()
@@ -2109,8 +2171,12 @@ class CustomAgentExecutor(AgentExecutor):
                 f"memory object is not none and metadata is {metadata}")
             try:
                 self.memory.save_context(inputs, outputs, metadata=metadata)
+                # Force immediate flush so next request sees the buffer on disk
+                if hasattr(self.memory, 'chat_memory') and hasattr(self.memory.chat_memory, 'flush_sync'):
+                    self.memory.chat_memory.flush_sync()
                 app.logger.info(
-                    f"After: memory saved successfully with metadata {metadata}")
+                    f"After: memory saved successfully with metadata {metadata}, "
+                    f"buffer_size={len(self.memory.chat_memory.messages) if hasattr(self.memory, 'chat_memory') else '?'}")
             except Exception as e:
                 app.logger.error(f"Failed to save memory: {e}")
                 # Continue without crashing - memory save is not critical
@@ -2171,6 +2237,10 @@ class CustomAgentExecutor(AgentExecutor):
         if self.memory is not None:
             try:
                 external_context = self.memory.load_memory_variables(inputs)
+                chat_hist = external_context.get('chat_history', [])
+                app.logger.info(
+                    f"Memory loaded: {len(chat_hist)} messages in chat_history"
+                    f" (buffer_file={getattr(getattr(self.memory, 'chat_memory', None), '_buffer_file', '?')})")
                 inputs = dict(inputs, **external_context)
             except Exception as e:
                 app.logger.warning(f"Could not load memory: {e}")
@@ -3091,6 +3161,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
     prefix = f"""You are Hevolve, an expert educational AI teacher with knowledge in every field.
         Answer questions accurately and respond as quickly as possible in {language}.
         Keep responses under 200 words. Be colloquial and natural - don't always greet or use the user's name.
+        IMPORTANT: Do NOT re-introduce yourself if you already did in the conversation history below. Continue naturally.
 
         User details: {user_details}
         Context: {custom_prompt}
@@ -3530,6 +3601,36 @@ def chat():
         except Exception:
             pass  # Degrade gracefully
 
+    # --- Agentic execution after user consent (Plan Mode → execute) ---
+    agentic_execute = data.get('agentic_execute', False)
+    if agentic_execute and prompt and user_id:
+        agentic_plan = data.get('agentic_plan', {})
+        matched_agent_id = agentic_plan.get('matched_agent_id')
+        app.logger.info(f'Agentic execute: matched_agent={matched_agent_id}, user={user_id}')
+
+        if matched_agent_id and os.path.exists(os.path.join(PROMPTS_DIR, f'{matched_agent_id}.json')):
+            # Route to existing agent via chat_agent (reuse_recipe.py)
+            prompt_id = matched_agent_id
+            # Fall through to the existing prompt_id routing below
+        else:
+            # No matching agent — auto-create one, then execute
+            new_prompt_id = _next_prompt_id()
+            auto_response = _autonomous_gather_info(user_id, prompt, new_prompt_id)
+            review_agents[user_id] = True
+            _touch_agent_timestamp(user_id)
+            _record_lifecycle('Review Mode', user_id, new_prompt_id,
+                              f'Agentic auto-creation: {prompt[:100]}')
+            return jsonify({
+                'response': auto_response,
+                'intent': ['FINAL_ANSWER'],
+                'Agent_status': 'Review Mode',
+                'autonomous_creation': True,
+                'prompt_id': new_prompt_id,
+                'req_token_count': 0,
+                'res_token_count': 0,
+                'history_request_id': [],
+            })
+
     if prompt_id:
         # Per-user lock prevents concurrent requests from corrupting agent state.
         # Replaces the global _state_lock for better concurrency.
@@ -3865,6 +3966,31 @@ def chat():
                   query=prompt, custom_prompt=custom_prompt, preferred_lang=preferred_lang)
     app.logger.info("the time taken by get ans in main api is %s seconds",
                     time.time() - ans_start_time)
+
+    # --- Check if LLM's Agentic_Router tool fired during get_ans() ---
+    if thread_local_data.get_agentic_requested():
+        task_desc = thread_local_data.get_agentic_task_description()
+        plan_steps = thread_local_data.get_agentic_plan_steps()
+        matched_agent = thread_local_data.get_agentic_matched_agent_id()
+        thread_local_data.clear_agentic_flags()
+        app.logger.info(f'Agentic_Router tool fired: task="{task_desc[:80] if task_desc else ""}", '
+                        f'steps={len(plan_steps)}, matched_agent={matched_agent}')
+
+        return jsonify({
+            'response': ans,
+            'intent': ['FINAL_ANSWER'],
+            'Agent_status': 'Plan Mode',
+            'agentic_plan': {
+                'task_description': task_desc,
+                'steps': plan_steps,
+                'matched_agent_id': matched_agent,
+                'requires_consent': True,
+            },
+            'prompt_id': prompt_id if prompt_id else _next_prompt_id(),
+            'req_token_count': thread_local_data.get_req_token_count(),
+            'res_token_count': thread_local_data.get_res_token_count(),
+            'history_request_id': thread_local_data.get_reqid_list(),
+        })
 
     # --- Step 16c: Check if LLM's Create_Agent tool fired during get_ans() ---
     if thread_local_data.get_creation_requested():

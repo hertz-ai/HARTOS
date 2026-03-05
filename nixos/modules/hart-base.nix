@@ -96,6 +96,9 @@ in
   # ─── Configuration ──────────────────────────────────────────
   config = lib.mkIf cfg.enable {
 
+    # ── Allow unfree packages (NVIDIA drivers, CUDA) ──
+    nixpkgs.config.allowUnfree = true;
+
     # ── Branding ──
     environment.etc = {
       "os-release".text = ''
@@ -183,40 +186,41 @@ in
     # ── Kernel tuning (P2P gossip + compute workloads) ──
     boot.kernel.sysctl = {
       # Networking: optimize for P2P gossip
-      "net.core.rmem_max" = 16777216;
-      "net.core.wmem_max" = 16777216;
-      "net.ipv4.tcp_fastopen" = 3;
-      "net.core.somaxconn" = 4096;
-      "net.ipv4.tcp_tw_reuse" = 1;
-      "net.ipv4.tcp_fin_timeout" = 15;
+      # mkDefault so hart-kernel.nix specialized values win
+      "net.core.rmem_max" = lib.mkDefault 16777216;
+      "net.core.wmem_max" = lib.mkDefault 16777216;
+      "net.ipv4.tcp_fastopen" = lib.mkDefault 3;
+      "net.core.somaxconn" = lib.mkDefault 4096;
+      "net.ipv4.tcp_tw_reuse" = lib.mkDefault 1;
+      "net.ipv4.tcp_fin_timeout" = lib.mkDefault 15;
 
       # Memory: favor compute workloads
-      "vm.swappiness" = 10;
-      "vm.dirty_ratio" = 40;
-      "vm.dirty_background_ratio" = 10;
-      "vm.overcommit_memory" = 1;
+      "vm.swappiness" = lib.mkDefault 10;
+      "vm.dirty_ratio" = lib.mkDefault 40;
+      "vm.dirty_background_ratio" = lib.mkDefault 10;
+      "vm.overcommit_memory" = lib.mkDefault 1;
 
-      # Security: kernel hardening
-      "kernel.dmesg_restrict" = 1;
-      "kernel.kptr_restrict" = 2;
-      "net.ipv4.conf.all.rp_filter" = 1;
-      "net.ipv4.conf.default.rp_filter" = 1;
-      "net.ipv4.icmp_echo_ignore_broadcasts" = 1;
-      "net.ipv4.conf.all.accept_redirects" = 0;
-      "net.ipv4.conf.default.accept_redirects" = 0;
-      "net.ipv6.conf.all.accept_redirects" = 0;
-      "net.ipv6.conf.default.accept_redirects" = 0;
+      # Security: kernel hardening (mkForce — our stricter values override nixpkgs)
+      "kernel.dmesg_restrict" = lib.mkForce 1;
+      "kernel.kptr_restrict" = lib.mkForce 2;
+      "net.ipv4.conf.all.rp_filter" = lib.mkForce 1;
+      "net.ipv4.conf.default.rp_filter" = lib.mkForce 1;
+      "net.ipv4.icmp_echo_ignore_broadcasts" = lib.mkForce 1;
+      "net.ipv4.conf.all.accept_redirects" = lib.mkForce 0;
+      "net.ipv4.conf.default.accept_redirects" = lib.mkForce 0;
+      "net.ipv6.conf.all.accept_redirects" = lib.mkForce 0;
+      "net.ipv6.conf.default.accept_redirects" = lib.mkForce 0;
 
       # File descriptors: agent workloads
-      "fs.file-max" = 524288;
-      "fs.inotify.max_user_watches" = 524288;
+      "fs.file-max" = lib.mkDefault 524288;
+      "fs.inotify.max_user_watches" = lib.mkDefault 524288;
     };
 
     # ── SSH ──
     services.openssh = {
       enable = true;
       settings = {
-        PermitRootLogin = "no";
+        PermitRootLogin = lib.mkDefault "no";
         PasswordAuthentication = true;  # For first login; disable after key setup
       };
     };

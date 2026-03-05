@@ -119,6 +119,8 @@ async def diarization(websocket, diarize_model, output_dir, device):
                     _cleanup_stream(user_id)
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
+                    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                        torch.mps.empty_cache()
 
     except Exception as e:
         logging.debug(f"Connection ended: {e}")
@@ -224,7 +226,12 @@ if __name__ == "__main__":
     if args.device is None:
         try:
             import torch
-            args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            if torch.cuda.is_available():
+                args.device = 'cuda'
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                args.device = 'mps'
+            else:
+                args.device = 'cpu'
         except ImportError:
             args.device = 'cpu'
 

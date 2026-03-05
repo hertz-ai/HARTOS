@@ -1,4 +1,4 @@
-{ config, lib, pkgs, hartSrc, ... }:
+{ config, lib, pkgs, modulesPath, hartSrc, ... }:
 
 # ═══════════════════════════════════════════════════════════════
 # HART OS Edge Variant
@@ -14,8 +14,11 @@
 
 {
   imports = [
-    "${toString <nixpkgs>}/nixos/modules/installer/cd-dvd/installation-cd-minimal.nix"
+    "${modulesPath}/installer/cd-dvd/installation-cd-minimal.nix"
   ];
+
+  # ─── Disable ZFS (broken in nixpkgs 24.11 for kernel 6.15) ───
+  boot.supportedFilesystems.zfs = lib.mkForce false;
 
   # ─── HART OS (minimal) ───
   hart = {
@@ -71,7 +74,7 @@
   services.xserver.enable = false;
 
   # Minimal footprint
-  boot.kernel.sysctl."vm.swappiness" = 60;
+  boot.kernel.sysctl."vm.swappiness" = lib.mkForce 60;
 
   environment.noXlibs = true;
   documentation.enable = false;

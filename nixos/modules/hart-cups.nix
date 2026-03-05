@@ -53,11 +53,9 @@ in
     # ── Firewall: CUPS web UI ──
     networking.firewall.allowedTCPPorts = [ 631 ];
 
-    # ── Print-to-PDF ──
-    environment.systemPackages = [ pkgs.cups-pdf-to-pdf or pkgs.cups ];
-
-    # ── CLI tool ──
+    # ── Print-to-PDF + CLI tool ──
     environment.systemPackages = [
+      (pkgs.cups-pdf-to-pdf or pkgs.cups)
       (pkgs.writeShellScriptBin "hart-print" ''
         case "''${1:-status}" in
           status)
