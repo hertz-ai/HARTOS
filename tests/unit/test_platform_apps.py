@@ -31,8 +31,9 @@ CODING_PANEL = AppManifest(
 HARDWARE_MONITOR = AppManifest(
     id='hardware_monitor', name='Hardware Monitor', version='1.0.0',
     type=AppType.SYSTEM_PANEL.value, icon='memory',
-    entry={'api': '/api/shell/system/metrics'}, group='System',
+    entry={'loader': 'loadHardwareMonitor'}, group='System',
     permissions=['system_read'],
+    apis=['/api/shell/system/metrics'],
 )
 
 RUSTDESK = AppManifest(
@@ -49,7 +50,7 @@ LLAMA_CPP = AppManifest(
     id='llama_cpp', name='LLM Engine', version='1.0.0',
     type=AppType.SERVICE.value, icon='psychology',
     entry={'http': 'http://localhost:8080'},
-    auto_start=True, permissions=['compute'],
+    auto_start=True, permissions=['network', 'system_read'],
 )
 
 
@@ -325,6 +326,82 @@ class TestAppRegistryHealth(unittest.TestCase):
         self.assertEqual(h['total_apps'], 2)
         self.assertIn('nunba_panel', h['types'])
         self.assertIn('desktop_app', h['types'])
+
+
+# ═══════════════════════════════════════════════════════════════
+# OS Feature Panel Registrations (P0/P1 OS Credibility)
+# ═══════════════════════════════════════════════════════════════
+
+class TestOSPanelRegistrations(unittest.TestCase):
+    """Verify all new OS feature panels are registered in shell_manifest."""
+
+    @classmethod
+    def setUpClass(cls):
+        from integrations.agent_engine.shell_manifest import SYSTEM_PANELS
+        cls.panels = SYSTEM_PANELS
+
+    def test_calculator_panel_registered(self):
+        self.assertIn('calculator', self.panels)
+        self.assertEqual(self.panels['calculator']['icon'], 'calculate')
+
+    def test_image_viewer_panel_registered(self):
+        self.assertIn('image_viewer', self.panels)
+        self.assertEqual(self.panels['image_viewer']['icon'], 'photo')
+
+    def test_notes_panel_registered(self):
+        self.assertIn('notes_app', self.panels)
+        self.assertEqual(self.panels['notes_app']['icon'], 'sticky_note_2')
+
+    def test_app_store_panel_registered(self):
+        self.assertIn('app_store', self.panels)
+        self.assertEqual(self.panels['app_store']['icon'], 'storefront')
+
+    def test_app_permissions_panel_registered(self):
+        self.assertIn('app_permissions', self.panels)
+        self.assertEqual(self.panels['app_permissions']['icon'], 'admin_panel_settings')
+
+    def test_battery_monitor_panel_registered(self):
+        self.assertIn('battery_monitor', self.panels)
+        self.assertEqual(self.panels['battery_monitor']['icon'], 'battery_full')
+
+    def test_wifi_manager_panel_registered(self):
+        self.assertIn('wifi_manager', self.panels)
+        self.assertIn('/api/shell/wifi/scan', self.panels['wifi_manager']['apis'])
+
+    def test_vpn_manager_panel_registered(self):
+        self.assertIn('vpn_manager', self.panels)
+        self.assertEqual(self.panels['vpn_manager']['icon'], 'vpn_key')
+
+    def test_trash_bin_panel_registered(self):
+        self.assertIn('trash_bin', self.panels)
+        self.assertIn('/api/shell/trash', self.panels['trash_bin']['apis'])
+
+    def test_webcam_viewer_panel_registered(self):
+        self.assertIn('webcam_viewer', self.panels)
+        self.assertEqual(self.panels['webcam_viewer']['icon'], 'videocam')
+
+    def test_scanner_panel_registered(self):
+        self.assertIn('scanner', self.panels)
+        self.assertEqual(self.panels['scanner']['icon'], 'scanner')
+
+    def test_weather_widget_panel_registered(self):
+        self.assertIn('weather_widget', self.panels)
+
+    def test_all_panels_have_group(self):
+        for pid, panel in self.panels.items():
+            self.assertIn('group', panel, f"Panel '{pid}' missing group")
+
+    def test_all_panels_have_default_size(self):
+        for pid, panel in self.panels.items():
+            self.assertIn('default_size', panel, f"Panel '{pid}' missing default_size")
+            self.assertEqual(len(panel['default_size']), 2, f"Panel '{pid}' bad size")
+
+    def test_panel_manifest_to_app_manifest(self):
+        """Panels should be convertible to AppManifest for AppRegistry."""
+        from core.platform.app_manifest import AppManifest, AppType
+        manifest = AppManifest.from_system_panel('calculator', self.panels['calculator'])
+        self.assertEqual(manifest.type, AppType.SYSTEM_PANEL.value)
+        self.assertEqual(manifest.name, 'Calculator')
 
 
 if __name__ == '__main__':

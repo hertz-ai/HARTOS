@@ -110,7 +110,8 @@ class TestShellFileManager(unittest.TestCase):
     def test_browse_invalid_path(self):
         client = _make_os_app()
         r = client.get('/api/shell/files/browse?path=/nonexistent_dir_xyz')
-        self.assertEqual(r.status_code, 400)
+        # Path outside allowed roots (home + /tmp) returns 403
+        self.assertIn(r.status_code, (400, 403))
 
     def test_mkdir_and_delete(self):
         client = _make_os_app()
@@ -625,6 +626,536 @@ class TestShellBackup(unittest.TestCase):
         r = client.post('/api/shell/backup/restore',
                         json={'user_id': 1})
         self.assertEqual(r.status_code, 400)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Battery / Lid
+# ═══════════════════════════════════════════════════════════════
+
+class TestShellBattery(unittest.TestCase):
+    """Tests for /api/shell/battery and /api/shell/power/lid."""
+
+    @patch('integrations.agent_engine.shell_os_apis.os.path.isdir', return_value=False)
+    def test_battery_status_no_battery(self, _mock_isdir):
+        client = _make_os_app()
+        r = client.get('/api/shell/battery')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertFalse(data['has_battery'])
+
+    def test_battery_status_with_battery(self):
+        """Battery endpoint returns level and charging state when battery present."""
+        client = _make_os_app()
+        bat_base = '/sys/class/power_supply'
+        # Use os.path.join so keys match Windows backslash convention
+        file_contents = {
+            os.path.join(bat_base, 'BAT0', 'type'): 'Battery\n',
+            os.path.join(bat_base, 'BAT0', 'capacity'): '75\n',
+            os.path.join(bat_base, 'BAT0', 'status'): 'Charging\n',
+        }
+        _real_isdir = os.path.isdir
+        _real_isfile = os.path.isfile
+        _real_listdir = os.listdir
+        _real_open = open
+
+        def mock_isdir(p):
+            if 'power_supply' in str(p):
+                return p == bat_base
+            return _real_isdir(p)
+
+        def mock_isfile(p):
+            if 'power_supply' in str(p):
+                return p in file_contents
+            return _real_isfile(p)
+
+        def mock_listdir(p):
+            if p == bat_base:
+                return ['BAT0']
+            return _real_listdir(p)
+
+        def smart_open(path, *args, **kwargs):
+            if path in file_contents:
+                from io import StringIO
+                return StringIO(file_contents[path])
+            return _real_open(path, *args, **kwargs)
+
+        with patch('os.path.isdir', side_effect=mock_isdir):
+            with patch('os.path.isfile', side_effect=mock_isfile):
+                with patch('os.listdir', side_effect=mock_listdir):
+                    with patch('builtins.open', side_effect=smart_open):
+                        r = client.get('/api/shell/battery')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertTrue(data['has_battery'])
+        self.assertEqual(data['level'], 75)
+        self.assertEqual(data['charging'], 'Charging')
+
+    def test_battery_ac_power(self):
+        """Battery endpoint returns ac_power field when AC adapter present."""
+        client = _make_os_app()
+        bat_base = '/sys/class/power_supply'
+        file_contents = {
+            os.path.join(bat_base, 'BAT0', 'type'): 'Battery\n',
+            os.path.join(bat_base, 'BAT0', 'capacity'): '90\n',
+            os.path.join(bat_base, 'BAT0', 'status'): 'Full\n',
+            os.path.join(bat_base, 'AC0', 'online'): '1\n',
+        }
+        _real_isdir = os.path.isdir
+        _real_isfile = os.path.isfile
+        _real_listdir = os.listdir
+        _real_open = open
+
+        def mock_isdir(p):
+            if 'power_supply' in str(p):
+                return p == bat_base
+            return _real_isdir(p)
+
+        def mock_isfile(p):
+            if 'power_supply' in str(p):
+                return p in file_contents
+            return _real_isfile(p)
+
+        def mock_listdir(p):
+            if p == bat_base:
+                return ['BAT0']
+            return _real_listdir(p)
+
+        def smart_open(path, *args, **kwargs):
+            if path in file_contents:
+                from io import StringIO
+                return StringIO(file_contents[path])
+            return _real_open(path, *args, **kwargs)
+
+        with patch('os.path.isdir', side_effect=mock_isdir):
+            with patch('os.path.isfile', side_effect=mock_isfile):
+                with patch('os.listdir', side_effect=mock_listdir):
+                    with patch('builtins.open', side_effect=smart_open):
+                        r = client.get('/api/shell/battery')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertTrue(data.get('ac_power'))
+
+    def test_lid_get_default(self):
+        client = _make_os_app()
+        r = client.get('/api/shell/power/lid')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(data['action'], 'suspend')
+        self.assertIn('valid_actions', data)
+
+    def test_lid_put_valid(self):
+        client = _make_os_app()
+        r = client.put('/api/shell/power/lid', json={'action': 'hibernate'})
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(data['status'], 'ok')
+        self.assertEqual(data['action'], 'hibernate')
+
+    def test_lid_put_invalid(self):
+        client = _make_os_app()
+        r = client.put('/api/shell/power/lid', json={'action': 'explode'})
+        self.assertEqual(r.status_code, 400)
+        data = json.loads(r.data)
+        self.assertIn('error', data)
+
+
+# ═══════════════════════════════════════════════════════════════
+# WiFi Management
+# ═══════════════════════════════════════════════════════════════
+
+class TestShellWiFi(unittest.TestCase):
+    """Tests for /api/shell/wifi/* routes."""
+
+    @patch('integrations.agent_engine.shell_os_apis.subprocess')
+    def test_wifi_scan_returns_networks(self, mock_sub):
+        client = _make_os_app()
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.stdout = 'MyNet:85:WPA2:AA:BB:CC\nOpenNet:60::DD:EE:FF\n'
+        proc.stderr = ''
+        mock_sub.run.return_value = proc
+        mock_sub.TimeoutExpired = Exception
+        r = client.get('/api/shell/wifi/scan')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(len(data['networks']), 2)
+        self.assertEqual(data['networks'][0]['ssid'], 'MyNet')
+        self.assertEqual(data['networks'][0]['signal'], 85)
+        self.assertEqual(data['networks'][0]['security'], 'WPA2')
+
+    @patch('integrations.agent_engine.shell_os_apis.subprocess')
+    def test_wifi_scan_empty(self, mock_sub):
+        client = _make_os_app()
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.stdout = ''
+        proc.stderr = ''
+        mock_sub.run.return_value = proc
+        mock_sub.TimeoutExpired = Exception
+        r = client.get('/api/shell/wifi/scan')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(data['networks'], [])
+
+    @patch('integrations.agent_engine.shell_os_apis.subprocess')
+    def test_wifi_scan_nmcli_not_found(self, mock_sub):
+        client = _make_os_app()
+        mock_sub.run.side_effect = FileNotFoundError
+        mock_sub.TimeoutExpired = Exception
+        r = client.get('/api/shell/wifi/scan')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(data['networks'], [])
+        self.assertEqual(data['error'], 'nmcli not available')
+
+    @patch('integrations.agent_engine.shell_os_apis.subprocess')
+    def test_wifi_connect_success(self, mock_sub):
+        client = _make_os_app()
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.stdout = 'successfully activated'
+        proc.stderr = ''
+        mock_sub.run.return_value = proc
+        mock_sub.TimeoutExpired = Exception
+        r = client.post('/api/shell/wifi/connect',
+                        json={'ssid': 'MyNet', 'password': '1234'})
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(data['status'], 'connected')
+        self.assertEqual(data['ssid'], 'MyNet')
+
+    @patch('integrations.agent_engine.shell_os_apis.subprocess')
+    def test_wifi_connect_missing_ssid(self, mock_sub):
+        client = _make_os_app()
+        r = client.post('/api/shell/wifi/connect', json={})
+        self.assertEqual(r.status_code, 400)
+        data = json.loads(r.data)
+        self.assertIn('error', data)
+
+    @patch('integrations.agent_engine.shell_os_apis.subprocess')
+    def test_wifi_status(self, mock_sub):
+        client = _make_os_app()
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.stdout = 'MyNet:802-11-wireless:wlan0:activated\n'
+        proc.stderr = ''
+        mock_sub.run.return_value = proc
+        r = client.get('/api/shell/wifi/status')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertTrue(data['connected'])
+        self.assertEqual(data['connection']['name'], 'MyNet')
+        self.assertEqual(data['connection']['device'], 'wlan0')
+
+
+# ═══════════════════════════════════════════════════════════════
+# VPN Management
+# ═══════════════════════════════════════════════════════════════
+
+class TestShellVPN(unittest.TestCase):
+    """Tests for /api/shell/vpn/* routes."""
+
+    @patch('integrations.agent_engine.shell_os_apis.subprocess')
+    def test_vpn_list(self, mock_sub):
+        client = _make_os_app()
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.stdout = 'MyVPN:vpn:activated\nWork:vpn:deactivated\n'
+        proc.stderr = ''
+        mock_sub.run.return_value = proc
+        r = client.get('/api/shell/vpn/list')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(len(data['vpns']), 2)
+        self.assertEqual(data['vpns'][0]['name'], 'MyVPN')
+
+    @patch('integrations.agent_engine.shell_os_apis.subprocess')
+    def test_vpn_connect_success(self, mock_sub):
+        client = _make_os_app()
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.stdout = 'Connection successfully activated'
+        proc.stderr = ''
+        mock_sub.run.return_value = proc
+        mock_sub.TimeoutExpired = Exception
+        r = client.post('/api/shell/vpn/connect', json={'name': 'MyVPN'})
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(data['status'], 'connected')
+        self.assertEqual(data['name'], 'MyVPN')
+
+    @patch('integrations.agent_engine.shell_os_apis.subprocess')
+    def test_vpn_connect_missing_name(self, mock_sub):
+        client = _make_os_app()
+        r = client.post('/api/shell/vpn/connect', json={})
+        self.assertEqual(r.status_code, 400)
+        data = json.loads(r.data)
+        self.assertIn('error', data)
+
+    @patch('integrations.agent_engine.shell_os_apis.subprocess')
+    def test_vpn_disconnect(self, mock_sub):
+        client = _make_os_app()
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.stdout = 'Connection successfully deactivated'
+        proc.stderr = ''
+        mock_sub.run.return_value = proc
+        r = client.post('/api/shell/vpn/disconnect', json={'name': 'MyVPN'})
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(data['status'], 'disconnected')
+
+    @patch('integrations.agent_engine.shell_os_apis.subprocess')
+    @patch('integrations.agent_engine.shell_os_apis.os.path.isfile', return_value=True)
+    def test_vpn_import_wireguard(self, _mock_isfile, mock_sub):
+        client = _make_os_app()
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.stdout = 'Connection imported'
+        proc.stderr = ''
+        mock_sub.run.return_value = proc
+        r = client.post('/api/shell/vpn/import',
+                        json={'path': '/tmp/test.conf'})
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(data['status'], 'imported')
+
+
+# ═══════════════════════════════════════════════════════════════
+# Trash / Recycle Bin
+# ═══════════════════════════════════════════════════════════════
+
+class TestShellTrash(unittest.TestCase):
+    """Tests for /api/shell/trash routes using real temp dirs."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp(prefix='hart_trash_test_')
+        self._trash_root = os.path.join(self._tmpdir, '.local', 'share', 'Trash')
+        self._files_dir = os.path.join(self._trash_root, 'files')
+        self._info_dir = os.path.join(self._trash_root, 'info')
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _patch_trash_dir(self):
+        """Return a patch that redirects _trash_dir() to our temp trash root."""
+        return patch('integrations.agent_engine.shell_os_apis.os.path.expanduser',
+                     return_value=self._tmpdir)
+
+    def test_trash_list_empty(self):
+        client = _make_os_app()
+        with self._patch_trash_dir():
+            r = client.get('/api/shell/trash')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(data['items'], [])
+        self.assertEqual(data['total'], 0)
+
+    def test_trash_file(self):
+        client = _make_os_app()
+        # Create a source file to trash
+        src_file = os.path.join(self._tmpdir, 'myfile.txt')
+        with open(src_file, 'w') as f:
+            f.write('hello')
+        with self._patch_trash_dir():
+            r = client.post('/api/shell/trash', json={'path': src_file})
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(data['status'], 'trashed')
+        # Verify file moved to trash files dir
+        self.assertTrue(os.path.isdir(self._files_dir))
+        trashed_files = os.listdir(self._files_dir)
+        self.assertGreater(len(trashed_files), 0)
+        # Verify .trashinfo was created
+        self.assertTrue(os.path.isdir(self._info_dir))
+        info_files = [f for f in os.listdir(self._info_dir) if f.endswith('.trashinfo')]
+        self.assertGreater(len(info_files), 0)
+
+    def test_trash_restore(self):
+        client = _make_os_app()
+        # Pre-populate trash
+        os.makedirs(self._files_dir, exist_ok=True)
+        os.makedirs(self._info_dir, exist_ok=True)
+        restore_dest = os.path.join(self._tmpdir, 'restored.txt')
+        with open(os.path.join(self._files_dir, 'restored.txt'), 'w') as f:
+            f.write('content')
+        info_content = (
+            "[Trash Info]\n"
+            f"Path={restore_dest}\n"
+            "DeletionDate=2026-03-05T12:00:00\n"
+        )
+        with open(os.path.join(self._info_dir, 'restored.txt.trashinfo'), 'w') as f:
+            f.write(info_content)
+        with self._patch_trash_dir():
+            r = client.post('/api/shell/trash/restore', json={'name': 'restored.txt'})
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(data['status'], 'restored')
+        self.assertTrue(os.path.isfile(restore_dest))
+
+    def test_trash_empty(self):
+        client = _make_os_app()
+        # Pre-populate trash with files
+        os.makedirs(self._files_dir, exist_ok=True)
+        os.makedirs(self._info_dir, exist_ok=True)
+        with open(os.path.join(self._files_dir, 'a.txt'), 'w') as f:
+            f.write('a')
+        with open(os.path.join(self._files_dir, 'b.txt'), 'w') as f:
+            f.write('b')
+        with open(os.path.join(self._info_dir, 'a.txt.trashinfo'), 'w') as f:
+            f.write('[Trash Info]\nPath=/tmp/a.txt\n')
+        with self._patch_trash_dir():
+            r = client.post('/api/shell/trash/empty')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(data['status'], 'emptied')
+        self.assertGreater(data['removed'], 0)
+        # Verify dirs are empty
+        self.assertEqual(os.listdir(self._files_dir), [])
+
+    def test_trash_missing_path(self):
+        client = _make_os_app()
+        r = client.post('/api/shell/trash', json={'path': '/nonexistent_xyz'})
+        self.assertEqual(r.status_code, 400)
+        data = json.loads(r.data)
+        self.assertIn('error', data)
+
+    def test_trash_list_with_items(self):
+        client = _make_os_app()
+        # Pre-populate info dir with .trashinfo files
+        os.makedirs(self._info_dir, exist_ok=True)
+        for name in ['doc.txt', 'pic.png']:
+            info_content = (
+                "[Trash Info]\n"
+                f"Path=/home/user/{name}\n"
+                "DeletionDate=2026-03-05T10:00:00\n"
+            )
+            with open(os.path.join(self._info_dir, f'{name}.trashinfo'), 'w') as f:
+                f.write(info_content)
+        with self._patch_trash_dir():
+            r = client.get('/api/shell/trash')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(data['total'], 2)
+        names = [item['name'] for item in data['items']]
+        self.assertIn('doc.txt', names)
+        self.assertIn('pic.png', names)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Notes App
+# ═══════════════════════════════════════════════════════════════
+
+def _make_notes_app(notes_dir):
+    """Create a Flask test app with _NOTES_DIR pointing to notes_dir.
+
+    _NOTES_DIR is a closure variable captured at route-registration time,
+    so we must redirect the path computation *before* registering routes.
+    """
+    from flask import Flask
+    import integrations.agent_engine.shell_os_apis as mod
+
+    real_join = os.path.join
+    # The _NOTES_DIR computation is:
+    #   os.path.join(os.path.dirname(os.path.dirname(
+    #       os.path.dirname(os.path.abspath(__file__)))), 'agent_data', 'notes')
+    # We intercept join calls that end with ('agent_data', 'notes') to redirect.
+    def patched_join(*args):
+        result = real_join(*args)
+        if len(args) >= 3 and args[-2] == 'agent_data' and args[-1] == 'notes':
+            return notes_dir
+        return result
+
+    app = Flask(__name__)
+    app.config['TESTING'] = True
+    with patch('os.path.join', side_effect=patched_join):
+        mod.register_shell_os_routes(app)
+    return app.test_client()
+
+
+class TestShellNotes(unittest.TestCase):
+    """Tests for /api/shell/notes routes."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp(prefix='hart_notes_test_')
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_notes_save_and_list(self):
+        client = _make_notes_app(self._tmpdir)
+        r = client.post('/api/shell/notes',
+                        json={'title': 'Test Note', 'content': 'Hello world'})
+        self.assertEqual(r.status_code, 201)
+        data = json.loads(r.data)
+        self.assertEqual(data['status'], 'saved')
+        # List and verify
+        r = client.get('/api/shell/notes')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertGreater(len(data['notes']), 0)
+        titles = [n['title'] for n in data['notes']]
+        self.assertIn('Test Note', titles)
+
+    def test_notes_delete(self):
+        client = _make_notes_app(self._tmpdir)
+        # Create a note first
+        r = client.post('/api/shell/notes',
+                        json={'title': 'ToDelete', 'content': 'Bye'})
+        self.assertEqual(r.status_code, 201)
+        note_id = json.loads(r.data)['id']
+        # Delete it
+        r = client.delete(f'/api/shell/notes/{note_id}')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(data['status'], 'deleted')
+
+    def test_notes_save_missing_content(self):
+        client = _make_os_app()
+        r = client.post('/api/shell/notes', json={'title': 'T'})
+        self.assertEqual(r.status_code, 400)
+        data = json.loads(r.data)
+        self.assertIn('error', data)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Open With
+# ═══════════════════════════════════════════════════════════════
+
+class TestShellOpenWith(unittest.TestCase):
+    """Tests for /api/shell/open-with."""
+
+    def test_open_with_missing_path(self):
+        client = _make_os_app()
+        r = client.post('/api/shell/open-with', json={})
+        self.assertEqual(r.status_code, 400)
+        data = json.loads(r.data)
+        self.assertIn('error', data)
+
+    def test_open_with_file_not_found(self):
+        client = _make_os_app()
+        r = client.post('/api/shell/open-with',
+                        json={'path': '/nonexistent_file_xyz.txt'})
+        self.assertEqual(r.status_code, 404)
+        data = json.loads(r.data)
+        self.assertIn('error', data)
+
+    def test_open_with_outside_sandbox(self):
+        client = _make_os_app()
+        # Create a temp file outside allowed roots then simulate with a path
+        # that resolves outside ~ and /tmp
+        with patch('integrations.agent_engine.shell_os_apis.os.path.isfile', return_value=True):
+            with patch('integrations.agent_engine.shell_os_apis.os.path.realpath',
+                       return_value='/etc/shadow'):
+                with patch('integrations.agent_engine.shell_os_apis.os.path.expanduser',
+                           return_value='/home/testuser'):
+                    r = client.post('/api/shell/open-with',
+                                    json={'path': '/etc/shadow'})
+        self.assertEqual(r.status_code, 403)
+        data = json.loads(r.data)
+        self.assertIn('error', data)
 
 
 if __name__ == '__main__':

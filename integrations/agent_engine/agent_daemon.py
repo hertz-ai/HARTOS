@@ -18,6 +18,11 @@ logger = logging.getLogger('hevolve_social')
 # Track which tasks we've already sent HITL notifications for (avoid spam)
 _hitl_notified: set = set()
 
+# Goals that are budget-blocked are immediately paused (no retries).
+# Previously we retried 3 times, but that just re-dispatches a blocked goal
+# every 30 seconds with no chance of success (budget doesn't change between ticks).
+_budget_blocked_goals: set = set()
+
 
 def _get_blocked_hitl_tasks(ledger, goal_id):
     """Get tasks blocked with APPROVAL_REQUIRED under a goal."""
@@ -74,6 +79,9 @@ class AgentDaemon:
         self._tick_count = 0
         self._remediate_every = int(os.environ.get(
             'HEVOLVE_REMEDIATE_INTERVAL_TICKS', '10'))
+        # Cache SmartLedger instances by (agent_id, session_id) to avoid
+        # re-creating them every tick (which spams "starting fresh" logs).
+        self._ledger_cache: dict = {}
 
     def start(self):
         with self._lock:
@@ -142,13 +150,20 @@ class AgentDaemon:
         """Get a SmartLedger for a goal's task graph (if one exists).
 
         Returns None when no ledger exists or it has only 1 task (no parallelism).
+        Ledger instances are cached on self._ledger_cache to avoid re-creating
+        (and re-logging "starting fresh") on every daemon tick.
         """
         try:
             from agent_ledger import SmartLedger
             goal_id = str(goal.id) if hasattr(goal, 'id') else ''
             user_id = str(goal.user_id) if hasattr(goal, 'user_id') else 'system'
 
-            ledger = SmartLedger(agent_id=user_id, session_id=str(goal_id))
+            cache_key = (user_id, goal_id)
+            ledger = self._ledger_cache.get(cache_key)
+            if ledger is None:
+                ledger = SmartLedger(agent_id=user_id, session_id=str(goal_id))
+                self._ledger_cache[cache_key] = ledger
+
             # Use the ledger's resolved dir (handles bundled/read-only fallback)
             ledger_path = str(ledger.ledger_file)
             if os.path.isfile(ledger_path):
@@ -278,10 +293,34 @@ class AgentDaemon:
                 # BUDGET GATE: check goal budget + platform affordability
                 try:
                     from .budget_gate import pre_dispatch_budget_gate
+                    goal_key = str(goal.id)
+
+                    # Skip goals already known to be budget-blocked (avoids
+                    # re-checking every 30s when nothing has changed).
+                    if goal_key in _budget_blocked_goals:
+                        continue
+
                     bg_allowed, bg_reason = pre_dispatch_budget_gate(goal.id, prompt)
                     if not bg_allowed:
-                        logger.warning(f"Goal {goal.id} blocked by budget gate: {bg_reason}")
+                        # Immediately pause — budget won't change between daemon
+                        # ticks, so retrying is wasteful.
+                        goal.status = 'paused'
+                        cfg = goal.config_json or {}
+                        cfg['pause_reason'] = (
+                            f'Auto-paused: budget gate blocked. '
+                            f'Reason: {bg_reason}')
+                        cfg['paused_at'] = datetime.utcnow().isoformat()
+                        goal.config_json = cfg
+                        _budget_blocked_goals.add(goal_key)
+                        logger.info(
+                            f"Goal {goal.id} AUTO-PAUSED by budget gate: "
+                            f"{bg_reason}")
                         continue
+                    else:
+                        # Budget passed — clear from blocked set if it was
+                        # previously blocked (e.g. goal was resumed with
+                        # more budget).
+                        _budget_blocked_goals.discard(goal_key)
                 except ImportError:
                     pass
 
@@ -323,10 +362,11 @@ class AgentDaemon:
 
             # ── HITL: notify owners of APPROVAL_REQUIRED tasks ──
             try:
-                from agent_ledger.core import SmartLedger
-                ledger = SmartLedger()
                 for goal in goals:
                     if goal.goal_type != 'thought_experiment':
+                        continue
+                    ledger = self._get_goal_ledger(goal)
+                    if not ledger:
                         continue
                     ledger_tasks = _get_blocked_hitl_tasks(ledger, goal.id)
                     for task in ledger_tasks:

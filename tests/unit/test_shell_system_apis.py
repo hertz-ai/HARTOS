@@ -580,5 +580,129 @@ class TestMediaIndexer(unittest.TestCase):
         self.assertEqual(data['total'], 0)
 
 
+# ═══════════════════════════════════════════════════════════════
+# Webcam / Camera
+# ═══════════════════════════════════════════════════════════════
+
+class TestShellWebcam(unittest.TestCase):
+
+    @patch('glob.glob', return_value=[])
+    def test_webcam_list_no_devices(self, _glob):
+        client = _make_system_app()
+        r = client.get('/api/shell/webcam/list')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(len(data['devices']), 0)
+
+    @patch('integrations.agent_engine.shell_system_apis._run')
+    @patch('glob.glob', return_value=['/dev/video0'])
+    def test_webcam_list_with_device(self, _glob, mock_run):
+        v4l2_output = (
+            'Driver name   : uvcvideo\n'
+            'Card type     : HD Webcam\n'
+        )
+        mock_run.return_value = MagicMock(returncode=0, stdout=v4l2_output)
+        client = _make_system_app()
+        r = client.get('/api/shell/webcam/list')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(len(data['devices']), 1)
+        self.assertEqual(data['devices'][0]['device'], '/dev/video0')
+        self.assertEqual(data['devices'][0]['name'], 'HD Webcam')
+
+    @patch('integrations.agent_engine.shell_system_apis._run', return_value=None)
+    def test_webcam_capture_ffmpeg_not_found(self, mock_run):
+        client = _make_system_app()
+        r = client.post('/api/shell/webcam/capture',
+                        data=json.dumps({'device': '/dev/video0'}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 500)
+        data = json.loads(r.data)
+        self.assertIn('error', data)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Scanner
+# ═══════════════════════════════════════════════════════════════
+
+class TestShellScanner(unittest.TestCase):
+
+    @patch('integrations.agent_engine.shell_system_apis._run', return_value=None)
+    def test_scanner_list_empty(self, mock_run):
+        client = _make_system_app()
+        r = client.get('/api/shell/scanner/list')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(len(data['scanners']), 0)
+
+    @patch('integrations.agent_engine.shell_system_apis._run')
+    def test_scanner_list_with_scanner(self, mock_run):
+        scanimage_output = "device `hpaio:/net/HP_LaserJet?ip=192.168.1.10' is a Hewlett-Packard HP_LaserJet all-in-one"
+        mock_run.return_value = MagicMock(returncode=0, stdout=scanimage_output)
+        client = _make_system_app()
+        r = client.get('/api/shell/scanner/list')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertGreater(len(data['scanners']), 0)
+        self.assertIn('raw', data['scanners'][0])
+
+    @patch('integrations.agent_engine.shell_system_apis._run')
+    def test_scanner_scan_error(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=1, stderr='scanimage: no SANE devices found')
+        client = _make_system_app()
+        r = client.post('/api/shell/scanner/scan',
+                        data=json.dumps({'format': 'png'}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 500)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Protected Names
+# ═══════════════════════════════════════════════════════════════
+
+class TestProtectedNames(unittest.TestCase):
+
+    def test_docker_in_protected_names(self):
+        """Verify 'dockerd' is in the _PROTECTED_NAMES set."""
+        import inspect
+        from integrations.agent_engine.shell_system_apis import register_shell_system_routes
+        source = inspect.getsource(register_shell_system_routes)
+        self.assertIn("'dockerd'", source)
+
+    def test_k8s_in_protected_names(self):
+        """Verify Kubernetes-related names are in _PROTECTED_NAMES."""
+        import inspect
+        from integrations.agent_engine.shell_system_apis import register_shell_system_routes
+        source = inspect.getsource(register_shell_system_routes)
+        for name in ('kubelet', 'etcd', 'containerd'):
+            self.assertIn(f"'{name}'", source, f"{name} not found in _PROTECTED_NAMES")
+
+
+# ═══════════════════════════════════════════════════════════════
+# Bluetooth Timeout
+# ═══════════════════════════════════════════════════════════════
+
+class TestBluetoothTimeout(unittest.TestCase):
+
+    def test_bluetooth_scan_has_timeout(self):
+        """Verify the bluetooth scan subprocess call includes a timeout parameter."""
+        import inspect
+        from integrations.agent_engine.shell_system_apis import register_shell_system_routes
+        source = inspect.getsource(register_shell_system_routes)
+        # Find the _do_scan section and verify timeout is passed to _run
+        scan_idx = source.find('def _do_scan')
+        self.assertGreater(scan_idx, -1, '_do_scan function not found')
+        scan_section = source[scan_idx:scan_idx + 300]
+        self.assertIn('timeout=', scan_section)
+
+    def test_bluetooth_background_thread_exists(self):
+        """Verify a background scan thread function exists in the bluetooth scan route."""
+        import inspect
+        from integrations.agent_engine.shell_system_apis import register_shell_system_routes
+        source = inspect.getsource(register_shell_system_routes)
+        self.assertIn('def _do_scan', source)
+        self.assertIn('Thread(target=_do_scan', source)
+
+
 if __name__ == '__main__':
     unittest.main()

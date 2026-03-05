@@ -98,6 +98,14 @@
       clipboardSync = true;
     };
 
+    # ── On-Screen Keyboard ──
+    osk = {
+      enable = true;
+      backend = "squeekboard";
+      autoShow = true;
+      hapticFeedback = true;
+    };
+
     # ── Sandbox ──
     sandbox.enable = true;
   };

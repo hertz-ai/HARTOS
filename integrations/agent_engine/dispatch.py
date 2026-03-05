@@ -210,6 +210,23 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     except ImportError:
         pass
 
+    # TOOL ALLOWLIST: resolve model tier and attach to dispatch context
+    _dispatch_model_tier = None
+    if model_config:
+        try:
+            from integrations.agent_engine.tool_allowlist import check_tool_allowed
+            from integrations.agent_engine.model_registry import model_registry
+            first_model = model_config[0].get('model', '') if model_config else ''
+            if first_model:
+                info = model_registry.get(first_model)
+                if info:
+                    _dispatch_model_tier = (info.get('tier') or info.get('model_tier'))
+                    if _dispatch_model_tier:
+                        logger.info(f"Dispatch model tier: {_dispatch_model_tier.value} "
+                                    f"for {goal_type} goal {goal_id}")
+        except Exception:
+            pass  # Model registry unavailable — no tier restriction
+
     # GUARDRAIL: full pre-dispatch gate (fail-closed: block if guardrails unavailable)
     try:
         from security.hive_guardrails import GuardrailEnforcer
@@ -282,6 +299,8 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     }
     if model_config:
         body['model_config'] = model_config
+    if _dispatch_model_tier:
+        body['model_tier'] = _dispatch_model_tier.value
 
     try:
         resp = requests.post(

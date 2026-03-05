@@ -31,8 +31,11 @@ def _audit(event_type: str, actor_id: str, action: str, detail: dict):
                             action=action, detail=detail)
         finally:
             audit._use_db = saved
-    except Exception:
-        pass
+    except Exception as e:
+        import logging as _log
+        _log.getLogger('hevolve.consent').warning(
+            "Consent audit log failed (event=%s, actor=%s): %s",
+            event_type, actor_id, e)
 
 
 def _emit(topic: str, data: dict):

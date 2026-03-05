@@ -157,6 +157,17 @@ class ActionRetryTracker:
 
         if count > self.MAX_PENDING_RETRIES:
             logger.warning(f"[RETRY LIMIT] Action {action_id} has been PENDING {count} times - forcing to ERROR state")
+            # Emit retry exhaustion event so other subsystems can react
+            try:
+                from core.platform.events import emit_event
+                emit_event('action.retry_exhausted', {
+                    'action_id': action_id,
+                    'prompt': user_prompt,
+                    'retry_count': count,
+                    'max_retries': self.MAX_PENDING_RETRIES,
+                })
+            except Exception:
+                pass
             return True  # Exceeded threshold
 
         logger.info(f"[RETRY TRACKING] Action {action_id} pending count: {count}/{self.MAX_PENDING_RETRIES}")

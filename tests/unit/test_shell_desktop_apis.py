@@ -642,5 +642,161 @@ class TestWorkspaces(unittest.TestCase):
         self.assertEqual(r.status_code, 400)
 
 
+# ═══════════════════════════════════════════════════════════════
+# Multi-Monitor Management
+# ═══════════════════════════════════════════════════════════════
+
+class TestShellMultiMonitor(unittest.TestCase):
+
+    @patch('integrations.agent_engine.shell_desktop_apis._run')
+    @patch('integrations.agent_engine.shell_desktop_apis._is_wayland', return_value=True)
+    def test_displays_list_wayland(self, _wl, mock_run):
+        sway_output = json.dumps([{
+            'name': 'HDMI-A-1', 'model': 'Monitor',
+            'rect': {'width': 1920, 'height': 1080, 'x': 0, 'y': 0},
+            'scale': 1.0, 'active': True,
+        }])
+        mock_run.return_value = MagicMock(returncode=0, stdout=sway_output)
+        client = _make_desktop_app()
+        r = client.get('/api/shell/displays')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(len(data['displays']), 1)
+        self.assertEqual(data['displays'][0]['name'], 'HDMI-A-1')
+        self.assertEqual(data['displays'][0]['resolution'], '1920x1080')
+        self.assertEqual(data['compositor'], 'wayland')
+
+    @patch('integrations.agent_engine.shell_desktop_apis._run')
+    @patch('integrations.agent_engine.shell_desktop_apis._is_wayland', return_value=False)
+    def test_displays_list_x11_fallback(self, _wl, mock_run):
+        xrandr_output = 'HDMI-1 connected primary 1920x1080+0+0'
+        mock_run.return_value = MagicMock(returncode=0, stdout=xrandr_output)
+        client = _make_desktop_app()
+        r = client.get('/api/shell/displays')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(len(data['displays']), 1)
+        self.assertEqual(data['displays'][0]['name'], 'HDMI-1')
+        self.assertTrue(data['displays'][0]['primary'])
+        self.assertEqual(data['compositor'], 'x11')
+
+    @patch('integrations.agent_engine.shell_desktop_apis._is_wayland', return_value=True)
+    def test_displays_arrange_missing_display(self, _wl):
+        client = _make_desktop_app()
+        r = client.put('/api/shell/displays/arrange',
+                       data=json.dumps({'resolution': '1920x1080'}),
+                       content_type='application/json')
+        self.assertEqual(r.status_code, 400)
+
+
+# ═══════════════════════════════════════════════════════════════
+# HiDPI Scaling
+# ═══════════════════════════════════════════════════════════════
+
+class TestShellHiDPI(unittest.TestCase):
+
+    @patch('integrations.agent_engine.shell_desktop_apis._run')
+    @patch('integrations.agent_engine.shell_desktop_apis._is_wayland', return_value=True)
+    def test_get_scale_wayland(self, _wl, mock_run):
+        sway_output = json.dumps([{'scale': 2.0, 'name': 'eDP-1'}])
+        mock_run.return_value = MagicMock(returncode=0, stdout=sway_output)
+        client = _make_desktop_app()
+        r = client.get('/api/shell/display/scale')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(data['scale'], 2.0)
+
+    @patch('integrations.agent_engine.shell_desktop_apis._is_wayland', return_value=False)
+    @patch.dict(os.environ, {'GDK_SCALE': '2'})
+    def test_get_scale_x11(self, _wl):
+        client = _make_desktop_app()
+        r = client.get('/api/shell/display/scale')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(data['scale'], 2.0)
+
+    @patch('integrations.agent_engine.shell_desktop_apis._is_wayland', return_value=False)
+    def test_put_scale_x11(self, _wl):
+        client = _make_desktop_app()
+        r = client.put('/api/shell/display/scale',
+                       data=json.dumps({'scale': 2}),
+                       content_type='application/json')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(data['scale'], 2)
+        self.assertEqual(os.environ.get('GDK_SCALE'), '2')
+
+
+# ═══════════════════════════════════════════════════════════════
+# Per-App Volume Control
+# ═══════════════════════════════════════════════════════════════
+
+class TestShellPerAppVolume(unittest.TestCase):
+
+    @patch('integrations.agent_engine.shell_desktop_apis._run')
+    def test_list_audio_apps(self, mock_run):
+        pw_output = (
+            'id 42,\n'
+            '    type PipeWire:Interface:Node\n'
+            '    application.name = "Firefox"\n'
+            '    node.name = "firefox"\n'
+            'id 43,\n'
+            '    type PipeWire:Interface:Node\n'
+            '    application.name = "Spotify"\n'
+            '    node.name = "spotify"\n'
+        )
+        mock_run.return_value = MagicMock(returncode=0, stdout=pw_output)
+        client = _make_desktop_app()
+        r = client.get('/api/shell/audio/apps')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertIn('apps', data)
+        self.assertGreater(len(data['apps']), 0)
+
+    @patch('integrations.agent_engine.shell_desktop_apis._run')
+    def test_set_volume_valid(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0)
+        client = _make_desktop_app()
+        r = client.put('/api/shell/audio/apps/42/volume',
+                       data=json.dumps({'volume': 0.5}),
+                       content_type='application/json')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(data['status'], 'ok')
+        self.assertEqual(data['volume'], 0.5)
+
+    def test_set_volume_invalid_range(self):
+        client = _make_desktop_app()
+        r = client.put('/api/shell/audio/apps/42/volume',
+                       data=json.dumps({'volume': 5.0}),
+                       content_type='application/json')
+        self.assertEqual(r.status_code, 400)
+
+
+# ═══════════════════════════════════════════════════════════════
+# RTL Layout Support
+# ═══════════════════════════════════════════════════════════════
+
+class TestShellRTL(unittest.TestCase):
+
+    @patch.dict(os.environ, {'LANG': 'ar_EG.UTF-8'})
+    def test_rtl_for_arabic(self):
+        client = _make_desktop_app()
+        r = client.get('/api/shell/rtl/status')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertTrue(data['rtl'])
+        self.assertEqual(data['css_direction'], 'rtl')
+
+    @patch.dict(os.environ, {'LANG': 'en_US.UTF-8'})
+    def test_ltr_for_english(self):
+        client = _make_desktop_app()
+        r = client.get('/api/shell/rtl/status')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertFalse(data['rtl'])
+        self.assertEqual(data['css_direction'], 'ltr')
+
+
 if __name__ == '__main__':
     unittest.main()

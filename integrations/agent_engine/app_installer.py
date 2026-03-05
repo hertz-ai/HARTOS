@@ -233,21 +233,126 @@ class AppInstaller:
             'error': result.error,
         })
 
+        # Audit log successful installs
+        if result.success:
+            try:
+                from security.immutable_audit_log import get_audit_log
+                get_audit_log().log_event(
+                    'app_lifecycle', 'app_installer',
+                    f'Installed {result.name}',
+                    detail={
+                        'platform': result.platform,
+                        'app_id': result.app_id,
+                        'source': req.source,
+                        'duration': round(result.duration_seconds, 2),
+                    })
+            except Exception:
+                pass
+
+            # Auto-register in AppRegistry so the app appears in shell/spotlight
+            self._auto_register_app(result, req)
+
         return result
 
     def uninstall(self, app_id: str, platform: str = '') -> InstallResult:
         """Uninstall an application."""
         if platform == 'nix' or not platform:
-            return self._uninstall_nix(app_id)
+            result = self._uninstall_nix(app_id)
         elif platform == 'flatpak':
-            return self._uninstall_flatpak(app_id)
+            result = self._uninstall_flatpak(app_id)
         elif platform == 'appimage':
-            return self._uninstall_appimage(app_id)
+            result = self._uninstall_appimage(app_id)
         elif platform == 'windows':
-            return self._uninstall_windows(app_id)
-        return InstallResult(
-            success=False, platform=platform, name=app_id,
-            error=f'Uninstall not supported for: {platform}')
+            result = self._uninstall_windows(app_id)
+        else:
+            result = InstallResult(
+                success=False, platform=platform, name=app_id,
+                error=f'Uninstall not supported for: {platform}')
+
+        # Audit log successful uninstalls
+        if result.success:
+            try:
+                from security.immutable_audit_log import get_audit_log
+                get_audit_log().log_event(
+                    'app_lifecycle', 'app_installer',
+                    f'Uninstalled {app_id}',
+                    detail={
+                        'platform': result.platform,
+                        'app_id': app_id,
+                    })
+            except Exception:
+                pass
+
+            # Auto-unregister from AppRegistry
+            self._auto_unregister_app(app_id)
+
+        return result
+
+    def _auto_register_app(self, result: InstallResult, req: InstallRequest):
+        """Register successfully installed app in AppRegistry for shell/spotlight."""
+        try:
+            from core.platform.registry import get_registry
+            from core.platform.app_manifest import AppManifest, AppType
+
+            registry = get_registry()
+            if not registry.has('apps'):
+                return
+            apps = registry.get('apps')
+
+            app_id = result.app_id or result.name.lower().replace(' ', '_')
+            if apps.get(app_id):
+                return  # Already registered
+
+            # Map installer platform to app type
+            platform_type_map = {
+                'nix': AppType.DESKTOP_APP.value,
+                'flatpak': AppType.DESKTOP_APP.value,
+                'appimage': AppType.DESKTOP_APP.value,
+                'windows': AppType.DESKTOP_APP.value,
+                'android': AppType.DESKTOP_APP.value,
+                'extension': AppType.EXTENSION.value,
+            }
+            app_type = platform_type_map.get(result.platform, AppType.DESKTOP_APP.value)
+
+            # Build entry dict with required keys per app type
+            entry = {}
+            if app_type == AppType.DESKTOP_APP.value:
+                entry['exec'] = app_id
+                if result.install_path:
+                    entry['install_path'] = result.install_path
+            elif app_type == AppType.EXTENSION.value:
+                entry['module'] = f'extensions.{app_id}'
+            else:
+                entry['exec'] = app_id
+
+            manifest = AppManifest(
+                id=app_id,
+                name=result.name,
+                version=result.version or '1.0.0',
+                type=app_type,
+                icon='apps',
+                entry=entry,
+                group='Installed',
+                tags=['installed', result.platform],
+            )
+            apps.register(manifest)
+            logger.info(f"Auto-registered app: {app_id} ({result.platform})")
+        except Exception as e:
+            logger.debug(f"App auto-register skipped: {e}")
+
+    def _auto_unregister_app(self, app_id: str):
+        """Unregister app from AppRegistry on uninstall."""
+        try:
+            from core.platform.registry import get_registry
+            registry = get_registry()
+            if not registry.has('apps'):
+                return
+            apps = registry.get('apps')
+            if apps.get(app_id):
+                apps.unregister(app_id)
+                logger.info(f"Auto-unregistered app: {app_id}")
+        except Exception as e:
+            logger.debug(f"App auto-unregister skipped: {e}")
 
     def list_installed(self) -> List[dict]:
         """List all installed applications across platforms."""

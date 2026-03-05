@@ -3177,6 +3177,24 @@ if(!PERF.potato) {{
                 'renderer': self.renderer,
             })
 
+        # Register OS management APIs (shell file manager, terminal,
+        # desktop settings, system monitoring, app installer)
+        try:
+            from integrations.agent_engine.shell_os_apis import (
+                register_shell_os_routes)
+            from integrations.agent_engine.shell_desktop_apis import (
+                register_shell_desktop_routes)
+            from integrations.agent_engine.shell_system_apis import (
+                register_shell_system_routes)
+            from integrations.agent_engine.app_installer import (
+                register_app_install_routes)
+            register_shell_os_routes(app)
+            register_shell_desktop_routes(app)
+            register_shell_system_routes(app)
+            register_app_install_routes(app)
+        except Exception as e:
+            logger.warning("Shell APIs registration: %s", e)
+
         return app
 
     # ─── Serve ────────────────────────────────────────────────
@@ -3184,6 +3202,13 @@ if(!PERF.potato) {{
     def serve_forever(self):
         """Start the glass desktop shell service."""
         self._running = True
+
+        # Ensure platform substrate is ready (EventBus, AppRegistry, Extensions)
+        try:
+            from core.platform.boot_service import ensure_platform
+            ensure_platform()
+        except Exception as e:
+            logger.warning("Platform boot: %s", e)
 
         def _model_check_loop():
             import requests

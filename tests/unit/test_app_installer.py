@@ -934,5 +934,72 @@ class TestPlatformsRoute(unittest.TestCase):
         self.assertTrue(ext['available'])
 
 
+# ═══════════════════════════════════════════════════════════════
+# App Store Routes — Search and Install
+# ═══════════════════════════════════════════════════════════════
+
+class TestAppStoreRoutes(unittest.TestCase):
+    """Tests for the app store search and install routes."""
+
+    def test_search_route_empty_query(self):
+        """GET /api/shell/apps/search?q= returns 400 (query required)."""
+        client = _make_installer_app()
+        r = client.get('/api/shell/apps/search?q=')
+        self.assertEqual(r.status_code, 400)
+
+    def test_search_route_with_query(self):
+        """GET /api/shell/apps/search?q=terminal returns matching results."""
+        client = _make_installer_app()
+        with patch.object(AppInstaller, 'search', return_value=[
+            {'name': 'terminal', 'platform': 'nix'}
+        ]):
+            r = client.get('/api/shell/apps/search?q=terminal')
+            self.assertEqual(r.status_code, 200)
+            data = json.loads(r.data)
+            self.assertIn('results', data)
+            self.assertIn('count', data)
+
+    def test_install_route_missing_fields(self):
+        """POST /api/shell/apps/install with {} returns 400."""
+        client = _make_installer_app()
+        r = client.post('/api/shell/apps/install',
+                        data=json.dumps({}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 400)
+
+    def test_uninstall_route_missing_fields(self):
+        """POST /api/shell/apps/uninstall with {} returns 400."""
+        client = _make_installer_app()
+        r = client.post('/api/shell/apps/uninstall',
+                        data=json.dumps({}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 400)
+
+
+# ═══════════════════════════════════════════════════════════════
+# App Manifest Permissions
+# ═══════════════════════════════════════════════════════════════
+
+class TestAppPermissions(unittest.TestCase):
+    """App manifest permissions."""
+
+    def test_manifest_has_permissions_field(self):
+        from core.platform.app_manifest import AppManifest
+        m = AppManifest(id='t', name='T', version='1.0', type='service', icon='x', entry={})
+        self.assertIsInstance(m.permissions, list)
+
+    def test_permissions_default_empty(self):
+        from core.platform.app_manifest import AppManifest
+        m = AppManifest(id='t', name='T', version='1.0', type='service', icon='x', entry={})
+        self.assertEqual(m.permissions, [])
+
+    def test_manifest_with_permissions(self):
+        from core.platform.app_manifest import AppManifest
+        m = AppManifest(id='t', name='T', version='1.0', type='service', icon='x',
+                       entry={}, permissions=['network', 'system_read'])
+        self.assertIn('network', m.permissions)
+        self.assertIn('system_read', m.permissions)
+
+
 if __name__ == '__main__':
     unittest.main()

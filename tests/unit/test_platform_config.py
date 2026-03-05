@@ -316,5 +316,54 @@ class TestBoolConverter(unittest.TestCase):
             self.assertFalse(_convert_bool(val), f"Failed for {val!r}")
 
 
+# ═══════════════════════════════════════════════════════════════
+# Settings Export / Import (Cloud Sync)
+# ═══════════════════════════════════════════════════════════════
+
+class TestConfigExportImport(unittest.TestCase):
+    """Settings export and import for cross-device sync."""
+
+    def test_export_contains_namespace(self):
+        cfg = DisplayConfig()
+        exported = cfg.export_settings()
+        self.assertEqual(exported['namespace'], 'display')
+        self.assertIn('exported_at', exported)
+
+    def test_export_contains_values(self):
+        cfg = DisplayConfig()
+        cfg.set('scale', 2.0)
+        exported = cfg.export_settings()
+        self.assertEqual(exported['values']['scale'], 2.0)
+
+    def test_import_restores_values(self):
+        cfg = DisplayConfig()
+        data = {'values': {'scale': 1.5, 'brightness': 0.8}}
+        count = cfg.import_settings(data)
+        self.assertEqual(count, 2)
+        self.assertEqual(cfg.get('scale'), 1.5)
+        self.assertEqual(cfg.get('brightness'), 0.8)
+
+    def test_import_ignores_unknown_keys(self):
+        cfg = DisplayConfig()
+        data = {'values': {'scale': 1.5, 'unknown_key': 99}}
+        count = cfg.import_settings(data)
+        self.assertEqual(count, 1)
+
+    def test_round_trip(self):
+        cfg1 = DisplayConfig()
+        cfg1.set('scale', 2.5)
+        cfg1.set('brightness', 0.5)
+        exported = cfg1.export_settings()
+        cfg2 = DisplayConfig()
+        cfg2.import_settings(exported)
+        self.assertEqual(cfg2.get('scale'), 2.5)
+        self.assertEqual(cfg2.get('brightness'), 0.5)
+
+    def test_import_empty(self):
+        cfg = DisplayConfig()
+        count = cfg.import_settings({})
+        self.assertEqual(count, 0)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -111,7 +111,17 @@ class RemoteDesktopOrchestrator:
         svc = get_service_manager()
         ready, msg = svc.ensure_engine(selected_engine)
         if not ready:
-            return {'status': 'error', 'error': msg, 'engine': selected_engine}
+            # Fallback: try native transport if selected engine failed
+            if selected_engine != 'native':
+                logger.warning("Engine '%s' failed (%s), falling back to native transport",
+                               selected_engine, msg)
+                selected_engine = 'native'
+                ready, msg = svc.ensure_engine('native')
+                if not ready:
+                    return {'status': 'error', 'error': f'All engines failed. Last: {msg}',
+                            'engine': selected_engine}
+            else:
+                return {'status': 'error', 'error': msg, 'engine': selected_engine}
 
         # 4. Generate password (OTP)
         from integrations.remote_desktop.session_manager import (
@@ -497,8 +507,19 @@ class RemoteDesktopOrchestrator:
             return False
 
     def _handle_clipboard_outbound(self, session_id: str, engine: str,
-                                    content: str) -> None:
+                                    content: str) -> Optional[dict]:
         """Push local clipboard change to remote via active engine."""
+        # DLP scan clipboard content for PII before sync
+        try:
+            from security.dlp_engine import get_dlp_engine
+            dlp = get_dlp_engine()
+            allowed, reason = dlp.check_outbound(content)
+            if not allowed:
+                logger.warning("Clipboard content blocked by DLP: %s", reason or 'PII detected')
+                return {'synced': False, 'reason': 'DLP blocked'}
+        except (ImportError, Exception):
+            pass
+
         # Each engine handles clipboard differently:
         # - RustDesk: clipboard flows through its own protocol
         # - Sunshine/Moonlight: no cross-clipboard API — use native fallback
@@ -509,6 +530,7 @@ class RemoteDesktopOrchestrator:
             logger.debug(f"Clipboard → remote via native transport ({len(content)} chars)")
         # For RustDesk/Sunshine, clipboard sync is handled by the engine itself.
         # Our clipboard bridge catches what leaks through to ensure nothing is missed.
+        return None
 
     # ── Window Streaming (Tab Detach) ─────────────────────────
 

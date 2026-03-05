@@ -32,6 +32,8 @@ class VRAMManager:
     def __init__(self):
         self._allocations: Dict[str, float] = {}  # tool → GB reserved
         self._gpu_info: Optional[Dict] = None
+        self._gpu_info_ts: float = 0.0  # timestamp of last nvidia-smi call
+        self._refresh_ttl: float = 30.0  # seconds between nvidia-smi calls
 
     # ── GPU Detection ────────────────────────────────────────────
 
@@ -132,9 +134,15 @@ class VRAMManager:
         return info
 
     def refresh_gpu_info(self) -> Dict:
-        """Force re-detect GPU (clears cache)."""
+        """Re-detect GPU with TTL cache (avoids nvidia-smi spam from multiple threads)."""
+        import time as _t
+        now = _t.monotonic()
+        if self._gpu_info is not None and (now - self._gpu_info_ts) < self._refresh_ttl:
+            return self._gpu_info  # recent enough — skip subprocess
         self._gpu_info = None
-        return self.detect_gpu()
+        result = self.detect_gpu()
+        self._gpu_info_ts = _t.monotonic()
+        return result
 
     # ── VRAM queries ─────────────────────────────────────────────
 
