@@ -1284,16 +1284,151 @@ def _response_signals_creation(response_text):
     return any(signal in lower for signal in _RESPONSE_CREATION_SIGNALS)
 
 
+# ─── Perception Watchers (Future TTL) ───────────────────────────────────
+_active_watchers = {}  # user_id -> [{trigger_id, expires_at, condition, action, modality, callback}]
+
+
+def _handle_visual_watcher_tool(input_text):
+    """Register a visual/audio watcher trigger with TTL.
+
+    Input format: 'CONDITION: <condition> | ACTION: <action> | TTL: <minutes>'
+    Optional: '| MODALITY: visual|audio|both' (defaults to visual)
+    """
+    import re
+    import time as _time
+
+    parts = {}
+    for segment in input_text.split('|'):
+        segment = segment.strip()
+        if ':' in segment:
+            key, val = segment.split(':', 1)
+            parts[key.strip().upper()] = val.strip()
+
+    condition = parts.get('CONDITION', input_text)
+    action_text = parts.get('ACTION', 'notify user')
+    ttl_minutes = int(parts.get('TTL', '30'))
+    modality = parts.get('MODALITY', 'visual').lower()
+
+    user_id = thread_local_data.get_user_id() or 'default'
+    trigger_id = f'watcher_{user_id}_{int(_time.time())}'
+    expires_at = _time.time() + (ttl_minutes * 60)
+
+    def _on_trigger(description, **kwargs):
+        """Callback fired when visual trigger matches."""
+        try:
+            from core.platform.events import emit_event
+            emit_event('tts.speak', {'user_id': user_id, 'text': action_text})
+            emit_event('perception.watcher.fired', {
+                'user_id': user_id, 'condition': condition,
+                'action': action_text, 'trigger_id': trigger_id,
+            })
+        except Exception:
+            pass
+
+    # Register with VisionService for visual watchers
+    if modality in ('visual', 'both'):
+        try:
+            from integrations.vision.vision_service import VisionService
+            from core.platform.service_registry import ServiceRegistry
+            vs = ServiceRegistry.get('VisionService')
+            if vs:
+                condition_words = [w for w in condition.lower().split() if len(w) > 3]
+                vs.register_visual_trigger(
+                    channel='camera', callback=_on_trigger,
+                    keywords=condition_words, cooldown_seconds=5,
+                    name=trigger_id,
+                )
+        except Exception:
+            pass
+
+    watcher_entry = {
+        'trigger_id': trigger_id, 'expires_at': expires_at,
+        'condition': condition, 'action': action_text,
+        'modality': modality, 'callback': _on_trigger,
+    }
+
+    if user_id not in _active_watchers:
+        _active_watchers[user_id] = []
+    _active_watchers[user_id].append(watcher_entry)
+
+    return (
+        f"Watcher registered: watching for '{condition}' → will '{action_text}'. "
+        f"TTL: {ttl_minutes} minutes. Modality: {modality}."
+    )
+
+
+def _evaluate_audio_watchers(user_id, transcript):
+    """LLM-powered evaluation of audio watchers against transcript."""
+    import time as _time
+    watchers = [w for w in _active_watchers.get(user_id, [])
+                if w['modality'] in ('audio', 'both') and _time.time() < w['expires_at']]
+    if not watchers:
+        return
+
+    conditions = "\n".join(f"- Watcher {i+1}: {w['condition']}" for i, w in enumerate(watchers))
+
+    try:
+        llm = get_llm(temperature=0.1, max_tokens=200)
+        result = llm.invoke(
+            f"The user just said: \"{transcript}\"\n\n"
+            f"Active watchers:\n{conditions}\n\n"
+            f"Which watcher conditions (if any) are semantically triggered by what the user said? "
+            f"Return ONLY a JSON array of triggered watcher numbers, e.g. [1, 3]. "
+            f"Return [] if none match."
+        )
+        import re as _re
+        text = (result.content if hasattr(result, 'content') else str(result)).strip()
+        match = _re.search(r'\[.*?\]', text)
+        if match:
+            triggered = json.loads(match.group())
+            for idx in triggered:
+                if 1 <= idx <= len(watchers):
+                    w = watchers[idx - 1]
+                    if w.get('callback'):
+                        w['callback'](transcript)
+    except Exception as e:
+        app.logger.debug(f"Audio watcher eval failed: {e}")
+
+
+def _push_workflow_flowchart(user_id, prompt_id, request_id=None):
+    """Push recipe JSON to frontend via Crossbar for interactive flowchart rendering."""
+    try:
+        recipe_path = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
+        if not os.path.isfile(recipe_path):
+            return
+        with open(recipe_path) as f:
+            recipe_data = json.load(f)
+        crossbar_message = {
+            "text": ["Agent workflow ready"],
+            "priority": 50,
+            "action": "WorkflowFlowchart",
+            "recipe": recipe_data,
+            "request_id": request_id or "0",
+            "prompt_id": prompt_id,
+            "historical_request_id": [],
+            "options": [], "newoptions": [],
+        }
+        publish_async(f'com.hertzai.hevolve.chat.{user_id}', json.dumps(crossbar_message))
+    except Exception:
+        pass
+
+
 def _handle_agentic_router_tool(input_text):
     """Tool handler: LLM detected a multi-step agentic task.
 
     Called by the LangChain agent when a prompt needs multi-step execution.
-    Builds a plan using ExpertAgentRegistry + user recipes, sets thread-local
-    flags that the /chat handler checks after get_ans() returns.
+    Builds a plan using LLM-powered agent matching + plan generation,
+    sets thread-local flags that the /chat handler checks after get_ans() returns.
     """
     try:
+        import concurrent.futures
         from integrations.agentic_router import build_agentic_plan
-        plan = build_agentic_plan(input_text, PROMPTS_DIR)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(build_agentic_plan, input_text, PROMPTS_DIR)
+            try:
+                plan = future.result(timeout=15)
+            except concurrent.futures.TimeoutError:
+                return f"I'll help you with: {input_text}. Let me work on this directly."
 
         thread_local_data.set_agentic_routing(
             task_description=plan['task_description'],
@@ -1493,6 +1628,20 @@ def get_tools(req_tool, is_first: bool = False):
                 name="Visual_Context_Camera",
                 func=parse_visual_context,
                 description="To see user or if there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input to this tool function should be the user query/input. Only if last 16 seconds Visual Context information is present & is enough, then use that to craft a better creative, better, cohesive, correlated , summarised natural response, format this tool response togather with Previous 15 minutes Visual Context information if you are seeing the scene via videocall from the other end. If there are more than 1 person try to give an identity to each across frames to track the subjects through time by framing the tool input accordingly."
+            ),
+            Tool(
+                name="Visual_Context_Watcher",
+                func=_handle_visual_watcher_tool,
+                description=(
+                    "Register a visual or audio trigger: continuously watch what the user is doing "
+                    "via camera or listen to what they say, and perform an action when a condition is met. "
+                    "Input format: 'CONDITION: <what to watch for> | ACTION: <what to do> | TTL: <minutes>'. "
+                    "Optional: '| MODALITY: visual|audio|both' (defaults to visual). "
+                    "Example: 'CONDITION: user raises hand | ACTION: say banana | TTL: 30'. "
+                    "Example: 'CONDITION: user mentions their dog | ACTION: remind them about vet appointment | TTL: 60 | MODALITY: audio'. "
+                    "The watcher runs in the background and fires the action whenever the condition "
+                    "is detected. TTL auto-expires the watcher."
+                ),
             ),
             Tool(
                 name="Create_Agent",
@@ -3614,12 +3763,14 @@ def chat():
             # Fall through to the existing prompt_id routing below
         else:
             # No matching agent — auto-create one, then execute
-            new_prompt_id = _next_prompt_id()
+            # Reuse prompt_id from Plan Mode response if available
+            new_prompt_id = prompt_id if prompt_id else _next_prompt_id()
             auto_response = _autonomous_gather_info(user_id, prompt, new_prompt_id)
             review_agents[user_id] = True
             _touch_agent_timestamp(user_id)
             _record_lifecycle('Review Mode', user_id, new_prompt_id,
                               f'Agentic auto-creation: {prompt[:100]}')
+            _push_workflow_flowchart(user_id, new_prompt_id, request_id)
             return jsonify({
                 'response': auto_response,
                 'intent': ['FINAL_ANSWER'],
@@ -3701,6 +3852,7 @@ def chat():
                     conversation_agent[user_id] = False
                     _touch_agent_timestamp(user_id)
                 _record_lifecycle('Review Mode', user_id, prompt_id, f'Autonomous creation via dispatch: {prompt[:100]}')
+                _push_workflow_flowchart(user_id, prompt_id, request_id)
                 return jsonify({'response': auto_response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [], 'Agent_status': 'Review Mode', 'autonomous_creation': True, 'prompt_id': prompt_id})
             from gather_agentdetails import gather_info
 
@@ -3795,6 +3947,7 @@ def chat():
                     # Completed (or forced completion after max turns)
                     app.logger.info('COMPLETED STATUS')
                     _save_and_enter_review(new_res)
+                    _push_workflow_flowchart(user_id, prompt_id, request_id)
                     return jsonify({'response': 'Got Agent details successfully lets move on to review them one at a time', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Review Mode', 'prompt_id': prompt_id})
 
             except Exception as e:
@@ -3833,6 +3986,7 @@ def chat():
                 except Exception as e:
                     app.logger.debug(f"Social agent bridge skipped: {e}")
                 _record_lifecycle('completed', user_id, prompt_id, 'Agent creation completed successfully')
+                _push_workflow_flowchart(user_id, prompt_id, request_id)
                 return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'completed'})
             _record_lifecycle('Review Mode', user_id, prompt_id, 'Agent details being reviewed')
             return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Review Mode'})
