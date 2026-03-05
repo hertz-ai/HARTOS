@@ -118,10 +118,22 @@
     enable = true;
     settings.PermitRootLogin = "yes";
     settings.PermitEmptyPasswords = "yes";
+    settings.PasswordAuthentication = true;
   };
 
-  # Set empty root password for live ISO access
-  users.users.root.initialHashedPassword = "";
+  # SSH key + password auth for dev machine access
+  users.users.root = {
+    initialHashedPassword = lib.mkForce "$6$6eou36tyKBY.i3XA$bTuCl2eaJaTOYCELTsal6N/acBlksH8fZ5/ugH/jlLdzFfUQkCEoLrmhh8mXimAwybvrQCjKqmYAAio9Ta4p41";
+    openssh.authorizedKeys.keys = [
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJZsU51nixnLUQMV/T4IeXruPZBfe17rB00pNb/WQEDc sathish@hertzai.com"
+    ];
+  };
+  users.users.nixos = {
+    initialHashedPassword = lib.mkForce "$6$6eou36tyKBY.i3XA$bTuCl2eaJaTOYCELTsal6N/acBlksH8fZ5/ugH/jlLdzFfUQkCEoLrmhh8mXimAwybvrQCjKqmYAAio9Ta4p41";
+    openssh.authorizedKeys.keys = [
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJZsU51nixnLUQMV/T4IeXruPZBfe17rB00pNb/WQEDc sathish@hertzai.com"
+    ];
+  };
 
   # Headless: no desktop
   services.xserver.enable = false;
