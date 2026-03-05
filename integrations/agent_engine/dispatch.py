@@ -270,7 +270,10 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     # to port 6777 (which doesn't run as a separate server in bundled mode).
     if os.environ.get('NUNBA_BUNDLED'):
         try:
-            from hartos_backend_adapter import chat as hevolve_chat
+            try:
+                from routes.hartos_backend_adapter import chat as hevolve_chat
+            except ImportError:
+                from hartos_backend_adapter import chat as hevolve_chat
             result = hevolve_chat(
                 text=prompt,
                 user_id=user_id,

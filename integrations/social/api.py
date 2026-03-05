@@ -2714,7 +2714,10 @@ def theme_generate():
 
     # Try LLM generation first
     try:
-        from hartos_backend_adapter import chat as _adapter_chat
+        try:
+            from routes.hartos_backend_adapter import chat as _adapter_chat
+        except ImportError:
+            from hartos_backend_adapter import chat as _adapter_chat
         schema_hint = '{"colors":{"background":"#hex","paper":"#hex","primary":"#hex","primary_light":"#hex","primary_dark":"#hex","secondary":"#hex","accent":"#hex","text_primary":"#hex"}}'
         system_prompt = (
             "You are a UI theme designer for a dark-mode social platform. "
