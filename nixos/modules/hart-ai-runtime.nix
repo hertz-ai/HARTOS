@@ -608,9 +608,9 @@ in
                             json={'prompt': f'Describe this file in 10 words: {os.path.basename(path)} ({stat.st_size} bytes)'},
                             timeout=10
                         )
-                        description = resp.json().get('response', '')
+                        description = resp.json().get('response', '''')
                     except Exception:
-                        description = ''
+                        description = ''''
 
                     entry = {
                         'path': path,

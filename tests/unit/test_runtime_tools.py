@@ -173,7 +173,7 @@ class TestVRAMManager:
     def test_detect_gpu_with_cuda(self, mock_reserved, mock_alloc,
                                    mock_props, mock_name, mock_avail,
                                    mock_smi, vm):
-        mock_props.return_value = MagicMock(total_mem=8 * 1024**3)
+        mock_props.return_value = MagicMock(total_memory=8 * 1024**3)
         vm._gpu_info = None
         info = vm.detect_gpu()
         assert info['cuda_available'] is True

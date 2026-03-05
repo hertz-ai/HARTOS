@@ -90,7 +90,7 @@ def health():
         import torch
         if torch.cuda.is_available():
             status['gpu'] = torch.cuda.get_device_name(0)
-            status['vram_total_gb'] = round(torch.cuda.get_device_properties(0).total_mem / 1e9, 2)
+            status['vram_total_gb'] = round(torch.cuda.get_device_properties(0).total_memory / 1e9, 2)
             status['vram_used_gb'] = round(torch.cuda.memory_allocated(0) / 1e9, 2)
     except ImportError:
         pass
@@ -159,6 +159,8 @@ def unload():
         import torch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
     except ImportError:
         pass
     return jsonify({'status': 'unloaded'})

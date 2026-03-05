@@ -29,16 +29,22 @@ class MiniCPMInstaller:
         self._gpu_available = False
 
     def detect_gpu(self) -> bool:
-        """Check if CUDA GPU is available."""
+        """Check if a compatible GPU is available (CUDA or Apple Metal/MPS)."""
         try:
             import torch
-            self._gpu_available = torch.cuda.is_available()
-            if self._gpu_available:
+            if torch.cuda.is_available():
+                self._gpu_available = True
                 name = torch.cuda.get_device_name(0)
-                mem = torch.cuda.get_device_properties(0).total_mem / (1024**3)
-                logger.info(f"GPU detected: {name} ({mem:.1f} GB)")
+                mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                logger.info(f"CUDA GPU detected: {name} ({mem:.1f} GB)")
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                self._gpu_available = True
+                import platform
+                chip = platform.processor() or 'Apple Silicon'
+                logger.info(f"Apple Metal (MPS) detected: {chip}")
             else:
-                logger.warning("No CUDA GPU detected — MiniCPM requires GPU")
+                self._gpu_available = False
+                logger.warning("No compatible GPU detected — MiniCPM requires GPU")
             return self._gpu_available
         except ImportError:
             logger.warning("PyTorch not installed — cannot detect GPU")

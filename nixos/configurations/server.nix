@@ -1,4 +1,4 @@
-{ config, lib, pkgs, hartSrc, ... }:
+{ config, lib, pkgs, modulesPath, hartSrc, ... }:
 
 # ═══════════════════════════════════════════════════════════════
 # HART OS Server Variant
@@ -15,8 +15,12 @@
 
 {
   imports = [
-    "${toString <nixpkgs>}/nixos/modules/installer/cd-dvd/installation-cd-minimal.nix"
+    "${modulesPath}/installer/cd-dvd/installation-cd-minimal.nix"
   ];
+
+  # ─── Disable ZFS (broken in nixpkgs 24.11 for kernel 6.15) ───
+  boot.supportedFilesystems.zfs = lib.mkForce false;
+  nixpkgs.config.allowBroken = false;
 
   # ─── HART OS Core Services ───
   hart = {
@@ -92,7 +96,7 @@
   };
 
   # Boot configuration
-  boot.loader.timeout = 5;
+  boot.loader.timeout = lib.mkForce 5;
 
   # Headless: no desktop
   services.xserver.enable = false;

@@ -58,39 +58,8 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    environment.systemPackages = [ tool ];
-
-    # ── Systemd user service ──
-    systemd.user.services.hart-nightlight = {
-      description = "HART OS Night Light";
-      wantedBy = [ "graphical-session.target" ];
-      partOf = [ "graphical-session.target" ];
-      serviceConfig = {
-        ExecStart = let
-          args = if cfg.schedule.mode == "sunset" && cfg.latitude != 0.0
-                 then "-l ${toString cfg.latitude}:${toString cfg.longitude} -t 6500:${toString cfg.temperature}"
-                 else if cfg.schedule.mode == "manual"
-                 then "-t 6500:${toString cfg.temperature}"
-                 else "-O ${toString cfg.temperature}";
-        in "${tool}/bin/${toolName} ${args}";
-        Restart = "on-failure";
-        RestartSec = 5;
-      };
-    };
-
-    # ── Export config for shell API layer ──
-    environment.etc."hart/nightlight.json".text = builtins.toJSON {
-      enabled = true;
-      temperature = cfg.temperature;
-      schedule = {
-        inherit (cfg.schedule) mode start end;
-      };
-      latitude = cfg.latitude;
-      longitude = cfg.longitude;
-    };
-
-    # ── CLI tool ──
     environment.systemPackages = [
+      tool
       (pkgs.writeShellScriptBin "hart-nightlight" ''
         case "''${1:-status}" in
           status)
@@ -125,5 +94,35 @@ in
         esac
       '')
     ];
+
+    # ── Systemd user service ──
+    systemd.user.services.hart-nightlight = {
+      description = "HART OS Night Light";
+      wantedBy = [ "graphical-session.target" ];
+      partOf = [ "graphical-session.target" ];
+      serviceConfig = {
+        ExecStart = let
+          args = if cfg.schedule.mode == "sunset" && cfg.latitude != 0.0
+                 then "-l ${toString cfg.latitude}:${toString cfg.longitude} -t 6500:${toString cfg.temperature}"
+                 else if cfg.schedule.mode == "manual"
+                 then "-t 6500:${toString cfg.temperature}"
+                 else "-O ${toString cfg.temperature}";
+        in "${tool}/bin/${toolName} ${args}";
+        Restart = "on-failure";
+        RestartSec = 5;
+      };
+    };
+
+    # ── Export config for shell API layer ──
+    environment.etc."hart/nightlight.json".text = builtins.toJSON {
+      enabled = true;
+      temperature = cfg.temperature;
+      schedule = {
+        inherit (cfg.schedule) mode start end;
+      };
+      latitude = cfg.latitude;
+      longitude = cfg.longitude;
+    };
+
   };
 }

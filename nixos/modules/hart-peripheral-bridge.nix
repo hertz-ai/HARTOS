@@ -42,12 +42,16 @@ in
 
   config = lib.mkIf (cfg.enable && config.hart.peripheralBridge.enable) {
 
-    # ── USB/IP kernel modules + service ────────────────────────
-    boot.kernelModules = lib.mkIf config.hart.peripheralBridge.usbip.enable [
-      "usbip-core"
-      "usbip-host"
-      "vhci-hcd"      # Virtual Host Controller (viewer side)
-    ];
+    # ── USB/IP + gamepad kernel modules ─────────────────────────
+    boot.kernelModules =
+      (lib.optionals config.hart.peripheralBridge.usbip.enable [
+        "usbip-core"
+        "usbip-host"
+        "vhci-hcd"      # Virtual Host Controller (viewer side)
+      ]) ++
+      (lib.optionals config.hart.peripheralBridge.gamepad.enable [
+        "uinput"
+      ]);
 
     systemd.services.hart-usbipd = lib.mkIf config.hart.peripheralBridge.usbip.enable {
       description = "HART USB/IP Daemon";
@@ -77,9 +81,7 @@ in
     };
 
     # ── Gamepad / uinput ───────────────────────────────────────
-    boot.kernelModules = lib.mkIf config.hart.peripheralBridge.gamepad.enable [
-      "uinput"
-    ];
+    # (kernel module "uinput" merged into boot.kernelModules above)
 
     # udev rules for gamepad + uinput access
     services.udev.extraRules = lib.mkIf config.hart.peripheralBridge.gamepad.enable ''
@@ -89,10 +91,9 @@ in
       KERNEL=="uinput", GROUP="hart", MODE="0660"
     '';
 
-    # ── Python dependencies ────────────────────────────────────
-    hart.pythonExtraPackages = ps: with ps; [
-      (lib.optional config.hart.peripheralBridge.bluetooth.enable dbus-python)
-      evdev
+    # ── Python dependencies (via system packages) ──────────────
+    environment.systemPackages = lib.mkIf config.hart.peripheralBridge.gamepad.enable [
+      (pkgs.python3.withPackages (ps: [ ps.evdev ]))
     ];
 
     # ── Firewall: USB/IP default port ──────────────────────────

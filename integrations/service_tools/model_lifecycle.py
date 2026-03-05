@@ -624,6 +624,8 @@ class ModelLifecycleManager:
                         import torch
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
+                        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                            torch.mps.empty_cache()
                     return True
             except Exception as e:
                 logger.debug(f"Whisper CPU offload failed: {e}")
