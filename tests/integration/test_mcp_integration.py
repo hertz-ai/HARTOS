@@ -16,6 +16,8 @@ import sys
 import time
 import requests
 import json
+import pytest
+pytest.importorskip('mcp_integration', reason='mcp_integration module not available')
 from mcp_integration import load_user_mcp_servers, mcp_registry
 
 def test_mcp_server_running():

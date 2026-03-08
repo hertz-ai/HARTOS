@@ -18,6 +18,11 @@ logger = logging.getLogger('hevolve_social')
 # Track which tasks we've already sent HITL notifications for (avoid spam)
 _hitl_notified: set = set()
 
+# Goals that are budget-blocked are immediately paused (no retries).
+# Previously we retried 3 times, but that just re-dispatches a blocked goal
+# every 30 seconds with no chance of success (budget doesn't change between ticks).
+_budget_blocked_goals: set = set()
+
 
 def _get_blocked_hitl_tasks(ledger, goal_id):
     """Get tasks blocked with APPROVAL_REQUIRED under a goal."""
@@ -74,6 +79,9 @@ class AgentDaemon:
         self._tick_count = 0
         self._remediate_every = int(os.environ.get(
             'HEVOLVE_REMEDIATE_INTERVAL_TICKS', '10'))
+        # Cache SmartLedger instances by (agent_id, session_id) to avoid
+        # re-creating them every tick (which spams "starting fresh" logs).
+        self._ledger_cache: dict = {}
 
     def start(self):
         with self._lock:
@@ -142,13 +150,20 @@ class AgentDaemon:
         """Get a SmartLedger for a goal's task graph (if one exists).
 
         Returns None when no ledger exists or it has only 1 task (no parallelism).
+        Ledger instances are cached on self._ledger_cache to avoid re-creating
+        (and re-logging "starting fresh") on every daemon tick.
         """
         try:
             from agent_ledger import SmartLedger
             goal_id = str(goal.id) if hasattr(goal, 'id') else ''
             user_id = str(goal.user_id) if hasattr(goal, 'user_id') else 'system'
 
-            ledger = SmartLedger(agent_id=user_id, session_id=str(goal_id))
+            cache_key = (user_id, goal_id)
+            ledger = self._ledger_cache.get(cache_key)
+            if ledger is None:
+                ledger = SmartLedger(agent_id=user_id, session_id=str(goal_id))
+                self._ledger_cache[cache_key] = ledger
+
             # Use the ledger's resolved dir (handles bundled/read-only fallback)
             ledger_path = str(ledger.ledger_file)
             if os.path.isfile(ledger_path):
@@ -200,6 +215,21 @@ class AgentDaemon:
         from .goal_manager import GoalManager
         from .dispatch import dispatch_goal
 
+        # RESOURCE GATE: throttle dispatch when system is under pressure
+        # Prevents machine slowness while Nunba/HARTOS is running
+        try:
+            from integrations.service_tools.model_lifecycle import (
+                get_model_lifecycle_manager)
+            _pressure = get_model_lifecycle_manager().get_system_pressure()
+            _throttle = _pressure.get('throttle_factor', 1.0)
+            if _throttle < 0.1:
+                logger.debug(
+                    "Agent daemon: system under heavy pressure "
+                    f"(throttle={_throttle:.2f}), skipping dispatch")
+                return
+        except Exception:
+            _throttle = 1.0
+
         speculative_enabled = os.environ.get(
             'HEVOLVE_SPECULATIVE_ENABLED', 'false').lower() == 'true'
 
@@ -230,6 +260,8 @@ class AgentDaemon:
             dispatched = 0
             used_agents = set()
             max_concurrent = int(os.environ.get('HEVOLVE_AGENT_MAX_CONCURRENT', '10'))
+            # Reduce concurrency proportional to system pressure
+            max_concurrent = max(1, int(max_concurrent * _throttle))
 
             for goal in goals:
                 if dispatched >= len(idle_agents) or dispatched >= max_concurrent:
@@ -257,6 +289,40 @@ class AgentDaemon:
 
                 # Build prompt using registered builder (guardrail: togetherness rewrite)
                 prompt = GoalManager.build_prompt(goal.to_dict(), product_dict)
+
+                # BUDGET GATE: check goal budget + platform affordability
+                try:
+                    from .budget_gate import pre_dispatch_budget_gate
+                    goal_key = str(goal.id)
+
+                    # Skip goals already known to be budget-blocked (avoids
+                    # re-checking every 30s when nothing has changed).
+                    if goal_key in _budget_blocked_goals:
+                        continue
+
+                    bg_allowed, bg_reason = pre_dispatch_budget_gate(goal.id, prompt)
+                    if not bg_allowed:
+                        # Immediately pause — budget won't change between daemon
+                        # ticks, so retrying is wasteful.
+                        goal.status = 'paused'
+                        cfg = goal.config_json or {}
+                        cfg['pause_reason'] = (
+                            f'Auto-paused: budget gate blocked. '
+                            f'Reason: {bg_reason}')
+                        cfg['paused_at'] = datetime.utcnow().isoformat()
+                        goal.config_json = cfg
+                        _budget_blocked_goals.add(goal_key)
+                        logger.info(
+                            f"Goal {goal.id} AUTO-PAUSED by budget gate: "
+                            f"{bg_reason}")
+                        continue
+                    else:
+                        # Budget passed — clear from blocked set if it was
+                        # previously blocked (e.g. goal was resumed with
+                        # more budget).
+                        _budget_blocked_goals.discard(goal_key)
+                except ImportError:
+                    pass
 
                 # GUARDRAIL: full pre-dispatch gate
                 try:
@@ -296,10 +362,11 @@ class AgentDaemon:
 
             # ── HITL: notify owners of APPROVAL_REQUIRED tasks ──
             try:
-                from agent_ledger.core import SmartLedger
-                ledger = SmartLedger()
                 for goal in goals:
                     if goal.goal_type != 'thought_experiment':
+                        continue
+                    ledger = self._get_goal_ledger(goal)
+                    if not ledger:
                         continue
                     ledger_tasks = _get_blocked_hitl_tasks(ledger, goal.id)
                     for task in ledger_tasks:
@@ -381,6 +448,19 @@ class AgentDaemon:
                         logger.info(f"Self-healing: created {fix_count} fix goal(s)")
                 except Exception as e:
                     logger.debug(f"Self-healing check: {e}")
+
+            # Revenue → trading funding: every 5th remediation cycle
+            if self._tick_count % (self._remediate_every * 5) == 0:
+                try:
+                    from .revenue_aggregator import get_revenue_aggregator
+                    rev = get_revenue_aggregator()
+                    fund_result = rev.check_and_fund_trading(db)
+                    if fund_result.get('funded'):
+                        logger.info(
+                            f"Revenue aggregator: funded trading with "
+                            f"{fund_result['amount']} Spark")
+                except Exception as e:
+                    logger.debug(f"Revenue funding check: {e}")
 
             # Baseline intelligence check: re-snapshot when world model stats shift
             if self._tick_count % (self._remediate_every * 2) == 0:

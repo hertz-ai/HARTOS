@@ -1,13 +1,13 @@
 @echo off
 REM ============================================================
-REM HevolveBot LangChain Agent - Server Startup Script
+REM HART OS - Server Startup Script
 REM ============================================================
 REM This is the RECOMMENDED way to start the server.
 REM Starts the Flask API server on port 6777 using Waitress.
 REM ============================================================
 
 echo ========================================
-echo  Starting HevolveBot LangChain Agent
+echo  Starting HART OS
 echo  Flask API Server (port 6777)
 echo ========================================
 echo.

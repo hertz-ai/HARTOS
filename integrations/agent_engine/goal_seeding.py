@@ -199,7 +199,7 @@ SEED_BOOTSTRAP_GOALS = [
         'description': (
             'Make the business self-sustaining with Vijai personality: '
             '1) Use get_financial_health to monitor platform revenue and costs, '
-            '2) Use track_revenue_split to verify 90/10 compliance every period, '
+            '2) Use track_revenue_split to verify 90/9/1 compliance every period, '
             '3) Use assess_sustainability to determine if revenue covers infrastructure, '
             '4) Use manage_invite_participation to review private core access agreements. '
             'No code merges without review against vision, mission, goals, constitution. '
@@ -446,6 +446,96 @@ SEED_BOOTSTRAP_GOALS = [
         ),
         'config': {
             'mode': 'coordinator',
+            'continuous': True,
+        },
+        'spark_budget': 200,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_paper_trader_longterm',
+        'goal_type': 'trading',
+        'title': 'Paper Trading: Diversified Long-Term Portfolio',
+        'description': (
+            'Manage a diversified long-term paper portfolio: '
+            '1) Analyse market sentiment for BTC, ETH, and top-10 assets, '
+            '2) Build positions based on fundamental + sentiment analysis, '
+            '3) Monthly rebalance — max 25% per asset, '
+            '4) Track P&L and win rate with get_portfolio_status. '
+            'All trades are paper (simulated). Halt at 10% cumulative loss.'
+        ),
+        'config': {
+            'strategy': 'long_term',
+            'paper_trading': True,
+            'market': 'crypto',
+            'max_budget': 10000,
+            'max_loss_pct': 10,
+        },
+        'spark_budget': 200,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_paper_trader_intraday',
+        'goal_type': 'trading',
+        'title': 'Paper Trading: Intraday Technical BTC/ETH',
+        'description': (
+            'Run intraday paper trades on BTC and ETH: '
+            '1) Use get_technical_indicators for RSI, MACD, Bollinger Bands, '
+            '2) Enter only on signal confluence (2+ indicators agree), '
+            '3) Max 2% risk per trade, mandatory stop-loss, '
+            '4) Review trades with get_trade_history after each session. '
+            'Paper-only mode. Halt at 10% cumulative loss.'
+        ),
+        'config': {
+            'strategy': 'intraday',
+            'paper_trading': True,
+            'market': 'crypto',
+            'max_budget': 5000,
+            'max_loss_pct': 10,
+        },
+        'spark_budget': 150,
+        'use_product': False,
+    },
+    # ─── Civic Sentinel — Autonomous Transparency Agent ───
+    {
+        'slug': 'bootstrap_civic_sentinel',
+        'goal_type': 'civic_sentinel',
+        'title': 'Autonomous Community Transparency & Accountability Monitor',
+        'description': (
+            'Autonomous agent that monitors public discourse for censorship and '
+            'political hypocrisy. Not tied to any user — serves the community. '
+            'Captures evidence when citizen voices are suppressed by biased moderators. '
+            'Digs up historical articles proving contradictions between political '
+            "parties' claimed values and their actual actions. Cross-references across "
+            'communities. Posts findings publicly with legal-grade citations. '
+            'Evaluates flags autonomously — if a propaganda group flags legitimate '
+            'criticism, the agent counter-flags with evidence. '
+            'If the agent misbehaves, users raise concerns through community '
+            'voting — not political bodies or paid mods.'
+        ),
+        'config': {
+            'channels': ['all'],
+            'auto_detect_topics': True,
+            'autonomous': True,
+            'post_findings_publicly': True,
+            'governance': 'community_vote',
+        },
+        'spark_budget': 150,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_revenue_trading_pipeline',
+        'goal_type': 'finance',
+        'title': 'Revenue-to-Trading Pipeline Monitor',
+        'description': (
+            'Monitor platform revenue accumulation and trigger trading funding: '
+            '1) Use get_financial_health to check revenue streams, '
+            '2) When platform excess exceeds threshold, fund paper trading goals, '
+            '3) Track trading P&L and distribute simulated profits, '
+            '4) Report revenue dashboard metrics. '
+            'Revenue → Spark → trading → reinvestment cycle.'
+        ),
+        'config': {
+            'mode': 'revenue_pipeline',
             'continuous': True,
         },
         'spark_budget': 200,

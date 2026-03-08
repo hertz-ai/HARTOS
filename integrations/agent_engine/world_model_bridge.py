@@ -189,6 +189,39 @@ class WorldModelBridge:
         self._consent_cache[user_id] = (consent, now)
         return consent
 
+    # U3: Hive participation opt-out (reuses consent cache pattern)
+    def _has_hive_participation(self, user_id: str) -> bool:
+        """Check if user has hive participation enabled (default: True).
+
+        Users can opt out via User.settings['hive_participation'] = False.
+        Cached alongside cloud consent (same TTL).
+        """
+        if not user_id:
+            return True  # Default participate if no user context
+
+        cache_key = f"hive_{user_id}"
+        now = time.time()
+        cached = self._consent_cache.get(cache_key)
+        if cached and now - cached[1] < self._consent_cache_ttl:
+            return cached[0]
+
+        participate = True
+        try:
+            from integrations.social.models import get_db, User
+            db = get_db()
+            try:
+                user = db.query(User).filter_by(id=user_id).first()
+                if user:
+                    participate = bool(
+                        (user.settings or {}).get('hive_participation', True))
+            finally:
+                db.close()
+        except Exception:
+            pass
+
+        self._consent_cache[cache_key] = (participate, now)
+        return participate
+
     # ─── CCT (Compute Contribution Token) gating ──────────────────
 
     def _load_cached_cct(self) -> Optional[str]:
@@ -542,6 +575,11 @@ class WorldModelBridge:
         CCT gating: requires 'hivemind_query' capability. Without valid CCT,
         returns cached/stale response (graceful degradation, not hard block).
         """
+        # U3: Check hive participation setting
+        if user_id and not self._has_hive_participation(user_id):
+            logger.debug(f"HiveMind query skipped: user {user_id} opted out of hive")
+            return None
+
         # CCT access gate (graceful: degrade to cached, don't block)
         if not self._check_cct_access('hivemind_query'):
             logger.debug("HiveMind query: no CCT with hivemind_query capability")
@@ -577,6 +615,7 @@ class WorldModelBridge:
                     local_agent_id=getattr(
                         self._hive_mind, '_local_agent_id', 'local'),
                     timeout_ms=timeout_ms,
+                    **({"owner_id": user_id} if user_id else {}),
                 )
                 with self._lock:
                     self._stats['total_hivemind_queries'] += 1

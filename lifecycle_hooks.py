@@ -12,6 +12,11 @@ import os
 import threading
 from typing import Dict, Optional, Any
 
+try:
+    from helper import PROMPTS_DIR
+except ImportError:
+    PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
+
 logger = logging.getLogger(__name__)
 
 # Lock protecting _ledger_registry and action_states (accessed by multiple Waitress/Gunicorn threads)
@@ -66,6 +71,27 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState')
     except Exception as e:
         logger.error(f"Failed to auto-sync to ledger: {e}", exc_info=True)
 
+    # Audit log: record state transition
+    try:
+        from security.immutable_audit_log import get_audit_log
+        get_audit_log().log_event(
+            'state_change', actor_id=user_prompt,
+            action=f'{task_id} → {state.value}',
+            detail={'action_id': action_id, 'state': state.value})
+    except Exception:
+        pass  # Audit log is best-effort, never blocks state transitions
+
+    # Broadcast state change to EventBus
+    try:
+        from core.platform.events import emit_event
+        emit_event('action_state.changed', {
+            'action_id': action_id,
+            'state': state.value,
+            'prompt': user_prompt,
+        })
+    except Exception:
+        pass
+
 # Import ledger types for sync function (lazy import to avoid circular deps)
 def _get_ledger_task_status():
     """Lazy import to avoid circular dependencies"""
@@ -95,6 +121,8 @@ class ActionState(Enum):
     TERMINATED = "terminated"                     # 11. Action passed to chat instructor and Terminate issued
     EXECUTING_MOTION = "executing_motion"         # 12. Physical action executing via WorldModelBridge
     SENSOR_CONFIRM = "sensor_confirm"             # 13. Waiting for sensor confirmation of physical outcome
+    PREVIEW_PENDING = "preview_pending"           # 14. Destructive action awaiting user approval
+    PREVIEW_APPROVED = "preview_approved"         # 15. User approved destructive action, proceed
 
 
 # Add to lifecycle_hooks.py
@@ -129,6 +157,17 @@ class ActionRetryTracker:
 
         if count > self.MAX_PENDING_RETRIES:
             logger.warning(f"[RETRY LIMIT] Action {action_id} has been PENDING {count} times - forcing to ERROR state")
+            # Emit retry exhaustion event so other subsystems can react
+            try:
+                from core.platform.events import emit_event
+                emit_event('action.retry_exhausted', {
+                    'action_id': action_id,
+                    'prompt': user_prompt,
+                    'retry_count': count,
+                    'max_retries': self.MAX_PENDING_RETRIES,
+                })
+            except Exception:
+                pass
             return True  # Exceeded threshold
 
         logger.info(f"[RETRY TRACKING] Action {action_id} pending count: {count}/{self.MAX_PENDING_RETRIES}")
@@ -190,6 +229,19 @@ def set_action_state(user_prompt: str, action_id: int, state: ActionState, reaso
 
     # Auto-sync to ledger if registered
     _auto_sync_to_ledger(user_prompt, action_id, state)
+
+    # Advisory consent check — log when data_access consent is missing (never blocks)
+    if state == ActionState.IN_PROGRESS:
+        try:
+            from integrations.social.consent_service import ConsentService
+            from integrations.social.models import db_session
+            with db_session(commit=False) as db:
+                if not ConsentService.check_consent(db, user_prompt, 'data_access'):
+                    logger.info(
+                        f"[CONSENT] No data_access consent for user={user_prompt}, "
+                        f"action={action_id} (advisory only)")
+        except Exception:
+            pass  # Consent check is advisory, never blocks execution
 
     # Telemetry recording for recipe experience
     try:
@@ -303,7 +355,7 @@ def validate_state_transition(user_prompt: str, action_id: int, new_state: Actio
     current_state = get_action_state(user_prompt, action_id)
 
     valid_transitions = {
-        ActionState.ASSIGNED: [ActionState.IN_PROGRESS, ActionState.ASSIGNED],
+        ActionState.ASSIGNED: [ActionState.IN_PROGRESS, ActionState.ASSIGNED, ActionState.PREVIEW_PENDING],
         ActionState.IN_PROGRESS: [ActionState.STATUS_VERIFICATION_REQUESTED, ActionState.IN_PROGRESS],
         ActionState.STATUS_VERIFICATION_REQUESTED: [ActionState.COMPLETED, ActionState.PENDING, ActionState.ERROR, ActionState.STATUS_VERIFICATION_REQUESTED],
         ActionState.COMPLETED: [ActionState.FALLBACK_REQUESTED, ActionState.RECIPE_REQUESTED, ActionState.TERMINATED, ActionState.COMPLETED],  # Allow direct recipe request (autonomous) or termination
@@ -314,7 +366,10 @@ def validate_state_transition(user_prompt: str, action_id: int, new_state: Actio
         ActionState.FALLBACK_RECEIVED: [ActionState.RECIPE_REQUESTED, ActionState.FALLBACK_RECEIVED],
         ActionState.RECIPE_REQUESTED: [ActionState.RECIPE_RECEIVED, ActionState.RECIPE_REQUESTED],
         ActionState.RECIPE_RECEIVED: [ActionState.TERMINATED, ActionState.RECIPE_RECEIVED],
-        ActionState.TERMINATED: [ActionState.ASSIGNED]  # Final state but an entire actions can be updated and hence can go to assigned state again
+        ActionState.TERMINATED: [ActionState.ASSIGNED],  # Final state but an entire actions can be updated and hence can go to assigned state again
+        # Preview states (opt-in for destructive actions)
+        ActionState.PREVIEW_PENDING: [ActionState.PREVIEW_APPROVED, ActionState.ERROR, ActionState.TERMINATED],
+        ActionState.PREVIEW_APPROVED: [ActionState.IN_PROGRESS],
     }
 
     allowed = valid_transitions.get(current_state, [])
@@ -326,8 +381,21 @@ def validate_state_transition(user_prompt: str, action_id: int, new_state: Actio
     return True
 
 
-def lifecycle_hook_track_action_assignment(user_prompt: str, user_tasks, group_chat) -> bool:
-    """1. Track when action is assigned from array"""
+def lifecycle_hook_track_action_assignment(user_prompt: str, user_tasks, group_chat=None) -> bool:
+    """1. Track when action is assigned from array.
+
+    Args:
+        user_prompt: The user prompt key (e.g. "123_456").
+        user_tasks: Either a dict of user tasks, an Action object with
+            .current_action, or a plain int action_id for simple state setting.
+        group_chat: Optional GroupChat object. When provided, checks messages
+            to determine if ChatInstructor assigned the action.
+    """
+    # Support simple (user_prompt, action_id) calls for direct state setting
+    if isinstance(user_tasks, int):
+        set_action_state(user_prompt, user_tasks, ActionState.ASSIGNED)
+        return True
+
     if isinstance(user_tasks, dict):
         current_tasks = user_tasks.get(user_prompt)
         if not current_tasks:
@@ -343,7 +411,7 @@ def lifecycle_hook_track_action_assignment(user_prompt: str, user_tasks, group_c
         return False
 
     # When ChatInstructor assigns action, move from ASSIGNED to IN_PROGRESS
-    if (group_chat.messages and
+    if (group_chat and group_chat.messages and
         group_chat.messages[-1]['name'] == 'ChatInstructor' and f'Action {current_action_id}' in group_chat.messages[-1]['content']):
 
         if validate_state_transition(user_prompt, current_action_id, ActionState.IN_PROGRESS):
@@ -353,8 +421,20 @@ def lifecycle_hook_track_action_assignment(user_prompt: str, user_tasks, group_c
     return False
 
 
-def lifecycle_hook_track_status_verification_request(user_prompt: str, user_tasks, group_chat) -> bool:
-    """3. Track when status verification is requested"""
+def lifecycle_hook_track_status_verification_request(user_prompt: str, user_tasks, group_chat=None) -> bool:
+    """3. Track when status verification is requested.
+
+    Args:
+        user_prompt: The user prompt key.
+        user_tasks: Dict, Action object, or plain int action_id.
+        group_chat: Optional GroupChat object.
+    """
+    # Support simple (user_prompt, action_id) calls
+    if isinstance(user_tasks, int):
+        force_state_through_valid_path(user_prompt, user_tasks, ActionState.STATUS_VERIFICATION_REQUESTED,
+                                       "direct status verification request")
+        return True
+
     if isinstance(user_tasks, dict):
         current_tasks = user_tasks.get(user_prompt)
         if not current_tasks:
@@ -364,7 +444,7 @@ def lifecycle_hook_track_status_verification_request(user_prompt: str, user_task
         current_action_id = user_tasks.current_action
 
     # When @StatusVerifier is mentioned, move to STATUS_VERIFICATION_REQUESTED
-    if (group_chat.messages and
+    if (group_chat and group_chat.messages and
         '@StatusVerifier' in group_chat.messages[-1]['content']):
 
         if validate_state_transition(user_prompt, current_action_id, ActionState.STATUS_VERIFICATION_REQUESTED):
@@ -634,7 +714,7 @@ def lifecycle_hook_validate_final_agent_creation(user_prompt: str, user_tasks, p
     missing_files = []
 
     for action_id in range(1, total_actions + 1):
-        recipe_file = f'prompts/{prompt_id}_{flow}_{action_id}.json'
+        recipe_file = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow}_{action_id}.json')
         if not os.path.exists(recipe_file):
             missing_files.append(recipe_file)
 
@@ -645,7 +725,7 @@ def lifecycle_hook_validate_final_agent_creation(user_prompt: str, user_tasks, p
         }
 
     # Check 3: Flow recipe exists
-    flow_recipe_file = f'prompts/{prompt_id}_{flow}_recipe.json'
+    flow_recipe_file = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow}_recipe.json')
     if not os.path.exists(flow_recipe_file):
         return {
             'action': 'block',

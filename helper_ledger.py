@@ -20,7 +20,13 @@ Core functionality is now part of SmartLedger class:
 - ledger.get_pending_subtasks() - Get pending children
 """
 
-from agent_ledger import SmartLedger, Task, TaskType, TaskStatus as LedgerTaskStatus
+try:
+    from agent_ledger import SmartLedger, Task, TaskType, TaskStatus as LedgerTaskStatus
+except ImportError:
+    SmartLedger = None
+    Task = None
+    TaskType = None
+    LedgerTaskStatus = None
 from typing import Optional, Any, Dict, List
 import logging
 

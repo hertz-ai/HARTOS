@@ -151,10 +151,16 @@ class ThemeService:
         # 3. Apply GTK theme via gsettings (Linux only, non-blocking)
         ThemeService._apply_gtk(preset)
 
-        # 4. Notify LiquidUI via HTTP (non-blocking, best-effort)
-        ThemeService._notify_liquid_ui(preset)
-
         logger.info("Theme applied: %s", theme_id)
+
+        # Single notification path: EventBus → WAMP → all subsystems
+        # LiquidUI subscribes to 'theme.changed' on the EventBus
+        try:
+            from core.platform.events import emit_event
+            emit_event('theme.changed', {'theme_id': theme_id, 'preset': preset})
+        except Exception:
+            pass
+
         return {'status': 'applied', 'theme_id': theme_id, 'theme': preset}
 
     # ── Agent-Driven Customization ───────────────────────────────
@@ -189,7 +195,12 @@ class ThemeService:
             except OSError:
                 pass
 
-        ThemeService._notify_liquid_ui(ThemeService.get_active_theme())
+        try:
+            from core.platform.events import emit_event
+            emit_event('theme.custom_updated', {'overrides': merged})
+        except Exception:
+            pass
+
         return {'status': 'customized', 'overrides': merged}
 
     @staticmethod

@@ -31,7 +31,11 @@ from typing import Optional, List, Dict, Any, Callable
 from datetime import datetime
 from dataclasses import dataclass, field
 from xml.etree import ElementTree
-import aiohttp
+try:
+    import aiohttp
+    HAS_AIOHTTP = True
+except ImportError:
+    HAS_AIOHTTP = False
 
 try:
     from Crypto.Cipher import AES

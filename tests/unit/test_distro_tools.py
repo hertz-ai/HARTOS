@@ -298,7 +298,7 @@ class TestDBusService:
             'gi': mock_gi,
             'gi.repository': mock_gi.repository,
         }):
-            dbus_path = os.path.join(os.path.dirname(__file__), '..',
+            dbus_path = os.path.join(os.path.dirname(__file__), '..', '..',
                                      'deploy', 'linux', 'dbus', 'hart_dbus_service.py')
             spec = importlib.util.spec_from_file_location('hart_dbus_svc', dbus_path)
             dbus_mod = importlib.util.module_from_spec(spec)
@@ -328,7 +328,7 @@ class TestDBusService:
             'gi': mock_gi,
             'gi.repository': mock_gi.repository,
         }):
-            dbus_path = os.path.join(os.path.dirname(__file__), '..',
+            dbus_path = os.path.join(os.path.dirname(__file__), '..', '..',
                                      'deploy', 'linux', 'dbus', 'hart_dbus_service.py')
             spec = importlib.util.spec_from_file_location('hart_dbus_svc2', dbus_path)
             dbus_mod = importlib.util.module_from_spec(spec)
@@ -353,7 +353,7 @@ class TestDBusService:
             'gi': mock_gi,
             'gi.repository': mock_gi.repository,
         }):
-            dbus_path = os.path.join(os.path.dirname(__file__), '..',
+            dbus_path = os.path.join(os.path.dirname(__file__), '..', '..',
                                      'deploy', 'linux', 'dbus', 'hart_dbus_service.py')
             spec = importlib.util.spec_from_file_location('hart_dbus_svc3', dbus_path)
             dbus_mod = importlib.util.module_from_spec(spec)
@@ -378,7 +378,7 @@ class TestDBusService:
             'gi': mock_gi,
             'gi.repository': mock_gi.repository,
         }):
-            dbus_path = os.path.join(os.path.dirname(__file__), '..',
+            dbus_path = os.path.join(os.path.dirname(__file__), '..', '..',
                                      'deploy', 'linux', 'dbus', 'hart_dbus_service.py')
             spec = importlib.util.spec_from_file_location('hart_dbus_svc4', dbus_path)
             dbus_mod = importlib.util.module_from_spec(spec)
@@ -413,7 +413,7 @@ class TestHartTray:
             'PIL.ImageDraw': mock_pil_draw,
             'PIL.ImageFont': mock_pil_font,
         }):
-            tray_path = os.path.join(os.path.dirname(__file__), '..',
+            tray_path = os.path.join(os.path.dirname(__file__), '..', '..',
                                      'deploy', 'linux', 'desktop', 'hart-tray.py')
             spec = importlib.util.spec_from_file_location('hart_tray', tray_path)
             mod = importlib.util.module_from_spec(spec)

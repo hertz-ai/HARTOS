@@ -19,6 +19,8 @@ from unittest.mock import patch, MagicMock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 os.environ.setdefault('HEVOLVE_DB_PATH', ':memory:')
 
+pytest.importorskip('agent_ledger', reason='agent_ledger not installed')
+
 
 class TestInMemoryTaskLock:
     """Test InMemoryTaskLock — thread-safe, no Redis."""

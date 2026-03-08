@@ -67,6 +67,7 @@ class TestRecipeRedaction:
 
     def test_recipe_save_has_redaction(self):
         """Verify create_recipe.py redacts before json.dump."""
+        pytest.importorskip('autogen', reason='autogen not installed')
         import create_recipe
         source_file = create_recipe.__file__
         with open(source_file, 'r', encoding='utf-8') as f:

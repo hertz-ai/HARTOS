@@ -93,6 +93,17 @@ async def diarization(websocket, diarize_model, output_dir, device):
                         _export_audio(
                             audio_data_bytes, user_id, output_dir)
 
+                        # Voice signature enrollment — dispatched to HevolveAI
+                        try:
+                            from core.resonance_identifier import ResonanceIdentifier
+                            if user_id:
+                                _identifier = ResonanceIdentifier()
+                                _identifier.enroll_voice(str(user_id), audio_data_bytes)
+                        except ImportError:
+                            pass
+                        except Exception:
+                            pass
+
                         res = {
                             "no_of_speaker": no_of_speakers,
                             "stop_mic": no_of_speakers > 1,
@@ -108,6 +119,8 @@ async def diarization(websocket, diarize_model, output_dir, device):
                     _cleanup_stream(user_id)
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
+                    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                        torch.mps.empty_cache()
 
     except Exception as e:
         logging.debug(f"Connection ended: {e}")
@@ -193,11 +206,13 @@ async def main(port, device, output_dir, hf_token):
 
 
 if __name__ == "__main__":
+    from core.port_registry import get_port as _get_port
     parser = argparse.ArgumentParser(
         description='Speaker Diarization Sidecar')
     parser.add_argument(
         '--port', type=int,
-        default=int(os.environ.get('HEVOLVE_DIARIZATION_PORT', 8004)))
+        default=int(os.environ.get('HEVOLVE_DIARIZATION_PORT',
+                                     _get_port('diarization'))))
     parser.add_argument(
         '--device',
         default=os.environ.get('HEVOLVE_DIARIZATION_DEVICE', None))
@@ -211,7 +226,12 @@ if __name__ == "__main__":
     if args.device is None:
         try:
             import torch
-            args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            if torch.cuda.is_available():
+                args.device = 'cuda'
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                args.device = 'mps'
+            else:
+                args.device = 'cpu'
         except ImportError:
             args.device = 'cpu'
 

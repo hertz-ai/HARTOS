@@ -258,13 +258,10 @@ class TestRecipeExperienceRecorder:
             time.sleep(0.03)
             RER.stop_action_timer('test_merge', 2, 'completed')
 
-            # Merge - need to be in the right directory
-            old_cwd = os.getcwd()
-            try:
-                os.chdir(tmpdir)
+            # Merge — patch PROMPTS_DIR to point to temp directory
+            from unittest.mock import patch
+            with patch('recipe_experience.PROMPTS_DIR', prompts_dir):
                 RER.merge_experience_into_recipe('999', 0, 'test_merge')
-            finally:
-                os.chdir(old_cwd)
 
             # Verify merged recipe
             with open(recipe_path, 'r') as f:

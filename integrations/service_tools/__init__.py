@@ -22,6 +22,7 @@ from .omniparser_tool import OmniParserTool
 from .model_storage import ModelStorageManager, model_storage
 from .vram_manager import VRAMManager, vram_manager
 from .runtime_manager import RuntimeToolManager, runtime_tool_manager
+from .model_lifecycle import ModelLifecycleManager, get_model_lifecycle_manager
 from .media_agent import generate_media, check_media_status, register_media_tools
 
 __all__ = [
@@ -40,6 +41,8 @@ __all__ = [
     "vram_manager",
     "RuntimeToolManager",
     "runtime_tool_manager",
+    "ModelLifecycleManager",
+    "get_model_lifecycle_manager",
     "generate_media",
     "check_media_status",
     "register_media_tools",

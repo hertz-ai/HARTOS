@@ -30,6 +30,8 @@ def _get_jwt_manager():
     global _jwt_manager
     if _jwt_manager is not None:
         return _jwt_manager
+    if _jwt_manager is False:
+        return None  # already tried and failed — don't log again
     try:
         from security.jwt_manager import JWTManager
         _jwt_manager = JWTManager()
@@ -37,6 +39,7 @@ def _get_jwt_manager():
         return _jwt_manager
     except Exception as e:
         logger.warning(f"JWTManager unavailable ({e}), using legacy JWT")
+        _jwt_manager = False  # sentinel: don't retry
         return None
 
 # Legacy fallback values - fail closed if not configured
@@ -207,7 +210,8 @@ def require_auth(f):
             db.commit()
             return result
         except Exception as e:
-            db.rollback()
+            if db.is_active:
+                db.rollback()
             raise
         finally:
             db.close()

@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================
-REM HevolveBot LangChain Agent - Interactive Test Runner
+REM HART OS - Interactive Test Runner
 REM ============================================================
 REM Runs unit and integration tests with selectable suites.
 REM ============================================================
@@ -25,7 +25,7 @@ if exist "venv310\Scripts\python.exe" (
 echo.
 echo Select test suite:
 echo   1. All tests (comprehensive)
-echo   2. HevolveBot channel regression tests (91 tests)
+echo   2. HART channel regression tests (91 tests)
 echo   3. Master test suite
 echo   4. Autonomous agent suite
 echo   5. Dynamic agents tests
@@ -40,7 +40,7 @@ if "%choice%"=="1" (
     echo Running all tests...
     "%PYTHON_EXE%" -m pytest tests/unit/ tests/integration/ -v --tb=short --color=yes
 ) else if "%choice%"=="2" (
-    echo Running HevolveBot channel regression tests...
+    echo Running HART channel regression tests...
     "%PYTHON_EXE%" -m pytest tests/integration/test_channels_e2e_regression.py -v --tb=short --color=yes
 ) else if "%choice%"=="3" (
     echo Running master test suite...

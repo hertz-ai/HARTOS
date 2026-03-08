@@ -9,6 +9,9 @@ import os
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+import pytest
+pytest.importorskip('agent_ledger', reason='agent_ledger not installed')
+
 from agent_ledger import (
     SmartLedger, Task, TaskType, TaskStatus, ExecutionMode
 )

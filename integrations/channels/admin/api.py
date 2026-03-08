@@ -1889,7 +1889,8 @@ def update_media_config():
     """Update media handling configuration."""
     api = get_api()
     data = request.get_json()
-    api._global_config.media = MediaConfigSchema(**data)
+    valid_fields = {f.name for f in MediaConfigSchema.__dataclass_fields__.values()}
+    api._global_config.media = MediaConfigSchema(**{k: v for k, v in data.items() if k in valid_fields})
     api._save_config()
     return api._global_config.media.to_dict()
 

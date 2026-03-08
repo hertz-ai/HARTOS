@@ -9,6 +9,9 @@ import random
 import time
 from pathlib import Path
 
+import pytest
+pytest.importorskip('agent_ledger', reason='agent_ledger not installed')
+
 from agent_ledger import (
     Task, TaskType, TaskStatus, ExecutionMode,
     SmartLedger, create_ledger_from_actions, get_production_backend

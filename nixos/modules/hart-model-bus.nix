@@ -292,8 +292,9 @@ in
     # ─────────────────────────────────────────────────────────
     (lib.mkIf bus.enableDBus {
 
-      # D-Bus policy: allow hart user + hart group to call ModelBus
+      # D-Bus policy + activation file
       services.dbus.packages = [
+        # Policy: allow hart user + hart group to call ModelBus
         (pkgs.writeTextDir "share/dbus-1/system.d/com.hart.ModelBus.conf" ''
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE busconfig PUBLIC
@@ -335,18 +336,15 @@ in
             </policy>
           </busconfig>
         '')
-      ];
-
-      # D-Bus activation: auto-start model bus when any app calls it
-      environment.etc."dbus-1/system.d/com.hart.ModelBus.service" = {
-        text = ''
+        # Activation: auto-start model bus when any app calls it
+        (pkgs.writeTextDir "share/dbus-1/system-services/com.hart.ModelBus.service" ''
           [D-BUS Service]
           Name=com.hart.ModelBus
           Exec=${cfg.package.python}/bin/python -c "from integrations.agent_engine.model_bus_service import start_dbus_bridge; start_dbus_bridge()"
           User=hart
           SystemdService=hart-model-bus.service
-        '';
-      };
+        '')
+      ];
     })
 
     # ─────────────────────────────────────────────────────────

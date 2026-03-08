@@ -26,8 +26,9 @@ class DiarizationService:
     and provides lifecycle management (start/stop/health/status).
     """
 
-    def __init__(self, port: int = 8004):
-        self._port = int(os.environ.get('HEVOLVE_DIARIZATION_PORT', port))
+    def __init__(self, port: int = None):
+        from core.port_registry import get_port
+        self._port = int(os.environ.get('HEVOLVE_DIARIZATION_PORT', port or get_port('diarization')))
         self._process: Optional[subprocess.Popen] = None
         self._running = False
         self._ready = False
@@ -135,8 +136,22 @@ class DiarizationService:
 
     def _start_subprocess(self):
         """Launch the diarization server as a subprocess."""
+        # In frozen builds (cx_Freeze), sys.executable is Nunba.exe — using it
+        # with -m would launch a full GUI instance instead of the module.
+        # Use the bundled python interpreter from python-embed/ instead.
+        python_exe = sys.executable
+        if getattr(sys, 'frozen', False):
+            app_dir = os.path.dirname(sys.executable)
+            embed_python = os.path.join(app_dir, 'python-embed', 'python.exe')
+            if os.path.isfile(embed_python):
+                python_exe = embed_python
+            else:
+                logger.warning(
+                    "python-embed/python.exe not found — "
+                    "diarization sidecar may not start correctly")
+
         cmd = [
-            sys.executable, '-m',
+            python_exe, '-m',
             'integrations.audio.diarization_server',
             '--port', str(self._port),
         ]

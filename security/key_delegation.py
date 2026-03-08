@@ -101,7 +101,15 @@ def _generate_domain_nonce() -> str:
 
 
 def get_node_tier() -> str:
-    """Return node tier from env var. Default: 'flat' (backward-compatible)."""
+    """Return node TOPOLOGY mode from HEVOLVE_NODE_TIER env var.
+
+    Returns one of: 'flat', 'regional', 'central', 'local'
+
+    NOTE: Despite the name, this returns TOPOLOGY MODE, not capability tier.
+    For capability tier (embedded/lite/standard/full/compute_host), use
+    security.system_requirements.get_tier() instead.
+    Legacy name retained for backward compatibility.
+    """
     tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat').lower()
     if tier in ('central', 'regional', 'local', 'flat'):
         return tier

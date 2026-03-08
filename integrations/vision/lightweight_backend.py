@@ -72,8 +72,9 @@ class VisionBackend(ABC):
 class MiniCPMBackend(VisionBackend):
     """Full MiniCPM-V-2 backend — existing sidecar subprocess."""
 
-    def __init__(self, port: int = 9891):
-        self._port = int(os.environ.get('HEVOLVE_MINICPM_PORT', port))
+    def __init__(self, port: int = None):
+        from core.port_registry import get_port
+        self._port = int(os.environ.get('HEVOLVE_MINICPM_PORT', port or get_port('vision')))
 
     @property
     def name(self) -> str:
@@ -201,7 +202,17 @@ class CLIPBackend(VisionBackend):
     def ram_mb(self) -> int:
         return 400
 
+    def _torch_functional(self) -> bool:
+        """Check that torch is real (not a frozen build stub)."""
+        try:
+            import torch
+            return not getattr(torch, '_is_stub', False) and hasattr(torch, 'Tensor')
+        except (ImportError, AttributeError, OSError, RuntimeError):
+            return False
+
     def is_available(self) -> bool:
+        if not self._torch_functional():
+            return False
         try:
             import clip
             return True
@@ -214,6 +225,9 @@ class CLIPBackend(VisionBackend):
             return False
 
     def start(self) -> bool:
+        if not self._torch_functional():
+            logger.warning("CLIP backend unavailable: torch not functional")
+            return False
         try:
             import clip
             import torch
@@ -221,7 +235,7 @@ class CLIPBackend(VisionBackend):
             self._model, self._preprocess = clip.load('ViT-B/16', device=device)
             logger.info("CLIP ViT-B/16 backend loaded (CPU)")
             return True
-        except ImportError:
+        except (ImportError, AttributeError, RuntimeError):
             pass
         try:
             import open_clip
@@ -274,6 +288,74 @@ class CLIPBackend(VisionBackend):
             return None
 
 
+class Qwen3VLVisionBackend(VisionBackend):
+    """Qwen3-VL as vision description backend — replaces MiniCPM.
+
+    Uses the same Qwen3-VL server already running for Computer Use,
+    so no additional process or VRAM is needed.
+    """
+
+    def __init__(self):
+        self._backend = None
+
+    @property
+    def name(self) -> str:
+        return 'qwen3vl'
+
+    @property
+    def requires_gpu(self) -> bool:
+        return True
+
+    @property
+    def ram_mb(self) -> int:
+        return 4000
+
+    def is_available(self) -> bool:
+        base_url = os.environ.get(
+            'HEVOLVE_VLM_ENDPOINT_URL',
+            os.environ.get('HEVOLVE_LLM_ENDPOINT_URL', '')
+        )
+        if not base_url:
+            return False
+        try:
+            resp = requests.get(
+                f'{base_url.rstrip("/")}/models', timeout=3
+            )
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    def start(self) -> bool:
+        try:
+            from integrations.vlm.qwen3vl_backend import get_qwen3vl_backend
+            self._backend = get_qwen3vl_backend()
+            logger.info("Qwen3-VL vision backend initialized")
+            return True
+        except Exception as e:
+            logger.error(f"Qwen3-VL vision backend start failed: {e}")
+            return False
+
+    def stop(self):
+        self._backend = None
+
+    def describe(self, frame_bytes: bytes, prompt: str = '') -> Optional[str]:
+        if self._backend is None:
+            try:
+                from integrations.vlm.qwen3vl_backend import get_qwen3vl_backend
+                self._backend = get_qwen3vl_backend()
+            except Exception:
+                return None
+        try:
+            import base64
+            b64 = base64.b64encode(frame_bytes).decode('utf-8')
+            return self._backend.describe_scene(
+                b64, prompt or 'Describe what you see in this image.'
+            )
+        except Exception as e:
+            logger.debug(f"Qwen3-VL describe error: {e}")
+            return None
+
+
 class NoneBackend(VisionBackend):
     """No-op backend — FrameStore only, zero overhead."""
 
@@ -299,6 +381,7 @@ class NoneBackend(VisionBackend):
 # ─── Backend Registry ───
 
 _BACKENDS = {
+    'qwen3vl': Qwen3VLVisionBackend,
     'minicpm': MiniCPMBackend,
     'mobilevlm': MobileVLMBackend,
     'clip': CLIPBackend,
@@ -323,7 +406,11 @@ def get_vision_backend(name: str = '') -> VisionBackend:
         cls = _BACKENDS.get(backend_name, NoneBackend)
         return cls()
 
-    # Auto-detect
+    # Auto-detect — prefer Qwen3-VL if its server is already running
+    qwen3vl = Qwen3VLVisionBackend()
+    if qwen3vl.is_available():
+        return qwen3vl
+
     try:
         from security.system_requirements import get_capabilities
         caps = get_capabilities()
