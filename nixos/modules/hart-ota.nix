@@ -404,19 +404,39 @@ in
             echo "Rolling back to previous generation..."
             sudo nixos-rebuild switch --rollback
             ;;
+          self-build|build)
+            echo "Rebuilding HART OS from current configuration..."
+            sudo hart-self-build switch
+            ;;
+          dry-run)
+            echo "Testing build without applying..."
+            sudo hart-self-build dry-run
+            ;;
+          diff)
+            echo "Showing what would change..."
+            sudo hart-self-build diff
+            ;;
           history)
             echo "=== Update History ==="
             ls -lt /nix/var/nix/profiles/system-*-link 2>/dev/null | head -10
+            echo ""
+            echo "=== Self-Build History ==="
+            tail -5 /var/lib/hart/ota/history/builds.jsonl 2>/dev/null | \
+              ${pkgs.jq}/bin/jq -r '"\(.timestamp) | \(.action) | \(.status)"' 2>/dev/null || \
+              echo "(no self-builds yet)"
             ;;
           help|--help|-h)
             echo "hart-ota — HART OS Update Manager"
             echo ""
             echo "Commands:"
-            echo "  hart-ota status     Show update status + current generation"
-            echo "  hart-ota check      Check for updates now"
-            echo "  hart-ota apply      Apply staged update (nixos-rebuild switch)"
-            echo "  hart-ota rollback   Revert to previous generation"
-            echo "  hart-ota history    Show update history (NixOS generations)"
+            echo "  hart-ota status       Show update status + current generation"
+            echo "  hart-ota check        Check for updates now"
+            echo "  hart-ota apply        Apply staged update (nixos-rebuild switch)"
+            echo "  hart-ota rollback     Revert to previous generation"
+            echo "  hart-ota self-build   Rebuild OS from current config (runtime.nix)"
+            echo "  hart-ota dry-run      Test build without applying"
+            echo "  hart-ota diff         Show what would change"
+            echo "  hart-ota history      Show update + build history"
             ;;
           *)
             echo "Unknown command: $1 (try: hart-ota help)"

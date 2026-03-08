@@ -6,7 +6,7 @@ from typing import Annotated, Optional, Dict, Tuple, List, Any
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-import requests
+from core.http_pool import pooled_get, pooled_post, pooled_patch, pooled_request
 from autobahn.asyncio.component import Component, run
 import uuid
 import asyncio
@@ -31,39 +31,10 @@ from concurrent.futures import ThreadPoolExecutor
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
 from autogen.cache.in_memory_cache import InMemoryCache
 from json_repair import repair_json
-from crossbarhttp import Client
-client = Client('http://aws_rasa.hertzai.com:8088/publish')
-
-# Create thread pool executor for async Crossbar publishing
-crossbar_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='crossbar_publish')
-
 def publish_async(topic, message, timeout=2.0):
-    """
-    Publish to Crossbar in a background thread without blocking the main request.
-
-    Args:
-        topic: Crossbar topic to publish to
-        message: Message payload (dict or JSON string)
-        timeout: Maximum time to wait for publish (default: 2.0 seconds)
-    """
-    def _publish():
-        import socket
-        try:
-            # Set socket timeout to prevent long waits
-            original_timeout = socket.getdefaulttimeout()
-            socket.setdefaulttimeout(timeout)
-
-            client.publish(topic, message)
-            current_app.logger.debug(f"Successfully published to {topic}")
-        except Exception as e:
-            current_app.logger.error(f"Error publishing to {topic}: {e}")
-        finally:
-            # Restore original timeout
-            if original_timeout is not None:
-                socket.setdefaulttimeout(original_timeout)
-
-    # Submit to executor without waiting for result
-    crossbar_executor.submit(_publish)
+    """Delegate to the canonical publish_async in langchain_gpt_api."""
+    from langchain_gpt_api import publish_async as _publish
+    _publish(topic, message, timeout)
 
 # Add Smart Ledger for persistent task tracking - using agent_ledger package (from gpt4.1)
 try:
@@ -368,7 +339,8 @@ except Exception as e:
     tool_logger.error(f"Failed to register expert agents: {e}")
     expert_agents = {}
 
-database_url = 'https://mailer.hertzai.com'
+from core.config_cache import get_db_url
+database_url = get_db_url() or 'https://mailer.hertzai.com'
 
 
 def save_conversation_db(text,user_id,prompt_id,database_url,request_id):
@@ -390,7 +362,7 @@ def save_conversation_db(text,user_id,prompt_id,database_url,request_id):
         "request_id": request_id,
         "historical_request_id": str('[]')
     }
-    res = requests.post("{}/conversation".format(database_url),
+    res = pooled_post("{}/conversation".format(database_url),
                         data=json.dumps(data), headers=headers).json()
     conv_id = res['conv_id']
     return conv_id
@@ -402,14 +374,14 @@ def send_message_to_user1(user_id,response,inp,prompt_id):
     url = 'http://aws_rasa.hertzai.com:9890/autogen_response'
     body = json.dumps({'user_id':user_id,'message':response,'inp':inp,'request_id':request_id, 'Agent_status': 'Review Mode'})
     headers = {'Content-Type': 'application/json'}
-    res = requests.post(url,data=body,headers=headers)
+    res = pooled_post(url,data=body,headers=headers)
 
 
 def execute_python_file(task_description:str,user_id: int,prompt_id:int,action_entry_point:int=0):
     headers = {'Content-Type': 'application/json'}
-    url = 'http://localhost:6777/time_agent'
+    url = f'http://localhost:{_get_llm_port("backend")}/time_agent'
     data = json.dumps({'task_description':task_description,'user_id':user_id,'prompt_id':prompt_id,'action_entry_point':action_entry_point,'request_from':'Reuse'})
-    res = requests.post(url,data=data,headers=headers)
+    res = pooled_post(url,data=data,headers=headers)
     return 'done'
 
 
@@ -530,7 +502,7 @@ def get_action_user_details(user_id):
     payload = {}
     headers = {}
     try:
-        response = requests.request("GET", action_url, headers=headers, data=payload)
+        response = pooled_request("GET", action_url, headers=headers, data=payload)
         if response.status_code == 200:
             data = response.json()
             filtered_data = [obj for obj in data if obj["action"] not in unwanted_actions and obj["zeroshot_label"] not in ['Video Reasoning']]
@@ -558,7 +530,7 @@ def get_action_user_details(user_id):
         url = STUDENT_API
         payload = json.dumps({"user_id": user_id})
         headers = {'Content-Type': 'application/json'}
-        response = requests.request("POST", url, headers=headers, data=payload)
+        response = pooled_request("POST", url, headers=headers, data=payload)
         if response.status_code == 200:
             user_data = response.json()
             user_details = f'''Below are the information about the user.
@@ -614,14 +586,14 @@ def visual_execution(task_description: str, user_id: int, prompt_id: int):
 
 def call_visual_task(task_description: str, user_id: int, prompt_id: int):
     headers = {'Content-Type': 'application/json'}
-    url = 'http://localhost:6777/visual_agent'
+    url = f'http://localhost:{_get_llm_port("backend")}/visual_agent'
 
     now = datetime.now()
     action_url = f"{ACTION_API}?user_id={user_id}"
     payload = {}
     headers_api = {}
 
-    response = requests.request("GET", action_url, headers=headers_api, data=payload)
+    response = pooled_request("GET", action_url, headers=headers_api, data=payload)
 
     if response.status_code == 200:
         api_data = response.json()
@@ -642,7 +614,7 @@ def call_visual_task(task_description: str, user_id: int, prompt_id: int):
                     'request_from': 'Create'
                 })
                 # Send POST request to the external visual agent
-                res = requests.post(url, data=data_to_send, headers=headers, timeout=10)
+                res = pooled_post(url, data=data_to_send, headers=headers, timeout=10)
                 current_app.logger.info(f"External visual agent response: {res.status_code}")
                 return 'done'
             except Exception as e:
@@ -1700,6 +1672,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             from integrations.agent_engine.ip_protection_tools import register_ip_protection_tools
             register_ip_protection_tools(helper, assistant, user_id)
             tool_logger.info("IP protection tools loaded (Tier 2) based on prompt content")
+        if 'self_build' in goal_tags:
+            from integrations.agent_engine.self_build_tools import register_self_build_tools
+            register_self_build_tools(helper, assistant, user_id)
+            tool_logger.info("Self-build tools loaded (Tier 2) based on prompt content")
     except Exception as e:
         tool_logger.debug(f"Goal-aware tool loading skipped: {e}")
 
@@ -4247,7 +4223,7 @@ def safe_increment_flow(user_prompt, prompt_id):
 def update_agent_creation_to_db(prompt_id):
     url = f'{database_url}/update_agent_prompt?prompt_id={prompt_id}'
     headers = {'Content-Type': 'application/json'}
-    res = requests.patch(url, headers=headers)
+    res = pooled_patch(url, headers=headers)
 
 
 def create_final_recipe_for_current_flow(flow, merged_dict, prompt_id):

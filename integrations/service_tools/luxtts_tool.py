@@ -369,7 +369,7 @@ def luxtts_clone_voice(audio_path: str, name: str) -> str:
             shutil.copy2(audio_path, str(save_path))
 
         # Clear cache entry so it reloads
-        _voice_cache.pop(name, None)
+        _prompt_cache.pop(name, None)
 
         logger.info(f"LuxTTS voice saved: {name} from {audio_path}")
         return json.dumps({

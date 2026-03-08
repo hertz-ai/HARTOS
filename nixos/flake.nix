@@ -2,7 +2,10 @@
   description = "HART OS — AI-Native Agentic Operating System";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11";
+    # Track unstable for latest GNOME (50+), kernel, and packages.
+    # Safe because HART OTA pipeline (hart-ota.nix) does canary deploys
+    # with automatic rollback on failure.
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
     llama-cpp = {
       url = "github:ggml-org/llama.cpp";
@@ -64,6 +67,10 @@
       ./modules/hart-gaming.nix
       ./modules/hart-devtools.nix
       ./modules/hart-osk.nix
+      # Onboarding ceremony (GTK4/libadwaita native)
+      ./modules/hart-onboarding.nix
+      # Runtime self-build (OS rebuilds itself live)
+      ./modules/hart-self-build.nix
     ];
 
     # Common specialArgs passed to all modules

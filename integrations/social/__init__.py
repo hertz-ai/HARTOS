@@ -184,6 +184,10 @@ def init_social(app):
     except Exception as e:
         logger.debug(f"Thought experiments blueprint skipped: {e}")
 
+    # NOTE: compute_pledge_bp (api_compute_pledge.py) was consolidated into tracker_bp.
+    # All pledge endpoints now live at /api/social/tracker/experiments/*/pledge*
+    # and /api/social/tracker/pledges/* — single source of truth.
+
     # Initialize node keypair for integrity verification
     try:
         from security.node_integrity import get_or_create_keypair, get_public_key_hex
@@ -328,12 +332,13 @@ def init_social(app):
         from security.node_watchdog import start_watchdog
         watchdog = start_watchdog()
 
-        # Register gossip
+        # Register gossip — interval must exceed worst-case gossip round
+        # (3 peers × 10s timeout = 30s max) to avoid false FROZEN alerts.
         if _boot_verified:
             try:
                 from .peer_discovery import gossip as _g
                 if _g._running:
-                    watchdog.register('gossip', expected_interval=10,
+                    watchdog.register('gossip', expected_interval=120,
                                       restart_fn=_g.start, stop_fn=_g.stop)
             except Exception:
                 pass
@@ -391,14 +396,15 @@ def init_social(app):
         except Exception:
             pass
 
-        # Register model lifecycle manager
+        # Register model lifecycle manager — interval must exceed worst-case
+        # tick duration (nvidia-smi 5s + pressure checks + federation report).
         try:
             from integrations.service_tools.model_lifecycle import get_model_lifecycle_manager
             _lifecycle = get_model_lifecycle_manager()
             _lifecycle.start()
             if _lifecycle._running:
                 watchdog.register('model_lifecycle',
-                                  expected_interval=_lifecycle._interval,
+                                  expected_interval=max(_lifecycle._interval * 3, 60),
                                   restart_fn=_lifecycle.start,
                                   stop_fn=_lifecycle.stop)
                 logger.info("Model lifecycle manager started")

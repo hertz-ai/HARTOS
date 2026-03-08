@@ -313,4 +313,12 @@ def detect_goal_tags(prompt: str) -> list:
     if any(kw in lower for kw in ip_keywords):
         tags.append('ip_protection')
 
+    self_build_keywords = [
+        'self-build', 'self_build', 'nixos', 'nix package', 'install package',
+        'runtime.nix', 'os rebuild', 'nixos-rebuild', 'system package',
+        'hart-pkg', 'nix-env', 'system generation', 'rollback generation',
+    ]
+    if any(kw in lower for kw in self_build_keywords):
+        tags.append('self_build')
+
     return tags

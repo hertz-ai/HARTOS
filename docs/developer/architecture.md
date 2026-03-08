@@ -1,6 +1,6 @@
 # System Architecture
 
-HART OS (Hevolve Agentic Runtime) is a multi-agent platform built on Flask, AutoGen, and LangChain. It creates, trains, and reuses autonomous AI agents via the Recipe Pattern.
+HART OS (Hevolve Hive Agentic Runtime) is crowdsourced compute infrastructure for autonomous Hive AI Training -an open multi-agent platform democratizing access to the best intelligence, just like the internet is open. It orchestrates distributed thought processes across crowdsourced agents, incentivizes compute providers, and creates a self-sustaining economy -so no single entity monopolizes AI. Agents are created, trained, and reused via the Recipe Pattern.
 
 ## Core Pipeline
 

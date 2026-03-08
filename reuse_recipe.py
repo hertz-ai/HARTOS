@@ -4,7 +4,7 @@ import random
 import autogen
 import os
 import pytz
-import requests
+from core.http_pool import pooled_get, pooled_post, pooled_request
 from typing import Dict, Optional, Tuple, Any
 import uuid
 import time
@@ -22,7 +22,7 @@ import redis
 import pickle
 from PIL import Image
 
-from crossbarhttp import Client
+
 from flask import current_app
 from helper import ToolMessageHandler, strip_json_values, get_time_based_history, retrieve_json, load_vlm_agent_files
 try:
@@ -129,38 +129,10 @@ def parse_date(date_str):
     return datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%S")
 
 
-client = Client('http://aws_rasa.hertzai.com:8088/publish')
-
-# Create thread pool executor for async Crossbar publishing
-crossbar_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='crossbar_publish')
-
 def publish_async(topic, message, timeout=2.0):
-    """
-    Publish to Crossbar in a background thread without blocking the main request.
-
-    Args:
-        topic: Crossbar topic to publish to
-        message: Message payload (dict or JSON string)
-        timeout: Maximum time to wait for publish (default: 2.0 seconds)
-    """
-    def _publish():
-        import socket
-        try:
-            # Set socket timeout to prevent long waits
-            original_timeout = socket.getdefaulttimeout()
-            socket.setdefaulttimeout(timeout)
-
-            client.publish(topic, message)
-            current_app.logger.debug(f"Successfully published to {topic}")
-        except Exception as e:
-            current_app.logger.error(f"Error publishing to {topic}: {e}")
-        finally:
-            # Restore original timeout
-            if original_timeout is not None:
-                socket.setdefaulttimeout(original_timeout)
-
-    # Submit to executor without waiting for result
-    crossbar_executor.submit(_publish)
+    """Delegate to the canonical publish_async in langchain_gpt_api."""
+    from langchain_gpt_api import publish_async as _publish
+    _publish(topic, message, timeout)
 
 scheduler = BackgroundScheduler()
 scheduler.start()
@@ -361,7 +333,8 @@ async def subscribe_and_return(message, topic, time=1800000):
                 current_app.logger.error(f"Error stopping component in finally: {e}")
 
 
-database_url = 'https://mailer.hertzai.com'
+from core.config_cache import get_db_url
+database_url = get_db_url() or 'https://mailer.hertzai.com'
 
 
 def save_conversation_db(text, user_id, prompt_id, database_url, request_id):
@@ -383,7 +356,7 @@ def save_conversation_db(text, user_id, prompt_id, database_url, request_id):
         "request_id": request_id,
         "historical_request_id": str('[]')
     }
-    res = requests.post("{}/conversation".format(database_url),
+    res = pooled_post("{}/conversation".format(database_url),
                         data=json.dumps(data), headers=headers).json()
     conv_id = res['conv_id']
     return conv_id
@@ -480,7 +453,7 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
     headers = {'Content-Type': 'application/json'}
 
     try:
-        res = requests.post(url, data=body, headers=headers)
+        res = pooled_post(url, data=body, headers=headers)
         current_app.logger.info(
             f'Message sent with request_id: {intermediate_request_id}, tracking will reset in {reset_tracking_delay}s')
     except Exception as e:
@@ -493,16 +466,16 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
 
 def execute_python_file(task_description: str, user_id: int, prompt_id: int, action_entry_point: int = 0):
     headers = {'Content-Type': 'application/json'}
-    url = 'http://localhost:6777/time_agent'
+    url = f'http://localhost:{_get_llm_port("backend")}/time_agent'
     data = json.dumps({'task_description': task_description, 'user_id': user_id, 'prompt_id': prompt_id,
                        'action_entry_point': action_entry_point, 'request_from': 'Reuse'})
-    res = requests.post(url, data=data, headers=headers)
+    res = pooled_post(url, data=data, headers=headers)
     return 'done'
 
 
 def call_visual_task(task_description: str, user_id: int, prompt_id: int):
     headers = {'Content-Type': 'application/json'}
-    url = 'http://localhost:6777/visual_agent'
+    url = f'http://localhost:{_get_llm_port("backend")}/visual_agent'
 
     # Get current time in UTC for comparison
     now_utc = datetime.utcnow()
@@ -513,7 +486,7 @@ def call_visual_task(task_description: str, user_id: int, prompt_id: int):
         payload = {}
         headers_api = {}
 
-        response = requests.request("GET", action_url, headers=headers_api, data=payload)
+        response = pooled_request("GET", action_url, headers=headers_api, data=payload)
 
         if response.status_code == 200:
             api_data = response.json()
@@ -552,7 +525,7 @@ def call_visual_task(task_description: str, user_id: int, prompt_id: int):
 
                 try:
                     # Send the POST request to the visual agent
-                    res = requests.post(url, data=data_to_send, headers=headers)
+                    res = pooled_post(url, data=data_to_send, headers=headers)
                     current_app.logger.info(f"Visual agent response: {res.status_code}")
                     return 'done'
                 except Exception as e:
@@ -636,7 +609,7 @@ def get_action_user_details(user_id):
     payload = {}
     headers = {}
 
-    response = requests.request(
+    response = pooled_request(
         "GET", action_url, headers=headers, data=payload)
 
     if response.status_code == 200:
@@ -748,7 +721,7 @@ def get_action_user_details(user_id):
     headers = {
         'Content-Type': 'application/json'
     }
-    response = requests.request("POST", url, headers=headers, data=payload)
+    response = pooled_request("POST", url, headers=headers, data=payload)
     if response.status_code == 200:
         user_data = response.json()
 
@@ -1368,7 +1341,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         payload = ""
         headers = {}
 
-        response = requests.post(url, headers=headers, data=payload)
+        response = pooled_post(url, headers=headers, data=payload)
         return response.json()['img_url']
 
     @assistant.register_for_execution()
@@ -1385,7 +1358,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         files = []
         headers = {}
 
-        response = requests.request(
+        response = pooled_request(
             "POST", url, headers=headers, data=payload, files=files, timeout=300)
         if response.status_code == 200:
             return response.text
@@ -1510,7 +1483,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         current_app.logger.info('INSIDE get_prompt_id')
         return f'{prompt_id}'
 
-    database_url = 'https://mailer.hertzai.com'
+    database_url = get_db_url() or 'https://mailer.hertzai.com'
 
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function", description="Generate video with text and save it in database")
@@ -1519,7 +1492,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                        realtime: Annotated[
                            bool, "If True, response is fast but less realistic by default it should be true; if False, response is realistic but slower"]) -> str:
         print('INSIDE Generate_video')
-        database_url = 'https://mailer.hertzai.com'
+        database_url = get_db_url() or 'https://mailer.hertzai.com'
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
         print(f"avtar_id: {avatar_id}:\n{text[:10]}....\n")
 
@@ -1538,7 +1511,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         data['chattts'] = False
         data['openvoice'] = "false"
         try:
-            res = requests.get("https://mailer.hertzai.com/get_image_by_id/{}".format(avatar_id))
+            res = pooled_get("https://mailer.hertzai.com/get_image_by_id/{}".format(avatar_id))
             res = res.json()
             new_image_url = res["image_url"]
         except:
@@ -1568,7 +1541,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             data["cartoon_image"] = False
 
         if res['voice_id'] != None:
-            voice_sample = requests.get(
+            voice_sample = pooled_get(
                 "{}/get_voice_sample_id/{}".format(database_url, res['voice_id']))
             voice_sample = voice_sample.json()
             data["audio_sample_url"] = voice_sample["voice_sample_url"]
@@ -1582,7 +1555,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         data['avatar_id'] = avatar_id_int  # Use the integer version
         data['timeout'] = timeout
         try:
-            video_link = requests.post("{}/video_generate_save".format(database_url),
+            video_link = pooled_post("{}/video_generate_save".format(database_url),
                                        data=json.dumps(data), headers=headers, timeout=1)
         except:
             pass
@@ -1624,7 +1597,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             ]
             headers = {}
             try:
-                response = requests.post(
+                response = pooled_post(
                     url, headers=headers, data=payload, files=files)
                 current_app.logger.info(response.text)
                 response = response.text

@@ -15,6 +15,8 @@ import threading
 import requests
 from typing import Optional
 
+from core.port_registry import get_port
+
 logger = logging.getLogger('hevolve_social')
 
 
@@ -86,19 +88,22 @@ class DistributedWorkerLoop:
         except Exception:
             return False
 
+    def _wd_heartbeat(self):
+        """Send heartbeat to watchdog between potentially blocking operations."""
+        try:
+            from security.node_watchdog import get_watchdog
+            wd = get_watchdog()
+            if wd:
+                wd.heartbeat('distributed_worker')
+        except Exception:
+            pass
+
     def _loop(self):
         while self._running:
             time.sleep(self._interval)
             if not self._running:
                 break
-            # Heartbeat to watchdog
-            try:
-                from security.node_watchdog import get_watchdog
-                wd = get_watchdog()
-                if wd:
-                    wd.heartbeat('distributed_worker')
-            except Exception:
-                pass
+            self._wd_heartbeat()
             # GUARDRAIL: circuit breaker
             try:
                 from security.hive_guardrails import HiveCircuitBreaker
@@ -110,6 +115,7 @@ class DistributedWorkerLoop:
                 self._tick()
             except Exception as e:
                 logger.debug(f"Distributed worker tick error: {e}")
+            self._wd_heartbeat()
 
     def _tick(self):
         """Try to claim and execute one task per tick."""
@@ -160,7 +166,7 @@ class DistributedWorkerLoop:
             logger.error("CRITICAL: hive_guardrails not available — blocking worker dispatch")
             return None
 
-        base_url = os.environ.get('HEVOLVE_BASE_URL', 'http://localhost:6777')
+        base_url = os.environ.get('HEVOLVE_BASE_URL', f'http://localhost:{get_port("backend")}')
         prompt_id = f"{goal_type}_{task.task_id[:8]}"
 
         body = {

@@ -42,7 +42,7 @@ from json_repair import repair_json
 import traceback
 
 # Performance: cached config loading (single read instead of 3+)
-from core.config_cache import get_config as _get_config
+from core.config_cache import get_config as _get_config, get_visual_context_api
 # Performance: connection-pooled HTTP sessions
 from core.http_pool import get_http_session, pooled_post, pooled_get, pooled_request
 # Performance: singleton event loop
@@ -93,8 +93,7 @@ async def async_main(urls):
 
 
 
-# Configuration for Crawl4AI API service
-CRAWL4AI_API_URL = os.environ.get('CRAWL4AI_API_URL', 'http://localhost:8094')
+# Native web crawler (in-process, no HTTP API needed)
 
 # --- Path traversal protection for prompt file access ---
 PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
@@ -134,100 +133,34 @@ def safe_prompt_path(*parts, ext='.json'):
 
 
 def crawl4ai_fetch(url: str, timeout: int = 30) -> str:
-    """
-    Fetch content from URL using Crawl4AI API service
-    Simple HTTP client - no dependency conflicts!
-    """
+    """Fetch content from URL using native in-process crawler."""
     try:
-        current_app.logger.info(f"Fetching via Crawl4AI API: {url}")
-
-        # Prepare request
-        payload = {
-            "url": url,
-            "word_count_threshold": 50,
-            "timeout": timeout * 1000,  # Convert to milliseconds
-            "bypass_cache": True,
-            "wait_for": "css:body"
-        }
-
-        # Call Crawl4AI API (connection pooled)
-        response = pooled_post(
-            f"{CRAWL4AI_API_URL}/crawl",
-            json=payload,
-            timeout=timeout + 10,  # Add buffer for API processing
-            headers={"Content-Type": "application/json"}
-        )
-
-        if response.status_code == 200:
-            result = response.json()
-
-            if result["success"] and result["markdown"]:
-                content = result["markdown"]
-                current_app.logger.info(f"Crawl4AI success: {result['word_count']} words from {url}")
-                return content
-            else:
-                error_msg = result.get("error_message", "Unknown error")
-                current_app.logger.warning(f"Crawl4AI failed for {url}: {error_msg}")
-                return ""
-        else:
-            current_app.logger.error(f"Crawl4AI API error {response.status_code} for {url}")
-            return ""
-
-    except requests.exceptions.Timeout:
-        current_app.logger.warning(f"Crawl4AI API timeout for {url}")
-        return ""
-    except requests.exceptions.ConnectionError:
-        current_app.logger.error(f"Cannot connect to Crawl4AI API service for {url}")
+        from integrations.web_crawler import crawl_url
+        result = crawl_url(url, timeout)
+        if result['success']:
+            current_app.logger.info(f"Crawl success: {result['word_count']} words from {url}")
+            return result['markdown']
+        current_app.logger.warning(f"Crawl failed for {url}: {result.get('error')}")
         return ""
     except Exception as e:
-        current_app.logger.error(f"Crawl4AI API error for {url}: {e}")
+        current_app.logger.error(f"Crawl error for {url}: {e}")
         return ""
 
 
 def crawl4ai_batch_fetch(urls: List[str], max_concurrent: int = 2) -> List[str]:
-    """
-    Fetch multiple URLs using Crawl4AI batch API
-    """
+    """Fetch multiple URLs using native in-process crawler."""
     try:
-        current_app.logger.info(f"Batch fetching {len(urls)} URLs via Crawl4AI API")
-
-        # Prepare batch request
-        payload = {
-            "urls": urls,
-            "word_count_threshold": 50,
-            "timeout": 30000,  # 30 seconds per URL
-            "max_concurrent": max_concurrent
-        }
-
-        # Call Crawl4AI batch API (connection pooled)
-        response = pooled_post(
-            f"{CRAWL4AI_API_URL}/crawl/batch",
-            json=payload,
-            timeout=120,  # 2 minutes for batch processing
-            headers={"Content-Type": "application/json"}
-        )
-
-        if response.status_code == 200:
-            result = response.json()
-
-            # Extract content from results
-            extracted_content = []
-            for crawl_result in result["results"]:
-                if crawl_result["success"] and crawl_result["markdown"]:
-                    extracted_content.append(crawl_result["markdown"])
-                else:
-                    extracted_content.append("")  # Empty string for failed URLs
-
-            current_app.logger.info(
-                f"Batch crawl completed: {result['successful_crawls']}/{result['total_urls']} successful")
-            return extracted_content
-        else:
-            current_app.logger.error(f"Crawl4AI batch API error {response.status_code}")
-            return [""] * len(urls)  # Return empty strings for all URLs
-
+        from integrations.web_crawler import crawl_urls
+        results = crawl_urls(urls, timeout=30, max_concurrent=max_concurrent)
+        extracted = []
+        for r in results:
+            extracted.append(r['markdown'] if r['success'] else "")
+        success_count = sum(1 for r in results if r['success'])
+        current_app.logger.info(f"Batch crawl: {success_count}/{len(urls)} succeeded")
+        return extracted
     except Exception as e:
-        current_app.logger.error(f"Crawl4AI batch API error: {e}")
-        return [""] * len(urls)  # Return empty strings for all URLs
+        current_app.logger.error(f"Batch crawl error: {e}")
+        return [""] * len(urls)
 
 
 def fallback_fetch(url: str) -> str:
@@ -258,14 +191,8 @@ def fallback_fetch(url: str) -> str:
 
 
 def check_crawl4ai_service() -> bool:
-    """
-    Check if Crawl4AI API service is available
-    """
-    try:
-        response = pooled_get(f"{CRAWL4AI_API_URL}/health", timeout=5)
-        return response.status_code == 200
-    except:
-        return False
+    """Check if web crawling is available (in-process, always True)."""
+    return True  # Native in-process — no external service to check
 
 
 def top5_results(query):
@@ -1673,7 +1600,7 @@ def get_visual_context(user_id,mins=5):
         This function help to extract action that user have perfomed till time
     '''
     # action_url = f"{ACTION_API}?user_id={user_id}"
-    action_url = f"https://mailer.hertzai.com/get_visual_bymins?user_id={user_id}&mins={mins}"
+    action_url = get_visual_context_api(user_id, mins)
     # Todo: get, and populate timezone from client
     time_zone = "Asia/Kolkata"
 
@@ -1716,7 +1643,7 @@ def get_screen_context(user_id, mins=2):
         Get recent screen understanding descriptions (shorter window than visual).
         Screen context goes stale faster - default 2 minute window.
     '''
-    action_url = f"https://mailer.hertzai.com/get_visual_bymins?user_id={user_id}&mins={mins}"
+    action_url = get_visual_context_api(user_id, mins)
     time_zone = "Asia/Kolkata"
     india_tz = pytz.timezone(time_zone)
 
@@ -1751,7 +1678,7 @@ def search_visual_history(user_id, query, mins=30, channel='both'):
         Reuses the same DB endpoint as get_visual_context/get_screen_context.
         channel: 'camera', 'screen', or 'both'
     '''
-    action_url = f"https://mailer.hertzai.com/get_visual_bymins?user_id={user_id}&mins={mins}"
+    action_url = get_visual_context_api(user_id, mins)
     time_zone = "Asia/Kolkata"
     india_tz = pytz.timezone(time_zone)
 
@@ -1978,7 +1905,8 @@ def _resolve_agent_data_dir():
         # Use sibling directory to the database file
         return os.path.join(os.path.dirname(db_path), 'agent_data')
     # Bundled/frozen mode: use writable user directory (Program Files is read-only)
-    if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
+    from core.config_cache import is_bundled as _is_bundled_check
+    if _is_bundled_check():
         return os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data')
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'agent_data')
 

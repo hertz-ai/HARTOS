@@ -1587,4 +1587,194 @@ def register_shell_os_routes(app):
         except FileNotFoundError:
             return jsonify({'error': 'xdg-open not available'}), 500
 
+    # ── Self-Build API ──────────────────────────────────────────
+    # Runtime OS rebuilding — the OS modifies and rebuilds itself
+
+    @app.route('/api/system/self-build/status', methods=['GET'])
+    def _self_build_status():
+        """Current self-build status and generation info."""
+        from flask import jsonify
+        info = {'self_build_available': False}
+
+        try:
+            result = subprocess.run(
+                ['nixos-version'], capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                info['nixos_version'] = result.stdout.strip()
+                info['self_build_available'] = True
+        except Exception:
+            pass
+
+        # Current generation
+        gen_link = '/nix/var/nix/profiles/system'
+        if os.path.islink(gen_link):
+            info['current_generation'] = os.readlink(gen_link)
+
+        # Runtime config exists?
+        runtime_nix = '/etc/hart/runtime.nix'
+        info['runtime_config_exists'] = os.path.isfile(runtime_nix)
+
+        # Build history
+        history_file = '/var/lib/hart/ota/history/builds.jsonl'
+        if os.path.isfile(history_file):
+            try:
+                with open(history_file) as f:
+                    lines = f.readlines()
+                info['recent_builds'] = [
+                    json.loads(l) for l in lines[-5:] if l.strip()]
+            except Exception:
+                pass
+
+        return jsonify(info)
+
+    @app.route('/api/system/self-build/packages', methods=['GET'])
+    def _self_build_packages():
+        """List runtime-installed packages."""
+        from flask import jsonify
+        runtime_nix = '/etc/hart/runtime.nix'
+        packages = []
+        if os.path.isfile(runtime_nix):
+            try:
+                with open(runtime_nix) as f:
+                    in_packages = False
+                    for line in f:
+                        stripped = line.strip()
+                        if 'systemPackages' in stripped:
+                            in_packages = True
+                            continue
+                        if in_packages and stripped == '];':
+                            break
+                        if in_packages and stripped and not stripped.startswith('#'):
+                            packages.append(stripped)
+            except Exception:
+                pass
+        return jsonify({'packages': packages})
+
+    @app.route('/api/system/self-build/install', methods=['POST'])
+    def _self_build_install():
+        """Add a package to runtime config (requires self-build to apply)."""
+        from flask import request, jsonify
+        data = request.get_json(silent=True) or {}
+        package = data.get('package', '').strip()
+        if not package or not package.replace('-', '').replace('_', '').isalnum():
+            return jsonify({'error': 'Invalid package name'}), 400
+
+        runtime_nix = '/etc/hart/runtime.nix'
+        if not os.path.isfile(runtime_nix):
+            return jsonify({'error': 'Runtime config not found'}), 404
+
+        try:
+            with open(runtime_nix) as f:
+                content = f.read()
+            if package in content:
+                return jsonify({'status': 'already_installed', 'package': package})
+            content = content.replace(
+                '# Packages added at runtime appear here',
+                f'# Packages added at runtime appear here\n    {package}')
+            with open(runtime_nix, 'w') as f:
+                f.write(content)
+            return jsonify({
+                'status': 'staged',
+                'package': package,
+                'message': 'Run self-build to apply',
+            })
+        except PermissionError:
+            return jsonify({'error': 'Permission denied'}), 403
+
+    @app.route('/api/system/self-build/remove', methods=['POST'])
+    def _self_build_remove():
+        """Remove a package from runtime config."""
+        from flask import request, jsonify
+        data = request.get_json(silent=True) or {}
+        package = data.get('package', '').strip()
+        if not package:
+            return jsonify({'error': 'Package name required'}), 400
+
+        runtime_nix = '/etc/hart/runtime.nix'
+        if not os.path.isfile(runtime_nix):
+            return jsonify({'error': 'Runtime config not found'}), 404
+
+        try:
+            with open(runtime_nix) as f:
+                lines = f.readlines()
+            new_lines = [l for l in lines if package not in l.strip()
+                         or l.strip().startswith('#')]
+            if len(new_lines) == len(lines):
+                return jsonify({'status': 'not_found', 'package': package})
+            with open(runtime_nix, 'w') as f:
+                f.writelines(new_lines)
+            return jsonify({
+                'status': 'staged_removal',
+                'package': package,
+                'message': 'Run self-build to apply',
+            })
+        except PermissionError:
+            return jsonify({'error': 'Permission denied'}), 403
+
+    @app.route('/api/system/self-build/trigger', methods=['POST'])
+    def _self_build_trigger():
+        """Trigger a self-build (dry-run or switch)."""
+        from flask import request, jsonify
+        data = request.get_json(silent=True) or {}
+        mode = data.get('mode', 'dry-run')
+        if mode not in ('dry-run', 'switch', 'diff'):
+            return jsonify({'error': 'Mode must be dry-run, switch, or diff'}), 400
+
+        try:
+            result = subprocess.run(
+                ['hart-self-build', mode],
+                capture_output=True, text=True, timeout=600)
+            return jsonify({
+                'status': 'completed' if result.returncode == 0 else 'failed',
+                'mode': mode,
+                'returncode': result.returncode,
+                'output': result.stdout[-2000:] if result.stdout else '',
+                'errors': result.stderr[-1000:] if result.stderr else '',
+            })
+        except subprocess.TimeoutExpired:
+            return jsonify({'error': 'Build timed out (10 min limit)'}), 504
+        except FileNotFoundError:
+            return jsonify({'error': 'hart-self-build not available (not on NixOS?)'}), 501
+
+    @app.route('/api/system/generations', methods=['GET'])
+    def _system_generations():
+        """List NixOS generations (rollback targets)."""
+        from flask import jsonify
+        generations = []
+        profile_dir = '/nix/var/nix/profiles'
+        if os.path.isdir(profile_dir):
+            try:
+                for entry in sorted(os.listdir(profile_dir), reverse=True):
+                    if entry.startswith('system-') and entry.endswith('-link'):
+                        gen_num = entry.replace('system-', '').replace('-link', '')
+                        target = os.readlink(os.path.join(profile_dir, entry))
+                        generations.append({
+                            'generation': gen_num,
+                            'path': target,
+                        })
+            except Exception:
+                pass
+        current = ''
+        if os.path.islink(os.path.join(profile_dir, 'system')):
+            current = os.readlink(os.path.join(profile_dir, 'system'))
+        return jsonify({
+            'current': current,
+            'generations': generations[:20],
+        })
+
+    @app.route('/api/system/rollback', methods=['POST'])
+    def _system_rollback():
+        """Rollback to previous NixOS generation."""
+        from flask import jsonify
+        try:
+            result = subprocess.run(
+                ['sudo', 'nixos-rebuild', 'switch', '--rollback'],
+                capture_output=True, text=True, timeout=300)
+            return jsonify({
+                'status': 'rolled_back' if result.returncode == 0 else 'failed',
+                'output': result.stdout[-2000:] if result.stdout else '',
+            })
+        except FileNotFoundError:
+            return jsonify({'error': 'nixos-rebuild not available'}), 501
+
     logger.info("Registered shell OS API routes")

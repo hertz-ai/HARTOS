@@ -23,8 +23,14 @@ APP_TEMP_DIR = os.environ.get("APP_TEMP_DIR", "/app/temp")
 
 class TTSProvider(Enum):
     """Supported TTS providers."""
-    LUXTTS = "luxtts"      # Offline: LuxTTS 24kHz — GPU/CPU, voice cloning, Apache 2.0
-    POCKET = "pocket"      # Offline: Pocket TTS (Kyutai) — 100M params, CPU, MIT
+    LUXTTS = "luxtts"                # Offline: LuxTTS 24kHz — GPU/CPU, voice cloning, Apache 2.0
+    POCKET = "pocket"                # Offline: Pocket TTS (Kyutai) — 100M params, CPU, MIT
+    CHATTERBOX = "chatterbox"        # GPU: English, emotional, voice cloning, 3.8GB VRAM
+    CHATTERBOX_ML = "chatterbox_ml"  # GPU: 23 languages, voice cloning, 12GB VRAM
+    COSYVOICE = "cosyvoice"          # GPU: 9 languages (zh/ja/ko/de/es/fr/it/ru/en), 3.5GB
+    F5 = "f5_tts"                    # GPU: English + Chinese, voice cloning, 1.3GB VRAM
+    INDIC_PARLER = "indic_parler"    # GPU: 22 Indic languages + English, 1.8GB VRAM
+    ESPEAK = "espeak"                # CPU: 100+ languages, robotic quality, instant
     # Cloud providers — kept for config compatibility, disabled at runtime
     OPENAI = "openai"           # Disabled: closed-source cloud API
     ELEVENLABS = "elevenlabs"   # Disabled: closed-source cloud API

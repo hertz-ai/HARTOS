@@ -25,6 +25,19 @@ from threading import Lock, Thread
 
 from flask import Flask, request, jsonify, send_file
 
+try:
+    from integrations.service_tools.vram_manager import clear_cuda_cache
+except ImportError:
+    def clear_cuda_cache():
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+        except Exception:
+            pass
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('wan2gp_server')
 
@@ -190,14 +203,7 @@ def unload():
     """Unload pipeline to free memory."""
     global _pipeline
     _pipeline = None
-    try:
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-            torch.mps.empty_cache()
-    except ImportError:
-        pass
+    clear_cuda_cache()
     return jsonify({'status': 'unloaded'})
 
 

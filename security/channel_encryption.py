@@ -76,6 +76,12 @@ def get_x25519_keypair() -> Tuple[X25519PrivateKey, bytes]:
         try:
             with open(x_priv_path, 'rb') as f:
                 raw = f.read()
+            # Decrypt at rest — auto-detects encrypted vs plaintext
+            try:
+                from security.crypto import decrypt_data
+                raw = decrypt_data(raw)
+            except ImportError:
+                pass
             _x25519_private = X25519PrivateKey.from_private_bytes(raw)
             logger.info("X25519 keypair loaded from %s", key_dir)
         except Exception as e:
@@ -90,8 +96,14 @@ def get_x25519_keypair() -> Tuple[X25519PrivateKey, bytes]:
             serialization.PrivateFormat.Raw,
             serialization.NoEncryption(),
         )
-        with open(x_priv_path, 'wb') as f:
-            f.write(raw)
+        # Encrypt at rest when HEVOLVE_DATA_KEY is configured
+        try:
+            from security.crypto import encrypt_data
+            with open(x_priv_path, 'wb') as f:
+                f.write(encrypt_data(raw))
+        except ImportError:
+            with open(x_priv_path, 'wb') as f:
+                f.write(raw)
         logger.info("X25519 keypair generated and saved to %s", key_dir)
 
     _x25519_public_bytes = _x25519_private.public_key().public_bytes(

@@ -316,11 +316,14 @@ class TestBootVerification:
         manifest_path = Path(tmp_code_root) / 'release_manifest.json'
         manifest_path.write_text(json.dumps(manifest))
 
+        mock_origin = {'verified': True, 'details': 'test mode'}
         with patch.dict(os.environ, {'HEVOLVE_DEV_MODE': 'false',
                                       'HEVOLVE_ENFORCEMENT_MODE': 'hard'}):
             with patch('security.master_key.MASTER_PUBLIC_KEY_HEX', master_keypair['public_hex']):
-                result = full_boot_verification(tmp_code_root)
-                assert result['passed'] is True
+                with patch('security.origin_attestation.verify_origin',
+                           return_value=mock_origin):
+                    result = full_boot_verification(tmp_code_root)
+                    assert result['passed'] is True
 
     def test_tampered_code_fails(self, master_keypair, tmp_code_root):
         """If code is modified after signing, verification should fail."""

@@ -41,19 +41,22 @@ class CodingAgentDaemon:
         if self._thread:
             self._thread.join(timeout=10)
 
+    def _wd_heartbeat(self):
+        """Send heartbeat to watchdog between potentially blocking operations."""
+        try:
+            from security.node_watchdog import get_watchdog
+            wd = get_watchdog()
+            if wd:
+                wd.heartbeat('coding_daemon')
+        except Exception:
+            pass
+
     def _loop(self):
         while self._running:
             time.sleep(self._interval)
             if not self._running:
                 break
-            # Heartbeat to watchdog
-            try:
-                from security.node_watchdog import get_watchdog
-                wd = get_watchdog()
-                if wd:
-                    wd.heartbeat('coding_daemon')
-            except Exception:
-                pass
+            self._wd_heartbeat()
             try:
                 self._tick()
             except Exception as e:
@@ -102,6 +105,7 @@ class CodingAgentDaemon:
                 prompt = CodingGoalManager.build_prompt(goal.to_dict())
                 dispatch_to_chat(prompt, str(agent['user_id']), goal.id)
                 dispatched += 1
+                self._wd_heartbeat()
 
             if dispatched > 0:
                 logger.info(f"Coding daemon: dispatched {dispatched} goal(s) to idle agents")

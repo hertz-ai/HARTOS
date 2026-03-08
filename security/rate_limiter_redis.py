@@ -46,6 +46,8 @@ class RedisRateLimiter:
         'games': (20, 60),              # 20 game operations per 60 seconds
         'mcp': (30, 60),                # 30 MCP operations per 60 seconds
         'tts': (10, 60),                # 10 TTS generations per 60 seconds
+        'tts_speak': (20, 60),              # 20 TTS speak requests per 60 seconds
+        'tts_clone': (5, 3600),             # 5 voice clones per hour
         'civic_sentinel': (20, 60),      # 20 civic sentinel ops per 60 seconds
         'wifi': (30, 60),                # 30 wifi operations per 60 seconds
         'vpn': (20, 60),                 # 20 vpn operations per 60 seconds

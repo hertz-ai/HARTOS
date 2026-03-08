@@ -16,6 +16,7 @@ import time
 from datetime import datetime, timedelta
 from functools import wraps
 from typing import Dict, List, Optional
+from core.port_registry import get_port
 
 from flask import Blueprint, g, jsonify, request
 from sqlalchemy.orm import Session
@@ -311,7 +312,7 @@ def intelligence_chat():
 
     try:
         from core.http_pool import pooled_post
-        result = pooled_post('http://localhost:6777/chat', json={
+        result = pooled_post(f'http://localhost:{get_port("backend")}/chat', json={
             'user_id': g.api_key['user_id'],
             'prompt_id': 'api_intelligence',
             'prompt': prompt,
@@ -355,7 +356,7 @@ def intelligence_analyze():
 
     try:
         from core.http_pool import pooled_post
-        result = pooled_post('http://localhost:6777/chat', json={
+        result = pooled_post(f'http://localhost:{get_port("backend")}/chat', json={
             'user_id': g.api_key['user_id'],
             'prompt_id': 'api_analyze',
             'prompt': prompt,

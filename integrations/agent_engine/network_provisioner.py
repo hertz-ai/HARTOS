@@ -24,6 +24,7 @@ import tempfile
 import time
 from datetime import datetime
 from typing import Dict, List, Optional
+from core.port_registry import get_port
 
 logger = logging.getLogger('hevolve_provisioner')
 
@@ -593,7 +594,7 @@ class NetworkProvisioner:
 
             # Backend HTTP health
             result = NetworkProvisioner._exec_remote(
-                client, 'curl -s http://localhost:6777/status')
+                client, f'curl -s http://localhost:{get_port("backend")}/status')
             health['backend_responding'] = result['exit_code'] == 0
 
             # Node ID
@@ -710,7 +711,7 @@ class NetworkProvisioner:
             # Wait for backend
             for _ in range(15):
                 check = NetworkProvisioner._exec_remote(
-                    client, 'curl -s http://localhost:6777/status', timeout=5)
+                    client, f'curl -s http://localhost:{get_port("backend")}/status', timeout=5)
                 if check['exit_code'] == 0:
                     # Update DB record
                     ver_result = NetworkProvisioner._exec_remote(

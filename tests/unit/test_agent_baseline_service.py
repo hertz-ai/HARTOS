@@ -193,7 +193,10 @@ class TestRecipeMetrics:
     """Test recipe metric collection."""
 
     def test_collect_recipe_metrics(self, sample_recipe, monkeypatch):
-        monkeypatch.chdir(sample_recipe)
+        prompts_dir = os.path.join(sample_recipe, 'prompts')
+        monkeypatch.setattr(
+            'integrations.agent_engine.agent_baseline_service.PROMPTS_DIR',
+            prompts_dir)
         metrics = AgentBaselineService._collect_recipe_metrics('test_123', 0)
 
         assert metrics['action_count'] == 2

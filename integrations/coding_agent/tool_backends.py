@@ -256,7 +256,7 @@ BACKENDS = {
     'kilocode': KiloCodeBackend,
     'claude_code': ClaudeCodeBackend,
     'opencode': OpenCodeBackend,
-    'aider_native': _get_aider_native_class,
+    'aider_native': _LazyAiderNative(),
 }
 
 

@@ -249,6 +249,28 @@ SEED_BOOTSTRAP_GOALS = [
         'use_product': False,
     },
     {
+        'slug': 'bootstrap_self_build_monitor',
+        'goal_type': 'self_build',
+        'title': 'OS Self-Build Monitor — Sandbox-First Package Management',
+        'description': (
+            'Monitor and maintain the OS runtime configuration: '
+            '1) Use get_self_build_status to check current packages, version, generations, '
+            '2) When a package install/remove is needed, stage it with install_package/remove_package, '
+            '3) ALWAYS call sandbox_test_build() before apply_build() — never skip the sandbox, '
+            '4) Use show_build_diff() to review what will change, '
+            '5) After apply, verify the change worked — rollback_build() if anything is wrong, '
+            '6) Track build history and alert on repeated failures. '
+            'The OS rebuilds itself. Every change is reversible. Test first, deploy second.'
+        ),
+        'config': {
+            'mode': 'monitor',
+            'continuous': True,
+            'sandbox_required': True,
+        },
+        'spark_budget': 150,
+        'use_product': False,
+    },
+    {
         'slug': 'bootstrap_upgrade_monitor',
         'goal_type': 'upgrade',
         'title': 'Continuous Version Upgrade Monitor',

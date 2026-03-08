@@ -17,9 +17,10 @@ Environment variables:
     HEVOLVE_DB_PATH                 SQLite DB path (default: agent_data/hevolve.db).
 
 Queen Bee Authority:
-    Central has instant, total authority over this node. On every gossip round,
-    the main loop checks for pending fleet commands from central. Commands are
-    signed with central's certificate and executed immediately:
+    Central has instant, total authority over this node. Fleet commands arrive
+    via MessageBus subscription (WAMP push — instant delivery, no polling).
+    On startup, DB is drained once for commands queued while offline.
+    Commands are signed with central's certificate and executed immediately:
         config_update, goal_assign, sensor_config, firmware_update, halt, restart
 """
 import logging
@@ -158,7 +159,7 @@ def _boot_db():
 
 
 def _drain_fleet_commands(node_id: str):
-    """Check for and execute pending fleet commands from central."""
+    """Drain pending fleet commands from DB (startup only — catches offline-queued commands)."""
     try:
         from integrations.social.models import get_db
         from integrations.social.fleet_command import FleetCommandService
@@ -167,33 +168,66 @@ def _drain_fleet_commands(node_id: str):
         try:
             commands = FleetCommandService.get_pending_commands(db, node_id)
             for cmd in commands:
-                logger.info(f"Fleet command: {cmd['cmd_type']} from {cmd['issued_by'][:8]}...")
-
-                # Verify signature before executing
-                if not FleetCommandService.verify_command_signature(cmd):
-                    logger.warning(f"Fleet command {cmd['id']}: invalid signature, skipping")
-                    FleetCommandService.ack_command(
-                        db, cmd['id'], node_id, success=False,
-                        result_message='Invalid signature',
-                    )
-                    continue
-
-                # Execute the command
-                result = FleetCommandService.execute_command(
-                    cmd['cmd_type'], cmd.get('params', {}),
-                )
-                FleetCommandService.ack_command(
-                    db, cmd['id'], node_id,
-                    success=result.get('success', False),
-                    result_message=result.get('message', ''),
-                )
-
+                _execute_fleet_command(cmd, node_id, db)
             if commands:
                 db.commit()
+                logger.info(f"Fleet: drained {len(commands)} offline-queued commands")
         finally:
             db.close()
     except Exception as e:
-        logger.debug(f"Fleet command check failed: {e}")
+        logger.debug(f"Fleet command drain failed: {e}")
+
+
+def _execute_fleet_command(cmd: dict, node_id: str, db=None):
+    """Execute a single fleet command (shared by DB drain + MessageBus handler)."""
+    from integrations.social.fleet_command import FleetCommandService
+
+    logger.info(f"Fleet command: {cmd['cmd_type']} from {cmd.get('issued_by', '?')[:8]}...")
+
+    # Verify signature before executing
+    if not FleetCommandService.verify_command_signature(cmd):
+        logger.warning(f"Fleet command {cmd.get('id', '?')}: invalid signature, skipping")
+        if db and cmd.get('id'):
+            FleetCommandService.ack_command(
+                db, cmd['id'], node_id, success=False,
+                result_message='Invalid signature',
+            )
+        return
+
+    # Execute the command
+    result = FleetCommandService.execute_command(
+        cmd['cmd_type'], cmd.get('params', {}),
+    )
+    if db and cmd.get('id'):
+        FleetCommandService.ack_command(
+            db, cmd['id'], node_id,
+            success=result.get('success', False),
+            result_message=result.get('message', ''),
+        )
+
+
+def _subscribe_fleet_commands(node_id: str):
+    """Subscribe to fleet.command via MessageBus for instant WAMP-pushed commands."""
+    try:
+        from core.peer_link.message_bus import get_message_bus
+        bus = get_message_bus()
+
+        def _on_fleet_command(topic, data):
+            """Handle fleet command received via WAMP push (instant, no polling)."""
+            if not isinstance(data, dict):
+                return
+            target = data.get('target_node_id', '')
+            if target and target != node_id:
+                return  # Not for this node
+            try:
+                _execute_fleet_command(data, node_id)
+            except Exception as e:
+                logger.error(f"Fleet command execution failed: {e}")
+
+        bus.subscribe('fleet.command', _on_fleet_command)
+        logger.info("Fleet: subscribed to MessageBus (instant delivery)")
+    except Exception as e:
+        logger.warning(f"Fleet: MessageBus subscription failed: {e}")
 
 
 def _check_halt():
@@ -216,10 +250,18 @@ def _check_restart():
 
 
 def _main_loop(node_id: str, gossip_interval: int = 60):
-    """Main loop: gossip + fleet commands + hardware adapters.
+    """Main loop: gossip + halt/restart checks.
 
-    Runs until SIGTERM/SIGINT or halt command from central.
+    Fleet commands arrive via MessageBus subscription (instant, event-driven).
+    DB drain runs once at startup for commands queued while offline.
+    Loop only handles halt/restart flag checks and gossip heartbeat.
     """
+    # One-time: drain commands queued in DB while we were offline
+    _drain_fleet_commands(node_id)
+
+    # Subscribe to MessageBus for instant fleet command delivery
+    _subscribe_fleet_commands(node_id)
+
     tick = 0
     logger.info(f"Main loop started (interval={gossip_interval}s)")
 
@@ -237,10 +279,7 @@ def _main_loop(node_id: str, gossip_interval: int = 60):
             logger.info(f"Restarting {restart_target}...")
             # For now, just log. Future: restart specific subsystems.
 
-        # Drain fleet commands from central
-        _drain_fleet_commands(node_id)
-
-        # Sleep for gossip interval
+        # Sleep for gossip interval (fleet commands arrive via MessageBus, not polling)
         try:
             time.sleep(gossip_interval)
         except KeyboardInterrupt:

@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: HART API
-  description: The HART platform API (formerly Hevolve-db-app) provides programmatic access to the Hevolve Agentic Runtime. Explore the various endpoints for agent orchestration, social communities, goal management, and distributed compute.
+  description: The HART platform API provides programmatic access to the Hevolve Hive Agentic Runtime -crowdsourced compute infrastructure for autonomous Hive AI Training. Distributed thought process across crowdsourced agents, distributed coding agents incentivizing compute providers, self-sustaining economy so no single entity monopolizes AI. Explore endpoints for agent orchestration, social communities, goal management, and distributed compute.
   version: '1.0'
 servers:
   - url: https://azurekong.hertzai.com:8443/db

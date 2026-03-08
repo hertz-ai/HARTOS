@@ -57,6 +57,16 @@ class RuntimeIntegrityMonitor:
         if self._thread:
             self._thread.join(timeout=10)
 
+    def _wd_heartbeat(self):
+        """Send heartbeat to watchdog between potentially blocking checks."""
+        try:
+            from security.node_watchdog import get_watchdog
+            wd = get_watchdog()
+            if wd:
+                wd.heartbeat('runtime_monitor')
+        except Exception:
+            pass
+
     def _check_loop(self) -> None:
         """Background loop: periodic code hash + guardrail hash verification.
 
@@ -70,14 +80,7 @@ class RuntimeIntegrityMonitor:
             time.sleep(self._check_interval)
             if not self._running:
                 break
-            # Heartbeat to watchdog
-            try:
-                from security.node_watchdog import get_watchdog
-                wd = get_watchdog()
-                if wd:
-                    wd.heartbeat('runtime_monitor')
-            except Exception:
-                pass
+            self._wd_heartbeat()
             try:
                 from security.node_integrity import compute_code_hash
                 current_hash = compute_code_hash(self._code_root)
@@ -91,6 +94,8 @@ class RuntimeIntegrityMonitor:
             except Exception as e:
                 logger.warning(f"Runtime integrity check error: {e}")
 
+            self._wd_heartbeat()
+
             # Guardrail values integrity check
             try:
                 from security.hive_guardrails import verify_guardrail_integrity
@@ -102,6 +107,18 @@ class RuntimeIntegrityMonitor:
                     return
             except Exception as e:
                 logger.warning(f"Guardrail integrity check error: {e}")
+
+            self._wd_heartbeat()
+
+            # Origin attestation check — detect branding removal
+            try:
+                from security.origin_attestation import verify_origin
+                origin = verify_origin(self._code_root)
+                if not origin['genuine']:
+                    logger.critical(
+                        f"ORIGIN ATTESTATION FAILED: {origin['details']}")
+            except Exception:
+                pass
 
     def _on_tamper_detected(self) -> None:
         """Respond to tampering: stop gossip, log changed files."""

@@ -17,12 +17,21 @@ logger = logging.getLogger(__name__)
 
 # VRAM budget table: tool_name -> (min_vram_gb, model_size_gb)
 VRAM_BUDGETS: Dict[str, Tuple[float, float]] = {
-    "acestep":          (6.0,  4.0),
-    "wan2gp":           (8.0,  8.0),
-    "whisper":          (2.0,  1.5),
-    "tts_audio_suite":  (4.0,  2.0),
-    "ltx2":             (6.0,  4.0),
-    "minicpm":          (6.0,  4.0),
+    "acestep":              (6.0,  4.0),
+    "wan2gp":               (8.0,  8.0),
+    "ltx2":                 (6.0,  4.0),
+    "minicpm":              (6.0,  4.0),
+    # STT engines
+    "whisper":              (2.0,  1.5),
+    "whisper_base":         (0.5,  0.2),    # faster-whisper base (CPU-friendly)
+    "whisper_medium":       (2.0,  1.5),    # faster-whisper medium
+    "whisper_large":        (4.0,  3.0),    # faster-whisper large-v3-turbo
+    # TTS engines
+    "tts_chatterbox_turbo": (5.6,  3.8),    # English, [laugh]/[chuckle] tags
+    "tts_f5":               (2.0,  1.3),    # English+Chinese, voice cloning
+    "tts_indic_parler":     (2.0,  1.8),    # 21 Indic languages + English
+    "tts_cosyvoice3":       (4.0,  3.5),    # zh/ja/ko/de/es/fr/it/ru, zero-shot
+    "tts_chatterbox_ml":    (14.0, 12.0),   # 23 languages, needs 16GB+
 }
 
 
@@ -276,3 +285,21 @@ class VRAMManager:
 
 # Global singleton
 vram_manager = VRAMManager()
+
+
+# ── Module-level convenience functions ──────────────────────────
+# Allow: from integrations.service_tools.vram_manager import detect_gpu, clear_cuda_cache
+
+def detect_gpu() -> Dict:
+    """Detect GPU via the singleton VRAMManager. See VRAMManager.detect_gpu."""
+    return vram_manager.detect_gpu()
+
+
+def clear_cuda_cache() -> bool:
+    """Clear GPU cache via the singleton VRAMManager. See VRAMManager.clear_cuda_cache."""
+    return VRAMManager.clear_cuda_cache()
+
+
+def get_vram_manager() -> VRAMManager:
+    """Return the global VRAMManager singleton."""
+    return vram_manager

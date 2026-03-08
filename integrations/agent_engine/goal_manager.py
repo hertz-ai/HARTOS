@@ -1218,3 +1218,35 @@ def _build_civic_sentinel_prompt(goal_dict, product_dict=None):
 
 register_goal_type('civic_sentinel', _build_civic_sentinel_prompt,
                     tool_tags=['news', 'web_search', 'content_gen', 'feed_management'])
+
+
+# ─── Self-Build — OS Runtime Modification Agent ───
+
+def _build_self_build_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
+    """Build prompt for OS self-build agent."""
+    config = goal_dict.get('config_json', {})
+    mode = config.get('mode', 'monitor')
+    return (
+        f"You are the HART OS Self-Build agent. You can modify the operating system "
+        f"at runtime by installing/removing NixOS packages and triggering rebuilds.\n\n"
+        f"Goal: {goal_dict.get('description', '')}\n"
+        f"Mode: {mode}\n\n"
+        f"CRITICAL SAFETY RULES — NEVER SKIP THESE:\n"
+        f"1. ALWAYS call sandbox_test_build() BEFORE apply_build(). No exceptions.\n"
+        f"2. If the sandbox fails, fix the issue and re-test. NEVER apply a failing build.\n"
+        f"3. NixOS builds are atomic — a failed apply leaves the system unchanged.\n"
+        f"4. Every apply creates a new generation. Rollback is instant via rollback_build().\n"
+        f"5. After applying, verify the change worked. If not, rollback immediately.\n\n"
+        f"WORKFLOW:\n"
+        f"1. get_self_build_status() — check current state and what's installed\n"
+        f"2. install_package() or remove_package() — stage the change\n"
+        f"3. sandbox_test_build() — MANDATORY dry-run test\n"
+        f"4. show_build_diff() — review what will change\n"
+        f"5. apply_build() — only if sandbox passed\n"
+        f"6. Verify the change, rollback_build() if anything is wrong\n\n"
+        f"The OS rebuilds itself. Every change is reversible. Test first, deploy second.\n"
+    )
+
+
+register_goal_type('self_build', _build_self_build_prompt,
+                    tool_tags=['self_build'])

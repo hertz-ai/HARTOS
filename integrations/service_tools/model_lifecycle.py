@@ -254,8 +254,18 @@ class ModelLifecycleManager:
             except Exception as e:
                 logger.debug(f"Model lifecycle tick error: {e}")
 
+    def _wd_heartbeat(self):
+        """Send heartbeat to watchdog between potentially blocking phases."""
+        try:
+            from security.node_watchdog import get_watchdog
+            wd = get_watchdog()
+            if wd:
+                wd.heartbeat('model_lifecycle')
+        except Exception:
+            pass
+
     def _tick(self):
-        """Single lifecycle pass."""
+        """Single lifecycle pass with heartbeat checkpoints between phases."""
         self._tick_count += 1
 
         # Guardrail: circuit breaker
@@ -266,8 +276,9 @@ class ModelLifecycleManager:
         except (ImportError, AttributeError):
             pass
 
-        # Phase 1: Refresh real GPU state
+        # Phase 1: Refresh real GPU state (may call nvidia-smi subprocess)
         self._refresh_memory_state()
+        self._wd_heartbeat()
 
         # Phase 2: Update priorities
         self._update_priorities()
@@ -275,6 +286,7 @@ class ModelLifecycleManager:
         # Phase 3: VRAM pressure response
         if self._detect_vram_pressure():
             self._respond_to_vram_pressure()
+        self._wd_heartbeat()
 
         # Phase 4: RAM pressure response
         if self._detect_ram_pressure():
@@ -289,6 +301,7 @@ class ModelLifecycleManager:
         # Phase 6: Disk pressure response
         disk_pressure = self._detect_disk_pressure()
         self._disk_throttle_active = disk_pressure
+        self._wd_heartbeat()
 
         # Phase 7: Background idle eviction
         self._evict_idle_models()
@@ -300,6 +313,7 @@ class ModelLifecycleManager:
         # Phase 9: Report to federation (every 6th tick, ~90s)
         if self._tick_count % 6 == 0:
             self._report_to_federation()
+        self._wd_heartbeat()
 
     # ── Hook callbacks (from RuntimeToolManager) ──────────────
 
@@ -620,12 +634,8 @@ class ModelLifecycleManager:
                 from .whisper_tool import _whisper_model
                 if _whisper_model is not None:
                     _whisper_model.cpu()
-                    if 'torch' in __import__('sys').modules:
-                        import torch
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-                            torch.mps.empty_cache()
+                    from .vram_manager import clear_cuda_cache
+                    clear_cuda_cache()
                     return True
             except Exception as e:
                 logger.debug(f"Whisper CPU offload failed: {e}")

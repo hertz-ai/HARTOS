@@ -12,13 +12,16 @@ import logging
 import os
 from typing import Dict, Optional
 
+from core.http_pool import pooled_get, pooled_post
+from core.port_registry import get_port
+
 logger = logging.getLogger('hevolve.coding_agent')
 
 
 class RemoteDesktopExecutor:
     """Bridge CLI commands to Nunba /execute and /screenshot endpoints."""
 
-    def __init__(self, nunba_url: str = 'http://localhost:6777'):
+    def __init__(self, nunba_url: str = f'http://localhost:{get_port("backend")}'):
         self.base_url = nunba_url.rstrip('/')
 
     def execute(self, command: str, timeout: int = 120,
@@ -42,7 +45,7 @@ class RemoteDesktopExecutor:
         import requests
 
         try:
-            resp = requests.post(
+            resp = pooled_post(
                 f'{self.base_url}/execute',
                 json={'command': command, 'timeout': timeout},
                 timeout=timeout + 10,
@@ -88,7 +91,7 @@ class RemoteDesktopExecutor:
         import requests
 
         try:
-            resp = requests.get(
+            resp = pooled_get(
                 f'{self.base_url}/screenshot',
                 timeout=30,
             )

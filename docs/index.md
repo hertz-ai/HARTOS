@@ -1,6 +1,6 @@
 # HART OS
 
-**Hevolve Agentic Runtime — Multi-agent platform where humans are always in control.**
+**Hevolve Hive Agentic Runtime -Crowdsourced compute infrastructure for autonomous Hive AI Training. Distributed thought process across crowdsourced agents, self-sustaining economy at national scale -so no single entity monopolizes AI. Humans are always in control.**
 
 ---
 

@@ -234,7 +234,26 @@ model_registry = ModelRegistry()
 def _register_defaults():
     """Register default model backends. Only available if API keys are set."""
 
-    # 1. Local Qwen3-VL (always available — hive compute)
+    # 1. Local Qwen3.5-4B VL — default local model (256K context, vision+text, llama.cpp b8148+)
+    model_registry.register(ModelBackend(
+        model_id='qwen3.5-4b-local',
+        display_name='Qwen3.5 4B VL (Local)',
+        tier=ModelTier.FAST,
+        config_list_entry={
+            'model': 'Qwen3.5-4B',
+            'api_key': 'dummy',
+            'base_url': f'http://localhost:{os.environ.get("LLAMA_CPP_PORT", "8080")}/v1',
+            'price': [0, 0],
+        },
+        avg_latency_ms=700.0,
+        accuracy_score=0.60,
+        cost_per_1k_tokens=0.0,
+        is_local=True,
+        hardware_dependent=True,
+        gpu_tdp_watts=170.0,
+    ))
+
+    # 1b. Local Qwen3-VL-4B — fallback for older llama.cpp installs
     model_registry.register(ModelBackend(
         model_id='qwen3-vl-4b-local',
         display_name='Qwen3-VL 4B (Local)',
@@ -247,25 +266,6 @@ def _register_defaults():
         },
         avg_latency_ms=800.0,
         accuracy_score=0.55,
-        cost_per_1k_tokens=0.0,
-        is_local=True,
-        hardware_dependent=True,
-        gpu_tdp_watts=170.0,
-    ))
-
-    # 1b. Local Qwen3.5-4B text-only (always available — 256K context, llama.cpp b8148+)
-    model_registry.register(ModelBackend(
-        model_id='qwen3.5-4b-local',
-        display_name='Qwen3.5 4B (Local)',
-        tier=ModelTier.FAST,
-        config_list_entry={
-            'model': 'Qwen3.5-4B-Instruct',
-            'api_key': 'dummy',
-            'base_url': f'http://localhost:{os.environ.get("LLAMA_CPP_PORT", "8080")}/v1',
-            'price': [0, 0],
-        },
-        avg_latency_ms=700.0,
-        accuracy_score=0.60,
         cost_per_1k_tokens=0.0,
         is_local=True,
         hardware_dependent=True,

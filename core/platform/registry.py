@@ -97,7 +97,7 @@ class ServiceRegistry:
 
     def __init__(self):
         self._entries: Dict[str, _ServiceEntry] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._start_order: List[str] = []  # tracks actual start order for stop
 
     def register(self, name: str, factory: Callable, *,

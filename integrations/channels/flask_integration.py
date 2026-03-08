@@ -14,6 +14,7 @@ from typing import Optional, Dict, Any
 from functools import wraps
 
 import requests
+from core.http_pool import pooled_post
 
 from .base import Message, ChannelConfig
 from .registry import ChannelRegistry, ChannelRegistryConfig, get_registry
@@ -89,7 +90,7 @@ class FlaskChannelIntegration:
             logger.info(f"Routing message from {message.channel}:{message.sender_id} to agent")
 
             # Call agent API
-            response = requests.post(
+            response = pooled_post(
                 self.agent_api_url,
                 json=payload,
                 timeout=120,  # 2 minute timeout for agent processing

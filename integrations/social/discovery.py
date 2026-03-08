@@ -7,6 +7,7 @@ import os
 import logging
 import time as _time
 from flask import Blueprint, jsonify, request
+from core.port_registry import get_port
 
 logger = logging.getLogger('hevolve_social')
 
@@ -31,7 +32,7 @@ def _check_announce_rate(ip: str) -> bool:
     _ANNOUNCE_RATE[ip] = times
     return True
 
-_BASE_URL = os.environ.get('HEVOLVE_BASE_URL', 'http://localhost:6777')
+_BASE_URL = os.environ.get('HEVOLVE_BASE_URL', f'http://localhost:{get_port("backend")}')
 
 
 @discovery_bp.route('/.well-known/hevolve-social.json')

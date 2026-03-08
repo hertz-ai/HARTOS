@@ -15,6 +15,7 @@ import glob as _glob
 import logging
 from pathlib import Path
 from typing import Optional
+from core.port_registry import get_port
 
 from mcp.server.fastmcp import FastMCP
 
@@ -218,7 +219,7 @@ def agent_status() -> str:
     # Check LLM
     try:
         import requests
-        resp = requests.get('http://localhost:8080/health', timeout=2)
+        resp = requests.get(f'http://localhost:{get_port("llm")}/health', timeout=2)
         status['llm_server'] = 'running' if resp.status_code == 200 else f'status {resp.status_code}'
     except Exception:
         status['llm_server'] = 'not reachable'
@@ -322,10 +323,10 @@ def system_health() -> str:
     # LLM server
     try:
         import requests
-        resp = requests.get('http://localhost:8080/health', timeout=2)
+        resp = requests.get(f'http://localhost:{get_port("llm")}/health', timeout=2)
         health['llm'] = {'status': 'up', 'code': resp.status_code}
         try:
-            models_resp = requests.get('http://localhost:8080/v1/models', timeout=2)
+            models_resp = requests.get(f'http://localhost:{get_port("llm")}/v1/models', timeout=2)
             if models_resp.status_code == 200:
                 data = models_resp.json()
                 models = data.get('data', [])
@@ -421,18 +422,18 @@ def switch_model(model_name: str) -> str:
     """Switch the local LLM model at runtime. Restarts llama-server with the new model.
 
     Available models:
-    - "text" or "qwen35-4b": Qwen3.5-4B (GPT-3.5 level, text-only, best for agents) [index 5]
-    - "vision" or "qwen3-vl-2b": Qwen3-VL-2B (vision+text, for image/video reasoning) [index 0]
-    - "vision-4b" or "qwen3-vl-4b": Qwen3-VL-4B (vision+text, higher quality) — must be in MODEL_PRESETS
-    - "qwen35-2b": Qwen3.5-2B (lightweight text) [index 4]
-    - "gemma": Gemma-3-1B (smallest, fastest) [index 2]
+    - "default" or "qwen35-4b": Qwen3.5-4B VL (recommended, vision+text) [index 0]
+    - "qwen35-2b": Qwen3.5-2B VL (lightweight, low VRAM / CPU) [index 1]
+    - "vision" or "qwen3-vl-2b": Qwen3-VL-2B (older vision model) [index 2]
+    - "gemma": Gemma-3-1B (smallest, fastest, text-only) [index 3]
+    - "qwen3-2b": Qwen3-2B (text-only) [index 4]
     """
     name_to_index = {
-        "text": 5, "qwen35-4b": 5, "qwen3.5-4b": 5,
-        "qwen35-2b": 4, "qwen3.5-2b": 4,
-        "vision": 0, "qwen3-vl-2b": 0, "vl": 0, "vl-2b": 0,
-        "qwen3-2b": 3,
-        "gemma": 2, "gemma-1b": 2,
+        "default": 0, "text": 0, "qwen35-4b": 0, "qwen3.5-4b": 0,
+        "qwen35-2b": 1, "qwen3.5-2b": 1,
+        "vision": 2, "qwen3-vl-2b": 2, "vl": 2, "vl-2b": 2,
+        "gemma": 3, "gemma-1b": 3,
+        "qwen3-2b": 4,
     }
 
     model_index = name_to_index.get(model_name.lower().strip())

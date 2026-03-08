@@ -127,7 +127,7 @@ class CodingAgentOrchestrator:
             from security.channel_encryption import (
                 encrypt_json_for_peer, decrypt_json_from_peer
             )
-            import requests
+            from core.http_pool import pooled_post
 
             mesh = get_compute_mesh()
             peers = mesh.get_available_peers()
@@ -157,7 +157,7 @@ class CodingAgentOrchestrator:
             envelope = encrypt_json_for_peer(payload, peer_pub)
 
             # POST to peer's /coding/execute endpoint
-            resp = requests.post(
+            resp = pooled_post(
                 f'{peer_url.rstrip("/")}/coding/execute',
                 json={'encrypted': envelope},
                 timeout=300,

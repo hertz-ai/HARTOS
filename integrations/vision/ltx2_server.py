@@ -19,6 +19,18 @@ import logging
 from flask import Flask, request, jsonify, send_file
 from threading import Lock
 
+try:
+    from integrations.service_tools.vram_manager import clear_cuda_cache
+except ImportError:
+    def clear_cuda_cache():
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+        except Exception:
+            pass
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -156,8 +168,7 @@ def generate_video():
                 load_pipeline()
 
         # Clear CUDA cache before generation
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        clear_cuda_cache()
 
         # Generate video
         start_time = time.time()
@@ -192,7 +203,7 @@ def generate_video():
         logger.info(f"Video generated in {generation_time:.2f}s: {output_path}")
 
         # Clear cache after generation
-        torch.cuda.empty_cache()
+        clear_cuda_cache()
 
         return jsonify({
             "status": "success",
@@ -210,7 +221,7 @@ def generate_video():
         })
 
     except torch.cuda.OutOfMemoryError:
-        torch.cuda.empty_cache()
+        clear_cuda_cache()
         logger.error("CUDA out of memory! Try reducing resolution or num_frames")
         return jsonify({
             "error": "GPU out of memory. Try reducing width/height (e.g., 512x320) or num_frames (e.g., 33)"
@@ -247,10 +258,10 @@ def list_videos():
 @app.route('/clear_cache', methods=['POST'])
 def clear_cache():
     """Clear CUDA cache to free up VRAM"""
-    torch.cuda.empty_cache()
+    clear_cuda_cache()
     return jsonify({
         "status": "cache_cleared",
-        "vram_used_gb": round(torch.cuda.memory_allocated(0) / 1e9, 2)
+        "vram_used_gb": round(torch.cuda.memory_allocated(0) / 1e9, 2) if torch.cuda.is_available() else 0
     })
 
 
@@ -309,8 +320,7 @@ def generate_long_video():
             chunk_num += 1
             logger.info(f"Generating chunk {chunk_num} (frames {len(all_frames)}-{len(all_frames)+frames_per_chunk})")
 
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            clear_cuda_cache()
 
             chunk_seed = seed + chunk_num
             output_chunk = os.path.join(OUTPUT_DIR, f"chunk_{chunk_num}_{int(time.time())}.mp4")
@@ -367,7 +377,7 @@ def generate_long_video():
         })
 
     except torch.cuda.OutOfMemoryError:
-        torch.cuda.empty_cache()
+        clear_cuda_cache()
         logger.error("CUDA OOM during long video generation")
         return jsonify({"error": "GPU out of memory. Try smaller resolution (384x256)"}), 507
 
@@ -384,7 +394,7 @@ def unload_model():
         if pipeline is not None:
             del pipeline
             pipeline = None
-            torch.cuda.empty_cache()
+            clear_cuda_cache()
     return jsonify({"status": "model_unloaded"})
 
 

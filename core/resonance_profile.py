@@ -97,11 +97,19 @@ class UserResonanceProfile:
 
 def save_resonance_profile(profile: UserResonanceProfile,
                            base_dir: str = None) -> None:
-    """Save profile to agent_data/resonance/{user_id}_resonance.json."""
+    """Save profile to agent_data/resonance/{user_id}_resonance.json.
+
+    Encrypted at rest when HEVOLVE_DATA_KEY is configured.
+    Falls back to plaintext JSON when encryption key is not set.
+    """
     base_dir = base_dir or RESONANCE_STORAGE_DIR
     os.makedirs(base_dir, exist_ok=True)
     path = os.path.join(base_dir, f"{profile.user_id}_resonance.json")
     try:
+        from security.crypto import encrypt_json_file
+        encrypt_json_file(path, profile.to_dict())
+    except ImportError:
+        # Fallback: no crypto module available
         with open(path, 'w') as f:
             json.dump(profile.to_dict(), f, indent=2)
     except Exception as e:
@@ -110,12 +118,22 @@ def save_resonance_profile(profile: UserResonanceProfile,
 
 def load_resonance_profile(user_id: str,
                            base_dir: str = None) -> Optional[UserResonanceProfile]:
-    """Load profile from disk. Returns None if not found."""
+    """Load profile from disk. Auto-detects encrypted vs plaintext.
+
+    Returns None if not found.
+    """
     base_dir = base_dir or RESONANCE_STORAGE_DIR
     path = os.path.join(base_dir, f"{user_id}_resonance.json")
     if not os.path.exists(path):
         return None
     try:
+        from security.crypto import decrypt_json_file
+        data = decrypt_json_file(path)
+        if data is None:
+            return None
+        return UserResonanceProfile.from_dict(data)
+    except ImportError:
+        # Fallback: no crypto module
         with open(path, 'r') as f:
             data = json.load(f)
         return UserResonanceProfile.from_dict(data)

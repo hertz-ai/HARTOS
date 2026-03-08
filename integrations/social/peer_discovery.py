@@ -12,6 +12,8 @@ import threading
 import requests
 from datetime import datetime, timedelta
 
+from core.http_pool import pooled_get, pooled_post
+
 logger = logging.getLogger('hevolve_social')
 
 
@@ -82,8 +84,9 @@ class GossipProtocol:
         self.node_id = str(uuid.uuid4())
         self.node_name = os.environ.get(
             'HEVOLVE_NODE_NAME', f'hevolve-{self.node_id[:8]}')
+        from core.port_registry import get_port
         self.base_url = os.environ.get(
-            'HEVOLVE_BASE_URL', 'http://localhost:6777').rstrip('/')
+            'HEVOLVE_BASE_URL', f'http://localhost:{get_port("backend")}').rstrip('/')
         self.version = '1.0.0'
         self.started_at = datetime.utcnow()
 
@@ -244,6 +247,16 @@ class GossipProtocol:
 
     # ─── Gossip Round ───
 
+    def _heartbeat(self):
+        """Send heartbeat to watchdog between potentially blocking operations."""
+        try:
+            from security.node_watchdog import get_watchdog
+            wd = get_watchdog()
+            if wd:
+                wd.heartbeat('gossip')
+        except Exception:
+            pass
+
     def _gossip_round(self):
         # Tier-aware gossip: scope targets by tier
         if self.tier == 'flat':
@@ -252,19 +265,26 @@ class GossipProtocol:
             peers = self._load_peers_by_tier()
 
         if not peers:
-            # Retry seeds if we have no peers
-            for url in self.seed_peers:
+            # Retry seeds if we have no peers — limit to 2 seeds max
+            # to avoid blocking for N × 5s when all seeds are unreachable
+            for url in list(self.seed_peers)[:2]:
+                if not self._running:
+                    return
                 self._announce_to_peer(url)
+                self._heartbeat()
             return
 
         targets = random.sample(peers, min(self.gossip_fanout, len(peers)))
         for peer in targets:
+            if not self._running:
+                return
             try:
                 their_peers = self._exchange_with_peer(peer['url'])
                 if their_peers:
                     self._merge_peer_list(their_peers)
             except Exception as e:
                 logger.debug(f"Gossip exchange failed with {peer['url']}: {e}")
+            self._heartbeat()
 
     def _health_check_round(self):
         from .models import get_db, PeerNode
@@ -273,9 +293,12 @@ class GossipProtocol:
             peers = db.query(PeerNode).filter(PeerNode.status != 'dead').all()
             now = datetime.utcnow()
             for peer in peers:
+                if not self._running:
+                    break
                 if peer.node_id == self.node_id:
                     continue
                 reachable = self._ping_peer(peer.url)
+                self._heartbeat()
                 if reachable:
                     peer.last_seen = now
                     peer.status = 'active'
@@ -308,12 +331,15 @@ class GossipProtocol:
         urls = set(p['url'] for p in peers)
         urls.update(self.seed_peers)
         for url in urls:
+            if not self._running:
+                return
             if url != self.base_url:
                 self._announce_to_peer(url)
+                self._heartbeat()
 
     def _announce_to_peer(self, peer_url):
         try:
-            resp = requests.post(
+            resp = pooled_post(
                 f"{peer_url}/api/social/peers/announce",
                 json=self._self_info(),
                 timeout=5,
@@ -330,37 +356,73 @@ class GossipProtocol:
                 'peers': self._gossip_peer_list(),
                 'sender': self._gossip_self_info(),
             }
-            # Use msgpack for minimal bandwidth if both sides support it
+
+            # Try PeerLink first (direct WebSocket, no HTTP overhead)
+            try:
+                peer_id = self._url_to_node_id(peer_url)
+                if peer_id:
+                    from core.peer_link.link_manager import get_link_manager
+                    link = get_link_manager().get_link(peer_id)
+                    if link:
+                        result = link.send('gossip', payload,
+                                          wait_response=True, timeout=10)
+                        if result is not None:
+                            get_link_manager().record_http_exchange(peer_id)
+                            return result.get('peers', [])
+            except Exception:
+                pass  # Fall through to HTTP
+
+            # HTTP path (original)
             if self.payload_mode == 'msgpack':
                 try:
                     import msgpack
-                    resp = requests.post(
+                    resp = pooled_post(
                         f"{peer_url}/api/social/peers/exchange",
                         data=self._serialize_payload(payload),
                         headers={'Content-Type': 'application/msgpack'},
                         timeout=10,
                     )
                 except ImportError:
-                    # Fallback to JSON if msgpack not installed
-                    resp = requests.post(
+                    resp = pooled_post(
                         f"{peer_url}/api/social/peers/exchange",
                         json=payload, timeout=10,
                     )
             else:
-                resp = requests.post(
+                resp = pooled_post(
                     f"{peer_url}/api/social/peers/exchange",
                     json=payload, timeout=10,
                 )
             if resp.status_code == 200:
                 data = resp.json()
+                # Record exchange for auto-upgrade to PeerLink
+                try:
+                    peer_id = self._url_to_node_id(peer_url)
+                    if peer_id:
+                        from core.peer_link.link_manager import get_link_manager
+                        get_link_manager().record_http_exchange(peer_id)
+                except Exception:
+                    pass
                 return data.get('peers', [])
         except requests.RequestException:
             pass
         return None
 
+    def _url_to_node_id(self, peer_url: str) -> str:
+        """Look up node_id for a peer URL from the DB."""
+        try:
+            from .models import PeerNode, db_session
+            with db_session() as db:
+                peer = db.query(PeerNode).filter(
+                    PeerNode.url == peer_url).first()
+                if peer:
+                    return peer.node_id
+        except Exception:
+            pass
+        return ''
+
     def _ping_peer(self, peer_url):
         try:
-            resp = requests.get(f"{peer_url}/api/social/peers/health", timeout=3)
+            resp = pooled_get(f"{peer_url}/api/social/peers/health", timeout=3)
             return resp.status_code == 200
         except requests.RequestException:
             return False
@@ -404,7 +466,7 @@ class GossipProtocol:
             if not url or peer.get('node_id') == self.node_id:
                 continue
             try:
-                requests.post(
+                pooled_post(
                     f"{url}/api/social/peers/broadcast",
                     json=message,
                     timeout=5,
@@ -926,7 +988,7 @@ class GossipProtocol:
         """Re-verify a peer's guardrail hash by directly querying it.
         This is the continuous audit — every node verifies every other node."""
         try:
-            resp = requests.get(
+            resp = pooled_get(
                 f"{peer.url}/api/social/integrity/guardrail-hash",
                 timeout=5,
             )
@@ -1233,6 +1295,14 @@ class AutoDiscovery:
             try:
                 data, addr = self._sock.recvfrom(self.MAX_PACKET_SIZE)
             except _socket.timeout:
+                # Heartbeat on timeout so watchdog knows we're alive
+                try:
+                    from security.node_watchdog import get_watchdog
+                    wd = get_watchdog()
+                    if wd:
+                        wd.heartbeat('auto_discovery')
+                except Exception:
+                    pass
                 continue
             except OSError:
                 if not self._running:

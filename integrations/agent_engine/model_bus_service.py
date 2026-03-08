@@ -23,6 +23,8 @@ import os
 import socket
 import threading
 import time
+
+from core.port_registry import get_port
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger('hevolve.model_bus')
@@ -69,13 +71,13 @@ class ModelBusService:
 
     def discover_backends(self) -> Dict[str, dict]:
         """Discover all available model backends."""
-        import requests
+        from core.http_pool import pooled_get
 
         backends = {}
 
         # LLM (llama.cpp)
         try:
-            resp = requests.get(
+            resp = pooled_get(
                 f'http://localhost:{self.llm_port}/health', timeout=3
             )
             if resp.status_code == 200:
@@ -91,7 +93,7 @@ class ModelBusService:
 
         # Vision (MiniCPM)
         try:
-            resp = requests.get(
+            resp = pooled_get(
                 f'http://localhost:{self.vision_port}/health', timeout=3
             )
             if resp.status_code == 200:
@@ -107,7 +109,7 @@ class ModelBusService:
 
         # HART backend (for world model bridge)
         try:
-            resp = requests.get(
+            resp = pooled_get(
                 f'http://localhost:{self.backend_port}/status', timeout=3
             )
             if resp.status_code == 200:
@@ -123,14 +125,14 @@ class ModelBusService:
 
         # Compute mesh peers
         try:
-            resp = requests.get('http://localhost:6796/mesh/status', timeout=3)
+            resp = pooled_get(f'http://localhost:{get_port("mesh_relay")}/mesh/status', timeout=3)
             if resp.status_code == 200:
                 mesh_data = resp.json()
                 peer_count = mesh_data.get('peer_count', 0)
                 if peer_count > 0:
                     backends['mesh'] = {
                         'type': 'mesh',
-                        'url': 'http://localhost:6796',
+                        'url': f'http://localhost:{get_port("mesh_relay")}',
                         'status': 'ready',
                         'local': False,
                         'peers': peer_count,
@@ -160,8 +162,6 @@ class ModelBusService:
         Returns:
             Dict with 'response', 'model', 'backend', 'latency_ms'
         """
-        import requests
-
         if not self._semaphore.acquire(timeout=30):
             return {'error': 'Model Bus overloaded — try again later'}
 
@@ -212,7 +212,7 @@ class ModelBusService:
 
     def _route_llm(self, prompt: str, options: dict) -> dict:
         """Route LLM inference to best backend."""
-        import requests
+        from core.http_pool import pooled_post
 
         # Strategy: try local first, then mesh, then cloud
         backends_to_try = []
@@ -231,7 +231,7 @@ class ModelBusService:
             try:
                 if backend_name == 'local_llm':
                     # llama.cpp OpenAI-compatible API
-                    resp = requests.post(
+                    resp = pooled_post(
                         f'{url}/v1/chat/completions',
                         json={
                             'model': 'local',
@@ -251,7 +251,7 @@ class ModelBusService:
                         }
                 elif backend_name == 'mesh':
                     # Compute mesh offload
-                    resp = requests.post(
+                    resp = pooled_post(
                         f'{url}/mesh/infer',
                         json={'model_type': 'llm', 'prompt': prompt},
                         timeout=options.get('timeout', 120),
@@ -265,7 +265,7 @@ class ModelBusService:
                         }
                 elif backend_name == 'backend':
                     # HART backend (may route to cloud or world model)
-                    resp = requests.post(
+                    resp = pooled_post(
                         f'{url}/chat',
                         json={'prompt': prompt, 'user_id': 'model_bus', 'prompt_id': 'bus'},
                         timeout=options.get('timeout', 60),
@@ -285,7 +285,7 @@ class ModelBusService:
 
     def _route_vision(self, prompt: str, options: dict) -> dict:
         """Route vision inference."""
-        import requests
+        from core.http_pool import pooled_post
 
         image_path = options.get('image_path', '')
         if not image_path:
@@ -294,7 +294,7 @@ class ModelBusService:
         if 'vision' in self._backends:
             try:
                 with open(image_path, 'rb') as f:
-                    resp = requests.post(
+                    resp = pooled_post(
                         f"{self._backends['vision']['url']}/describe",
                         files={'image': f},
                         data={'prompt': prompt},
@@ -312,7 +312,7 @@ class ModelBusService:
         # Fallback to mesh
         if 'mesh' in self._backends:
             try:
-                resp = requests.post(
+                resp = pooled_post(
                     f"{self._backends['mesh']['url']}/mesh/infer",
                     json={'model_type': 'vision', 'prompt': prompt, 'image_path': image_path},
                     timeout=120,
@@ -329,31 +329,47 @@ class ModelBusService:
         return {'error': 'No vision backend available', 'response': None}
 
     def _route_tts(self, prompt: str, options: dict) -> dict:
-        """Route TTS through fallback chain:
+        """Route TTS through smart TTS router (language-aware, GPU/hive/CPU).
 
-        1. LuxTTS (local, GPU/CPU, 48kHz, 150x RT on GPU) — if installed
-        2. MakeItTalk cloud (lip-sync video) — if MAKEITTALK_API_URL set
-        3. Pocket TTS (local, CPU, 24kHz) — always available
-        4. espeak-ng (robotic, instant) — ultimate fallback inside Pocket TTS
-
-        HART OS offline mode skips cloud backends.
+        Delegates to TTSRouter which considers language, GPU, VRAM, compute
+        policy, hive peers, and urgency. Falls back to legacy chain if
+        router is unavailable.
         """
-        makeittalk_url = os.environ.get('MAKEITTALK_API_URL')
-        is_offline = (os.environ.get('HART_OS_MODE') and not makeittalk_url)
+        try:
+            from integrations.channels.media.tts_router import get_tts_router
+            router = get_tts_router()
+            result = router.synthesize(
+                text=prompt,
+                language=options.get('language'),
+                voice=options.get('voice_audio') or options.get('voice'),
+                source=options.get('source', 'agent_tool'),
+                engine_override=options.get('engine'),
+            )
+            if not result.error:
+                return {
+                    'response': result.path,
+                    'model': f'{result.engine_id}',
+                    'backend': 'local_tts' if result.location == 'local' else result.location,
+                    'duration': result.duration,
+                    'latency_ms': result.latency_ms,
+                    'device': result.device,
+                }
+            logger.debug("TTS router failed: %s, falling back to legacy chain", result.error)
+        except (ImportError, Exception) as e:
+            logger.debug("TTS router unavailable (%s), using legacy chain", e)
 
-        # 1. LuxTTS (highest quality, 48kHz, voice cloning)
+        # Legacy fallback chain (preserved for robustness)
         result = self._try_luxtts(prompt, options)
         if result and 'error' not in result:
             return result
 
-        # 2. MakeItTalk cloud (if configured and not offline)
+        makeittalk_url = os.environ.get('MAKEITTALK_API_URL')
+        is_offline = (os.environ.get('HART_OS_MODE') and not makeittalk_url)
         if makeittalk_url and not is_offline:
             result = self._try_makeittalk_tts(prompt, options, makeittalk_url)
             if result and 'error' not in result:
                 return result
-            logger.info("MakeItTalk cloud unavailable, falling back to Pocket TTS")
 
-        # 3. Pocket TTS (always available, CPU)
         return self._try_pocket_tts(prompt, options)
 
     def _try_luxtts(self, prompt: str, options: dict) -> dict:

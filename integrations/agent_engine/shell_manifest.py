@@ -180,6 +180,21 @@ PANEL_MANIFEST = {
         'route': '/admin/content-tasks', 'group': 'Manage',
         'default_size': [800, 600],
     },
+
+    # ─── Assistant (floating chat bubble) ───
+    'assistant': {
+        'title': 'Assistant', 'icon': 'chat_bubble',
+        'route': '/social/assistant', 'group': 'Discover',
+        'default_size': [400, 600],
+        'floating': True,
+    },
+
+    # ─── OpenClaw Skills ───
+    'openclaw_skills': {
+        'title': 'OpenClaw Skills', 'icon': 'extension',
+        'route': '/social/openclaw', 'group': 'Create',
+        'default_size': [800, 600],
+    },
 }
 
 
@@ -523,6 +538,29 @@ SYSTEM_PANELS = {
         'title': 'Weather', 'icon': 'cloud',
         'group': 'System', 'default_size': [400, 350],
         'apis': [],
+    },
+    'keyboard_shortcuts': {
+        'title': 'Keyboard Shortcuts', 'icon': 'keyboard_command_key',
+        'group': 'System', 'default_size': [700, 600],
+        'apis': ['/api/shell/shortcuts'],
+    },
+    'hart_identity': {
+        'title': 'My HART', 'icon': 'badge',
+        'group': 'You', 'default_size': [500, 450],
+        'apis': ['/api/onboarding/profile', '/api/onboarding/status'],
+    },
+    'self_build': {
+        'title': 'Self-Build', 'icon': 'build',
+        'group': 'System', 'default_size': [700, 550],
+        'apis': [
+            '/api/system/self-build/status',
+            '/api/system/self-build/packages',
+            '/api/system/self-build/install',
+            '/api/system/self-build/remove',
+            '/api/system/self-build/trigger',
+            '/api/system/generations',
+            '/api/system/rollback',
+        ],
     },
 }
 

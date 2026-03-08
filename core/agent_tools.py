@@ -22,6 +22,8 @@ from typing import Annotated, Any, List, Optional, Tuple
 import requests
 from json_repair import repair_json
 
+from core.http_pool import pooled_get, pooled_post
+
 tool_logger = logging.getLogger('tool_execution')
 
 
@@ -271,7 +273,7 @@ def build_core_tool_closures(ctx):
             # Try local LTX-2 server first
             try:
                 tool_logger.info(f"Trying local LTX-2 server at {LOCAL_LTX_URL}")
-                response = requests.post(f"{LOCAL_LTX_URL}/generate", json=ltx_payload, headers=headers, timeout=600)
+                response = pooled_post(f"{LOCAL_LTX_URL}/generate", json=ltx_payload, headers=headers, timeout=600)
                 if response.status_code == 200:
                     result = response.json()
                     video_url = result.get('video_url') or result.get('output_url') or result.get('video_path')
@@ -293,13 +295,13 @@ def build_core_tool_closures(ctx):
                         "5": {"class_type": "VHS_VideoCombine", "inputs": {"frame_rate": ltx_payload["fps"], "filename_prefix": "ltx2_output", "format": "video/h264-mp4", "images": ["4", 0]}},
                     }
                 }
-                response = requests.post(f"{LOCAL_COMFYUI_URL}/prompt", json=comfyui_workflow, headers=headers, timeout=10)
+                response = pooled_post(f"{LOCAL_COMFYUI_URL}/prompt", json=comfyui_workflow, headers=headers, timeout=10)
                 if response.status_code == 200:
                     comfy_prompt_id = response.json().get('prompt_id')
                     tool_logger.info(f"ComfyUI LTX-2 job queued: {comfy_prompt_id}")
                     for _ in range(120):
                         time.sleep(5)
-                        history_response = requests.get(f"{LOCAL_COMFYUI_URL}/history/{comfy_prompt_id}")
+                        history_response = pooled_get(f"{LOCAL_COMFYUI_URL}/history/{comfy_prompt_id}")
                         if history_response.status_code == 200:
                             history = history_response.json()
                             if comfy_prompt_id in history:
@@ -321,7 +323,8 @@ def build_core_tool_closures(ctx):
                     "or (3) diffusers library with CUDA GPU")
 
         # Default: Avatar-based video generation
-        database_url = 'https://mailer.hertzai.com'
+        from core.config_cache import get_db_url
+        database_url = get_db_url() or 'https://mailer.hertzai.com'
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
         tool_logger.info(f"avtar_id: {avatar_id}:\n{text[:10]}....\n")
 
@@ -334,7 +337,7 @@ def build_core_tool_closures(ctx):
         }
 
         try:
-            res = requests.get(f"{database_url}/get_image_by_id/{avatar_id}")
+            res = pooled_get(f"{database_url}/get_image_by_id/{avatar_id}")
             res = res.json()
             new_image_url = res["image_url"]
             voice_id = res.get('voice_id')
@@ -367,7 +370,7 @@ def build_core_tool_closures(ctx):
 
         if voice_id is not None:
             try:
-                voice_sample = requests.get(f"{database_url}/get_voice_sample_id/{voice_id}")
+                voice_sample = pooled_get(f"{database_url}/get_voice_sample_id/{voice_id}")
                 voice_sample = voice_sample.json()
                 data["audio_sample_url"] = voice_sample.get("voice_sample_url")
                 data['voice_id'] = int(voice_id) if voice_id else None
@@ -384,7 +387,7 @@ def build_core_tool_closures(ctx):
         data['timeout'] = int(timeout)
 
         try:
-            requests.post(f"{database_url}/video_generate_save",
+            pooled_post(f"{database_url}/video_generate_save",
                           data=json.dumps(data), headers=headers, timeout=1)
         except Exception:
             pass
@@ -425,9 +428,18 @@ def build_core_tool_closures(ctx):
         text: Annotated[str, "the details you want from image"] = 'Describe the Images & Text data in this image in detail',
     ) -> str:
         tool_logger.info('INSIDE img2txt')
-        url = "http://azurekong.hertzai.com:8000/llava/image_inference"
-        payload = {'url': image_url, 'prompt': text}
-        response = requests.request("POST", url, headers={}, data=payload, files=[], timeout=300)
+        # Try local Qwen Vision first (bundled mode), fall back to cloud
+        from core.config_cache import get_vision_api, is_bundled
+        url = get_vision_api() or "http://azurekong.hertzai.com:8000/llava/image_inference"
+
+        if is_bundled():
+            # Local: use Qwen Vision via upload/vision endpoint
+            payload = json.dumps({'image_url': image_url, 'prompt': text})
+            response = requests.post(url, data=payload,
+                                     headers={'Content-Type': 'application/json'}, timeout=60)
+        else:
+            payload = {'url': image_url, 'prompt': text}
+            response = requests.request("POST", url, headers={}, data=payload, files=[], timeout=300)
         if response.status_code == 200:
             return response.text
         else:

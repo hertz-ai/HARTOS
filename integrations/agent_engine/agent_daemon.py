@@ -23,6 +23,10 @@ _hitl_notified: set = set()
 # every 30 seconds with no chance of success (budget doesn't change between ticks).
 _budget_blocked_goals: set = set()
 
+# Track dispatch failures per goal for exponential backoff.
+# Maps goal_id → {'failures': int, 'skip_until': float}
+_dispatch_backoff: dict = {}
+
 
 def _get_blocked_hitl_tasks(ledger, goal_id):
     """Get tasks blocked with APPROVAL_REQUIRED under a goal."""
@@ -174,19 +178,22 @@ class AgentDaemon:
             pass
         return None
 
+    def _wd_heartbeat(self):
+        """Send heartbeat to watchdog between potentially blocking operations."""
+        try:
+            from security.node_watchdog import get_watchdog
+            wd = get_watchdog()
+            if wd:
+                wd.heartbeat('agent_daemon')
+        except Exception:
+            pass
+
     def _loop(self):
         while self._running:
             time.sleep(self._interval)
             if not self._running:
                 break
-            # Heartbeat to watchdog
-            try:
-                from security.node_watchdog import get_watchdog
-                wd = get_watchdog()
-                if wd:
-                    wd.heartbeat('agent_daemon')
-            except Exception:
-                pass
+            self._wd_heartbeat()
             try:
                 self._tick()
             except Exception as e:
@@ -243,6 +250,8 @@ class AgentDaemon:
             idle_agents = IdleDetectionService.get_idle_opted_in_agents(db)
             if not idle_agents:
                 return
+
+            self._wd_heartbeat()
 
             # Assign excess idle agents as exception watchers
             try:
@@ -340,6 +349,16 @@ class AgentDaemon:
                 if not goal.prompt_id:
                     goal.prompt_id = prompt_id
 
+                # BACKOFF: skip goals that have failed repeatedly
+                goal_key = str(goal.id)
+                backoff_info = _dispatch_backoff.get(goal_key)
+                if backoff_info and time.time() < backoff_info.get('skip_until', 0):
+                    logger.debug(
+                        f"Skipping goal {goal_key}: backoff "
+                        f"({backoff_info['failures']} failures, "
+                        f"resume in {backoff_info['skip_until'] - time.time():.0f}s)")
+                    continue
+
                 goal.last_dispatched_at = datetime.utcnow()
 
                 # Speculative dispatch if enabled and budget allows
@@ -353,12 +372,39 @@ class AgentDaemon:
                                 prompt, str(agent['user_id']), prompt_id,
                                 goal.id, goal.goal_type)
                             dispatched += 1
+                            # Success — clear backoff
+                            _dispatch_backoff.pop(goal_key, None)
                             continue
                     except ImportError:
                         pass
 
-                dispatch_goal(prompt, str(agent['user_id']), goal.id, goal.goal_type)
+                result = dispatch_goal(prompt, str(agent['user_id']), goal.id, goal.goal_type)
                 dispatched += 1
+                self._wd_heartbeat()
+
+                # Track failures for exponential backoff
+                if result is None:
+                    info = _dispatch_backoff.get(goal_key, {'failures': 0})
+                    info['failures'] = info.get('failures', 0) + 1
+                    # Exponential backoff: 60s, 120s, 240s, 480s, max 900s (15 min)
+                    delay = min(60 * (2 ** (info['failures'] - 1)), 900)
+                    info['skip_until'] = time.time() + delay
+                    _dispatch_backoff[goal_key] = info
+                    if info['failures'] >= 5:
+                        # Auto-pause after 5 consecutive failures
+                        goal.status = 'paused'
+                        cfg = goal.config_json or {}
+                        cfg['pause_reason'] = (
+                            f'Auto-paused: {info["failures"]} consecutive '
+                            f'dispatch failures')
+                        cfg['paused_at'] = datetime.utcnow().isoformat()
+                        goal.config_json = cfg
+                        logger.warning(
+                            f"Goal {goal_key} AUTO-PAUSED after "
+                            f"{info['failures']} dispatch failures")
+                else:
+                    # Success — clear backoff
+                    _dispatch_backoff.pop(goal_key, None)
 
             # ── HITL: notify owners of APPROVAL_REQUIRED tasks ──
             try:
@@ -489,6 +535,8 @@ class AgentDaemon:
                 except Exception as e:
                     logger.debug(f"Baseline intelligence check: {e}")
 
+            self._wd_heartbeat()
+
             # Federation: aggregate learning deltas across peers every 2nd tick
             if self._tick_count % 2 == 0:
                 try:
@@ -501,6 +549,7 @@ class AgentDaemon:
                             f"convergence={fed_result.get('convergence', 0):.3f}")
                 except Exception as e:
                     logger.debug(f"Federation tick: {e}")
+                self._wd_heartbeat()
 
             # Monthly API quota reset
             if self._tick_count == 1 or self._tick_count % (self._remediate_every * 10) == 0:
@@ -513,6 +562,20 @@ class AgentDaemon:
                     pass
 
             db.commit()
+
+            # INSTRUCTION QUEUE: drain queued instructions on idle ticks
+            # When agents are idle and goals are dispatched, check if any
+            # user has pending queued instructions that can be batch-executed
+            if dispatched < len(idle_agents):
+                try:
+                    from .instruction_queue import get_all_pending
+                    from .dispatch import drain_instruction_queue
+                    pending = get_all_pending()
+                    for uid in list(pending.keys())[:3]:  # Max 3 users per tick
+                        drain_instruction_queue(uid)
+                except Exception as eq:
+                    logger.debug(f"Instruction queue drain: {eq}")
+
         except Exception as e:
             db.rollback()
             logger.debug(f"Agent daemon error: {e}")

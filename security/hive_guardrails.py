@@ -120,6 +120,8 @@ class _FrozenValues:
         'security/key_delegation.py',
         'security/runtime_monitor.py',
         'security/prompt_guard.py',
+        'security/origin_attestation.py',
+        'LICENSE',
     })
 
     # ── Constitutional Rules (all 31, immutable tuple) ──

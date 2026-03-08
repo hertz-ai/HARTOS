@@ -121,7 +121,9 @@ class TestShellFileManager(unittest.TestCase):
             self.assertEqual(r.status_code, 200)
             self.assertTrue(os.path.isdir(test_dir))
 
-            r = client.post('/api/shell/files/delete', json={'path': test_dir})
+            with patch('integrations.agent_engine.shell_os_apis._classify_destructive',
+                        return_value=True):
+                r = client.post('/api/shell/files/delete', json={'path': test_dir})
             self.assertEqual(r.status_code, 200)
         finally:
             if os.path.isdir(test_dir):
@@ -390,8 +392,10 @@ class TestShellPower(unittest.TestCase):
 
     def test_action_invalid(self):
         client = _make_os_app()
-        r = client.post('/api/shell/power/action',
-                        json={'action': 'destroy'})
+        with patch('integrations.agent_engine.shell_os_apis._classify_destructive',
+                    return_value=True):
+            r = client.post('/api/shell/power/action',
+                            json={'action': 'destroy'})
         self.assertEqual(r.status_code, 400)
 
     def test_checkpoint(self):

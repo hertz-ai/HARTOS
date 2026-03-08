@@ -47,7 +47,6 @@ OBJ_PATH = "/com/hart/Agent"
 IFACE = "com.hart.Agent"
 
 # Polling interval for fleet commands (seconds)
-FLEET_POLL_INTERVAL = 10
 
 
 def _api_request(method, path, data=None):
@@ -170,11 +169,17 @@ class HartAgentService(dbus.service.Object):
         logger.info("PeerJoined signal: node=%s", node_id)
 
 
-def _poll_fleet_commands(service):
-    """Poll for pending fleet commands and emit D-Bus ConsentRequired signals.
+def _get_dbus_node_id():
+    """Read this node's ID from key file."""
+    try:
+        with open("/var/lib/hart/node_public.key", "rb") as f:
+            return f.read().hex()[:16]
+    except FileNotFoundError:
+        return "dbus_local"
 
-    Uses FleetCommandService directly (no HTTP endpoint needed).
-    """
+
+def _drain_offline_fleet_commands(service):
+    """One-time drain of commands queued in DB while offline."""
     try:
         import sys
         if '/opt/hart' not in sys.path:
@@ -182,33 +187,55 @@ def _poll_fleet_commands(service):
         from integrations.social.fleet_command import FleetCommandService
         from integrations.social.models import get_db
 
-        # Read local node ID
-        node_id = "dbus_local"
-        try:
-            with open("/var/lib/hart/node_public.key", "rb") as f:
-                node_id = f.read().hex()[:16]
-        except FileNotFoundError:
-            pass
-
+        node_id = _get_dbus_node_id()
         db = get_db()
         try:
             commands = FleetCommandService.get_pending_commands(db, node_id)
+            for cmd in commands:
+                _emit_consent_if_needed(service, cmd)
             if commands:
-                for cmd in commands:
-                    cmd_id = str(cmd.get('id', ''))
-                    action = cmd.get('command_type', 'unknown')
-                    payload = cmd.get('payload', {})
-                    desc = payload.get('description', action) if isinstance(payload, dict) else action
-                    # Only emit for consent-type commands
-                    if action in ('agent_consent', 'tts_stream'):
-                        service.ConsentRequired(cmd_id, action, desc)
+                logger.info("Fleet: drained %d offline-queued commands", len(commands))
         finally:
             db.close()
     except ImportError:
         logger.debug("Fleet command service not available yet")
     except Exception as e:
-        logger.debug("Fleet poll: %s", e)
-    return True  # keep the GLib timeout active
+        logger.debug("Fleet drain: %s", e)
+
+
+def _emit_consent_if_needed(service, cmd):
+    """Emit D-Bus ConsentRequired signal for consent-type commands."""
+    cmd_id = str(cmd.get('id', ''))
+    action = cmd.get('cmd_type', cmd.get('command_type', 'unknown'))
+    params = cmd.get('params', cmd.get('payload', {}))
+    desc = params.get('description', action) if isinstance(params, dict) else action
+    if action in ('agent_consent', 'tts_stream'):
+        service.ConsentRequired(cmd_id, action, desc)
+
+
+def _subscribe_fleet_messagebus(service):
+    """Subscribe to fleet.command via MessageBus for instant delivery."""
+    try:
+        import sys
+        if '/opt/hart' not in sys.path:
+            sys.path.insert(0, '/opt/hart')
+        from core.peer_link.message_bus import get_message_bus
+
+        node_id = _get_dbus_node_id()
+        msg_bus = get_message_bus()
+
+        def _on_fleet_command(topic, data):
+            if not isinstance(data, dict):
+                return
+            target = data.get('target_node_id', '')
+            if target and target != node_id:
+                return
+            _emit_consent_if_needed(service, data)
+
+        msg_bus.subscribe('fleet.command', _on_fleet_command)
+        logger.info("Fleet: subscribed to MessageBus (instant delivery)")
+    except Exception as e:
+        logger.debug("Fleet: MessageBus subscription failed: %s", e)
 
 
 def main():
@@ -218,9 +245,11 @@ def main():
     bus = dbus.SystemBus()
     service = HartAgentService(bus)
 
-    # Poll for fleet consent commands and emit signals
-    GLib.timeout_add_seconds(FLEET_POLL_INTERVAL,
-                             lambda: _poll_fleet_commands(service))
+    # Subscribe to MessageBus for instant fleet command delivery
+    _subscribe_fleet_messagebus(service)
+
+    # One-time drain of commands queued while offline
+    _drain_offline_fleet_commands(service)
 
     logger.info("HART OS D-Bus service running on system bus")
     loop = GLib.MainLoop()

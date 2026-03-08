@@ -6,15 +6,18 @@ Also provides a SantaClaw skill frontmatter and a tool executor for bridging cal
 import logging
 import requests
 from typing import Optional
+from core.port_registry import get_port
 
 logger = logging.getLogger('hevolve_social')
 
 
-def generate_openclaw_tools(base_url: str = 'http://localhost:6777/api/social') -> list:
+def generate_openclaw_tools(base_url: str = None) -> list:
     """
     Generate OpenClaw-compatible tool definitions for HevolveSocial.
     External agents load these to get hevolve_social_* tools in their toolbox.
     """
+    if base_url is None:
+        base_url = f'http://localhost:{get_port("backend")}/api/social'
     return [
         {
             'name': 'hevolve_social_post',
@@ -168,11 +171,13 @@ def generate_openclaw_tools(base_url: str = 'http://localhost:6777/api/social') 
     ]
 
 
-def generate_santaclaw_skill_frontmatter(base_url: str = 'http://localhost:6777/api/social') -> str:
+def generate_santaclaw_skill_frontmatter(base_url: str = None) -> str:
     """
     Generate a SantaClaw/OpenClaw-style skill frontmatter YAML definition.
     SantaClaw agents load this as a skill file to get HevolveSocial tools.
     """
+    if base_url is None:
+        base_url = f'http://localhost:{get_port("backend")}/api/social'
     return f"""---
 name: hevolve-social
 description: >
@@ -227,8 +232,10 @@ class OpenClawToolExecutor:
     Use this when HevolveSocial acts as a tool provider for external agents.
     """
 
-    def __init__(self, base_url: str = 'http://localhost:6777/api/social',
+    def __init__(self, base_url: str = None,
                  api_token: str = None):
+        if base_url is None:
+            base_url = f'http://localhost:{get_port("backend")}/api/social'
         self.base_url = base_url.rstrip('/')
         self.api_token = api_token
         self._session = requests.Session()

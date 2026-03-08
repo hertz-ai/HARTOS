@@ -92,9 +92,12 @@ import sys
 
 import click
 
+from core.http_pool import pooled_get, pooled_post
+from core.port_registry import get_port
+
 # Default HARTOS server URL
-DEFAULT_SERVER_URL = os.environ.get('HART_SERVER_URL', 'http://localhost:6777')
-DEFAULT_NUNBA_URL = os.environ.get('HART_NUNBA_URL', 'http://localhost:6777')
+DEFAULT_SERVER_URL = os.environ.get('HART_SERVER_URL', f'http://localhost:{get_port("backend")}')
+DEFAULT_NUNBA_URL = os.environ.get('HART_NUNBA_URL', f'http://localhost:{get_port("backend")}')
 
 
 @click.group(invoke_without_command=True)
@@ -106,7 +109,11 @@ DEFAULT_NUNBA_URL = os.environ.get('HART_NUNBA_URL', 'http://localhost:6777')
 @click.version_option(version='0.1.0', prog_name='hart')
 @click.pass_context
 def hart(ctx, prompt, json_output, model, user_id, server):
-    """HART OS -- Hevolve Agentic Runtime CLI"""
+    """HART OS -- Hevolve Hive Agentic Runtime CLI
+
+    Crowdsourced compute infrastructure for autonomous Hive AI Training.
+    Distributed agents, self-sustaining economy - no entity monopolizes AI.
+    """
     ctx.ensure_object(dict)
     ctx.obj['json_output'] = json_output
     ctx.obj['model'] = model
@@ -137,7 +144,7 @@ def _execute_headless(prompt, user_id, model, json_output, server_url):
         payload['model'] = model
 
     try:
-        resp = requests.post(
+        resp = pooled_post(
             f'{server_url}/chat',
             json=payload,
             timeout=300,
@@ -200,7 +207,7 @@ def chat(ctx, prompt_id):
                 payload['model'] = model
 
             try:
-                resp = requests.post(
+                resp = pooled_post(
                     f'{server}/chat',
                     json=payload,
                     timeout=300,
@@ -1058,7 +1065,7 @@ def status(ctx, server):
     import requests
 
     try:
-        resp = requests.get(f'{server}/status', timeout=10)
+        resp = pooled_get(f'{server}/status', timeout=10)
         data = resp.json()
 
         if json_output:
@@ -2042,7 +2049,7 @@ def voice_transcribe(ctx, audio_file, language):
         with open(audio_file, 'rb') as f:
             files = {'audio_file': (os.path.basename(audio_file), f)}
             data = {'language': language}
-            resp = requests.post(
+            resp = pooled_post(
                 f'{server}/api/voice/transcribe',
                 files=files, data=data, timeout=120,
             )
@@ -2079,7 +2086,7 @@ def voice_speak(ctx, text, voice_name, output):
         payload = {'text': text, 'voice': voice_name}
         if output:
             payload['output_path'] = output
-        resp = requests.post(
+        resp = pooled_post(
             f'{server}/api/voice/speak',
             json=payload, timeout=120,
         )
@@ -2114,7 +2121,7 @@ def voice_list(ctx):
     import requests
 
     try:
-        resp = requests.get(f'{server}/api/voice/voices', timeout=30)
+        resp = pooled_get(f'{server}/api/voice/voices', timeout=30)
         result = resp.json()
 
         if json_output:
@@ -2156,7 +2163,7 @@ def a2a_discover(ctx, agent_url):
         url = f'{url}/.well-known/agent.json'
 
     try:
-        resp = requests.get(url, timeout=15)
+        resp = pooled_get(url, timeout=15)
         card = resp.json()
 
         if json_output:
@@ -2201,7 +2208,7 @@ def a2a_send(ctx, agent_url, message):
     }
 
     try:
-        resp = requests.post(f'{url}/jsonrpc', json=payload, timeout=120)
+        resp = pooled_post(f'{url}/jsonrpc', json=payload, timeout=120)
         result = resp.json()
 
         if json_output:
@@ -2379,7 +2386,7 @@ def _api_get(url, json_output=False, silent=False):
     """GET helper — returns parsed JSON or None."""
     import requests
     try:
-        resp = requests.get(url, timeout=30)
+        resp = pooled_get(url, timeout=30)
         data = resp.json()
         if json_output:
             click.echo(json.dumps(data, indent=2, default=str))
@@ -2398,7 +2405,7 @@ def _api_post(url, payload, json_output=False):
     """POST helper — returns parsed JSON or None."""
     import requests
     try:
-        resp = requests.post(url, json=payload, timeout=120)
+        resp = pooled_post(url, json=payload, timeout=120)
         data = resp.json()
         if json_output:
             click.echo(json.dumps(data, indent=2, default=str))

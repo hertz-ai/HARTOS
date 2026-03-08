@@ -387,6 +387,11 @@ class TestOSPanelRegistrations(unittest.TestCase):
     def test_weather_widget_panel_registered(self):
         self.assertIn('weather_widget', self.panels)
 
+    def test_hart_identity_panel_registered(self):
+        self.assertIn('hart_identity', self.panels)
+        self.assertEqual(self.panels['hart_identity']['group'], 'You')
+        self.assertIn('/api/onboarding/profile', self.panels['hart_identity']['apis'])
+
     def test_all_panels_have_group(self):
         for pid, panel in self.panels.items():
             self.assertIn('group', panel, f"Panel '{pid}' missing group")

@@ -8,7 +8,7 @@ from .models import get_engine, Base
 
 logger = logging.getLogger('hevolve_social')
 
-SCHEMA_VERSION = 33
+SCHEMA_VERSION = 35
 
 
 def get_schema_version(engine) -> int:
@@ -691,3 +691,57 @@ def run_migrations():
                     logger.warning("v33 migration: ADD COLUMN %s skipped: %s", col, e)
             conn.commit()
         set_schema_version(engine, 33)
+
+    if current < 34:
+        logger.info("HevolveSocial: migrating to v34 (Compute pledge extensions for thought experiments)")
+        with engine.connect() as conn:
+            # Extend compute_escrow for experiment-specific pledges
+            for stmt in [
+                "ALTER TABLE compute_escrow ADD COLUMN experiment_post_id VARCHAR(64)",
+                "ALTER TABLE compute_escrow ADD COLUMN pledge_type VARCHAR(20)",
+                "ALTER TABLE compute_escrow ADD COLUMN consumed REAL DEFAULT 0.0",
+                "ALTER TABLE compute_escrow ADD COLUMN pledge_message TEXT",
+            ]:
+                try:
+                    conn.execute(text(stmt))
+                except Exception as e:
+                    col = stmt.split("ADD COLUMN ")[-1].split()[0]
+                    logger.warning("v34 migration: ADD COLUMN %s on compute_escrow skipped: %s", col, e)
+            # Index for fast experiment pledge lookups
+            try:
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_compute_escrow_experiment_post_id "
+                    "ON compute_escrow (experiment_post_id)"))
+            except Exception as e:
+                logger.warning("v34 migration: index on experiment_post_id skipped: %s", e)
+            # Extend metered_api_usage for consumption-to-escrow linking
+            for stmt in [
+                "ALTER TABLE metered_api_usage ADD COLUMN escrow_id INTEGER",
+                "ALTER TABLE metered_api_usage ADD COLUMN experiment_post_id VARCHAR(64)",
+            ]:
+                try:
+                    conn.execute(text(stmt))
+                except Exception as e:
+                    col = stmt.split("ADD COLUMN ")[-1].split()[0]
+                    logger.warning("v34 migration: ADD COLUMN %s on metered_api_usage skipped: %s", col, e)
+            try:
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_metered_api_usage_escrow_id "
+                    "ON metered_api_usage (escrow_id)"))
+            except Exception as e:
+                logger.warning("v34 migration: index on escrow_id skipped: %s", e)
+            try:
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_metered_api_usage_experiment_post_id "
+                    "ON metered_api_usage (experiment_post_id)"))
+            except Exception as e:
+                logger.warning("v34 migration: index on experiment_post_id skipped: %s", e)
+            conn.commit()
+        set_schema_version(engine, 34)
+
+    if current < 35:
+        logger.info("HevolveSocial: migrating to v35 (Compute Pledge + Consumption tables)")
+        from .models import ComputePledge, PledgeConsumption
+        for tbl in [ComputePledge.__table__, PledgeConsumption.__table__]:
+            tbl.create(engine, checkfirst=True)
+        set_schema_version(engine, 35)

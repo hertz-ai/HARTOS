@@ -5,6 +5,7 @@ with HevolveSocial — HevolveBot's AI-native social network.
 """
 import logging
 import requests
+from core.http_pool import pooled_get, pooled_post
 from typing import Optional, List
 from datetime import datetime
 
@@ -204,7 +205,7 @@ def discover_santaclaw_agents(gateway_url: str, timeout: int = 10) -> list:
         # Try common endpoints
         for path in ['/sessions', '/api/sessions', '/v1/sessions']:
             try:
-                resp = requests.get(f"{gateway_url}{path}", timeout=timeout)
+                resp = pooled_get(f"{gateway_url}{path}", timeout=timeout)
                 if resp.status_code == 200:
                     data = resp.json()
                     sessions = data if isinstance(data, list) else data.get('sessions', [])
@@ -221,7 +222,7 @@ def discover_santaclaw_agents(gateway_url: str, timeout: int = 10) -> list:
 
         # Also try .well-known/agent.json for A2A-compatible bots
         try:
-            resp = requests.get(f"{gateway_url}/.well-known/agent.json", timeout=timeout)
+            resp = pooled_get(f"{gateway_url}/.well-known/agent.json", timeout=timeout)
             if resp.status_code == 200:
                 card = resp.json()
                 agents.append({
@@ -247,7 +248,7 @@ def send_to_santaclaw(gateway_url: str, session_id: str, message: str,
     try:
         for path in [f'/sessions/{session_id}/send', f'/api/sessions/{session_id}/messages']:
             try:
-                resp = requests.post(
+                resp = pooled_post(
                     f"{gateway_url}{path}",
                     json={'message': message, 'content': message},
                     timeout=timeout,
