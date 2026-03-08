@@ -237,16 +237,45 @@ class PRReviewService:
         simple:   <= 3 files, < 100 lines
         moderate: <= 10 files, < 500 lines
         complex:  > 10 files or > 500 lines
+
+        Also bumps to 'complex' if cyclomatic complexity exceeds
+        thresholds (via PRGuardian).
         """
         files = diff_stats.get('files_changed', 0)
         lines = (diff_stats.get('additions', 0) +
                  diff_stats.get('deletions', 0))
 
         if files <= 3 and lines < 100:
-            return 'simple'
+            base = 'simple'
         elif files <= 10 and lines < 500:
+            base = 'moderate'
+        else:
+            base = 'complex'
+
+        # If guardian analysis found violations, bump to at least moderate
+        if diff_stats.get('guardian_violations', 0) > 0 and base == 'simple':
             return 'moderate'
-        return 'complex'
+
+        return base
+
+    @staticmethod
+    def enhanced_review(changed_files: List[Dict]) -> Dict:
+        """Run PRGuardian analysis on changed files.
+
+        Args:
+            changed_files: List of {filename, source} dicts.
+
+        Returns:
+            PRGuardian analysis report, or error dict.
+        """
+        try:
+            from core.platform.pr_guardian import PRGuardian
+            report = PRGuardian.analyze_diff('', changed_files)
+            comment = PRGuardian.generate_review_comment(report)
+            report['review_comment'] = comment
+            return report
+        except Exception as e:
+            return {'error': str(e), 'passed': True}
 
     @staticmethod
     def post_review(

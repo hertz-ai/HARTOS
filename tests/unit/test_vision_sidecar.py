@@ -405,9 +405,16 @@ class TestVisionService:
     @patch('integrations.vision.minicpm_installer.MiniCPMInstaller.detect_gpu',
            return_value=False)
     def test_start_without_gpu_stays_stopped(self, mock_gpu, mock_installed):
+        _backend = MagicMock()
+        _backend.name = 'none'
         from integrations.vision.vision_service import VisionService
         svc = VisionService()
-        svc.start()
+        svc._detect_mode = lambda: 'full'
+        # Directly set the backend mock so get_vision_backend isn't called
+        with patch.object(svc, '_vision_backend', None):
+            with patch('integrations.vision.vision_service.get_vision_backend',
+                       return_value=_backend):
+                svc.start()
         assert svc._running is False
 
     def test_stop_terminates_process(self):

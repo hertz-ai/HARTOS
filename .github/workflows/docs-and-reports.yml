@@ -1,0 +1,136 @@
+name: Deploy Docs & Test Reports to GitHub Pages
+
+on:
+  push:
+    branches: [main, gpt4.1]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r docs/requirements.txt
+          pip install pytest pytest-cov
+
+      # ===== Build MkDocs site =====
+      - name: Build MkDocs
+        run: mkdocs build --strict --site-dir _site
+
+      # ===== Run tests + generate reports =====
+      - name: Create report directories
+        run: mkdir -p _site/test-reports/junit _site/test-reports/coverage
+
+      - name: Run WS + Security tests with coverage
+        continue-on-error: true
+        run: |
+          python -m pytest \
+            tests/unit/test_budget_gate.py \
+            tests/unit/test_boot_hardening.py \
+            tests/unit/test_revenue_pipeline.py \
+            tests/unit/test_compute_config.py \
+            tests/unit/test_model_routing.py \
+            tests/unit/test_metered_recovery.py \
+            tests/unit/test_settings_api.py \
+            tests/unit/test_ad_hosting_rewards.py \
+            tests/unit/test_integrity_system.py \
+            tests/unit/test_federation_upgrade.py \
+            tests/unit/test_build_verification.py \
+            tests/unit/test_immutable_audit_log.py \
+            tests/unit/test_tool_allowlist.py \
+            tests/unit/test_goal_rate_limit.py \
+            tests/unit/test_action_classifier.py \
+            tests/unit/test_dlp_engine.py \
+            tests/unit/test_qwen3vl_computer_use.py \
+            -v --noconftest --tb=short \
+            --junitxml=_site/test-reports/junit/ws_security.xml \
+            --cov=integrations --cov=security --cov=threadlocal \
+            --cov-report=html:_site/test-reports/coverage \
+            --cov-report=term-missing \
+            --cov-config=.coveragerc
+
+      # ===== Generate test results index page =====
+      - name: Generate test reports index
+        run: |
+          cat > _site/test-reports/index.html << 'INDEXEOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <title>HART OS — Test Reports</title>
+            <style>
+              body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                     max-width: 800px; margin: 60px auto; padding: 0 20px; color: #333; }
+              h1 { color: #512da8; border-bottom: 2px solid #512da8; padding-bottom: 10px; }
+              a { color: #512da8; text-decoration: none; }
+              a:hover { text-decoration: underline; }
+              .card { border: 1px solid #ddd; border-radius: 8px; padding: 20px; margin: 16px 0;
+                      transition: box-shadow 0.2s; }
+              .card:hover { box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+              .card h2 { margin-top: 0; }
+              .badge { display: inline-block; padding: 3px 10px; border-radius: 12px;
+                       font-size: 12px; color: white; }
+              .badge-green { background: #4caf50; }
+              .badge-blue { background: #2196f3; }
+              .nav { margin-bottom: 30px; }
+              .nav a { margin-right: 20px; font-weight: 500; }
+            </style>
+          </head>
+          <body>
+            <div class="nav">
+              <a href="../">← Back to Docs</a>
+            </div>
+            <h1>HART OS Test Reports</h1>
+            <p>Auto-generated on every push to <code>main</code> / <code>gpt4.1</code>.</p>
+
+            <div class="card">
+              <h2><a href="coverage/index.html">Code Coverage Report</a></h2>
+              <p><span class="badge badge-green">HTML</span> Interactive coverage browser — line-by-line hit/miss for all modules.</p>
+            </div>
+
+            <div class="card">
+              <h2><a href="junit/ws_security.xml">JUnit XML — WS + Security Tests</a></h2>
+              <p><span class="badge badge-blue">XML</span> Machine-readable test results (importable by CI dashboards, IDEs, etc.)</p>
+            </div>
+          </body>
+          </html>
+          INDEXEOF
+
+      # ===== Deploy =====
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

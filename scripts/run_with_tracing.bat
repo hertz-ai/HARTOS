@@ -1,13 +1,13 @@
 @echo off
 REM ============================================================
-REM HevolveBot LangChain Agent - Server WITH Socket Tracing
+REM HART OS - Server WITH Socket Tracing
 REM ============================================================
 REM This enables real-time PyCharm socket tracing for debugging.
 REM Trace events are sent to localhost:5678 for the TrueFlow plugin.
 REM ============================================================
 
 echo ========================================
-echo  Starting HevolveBot LangChain Agent
+echo  Starting HART OS
 echo  WITH SOCKET TRACING
 echo ========================================
 echo.

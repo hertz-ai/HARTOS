@@ -22,6 +22,11 @@ from datetime import datetime, timezone
 from collections import defaultdict
 from typing import Dict, List, Optional, Any
 
+try:
+    from helper import PROMPTS_DIR
+except ImportError:
+    PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
+
 logger = logging.getLogger(__name__)
 
 # Thread-safe telemetry storage
@@ -124,7 +129,7 @@ class RecipeExperienceRecorder:
         Adds 'experience' key to each action and 'experience_meta' at top level.
         Writes back atomically.
         """
-        recipe_path = f'prompts/{prompt_id}_{flow}_recipe.json'
+        recipe_path = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow}_recipe.json')
         if not os.path.exists(recipe_path):
             logger.debug(f"Recipe not found for experience merge: {recipe_path}")
             return

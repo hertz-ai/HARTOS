@@ -25,6 +25,11 @@ from PIL import Image
 from crossbarhttp import Client
 from flask import current_app
 from helper import ToolMessageHandler, strip_json_values, get_time_based_history, retrieve_json, load_vlm_agent_files
+try:
+    from helper import PROMPTS_DIR
+except Exception:
+    PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
+os.makedirs(PROMPTS_DIR, exist_ok=True)
 import helper as helper_fun
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
 import threading
@@ -212,7 +217,8 @@ elif _active_cloud and os.environ.get('HEVOLVE_LLM_API_KEY'):
     config_list = [_cloud_cfg]
 else:
     # Dynamic: reads from user's LLM Setup Wizard config (set by Nunba app.py)
-    _llama_port = os.environ.get('LLAMA_CPP_PORT', '8080')
+    from core.port_registry import get_port as _get_llm_port
+    _llama_port = os.environ.get('LLAMA_CPP_PORT', str(_get_llm_port('llm')))
     _local_llm_url = os.environ.get('HEVOLVE_LOCAL_LLM_URL', f'http://localhost:{_llama_port}/v1')
     config_list = [{
         "model": os.environ.get('HEVOLVE_LOCAL_LLM_MODEL', 'local'),
@@ -834,7 +840,7 @@ def create_agents_for_role(user_id: str, prompt_id):
 
     personas = []
     try:
-        with open(f"prompts/{prompt_id}.json", 'r') as f:
+        with open(os.path.join(PROMPTS_DIR, f"{prompt_id}.json"), 'r') as f:
             config = json.load(f)
             personas = config['personas']
             current_app.logger.info(f'Available Personas {personas}')
@@ -1003,12 +1009,12 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     # role = get_role(user_id,prompt_id)
     role_number, role = get_flow_number(user_id, prompt_id)
 
-    with open(f"prompts/{prompt_id}_{role_number}_recipe.json", 'r') as f:
+    with open(os.path.join(PROMPTS_DIR, f"{prompt_id}_{role_number}_recipe.json"), 'r') as f:
         config = json.load(f)
         recipes[user_prompt] = config
         final_recipe[prompt_id] = config
     goal = ''
-    with open(f"prompts/{prompt_id}.json", 'r') as f:
+    with open(os.path.join(PROMPTS_DIR, f"{prompt_id}.json"), 'r') as f:
         config = json.load(f)
         goal = config['goal']
 
@@ -1083,13 +1089,13 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
     individual_recipe = []
     for i in range(1, (len(recipes[user_prompt]['actions']) + 1)):
-        current_app.logger.info(f'checking for prompts/{prompt_id}_{role_number}_{i}.json')
+        current_app.logger.info(f'checking for {os.path.join(PROMPTS_DIR, f"{prompt_id}_{role_number}_{i}.json")}')
         try:
-            with open(f"prompts/{prompt_id}_{role_number}_{i}.json", 'r') as f:
+            with open(os.path.join(PROMPTS_DIR, f"{prompt_id}_{role_number}_{i}.json"), 'r') as f:
                 config = json.load(f)
                 individual_recipe.append(config)
         except Exception as e:
-            current_app.logger.error(f'Got error as :{e} while checking for prompts/{prompt_id}_{role_number}_{i}.json')
+            current_app.logger.error(f'Got error as :{e} while checking for {os.path.join(PROMPTS_DIR, f"{prompt_id}_{role_number}_{i}.json")}')
 
     # Build experience hints from accumulated recipe experience data
     experience_hints = ''
@@ -1099,9 +1105,28 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     except Exception:
         experience_hints = 'No prior experience recorded.'
 
+    # Load saved personality for this agent (generated in CREATE mode)
+    _personality_block = ""
+    try:
+        from core.agent_personality import load_personality, build_personality_prompt, build_proactive_vision_prompt
+        _saved_personality = load_personality(str(prompt_id))
+        if _saved_personality:
+            # Load resonance profile for continuous personality tuning
+            _resonance_profile = None
+            try:
+                from core.resonance_profile import get_or_create_profile
+                _resonance_profile = get_or_create_profile(str(user_id))
+            except ImportError:
+                pass
+            _personality_block = build_personality_prompt(_saved_personality, resonance_profile=_resonance_profile)
+            _personality_block += build_proactive_vision_prompt(goal)
+    except Exception:
+        pass
+
     response_format = {"message2userfinal": "Your message here"}
     agent_prompt = f'''You are a Helpful {role} Assistant. Your primary role is to assist the user efficiently while keeping all internal actions and processes hidden from the end user. Follow the guidelines below to perform tasks correctly:
 {get_cultural_prompt()}
+{_personality_block}
         1. If you encounter a task you cannot perform, request assistance from the @Helper and @Executor agents. If you need to run a tool, seek guidance from the @Helper agent. For code execution, ask the @Executor agent for assistance.
         2. Only execute actions where the persona is: {role}.
         3. Follow the steps below to achieve the goal: {goal}.
@@ -1764,6 +1789,24 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         scheduler.add_job(send_message_to_user1, 'date', run_date=run_time, args=[user_id, text, '', prompt_id])
         return 'Message scheduled successfully'
 
+    # Expert agent consultation tool — domain-specific guidance on demand
+    @assistant.register_for_execution()
+    @helper.register_for_llm(api_style="function",
+                             description="Consult a specialized domain expert for the current task")
+    def consult_expert(task_description: Annotated[str, "Describe what expertise you need"]) -> str:
+        """Consult a domain expert agent for specialized guidance on the current task."""
+        try:
+            from integrations.expert_agents import match_expert_for_context
+            match = match_expert_for_context(task_description, top_k=3, min_score=2)
+            if not match:
+                return "No domain expert matched this task. Proceeding with general knowledge."
+            send_message_to_user1(user_id,
+                f"Consulting expert: {match['name']}",
+                "Expert consultation", prompt_id)
+            return f"Expert guidance from {match['name']}:\n{match['prompt_block']}"
+        except Exception as e:
+            return f"Expert consultation unavailable: {str(e)}"
+
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",
                              description="Retrieve the user's visual camera input from the past specified minutes.")
@@ -1877,7 +1920,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             if user_prompt in user_tasks and hasattr(user_tasks[user_prompt], 'current_action'):
                 current_action_id = user_tasks[user_prompt].current_action
 
-            direct_vlm_path = f"prompts/{prompt_id}_{role_number}_{current_action_id}_vlm_agent.json"
+            direct_vlm_path = os.path.join(PROMPTS_DIR, f"{prompt_id}_{role_number}_{current_action_id}_vlm_agent.json")
             if os.path.exists(direct_vlm_path):
                 current_app.logger.info(f"Found direct VLM file for current action: {direct_vlm_path}")
                 try:
@@ -1960,7 +2003,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                         # Determine file path with the action_id
                         role_number, role = get_flow_number(user_id, prompt_id)
                         action_id_to_use = action_id
-                        base_path = f"prompts/{prompt_id}_{role_number}"
+                        base_path = os.path.join(PROMPTS_DIR, f"{prompt_id}_{role_number}")
 
                         # Import os here to ensure it's available
                         import os
@@ -2320,73 +2363,23 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     context_handling.add_to_agent(multi_role_agent1)
     context_handling.add_to_agent(verify1)
 
-    ##Tools call
-    helper1.register_for_llm(name="txt2img", description="Text to image Creator")(txt2img)
-    time_agent.register_for_execution(name="txt2img")(txt2img)
-    helper1.register_for_llm(name="img2txt", description="Image to Text/Question Answering from image")(img2txt)
-    time_agent.register_for_execution(name="img2txt")(img2txt)
-    helper1.register_for_llm(name="save_data_in_memory",
-                             description="Use this to Store and retrieve data using key-value storage system")(
-        save_data_in_memory)
-    time_agent.register_for_execution(name="save_data_in_memory")(save_data_in_memory)
-    helper1.register_for_llm(name="get_data_by_key", description="Returns all data from the internal Memory")(
-        get_data_by_key)
-    time_agent.register_for_execution(name="get_data_by_key")(get_data_by_key)
-    helper1.register_for_llm(name="get_user_id",
-                             description="Returns the unique identifier (user_id) of the current user.")(get_user_id)
-    time_agent.register_for_execution(name="get_user_id")(get_user_id)
-    helper1.register_for_llm(name="get_prompt_id",
-                             description="Returns the unique identifier (prompt_id) associated with the current prompt or conversation.")(
-        get_prompt_id)
-    time_agent.register_for_execution(name="get_prompt_id")(get_prompt_id)
-    helper1.register_for_llm(name="Generate_video", description="Generate video with text and save it in database")(
-        Generate_video)
-    time_agent.register_for_execution(name="Generate_video")(Generate_video)
-    helper1.register_for_llm(name="get_user_uploaded_file", description="get user's recent uploaded files")(
-        get_user_uploaded_file)
-    time_agent.register_for_execution(name="get_user_uploaded_file")(get_user_uploaded_file)
-    helper1.register_for_llm(name="get_user_camera_inp",
-                             description="Get user's visual information to process somethings")(get_user_camera_inp)
-    time_agent.register_for_execution(name="get_user_camera_inp")(get_user_camera_inp)
-    helper1.register_for_llm(name="create_scheduled_jobs",
-                             description="Creates time-based jobs using APScheduler to schedule jobs")(
-        create_scheduled_jobs)
-    time_agent.register_for_execution(name="create_scheduled_jobs")(create_scheduled_jobs)
-    helper1.register_for_llm(name="get_chat_history", description="Get Chat history based on text & start & end date")(
-        get_chat_history)
-    time_agent.register_for_execution(name="get_chat_history")(get_chat_history)
-    helper1.register_for_llm(name="search_visual_history", description="Search past camera and screen descriptions by keyword and time range.")(search_visual_history)
-    time_agent.register_for_execution(name="search_visual_history")(search_visual_history)
-    # SimpleMem tools for time_agent
-    if simplemem_store is not None:
-        helper1.register_for_llm(
-            name="search_long_term_memory",
-            description="Search long-term memory for past conversations, facts, and context using natural language query."
-        )(search_long_term_memory)
-        time_agent.register_for_execution(name="search_long_term_memory")(search_long_term_memory)
-        helper1.register_for_llm(
-            name="save_to_long_term_memory",
-            description="Save important facts or information to long-term memory for future retrieval across sessions."
-        )(save_to_long_term_memory)
-        time_agent.register_for_execution(name="save_to_long_term_memory")(save_to_long_term_memory)
-    helper1.register_for_llm(name="send_message_to_user", description="Send Message to User")(send_message_to_user)
-    time_agent.register_for_execution(name="send_message_to_user")(send_message_to_user)
-    helper1.register_for_llm(name="send_presynthesized_video_to_user",
-                             description="Sends a presynthesized message/video/dialogue to user using conv_id.")(
-        send_presynthesized_video_to_user)
-    time_agent.register_for_execution(name="send_presynthesized_video_to_user")(send_presynthesized_video_to_user)
-    helper1.register_for_llm(name="send_message_in_seconds",
-                             description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")(
-        send_message_in_seconds)
-    time_agent.register_for_execution(name="send_message_in_seconds")(send_message_in_seconds)
-
-    helper1.register_for_llm(name="execute_windows_or_android_command",
-                             description="Executes a command on a user's Windows computer or android device and returns the response.")(
-        execute_windows_or_android_command)
-    time_agent.register_for_execution(name="execute_windows_or_android_command")(execute_windows_or_android_command)
-
-    helper1.register_for_llm(name="google_search", description="Get google search response")(google_search)
-    time_agent.register_for_execution(name="google_search")(google_search)
+    # --- Core tools for time_agent (defined once in core/agent_tools.py) ---
+    from core.agent_tools import build_core_tool_closures, register_core_tools
+    _tool_ctx = {
+        'user_id': user_id, 'prompt_id': prompt_id,
+        'agent_data': agent_data, 'helper_fun': helper_fun,
+        'user_prompt': user_prompt, 'request_id_list': request_id_list,
+        'recent_file_id': recent_file_id, 'scheduler': scheduler,
+        'simplemem_store': simplemem_store,
+        'memory_graph': memory_graph,
+        # log_tool_execution not defined in reuse_recipe — uses passthrough default
+        'send_message_to_user1': send_message_to_user1,
+        'retrieve_json': retrieve_json,
+        'strip_json_values': strip_json_values,
+        'save_conversation_db': save_conversation_db,
+    }
+    core_tools = build_core_tool_closures(_tool_ctx)
+    register_core_tools(core_tools, helper1, time_agent)
 
     def connect_time_main(message: Annotated[str, "The message time agent want to send to main agent"]) -> str:
         message = f"Role: Time Agent\n Message: {message}"
@@ -2421,71 +2414,8 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     visual_agent, visual_user, helper2, executor2, multi_role_agent2, verify2, chat_instructor2 = helper_fun.create_visual_agent(
         user_id, prompt_id)
 
-    ##Tools call
-    helper2.register_for_llm(name="txt2img", description="Text to image Creator")(txt2img)
-    visual_agent.register_for_execution(name="txt2img")(txt2img)
-    helper2.register_for_llm(name="img2txt", description="Image to Text/Question Answering from image")(img2txt)
-    visual_agent.register_for_execution(name="img2txt")(img2txt)
-    helper2.register_for_llm(name="save_data_in_memory",
-                             description="Use this to Store and retrieve data using key-value storage system")(
-        save_data_in_memory)
-    visual_agent.register_for_execution(name="save_data_in_memory")(save_data_in_memory)
-    helper2.register_for_llm(name="get_data_by_key", description="Returns all data from the internal Memory")(
-        get_data_by_key)
-    visual_agent.register_for_execution(name="get_data_by_key")(get_data_by_key)
-    helper2.register_for_llm(name="get_user_id",
-                             description="Returns the unique identifier (user_id) of the current user.")(get_user_id)
-    visual_agent.register_for_execution(name="get_user_id")(get_user_id)
-    helper2.register_for_llm(name="get_prompt_id",
-                             description="Returns the unique identifier (prompt_id) associated with the current prompt or conversation.")(
-        get_prompt_id)
-    visual_agent.register_for_execution(name="get_prompt_id")(get_prompt_id)
-    helper2.register_for_llm(name="Generate_video", description="Generate video with text and save it in database")(
-        Generate_video)
-    visual_agent.register_for_execution(name="Generate_video")(Generate_video)
-    helper2.register_for_llm(name="get_user_uploaded_file", description="get user's recent uploaded files")(
-        get_user_uploaded_file)
-    visual_agent.register_for_execution(name="get_user_uploaded_file")(get_user_uploaded_file)
-    helper2.register_for_llm(name="get_user_camera_inp",
-                             description="Get user's visual information to process somethings")(get_user_camera_inp)
-    visual_agent.register_for_execution(name="get_user_camera_inp")(get_user_camera_inp)
-    helper2.register_for_llm(name="create_scheduled_jobs",
-                             description="Creates time-based jobs using APScheduler to schedule jobs")(
-        create_scheduled_jobs)
-    visual_agent.register_for_execution(name="create_scheduled_jobs")(create_scheduled_jobs)
-    helper2.register_for_llm(name="get_chat_history", description="Get Chat history based on text & start & end date")(
-        get_chat_history)
-    visual_agent.register_for_execution(name="get_chat_history")(get_chat_history)
-    helper2.register_for_llm(name="search_visual_history", description="Search past camera and screen descriptions by keyword and time range.")(search_visual_history)
-    visual_agent.register_for_execution(name="search_visual_history")(search_visual_history)
-    # SimpleMem tools for visual_agent
-    if simplemem_store is not None:
-        helper2.register_for_llm(
-            name="search_long_term_memory",
-            description="Search long-term memory for past conversations, facts, and context using natural language query."
-        )(search_long_term_memory)
-        visual_agent.register_for_execution(name="search_long_term_memory")(search_long_term_memory)
-        helper2.register_for_llm(
-            name="save_to_long_term_memory",
-            description="Save important facts or information to long-term memory for future retrieval across sessions."
-        )(save_to_long_term_memory)
-        visual_agent.register_for_execution(name="save_to_long_term_memory")(save_to_long_term_memory)
-    helper2.register_for_llm(name="send_message_to_user", description="Send Message to User")(send_message_to_user)
-    visual_agent.register_for_execution(name="send_message_to_user")(send_message_to_user)
-    helper2.register_for_llm(name="send_presynthesized_video_to_user",
-                             description="Sends a presynthesized message/video/dialogue to user using conv_id.")(
-        send_presynthesized_video_to_user)
-    visual_agent.register_for_execution(name="send_presynthesized_video_to_user")(send_presynthesized_video_to_user)
-    helper2.register_for_llm(name="send_message_in_seconds",
-                             description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")(
-        send_message_in_seconds)
-    visual_agent.register_for_execution(name="send_message_in_seconds")(send_message_in_seconds)
-    helper2.register_for_llm(name="execute_windows_or_android_command",
-                             description="Executes a command on a user's Windows computer or android device and returns the response.")(
-        execute_windows_or_android_command)
-    visual_agent.register_for_execution(name="execute_windows_or_android_command")(execute_windows_or_android_command)
-    helper2.register_for_llm(name="google_search", description="Get google search response")(google_search)
-    visual_agent.register_for_execution(name="google_search")(google_search)
+    # --- Core tools for visual_agent (reuse same tool closures) ---
+    register_core_tools(core_tools, helper2, visual_agent)
 
     # MCP Integration: Load and register user-provided MCP server tools
     try:
@@ -3284,7 +3214,7 @@ def get_flow_number(user_id, prompt_id):
     if not role:
         role = None
     current_app.logger.info(f'Got role as {role}')
-    file_path = f'prompts/{prompt_id}.json'
+    file_path = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
     with open(file_path, 'r') as f:
         data = json.load(f)
         available_roles = [x['name'] for x in data['personas']]
@@ -3300,30 +3230,39 @@ def get_flow_number(user_id, prompt_id):
     return role_number, role
 
 
+def _sched_log(level, msg):
+    """Log for create_schedule — works with or without Flask app context."""
+    try:
+        getattr(current_app.logger, level)(msg)
+    except RuntimeError:
+        import logging
+        getattr(logging.getLogger('reuse_recipe.scheduler'), level)(msg)
+
+
 def create_schedule(prompt_id, user_id):
-    current_app.logger.info('INSIDE Create Schedule')
+    _sched_log('info', 'INSIDE Create Schedule')
     user_prompt = f'{user_id}_{prompt_id}'
     role_number, role = get_flow_number(user_id, prompt_id)
-    with open(f"prompts/{prompt_id}_{role_number}_recipe.json", 'r') as f:
+    with open(os.path.join(PROMPTS_DIR, f"{prompt_id}_{role_number}_recipe.json"), 'r') as f:
         config = json.load(f)
         recipes[user_prompt] = config
     try:
         if 'scheduled_tasks' in config and len(config['scheduled_tasks']) > 0:
-            current_app.logger.info('Creating scheduled tasks')
+            _sched_log('info', 'Creating scheduled tasks')
             for i in config['scheduled_tasks']:
                 if role and i['persona'].lower() == role.lower():
                     trigger = CronTrigger.from_crontab(i['cron_expression'])
                     job_id = f"job_{int(time.time())}"
                     scheduler.add_job(execute_python_file, trigger=trigger, id=job_id,
                                       args=[i['job_description'], user_id, prompt_id, i['action_entry_point']])
-                    current_app.logger.info(f'Successfully created scheduler job {i["persona"]}')
+                    _sched_log('info', f'Successfully created scheduler job {i["persona"]}')
 
-        current_app.logger.info('Creating Visual scheduled tasks')
+        _sched_log('info', 'Creating Visual scheduled tasks')
         trigger = IntervalTrigger(seconds=int(2))
         job_id = f"job_{int(time.time())}"
         scheduler.add_job(call_visual_task, trigger=trigger, id=job_id,
                           args=['get past 1 mins visual information', user_id, prompt_id])
-        current_app.logger.info(f'Successfully created scheduler job')
+        _sched_log('info', 'Successfully created scheduler job')
         if 'visual_scheduled_tasks' in config and len(config['visual_scheduled_tasks']) > 0:
             for i in config['visual_scheduled_tasks']:
                 if role and i['persona'].lower() == role.lower():
@@ -3331,9 +3270,9 @@ def create_schedule(prompt_id, user_id):
                     job_id = f"job_{int(time.time())}"
                     scheduler.add_job(call_visual_task, trigger=trigger, id=job_id,
                                       args=[i['job_description'], user_id, prompt_id])
-                    current_app.logger.info(f'Successfully created scheduler job {i["persona"]}')
+                    _sched_log('info', f'Successfully created scheduler job {i["persona"]}')
     except Exception as e:
-        current_app.logger.error(f'Some Error in creating scheduled tasks error:{e}')
+        _sched_log('error', f'Some Error in creating scheduled tasks error:{e}')
 
 
 recent_file_id = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_recent_file_id')

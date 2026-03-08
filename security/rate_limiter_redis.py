@@ -33,6 +33,26 @@ class RedisRateLimiter:
         'bot_register': (5, 300),    # 5 registrations per 5 minutes
         'discover': (10, 60),        # 10 discovery calls per 60 seconds
         'chat': (30, 60),            # 30 chat requests per 60 seconds
+        'goal_create': (10, 3600),   # 10 goals per user per hour
+        'remote_desktop': (30, 60),  # 30 connections per 60 seconds
+        'remote_desktop_auth': (5, 60),  # 5 failed auth attempts per 60 seconds
+        'shell_ops': (30, 60),          # 30 shell operations per 60 seconds
+        'shell_file_ops': (20, 60),     # 20 file operations per 60 seconds
+        'shell_terminal': (10, 60),     # 10 terminal sessions per 60 seconds
+        'shell_power': (3, 60),         # 3 power actions per 60 seconds
+        'app_install': (5, 3600),       # 5 installs per hour
+        'sharing': (20, 60),            # 20 shares per 60 seconds
+        'gamification': (30, 60),       # 30 gamification calls per 60 seconds
+        'games': (20, 60),              # 20 game operations per 60 seconds
+        'mcp': (30, 60),                # 30 MCP operations per 60 seconds
+        'tts': (10, 60),                # 10 TTS generations per 60 seconds
+        'civic_sentinel': (20, 60),      # 20 civic sentinel ops per 60 seconds
+        'wifi': (30, 60),                # 30 wifi operations per 60 seconds
+        'vpn': (20, 60),                 # 20 vpn operations per 60 seconds
+        'trash': (30, 60),               # 30 trash operations per 60 seconds
+        'battery': (60, 60),             # 60 battery queries per 60 seconds
+        'webcam': (10, 60),              # 10 webcam operations per 60 seconds
+        'scanner': (5, 60),              # 5 scanner operations per 60 seconds
     }
 
     def __init__(self):

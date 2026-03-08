@@ -16,6 +16,8 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
+pytest.importorskip('autogen', reason='autogen not installed')
+
 from create_recipe import visual_execution, get_frame, get_visual_context, call_visual_task
 from reuse_recipe import visual_based_execution, get_frame as reuse_get_frame
 

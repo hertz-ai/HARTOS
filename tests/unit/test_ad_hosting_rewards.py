@@ -11,7 +11,7 @@ Ad System & Hosting Rewards Test Suite
 - Ad lifecycle (pause, delete+refund, list)
 - Contribution score computation and tiers
 - Hosting rewards (uptime bonus, milestones, ad revenue)
-- Revenue sharing (70/30 split)
+- Revenue sharing (90/9/1 split)
 - Migration v10 (schema version, tables, backfill)
 - AWARD_TABLE extensions
 
@@ -296,7 +296,7 @@ class TestAdImpressions:
         AdService.record_impression(db, ad.id, node_id=peer.node_id)
         db.flush()
         wallet = db.query(ResonanceWallet).filter_by(user_id=operator.id).first()
-        # 50% of 10.0 = 5.0 Spark (unwitnessed), 70% if witnessed
+        # 50% of 10.0 = 5.0 Spark (unwitnessed), 90% if witnessed
         assert wallet.spark >= 5
 
     def test_impression_rate_limit(self, db):
@@ -361,7 +361,7 @@ class TestAdClicks:
         AdService.record_click(db, ad.id, node_id=peer.node_id)
         db.flush()
         wallet = db.query(ResonanceWallet).filter_by(user_id=operator.id).first()
-        assert wallet.spark >= 5  # 50% of 10 (unwitnessed), 70% if witnessed
+        assert wallet.spark >= 5  # 50% of 10 (unwitnessed), 90% if witnessed
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -558,8 +558,8 @@ class TestHostingRewards:
 
 class TestRevenueSharing:
 
-    def test_70_30_split(self, db):
-        """Verify node operator gets 50% unwitnessed / 70% witnessed."""
+    def test_90_9_1_split(self, db):
+        """Verify node operator gets 50% unwitnessed / 90% witnessed (90/9/1 model)."""
         from integrations.social.ad_service import HOSTER_UNWITNESSED_SHARE
         operator = _make_user(db, spark=0)
         peer = _make_peer(db, operator=operator)
@@ -570,7 +570,7 @@ class TestRevenueSharing:
         db.flush()
         wallet = db.query(ResonanceWallet).filter_by(user_id=operator.id).first()
         assert wallet.spark == 5  # int(10.0 * 0.50) = 5 (unwitnessed)
-        assert HOSTER_REVENUE_SHARE == 0.70
+        assert HOSTER_REVENUE_SHARE == 0.90  # 90/9/1 split
         assert HOSTER_UNWITNESSED_SHARE == 0.50
 
 

@@ -7,7 +7,10 @@ import json
 import sys
 import time
 import random
+import pytest
 from pathlib import Path
+
+pytest.importorskip('agent_ledger', reason='agent_ledger not installed')
 
 # Test parameters - use random IDs to avoid state issues
 TEST_USER_ID = random.randint(900000, 999999)

@@ -68,6 +68,16 @@ class CodingAgentDaemon:
 
         self._tick_count += 1
 
+        # BUDGET GATE: platform affordability check before dispatching coding tasks
+        try:
+            from integrations.agent_engine.budget_gate import check_platform_affordability
+            can_afford, details = check_platform_affordability()
+            if not can_afford:
+                logger.warning(f"Coding daemon paused — platform not affordable: {details}")
+                return
+        except ImportError:
+            pass
+
         db = get_db()
         try:
             goals = db.query(CodingGoal).filter_by(status='active').all()

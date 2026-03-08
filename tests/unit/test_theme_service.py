@@ -654,7 +654,7 @@ class TestShellManifest:
 
     def test_system_panels_count(self):
         from integrations.agent_engine.shell_manifest import SYSTEM_PANELS
-        assert len(SYSTEM_PANELS) == 9
+        assert len(SYSTEM_PANELS) == 36
 
     def test_all_groups_represented(self):
         from integrations.agent_engine.shell_manifest import (

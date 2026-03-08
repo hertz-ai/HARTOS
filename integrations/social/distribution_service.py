@@ -89,6 +89,10 @@ class DistributionService:
         if user:
             user.referred_by_id = code_obj.user_id
 
+        # Award referrer for the signup (activation reward comes later)
+        ResonanceService.award_action(db, code_obj.user_id,
+                                      'referral_signup', str(referral.id))
+
         db.flush()
         return referral.to_dict()
 

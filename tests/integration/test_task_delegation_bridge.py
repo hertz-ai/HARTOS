@@ -9,6 +9,9 @@ import sys
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
+import pytest
+pytest.importorskip('agent_ledger', reason='agent_ledger not installed')
+
 from integrations.internal_comm import skill_registry, a2a_context, register_agent_with_skills
 from agent_ledger import SmartLedger, TaskType, TaskStatus
 from integrations.internal_comm.task_delegation_bridge import TaskDelegationBridge

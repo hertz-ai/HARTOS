@@ -676,7 +676,7 @@ class TestLocalVsCloudDeploymentDifferences:
     def test_local_endpoints_config(self):
         """config.json GPT_API points to localhost."""
         config_path = os.path.join(
-            os.path.dirname(__file__), '..', 'config.json')
+            os.path.dirname(__file__), '..', '..', 'config.json')
         with open(config_path, 'r') as f:
             config = json.load(f)
         assert 'localhost' in config.get('GPT_API', '')
@@ -684,7 +684,7 @@ class TestLocalVsCloudDeploymentDifferences:
     def test_cloud_endpoints_config(self):
         """config.json DB_URL points to hertzai.com."""
         config_path = os.path.join(
-            os.path.dirname(__file__), '..', 'config.json')
+            os.path.dirname(__file__), '..', '..', 'config.json')
         with open(config_path, 'r') as f:
             config = json.load(f)
         assert 'hertzai.com' in config.get('DB_URL', '')
@@ -692,7 +692,7 @@ class TestLocalVsCloudDeploymentDifferences:
     def test_hybrid_mode_local_llm_cloud_db(self):
         """Both local+cloud endpoints coexist in config."""
         config_path = os.path.join(
-            os.path.dirname(__file__), '..', 'config.json')
+            os.path.dirname(__file__), '..', '..', 'config.json')
         with open(config_path, 'r') as f:
             config = json.load(f)
         # Local LLM endpoint

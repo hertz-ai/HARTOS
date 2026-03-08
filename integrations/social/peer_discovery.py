@@ -46,15 +46,23 @@ BANDWIDTH_PROFILES = {
     },
 }
 
-# Tier → default bandwidth profile
+# Bandwidth profile lookup — handles BOTH classification dimensions:
+#   1. Capability tier (NodeTierLevel): embedded, observer, lite, standard, full, compute_host
+#      → describes what this node CAN do based on hardware
+#   2. Topology mode (HEVOLVE_NODE_TIER): flat, regional, central
+#      → describes WHERE this node sits in the network hierarchy
+# Lookup order: capability_tier first, then topology mode as fallback
+# (see GossipProtocol.__init__: cap_tier or self.tier)
 _TIER_BANDWIDTH_MAP = {
+    # Capability tiers (from security/system_requirements.py NodeTierLevel)
     'embedded': 'minimal',
     'observer': 'constrained',
     'lite': 'constrained',
     'standard': 'full',
     'full': 'full',
     'compute_host': 'full',
-    'flat': 'full',       # Legacy flat nodes default to full
+    # Topology modes (fallback when capability_tier is not yet resolved)
+    'flat': 'full',
     'regional': 'full',
     'central': 'full',
 }
@@ -1021,7 +1029,10 @@ class AutoDiscovery:
     def __init__(self, gossip_protocol: GossipProtocol,
                  port: int = None, beacon_interval: int = None):
         self._gossip = gossip_protocol
-        self._port = port or int(os.environ.get('HEVOLVE_DISCOVERY_PORT', '6780'))
+        from core.port_registry import get_port
+        # Legacy env var takes precedence for backward compat
+        _legacy = os.environ.get('HEVOLVE_DISCOVERY_PORT')
+        self._port = port or (int(_legacy) if _legacy else get_port('discovery'))
         self._beacon_interval = beacon_interval or int(
             os.environ.get('HEVOLVE_DISCOVERY_INTERVAL', '30'))
         self._running = False

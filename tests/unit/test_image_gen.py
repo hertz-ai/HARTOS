@@ -8,6 +8,7 @@ import pytest
 import asyncio
 import os
 import sys
+import time
 from unittest.mock import Mock, patch, AsyncMock
 from pathlib import Path
 
@@ -325,6 +326,7 @@ class TestImageGenerator:
     def test_get_temp_path(self, generator):
         """Test temporary path generation."""
         path1 = generator.get_temp_path()
+        time.sleep(0.002)  # Ensure different millisecond timestamp
         path2 = generator.get_temp_path()
 
         # Should be unique

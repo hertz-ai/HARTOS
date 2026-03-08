@@ -13,7 +13,7 @@
 # Exit: 0 = all pass, 1 = any failure
 # ============================================================
 
-set -uo pipefail
+set -euo pipefail
 
 BACKEND_PORT="${BACKEND_PORT:-16777}"
 SSH_PORT="${SSH_PORT:-10022}"

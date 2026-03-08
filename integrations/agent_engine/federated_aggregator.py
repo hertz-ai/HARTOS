@@ -13,8 +13,12 @@ Lifecycle (driven by AgentDaemon._tick every 2nd tick):
   5. apply_aggregated()     — store for dashboard + benchmark consumption
   6. track_convergence()    — variance-based convergence score
 """
+import hashlib
+import hmac
+import json
 import logging
 import math
+import os
 import threading
 import time
 from typing import Dict, List, Optional, Tuple
@@ -23,6 +27,29 @@ logger = logging.getLogger('hevolve_social')
 
 DELTA_VERSION = 1
 DELTA_MAX_AGE_SECONDS = 3600  # 1 hour freshness window
+
+
+def _sign_delta(delta_dict):
+    """Sign a federation delta with node key (HMAC-SHA256)."""
+    node_key = os.environ.get('HART_NODE_KEY', 'default-dev-key')
+    # Work on a copy without any existing hmac_signature
+    to_sign = {k: v for k, v in delta_dict.items() if k != 'hmac_signature'}
+    payload = json.dumps(to_sign, sort_keys=True).encode()
+    sig = hmac.new(node_key.encode(), payload, hashlib.sha256).hexdigest()
+    delta_dict['hmac_signature'] = sig
+    return delta_dict
+
+
+def _verify_delta_signature(delta_dict):
+    """Verify a received federation delta's HMAC-SHA256 signature."""
+    sig = delta_dict.get('hmac_signature', '')
+    if not sig:
+        return False
+    to_verify = {k: v for k, v in delta_dict.items() if k != 'hmac_signature'}
+    node_key = os.environ.get('HART_NODE_KEY', 'default-dev-key')
+    payload = json.dumps(to_verify, sort_keys=True).encode()
+    expected = hmac.new(node_key.encode(), payload, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(sig, expected)
 
 
 class FederatedAggregator:
@@ -43,6 +70,25 @@ class FederatedAggregator:
         self._embedding_deltas: Dict[str, dict] = {}  # node_id → compressed delta
         self._embedding_epoch = 0
         self._last_embedding_aggregated: Optional[dict] = None
+        # Model lifecycle delta channel (dynamic load/unload intelligence)
+        self._lifecycle_lock = threading.Lock()
+        self._lifecycle_deltas: Dict[str, dict] = {}  # node_id → model usage stats
+        self._last_lifecycle_aggregated: Optional[dict] = None
+        # Resonance tuning delta channel (personality tuning across nodes)
+        self._resonance_lock = threading.Lock()
+        self._resonance_deltas: Dict[str, dict] = {}  # node_id → anonymized tuning stats
+        self._resonance_epoch = 0
+        self._last_resonance_aggregated: Optional[dict] = None
+        # Recipe sharing channel (trained task intelligence)
+        self._recipe_lock = threading.Lock()
+        self._recipe_deltas: Dict[str, dict] = {}  # node_id → recipe catalog
+        self._last_recipe_aggregated: Optional[dict] = None
+        # EventBus counters (fed by real-time events)
+        self._event_counters_lock = threading.Lock()
+        self._event_counters: Dict[str, int] = {}
+
+        # Subscribe to EventBus (if platform is bootstrapped)
+        self._subscribe_to_eventbus()
 
     def tick(self) -> dict:
         """Full cycle: extract → broadcast → aggregate → apply → track."""
@@ -68,6 +114,11 @@ class FederatedAggregator:
             embedding_result = self.embedding_tick()
             if embedding_result.get('aggregated'):
                 result['embedding'] = embedding_result
+
+            # Resonance channel tick (personality tuning across nodes)
+            resonance_result = self.resonance_tick()
+            if resonance_result.get('aggregated'):
+                result['resonance'] = resonance_result
         except Exception as e:
             logger.debug(f"Federation tick error: {e}")
             result['error'] = str(e)
@@ -169,12 +220,13 @@ class FederatedAggregator:
                 'benchmark_results': self._get_benchmark_results(),
                 'capability_tier': capability_tier,
                 'contribution_score': contribution_score,
+                'event_counters': self.get_event_counters(),
             }
 
             # Sign the delta
             try:
-                from security.node_integrity import sign_payload
-                delta['signature'] = sign_payload(delta)
+                from security.node_integrity import sign_json_payload
+                delta['signature'] = sign_json_payload(delta)
             except Exception:
                 delta['signature'] = ''
 
@@ -206,6 +258,9 @@ class FederatedAggregator:
 
     def broadcast_delta(self, delta: dict):
         """POST delta to all known active peers."""
+        # Sign the delta with HMAC-SHA256 before broadcasting
+        _sign_delta(delta)
+
         try:
             from integrations.social.models import get_db, PeerNode
             import requests
@@ -255,11 +310,17 @@ class FederatedAggregator:
         sig = delta.get('signature', '')
         if sig:
             try:
-                from security.node_integrity import verify_signed_payload
-                if not verify_signed_payload(delta, delta.get('public_key', '')):
+                from security.node_integrity import verify_json_signature
+                if not verify_json_signature(delta.get('public_key', ''),
+                                             delta, sig):
                     return False, 'invalid signature'
             except Exception:
                 pass  # Verification module unavailable — accept
+
+        # HMAC-SHA256 delta signing verification
+        if delta.get('hmac_signature'):
+            if not _verify_delta_signature(delta):
+                return False, 'invalid HMAC signature'
 
         node_id = delta.get('node_id', '')
         if not node_id:
@@ -280,16 +341,21 @@ class FederatedAggregator:
         if len(all_deltas) < 1:
             return None
 
-        # Compute weights: log(1 + contribution_score) * tier_multiplier
-        tier_multipliers = {
-            'lite': 0.5, 'standard': 1.0, 'compute': 1.5, 'gpu': 2.0,
-        }
+        # Equal voice: every node's intelligence counts the same.
+        # Weight by data quality (interactions observed) not hardware tier.
+        # A Raspberry Pi that served 10,000 users has more insight than
+        # a GPU server that served 10. No one entity owns the built
+        # intelligence — everyone is equal for this hive being.
         weights = []
         for d in all_deltas:
-            cs = d.get('contribution_score', 0)
-            tier = d.get('capability_tier', 'standard')
-            w = math.log1p(max(0, cs)) * tier_multipliers.get(tier, 1.0)
-            weights.append(max(0.1, w))  # Floor at 0.1
+            interactions = (
+                d.get('experience_stats', {}).get('total_recorded', 0) +
+                d.get('quality_metrics', {}).get('goal_throughput', 0)
+            )
+            # Weight by log of interactions — diminishing returns prevents
+            # any single high-traffic node from dominating
+            w = math.log1p(max(0, interactions))
+            weights.append(max(1.0, w))  # Floor at 1.0 — every node counts
 
         total_weight = sum(weights)
 
@@ -337,6 +403,16 @@ class FederatedAggregator:
             from .world_model_bridge import get_world_model_bridge
             bridge = get_world_model_bridge()
             bridge._federation_aggregated = aggregated
+        except Exception:
+            pass
+
+        # Broadcast to EventBus — hive intelligence updated
+        try:
+            from core.platform.events import emit_event
+            emit_event('federation.aggregated', {
+                'epoch': aggregated.get('epoch', 0),
+                'peer_count': aggregated.get('peer_count', 0),
+            })
         except Exception:
             pass
 
@@ -434,6 +510,273 @@ class FederatedAggregator:
             'last_aggregated': self._last_embedding_aggregated,
         }
 
+    # ─── Model Lifecycle Delta Channel ───
+
+    def receive_lifecycle_delta(self, node_id: str, delta: dict):
+        """Store model usage stats from a peer node."""
+        if not node_id or not isinstance(delta, dict):
+            return
+        with self._lifecycle_lock:
+            self._lifecycle_deltas[node_id] = delta
+
+    def aggregate_lifecycle(self) -> Optional[dict]:
+        """Aggregate model popularity across all peers.
+
+        Returns: {popularity: {model_name: 0.0-1.0}, peer_count: int}
+        """
+        with self._lifecycle_lock:
+            deltas = list(self._lifecycle_deltas.values())
+        if not deltas:
+            return self._last_lifecycle_aggregated
+
+        total_peers = len(deltas)
+        model_counts: Dict[str, int] = {}
+        model_access_rates: Dict[str, List[float]] = {}
+
+        for d in deltas:
+            for model_name, stats in d.get('models', {}).items():
+                model_counts[model_name] = model_counts.get(model_name, 0) + 1
+                rate = stats.get('access_rate', 0)
+                if isinstance(rate, (int, float)):
+                    model_access_rates.setdefault(model_name, []).append(rate)
+
+        popularity = {}
+        for name, count in model_counts.items():
+            peer_fraction = count / max(1, total_peers)
+            rates = model_access_rates.get(name, [0])
+            avg_rate = sum(rates) / max(1, len(rates))
+            popularity[name] = min(1.0, peer_fraction * (1 + avg_rate))
+
+        result = {'popularity': popularity, 'peer_count': total_peers}
+        self._last_lifecycle_aggregated = result
+        return result
+
+    def get_lifecycle_stats(self) -> dict:
+        """Return model lifecycle delta stats for dashboard."""
+        with self._lifecycle_lock:
+            pending = len(self._lifecycle_deltas)
+        return {
+            'pending_deltas': pending,
+            'last_aggregated': self._last_lifecycle_aggregated,
+        }
+
+    # ─── Resonance Tuning Delta Channel ───
+
+    def receive_resonance_delta(self, node_id: str, delta: dict):
+        """Store anonymized resonance tuning stats from a peer node."""
+        if not node_id or not isinstance(delta, dict):
+            return
+        with self._resonance_lock:
+            self._resonance_deltas[node_id] = delta
+
+    def aggregate_resonance(self) -> Optional[dict]:
+        """Aggregate resonance deltas: weighted avg of tuning distributions."""
+        with self._resonance_lock:
+            deltas = list(self._resonance_deltas.values())
+        if not deltas:
+            return None
+
+        # Weighted by user_count (more users = more representative)
+        weights = []
+        for d in deltas:
+            uc = d.get('user_count', 1)
+            weights.append(max(1.0, float(uc)))
+        total_w = sum(weights)
+
+        n_dims = len(deltas[0].get('avg_tuning', []))
+        if n_dims == 0:
+            return None
+
+        avg_tuning = [0.0] * n_dims
+        for d, w in zip(deltas, weights):
+            at = d.get('avg_tuning', [0.5] * n_dims)
+            for i in range(min(n_dims, len(at))):
+                avg_tuning[i] += at[i] * w / total_w
+
+        result = {
+            'avg_tuning': avg_tuning,
+            'peer_count': len(deltas),
+            'total_users': sum(d.get('user_count', 0) for d in deltas),
+            'total_interactions': sum(d.get('total_interactions', 0) for d in deltas),
+            'timestamp': time.time(),
+        }
+        self._last_resonance_aggregated = result
+        self._resonance_epoch += 1
+        return result
+
+    def resonance_tick(self) -> dict:
+        """Resonance channel tick: extract local → aggregate → apply → clear."""
+        result = {'resonance_epoch': self._resonance_epoch, 'aggregated': False}
+        try:
+            # Extract local resonance delta
+            try:
+                from core.resonance_tuner import get_resonance_tuner
+                tuner = get_resonance_tuner()
+                local_delta = tuner.export_resonance_delta()
+                if local_delta:
+                    # Broadcast to peers (piggyback on existing gossip)
+                    self._broadcast_resonance(local_delta)
+            except ImportError:
+                pass
+
+            aggregated = self.aggregate_resonance()
+            if aggregated:
+                # Apply hive-aggregated tuning to local profiles
+                try:
+                    from core.resonance_tuner import get_resonance_tuner
+                    get_resonance_tuner().import_hive_resonance(aggregated)
+                except ImportError:
+                    pass
+
+                result.update({
+                    'aggregated': True,
+                    'resonance_epoch': self._resonance_epoch,
+                    'peer_count': aggregated.get('peer_count', 0),
+                    'total_users': aggregated.get('total_users', 0),
+                })
+                with self._resonance_lock:
+                    self._resonance_deltas.clear()
+        except Exception as e:
+            result['error'] = str(e)
+        return result
+
+    def _broadcast_resonance(self, delta: dict):
+        """Broadcast resonance delta to peers via gossip."""
+        try:
+            from integrations.social.peer_discovery import gossip
+            gossip.broadcast({
+                'type': 'resonance_delta',
+                'delta': delta,
+                'timestamp': time.time(),
+            })
+        except Exception:
+            pass
+
+    def get_resonance_stats(self) -> dict:
+        """Return resonance channel stats for dashboard."""
+        with self._resonance_lock:
+            pending = len(self._resonance_deltas)
+        return {
+            'resonance_epoch': self._resonance_epoch,
+            'pending_deltas': pending,
+            'last_aggregated': self._last_resonance_aggregated,
+        }
+
+    # ─── EventBus Integration ───
+
+    def _subscribe_to_eventbus(self):
+        """Subscribe to EventBus events so learning signals flow into federation.
+
+        Events consumed: inference.completed, resonance.tuned, memory.item_added,
+        action_state.changed. Counters are included in the next extract_local_delta().
+        """
+        try:
+            from core.platform.events import emit_event
+            from core.platform.registry import get_registry
+            registry = get_registry()
+            if not registry.has('events'):
+                return
+            bus = registry.get('events')
+            bus.on('inference.completed', self._on_event)
+            bus.on('resonance.tuned', self._on_event)
+            bus.on('memory.item_added', self._on_event)
+            bus.on('action_state.changed', self._on_event)
+        except Exception:
+            pass  # Platform not bootstrapped yet — will be wired on next tick
+
+    def _on_event(self, topic: str, data):
+        """Accumulate event counts for federation delta."""
+        with self._event_counters_lock:
+            self._event_counters[topic] = self._event_counters.get(topic, 0) + 1
+
+    def get_event_counters(self) -> dict:
+        """Return and reset event counters for inclusion in federation delta."""
+        with self._event_counters_lock:
+            counters = dict(self._event_counters)
+            self._event_counters.clear()
+        return counters
+
+    # ─── Recipe Sharing Channel ───
+
+    def receive_recipe_delta(self, node_id: str, delta: dict):
+        """Store recipe catalog summary from a peer node.
+
+        Delta format: {recipes: [{id, name, action_count, success_rate, reuse_count}]}
+        No proprietary data — just catalog metadata for discovery.
+        """
+        if not node_id or not isinstance(delta, dict):
+            return
+
+        # Check consent for recipe sharing (best-effort, fail-open)
+        user_id = delta.get('user_id', '')
+        if user_id:
+            try:
+                from integrations.social.consent_service import ConsentService
+                from integrations.social.models import db_session
+                with db_session() as db:
+                    if not ConsentService.check_consent(db, user_id, 'public_exposure'):
+                        logger.debug(f"Recipe delta from {node_id} blocked: user {user_id} has not consented")
+                        return
+            except (ImportError, ValueError, Exception):
+                pass  # consent service unavailable — allow (fail-open for dev)
+
+        with self._recipe_lock:
+            self._recipe_deltas[node_id] = delta
+
+    def aggregate_recipes(self) -> Optional[dict]:
+        """Aggregate recipe catalogs — build hive recipe index.
+
+        Every node's recipes are equally discoverable. No node gets priority
+        in the index regardless of its hardware tier.
+        """
+        with self._recipe_lock:
+            deltas = list(self._recipe_deltas.values())
+        if not deltas:
+            return self._last_recipe_aggregated
+
+        # Build unified catalog — every recipe listed equally
+        hive_recipes = {}
+        for d in deltas:
+            node_id = d.get('node_id', 'unknown')
+            for recipe in d.get('recipes', []):
+                rid = recipe.get('id', '')
+                if rid:
+                    if rid not in hive_recipes:
+                        hive_recipes[rid] = {
+                            'id': rid,
+                            'name': recipe.get('name', ''),
+                            'action_count': recipe.get('action_count', 0),
+                            'nodes': [],
+                            'total_reuse_count': 0,
+                            'avg_success_rate': 0.0,
+                        }
+                    entry = hive_recipes[rid]
+                    entry['nodes'].append(node_id)
+                    entry['total_reuse_count'] += recipe.get('reuse_count', 0)
+                    # Running average of success rates
+                    n = len(entry['nodes'])
+                    old_avg = entry['avg_success_rate']
+                    new_rate = recipe.get('success_rate', 0.0)
+                    entry['avg_success_rate'] = old_avg + (new_rate - old_avg) / n
+
+        result = {
+            'recipes': list(hive_recipes.values()),
+            'total_recipes': len(hive_recipes),
+            'peer_count': len(deltas),
+            'timestamp': time.time(),
+        }
+        self._last_recipe_aggregated = result
+        return result
+
+    def get_recipe_stats(self) -> dict:
+        """Return recipe sharing stats for dashboard."""
+        with self._recipe_lock:
+            pending = len(self._recipe_deltas)
+        return {
+            'pending_deltas': pending,
+            'last_aggregated': self._last_recipe_aggregated,
+        }
+
     def get_stats(self) -> dict:
         """Return federation stats for dashboard."""
         with self._lock:
@@ -448,6 +791,21 @@ class FederatedAggregator:
         # Include embedding stats
         try:
             stats['embedding'] = self.get_embedding_stats()
+        except Exception:
+            pass
+        # Include model lifecycle stats
+        try:
+            stats['lifecycle'] = self.get_lifecycle_stats()
+        except Exception:
+            pass
+        # Include resonance stats
+        try:
+            stats['resonance'] = self.get_resonance_stats()
+        except Exception:
+            pass
+        # Include recipe sharing stats
+        try:
+            stats['recipes'] = self.get_recipe_stats()
         except Exception:
             pass
         return stats

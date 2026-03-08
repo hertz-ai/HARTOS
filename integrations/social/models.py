@@ -589,7 +589,7 @@ class PeerNode(Base):
     master_key_verified = Column(Boolean, default=False)
     release_version = Column(String(20), nullable=True)
     # Hierarchy columns (v13)
-    tier = Column(String(20), default='flat')  # central|regional|local|flat
+    tier = Column(String(20), default='flat')  # TOPOLOGY MODE: central|regional|local|flat (NOT capability tier)
     parent_node_id = Column(String(64), nullable=True)
     certificate_json = Column(JSON, nullable=True)
     certificate_verified = Column(Boolean, default=False)
@@ -601,13 +601,21 @@ class PeerNode(Base):
     max_user_capacity = Column(Integer, default=0)
     dns_region = Column(String(50), nullable=True)
     # HART OS equilibrium: contribution tier + enabled features
-    capability_tier = Column(String(20), nullable=True)       # observer|lite|standard|full|compute_host
+    capability_tier = Column(String(20), nullable=True)       # CAPABILITY TIER: embedded|observer|lite|standard|full|compute_host
     enabled_features_json = Column(JSON, nullable=True)       # ["agent_engine", "tts", ...]
     # E2E encryption: X25519 public key for encrypted inter-node communication
     x25519_public = Column(String(64), nullable=True)         # Hex-encoded X25519 public key (32 bytes)
     # Fail2ban: progressive ban tracking
     ban_count = Column(Integer, default=0)                    # How many times this node has been banned
     ban_until = Column(DateTime, nullable=True)               # When current ban expires (None = no ban)
+    # Usage tracking (cumulative, periodically aggregated by aggregate_compute_stats)
+    gpu_hours_served = Column(Float, default=0.0)
+    total_inferences = Column(Integer, default=0)
+    energy_kwh_contributed = Column(Float, default=0.0)
+    metered_api_costs_absorbed = Column(Float, default=0.0)  # USD of metered API used for hive
+    # Provider identity (gossipped to network — single source of truth)
+    electricity_rate_kwh = Column(Float, nullable=True)
+    cause_alignment = Column(String(200), nullable=True)
 
     node_operator = relationship('User', foreign_keys=[node_operator_id])
 
@@ -644,6 +652,12 @@ class PeerNode(Base):
             'x25519_public': self.x25519_public,
             'ban_count': self.ban_count,
             'ban_until': self.ban_until.isoformat() if self.ban_until else None,
+            'gpu_hours_served': self.gpu_hours_served,
+            'total_inferences': self.total_inferences,
+            'energy_kwh_contributed': self.energy_kwh_contributed,
+            'metered_api_costs_absorbed': self.metered_api_costs_absorbed,
+            'electricity_rate_kwh': self.electricity_rate_kwh,
+            'cause_alignment': self.cause_alignment,
             'metadata': self.metadata_json,
         }
 
@@ -2625,6 +2639,7 @@ class ThoughtExperiment(Base):
     intent_category = Column(String(30), default='technology')
     status = Column(String(20), default='proposed', index=True)
     decision_type = Column(String(20), default='weighted')
+    decision_context = Column(String(50), nullable=True)
     voting_opens_at = Column(DateTime, nullable=True)
     voting_closes_at = Column(DateTime, nullable=True)
     evaluation_deadline = Column(DateTime, nullable=True)
@@ -2634,6 +2649,10 @@ class ThoughtExperiment(Base):
     agent_evaluations_json = Column(JSON, nullable=True)
     is_core_ip = Column(Boolean, default=False)
     parent_experiment_id = Column(String(64), nullable=True)
+    experiment_type = Column(String(20), default='traditional')   # physical_ai | software | traditional
+    funding_total = Column(Integer, default=0)                    # Total Spark invested
+    contributor_count = Column(Integer, default=0)                # Unique believers
+    camera_feed_url = Column(String(500), nullable=True)          # WebSocket URL for physical_ai
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
@@ -2648,6 +2667,7 @@ class ThoughtExperiment(Base):
             'intent_category': self.intent_category,
             'status': self.status,
             'decision_type': self.decision_type,
+            'decision_context': self.decision_context,
             'voting_opens_at': self.voting_opens_at.isoformat() if self.voting_opens_at else None,
             'voting_closes_at': self.voting_closes_at.isoformat() if self.voting_closes_at else None,
             'evaluation_deadline': self.evaluation_deadline.isoformat() if self.evaluation_deadline else None,
@@ -2657,6 +2677,10 @@ class ThoughtExperiment(Base):
             'agent_evaluations_json': self.agent_evaluations_json,
             'is_core_ip': self.is_core_ip or False,
             'parent_experiment_id': self.parent_experiment_id,
+            'experiment_type': self.experiment_type or 'traditional',
+            'funding_total': self.funding_total or 0,
+            'contributor_count': self.contributor_count or 0,
+            'camera_feed_url': self.camera_feed_url,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }
@@ -2694,5 +2718,543 @@ class ExperimentVote(Base):
             'reasoning': self.reasoning,
             'suggestion': self.suggestion,
             'constitutional_check': self.constitutional_check,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class PaperPortfolio(Base):
+    """Simulated trading portfolio for paper trading agents."""
+    __tablename__ = 'paper_portfolios'
+
+    id = Column(String(64), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(64), nullable=False, index=True)
+    goal_id = Column(String(64), nullable=True)
+    strategy = Column(String(30), default='long_term')
+    initial_balance = Column(Float, default=10000.0)
+    current_balance = Column(Float, default=10000.0)
+    total_pnl = Column(Float, default=0.0)
+    total_trades = Column(Integer, default=0)
+    winning_trades = Column(Integer, default=0)
+    status = Column(String(20), default='active')
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'goal_id': self.goal_id,
+            'strategy': self.strategy,
+            'initial_balance': self.initial_balance,
+            'current_balance': self.current_balance,
+            'total_pnl': self.total_pnl,
+            'total_trades': self.total_trades,
+            'winning_trades': self.winning_trades,
+            'win_rate': round(self.winning_trades / self.total_trades, 4) if self.total_trades else 0.0,
+            'status': self.status,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class PaperTrade(Base):
+    """Individual paper trade record."""
+    __tablename__ = 'paper_trades'
+
+    id = Column(String(64), primary_key=True, default=lambda: str(uuid.uuid4()))
+    portfolio_id = Column(String(64), ForeignKey('paper_portfolios.id', use_alter=True),
+                          nullable=False, index=True)
+    symbol = Column(String(20), nullable=False)
+    side = Column(String(10), nullable=False)
+    quantity = Column(Float, nullable=False)
+    entry_price = Column(Float, nullable=False)
+    exit_price = Column(Float, nullable=True)
+    stop_loss = Column(Float, nullable=True)
+    pnl = Column(Float, default=0.0)
+    status = Column(String(20), default='open')
+    opened_at = Column(DateTime, default=func.now())
+    closed_at = Column(DateTime, nullable=True)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'portfolio_id': self.portfolio_id,
+            'symbol': self.symbol,
+            'side': self.side,
+            'quantity': self.quantity,
+            'entry_price': self.entry_price,
+            'exit_price': self.exit_price,
+            'stop_loss': self.stop_loss,
+            'pnl': self.pnl,
+            'status': self.status,
+            'opened_at': self.opened_at.isoformat() if self.opened_at else None,
+            'closed_at': self.closed_at.isoformat() if self.closed_at else None,
+        }
+
+
+class ComputeEscrow(Base):
+    """Persistent compute lending escrow — replaces in-memory _compute_debts."""
+    __tablename__ = 'compute_escrow'
+
+    id = Column(Integer, primary_key=True)
+    debtor_node_id = Column(String(100), nullable=False, index=True)
+    creditor_node_id = Column(String(100), nullable=False, index=True)
+    request_id = Column(String(100), nullable=True)
+    task_type = Column(String(50), default='general')
+    spark_amount = Column(Integer, nullable=False)
+    status = Column(String(20), default='pending', index=True)  # pending|settled|expired
+    created_at = Column(DateTime, default=datetime.utcnow)
+    settled_at = Column(DateTime, nullable=True)
+    expires_at = Column(DateTime, nullable=True)
+
+
+class MeteredAPIUsage(Base):
+    """Per-call record of metered API consumption for cost recovery.
+
+    Tracks when hive/idle tasks consume a node operator's paid API credits
+    (GPT-4, Claude, Groq paid tier). Distinct from APIUsageLog which tracks
+    external commercial billing (customers paying us).
+    """
+    __tablename__ = 'metered_api_usage'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    node_id = Column(String(64), nullable=False, index=True)
+    operator_id = Column(String(64), nullable=True, index=True)
+    model_id = Column(String(100), nullable=False)
+    task_source = Column(String(30), nullable=False)                # own | hive | idle
+    goal_id = Column(String(64), nullable=True, index=True)
+    requester_node_id = Column(String(64), nullable=True)
+    tokens_in = Column(Integer, default=0)
+    tokens_out = Column(Integer, default=0)
+    cost_per_1k_tokens = Column(Float, default=0.0)
+    estimated_spark_cost = Column(Integer, default=0)
+    actual_usd_cost = Column(Float, default=0.0)
+    settlement_status = Column(String(20), default='pending', index=True)
+    created_at = Column(DateTime, default=func.now(), index=True)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'node_id': self.node_id,
+            'operator_id': self.operator_id,
+            'model_id': self.model_id,
+            'task_source': self.task_source,
+            'goal_id': self.goal_id,
+            'requester_node_id': self.requester_node_id,
+            'tokens_in': self.tokens_in,
+            'tokens_out': self.tokens_out,
+            'cost_per_1k_tokens': self.cost_per_1k_tokens,
+            'estimated_spark_cost': self.estimated_spark_cost,
+            'actual_usd_cost': self.actual_usd_cost,
+            'settlement_status': self.settlement_status,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class NodeComputeConfig(Base):
+    """Per-node LOCAL policy settings (not gossipped).
+
+    Controls how this node behaves: model routing, metered API opt-in,
+    feature flags, settlement. Provider identity fields (cause_alignment,
+    electricity_rate_kwh) live on PeerNode only — single source of truth.
+    """
+    __tablename__ = 'node_compute_config'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    node_id = Column(String(64), unique=True, nullable=False, index=True)
+    # Model routing (local policy)
+    compute_policy = Column(String(20), default='local_preferred')
+    hive_compute_policy = Column(String(20), default='local_preferred')
+    max_hive_gpu_pct = Column(Integer, default=50)
+    # Metered API opt-in (local policy)
+    allow_metered_for_hive = Column(Boolean, default=False)
+    metered_daily_limit_usd = Column(Float, default=0.0)
+    # Compute offer (local declaration)
+    offered_gpu_hours_per_day = Column(Float, default=0.0)
+    # Feature flags (local policy)
+    accept_thought_experiments = Column(Boolean, default=True)
+    accept_frontier_training = Column(Boolean, default=False)
+    # Settlement (local policy)
+    auto_settle = Column(Boolean, default=True)
+    min_settlement_spark = Column(Integer, default=10)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'node_id': self.node_id,
+            'compute_policy': self.compute_policy,
+            'hive_compute_policy': self.hive_compute_policy,
+            'max_hive_gpu_pct': self.max_hive_gpu_pct,
+            'allow_metered_for_hive': self.allow_metered_for_hive,
+            'metered_daily_limit_usd': self.metered_daily_limit_usd,
+            'offered_gpu_hours_per_day': self.offered_gpu_hours_per_day,
+            'accept_thought_experiments': self.accept_thought_experiments,
+            'accept_frontier_training': self.accept_frontier_training,
+            'auto_settle': self.auto_settle,
+            'min_settlement_spark': self.min_settlement_spark,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class AuditLogEntry(Base):
+    """Immutable audit log with hash-chain integrity (see security/immutable_audit_log.py)."""
+    __tablename__ = 'audit_log_entries'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_type = Column(String(50), nullable=False, index=True)
+    actor_id = Column(String(100), nullable=False, index=True)
+    target_id = Column(String(100), nullable=True)
+    action = Column(Text, nullable=False)
+    detail_json = Column(Text, nullable=True)
+    prev_hash = Column(String(64), nullable=False)
+    entry_hash = Column(String(64), nullable=False, unique=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+# ─── Multiplayer Games ───
+
+class GameSession(Base):
+    """Multiplayer game session (trivia, word chain, collab puzzle, compute challenge)."""
+    __tablename__ = 'game_sessions'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    game_type = Column(String(30), nullable=False, index=True)       # trivia|word_chain|collab_puzzle|compute_challenge|quick_match
+    status = Column(String(20), default='waiting', index=True)       # waiting|active|completed|expired|cancelled
+    host_user_id = Column(String(64), ForeignKey('users.id'), nullable=False, index=True)
+    encounter_id = Column(String(64), nullable=True, index=True)     # if born from encounter
+    community_id = Column(String(64), nullable=True)                 # scoped to community
+    challenge_id = Column(String(64), nullable=True)                 # linked challenge
+    max_players = Column(Integer, default=4)
+    current_round = Column(Integer, default=0)
+    total_rounds = Column(Integer, default=5)
+    game_state = Column(JSON, default=dict)                          # game-type-specific state
+    config = Column(JSON, default=dict)                              # difficulty, categories, etc.
+    started_at = Column(DateTime, nullable=True)
+    ended_at = Column(DateTime, nullable=True)
+    expires_at = Column(DateTime, nullable=False)                    # auto-cleanup
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    participants = relationship('GameParticipant', back_populates='session',
+                                cascade='all, delete-orphan', lazy='joined')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'game_type': self.game_type,
+            'status': self.status,
+            'host_user_id': self.host_user_id,
+            'encounter_id': self.encounter_id,
+            'community_id': self.community_id,
+            'challenge_id': self.challenge_id,
+            'max_players': self.max_players,
+            'current_round': self.current_round,
+            'total_rounds': self.total_rounds,
+            'game_state': self.game_state,
+            'config': self.config,
+            'started_at': self.started_at.isoformat() if self.started_at else None,
+            'ended_at': self.ended_at.isoformat() if self.ended_at else None,
+            'expires_at': self.expires_at.isoformat() if self.expires_at else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'participants': [p.to_dict() for p in (self.participants or [])],
+            'player_count': len(self.participants or []),
+        }
+
+
+class GameParticipant(Base):
+    """Player in a game session, tracks score and result."""
+    __tablename__ = 'game_participants'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    game_session_id = Column(String(64), ForeignKey('game_sessions.id'), nullable=False, index=True)
+    user_id = Column(String(64), ForeignKey('users.id'), nullable=False, index=True)
+    score = Column(Integer, default=0)
+    is_ready = Column(Boolean, default=False)
+    joined_at = Column(DateTime, default=datetime.utcnow)
+    finished_at = Column(DateTime, nullable=True)
+    result = Column(String(20), nullable=True)                       # win|loss|draw|abandoned
+    spark_earned = Column(Integer, default=0)
+    xp_earned = Column(Integer, default=0)
+
+    session = relationship('GameSession', back_populates='participants')
+
+    __table_args__ = (
+        UniqueConstraint('game_session_id', 'user_id', name='uq_game_participant'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'game_session_id': self.game_session_id,
+            'user_id': self.user_id,
+            'score': self.score,
+            'is_ready': self.is_ready,
+            'joined_at': self.joined_at.isoformat() if self.joined_at else None,
+            'finished_at': self.finished_at.isoformat() if self.finished_at else None,
+            'result': self.result,
+            'spark_earned': self.spark_earned,
+            'xp_earned': self.xp_earned,
+        }
+
+
+# ─── TABLE: shareable_links ───
+
+class ShareableLink(Base):
+    """Universal share token for any resource — posts, profiles, recipes, agents, etc."""
+    __tablename__ = 'shareable_links'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    token = Column(String(12), unique=True, nullable=False, index=True)
+    resource_type = Column(String(30), nullable=False)
+    resource_id = Column(String(64), nullable=False)
+    created_by = Column(String(64), ForeignKey('users.id'), nullable=True)
+    referral_code = Column(String(20), nullable=True)
+    is_private = Column(Boolean, default=False)
+    consent_token = Column(String(32), nullable=True)
+    view_count = Column(Integer, default=0)
+    share_count = Column(Integer, default=0)
+    created_at = Column(DateTime, default=func.now())
+    expires_at = Column(DateTime, nullable=True)
+    metadata_json = Column(Text, nullable=True)
+
+    creator = relationship('User', foreign_keys=[created_by])
+
+    __table_args__ = (
+        Index('ix_share_resource', 'resource_type', 'resource_id', 'created_by'),
+    )
+
+    def to_dict(self):
+        import json as _json
+        og = {}
+        if self.metadata_json:
+            try:
+                og = _json.loads(self.metadata_json)
+            except Exception:
+                pass
+        return {
+            'id': self.id,
+            'token': self.token,
+            'resource_type': self.resource_type,
+            'resource_id': self.resource_id,
+            'referral_code': self.referral_code,
+            'is_private': self.is_private,
+            'view_count': self.view_count,
+            'share_count': self.share_count,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'og': og,
+        }
+
+
+# ─── TABLE: share_events ───
+
+class ShareEvent(Base):
+    """Track share views, clicks, and consent grants."""
+    __tablename__ = 'share_events'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    link_id = Column(String(64), ForeignKey('shareable_links.id'), nullable=False, index=True)
+    event_type = Column(String(20), nullable=False)  # view|share|consent
+    viewer_id = Column(String(64), ForeignKey('users.id'), nullable=True)
+    ip_hash = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=func.now())
+
+    link = relationship('ShareableLink')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'link_id': self.link_id,
+            'event_type': self.event_type,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+# ─── TABLE: user_consents ───
+
+class UserConsent(Base):
+    """Track explicit user consent for data access, revenue sharing, and public exposure."""
+    __tablename__ = 'user_consents'
+
+    id = Column(String(64), primary_key=True)
+    user_id = Column(String(64), nullable=False, index=True)
+    agent_id = Column(String(64), nullable=True, index=True)
+    consent_type = Column(String(30), nullable=False, index=True)  # data_access|revenue_share|public_exposure
+    scope = Column(String(100), nullable=False, default='*')
+    granted = Column(Boolean, default=False, nullable=False)
+    granted_at = Column(DateTime, nullable=True)
+    revoked_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint('user_id', 'agent_id', 'consent_type', 'scope',
+                         name='uq_user_consent'),
+        Index('ix_user_consent_lookup', 'user_id', 'consent_type', 'scope', 'granted'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'agent_id': self.agent_id,
+            'consent_type': self.consent_type,
+            'scope': self.scope,
+            'granted': self.granted,
+            'granted_at': self.granted_at.isoformat() if self.granted_at else None,
+            'revoked_at': self.revoked_at.isoformat() if self.revoked_at else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+# ─── TABLE: marketplace_listings ───
+
+class MarketplaceListing(Base):
+    """HART agent service listing in the marketplace."""
+    __tablename__ = 'marketplace_listings'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    agent_id = Column(String(64), ForeignKey('users.id'), nullable=False, index=True)
+    title = Column(String(200), nullable=False)
+    description = Column(Text, default='')
+    category = Column(String(50), nullable=False, default='custom')
+    price_spark = Column(Integer, default=0)
+    rating_avg = Column(Float, default=0.0)
+    review_count = Column(Integer, default=0)
+    hire_count = Column(Integer, default=0)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    agent = relationship('User', backref='marketplace_listings')
+
+    def to_dict(self):
+        agent_data = None
+        if self.agent:
+            agent_data = {
+                'id': self.agent.id,
+                'username': self.agent.username,
+                'display_name': self.agent.display_name,
+                'avatar_url': self.agent.avatar_url,
+                'user_type': self.agent.user_type,
+            }
+        return {
+            'id': self.id,
+            'agent_id': self.agent_id,
+            'title': self.title,
+            'description': self.description,
+            'category': self.category,
+            'price_spark': self.price_spark,
+            'rating_avg': self.rating_avg,
+            'review_count': self.review_count,
+            'hire_count': self.hire_count,
+            'is_active': self.is_active,
+            'agent': agent_data,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class ListingReview(Base):
+    """Review for a marketplace listing."""
+    __tablename__ = 'listing_reviews'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    listing_id = Column(String(64), ForeignKey('marketplace_listings.id'), nullable=False, index=True)
+    user_id = Column(String(64), ForeignKey('users.id'), nullable=False, index=True)
+    rating = Column(Integer, nullable=False)  # 1-5
+    text = Column(Text, default='')
+    created_at = Column(DateTime, default=func.now())
+
+    listing = relationship('MarketplaceListing', backref='reviews')
+    user = relationship('User')
+
+    __table_args__ = (
+        UniqueConstraint('listing_id', 'user_id', name='uq_listing_review'),
+    )
+
+    def to_dict(self):
+        user_data = None
+        if self.user:
+            user_data = {
+                'id': self.user.id,
+                'username': self.user.username,
+                'display_name': self.user.display_name,
+                'avatar_url': self.user.avatar_url,
+            }
+        return {
+            'id': self.id,
+            'listing_id': self.listing_id,
+            'user_id': self.user_id,
+            'rating': self.rating,
+            'text': self.text,
+            'user': user_data,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class MCPServer(Base):
+    """Registered MCP tool server."""
+    __tablename__ = 'mcp_servers'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    owner_id = Column(String(64), ForeignKey('users.id'), nullable=False, index=True)
+    name = Column(String(100), nullable=False)
+    description = Column(Text, default='')
+    url = Column(String(500), nullable=True)
+    category = Column(String(50), default='general')
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    owner = relationship('User', backref='mcp_servers')
+
+    def to_dict(self):
+        owner_data = None
+        if self.owner:
+            owner_data = {
+                'id': self.owner.id,
+                'username': self.owner.username,
+                'display_name': self.owner.display_name,
+                'avatar_url': self.owner.avatar_url,
+                'user_type': self.owner.user_type,
+            }
+        return {
+            'id': self.id,
+            'owner_id': self.owner_id,
+            'name': self.name,
+            'description': self.description,
+            'url': self.url,
+            'category': self.category,
+            'is_active': self.is_active,
+            'owner': owner_data,
+            'tool_count': len(self.tools) if hasattr(self, 'tools') else 0,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class MCPTool(Base):
+    """A tool provided by an MCP server."""
+    __tablename__ = 'mcp_tools'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    server_id = Column(String(64), ForeignKey('mcp_servers.id'), nullable=False, index=True)
+    name = Column(String(100), nullable=False)
+    description = Column(Text, default='')
+    input_schema = Column(JSON, default=dict)
+    created_at = Column(DateTime, default=func.now())
+
+    server = relationship('MCPServer', backref='tools')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'server_id': self.server_id,
+            'name': self.name,
+            'description': self.description,
+            'input_schema': self.input_schema,
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }

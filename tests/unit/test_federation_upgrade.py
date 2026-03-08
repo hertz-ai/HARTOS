@@ -125,13 +125,13 @@ class TestFederatedAggregator:
             'node2': {
                 'experience_stats': {'flush_rate': 1.0},
                 'ralt_stats': {}, 'hivemind_state': {}, 'quality_metrics': {},
-                'contribution_score': 100.0, 'capability_tier': 'gpu',
+                'contribution_score': 100.0, 'capability_tier': 'compute_host',
             },
         }
         result = agg.aggregate()
         assert result is not None
         assert result['peer_count'] == 2
-        # GPU node with high contribution should pull average towards 1.0
+        # compute_host node with high contribution should pull average towards 1.0
         avg = result['experience_stats']['flush_rate']
         assert avg > 0.5, f"Weighted avg should be > 0.5, got {avg}"
 

@@ -20,6 +20,13 @@ def get_social_blueprint():
 
 def init_social(app):
     """Initialize the social network module. Call after app = Flask(...)."""
+    # Block dev mode on central
+    import os as _os_boot
+    node_tier = _os_boot.environ.get('HEVOLVE_NODE_TIER', 'flat')
+    if node_tier == 'central' and _os_boot.environ.get('HEVOLVE_DEV_MODE', '').lower() == 'true':
+        _os_boot.environ['HEVOLVE_DEV_MODE'] = 'false'
+        logger.critical("SECURITY: Dev mode FORCED OFF on central instance")
+
     from .models import init_db, DB_PATH
     try:
         init_db()
@@ -32,11 +39,13 @@ def init_social(app):
         from .gamification_service import GamificationService
         from .models import get_db
         db = get_db()
-        count = GamificationService.seed_achievements(db)
-        if count > 0:
-            db.commit()
-            logger.info(f"HevolveSocial: seeded {count} achievements")
-        db.close()
+        try:
+            count = GamificationService.seed_achievements(db)
+            if count > 0:
+                db.commit()
+                logger.info(f"HevolveSocial: seeded {count} achievements")
+        finally:
+            db.close()
     except Exception as e:
         logger.debug(f"HevolveSocial achievement seeding skipped: {e}")
 
@@ -45,11 +54,13 @@ def init_social(app):
         from .ad_service import AdService
         from .models import get_db as _get_db
         db = _get_db()
-        count = AdService.seed_placements(db)
-        if count > 0:
-            db.commit()
-            logger.info(f"HevolveSocial: seeded {count} ad placements")
-        db.close()
+        try:
+            count = AdService.seed_placements(db)
+            if count > 0:
+                db.commit()
+                logger.info(f"HevolveSocial: seeded {count} ad placements")
+        finally:
+            db.close()
     except Exception as e:
         logger.debug(f"HevolveSocial ad placement seeding skipped: {e}")
 
@@ -60,6 +71,30 @@ def init_social(app):
         logger.info("HevolveSocial gamification endpoints registered")
     except Exception as e:
         logger.warning(f"HevolveSocial gamification blueprint skipped: {e}")
+
+    # Register MCP tool registry blueprint (servers, tools, discover)
+    try:
+        from .api_mcp import mcp_bp
+        app.register_blueprint(mcp_bp)
+        logger.info("HevolveSocial MCP endpoints registered at /api/social/mcp/")
+    except Exception as e:
+        logger.warning(f"HevolveSocial marketplace+MCP blueprint skipped: {e}")
+
+    # Register sharing blueprint (short URLs, OG metadata, consent-gated links)
+    try:
+        from .api_sharing import sharing_bp
+        app.register_blueprint(sharing_bp)
+        logger.info("HevolveSocial sharing endpoints registered at /api/social/share/")
+    except Exception as e:
+        logger.warning(f"HevolveSocial sharing blueprint skipped: {e}")
+
+    # Register multiplayer games + compute lending blueprint
+    try:
+        from .api_games import games_bp
+        app.register_blueprint(games_bp)
+        logger.info("HevolveSocial games + compute endpoints registered at /api/social/games/, /api/social/compute/")
+    except Exception as e:
+        logger.warning(f"HevolveSocial games blueprint skipped: {e}")
 
     # Register discovery blueprint (.well-known/hevolve-social.json)
     try:
@@ -177,6 +212,18 @@ def init_social(app):
     except Exception as e:
         _boot_verified = True  # Allow if master_key module unavailable
         logger.debug(f"HevolveSocial boot verification skipped: {e}")
+
+    # ── Tier authorization (central must prove master key) ──
+    try:
+        from security.key_delegation import verify_tier_authorization
+        tier_auth = verify_tier_authorization()
+        if not tier_auth.get('authorized'):
+            logger.critical(f"Tier authorization FAILED: {tier_auth.get('details', 'unknown')}")
+            if node_tier == 'central':
+                _boot_verified = False
+                logger.critical("Central node cannot start without tier authorization")
+    except Exception as e:
+        logger.warning(f"Tier authorization check unavailable: {e}")
 
     # ── System Requirements (HART OS Equilibrium) ──
     # Detect hardware, classify contribution tier, auto-gate features.
@@ -344,6 +391,20 @@ def init_social(app):
         except Exception:
             pass
 
+        # Register model lifecycle manager
+        try:
+            from integrations.service_tools.model_lifecycle import get_model_lifecycle_manager
+            _lifecycle = get_model_lifecycle_manager()
+            _lifecycle.start()
+            if _lifecycle._running:
+                watchdog.register('model_lifecycle',
+                                  expected_interval=_lifecycle._interval,
+                                  restart_fn=_lifecycle.start,
+                                  stop_fn=_lifecycle.stop)
+                logger.info("Model lifecycle manager started")
+        except Exception as e:
+            logger.debug(f"Model lifecycle manager start skipped: {e}")
+
         watchdog.start()
         logger.info(f"NodeWatchdog started: monitoring "
                     f"{len(watchdog._threads)} threads")
@@ -364,13 +425,7 @@ def init_social(app):
                 logger.debug(f"HevolveSocial agent sync skipped: {e}")
 
 
-# For direct import: from integrations.social import social_bp, init_social
-@property
-def social_bp(self):
-    return get_social_blueprint()
-
-
-# Module-level lazy property workaround
+# Module-level lazy attribute: from integrations.social import social_bp
 def __getattr__(name):
     if name == 'social_bp':
         return get_social_blueprint()

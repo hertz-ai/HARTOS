@@ -320,6 +320,210 @@ SYSTEM_PANELS = {
         'group': 'System', 'default_size': [600, 400],
         'apis': ['/api/shell/display'],
     },
+    'remote_desktop': {
+        'title': 'Remote Desktop', 'icon': 'connected_tv',
+        'group': 'System', 'default_size': [800, 600],
+        'apis': [
+            '/api/remote-desktop/status',
+            '/api/remote-desktop/engines',
+            '/api/remote-desktop/sessions',
+        ],
+    },
+    'file_manager': {
+        'title': 'Files', 'icon': 'folder',
+        'group': 'System', 'default_size': [800, 600],
+        'apis': ['/api/shell/files/browse', '/api/shell/files/recent'],
+    },
+    'terminal': {
+        'title': 'Terminal', 'icon': 'terminal',
+        'group': 'System', 'default_size': [800, 500],
+        'apis': ['/api/shell/terminal/exec', '/api/shell/terminal/sessions'],
+    },
+    'user_accounts': {
+        'title': 'User Accounts', 'icon': 'group',
+        'group': 'System', 'default_size': [600, 500],
+        'apis': ['/api/shell/users'],
+    },
+    'notification_center': {
+        'title': 'Notification Center', 'icon': 'notifications_active',
+        'group': 'System', 'default_size': [500, 600],
+        'apis': ['/api/shell/notifications'],
+    },
+    'updates': {
+        'title': 'Updates', 'icon': 'system_update',
+        'group': 'System', 'default_size': [600, 400],
+        'apis': ['/api/upgrades/status'],
+    },
+    'backup_restore': {
+        'title': 'Backup & Restore', 'icon': 'backup',
+        'group': 'System', 'default_size': [600, 500],
+        'apis': ['/api/shell/backup/list', '/api/shell/backup/restore'],
+    },
+    'devices': {
+        'title': 'Devices & Mesh', 'icon': 'devices_other',
+        'group': 'System', 'default_size': [700, 500],
+        'apis': ['/api/shell/devices'],
+    },
+    'i18n': {
+        'title': 'Language & Region', 'icon': 'language',
+        'group': 'System', 'default_size': [500, 400],
+        'apis': ['/api/shell/i18n/locales', '/api/shell/i18n/strings'],
+    },
+    'accessibility': {
+        'title': 'Accessibility', 'icon': 'accessibility',
+        'group': 'System', 'default_size': [500, 500],
+        'apis': ['/api/shell/accessibility'],
+    },
+    'screenshot': {
+        'title': 'Screenshot & Recording', 'icon': 'screenshot_monitor',
+        'group': 'System', 'default_size': [500, 400],
+        'apis': ['/api/shell/screenshot', '/api/shell/recording/start'],
+    },
+    'firewall': {
+        'title': 'Firewall & Firmware', 'icon': 'security',
+        'group': 'System', 'default_size': [600, 500],
+        'apis': ['/api/shell/power/profiles'],  # Uses power API for system status
+    },
+
+    # ─── Desktop Experience ───
+    'default_apps': {
+        'title': 'Default Apps', 'icon': 'open_in_browser',
+        'group': 'System', 'default_size': [600, 500],
+        'apis': ['/api/shell/default-apps'],
+    },
+    'font_manager': {
+        'title': 'Fonts', 'icon': 'font_download',
+        'group': 'System', 'default_size': [700, 500],
+        'apis': ['/api/shell/fonts'],
+    },
+    'sound_manager': {
+        'title': 'Sounds', 'icon': 'music_note',
+        'group': 'System', 'default_size': [600, 500],
+        'apis': ['/api/shell/sounds/themes', '/api/shell/sounds/events'],
+    },
+    'clipboard_manager': {
+        'title': 'Clipboard', 'icon': 'content_paste',
+        'group': 'System', 'default_size': [500, 600],
+        'apis': ['/api/shell/clipboard/history'],
+    },
+    'datetime': {
+        'title': 'Date & Time', 'icon': 'schedule',
+        'group': 'System', 'default_size': [500, 400],
+        'apis': ['/api/shell/datetime'],
+    },
+    'wallpaper_manager': {
+        'title': 'Wallpaper', 'icon': 'wallpaper',
+        'group': 'System', 'default_size': [800, 600],
+        'apis': ['/api/shell/wallpaper', '/api/shell/wallpaper/collection'],
+    },
+    'input_methods': {
+        'title': 'Keyboard & Input', 'icon': 'keyboard',
+        'group': 'System', 'default_size': [600, 500],
+        'apis': ['/api/shell/input-methods'],
+    },
+    'nightlight': {
+        'title': 'Night Light', 'icon': 'nightlight',
+        'group': 'System', 'default_size': [500, 400],
+        'apis': ['/api/shell/nightlight'],
+    },
+    'workspaces': {
+        'title': 'Workspaces', 'icon': 'view_carousel',
+        'group': 'System', 'default_size': [700, 500],
+        'apis': ['/api/shell/workspaces'],
+    },
+
+    # ─── System Management ───
+    'task_manager': {
+        'title': 'Task Manager', 'icon': 'monitoring',
+        'group': 'System', 'default_size': [800, 600],
+        'apis': ['/api/shell/tasks/processes', '/api/shell/tasks/resources'],
+    },
+    'storage_manager': {
+        'title': 'Storage', 'icon': 'storage',
+        'group': 'System', 'default_size': [700, 500],
+        'apis': ['/api/shell/storage', '/api/shell/storage/cleanup'],
+    },
+    'startup_apps': {
+        'title': 'Startup Apps', 'icon': 'play_circle',
+        'group': 'System', 'default_size': [600, 500],
+        'apis': ['/api/shell/startup'],
+    },
+    'bluetooth_manager': {
+        'title': 'Bluetooth Manager', 'icon': 'bluetooth_connected',
+        'group': 'System', 'default_size': [600, 500],
+        'apis': ['/api/shell/bluetooth/status'],
+    },
+    'print_manager': {
+        'title': 'Printers', 'icon': 'print',
+        'group': 'System', 'default_size': [700, 500],
+        'apis': ['/api/shell/printers'],
+    },
+    'media_library': {
+        'title': 'Media Library', 'icon': 'perm_media',
+        'group': 'System', 'default_size': [800, 600],
+        'apis': ['/api/shell/media/status', '/api/shell/media/photos'],
+    },
+    # ─── OS Feature Panels ───
+    'calculator': {
+        'title': 'Calculator', 'icon': 'calculate',
+        'group': 'System', 'default_size': [350, 500],
+        'apis': [],
+    },
+    'image_viewer': {
+        'title': 'Image Viewer', 'icon': 'photo',
+        'group': 'System', 'default_size': [800, 600],
+        'apis': ['/api/shell/files/browse'],
+    },
+    'notes_app': {
+        'title': 'Notes', 'icon': 'sticky_note_2',
+        'group': 'System', 'default_size': [600, 500],
+        'apis': ['/api/shell/notes'],
+    },
+    'app_store': {
+        'title': 'App Store', 'icon': 'storefront',
+        'group': 'System', 'default_size': [900, 700],
+        'apis': ['/api/apps/search', '/api/apps/install'],
+    },
+    'app_permissions': {
+        'title': 'App Permissions', 'icon': 'admin_panel_settings',
+        'group': 'System', 'default_size': [700, 500],
+        'apis': ['/api/apps/installed'],
+    },
+    'battery_monitor': {
+        'title': 'Battery', 'icon': 'battery_full',
+        'group': 'System', 'default_size': [400, 300],
+        'apis': ['/api/shell/battery'],
+    },
+    'wifi_manager': {
+        'title': 'WiFi', 'icon': 'wifi',
+        'group': 'System', 'default_size': [500, 400],
+        'apis': ['/api/shell/wifi/scan', '/api/shell/wifi/status'],
+    },
+    'vpn_manager': {
+        'title': 'VPN', 'icon': 'vpn_key',
+        'group': 'System', 'default_size': [500, 400],
+        'apis': ['/api/shell/vpn/list'],
+    },
+    'trash_bin': {
+        'title': 'Trash', 'icon': 'delete',
+        'group': 'System', 'default_size': [600, 500],
+        'apis': ['/api/shell/trash'],
+    },
+    'webcam_viewer': {
+        'title': 'Camera', 'icon': 'videocam',
+        'group': 'System', 'default_size': [640, 520],
+        'apis': ['/api/shell/webcam/list'],
+    },
+    'scanner': {
+        'title': 'Scanner', 'icon': 'scanner',
+        'group': 'System', 'default_size': [600, 500],
+        'apis': ['/api/shell/scanner/list'],
+    },
+    'weather_widget': {
+        'title': 'Weather', 'icon': 'cloud',
+        'group': 'System', 'default_size': [400, 350],
+        'apis': [],
+    },
 }
 
 
