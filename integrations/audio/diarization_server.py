@@ -21,6 +21,19 @@ import sys
 
 import numpy as np
 
+try:
+    from integrations.service_tools.vram_manager import clear_cuda_cache
+except ImportError:
+    def clear_cuda_cache():
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+        except Exception:
+            pass
+
 logger = logging.getLogger('hevolve_diarization')
 
 # Audio parameters (16kHz, 16-bit, mono)
@@ -117,10 +130,7 @@ async def diarization(websocket, diarize_model, output_dir, device):
                         f'{e.__traceback__.tb_lineno}: {e}')
                 finally:
                     _cleanup_stream(user_id)
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-                        torch.mps.empty_cache()
+                    clear_cuda_cache()
 
     except Exception as e:
         logging.debug(f"Connection ended: {e}")

@@ -120,6 +120,28 @@ def bootstrap_platform(extensions_dir: Optional[str] = None) -> ServiceRegistry:
 
     _register_orchestrator_services(registry)
 
+    # ── PeerLink — P2P communication layer ────────────────────
+
+    try:
+        from core.peer_link.link_manager import get_link_manager
+        from core.peer_link.telemetry import get_central_connection
+        from core.peer_link.message_bus import get_message_bus
+
+        registry.register('peer_link', get_link_manager, singleton=True)
+        registry.register('message_bus', get_message_bus, singleton=True)
+        registry.register('central_connection', get_central_connection, singleton=True)
+
+        # Start PeerLink services
+        link_mgr = registry.get('peer_link')
+        link_mgr.start()
+
+        central = registry.get('central_connection')
+        central.start()
+
+        logger.debug("PeerLink services registered")
+    except Exception as e:
+        logger.debug("PeerLink not available: %s", e)
+
     # ── Connect EventBus to Crossbar WAMP (if configured) ────
 
     cburl = os.environ.get('CBURL')

@@ -58,8 +58,14 @@ def get_or_create_keypair() -> Tuple[Ed25519PrivateKey, Ed25519PublicKey]:
 
     if priv_path.exists() and pub_path.exists():
         try:
-            priv_pem = priv_path.read_bytes()
-            _private_key = serialization.load_pem_private_key(priv_pem, password=None)
+            raw = priv_path.read_bytes()
+            # Decrypt at rest — auto-detects encrypted vs plaintext PEM
+            try:
+                from security.crypto import decrypt_data
+                raw = decrypt_data(raw)
+            except ImportError:
+                pass
+            _private_key = serialization.load_pem_private_key(raw, password=None)
             _public_key = _private_key.public_key()
             logger.info(f"Node keypair loaded from {key_dir}")
             return _private_key, _public_key
@@ -70,7 +76,7 @@ def get_or_create_keypair() -> Tuple[Ed25519PrivateKey, Ed25519PublicKey]:
     _private_key = Ed25519PrivateKey.generate()
     _public_key = _private_key.public_key()
 
-    # Persist to disk
+    # Persist to disk — encrypted at rest when HEVOLVE_DATA_KEY is set
     priv_pem = _private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.PKCS8,
@@ -80,8 +86,12 @@ def get_or_create_keypair() -> Tuple[Ed25519PrivateKey, Ed25519PublicKey]:
         encoding=serialization.Encoding.PEM,
         format=serialization.PublicFormat.SubjectPublicKeyInfo,
     )
-    priv_path.write_bytes(priv_pem)
-    pub_path.write_bytes(pub_pem)
+    try:
+        from security.crypto import encrypt_data
+        priv_path.write_bytes(encrypt_data(priv_pem))
+    except ImportError:
+        priv_path.write_bytes(priv_pem)
+    pub_path.write_bytes(pub_pem)  # Public key stays plaintext
     logger.info(f"Node keypair generated and saved to {key_dir}")
     return _private_key, _public_key
 
@@ -239,7 +249,7 @@ def _collect_py_files(directory: Path, root: Path):
             elif entry.is_file() and entry.suffix == '.py':
                 rel = str(entry.relative_to(root)).replace('\\', '/')
                 yield (rel, entry)
-    except PermissionError:
+    except (PermissionError, OSError):
         pass
 
 

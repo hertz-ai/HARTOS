@@ -10,6 +10,8 @@ import logging
 import threading
 import requests
 from datetime import datetime
+
+from core.http_pool import pooled_get, pooled_post
 from typing import Dict, Optional
 
 logger = logging.getLogger('hevolve_social')
@@ -116,7 +118,7 @@ class SyncEngine:
         except Exception:
             pass
         try:
-            resp = requests.post(
+            resp = pooled_post(
                 f"{target_url}/api/social/hierarchy/sync",
                 json=send_payload,
                 timeout=30,
@@ -224,7 +226,7 @@ class SyncEngine:
     def is_connected_to(target_url: str) -> bool:
         """Check if we can reach the target URL."""
         try:
-            resp = requests.get(
+            resp = pooled_get(
                 f"{target_url}/api/social/peers/health",
                 timeout=5,
             )
@@ -250,24 +252,28 @@ class SyncEngine:
         if self._thread:
             self._thread.join(timeout=10)
 
+    def _wd_heartbeat(self):
+        """Send heartbeat to watchdog between potentially blocking operations."""
+        try:
+            from security.node_watchdog import get_watchdog
+            wd = get_watchdog()
+            if wd:
+                wd.heartbeat('sync_engine')
+        except Exception:
+            pass
+
     def _sync_loop(self):
         """Background loop: periodically drain sync queue."""
         while self._running:
             time.sleep(self._interval)
             if not self._running:
                 break
-            # Heartbeat to watchdog
-            try:
-                from security.node_watchdog import get_watchdog
-                wd = get_watchdog()
-                if wd:
-                    wd.heartbeat('sync_engine')
-            except Exception:
-                pass
+            self._wd_heartbeat()
             try:
                 self._do_sync_drain()
             except Exception as e:
                 logger.debug(f"Sync drain error: {e}")
+            self._wd_heartbeat()
 
     def _do_sync_drain(self):
         """Attempt to drain queued items to target."""

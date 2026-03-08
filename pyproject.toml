@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hart-backend"
 dynamic = ["version"]
-description = "HART OS — Hevolve Agentic Runtime"
+description = "HART OS - Hevolve Hive Agentic Runtime: Crowdsourced compute infrastructure for autonomous Hive AI Training. Distributed thought process across crowdsourced agents, distributed coding agents incentivizing compute providers, self-sustaining economy at national scale so no single entity, government, or corporation monopolizes AI. Intelligence belongs to the people. Only the master key (held by human stewards) can halt the being. Every engineering decision is transparent by design."
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
@@ -194,6 +194,9 @@ py-modules = [
     "exception_collector",
     "recipe_experience",
     "embedded_main",
+    "agent_identity",
+    "hart_onboarding",
+    "hart_cli",
 ]
 
 [tool.setuptools.packages.find]

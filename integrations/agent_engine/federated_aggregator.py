@@ -261,9 +261,18 @@ class FederatedAggregator:
         # Sign the delta with HMAC-SHA256 before broadcasting
         _sign_delta(delta)
 
+        # Attach origin attestation so peers can verify we're genuine HART OS
+        try:
+            from security.origin_attestation import get_attestation_for_federation
+            att = get_attestation_for_federation()
+            if att.get('valid'):
+                delta['origin_attestation'] = att['attestation']
+        except Exception:
+            pass
+
         try:
             from integrations.social.models import get_db, PeerNode
-            import requests
+            from core.http_pool import pooled_post
 
             db = get_db()
             try:
@@ -273,7 +282,7 @@ class FederatedAggregator:
                         continue
                     try:
                         url = f"{peer.url.rstrip('/')}/api/social/peers/federation-delta"
-                        requests.post(url, json=delta, timeout=5)
+                        pooled_post(url, json=delta, timeout=5)
                     except Exception:
                         pass
             finally:
@@ -321,6 +330,17 @@ class FederatedAggregator:
         if delta.get('hmac_signature'):
             if not _verify_delta_signature(delta):
                 return False, 'invalid HMAC signature'
+
+        # Origin attestation — reject forks and rebranded builds
+        peer_attestation = delta.get('origin_attestation')
+        if peer_attestation:
+            try:
+                from security.origin_attestation import verify_peer_attestation
+                att_ok, att_msg = verify_peer_attestation(peer_attestation)
+                if not att_ok:
+                    return False, f'origin attestation failed: {att_msg}'
+            except ImportError:
+                pass  # Origin module not available — accept
 
         node_id = delta.get('node_id', '')
         if not node_id:

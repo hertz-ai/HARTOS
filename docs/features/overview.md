@@ -1,6 +1,6 @@
 # Feature Catalog
 
-All major features of HART OS (Hevolve Agentic Runtime). Each entry links to a dedicated detail page.
+All major features of HART OS (Hevolve Hive Agentic Runtime) -crowdsourced compute infrastructure for autonomous Hive AI Training. Each entry links to a dedicated detail page.
 
 | Feature | Description | Details |
 |---------|-------------|---------|

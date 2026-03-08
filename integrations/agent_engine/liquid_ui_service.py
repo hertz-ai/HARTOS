@@ -114,9 +114,9 @@ class ContextEngine:
         return context
 
     def _get_model_context(self) -> dict:
-        import requests
+        from core.http_pool import pooled_get
         try:
-            resp = requests.get(
+            resp = pooled_get(
                 f'http://localhost:{self.model_bus_port}/v1/models', timeout=3)
             if resp.status_code == 200:
                 data = resp.json()
@@ -127,9 +127,9 @@ class ContextEngine:
         return {'available': False, 'models': [], 'count': 0}
 
     def _get_agent_context(self) -> dict:
-        import requests
+        from core.http_pool import pooled_get
         try:
-            resp = requests.get(
+            resp = pooled_get(
                 f'http://localhost:{self.backend_port}/api/social/dashboard/agents',
                 timeout=3)
             if resp.status_code == 200:
@@ -233,10 +233,10 @@ class LiquidUIService:
 
     def _generate_ai_ui(self, context: dict) -> dict:
         """Generate UI via LLM (when model is available)."""
-        import requests
+        from core.http_pool import pooled_post
         prompt = self._build_ui_prompt(context)
         try:
-            resp = requests.post(
+            resp = pooled_post(
                 f'http://localhost:{self.model_bus_port}/v1/chat',
                 json={'prompt': prompt, 'max_tokens': 1024}, timeout=15)
             if resp.status_code == 200:
@@ -369,10 +369,10 @@ class LiquidUIService:
     def handle_voice_input(self, audio_path: str) -> dict:
         if not self.voice_enabled:
             return {'error': 'Voice not enabled'}
-        import requests
+        from core.http_pool import pooled_post
         try:
             with open(audio_path, 'rb') as f:
-                resp = requests.post(
+                resp = pooled_post(
                     f'http://localhost:{self.model_bus_port}/v1/stt',
                     files={'audio': f}, timeout=30)
                 if resp.status_code == 200:
@@ -384,9 +384,9 @@ class LiquidUIService:
         return {'error': 'Voice recognition failed'}
 
     def _process_voice_command(self, text: str) -> dict:
-        import requests
+        from core.http_pool import pooled_post
         try:
-            resp = requests.post(
+            resp = pooled_post(
                 f'http://localhost:{self.model_bus_port}/v1/chat',
                 json={
                     'prompt': f'User said: "{text}". What action should the '
@@ -845,12 +845,13 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 .start-footer .power-btn:hover{{background:var(--hart-surface-hover,rgba(255,255,255,0.08))}}
 .start-footer .power-btn .mi{{font-size:16px}}
 
-/* ── Agent Pill ── */
+/* ── Agent Pill (collapsed floating bubble) ── */
 .agent-pill{{position:fixed;bottom:56px;right:16px;z-index:1500;display:flex;
   align-items:center;gap:8px;padding:8px 14px;cursor:pointer;
   transition:all var(--hart-anim-speed);max-width:360px}}
 .agent-pill:hover{{transform:translateY(-2px);box-shadow:0 8px 24px rgba(0,0,0,0.3)}}
 .agent-pill.expanded{{max-width:400px;padding:12px}}
+.agent-pill.hidden{{display:none}}
 .agent-pill .mi{{font-size:20px;color:var(--hart-accent);flex-shrink:0}}
 .agent-pill input{{flex:1;background:transparent;border:none;color:var(--hart-text);
   font-family:var(--hart-font-family);font-size:13px;outline:none;min-width:0}}
@@ -858,6 +859,52 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 .agent-response{{font-size:12px;color:var(--hart-muted);padding-top:6px;
   border-top:1px solid var(--hart-glass-border);display:none;width:100%}}
 .agent-response.visible{{display:block}}
+
+/* ── Floating Assistant Chat Panel ── */
+.assistant-chat{{position:fixed;bottom:56px;right:16px;z-index:1600;
+  width:380px;height:520px;display:none;flex-direction:column;
+  border-radius:var(--hart-radius-lg,16px);overflow:hidden;
+  resize:both;min-width:320px;min-height:400px;max-width:600px;max-height:80vh}}
+.assistant-chat.open{{display:flex}}
+.assistant-chat .ac-header{{display:flex;align-items:center;gap:8px;
+  padding:10px 14px;cursor:grab;user-select:none;
+  border-bottom:1px solid var(--hart-glass-border);flex-shrink:0}}
+.assistant-chat .ac-header:active{{cursor:grabbing}}
+.assistant-chat .ac-title{{flex:1;font-size:13px;font-weight:500}}
+.assistant-chat .ac-btn{{background:none;border:none;color:var(--hart-muted);
+  cursor:pointer;padding:2px;font-size:18px}}
+.assistant-chat .ac-btn:hover{{color:var(--hart-text)}}
+.assistant-chat .ac-caps{{display:flex;gap:6px;padding:8px 14px;overflow-x:auto;
+  flex-shrink:0;border-bottom:1px solid var(--hart-glass-border)}}
+.assistant-chat .ac-cap{{display:flex;align-items:center;gap:4px;
+  padding:4px 10px;border-radius:12px;font-size:11px;white-space:nowrap;
+  background:var(--hart-glass-bg);border:1px solid var(--hart-glass-border);
+  cursor:pointer;transition:background 120ms}}
+.assistant-chat .ac-cap:hover{{background:var(--hart-surface-hover,rgba(255,255,255,0.1))}}
+.assistant-chat .ac-cap.active{{background:var(--hart-accent);color:#fff;border-color:var(--hart-accent)}}
+.assistant-chat .ac-cap .mi{{font-size:14px}}
+.assistant-chat .ac-messages{{flex:1;overflow-y:auto;padding:12px 14px;
+  display:flex;flex-direction:column;gap:8px}}
+.assistant-chat .ac-msg{{max-width:85%;padding:8px 12px;border-radius:12px;
+  font-size:13px;line-height:1.4;word-break:break-word}}
+.assistant-chat .ac-msg.user{{align-self:flex-end;
+  background:var(--hart-accent);color:#fff;border-bottom-right-radius:4px}}
+.assistant-chat .ac-msg.assistant{{align-self:flex-start;
+  background:var(--hart-glass-bg);border:1px solid var(--hart-glass-border);
+  border-bottom-left-radius:4px}}
+.assistant-chat .ac-msg.typing{{opacity:0.6;font-style:italic}}
+.assistant-chat .ac-input-row{{display:flex;align-items:center;gap:6px;
+  padding:8px 10px;border-top:1px solid var(--hart-glass-border);flex-shrink:0}}
+.assistant-chat .ac-input{{flex:1;background:transparent;border:1px solid var(--hart-glass-border);
+  border-radius:20px;padding:8px 14px;color:var(--hart-text);
+  font-family:var(--hart-font-family);font-size:13px;outline:none;resize:none}}
+.assistant-chat .ac-input:focus{{border-color:var(--hart-accent)}}
+.assistant-chat .ac-input::placeholder{{color:var(--hart-muted)}}
+.assistant-chat .ac-send{{background:var(--hart-accent);border:none;
+  width:32px;height:32px;border-radius:50%;display:flex;align-items:center;
+  justify-content:center;cursor:pointer;flex-shrink:0;transition:opacity 120ms}}
+.assistant-chat .ac-send:hover{{opacity:0.85}}
+.assistant-chat .ac-send .mi{{font-size:16px;color:#fff}}
 
 /* ── Context Menu ── */
 .ctx-menu{{position:fixed;z-index:3000;min-width:180px;padding:4px;
@@ -946,12 +993,30 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <!-- Panel Container -->
 <div class="panel-container" id="panels"></div>
 
-<!-- Agent Pill -->
-<div class="agent-pill glass" id="agent-pill" onclick="focusAgent()">
-  <span class="mi material-icons-round mic-btn" onclick="event.stopPropagation();toggleVoice()" title="Voice input">mic</span>
-  <input id="agent-input" placeholder="Ask HART..." onkeydown="if(event.key==='Enter')askAgent()">
-  <span class="mi material-icons-round" onclick="event.stopPropagation();askAgent()" style="font-size:18px;cursor:pointer;color:var(--hart-accent)">send</span>
+<!-- Agent Pill (click to expand floating chat) -->
+<div class="agent-pill glass" id="agent-pill" onclick="toggleAssistantChat()">
+  <span class="mi material-icons-round" style="color:var(--hart-accent)">chat_bubble</span>
+  <input id="agent-input" placeholder="Ask HART..." onclick="event.stopPropagation();toggleAssistantChat()" onkeydown="if(event.key==='Enter'){{event.stopPropagation();toggleAssistantChat();setTimeout(function(){{var i=document.getElementById('ac-input');if(i){{i.value=document.getElementById('agent-input').value;document.getElementById('agent-input').value=''}}}},100)}}">
   <div class="agent-response" id="agent-resp"></div>
+</div>
+
+<!-- Floating Assistant Chat Panel -->
+<div class="assistant-chat glass" id="assistant-chat">
+  <div class="ac-header" id="ac-drag-handle">
+    <span class="mi material-icons-round" style="font-size:20px;color:var(--hart-accent)">chat_bubble</span>
+    <span class="ac-title">HART Assistant</span>
+    <button class="ac-btn mi material-icons-round" onclick="minimizeAssistant()" title="Minimize">remove</button>
+    <button class="ac-btn mi material-icons-round" onclick="toggleAssistantChat()" title="Close">close</button>
+  </div>
+  <div class="ac-caps" id="ac-caps"></div>
+  <div class="ac-messages" id="ac-messages">
+    <div class="ac-msg assistant">Hi! I can help with anything — chat, code, agents, vision, voice, remote desktop, and 3,200+ OpenClaw skills. What would you like to do?</div>
+  </div>
+  <div class="ac-input-row">
+    <span class="mi material-icons-round ac-btn" onclick="acVoiceInput()" title="Voice input" style="font-size:20px">mic</span>
+    <input class="ac-input" id="ac-input" placeholder="Ask anything..." onkeydown="if(event.key==='Enter'&&!event.shiftKey){{event.preventDefault();acSend()}}">
+    <button class="ac-send" onclick="acSend()"><span class="mi material-icons-round">send</span></button>
+  </div>
 </div>
 
 <!-- Start Menu -->
@@ -1633,6 +1698,47 @@ function loadSystemPanel(id, body) {{
   else if(id==='power') loadPowerPanel(container);
   else if(id==='display') loadDisplayPanel(container);
   else if(id==='remote_desktop') loadRemoteDesktopPanel(container, apis);
+  else if(id==='hart_identity') loadHartIdentityPanel(container, apis);
+  else if(id==='self_build') loadSelfBuildPanel(container, apis);
+  else if(id==='task_manager') loadTaskManagerPanel(container);
+  else if(id==='storage_manager') loadStoragePanel(container);
+  else if(id==='startup_apps') loadStartupAppsPanel(container);
+  else if(id==='bluetooth_manager') loadBluetoothManagerPanel(container);
+  else if(id==='print_manager') loadPrintManagerPanel(container);
+  else if(id==='media_library') loadMediaLibraryPanel(container);
+  else if(id==='file_manager') loadFileManagerPanel(container);
+  else if(id==='terminal') loadTerminalPanel(container);
+  else if(id==='user_accounts') loadUserAccountsPanel(container);
+  else if(id==='notification_center') loadNotificationCenterPanel(container);
+  else if(id==='updates') loadUpdatesPanel(container);
+  else if(id==='backup_restore') loadBackupRestorePanel(container);
+  else if(id==='devices') loadDevicesPanel(container);
+  else if(id==='i18n') loadI18nPanel(container);
+  else if(id==='accessibility') loadAccessibilityPanel(container);
+  else if(id==='screenshot') loadScreenshotPanel(container);
+  else if(id==='firewall') loadFirewallPanel(container);
+  else if(id==='default_apps') loadDefaultAppsPanel(container);
+  else if(id==='font_manager') loadFontManagerPanel(container);
+  else if(id==='sound_manager') loadSoundManagerPanel(container);
+  else if(id==='clipboard_manager') loadClipboardPanel(container);
+  else if(id==='datetime') loadDateTimePanel(container);
+  else if(id==='wallpaper_manager') loadWallpaperPanel(container);
+  else if(id==='input_methods') loadInputMethodsPanel(container);
+  else if(id==='nightlight') loadNightLightPanel(container);
+  else if(id==='workspaces') loadWorkspacesPanel(container);
+  else if(id==='calculator') loadCalculatorPanel(container);
+  else if(id==='image_viewer') loadImageViewerPanel(container);
+  else if(id==='notes_app') loadNotesAppPanel(container);
+  else if(id==='app_store') loadAppStorePanel(container);
+  else if(id==='app_permissions') loadAppPermissionsPanel(container);
+  else if(id==='battery_monitor') loadBatteryMonitorPanel(container);
+  else if(id==='wifi_manager') loadWiFiManagerPanel(container);
+  else if(id==='vpn_manager') loadVPNManagerPanel(container);
+  else if(id==='trash_bin') loadTrashBinPanel(container);
+  else if(id==='webcam_viewer') loadWebcamViewerPanel(container);
+  else if(id==='scanner') loadScannerPanel(container);
+  else if(id==='weather_widget') loadWeatherPanel(container);
+  else if(id==='keyboard_shortcuts') loadKeyboardShortcutsPanel(container);
   else container.innerHTML = '<div class="ds-body-md ds-text-muted">Panel: '+id+'</div>';
 }}
 
@@ -1762,6 +1868,878 @@ function loadNetworkPanel(el, apis) {{
       html += '</div>';
       el.innerHTML = html;
     }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted ds-flex ds-flex-center" style="height:100px"><span class="mi material-icons-round" style="margin-right:8px">error_outline</span>Network info unavailable</div>'; }});
+}}
+
+function loadHartIdentityPanel(el, apis) {{
+  const profileUrl = apis[0] || '/api/onboarding/profile';
+  const statusUrl = apis[1] || '/api/onboarding/status';
+  fetch(SHELL+statusUrl,{{signal:AbortSignal.timeout(3000)}}).then(r=>r.json()).then(st=>{{
+    if(!st.onboarded) {{
+      el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">My HART</div>'+
+        '<div class="ds-flex ds-flex-center ds-flex-col ds-gap-3" style="padding:40px 0">'+
+        '<span class="mi material-icons-round ds-text-muted" style="font-size:48px">person_outline</span>'+
+        '<div class="ds-body-md ds-text-muted">You haven\\'t lit your HART yet.</div>'+
+        dsBtn('Light Your HART',{{variant:'primary', onclick:"fetch(SHELL+'/api/onboarding/start',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{user_id:'1'}})}}).then(()=>showToast('Onboarding','Opening onboarding...','info')).catch(()=>{{}})"}})+'</div></div>';
+      return;
+    }}
+    fetch(SHELL+profileUrl,{{signal:AbortSignal.timeout(3000)}}).then(r=>r.json()).then(p=>{{
+      el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">My HART</div>'+
+        '<div class="ds-flex ds-flex-center ds-flex-col ds-gap-3" style="padding:24px 0">'+
+        '<span class="mi material-icons-round ds-text-accent" style="font-size:56px">badge</span>'+
+        '<div class="ds-display-sm ds-text-accent">'+(p.hart_name||p.name||'Unknown')+'</div>'+
+        (p.hart_tag?'<div class="ds-title-sm ds-text-muted">'+p.hart_tag+'</div>':'')+
+        '</div><div class="ds-stagger">'+
+        (p.element?dsStatusRow('flare','Element',p.element,'var(--hart-accent)'):'')+
+        (p.spirit?dsStatusRow('pets','Spirit',p.spirit,'var(--hart-active)'):'')+
+        (p.passion?dsStatusRow('favorite','Passion',p.passion,'var(--hart-accent)'):'')+
+        (p.escape?dsStatusRow('landscape','Escape',p.escape,'var(--hart-active)'):'')+
+        (p.locale?dsStatusRow('language','Language',p.locale,'var(--hart-muted)'):'')+
+        '</div></div>';
+    }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted ds-flex ds-flex-center" style="height:100px">Could not load identity</div>'; }});
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted ds-flex ds-flex-center" style="height:100px">Identity service unavailable</div>'; }});
+}}
+
+function selfBuildInstall() {{
+  dsPrompt('Install Package','Enter NixOS package name (e.g. <code>htop</code>, <code>nodejs_20</code>)',{{
+    placeholder:'Package name', okLabel:'Stage Install'
+  }}).then(function(pkg){{
+    if(!pkg) return;
+    showToast('Self-Build','Staging '+pkg+'...','info');
+    fetch(SHELL+'/api/system/self-build/install',{{
+      method:'POST', headers:{{'Content-Type':'application/json'}},
+      body:JSON.stringify({{package:pkg}}), signal:AbortSignal.timeout(10000)
+    }}).then(r=>r.json()).then(d=>{{
+      if(d.success) {{ showToast('Self-Build','Staged: '+pkg,'success'); loadSelfBuildPanel(document.getElementById('sys-self_build'),
+        (SYSTEM_PANELS['self_build']||{{}}).apis||[]); }}
+      else dsAlert('Stage Failed', d.error||'Unknown error', 'error');
+    }}).catch(e=>dsAlert('Error', e.message, 'error'));
+  }});
+}}
+function selfBuildRemove(pkg) {{
+  dsConfirm('Remove Package','Remove <strong>'+pkg+'</strong> from runtime config?',{{okLabel:'Remove',danger:true}}).then(function(ok){{
+    if(!ok) return;
+    fetch(SHELL+'/api/system/self-build/remove',{{
+      method:'POST', headers:{{'Content-Type':'application/json'}},
+      body:JSON.stringify({{package:pkg}}), signal:AbortSignal.timeout(10000)
+    }}).then(r=>r.json()).then(d=>{{
+      if(d.success) {{ showToast('Self-Build','Removed: '+pkg,'info'); loadSelfBuildPanel(document.getElementById('sys-self_build'),
+        (SYSTEM_PANELS['self_build']||{{}}).apis||[]); }}
+      else dsAlert('Remove Failed', d.error||'Unknown error', 'error');
+    }}).catch(e=>dsAlert('Error', e.message, 'error'));
+  }});
+}}
+function selfBuildTrigger(mode) {{
+  dsConfirm('Trigger Build','Run <strong>'+mode+'</strong> build? This may take a few minutes.',{{okLabel:'Build'}}).then(function(ok){{
+    if(!ok) return;
+    showToast('Self-Build','Building ('+mode+')...','info');
+    fetch(SHELL+'/api/system/self-build/trigger',{{
+      method:'POST', headers:{{'Content-Type':'application/json'}},
+      body:JSON.stringify({{mode:mode}}), signal:AbortSignal.timeout(600000)
+    }}).then(r=>r.json()).then(d=>{{
+      if(d.success) showToast('Self-Build','Build complete!','success');
+      else dsAlert('Build Failed', d.error||d.stderr||'Unknown error', 'error');
+      loadSelfBuildPanel(document.getElementById('sys-self_build'),
+        (SYSTEM_PANELS['self_build']||{{}}).apis||[]);
+    }}).catch(e=>dsAlert('Build Error', e.message, 'error'));
+  }});
+}}
+
+function loadSelfBuildPanel(el, apis) {{
+  const statusUrl = apis[0] || '/api/system/self-build/status';
+  const pkgsUrl = apis[1] || '/api/system/self-build/packages';
+  Promise.all([
+    fetch(SHELL+statusUrl,{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).catch(()=>({{}})),
+    fetch(SHELL+pkgsUrl,{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).catch(()=>({{}}))
+  ]).then(([status,pkgData])=>{{
+    const gen = status.generation||'?';
+    const version = status.nixos_version||'unknown';
+    const builds = status.recent_builds||[];
+    const pkgs = pkgData.packages||[];
+    let html = '<div class="ds-panel-grid ds-fade-in">';
+    html += '<div class="ds-panel-header"><span class="ds-panel-title">Self-Build</span>'+
+      '<span class="ds-chip"><span class="ds-chip-dot" style="background:var(--hart-active)"></span>Gen '+gen+'</span></div>';
+    html += '<div class="ds-flex ds-gap-3 ds-flex-wrap">';
+    html += dsCard('<div class="ds-metric"><div class="ds-metric-value ds-text-accent">'+version+'</div><div class="ds-metric-label">NixOS Version</div></div>',{{elevated:true}});
+    html += dsCard('<div class="ds-metric"><div class="ds-metric-value ds-text-active">'+pkgs.length+'</div><div class="ds-metric-label">Runtime Packages</div></div>',{{elevated:true}});
+    html += '</div>';
+    html += '<div class="ds-flex ds-gap-2">'+
+      dsBtn('Install Package',{{variant:'primary', cls:'ds-btn-sm', onclick:'selfBuildInstall()'}})+
+      dsBtn('Dry Run',{{variant:'secondary', cls:'ds-btn-sm', onclick:"selfBuildTrigger('dry-run')"}})+
+      dsBtn('Apply (Switch)',{{variant:'secondary', cls:'ds-btn-sm', onclick:"selfBuildTrigger('switch')"}})+
+      '</div>';
+    if(pkgs.length>0) {{
+      html += '<div class="ds-section-label">Runtime Packages</div><div class="ds-stagger">';
+      html += pkgs.map(p=>
+        '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon ds-text-accent">inventory_2</span>'+
+        '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+p+'</div></div>'+
+        '<span class="ds-list-item-trailing" style="cursor:pointer" onclick="selfBuildRemove(\\''+p.replace(/'/g,"\\\\'")+'\\')">' +
+        '<span class="mi material-icons-round ds-text-muted" style="font-size:18px">delete_outline</span></span></div>'
+      ).join('');
+      html += '</div>';
+    }}
+    if(builds.length>0) {{
+      html += '<div class="ds-section-label">Recent Builds</div><div class="ds-stagger">';
+      html += builds.slice(0,5).map(b=>
+        dsStatusRow(b.success?'check_circle':'error', b.mode||'build',
+          (b.timestamp||'').substring(0,19), b.success?'var(--hart-active)':'var(--hart-caution)')
+      ).join('');
+      html += '</div>';
+    }}
+    html += '</div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted ds-flex ds-flex-center" style="height:100px"><span class="mi material-icons-round" style="margin-right:8px">error_outline</span>Self-Build unavailable</div>'; }});
+}}
+
+// ═══ Keyboard Shortcuts ═══
+function loadKeyboardShortcutsPanel(el) {{
+  fetch(SHELL+'/api/shell/shortcuts',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+    const profile = data.profile||'windows';
+    const profiles = data.available_profiles||['windows','mac'];
+    const sc = data.shortcuts||{{}};
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-header"><span class="ds-panel-title">Keyboard Shortcuts</span>'+
+      '<div class="ds-flex ds-gap-2">';
+    profiles.forEach(p=>{{
+      html += dsBtn(p.charAt(0).toUpperCase()+p.slice(1),{{
+        variant:p===profile?'primary':'secondary', cls:'ds-btn-sm',
+        onclick:"fetch(SHELL+'/api/shell/shortcuts/profile',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{profile:'"+p+"'}})}}).then(()=>{{showToast('Shortcuts','Switched to "+p+"','success');loadKeyboardShortcutsPanel(document.getElementById('sys-keyboard_shortcuts'))}})"
+      }});
+    }});
+    html += '</div></div>';
+    const groups = {{
+      'Window Management': ['close_window','minimize','maximize','snap_left','snap_right','switch_apps','switch_windows'],
+      'Navigation': ['overview','app_grid','search','workspace_left','workspace_right','move_workspace_left','move_workspace_right'],
+      'System': ['lock_screen','file_manager','terminal','browser','calculator','task_manager','screenshot','screenshot_window','screenshot_area'],
+      'Editing': ['copy','paste','cut','undo','redo','select_all','save','find'],
+    }};
+    Object.keys(groups).forEach(group=>{{
+      html += '<div class="ds-section-label">'+group+'</div><div class="ds-stagger">';
+      groups[group].forEach(key=>{{
+        if(!sc[key]) return;
+        const label = key.replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
+        html += '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon ds-text-muted">keyboard</span>'+
+          '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+label+'</div></div>'+
+          '<span class="ds-list-item-trailing"><code style="background:#1a1a1a;padding:2px 8px;border-radius:4px;font-size:12px;color:var(--hart-accent)">'+sc[key]+'</code></span></div>';
+      }});
+      html += '</div>';
+    }});
+    html += '</div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Keyboard shortcuts unavailable</div>'; }});
+}}
+
+// ═══ Task Manager ═══
+function loadTaskManagerPanel(el) {{
+  Promise.all([
+    fetch(SHELL+'/api/shell/tasks/processes',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).catch(()=>({{}})),
+    fetch(SHELL+'/api/shell/tasks/resources',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).catch(()=>({{}}))
+  ]).then(([procData,res])=>{{
+    const procs = procData.processes||[];
+    const cpu = res.cpu_percent||0, mem = res.memory_percent||0;
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Task Manager</div>';
+    html += dsMetricBar('CPU', cpu, '%')+dsMetricBar('Memory', mem, '%');
+    html += '<div class="ds-section-label">Processes ('+procs.length+')</div><div class="ds-stagger">';
+    html += procs.slice(0,20).map(p=>
+      '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon ds-text-accent">memory</span>'+
+      '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+p.name+'</div>'+
+      '<div class="ds-list-item-secondary">PID '+p.pid+' &middot; CPU '+((p.cpu_percent||0).toFixed(1))+'% &middot; Mem '+((p.memory_percent||0).toFixed(1))+'%</div></div>'+
+      '<span class="ds-list-item-trailing" style="cursor:pointer" onclick="taskKill('+p.pid+')">'+
+      '<span class="mi material-icons-round ds-text-muted" style="font-size:18px">close</span></span></div>'
+    ).join('');
+    html += '</div></div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Task info unavailable</div>'; }});
+}}
+function taskKill(pid) {{
+  dsConfirm('End Process','Kill process PID '+pid+'?',{{okLabel:'Kill',danger:true}}).then(function(ok){{
+    if(!ok) return;
+    fetch(SHELL+'/api/shell/tasks/kill',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{pid:pid}})}}
+    ).then(r=>r.json()).then(d=>{{
+      if(d.success) {{ showToast('Task Manager','Process killed','info'); loadTaskManagerPanel(document.getElementById('sys-task_manager')); }}
+      else dsAlert('Error', d.error||'Failed','error');
+    }}).catch(e=>dsAlert('Error',e.message,'error'));
+  }});
+}}
+
+// ═══ Storage ═══
+function loadStoragePanel(el) {{
+  Promise.all([
+    fetch(SHELL+'/api/shell/storage',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).catch(()=>({{}})),
+    fetch(SHELL+'/api/shell/storage/cleanup',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).catch(()=>({{}}))
+  ]).then(([st,cl])=>{{
+    const disks = st.disks||[];
+    const cleanable = cl.total_cleanable_mb||0;
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Storage</div>';
+    disks.forEach(d=>{{
+      html += dsMetricBar(d.mountpoint||d.device, d.percent||0, '%', (d.used_gb||0).toFixed(1)+' / '+(d.total_gb||0).toFixed(1)+' GB');
+    }});
+    if(cleanable>0) html += '<div class="ds-flex ds-gap-2" style="margin-top:8px">'+
+      '<div class="ds-body-md ds-text-muted">'+(cleanable/1024).toFixed(1)+' GB cleanable</div>'+
+      dsBtn('Clean Up',{{variant:'secondary',cls:'ds-btn-sm',onclick:"fetch(SHELL+'/api/shell/storage/clean',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:'{{}}'}}).then(()=>showToast('Storage','Cleaned up','success'))"}})+'</div>';
+    html += '</div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Storage info unavailable</div>'; }});
+}}
+
+// ═══ Startup Apps ═══
+function loadStartupAppsPanel(el) {{
+  fetch(SHELL+'/api/shell/startup',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+    const apps = data.apps||[];
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Startup Apps</div><div class="ds-stagger">';
+    if(apps.length===0) html += '<div class="ds-body-md ds-text-muted">No startup apps configured</div>';
+    else apps.forEach(a=>{{
+      html += '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon '+(a.enabled?'ds-text-active':'ds-text-muted')+'">play_circle</span>'+
+        '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+a.name+'</div>'+
+        '<div class="ds-list-item-secondary">'+(a.comment||a.exec||'')+'</div></div>'+
+        '<label class="ds-switch"><input type="checkbox" '+(a.enabled?'checked':'')+' onchange="toggleStartup(\\''+a.id+'\\',this.checked)"><span class="ds-switch-slider"></span></label></div>';
+    }});
+    html += '</div></div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Startup apps unavailable</div>'; }});
+}}
+function toggleStartup(id,en) {{
+  fetch(SHELL+'/api/shell/startup/toggle',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{id:id,enabled:en}})}}).catch(()=>{{}});
+}}
+
+// ═══ Bluetooth Manager ═══
+function loadBluetoothManagerPanel(el) {{
+  fetch(SHELL+'/api/shell/bluetooth/status',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+    const devs = data.devices||[];
+    const powered = data.powered!==false;
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-header"><span class="ds-panel-title">Bluetooth</span>'+
+      '<span class="ds-chip"><span class="ds-chip-dot" style="background:var('+(powered?'--hart-active':'--hart-muted')+')"></span>'+(powered?'On':'Off')+'</span></div>';
+    html += dsBtn('Scan',{{variant:'secondary',cls:'ds-btn-sm',onclick:"fetch(SHELL+'/api/shell/bluetooth/scan',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:'{{}}'}}).then(()=>{{showToast('Bluetooth','Scanning...','info');setTimeout(()=>loadBluetoothManagerPanel(document.getElementById('sys-bluetooth_manager')),5000);}})"}});
+    html += '<div class="ds-stagger">';
+    devs.forEach(d=>{{
+      html += dsStatusRow(d.connected?'bluetooth_connected':'bluetooth', d.name||d.address, d.connected?'Connected':'Paired',
+        d.connected?'var(--hart-active)':'var(--hart-muted)',{{sublabel:d.address||''}});
+    }});
+    if(devs.length===0) html += '<div class="ds-body-md ds-text-muted">No paired devices</div>';
+    html += '</div></div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Bluetooth unavailable</div>'; }});
+}}
+
+// ═══ Print Manager ═══
+function loadPrintManagerPanel(el) {{
+  fetch(SHELL+'/api/shell/printers',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+    const printers = data.printers||[];
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Printers</div><div class="ds-stagger">';
+    if(printers.length===0) html += '<div class="ds-body-md ds-text-muted">No printers found</div>';
+    else printers.forEach(p=>{{
+      html += dsStatusRow('print', p.name, p.is_default?'Default':p.status||'Ready',
+        p.is_default?'var(--hart-accent)':'var(--hart-muted)',{{sublabel:p.location||p.device||''}});
+    }});
+    html += '</div></div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Printers unavailable</div>'; }});
+}}
+
+// ═══ Media Library ═══
+function loadMediaLibraryPanel(el) {{
+  fetch(SHELL+'/api/shell/media/status',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Media Library</div>';
+    html += '<div class="ds-flex ds-gap-3 ds-flex-wrap">';
+    html += dsCard('<div class="ds-metric"><div class="ds-metric-value ds-text-accent">'+(data.photo_count||0)+'</div><div class="ds-metric-label">Photos</div></div>',{{elevated:true}});
+    html += dsCard('<div class="ds-metric"><div class="ds-metric-value ds-text-active">'+(data.video_count||0)+'</div><div class="ds-metric-label">Videos</div></div>',{{elevated:true}});
+    html += dsCard('<div class="ds-metric"><div class="ds-metric-value ds-text-muted">'+(data.audio_count||0)+'</div><div class="ds-metric-label">Audio</div></div>',{{elevated:true}});
+    html += '</div></div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Media library unavailable</div>'; }});
+}}
+
+// ═══ File Manager ═══
+function loadFileManagerPanel(el) {{
+  fetch(SHELL+'/api/shell/files/browse?path=~',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+    const items = data.items||[];
+    const cwd = data.path||'~';
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-header"><span class="ds-panel-title">Files</span>'+
+      '<span class="ds-label-sm ds-text-muted">'+cwd+'</span></div><div class="ds-stagger">';
+    items.slice(0,30).forEach(f=>{{
+      const icon = f.is_dir?'folder':'description';
+      const size = f.is_dir?'':' &middot; '+(f.size_human||'');
+      html += '<div class="ds-list-item'+(f.is_dir?' ds-list-item-interactive':'')+'"'+
+        (f.is_dir?' onclick="browseDir(\\''+f.path.replace(/'/g,"\\\\'")+'\\');"':'')+'>'+
+        '<span class="mi material-icons-round ds-list-item-icon '+(f.is_dir?'ds-text-accent':'ds-text-muted')+'">'+icon+'</span>'+
+        '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+f.name+'</div>'+
+        '<div class="ds-list-item-secondary">'+(f.modified||'')+size+'</div></div></div>';
+    }});
+    html += '</div></div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">File browser unavailable</div>'; }});
+}}
+function browseDir(path) {{
+  const el = document.getElementById('sys-file_manager');
+  if(!el) return;
+  el.innerHTML = dsSkeleton('panel',3);
+  fetch(SHELL+'/api/shell/files/browse?path='+encodeURIComponent(path),{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+    const items = data.items||[];
+    const cwd = data.path||path;
+    const parent = data.parent||'';
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-header"><span class="ds-panel-title">Files</span>'+
+      '<span class="ds-label-sm ds-text-muted">'+cwd+'</span></div>';
+    if(parent) html += '<div class="ds-list-item ds-list-item-interactive" onclick="browseDir(\\''+parent.replace(/'/g,"\\\\'")+'\\')">'+
+      '<span class="mi material-icons-round ds-list-item-icon ds-text-muted">arrow_back</span>'+
+      '<div class="ds-list-item-content"><div class="ds-list-item-primary">..</div></div></div>';
+    html += '<div class="ds-stagger">';
+    items.slice(0,30).forEach(f=>{{
+      const icon = f.is_dir?'folder':'description';
+      html += '<div class="ds-list-item'+(f.is_dir?' ds-list-item-interactive':'')+'"'+
+        (f.is_dir?' onclick="browseDir(\\''+f.path.replace(/'/g,"\\\\'")+'\\');"':'')+'>'+
+        '<span class="mi material-icons-round ds-list-item-icon '+(f.is_dir?'ds-text-accent':'ds-text-muted')+'">'+icon+'</span>'+
+        '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+f.name+'</div></div></div>';
+    }});
+    html += '</div></div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Cannot browse</div>'; }});
+}}
+
+// ═══ Terminal ═══
+function loadTerminalPanel(el) {{
+  el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Terminal</div>'+
+    '<div style="background:#0d0d0d;border-radius:8px;padding:12px;font-family:monospace;min-height:200px;position:relative">'+
+    '<div id="term-output" style="color:#a0ffa0;white-space:pre-wrap;max-height:280px;overflow-y:auto;font-size:13px;line-height:1.5"></div>'+
+    '<div style="display:flex;align-items:center;margin-top:8px">'+
+    '<span style="color:#a0ffa0;margin-right:4px">$</span>'+
+    '<input id="term-input" type="text" style="flex:1;background:transparent;border:none;color:#a0ffa0;font-family:monospace;font-size:13px;outline:none" '+
+    'placeholder="Type command..." onkeydown="if(event.key===\\'Enter\\')termExec()">'+
+    '</div></div></div>';
+}}
+function termExec() {{
+  const inp = document.getElementById('term-input');
+  const out = document.getElementById('term-output');
+  if(!inp||!out) return;
+  const cmd = inp.value.trim();
+  if(!cmd) return;
+  inp.value = '';
+  out.textContent += '$ '+cmd+'\\n';
+  fetch(SHELL+'/api/shell/terminal/exec',{{method:'POST',headers:{{'Content-Type':'application/json'}},
+    body:JSON.stringify({{command:cmd}}),signal:AbortSignal.timeout(30000)}}
+  ).then(r=>r.json()).then(d=>{{
+    out.textContent += (d.stdout||'')+(d.stderr?'\\n'+d.stderr:'')+'\\n';
+    out.scrollTop = out.scrollHeight;
+  }}).catch(e=>{{ out.textContent += 'Error: '+e.message+'\\n'; }});
+}}
+
+// ═══ User Accounts ═══
+function loadUserAccountsPanel(el) {{
+  fetch(SHELL+'/api/shell/users',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+    const users = data.users||[];
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">User Accounts</div><div class="ds-stagger">';
+    users.forEach(u=>{{
+      html += dsStatusRow('person', u.username||u.name, u.is_admin?'Admin':'User',
+        u.is_admin?'var(--hart-accent)':'var(--hart-muted)',{{sublabel:'UID '+(u.uid||'')}});
+    }});
+    html += '</div></div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">User accounts unavailable</div>'; }});
+}}
+
+// ═══ Notification Center ═══
+function loadNotificationCenterPanel(el) {{
+  fetch(SHELL+'/api/shell/notifications',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+    const notifs = data.notifications||[];
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Notifications</div><div class="ds-stagger">';
+    if(notifs.length===0) html += '<div class="ds-body-md ds-text-muted">No notifications</div>';
+    else notifs.slice(0,20).forEach(n=>{{
+      html += '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon '+(n.read?'ds-text-muted':'ds-text-accent')+'">'+
+        (n.read?'notifications_none':'notifications_active')+'</span>'+
+        '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+(n.title||n.message||'Notification')+'</div>'+
+        '<div class="ds-list-item-secondary">'+(n.time||n.created_at||'')+'</div></div></div>';
+    }});
+    html += '</div></div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Notifications unavailable</div>'; }});
+}}
+
+// ═══ Updates ═══
+function loadUpdatesPanel(el) {{
+  fetch(BACKEND+'/api/upgrades/status',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">System Updates</div>';
+    html += dsStatusRow('system_update', 'Current Version', data.current_version||'unknown', 'var(--hart-active)');
+    if(data.new_version) html += dsStatusRow('upgrade', 'Available', data.new_version, 'var(--hart-accent)');
+    else html += '<div class="ds-body-md ds-text-active" style="padding:12px 0">System is up to date</div>';
+    html += dsStatusRow('schedule', 'Pipeline', data.pipeline_stage||'idle', 'var(--hart-muted)');
+    html += '</div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Update status unavailable</div>'; }});
+}}
+
+// ═══ Backup & Restore ═══
+function loadBackupRestorePanel(el) {{
+  fetch(SHELL+'/api/shell/backup/list',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+    const backups = data.backups||[];
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Backup &amp; Restore</div><div class="ds-stagger">';
+    if(backups.length===0) html += '<div class="ds-body-md ds-text-muted">No backups found</div>';
+    else backups.forEach(b=>{{
+      html += dsStatusRow('backup', b.name||b.path, b.date||b.created||'', 'var(--hart-muted)');
+    }});
+    html += '</div></div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Backup info unavailable</div>'; }});
+}}
+
+// ═══ Devices & Mesh ═══
+function loadDevicesPanel(el) {{
+  fetch(SHELL+'/api/shell/devices',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+    const devs = data.devices||[];
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Devices &amp; Mesh</div><div class="ds-stagger">';
+    if(devs.length===0) html += '<div class="ds-body-md ds-text-muted">No paired devices</div>';
+    else devs.forEach(d=>{{
+      html += dsStatusRow('devices_other', d.name||d.device_id||'Device', d.status||'unknown',
+        d.status==='paired'?'var(--hart-active)':'var(--hart-muted)',{{sublabel:d.device_id||''}});
+    }});
+    html += '</div></div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Devices unavailable</div>'; }});
+}}
+
+// ═══ Language & Region ═══
+function loadI18nPanel(el) {{
+  fetch(SHELL+'/api/shell/i18n/locales',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+    const current = data.current||'en';
+    const locales = data.available||[];
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Language &amp; Region</div>';
+    html += dsStatusRow('language', 'Current', current, 'var(--hart-accent)');
+    html += '<div class="ds-section-label">Available Languages</div><div class="ds-stagger">';
+    locales.slice(0,15).forEach(l=>{{
+      const active = l.code===current;
+      html += '<div class="ds-list-item'+(active?'':' ds-list-item-interactive')+'"'+
+        (active?'':' onclick="setLocale(\\''+l.code+'\\')"')+'>'+
+        '<span class="mi material-icons-round ds-list-item-icon '+(active?'ds-text-active':'ds-text-muted')+'">translate</span>'+
+        '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+(l.name||l.code)+'</div></div>'+
+        (active?'<span class="ds-list-item-trailing ds-text-active"><span class="mi material-icons-round">check</span></span>':'')+
+        '</div>';
+    }});
+    html += '</div></div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Language settings unavailable</div>'; }});
+}}
+function setLocale(code) {{
+  fetch(SHELL+'/api/shell/i18n/set',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{locale:code}})}})
+  .then(()=>{{showToast('Language','Set to '+code,'success');loadI18nPanel(document.getElementById('sys-i18n'));}}).catch(()=>{{}});
+}}
+
+// ═══ Accessibility ═══
+function loadAccessibilityPanel(el) {{
+  fetch(SHELL+'/api/shell/accessibility',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Accessibility</div><div class="ds-stagger">';
+    const items = [
+      ['screen_reader', 'Screen Reader', data.screen_reader],
+      ['text_increase', 'Large Text', data.large_text],
+      ['contrast', 'High Contrast', data.high_contrast],
+      ['animation', 'Reduce Motion', data.reduce_motion],
+    ];
+    items.forEach(([icon,label,val])=>{{
+      html += '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon ds-text-accent">'+icon+'</span>'+
+        '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+label+'</div></div>'+
+        '<label class="ds-switch"><input type="checkbox" '+(val?'checked':'')+' onchange="toggleA11y(\\''+label.toLowerCase().replace(/ /g,'_')+'\\',this.checked)"><span class="ds-switch-slider"></span></label></div>';
+    }});
+    if(data.font_scale) html += dsStatusRow('format_size', 'Font Scale', data.font_scale+'x', 'var(--hart-muted)');
+    html += '</div></div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Accessibility unavailable</div>'; }});
+}}
+function toggleA11y(key,val) {{
+  const body = {{}};
+  body[key] = val;
+  fetch(SHELL+'/api/shell/accessibility',{{method:'PUT',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body)}}).catch(()=>{{}});
+}}
+
+// ═══ Screenshot & Recording ═══
+function loadScreenshotPanel(el) {{
+  el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Screenshot &amp; Recording</div>'+
+    '<div class="ds-flex ds-gap-3 ds-flex-wrap" style="padding:24px 0">'+
+    dsBtn('Take Screenshot',{{variant:'primary',cls:'ds-btn-sm',onclick:"fetch(SHELL+'/api/shell/screenshot',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{type:'full'}})}}).then(r=>r.json()).then(d=>showToast('Screenshot',d.path||'Captured','success')).catch(()=>showToast('Screenshot','Failed','error'))"}})+
+    dsBtn('Window Screenshot',{{variant:'secondary',cls:'ds-btn-sm',onclick:"fetch(SHELL+'/api/shell/screenshot',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{type:'window'}})}}).then(r=>r.json()).then(d=>showToast('Screenshot',d.path||'Captured','success')).catch(()=>{{}})"}})+
+    dsBtn('Start Recording',{{variant:'secondary',cls:'ds-btn-sm',onclick:"fetch(SHELL+'/api/shell/recording/start',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:'{{}}'}}).then(()=>showToast('Recording','Started','info')).catch(()=>{{}})"}})+
+    dsBtn('Stop Recording',{{variant:'secondary',cls:'ds-btn-sm',onclick:"fetch(SHELL+'/api/shell/recording/stop',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:'{{}}'}}).then(r=>r.json()).then(d=>showToast('Recording','Saved: '+(d.path||''),'success')).catch(()=>{{}})"}})+
+    '</div></div>';
+}}
+
+// ═══ Firewall ═══
+function loadFirewallPanel(el) {{
+  el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Firewall &amp; Firmware</div>'+
+    '<div class="ds-stagger">'+
+    dsStatusRow('shield', 'Firewall', 'Active (nftables)', 'var(--hart-active)',{{sublabel:'Managed by NixOS declarative config'}})+
+    dsStatusRow('security', 'Zones', 'trusted / hive / public', 'var(--hart-muted)')+
+    dsStatusRow('verified_user', 'Firmware Updates', 'fwupd enabled', 'var(--hart-active)')+
+    '</div></div>';
+}}
+
+// ═══ Default Apps ═══
+function loadDefaultAppsPanel(el) {{
+  fetch(SHELL+'/api/shell/default-apps',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+    const apps = data.defaults||{{}};
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Default Apps</div><div class="ds-stagger">';
+    const cats = [['web-browser','Web Browser','public'],['text-editor','Text Editor','edit_note'],
+      ['file-manager','File Manager','folder'],['terminal','Terminal','terminal'],
+      ['image-viewer','Image Viewer','photo'],['video-player','Video Player','play_circle'],
+      ['music-player','Music Player','music_note'],['email-client','Email','email'],
+      ['pdf-viewer','PDF Viewer','picture_as_pdf']];
+    cats.forEach(([key,label,icon])=>{{
+      html += dsStatusRow(icon, label, apps[key]||'Not set', apps[key]?'var(--hart-accent)':'var(--hart-muted)');
+    }});
+    html += '</div></div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Default apps unavailable</div>'; }});
+}}
+
+// ═══ Font Manager ═══
+function loadFontManagerPanel(el) {{
+  fetch(SHELL+'/api/shell/fonts',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+    const fonts = data.fonts||[];
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-header"><span class="ds-panel-title">Fonts</span>'+
+      '<span class="ds-chip"><span class="ds-chip-dot" style="background:var(--hart-accent)"></span>'+fonts.length+' installed</span></div>';
+    html += '<div class="ds-stagger">';
+    fonts.slice(0,20).forEach(f=>{{
+      html += '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon ds-text-accent">font_download</span>'+
+        '<div class="ds-list-item-content"><div class="ds-list-item-primary" style="font-family:\\''+f.family+'\\'">'+f.family+'</div>'+
+        '<div class="ds-list-item-secondary">'+(f.style||f.styles||'')+'</div></div></div>';
+    }});
+    html += '</div></div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Fonts unavailable</div>'; }});
+}}
+
+// ═══ Sound Manager ═══
+function loadSoundManagerPanel(el) {{
+  fetch(SHELL+'/api/shell/sounds/themes',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+    const themes = data.themes||[];
+    const current = data.current||'freedesktop';
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Sound Theme</div>';
+    html += dsStatusRow('music_note', 'Current Theme', current, 'var(--hart-accent)');
+    html += '<div class="ds-stagger">';
+    themes.forEach(t=>{{
+      html += '<div class="ds-list-item'+(t===current?'':' ds-list-item-interactive')+'"'+
+        (t===current?'':' onclick="fetch(SHELL+\\'/api/shell/sounds/set-theme\\',{{method:\\'POST\\',headers:{{\\'Content-Type\\':\\'application/json\\'}},body:JSON.stringify({{theme:\\''+t+'\\'}})}}).then(()=>loadSoundManagerPanel(document.getElementById(\\'sys-sound_manager\\')))"')+'>'+
+        '<span class="mi material-icons-round ds-list-item-icon '+(t===current?'ds-text-active':'ds-text-muted')+'">volume_up</span>'+
+        '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+t+'</div></div>'+
+        (t===current?'<span class="ds-list-item-trailing ds-text-active"><span class="mi material-icons-round">check</span></span>':'')+
+        '</div>';
+    }});
+    html += '</div></div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Sound settings unavailable</div>'; }});
+}}
+
+// ═══ Clipboard ═══
+function loadClipboardPanel(el) {{
+  fetch(SHELL+'/api/shell/clipboard/history',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+    const items = data.history||[];
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-header"><span class="ds-panel-title">Clipboard</span>'+
+      dsBtn('Clear',{{variant:'secondary',cls:'ds-btn-sm',onclick:"fetch(SHELL+'/api/shell/clipboard/clear',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:'{{}}'}}).then(()=>loadClipboardPanel(document.getElementById('sys-clipboard_manager')))"}})+
+      '</div><div class="ds-stagger">';
+    if(items.length===0) html += '<div class="ds-body-md ds-text-muted">Clipboard empty</div>';
+    else items.slice(0,15).forEach((c,i)=>{{
+      const preview = (c.text||c.content||'').substring(0,80);
+      html += '<div class="ds-list-item ds-list-item-interactive" onclick="fetch(SHELL+\\'/api/shell/clipboard/copy\\',{{method:\\'POST\\',headers:{{\\'Content-Type\\':\\'application/json\\'}},body:JSON.stringify({{text:\\''+preview.replace(/'/g,"\\\\'").replace(/\n/g,' ')+'\\'}})}}); showToast(\\'Clipboard\\',\\'Copied\\',\\'info\\')">'+
+        '<span class="mi material-icons-round ds-list-item-icon ds-text-muted">content_paste</span>'+
+        '<div class="ds-list-item-content"><div class="ds-list-item-primary ds-truncate">'+preview+'</div>'+
+        '<div class="ds-list-item-secondary">'+(c.time||'')+(c.pinned?' &middot; Pinned':'')+'</div></div></div>';
+    }});
+    html += '</div></div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Clipboard unavailable</div>'; }});
+}}
+
+// ═══ Date & Time ═══
+function loadDateTimePanel(el) {{
+  fetch(SHELL+'/api/shell/datetime',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Date &amp; Time</div>';
+    html += '<div class="ds-flex ds-flex-center ds-flex-col ds-gap-2" style="padding:16px 0">'+
+      '<div class="ds-display-sm ds-text-accent">'+(data.time||'')+'</div>'+
+      '<div class="ds-title-sm ds-text-muted">'+(data.date||'')+'</div></div>';
+    html += '<div class="ds-stagger">';
+    html += dsStatusRow('schedule', 'Timezone', data.timezone||'UTC', 'var(--hart-accent)');
+    html += dsStatusRow('sync', 'NTP Sync', data.ntp_enabled?'Enabled':'Disabled', data.ntp_enabled?'var(--hart-active)':'var(--hart-muted)');
+    html += dsStatusRow('today', 'Format', data.format||'24h', 'var(--hart-muted)');
+    html += '</div></div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Date/time unavailable</div>'; }});
+}}
+
+// ═══ Wallpaper ═══
+function loadWallpaperPanel(el) {{
+  Promise.all([
+    fetch(SHELL+'/api/shell/wallpaper',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).catch(()=>({{}})),
+    fetch(SHELL+'/api/shell/wallpaper/collection',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).catch(()=>({{}}))
+  ]).then(([cur,col])=>{{
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Wallpaper</div>';
+    html += dsStatusRow('wallpaper', 'Current', (cur.path||'Default').split('/').pop(), 'var(--hart-accent)');
+    const walls = col.wallpapers||[];
+    if(walls.length>0) {{
+      html += '<div class="ds-section-label">Collection</div><div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px">';
+      walls.slice(0,12).forEach(w=>{{
+        html += '<div style="aspect-ratio:16/9;border-radius:8px;background:#1a1a1a;cursor:pointer;overflow:hidden;border:2px solid transparent" '+
+          'onclick="fetch(SHELL+\\'/api/shell/wallpaper/set\\',{{method:\\'POST\\',headers:{{\\'Content-Type\\':\\'application/json\\'}},body:JSON.stringify({{path:\\''+w.path.replace(/'/g,"\\\\'")+'\\'}})}}); showToast(\\'Wallpaper\\',\\'Set\\',\\'success\\')">'+
+          '<img src="'+SHELL+'/api/shell/files/thumb?path='+encodeURIComponent(w.path)+'" style="width:100%;height:100%;object-fit:cover" onerror="this.parentNode.innerHTML=\\'<div style=padding:8px;font-size:11px>'+w.name+'</div>\\'"></div>';
+      }});
+      html += '</div>';
+    }}
+    html += '</div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Wallpaper settings unavailable</div>'; }});
+}}
+
+// ═══ Keyboard & Input Methods ═══
+function loadInputMethodsPanel(el) {{
+  fetch(SHELL+'/api/shell/input-methods',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+    const layout = data.layout||'us';
+    const variant = data.variant||'';
+    const methods = data.input_methods||[];
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Keyboard &amp; Input</div><div class="ds-stagger">';
+    html += dsStatusRow('keyboard', 'Layout', layout+(variant?' ('+variant+')':''), 'var(--hart-accent)');
+    if(methods.length>0) {{
+      html += '<div class="ds-section-label">Input Methods</div>';
+      methods.forEach(m=>{{
+        html += dsStatusRow('translate', m.name||m.id, m.active?'Active':'Available',
+          m.active?'var(--hart-active)':'var(--hart-muted)');
+      }});
+    }}
+    html += '</div></div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Input settings unavailable</div>'; }});
+}}
+
+// ═══ Night Light ═══
+function loadNightLightPanel(el) {{
+  el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Night Light</div>'+
+    '<div class="ds-stagger">'+
+    dsStatusRow('nightlight', 'Status', 'Managed by gammastep', 'var(--hart-accent)',{{sublabel:'Reduces blue light in the evening'}})+
+    dsStatusRow('schedule', 'Schedule', 'Sunset to Sunrise', 'var(--hart-muted)')+
+    dsStatusRow('thermostat', 'Temperature', '3500K', 'var(--hart-accent)')+
+    '</div><div class="ds-body-sm ds-text-muted" style="margin-top:12px">Configured via NixOS module hart-nightlight.nix</div></div>';
+}}
+
+// ═══ Workspaces ═══
+function loadWorkspacesPanel(el) {{
+  fetch(SHELL+'/api/shell/workspaces',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+    const ws = data.workspaces||[];
+    const current = data.current||1;
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Workspaces</div>'+
+      '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(100px,1fr));gap:8px;padding:16px 0">';
+    (ws.length>0?ws:([1,2,3,4].map(i=>({{number:i}})))).forEach(w=>{{
+      const num = w.number||w.id;
+      const active = num===current;
+      html += '<div style="aspect-ratio:16/9;border-radius:8px;background:'+(active?'var(--hart-accent-10)':'#1a1a1a')+';border:2px solid '+(active?'var(--hart-accent)':'transparent')+';display:flex;align-items:center;justify-content:center;cursor:pointer">'+
+        '<span class="ds-title-sm '+(active?'ds-text-accent':'ds-text-muted')+'">'+num+'</span></div>';
+    }});
+    html += '</div></div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Workspaces unavailable</div>'; }});
+}}
+
+// ═══ Calculator ═══
+function loadCalculatorPanel(el) {{
+  el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Calculator</div>'+
+    '<input id="calc-display" type="text" readonly value="0" style="width:100%;background:#0d0d0d;color:var(--hart-text);border:none;border-radius:8px;padding:16px;font-size:28px;text-align:right;font-family:monospace;margin-bottom:8px">'+
+    '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:4px" id="calc-grid"></div></div>';
+  const grid = document.getElementById('calc-grid');
+  const btns = ['C','(',')','/',7,8,9,'*',4,5,6,'-',1,2,3,'+',0,'.','%','='];
+  btns.forEach(b=>{{
+    const isOp = typeof b==='string'&&b!=='C';
+    const el2 = document.createElement('button');
+    el2.className = 'ds-btn ds-btn-sm';
+    el2.style.cssText = 'padding:14px;font-size:18px;'+(isOp?'color:var(--hart-accent)':'');
+    el2.textContent = b;
+    el2.onclick = ()=>calcPress(String(b));
+    grid.appendChild(el2);
+  }});
+}}
+function calcPress(b) {{
+  const d = document.getElementById('calc-display');
+  if(!d) return;
+  if(b==='C') {{ d.value='0'; return; }}
+  if(b==='=') {{ try {{ d.value=String(Function('"use strict";return('+d.value+')')());}} catch {{ d.value='Error'; }} return; }}
+  if(d.value==='0'&&b!=='.') d.value=b; else d.value+=b;
+}}
+
+// ═══ Image Viewer ═══
+function loadImageViewerPanel(el) {{
+  el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Image Viewer</div>'+
+    '<div class="ds-flex ds-flex-center ds-flex-col ds-gap-3" style="padding:40px 0">'+
+    '<span class="mi material-icons-round ds-text-muted" style="font-size:48px">photo</span>'+
+    '<div class="ds-body-md ds-text-muted">Open an image from the File Manager</div></div></div>';
+}}
+
+// ═══ Notes ═══
+function loadNotesAppPanel(el) {{
+  fetch(SHELL+'/api/shell/notes',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+    const notes = data.notes||[];
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-header"><span class="ds-panel-title">Notes</span>'+
+      dsBtn('New',{{variant:'primary',cls:'ds-btn-sm',onclick:"dsPrompt('New Note','',{{placeholder:'Write your note...',okLabel:'Save'}}).then(c=>{{if(!c)return;fetch(SHELL+'/api/shell/notes',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{content:c}})}}).then(()=>loadNotesAppPanel(document.getElementById('sys-notes_app')))}})"}})+'</div>';
+    html += '<div class="ds-stagger">';
+    if(notes.length===0) html += '<div class="ds-body-md ds-text-muted">No notes yet</div>';
+    else notes.forEach(n=>{{
+      html += '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon ds-text-accent">sticky_note_2</span>'+
+        '<div class="ds-list-item-content"><div class="ds-list-item-primary ds-truncate">'+(n.content||'').substring(0,80)+'</div>'+
+        '<div class="ds-list-item-secondary">'+(n.created||n.date||'')+'</div></div>'+
+        '<span class="ds-list-item-trailing" style="cursor:pointer" onclick="fetch(SHELL+\\'/api/shell/notes/delete\\',{{method:\\'POST\\',headers:{{\\'Content-Type\\':\\'application/json\\'}},body:JSON.stringify({{id:\\''+n.id+'\\'}})}}).then(()=>loadNotesAppPanel(document.getElementById(\\'sys-notes_app\\')))">'+
+        '<span class="mi material-icons-round ds-text-muted" style="font-size:18px">delete_outline</span></span></div>';
+    }});
+    html += '</div></div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Notes unavailable</div>'; }});
+}}
+
+// ═══ App Store ═══
+function loadAppStorePanel(el) {{
+  el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">App Store</div>'+
+    '<div style="display:flex;gap:8px;margin-bottom:12px">'+
+    '<input id="appstore-search" type="text" placeholder="Search packages..." style="flex:1;background:#1a1a1a;border:1px solid #333;color:var(--hart-text);border-radius:8px;padding:8px 12px;font-size:14px" onkeydown="if(event.key===\\'Enter\\')appStoreSearch()">'+
+    dsBtn('Search',{{variant:'primary',cls:'ds-btn-sm',onclick:'appStoreSearch()'}})+'</div>'+
+    '<div id="appstore-results" class="ds-stagger"><div class="ds-body-md ds-text-muted">Search for Nix, Flatpak, or AppImage packages</div></div></div>';
+}}
+function appStoreSearch() {{
+  const q = document.getElementById('appstore-search');
+  const r = document.getElementById('appstore-results');
+  if(!q||!r||!q.value.trim()) return;
+  r.innerHTML = dsSkeleton('panel',2);
+  fetch(SHELL+'/api/apps/search?q='+encodeURIComponent(q.value),{{signal:AbortSignal.timeout(15000)}}).then(r2=>r2.json()).then(data=>{{
+    const pkgs = data.results||[];
+    if(pkgs.length===0) {{ r.innerHTML='<div class="ds-body-md ds-text-muted">No packages found</div>'; return; }}
+    r.innerHTML = pkgs.slice(0,15).map(p=>
+      '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon ds-text-accent">inventory_2</span>'+
+      '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+p.name+'</div>'+
+      '<div class="ds-list-item-secondary">'+(p.platform||p.source||'')+' &middot; '+(p.version||'')+'</div></div>'+
+      dsBtn('Install',{{variant:'secondary',cls:'ds-btn-sm',onclick:"fetch(SHELL+'/api/apps/install',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{package:'"+p.name+"',platform:'"+(p.platform||'nix')+"'}})}}).then(()=>showToast('App Store','Installing "+p.name+"','info'))"}})+'</div>'
+    ).join('');
+  }}).catch(()=>{{ r.innerHTML='<div class="ds-body-md ds-text-muted">Search failed</div>'; }});
+}}
+
+// ═══ App Permissions ═══
+function loadAppPermissionsPanel(el) {{
+  fetch(SHELL+'/api/apps/installed',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+    const apps = data.apps||[];
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">App Permissions</div><div class="ds-stagger">';
+    if(apps.length===0) html += '<div class="ds-body-md ds-text-muted">No apps installed</div>';
+    else apps.slice(0,20).forEach(a=>{{
+      html += dsStatusRow('admin_panel_settings', a.name||a.id, a.platform||'system',
+        'var(--hart-muted)',{{sublabel:(a.permissions||[]).join(', ')||'No special permissions'}});
+    }});
+    html += '</div></div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">App permissions unavailable</div>'; }});
+}}
+
+// ═══ Battery Monitor ═══
+function loadBatteryMonitorPanel(el) {{
+  fetch(SHELL+'/api/shell/battery',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+    const pct = data.percent||0;
+    const charging = data.charging||false;
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Battery</div>'+
+      '<div class="ds-flex ds-flex-center ds-flex-col ds-gap-2" style="padding:24px 0">'+
+      '<span class="mi material-icons-round ds-text-accent" style="font-size:56px">'+(charging?'battery_charging_full':pct>20?'battery_full':'battery_alert')+'</span>'+
+      '<div class="ds-display-sm ds-text-accent">'+pct+'%</div>'+
+      '<div class="ds-label-sm ds-text-muted">'+(charging?'Charging':'On Battery')+(data.time_remaining?' &middot; '+data.time_remaining+' remaining':'')+'</div></div>';
+    html += dsMetricBar('Level', pct, '%');
+    if(data.power_profile) html += dsStatusRow('power', 'Profile', data.power_profile, 'var(--hart-muted)');
+    html += '</div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Battery info unavailable</div>'; }});
+}}
+
+// ═══ WiFi Manager ═══
+function loadWiFiManagerPanel(el) {{
+  Promise.all([
+    fetch(SHELL+'/api/shell/wifi/status',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).catch(()=>({{}})),
+    fetch(SHELL+'/api/shell/wifi/scan',{{signal:AbortSignal.timeout(8000)}}).then(r=>r.json()).catch(()=>({{}}))
+  ]).then(([status,scan])=>{{
+    const connected = status.connected||{{}};
+    const networks = scan.networks||[];
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">WiFi</div>';
+    if(connected.ssid) {{
+      html += dsCard('<div class="ds-flex ds-flex-center ds-flex-col ds-gap-2">'+
+        '<span class="mi material-icons-round ds-text-active" style="font-size:28px">wifi</span>'+
+        '<div class="ds-title-sm ds-text-active">'+connected.ssid+'</div>'+
+        '<div class="ds-label-sm ds-text-muted">'+(connected.ip||'')+'</div>'+
+        dsBtn('Disconnect',{{variant:'secondary',cls:'ds-btn-sm',onclick:"wifiDisconnect()"}})+'</div>',{{elevated:true}});
+    }}
+    if(networks.length>0) {{
+      html += '<div class="ds-section-label">Available Networks</div><div class="ds-stagger">';
+      networks.filter(n=>!n.active).slice(0,8).forEach(n=>{{
+        html += '<div class="ds-list-item ds-list-item-interactive" onclick="wifiConnect(\\''+n.ssid.replace(/'/g,"\\\\'")+'\\')">'+
+          '<span class="mi material-icons-round ds-list-item-icon ds-text-accent">wifi</span>'+
+          '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+n.ssid+'</div>'+
+          '<div class="ds-list-item-secondary">'+n.security+' &middot; '+n.signal+'%</div></div></div>';
+      }});
+      html += '</div>';
+    }}
+    html += '</div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">WiFi unavailable</div>'; }});
+}}
+
+// ═══ VPN Manager ═══
+function loadVPNManagerPanel(el) {{
+  fetch(SHELL+'/api/shell/vpn/list',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+    const vpns = data.connections||[];
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-header"><span class="ds-panel-title">VPN</span>'+
+      dsBtn('Import',{{variant:'secondary',cls:'ds-btn-sm',onclick:"dsPrompt('Import VPN','Enter WireGuard config path',{{placeholder:'/path/to/wg0.conf',okLabel:'Import'}}).then(p=>{{if(!p)return;fetch(SHELL+'/api/shell/vpn/import',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{config_path:p,type:'wireguard'}})}}).then(r=>r.json()).then(d=>{{showToast('VPN',d.message||'Imported','success');loadVPNManagerPanel(document.getElementById('sys-vpn_manager'))}})}})"}})+'</div><div class="ds-stagger">';
+    if(vpns.length===0) html += '<div class="ds-body-md ds-text-muted">No VPN connections</div>';
+    else vpns.forEach(v=>{{
+      html += '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon '+(v.active?'ds-text-active':'ds-text-muted')+'">vpn_key</span>'+
+        '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+v.name+'</div>'+
+        '<div class="ds-list-item-secondary">'+(v.type||'')+'</div></div>'+
+        dsBtn(v.active?'Disconnect':'Connect',{{variant:'secondary',cls:'ds-btn-sm',
+          onclick:"fetch(SHELL+'/api/shell/vpn/"+(v.active?'disconnect':'connect')+"',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{name:'"+v.name+"'}})}}).then(()=>loadVPNManagerPanel(document.getElementById('sys-vpn_manager')))"}})+
+        '</div>';
+    }});
+    html += '</div></div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">VPN unavailable</div>'; }});
+}}
+
+// ═══ Trash Bin ═══
+function loadTrashBinPanel(el) {{
+  fetch(SHELL+'/api/shell/trash',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+    const items = data.items||[];
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-header"><span class="ds-panel-title">Trash</span>'+
+      (items.length>0?dsBtn('Empty Trash',{{variant:'secondary',cls:'ds-btn-sm',onclick:"dsConfirm('Empty Trash','Permanently delete all items?',{{okLabel:'Empty',danger:true}}).then(ok=>{{if(!ok)return;fetch(SHELL+'/api/shell/trash/empty',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:'{{}}'}}).then(()=>loadTrashBinPanel(document.getElementById('sys-trash_bin')))}})"}}):'')+
+      '</div><div class="ds-stagger">';
+    if(items.length===0) html += '<div class="ds-body-md ds-text-muted">Trash is empty</div>';
+    else items.slice(0,20).forEach(t=>{{
+      html += '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon ds-text-muted">delete</span>'+
+        '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+t.name+'</div>'+
+        '<div class="ds-list-item-secondary">'+(t.deleted_at||'')+'</div></div>'+
+        '<span class="ds-list-item-trailing" style="cursor:pointer" onclick="fetch(SHELL+\\'/api/shell/trash/restore\\',{{method:\\'POST\\',headers:{{\\'Content-Type\\':\\'application/json\\'}},body:JSON.stringify({{path:\\''+t.original_path.replace(/'/g,"\\\\'")+'\\'}})}}); loadTrashBinPanel(document.getElementById(\\'sys-trash_bin\\'))">'+
+        '<span class="mi material-icons-round ds-text-accent" style="font-size:18px">restore</span></span></div>';
+    }});
+    html += '</div></div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Trash unavailable</div>'; }});
+}}
+
+// ═══ Webcam Viewer ═══
+function loadWebcamViewerPanel(el) {{
+  el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Camera</div>'+
+    '<div class="ds-flex ds-flex-center ds-flex-col ds-gap-3" style="padding:40px 0">'+
+    '<span class="mi material-icons-round ds-text-muted" style="font-size:48px">videocam</span>'+
+    '<div class="ds-body-md ds-text-muted">Camera preview requires native GNOME Cheese or direct device access</div>'+
+    dsBtn('Open Camera App',{{variant:'secondary',cls:'ds-btn-sm',onclick:"showToast('Camera','Opening cheese...','info')"}})+'</div></div>';
+}}
+
+// ═══ Scanner ═══
+function loadScannerPanel(el) {{
+  fetch(SHELL+'/api/shell/scanner/list',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+    const scanners = data.scanners||[];
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Scanner</div><div class="ds-stagger">';
+    if(scanners.length===0) html += '<div class="ds-body-md ds-text-muted">No scanners detected</div>';
+    else scanners.forEach(s=>{{
+      html += dsStatusRow('scanner', s.name||s.device, s.status||'Ready', 'var(--hart-active)');
+    }});
+    html += '</div></div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Scanner unavailable</div>'; }});
+}}
+
+// ═══ Weather ═══
+function loadWeatherPanel(el) {{
+  el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Weather</div>'+
+    '<div class="ds-flex ds-flex-center ds-flex-col ds-gap-3" style="padding:40px 0">'+
+    '<span class="mi material-icons-round ds-text-accent" style="font-size:56px">cloud</span>'+
+    '<div class="ds-body-md ds-text-muted">Weather widget uses GNOME Weather or wttr.in</div>'+
+    '<div class="ds-label-sm ds-text-muted">Connect location services for automatic weather</div></div></div>';
 }}
 
 function loadEventLog(el) {{
@@ -2049,9 +3027,154 @@ function askAgent() {{
     .then(r=>r.json()).then(data=>{{
       const txt = data.response || data.error || 'No response';
       resp.textContent = txt;
-      speakText(txt);
+      speakText(txt, 'chat_response');
     }}).catch(()=>{{ resp.textContent='Could not reach agent'; }});
 }}
+
+// ═══ Floating Assistant Chat ═══
+const AC_CAPS = [
+  {{id:'chat',name:'Chat',icon:'chat'}},
+  {{id:'recipe',name:'Recipes',icon:'receipt_long'}},
+  {{id:'agents',name:'Agents',icon:'smart_toy'}},
+  {{id:'vision',name:'Vision',icon:'visibility'}},
+  {{id:'voice',name:'Voice',icon:'record_voice_over'}},
+  {{id:'expert',name:'Experts',icon:'psychology'}},
+  {{id:'openclaw',name:'OpenClaw',icon:'extension'}},
+  {{id:'code',name:'Code',icon:'code'}},
+  {{id:'remote',name:'Remote',icon:'desktop_windows'}},
+  {{id:'channels',name:'Channels',icon:'forum'}},
+];
+let acMessages = [];
+let acActiveCap = 'chat';
+let acDragging = false;
+let acDragOfs = {{x:0,y:0}};
+
+function initAssistantChat() {{
+  // Render capability pills
+  const capsEl = document.getElementById('ac-caps');
+  if(!capsEl) return;
+  capsEl.innerHTML = AC_CAPS.map(c=>
+    '<div class="ac-cap'+(c.id===acActiveCap?' active':'')+'" onclick="acSelectCap(\''+c.id+'\')" title="'+c.name+'">'+
+    '<span class="mi material-icons-round">'+c.icon+'</span>'+c.name+'</div>'
+  ).join('');
+
+  // Drag support
+  const handle = document.getElementById('ac-drag-handle');
+  const chat = document.getElementById('assistant-chat');
+  if(!handle||!chat) return;
+  handle.addEventListener('mousedown', function(e) {{
+    if(e.target.closest('.ac-btn')) return;
+    acDragging = true;
+    const rect = chat.getBoundingClientRect();
+    acDragOfs = {{x: e.clientX - rect.left, y: e.clientY - rect.top}};
+    e.preventDefault();
+  }});
+  document.addEventListener('mousemove', function(e) {{
+    if(!acDragging) return;
+    const chat = document.getElementById('assistant-chat');
+    chat.style.left = (e.clientX - acDragOfs.x) + 'px';
+    chat.style.top = (e.clientY - acDragOfs.y) + 'px';
+    chat.style.right = 'auto';
+    chat.style.bottom = 'auto';
+  }});
+  document.addEventListener('mouseup', function() {{ acDragging = false; }});
+}}
+
+function toggleAssistantChat() {{
+  const chat = document.getElementById('assistant-chat');
+  const pill = document.getElementById('agent-pill');
+  if(!chat) return;
+  const isOpen = chat.classList.contains('open');
+  if(isOpen) {{
+    chat.classList.remove('open');
+    pill.classList.remove('hidden');
+  }} else {{
+    chat.classList.add('open');
+    pill.classList.add('hidden');
+    initAssistantChat();
+    const input = document.getElementById('ac-input');
+    if(input) setTimeout(function(){{input.focus()}},100);
+  }}
+}}
+
+function minimizeAssistant() {{
+  const chat = document.getElementById('assistant-chat');
+  const pill = document.getElementById('agent-pill');
+  if(chat) chat.classList.remove('open');
+  if(pill) pill.classList.remove('hidden');
+}}
+
+function acSelectCap(id) {{
+  acActiveCap = id;
+  document.querySelectorAll('.ac-cap').forEach(function(el) {{
+    el.classList.toggle('active', el.getAttribute('onclick').includes("'"+id+"'"));
+  }});
+}}
+
+function acAddMsg(role, text) {{
+  const msgsEl = document.getElementById('ac-messages');
+  if(!msgsEl) return;
+  const div = document.createElement('div');
+  div.className = 'ac-msg ' + role;
+  div.textContent = text;
+  msgsEl.appendChild(div);
+  msgsEl.scrollTop = msgsEl.scrollHeight;
+  return div;
+}}
+
+function acSend() {{
+  const input = document.getElementById('ac-input');
+  if(!input) return;
+  const text = input.value.trim();
+  if(!text) return;
+  input.value = '';
+
+  acAddMsg('user', text);
+
+  // Show typing indicator
+  const typing = acAddMsg('assistant', 'Thinking...');
+  typing.classList.add('typing');
+
+  // Check local commands first
+  const lower = text.toLowerCase();
+  if(lower.startsWith('open ')) {{
+    const target = lower.replace('open ','').trim();
+    const match = Object.entries(MANIFEST).find(([k,v])=>
+      v.title.toLowerCase().includes(target)||k.includes(target));
+    if(match) {{
+      openPanel(match[0]);
+      typing.textContent = 'Opened ' + match[1].title;
+      typing.classList.remove('typing');
+      return;
+    }}
+  }}
+  if(lower.includes('theme')||lower.includes('font')||lower.includes('bigger')||
+     lower.includes('smaller')||lower.includes('dark')||lower.includes('light')) {{
+    const fakeResp = {{set textContent(v){{typing.textContent=v;typing.classList.remove('typing')}}}};
+    handleThemeCommand(lower, fakeResp);
+    return;
+  }}
+
+  // Send to backend
+  fetch(SHELL+'/api/agent/ask',{{method:'POST',headers:{{'Content-Type':'application/json'}},
+    body:JSON.stringify({{text:text,capability:acActiveCap}})}})
+    .then(function(r){{return r.json()}}).then(function(data){{
+      const reply = data.response || data.error || 'No response';
+      typing.textContent = reply;
+      typing.classList.remove('typing');
+      speakText(reply, 'chat_response');
+    }}).catch(function(){{
+      typing.textContent = 'Could not reach agent';
+      typing.classList.remove('typing');
+    }});
+}}
+
+function acVoiceInput() {{
+  toggleVoice();
+}}
+
+// Init on load
+setTimeout(initAssistantChat, 500);
 
 function handleThemeCommand(text, resp) {{
   let customization = {{}};
@@ -2235,12 +3358,28 @@ function stopRecording() {{
   if(btn) btn.classList.remove('recording');
 }}
 
-// TTS helper
-function speakText(text) {{
-  if(!text || PERF.potato || !('speechSynthesis' in window)) return;
-  const utt = new SpeechSynthesisUtterance(text);
-  utt.rate = 1.0; utt.pitch = 1.0;
-  speechSynthesis.speak(utt);
+// TTS helper — hybrid: browser instant + server quality
+function speakText(text, source) {{
+  if(!text || PERF.potato) return;
+  source = source || 'chat_response';
+  // 1. Browser instant feedback (Web Speech API)
+  if('speechSynthesis' in window) {{
+    const utt = new SpeechSynthesisUtterance(text);
+    utt.rate = 1.0; utt.pitch = 1.0;
+    speechSynthesis.speak(utt);
+  }}
+  // 2. Server quality audio (async, replaces browser TTS when ready)
+  fetch(SHELL+'/api/voice/speak', {{
+    method:'POST',
+    headers:{{'Content-Type':'application/json'}},
+    body:JSON.stringify({{text:text, source:source}})
+  }}).then(function(r){{ return r.json(); }}).then(function(d){{
+    if(d.audio_url && !d.error) {{
+      if('speechSynthesis' in window) speechSynthesis.cancel();
+      var a = new Audio(SHELL+d.audio_url);
+      a.play().catch(function(){{}});
+    }}
+  }}).catch(function(){{}});
 }}
 
 // ═══ SSE Notification Stream ═══
@@ -2290,7 +3429,7 @@ if(!PERF.potato) {{
     const greeting = hour<12?'Good morning':hour<17?'Good afternoon':'Good evening';
     const msg = greeting+'! '+agentCount+' agent'+(agentCount!==1?'s':'')+' running, '+peerCount+' peer'+(peerCount!==1?'s':'')+' connected.';
     showToast('HART', msg, 'info');
-    setTimeout(function(){{ speakText(msg); }}, 1000);
+    setTimeout(function(){{ speakText(msg, 'greeting'); }}, 1000);
   }});
 }})();
 </script>
@@ -3195,6 +4334,22 @@ if(!PERF.potato) {{
         except Exception as e:
             logger.warning("Shell APIs registration: %s", e)
 
+        # Register OpenClaw + floating assistant APIs
+        try:
+            from integrations.openclaw.shell_openclaw_apis import (
+                register_openclaw_routes)
+            register_openclaw_routes(app)
+        except Exception as e:
+            logger.warning("OpenClaw APIs registration: %s", e)
+
+        # Register HART onboarding ceremony APIs
+        try:
+            from integrations.agent_engine.onboarding_routes import (
+                register_onboarding_routes)
+            register_onboarding_routes(app)
+        except Exception as e:
+            logger.warning("Onboarding APIs registration: %s", e)
+
         return app
 
     # ─── Serve ────────────────────────────────────────────────
@@ -3211,10 +4366,10 @@ if(!PERF.potato) {{
             logger.warning("Platform boot: %s", e)
 
         def _model_check_loop():
-            import requests
+            from core.http_pool import pooled_get
             while self._running:
                 try:
-                    resp = requests.get(
+                    resp = pooled_get(
                         f'http://localhost:{self.model_bus_port}/v1/status',
                         timeout=3)
                     self._model_available = (

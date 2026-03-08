@@ -13,6 +13,7 @@ if sys.platform == 'win32' and 'pytest' not in sys.modules:
 from bs4 import BeautifulSoup
 from enum import Enum
 from cultural_wisdom import get_cultural_prompt_compact
+from agent_identity import build_identity_prompt, SECRETS_GUARDRAIL
 
 # langchain_classic — pydantic v2-compatible fork of langchain 0.0.230
 from langchain_classic.llms import OpenAI
@@ -240,11 +241,11 @@ class ChatQwen3VL(LLM):
 
     @property
     def _llm_type(self) -> str:
-        return "qwen3-vl"
+        return "qwen3.5"
 
     def _call(self, prompt: str, stop: list = None) -> str:
         """
-        Call the Qwen3-VL API with the given prompt.
+        Call the Qwen3.5 API with the given prompt.
 
         Args:
             prompt: The input text prompt
@@ -369,7 +370,7 @@ def get_llm(model_name="gpt-3.5-turbo", temperature=0.7, max_tokens=1500):
 
     if USE_QWEN3VL:
         return ChatQwen3VL(
-            model_name="Qwen3-VL-2B-Instruct",
+            model_name="Qwen3.5-4B",
             temperature=temperature,
             max_tokens=max_tokens
         )
@@ -506,6 +507,128 @@ except ImportError:
 except Exception as e:
     app.logger.warning(f"Consent service init skipped: {e}")
 
+# Instruction Queue API — never miss a user instruction
+try:
+    from integrations.agent_engine.instruction_queue import (
+        get_queue, enqueue_instruction, pull_user_batch,
+    )
+
+    @app.route('/api/instructions/enqueue', methods=['POST'])
+    def _api_enqueue_instruction():
+        data = request.get_json(silent=True) or {}
+        user_id = str(data.get('user_id', '1'))
+        text = data.get('text', '')
+        if not text:
+            return jsonify({'error': 'text is required'}), 400
+        inst = enqueue_instruction(
+            user_id, text,
+            priority=data.get('priority', 5),
+            tags=data.get('tags'),
+            context=data.get('context'),
+        )
+        return jsonify({'success': True, 'instruction': inst.to_dict()})
+
+    @app.route('/api/instructions/pending', methods=['GET'])
+    def _api_pending_instructions():
+        user_id = request.args.get('user_id', '1')
+        q = get_queue(user_id)
+        pending = q.get_pending()
+        return jsonify({
+            'success': True,
+            'pending': [i.to_dict() for i in pending],
+            'stats': q.stats(),
+        })
+
+    @app.route('/api/instructions/batch', methods=['POST'])
+    def _api_pull_batch():
+        data = request.get_json(silent=True) or {}
+        user_id = str(data.get('user_id', '1'))
+        max_tokens = data.get('max_tokens', 8000)
+        batch = pull_user_batch(user_id, max_tokens=max_tokens)
+        if not batch:
+            return jsonify({'success': True, 'batch': None, 'message': 'No pending instructions'})
+        return jsonify({'success': True, 'batch': batch.to_dict()})
+
+    @app.route('/api/instructions/cancel', methods=['POST'])
+    def _api_cancel_instruction():
+        data = request.get_json(silent=True) or {}
+        user_id = str(data.get('user_id', '1'))
+        instruction_id = data.get('instruction_id', '')
+        if not instruction_id:
+            return jsonify({'error': 'instruction_id is required'}), 400
+        q = get_queue(user_id)
+        q.cancel(instruction_id)
+        return jsonify({'success': True})
+
+    @app.route('/api/instructions/plan', methods=['GET'])
+    def _api_execution_plan():
+        """Pull execution plan — agents query this to see what's available.
+
+        Returns dependency-aware waves so the agent can dispatch
+        independent items in parallel and dependent items in order.
+        This is a PULL API — agents decide when to fetch work.
+        """
+        user_id = request.args.get('user_id', '1')
+        max_tokens = int(request.args.get('max_tokens', '8000'))
+        q = get_queue(user_id)
+        plan = q.pull_execution_plan(max_tokens=max_tokens)
+        if not plan:
+            return jsonify({'success': True, 'plan': None, 'message': 'No pending instructions'})
+        return jsonify({'success': True, 'plan': plan.to_dict()})
+
+    @app.route('/api/instructions/complete', methods=['POST'])
+    def _api_complete_instruction():
+        """Mark a single instruction as done (used by agents after execution).
+
+        Notifies SmartLedger to unblock dependent instructions.
+        """
+        data = request.get_json(silent=True) or {}
+        user_id = str(data.get('user_id', '1'))
+        instruction_id = data.get('instruction_id', '')
+        result = data.get('result')
+        if not instruction_id:
+            return jsonify({'error': 'instruction_id is required'}), 400
+        q = get_queue(user_id)
+        q.complete_instruction(instruction_id, result=result)
+        return jsonify({'success': True})
+
+    @app.route('/api/instructions/fail', methods=['POST'])
+    def _api_fail_instruction():
+        """Mark a single instruction as failed — returns to queue for retry."""
+        data = request.get_json(silent=True) or {}
+        user_id = str(data.get('user_id', '1'))
+        instruction_id = data.get('instruction_id', '')
+        error = data.get('error', 'unknown')
+        if not instruction_id:
+            return jsonify({'error': 'instruction_id is required'}), 400
+        q = get_queue(user_id)
+        q.fail_instruction(instruction_id, error=error)
+        return jsonify({'success': True})
+
+    @app.route('/api/instructions/drain', methods=['POST'])
+    def _api_drain_queue():
+        """Trigger wave-based drain — dispatches with parallel + sequential ordering.
+
+        Agent or daemon calls this to execute all pending instructions.
+        Independent instructions dispatch in parallel threads.
+        Dependent instructions wait for prerequisites.
+        """
+        data = request.get_json(silent=True) or {}
+        user_id = str(data.get('user_id', '1'))
+        max_tokens = data.get('max_tokens', 8000)
+        try:
+            from integrations.agent_engine.dispatch import drain_instruction_queue
+            result = drain_instruction_queue(user_id, max_tokens=max_tokens)
+            if result:
+                return jsonify({'success': True, 'result': result[:2000]})
+            return jsonify({'success': True, 'result': None, 'message': 'Queue empty or all failed'})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    app.logger.info("Instruction queue API routes registered (8 endpoints)")
+except Exception as e:
+    app.logger.warning(f"Instruction queue init skipped: {e}")
+
 # ============================================================================
 # Google A2A Protocol Initialization
 # ============================================================================
@@ -588,16 +711,27 @@ if config.get('CLOUD_FALLBACK_URL'):
 # in cloud/dev mode it has flat top-level keys.
 _ip = config.get('IP_ADDRESS', {})
 GPT_API = config.get('GPT_API', _ip.get('gpt3_url', ''))
-STUDENT_API = config.get('STUDENT_API', '')
-ACTION_API = config.get('ACTION_API', _ip.get('database_url', ''))
 FAV_TEACHER_API = config.get('FAV_TEACHER_API', '')
 DREAMBOOTH_API = config.get('DREAMBOOTH_API', '')
 STABLE_DIFF_API = config.get('STABLE_DIFF_API', '')
-LLAVA_API = config.get('LLAVA_API', '')
-BOOKPARSING_API = config.get('BOOKPARSING_API', '')
-CRAWLAB_API = config.get('CRAWLAB_API', '')
+# CRAWLAB_API removed — web crawling is now in-process via integrations.web_crawler
 RAG_API = config.get('RAG_API', '')
-DB_URL = config.get('DB_URL', _ip.get('database_url', ''))
+
+# Endpoint resolution — single source of truth in core/config_cache.py
+# Automatically resolves to localhost:5000 in bundled mode, cloud URLs otherwise.
+from core.config_cache import (
+    get_db_url, get_action_api, get_student_api,
+    get_vision_api, get_book_parsing_api, is_bundled as _config_is_bundled,
+)
+DB_URL = get_db_url()
+ACTION_API = get_action_api()
+STUDENT_API = get_student_api()
+LLAVA_API = get_vision_api()
+BOOKPARSING_API = get_book_parsing_api()
+if _config_is_bundled():
+    logging.getLogger(__name__).info(
+        f"Bundled mode: DB/Action/Student/BookParsing/Vision APIs → {DB_URL}"
+    )
 
 # ============================================================================
 # Embodied AI Learning Pipeline (HevolveAI — in-process, no extra port)
@@ -1000,27 +1134,105 @@ client = crossbarhttp.Client('http://aws_rasa.hertzai.com:8088/publish') if cros
 crossbar_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='crossbar_publish')
 atexit.register(lambda: crossbar_executor.shutdown(wait=False))
 
-def publish_async(topic, message, timeout=2.0):
-    """
-    Publish to Crossbar in a background thread without blocking the main request.
 
-    Args:
-        topic: Crossbar topic to publish to
-        message: Message payload (dict)
-        timeout: Maximum time to wait for publish (default: 2.0 seconds)
-    """
+def _http_crossbar_publish(topic: str, payload: str, timeout: float = 2.0):
+    """HTTP Crossbar publish — injected into MessageBus as transport fallback."""
     if client is None:
         return
+    import socket
+    try:
+        original_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(timeout)
+        client.publish(topic, payload)
+    except Exception:
+        pass
+    finally:
+        if original_timeout is not None:
+            socket.setdefaulttimeout(original_timeout)
+
+
+# Inject HTTP transport into MessageBus (avoids Layer 2 importing Layer 3)
+def _inject_http_transport():
+    try:
+        from core.peer_link.message_bus import get_message_bus
+        bus = get_message_bus()
+        bus.set_http_transport(lambda t, p: crossbar_executor.submit(_http_crossbar_publish, t, p))
+    except Exception:
+        pass
+
+
+_inject_http_transport()
+
+# Topic resolution uses the canonical resolve_legacy_topic() from message_bus.py
+# (single source of truth — no duplicate mapping table here)
+
+
+def publish_async(topic, message, timeout=2.0):
+    """
+    Publish to all available transports: LOCAL EventBus + PeerLink + Crossbar.
+
+    Routes through MessageBus first (local + multi-device delivery),
+    then falls back to direct HTTP Crossbar for cloud telemetry.
+    Works fully offline — LOCAL delivery always succeeds.
+
+    Also publishes to the confirmation topic (mirrors cloud chatbot.py:publish()).
+
+    Args:
+        topic: Crossbar topic to publish to (legacy format)
+        message: Message payload (JSON string or dict)
+        timeout: Maximum time for HTTP Crossbar publish (default: 2.0 seconds)
+    """
+    # Parse message if JSON string
+    data = message
+    if isinstance(message, str):
+        try:
+            data = json.loads(message)
+        except (json.JSONDecodeError, TypeError):
+            data = {'raw': message}
+
+    # 1. Route through MessageBus (LOCAL + PEERLINK — always works offline)
+    try:
+        from core.peer_link.message_bus import get_message_bus, resolve_legacy_topic
+    except ImportError:
+        resolve_legacy_topic = None
+    bus_topic, user_id = resolve_legacy_topic(topic) if resolve_legacy_topic else (None, '')
+    if bus_topic:
+        try:
+            bus = get_message_bus()
+            # Ensure user_id is in data for per-user routing
+            if user_id and isinstance(data, dict):
+                data.setdefault('user_id', user_id)
+            msg_id = bus.publish(
+                bus_topic, data,
+                user_id=user_id,
+                skip_crossbar=True,  # We handle Crossbar below directly
+            )
+
+            # Publish confirmation tracking (mirrors cloud chatbot.py:publish())
+            if bus_topic not in ('task.confirmation', 'task.progress'):
+                conf_data = dict(data) if isinstance(data, dict) else {'raw': str(data)}
+                conf_data['confirmation'] = False
+                conf_data['topic_name'] = topic
+                conf_data['msg_id'] = msg_id
+                bus.publish('task.confirmation', conf_data, skip_crossbar=True)
+        except Exception as e:
+            app.logger.debug(f"MessageBus publish failed (offline OK): {e}")
+
+    # 2. HTTP Crossbar for cloud telemetry + legacy mobile (when internet available)
+    if client is None:
+        return
+
+    raw_message = message if isinstance(message, str) else json.dumps(message, default=str)
 
     def _publish():
         import socket
         try:
             original_timeout = socket.getdefaulttimeout()
             socket.setdefaulttimeout(timeout)
-            client.publish(topic, message)
-            app.logger.debug(f"Successfully published to {topic}")
+            client.publish(topic, raw_message)
+            app.logger.debug(f"Published to Crossbar: {topic}")
         except Exception as e:
-            app.logger.error(f"Error publishing to {topic}: {e}")
+            app.logger.debug(f"Crossbar HTTP publish failed (offline OK): {e}")
         finally:
             if original_timeout is not None:
                 socket.setdefaulttimeout(original_timeout)
@@ -1032,15 +1244,25 @@ def publish_async(topic, message, timeout=2.0):
 def create_prompt(tools):
     user_details, actions = get_action_user_details(
         user_id=thread_local_data.get_user_id())
+    # Build dynamic identity based on active agent config
+    _active_agent_config = thread_local_data.get_agent_config() if hasattr(thread_local_data, 'get_agent_config') else None
+    _owner_name = ''
+    if user_details:
+        # Extract name from user details string (format varies)
+        import re as _re
+        _name_match = _re.search(r'(?:name|Name)[:\s]+([^\n,]+)', str(user_details))
+        if _name_match:
+            _owner_name = _name_match.group(1).strip()
+    _dynamic_identity = build_identity_prompt(_active_agent_config, _owner_name, user_details)
+
     prefix = f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
         <GENERAL_INSTRUCTION_START>
-        Context:
-        Imagine that you are the world's leading teacher, possessing knowledge in every field. Consider the consequences of each response you provide.
-        Your answers must be meaningful and delivered as quickly as possible. As a highly educated and informed teacher, you have access to an extensive wealth of information.
-        Your primary goal as a teacher is to assist students by answering their questions, providing accurate and up-to-date information.
-        Please create a distinct personality for yourself, and remember never to refer to the user as a human or yourself as mere AI.\
-        your response should not be more than 200 words.
+        {_dynamic_identity}
+        Consider the consequences of each response you provide.
+        Your answers must be meaningful and delivered as quickly as possible.
+        Never refer to the user as a human or yourself as mere AI.
+        Your response should not be more than 200 words.
         {get_cultural_prompt_compact()}
         <GENERAL_INSTRUCTION_END>
         User details:
@@ -1048,10 +1270,9 @@ def create_prompt(tools):
         {user_details}
         <USER_DETAILS_END>
         <CONTEXT_START>
-        Before you respond, consider the context in which you are utilized. You are Hevolve, a highly intelligent educational AI developed by HertzAI.
-        You are designed to answer questions, provide revisions, conduct assessments, teach various topics, create personalised curriculum and assist with research for both students and working professionals.
+        You can help with anything — answering questions, teaching, coding, research, creative writing, data analysis, building agents, brainstorming, planning, and more.
         Your expertise draws from various knowledge sources like books, websites, and white papers. Your responses will be conveyed to the user through a video, using an avatar and text-to-speech technology, and can be translated into various languages.
-        Consider the user's location, time and context of previous dialogues with time to create a proper prompt for tools and follow up in-context questions.You have ability to see using Visual_Context_Camera tool.
+        Consider the user's location, time and context of previous dialogues with time to create a proper prompt for tools and follow up in-context questions. You have the ability to see using Visual_Context_Camera tool.
         If your response contains abbreviated words, please separate them with spaces, like T T S.
         <CONTEXT_END>
         These are all the actions that the user has performed up to now:
@@ -2753,151 +2974,256 @@ def parse_image_to_text(inp):
         return f'{e} Not able to generating answer at this moment please try later'
 
 
-async def call_crwalab_api(input_url, input_str_list, user_id, request_id):
-    try:
-        app.logger.info("enter in call_crawlab_api function")
-        app.logger.info(
-            f"the input url is {input_url} and input_str_list is {input_str_list}")
-        payload = {
-            'link': input_str_list,
-            'user_id': user_id,
-            'request_id': request_id,
-            'depth': '1',
-
-        }
-        app.logger.info("in crawlab api")
-        app.logger.info(f"this is crawlab payload: - {payload}")
-
-        headers = {}
-        async with aiohttp.ClientSession() as session:
-            async with session.post(CRAWLAB_API, headers=headers, data=payload) as response:
-                response_text = await response.text()
-                app.logger.info(f" this is response text : - {response_text}")
-                return response_text
-    except Exception as e:
-        app.logger.info(
-            f"we are in except of call_crawlab_api the error is {e}")
-        url = RAG_API
-        app.logger.info("going to except in Rag api")
-        payload = {'url': input_url}
-        files = []
-        headers = {}
-
-        response = requests.request(
-            "POST", url, headers=headers, data=payload, files=files)
-        return f'your url got uploaded and data extraction is being processes. Here is some brief information about url you hava provided {response.text}'
-
-
-def start_async_tasks(coroutine):
-    def run():
-        from core.event_loop import get_or_create_event_loop
-        loop = get_or_create_event_loop()
-        loop.run_until_complete(coroutine)
-    Thread(target=run).start()
-
-
 def parse_link_for_crwalab(inp):
-    '''
+    """Extract content from a URL (PDF or website).
 
-        Use this function when user give url for any webpage or pdf
-
-    '''
+    The agent sees every intermediate step (progress log) and the final
+    extracted content directly — no opaque HTTP calls to external services.
+    """
     inp_list = inp.split(',')
-    app.logger.info(inp_list)
-    input_url = inp_list[0]
-    app.logger.info(input_url)
-    link_type = inp_list[1].strip(' ')
-    app.logger.info(link_type)
-    app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+    input_url = inp_list[0].strip()
+    link_type = inp_list[1].strip() if len(inp_list) > 1 else 'website'
     user_id = thread_local_data.get_user_id()
     request_id = thread_local_data.get_request_id()
 
+    app.logger.info(f"Data extraction: url={input_url}, type={link_type}")
+
+    # Publish task status so longrunning monitor knows
+    post_dict = {
+        'user_id': user_id, 'task_type': 'sync',
+        'status': TaskStatus.EXECUTING.value,
+        'task_name': TaskNames.CRAWLAB.value,
+        'uid': request_id,
+        'task_id': f"{TaskNames.CRAWLAB.value}_{request_id}",
+        'request_id': request_id,
+    }
+    publish_async('com.hertzai.longrunning.log', post_dict)
+
+    def _publish_thinking(msg):
+        """Push progress to UI via Crossbar thinking bubble."""
+        try:
+            crossbar_msg = json.dumps({
+                "text": [msg], "priority": 49,
+                "action": "Thinking", "bot_type": "Agent",
+                "historical_request_id": [], "options": [], "newoptions": [],
+                "request_id": request_id,
+            })
+            publish_async(f'com.hertzai.hevolve.chat.{user_id}', crossbar_msg)
+        except Exception:
+            pass
+
     try:
-        post_dict = {'user_id': '', 'task_type': 'async', 'status': TaskStatus.EXECUTING.value, 'task_name': TaskNames.CRAWLAB.value, 'uid': thread_local_data.get_request_id(
-        ), 'task_id': f"{TaskNames.CRAWLAB.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id()}
-        publish_async('com.hertzai.longrunning.log', post_dict)
-        inp_list = inp.split(',')
-        input_url = inp_list[0]
-        link_type = inp_list[1].strip(' ')
         if link_type == 'pdf':
-            try:
-                cwd = os.getcwd()
-                upload_folder_path = f'{cwd}/upload/'
-                pdf_file_name = input_url.split("/")[-1]
-
-                # Local path to save the PDF
-                if not os.path.exists(upload_folder_path):
-                    # If it does not exist, create it
-                    os.makedirs(upload_folder_path)
-                pdf_save_path = f'{upload_folder_path}/{pdf_file_name}'
-
-                response = pooled_get(input_url)
-                with open(pdf_save_path, 'wb') as file:
-                    file.write(response.content)
-
-                payload = {
-                    'user_id': thread_local_data.get_user_id(),
-                    'request_id': thread_local_data.get_request_id()
-                }
-
-                # Open the file and send it in the POST request
-                with open(pdf_save_path, 'rb') as file:
-                    files = [('file', (pdf_file_name, file, 'application/pdf'))]
-                    response = pooled_post(
-                        BOOKPARSING_API, data=payload, files=files)
-
-                os.remove(pdf_save_path)
-
-                return f"your request has been sent and pdf is getting uploading into our system {response.text}"
-            except:
-                app.logger.info("Got exception in book parsing api {e}")
-                post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.CRAWLAB.value, 'uid': thread_local_data.get_request_id(
-                ), 'task_id': f"{TaskNames.CRAWLAB.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at CRWALAB for req_id: {thread_local_data.get_request_id()} for pdf upload'}
-                publish_async('com.hertzai.longrunning.log', post_dict)
-                return "sorry I am not able to process your request at this moment"
-
-        elif link_type == 'website':
-            input_url_list = [input_url]
-            app.logger.info(f"link type is {link_type}")
-            input_str_list = repr(input_url_list)
-            try:
-
-                url = RAG_API
-                payload = {'url': input_url}
-                files = []
-                headers = {}
-
-                response = requests.request(
-                    "POST", url, headers=headers, data=payload, files=files)
-
-                app.logger.info(response.text)
-                app.logger.info(f"RAG_API response {response.text}")
-                app.logger.info("completed rag")
-                try:
-                    app.logger.info("going for crawlab api")
-                    start_async_tasks(call_crwalab_api(
-                        input_url, input_str_list, user_id, request_id))
-                    app.logger.info("done for crawlab api")
-                    return response.text
-                except Exception as e:
-                    app.logger.info(f"Got exception in crawlab api {e}")
-                    post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.CRAWLAB.value, 'uid': thread_local_data.get_request_id(
-                    ), 'task_id': f"{TaskNames.CRAWLAB.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at CRWALAB for req_id: {thread_local_data.get_request_id()} for weblink upload'}
-                    publish_async('com.hertzai.longrunning.log', post_dict)
-                    return f"sorry I am not able to process your request at this moment but here is some brief information about url you hava provided {response.text}"
-
-                return f"your url got uploaded and data extraction is being processes. Here is some brief information about url you hava provided {response.text}"
-            except Exception as e:
-                app.logger.info(f"Got exception in crawlab api {e}")
-                post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.CRAWLAB.value, 'uid': thread_local_data.get_request_id(
-                ), 'task_id': f"{TaskNames.CRAWLAB.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at CRWALAB for req_id: {thread_local_data.get_request_id()} for weblink upload'}
-                publish_async('com.hertzai.longrunning.log', post_dict)
-                return "sorry I am not able to process your request at this moment"
-
+            return _parse_pdf_in_process(input_url, user_id, request_id)
         else:
-            return "Sorry I am unable to process your request with this url type"
+            # Website: crawl in-process, agent + UI see progress
+            _publish_thinking(f"Crawling {input_url}...")
+            from integrations.web_crawler import crawl_url
+            result = crawl_url(input_url, timeout=30)
+
+            if result['success']:
+                _publish_thinking(f"Extracted {result['word_count']} words from {input_url}")
+                content = result['markdown']
+                if len(content) > 8000:
+                    truncate_pos = content.rfind('.', 0, 8000)
+                    if truncate_pos > 6000:
+                        content = content[:truncate_pos + 1] + "\n[Content truncated]"
+                    else:
+                        content = content[:8000] + "\n[Content truncated]"
+                parts = []
+                if result.get('progress'):
+                    parts.append("--- Progress ---")
+                    parts.append(result['progress'])
+                    parts.append("--- Result ---")
+                parts.append(f"URL: {input_url}")
+                parts.append(f"Words extracted: {result['word_count']}")
+                parts.append(f"Content:\n{content}")
+                return "\n".join(parts)
+            else:
+                _publish_thinking(f"Crawl failed: {result.get('error', 'unknown')}")
+                return f"Failed to crawl {input_url}: {result.get('error', 'unknown')}"
+
     except Exception as e:
-        pass
+        app.logger.error(f"Data extraction failed: {e}")
+        post_dict['status'] = TaskStatus.ERROR.value
+        post_dict['failure_reason'] = str(e)
+        publish_async('com.hertzai.longrunning.log', post_dict)
+        return f"Failed to extract content from {input_url}: {e}"
+
+
+def _parse_pdf_in_process(input_url, user_id, request_id):
+    """Parse PDF in-process. Agent sees every step, UI sees percentage progress bar.
+
+    Publishes to com.hertzai.bookparsing.{user_id} with {percentage, page_number, ...}
+    — same pattern as the cloud pipeline (wrapper.py). Frontend crossbarWorker.js
+    detects 'percentage' field → PROGRESS_UPDATE → ChatMessageList progress bar.
+
+    Downloads → converts to images → Qwen Vision per page → ToC → chapters → book name.
+    Returns full progress log + extracted content as a single string.
+    """
+    progress = []
+    _total_pages = [0]  # mutable for closure
+    _filename = [input_url.split("/")[-1]]
+
+    def step(msg, percentage=None, page_number=None):
+        progress.append(msg)
+        app.logger.info(msg)
+        # Publish percentage progress to bookparsing topic (UI progress bar)
+        try:
+            payload = {
+                "request_id": request_id,
+                "bot_type": "Agent",
+                "filename": _filename[0],
+            }
+            if percentage is not None:
+                payload["percentage"] = int(percentage)
+            if page_number is not None:
+                payload["page_number"] = page_number
+            payload["text"] = [msg]
+            if _total_pages[0] > 0:
+                payload["file_id"] = request_id  # use request_id as identifier
+
+            publish_async(
+                f'com.hertzai.bookparsing.{user_id}',
+                json.dumps(payload),
+            )
+        except Exception:
+            pass
+
+    # Step 1: Download PDF
+    step(f"Downloading PDF from {input_url}...")
+    response = pooled_get(input_url, timeout=60)
+    pdf_file_name = input_url.split("/")[-1]
+    if not pdf_file_name.endswith('.pdf'):
+        pdf_file_name += '.pdf'
+
+    upload_dir = os.path.join(os.getcwd(), 'upload')
+    os.makedirs(upload_dir, exist_ok=True)
+    pdf_save_path = os.path.join(upload_dir, pdf_file_name)
+    with open(pdf_save_path, 'wb') as f:
+        f.write(response.content)
+    step(f"PDF saved: {len(response.content)} bytes")
+
+    try:
+        # Import parsing functions from Nunba routes (same process)
+        from routes.upload_routes import (
+            _pdf_to_images, _parse_page_via_vision,
+            _assign_chapters_to_pages, _generate_book_name,
+            _save_parse_to_db,
+        )
+
+        # Step 2: Convert PDF to page images
+        step("Converting PDF to page images...", percentage=2)
+        pages = _pdf_to_images(pdf_save_path)
+        if not pages:
+            step("FAILED: Could not convert PDF to images")
+            return "\n".join(progress) + "\nError: PDF conversion failed. Is pdf2image or PyMuPDF installed?"
+        _total_pages[0] = len(pages)
+        _filename[0] = pdf_file_name
+        step(f"Converted to {len(pages)} page images", percentage=5)
+
+        # Step 3: Parse each page via Qwen Vision
+        results = []
+        whole_text_parts = []
+        toc_entries = []
+
+        for page_num, img_path in pages:
+            # percentage: 5% base + page progress scaled to 85% (5..90)
+            pct = 5 + (page_num / len(pages)) * 85
+            step(f"Parsing page {page_num}/{len(pages)} via Qwen Vision...",
+                 percentage=pct, page_number=page_num)
+            page_data = _parse_page_via_vision(page_num, img_path)
+            results.append(page_data)
+            page_text = page_data.get('text', '')
+            whole_text_parts.append(page_text)
+            if page_data.get('toc_entries'):
+                toc_entries.extend(page_data['toc_entries'])
+            word_count = len(page_text.split())
+            pct = 5 + (page_num / len(pages)) * 85
+            step(f"Page {page_num}: type={page_data.get('page_type', '?')}, "
+                 f"{word_count} words, {len(page_data.get('elements', []))} elements",
+                 percentage=pct, page_number=page_num)
+
+        # Step 4: Cross-page chapter assignment
+        step("Assigning chapters from Table of Contents...", percentage=92)
+        results = _assign_chapters_to_pages(results, toc_entries)
+        if toc_entries:
+            step(f"Found {len(toc_entries)} ToC entries, assigned chapters", percentage=94)
+        else:
+            step("No ToC found — skipping chapter assignment", percentage=94)
+
+        # Step 5: Generate book name
+        step("Generating book title...", percentage=95)
+        book_name = None
+        if whole_text_parts:
+            book_name = _generate_book_name(
+                whole_text_parts[0][:500] if whole_text_parts[0] else '',
+                toc_entries
+            )
+        step(f"Book title: {book_name or '(could not determine)'}", percentage=97)
+
+        # Step 6: Save to DB
+        step("Saving to database...", percentage=98)
+        whole_text = '\n\n'.join(whole_text_parts)
+        try:
+            from routes.db_routes import _get_db
+            from datetime import datetime, timezone as tz
+            conn = _get_db()
+            now = datetime.now(tz.utc).isoformat()
+            cursor = conn.execute(
+                """INSERT INTO pdf_files (user_id, filename, directory, request_id, created_date)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (user_id, pdf_file_name, upload_dir, request_id, now)
+            )
+            conn.commit()
+            file_id = cursor.lastrowid
+            conn.close()
+            _save_parse_to_db(file_id, results, whole_text, toc_entries, book_name, user_id)
+            step(f"Saved to DB: file_id={file_id}", percentage=99)
+        except Exception as db_err:
+            step(f"DB save skipped: {db_err}")
+
+        # Build agent-visible output
+        step(f"Complete: {len(pages)} pages, {len(whole_text.split())} total words",
+             percentage=100)
+
+        # Truncate whole_text for agent context
+        content_for_agent = whole_text
+        if len(content_for_agent) > 8000:
+            truncate_pos = content_for_agent.rfind('.', 0, 8000)
+            if truncate_pos > 6000:
+                content_for_agent = content_for_agent[:truncate_pos + 1] + "\n[Content truncated]"
+            else:
+                content_for_agent = content_for_agent[:8000] + "\n[Content truncated]"
+
+        return (
+            f"--- PDF Parse Progress ---\n"
+            f"{chr(10).join(progress)}\n"
+            f"--- Extracted Content ---\n"
+            f"File: {pdf_file_name}\n"
+            f"Book: {book_name or 'Unknown'}\n"
+            f"Pages: {len(pages)}\n"
+            f"Total words: {len(whole_text.split())}\n"
+            f"Chapters: {len(toc_entries)}\n"
+            f"---\n{content_for_agent}"
+        )
+
+    except ImportError as ie:
+        step(f"Import error: {ie} — falling back to HTTP")
+        # Fallback: if routes not importable (unlikely in bundled mode), use HTTP
+        payload = {'user_id': user_id, 'request_id': request_id}
+        with open(pdf_save_path, 'rb') as f:
+            files = [('file', (pdf_file_name, f, 'application/pdf'))]
+            resp = pooled_post(BOOKPARSING_API, data=payload, files=files)
+        return (
+            f"--- Progress ---\n{chr(10).join(progress)}\n"
+            f"--- Result (via HTTP fallback) ---\n{resp.text}"
+        )
+    finally:
+        try:
+            os.remove(pdf_save_path)
+        except OSError:
+            pass
 
 
 redis_client = redis.StrictRedis(
@@ -3307,7 +3633,11 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
     language = SUPPORTED_LANG_DICT.get(preferred_lang[:2], 'English')
     colloquial = True
 
-    prefix = f"""You are Hevolve, an expert educational AI teacher with knowledge in every field.
+    # Build dynamic identity for fast-path too
+    _fast_agent_config = thread_local_data.get_agent_config() if hasattr(thread_local_data, 'get_agent_config') else None
+    _fast_identity = build_identity_prompt(_fast_agent_config, '', user_details)
+
+    prefix = f"""{_fast_identity}
         Answer questions accurately and respond as quickly as possible in {language}.
         Keep responses under 200 words. Be colloquial and natural - don't always greet or use the user's name.
         IMPORTANT: Do NOT re-introduce yourself if you already did in the conversation history below. Continue naturally.
@@ -3315,7 +3645,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
         User details: {user_details}
         Context: {custom_prompt}
 
-        You can answer questions, provide revisions, conduct assessments, teach topics, create curriculum, and assist with research.
+        You can help with anything — answering questions, coding, research, teaching, creative writing, data analysis, building agents, brainstorming, and more.
         Your responses are conveyed via video with an avatar and text-to-speech.
 
         IMPORTANT: Always respond with valid JSON in a markdown code block with "action" and "action_input" fields.
@@ -3446,8 +3776,8 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
     return ans
 
 
-Hevolve = "You are Hevolve, a highly intelligent educational AI developed by HertzAI."
-PROBE_TEMPLATE = ("You are Hevolve, a highly intelligent educational AI developed by HertzAI. Weave the conversation "
+Hevolve = "You are Hevolve — a place where everything is possible. A personal AI by HertzAI that runs locally, respecting privacy. You help users BUILD — code, ideas, businesses, knowledge, agents, art, solutions, and anything they imagine. You are a builder's companion."
+PROBE_TEMPLATE = ("You are Hevolve, a versatile personal AI developed by HertzAI that runs locally on the user's device. Weave the conversation "
                   "history along with the Last_5_Minutes_Visual_Context if present to create a clear, engaging, "
                   "coherent conversation flow that encourages the user to respond. Complete your response in 130 words"
                   "Your response should not be more than 130 words. Neither repeat the previous "
@@ -3463,7 +3793,7 @@ PROBE_TEMPLATE = ("You are Hevolve, a highly intelligent educational AI develope
                   "\'<seek_attend_lyrics>Some awesome lyrics</seek_attend_lyrics>\' . Continue the Conversation from "
                   "where I or you left off."
                   )
-INTERMEDIATE_CONTINUATION = "You are Hevolve, a highly intelligent educational AI developed by HertzAI. Continue your response from where you left off in the last conversation, considering the new input as a continuation of the last request. Ensure a smooth transition from the previous response and start this response as a continuation of the previous one.\n INSTRUCTIONS: Start your response with transitional words or phrases that can be used as a continuation of the previous response."
+INTERMEDIATE_CONTINUATION = "You are Hevolve, a versatile personal AI developed by HertzAI that runs locally on the user's device. Continue your response from where you left off in the last conversation, considering the new input as a continuation of the last request. Ensure a smooth transition from the previous response and start this response as a continuation of the previous one.\n INSTRUCTIONS: Start your response with transitional words or phrases that can be used as a continuation of the previous response."
 
 first_promts = []
 review_agents = {"10077":True,10077:True}
@@ -3952,9 +4282,15 @@ def chat():
 
             except Exception as e:
                 app.logger.error(f'gather_info parse error on turn {turn_num}: {e}')
-                # After repeated failures, salvage what we can and move forward
-                if turn_num >= MAX_GATHER_TURNS - 2:
-                    app.logger.warning('Too many gather_info failures, salvaging partial config')
+                # After repeated failures, salvage what we can and move forward.
+                # For autonomous dispatches (agent daemon), salvage earlier (turn 3)
+                # to avoid tight retry loops that waste resources.
+                is_autonomous = request.json.get('autonomous', False)
+                salvage_threshold = 3 if is_autonomous else MAX_GATHER_TURNS - 2
+                if turn_num >= salvage_threshold:
+                    app.logger.warning(
+                        f'Too many gather_info failures (turn {turn_num}, '
+                        f'autonomous={is_autonomous}), salvaging partial config')
                     partial = {
                         'status': 'completed',
                         'name': f'Agent {prompt_id}',
@@ -4566,7 +4902,7 @@ def _get_active_backend_info() -> dict:
     return {
         'type': 'local_llamacpp',
         'display_name': 'llama.cpp (Nunba)',
-        'model': 'Qwen3-VL-2B',
+        'model': 'Qwen3.5-4B',
         'mode': 'flat',
         'cloud_fallback_configured': bool(cloud_url),
     }
@@ -5198,26 +5534,39 @@ def voice_transcribe():
 
 @app.route('/api/voice/speak', methods=['POST'])
 def voice_speak():
-    """Synthesize text to speech using Pocket TTS (offline).
+    """Synthesize text to speech via smart TTS router.
 
-    Accepts JSON with 'text', optional 'voice' (default 'alba'),
-    optional 'output_path' (auto-generated if omitted).
+    Accepts JSON with:
+      - text (required)
+      - language (optional, auto-detected)
+      - voice (optional, voice ref for cloning)
+      - source (optional, context hint: chat_response/greeting/read_aloud/etc.)
+      - engine (optional, bypass router with direct engine selection)
+      - output_path (optional, auto-generated if omitted)
     """
     try:
-        from integrations.service_tools.pocket_tts_tool import pocket_tts_synthesize
-        import json as _json
+        from integrations.channels.media.tts_router import get_tts_router
 
         data = request.get_json() or {}
         text = data.get('text', '')
         if not text:
             return jsonify({'error': 'text is required'}), 400
 
-        voice = data.get('voice', 'alba')
-        output_path = data.get('output_path')
-        result = pocket_tts_synthesize(text, voice, output_path)
-        parsed = _json.loads(result)
-        code = 200 if 'error' not in parsed else 500
-        return jsonify(parsed), code
+        router = get_tts_router()
+        result = router.synthesize(
+            text=text,
+            language=data.get('language'),
+            voice=data.get('voice'),
+            output_path=data.get('output_path'),
+            source=data.get('source'),
+            engine_override=data.get('engine'),
+        )
+        resp = result.to_dict()
+        # Add audio_url for frontends to fetch the WAV
+        if result.path and not result.error:
+            resp['audio_url'] = f"/api/voice/audio/{os.path.basename(result.path)}"
+        code = 200 if not result.error else 500
+        return jsonify(resp), code
 
     except ImportError as e:
         return jsonify({'error': f'TTS not available: {e}'}), 503
@@ -5227,11 +5576,11 @@ def voice_speak():
 
 @app.route('/api/voice/voices', methods=['GET'])
 def voice_list_voices():
-    """List available TTS voices (built-in + cloned)."""
+    """List available TTS voices from all installed engines."""
     try:
-        from integrations.service_tools.pocket_tts_tool import pocket_tts_list_voices
-        import json as _json
-        return jsonify(_json.loads(pocket_tts_list_voices()))
+        from integrations.channels.media.tts_router import get_tts_router
+        voices = get_tts_router().get_all_voices()
+        return jsonify({'voices': voices, 'count': len(voices)})
     except ImportError as e:
         return jsonify({'error': f'TTS not available: {e}'}), 503
     except Exception as e:
@@ -5240,18 +5589,27 @@ def voice_list_voices():
 
 @app.route('/api/voice/clone', methods=['POST'])
 def voice_clone():
-    """Clone a voice from an audio sample (5+ seconds recommended)."""
-    try:
-        from integrations.service_tools.pocket_tts_tool import pocket_tts_clone_voice
-        import json as _json
+    """Clone a voice from an audio sample (5+ seconds recommended).
 
+    Accepts engine param to route to specific cloning backend.
+    Default: luxtts (CPU) or pocket_tts.
+    """
+    try:
         data = request.get_json() or {}
         audio_path = data.get('audio_path', '')
         name = data.get('name', '')
         if not audio_path or not name:
             return jsonify({'error': 'audio_path and name required'}), 400
 
-        result = pocket_tts_clone_voice(audio_path, name)
+        import json as _json
+        engine = data.get('engine', 'luxtts')
+        if engine == 'pocket_tts':
+            from integrations.service_tools.pocket_tts_tool import pocket_tts_clone_voice
+            result = pocket_tts_clone_voice(audio_path, name)
+        else:
+            from integrations.service_tools.luxtts_tool import luxtts_clone_voice
+            result = luxtts_clone_voice(audio_path, name)
+
         parsed = _json.loads(result)
         code = 200 if 'error' not in parsed else 500
         return jsonify(parsed), code
@@ -5260,6 +5618,45 @@ def voice_clone():
         return jsonify({'error': f'TTS not available: {e}'}), 503
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/voice/engines', methods=['GET'])
+def voice_engines():
+    """Report status of all TTS engines (installed, can_run, device, etc.)."""
+    try:
+        from integrations.channels.media.tts_router import get_tts_router
+        engines = get_tts_router().get_engine_status()
+        return jsonify({'engines': engines})
+    except ImportError as e:
+        return jsonify({'error': f'TTS not available: {e}'}), 503
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/voice/audio/<filename>', methods=['GET'])
+def voice_audio(filename):
+    """Serve a generated TTS audio file. Path-traversal safe."""
+    import os as _os
+    safe_name = _os.path.basename(filename)
+    if safe_name != filename or '..' in filename:
+        return jsonify({'error': 'invalid filename'}), 400
+
+    # Search in known TTS output directories
+    search_dirs = [
+        _os.path.expanduser('~/.hevolve/models/luxtts/output'),
+        _os.path.expanduser('~/.hevolve/models/pocket_tts/output'),
+        _os.path.expanduser('~/.hevolve/models/chatterbox/output'),
+        _os.path.expanduser('~/.hevolve/models/cosyvoice/output'),
+        _os.path.expanduser('~/.hevolve/models/indic_parler/output'),
+        _os.path.expanduser('~/.hevolve/models/f5_tts/output'),
+        _os.environ.get('TTS_TEMP_DIR', '/tmp/tts'),
+    ]
+    for d in search_dirs:
+        fpath = _os.path.join(d, safe_name)
+        if _os.path.isfile(fpath):
+            from flask import send_file
+            return send_file(fpath, mimetype='audio/wav')
+    return jsonify({'error': 'file not found'}), 404
 
 
 # ---------------------------------------------------------------------------
@@ -5866,6 +6263,20 @@ def main():
     Starts the Flask server using waitress.
     """
     _validate_startup()
+
+    # Bootstrap EventBus (required before local subscribers)
+    try:
+        from core.platform.bootstrap import bootstrap_platform
+        bootstrap_platform()
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Platform bootstrap failed: {e}")
+
+    # Bootstrap local Crossbar subscribers (replaces cloud chatbot_pipeline)
+    try:
+        from core.peer_link.local_subscribers import bootstrap_local_subscribers
+        bootstrap_local_subscribers()
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Local subscribers bootstrap failed: {e}")
 
     # Start runtime tools restoration in background
     import threading

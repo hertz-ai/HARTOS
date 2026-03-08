@@ -62,7 +62,12 @@ class VisionService:
             model_dir=minicpm_model_dir or MiniCPMInstaller().model_dir
         )
         self._config = self._load_config(config_path)
-        self._callback_url = callback_url or self._config.get('database_url')
+        # In bundled Nunba mode, use local server for action/DB callbacks
+        from core.config_cache import is_bundled, get_db_url
+        if not callback_url and is_bundled():
+            self._callback_url = get_db_url()
+        else:
+            self._callback_url = callback_url or self._config.get('database_url')
         self._trigger_manager = trigger_manager  # Optional TriggerManager
 
         self._minicpm_process: Optional[subprocess.Popen] = None
@@ -242,7 +247,7 @@ class VisionService:
                 user_id, desc, label='Screen Context',
                 zeroshot_label='Screen Reasoning'
             )
-            self._record_to_world_model(user_id, desc, 'screen')
+            self._record_to_world_model(user_id, desc, 'screen', frame_bytes)
             self._evaluate_visual_triggers(user_id, desc, 'screen')
             self._frames_described += 1
         return desc
@@ -573,7 +578,7 @@ class VisionService:
                             if desc:
                                 self.store.put_description(user_id, desc)
                                 self._post_description_to_db(user_id, desc)
-                                self._record_to_world_model(user_id, desc, 'camera')
+                                self._record_to_world_model(user_id, desc, 'camera', frame_bytes)
                                 self._save_to_memory_graph(user_id, desc, 'camera')
                                 self._emit_perception_event(user_id, desc, 'camera')
                                 self._evaluate_visual_triggers(
@@ -598,7 +603,7 @@ class VisionService:
                                     label='Screen Context',
                                     zeroshot_label='Screen Reasoning',
                                 )
-                                self._record_to_world_model(user_id, desc, 'screen')
+                                self._record_to_world_model(user_id, desc, 'screen', screen_bytes)
                                 self._save_to_memory_graph(user_id, desc, 'screen')
                                 self._emit_perception_event(user_id, desc, 'screen')
                                 self._evaluate_visual_triggers(
@@ -678,15 +683,47 @@ class VisionService:
     # ─── World Model Integration ───
 
     def _record_to_world_model(self, user_id: str, description: str,
-                                channel: str = 'camera'):
-        """Feed scene descriptions to world model for continuous learning."""
+                                channel: str = 'camera',
+                                frame_bytes: bytes = None):
+        """Feed scene descriptions AND raw frames to world model for learning.
+
+        Two data paths to HevolveAI:
+        1. Text description -> record_interaction() (language learning)
+        2. Raw frame bytes -> submit_sensor_frame() (visual prediction learning)
+        Both are needed: text for semantic understanding, frames for
+        autoregressive visual prediction error (predict next frame -> compare).
+        """
         try:
             from integrations.agent_engine.world_model_bridge import get_world_model_bridge
+            bridge = get_world_model_bridge()
             model_id = self._vision_backend.name if self._vision_backend else 'minicpm-v2'
-            get_world_model_bridge().record_interaction(
+
+            # 1. Text description (existing path)
+            bridge.record_interaction(
                 user_id=user_id, prompt_id=f'vision_{channel}',
                 prompt=f'[{channel}] describe what you see',
                 response=description, model_id=model_id)
+
+            # 2. Raw frame for visual encoding + autoregressive learning
+            # Only when frame bytes available and scene changed (caller already filtered)
+            if frame_bytes is not None:
+                # Submit async to avoid blocking description loop
+                self._flush_executor_submit(
+                    bridge.submit_sensor_frame,
+                    user_id, frame_bytes, channel,
+                    1.0 if channel == 'camera' else 0.0,
+                )
+        except Exception:
+            pass
+
+    def _flush_executor_submit(self, fn, *args):
+        """Submit work to a background thread (reuse VisionService's thread pool)."""
+        try:
+            import concurrent.futures
+            if not hasattr(self, '_frame_forward_executor'):
+                self._frame_forward_executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix='frame_fwd')
+            self._frame_forward_executor.submit(fn, *args)
         except Exception:
             pass
 

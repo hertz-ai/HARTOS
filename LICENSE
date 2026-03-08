@@ -1,21 +1,87 @@
-MIT License
+HART OS — Hevolve Hive Agentic Runtime
+Copyright (c) 2024-2026 Hevolve.ai and contributors
 
-Copyright (c) 2023 Abonia Sojasingarayar
+BUSINESS SOURCE LICENSE 1.1
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+Parameters:
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+  Licensor:           Hevolve.ai
+  Licensed Work:      HART OS (Hevolve Hive Agentic Runtime)
+  Additional Use Grant: Personal, non-commercial, academic, and research use
+  Change Date:        2030-01-01
+  Change License:     Apache License, Version 2.0
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+Terms:
+
+The Licensor hereby grants you the right to copy, modify, create derivative
+works, redistribute, and make non-production use of the Licensed Work. The
+Licensor may make an Additional Use Grant, above, permitting limited
+production use.
+
+Effective on the Change Date, or the fifth anniversary of the first publicly
+available distribution of a specific version of the Licensed Work under this
+License, whichever comes first, the Licensor hereby grants you rights under
+the terms of the Change License, and the rights granted in the paragraph
+above terminate.
+
+If your use of the Licensed Work does not comply with the requirements
+currently in effect as described in this License, you must purchase a
+commercial license from the Licensor, its affiliated entities, or authorized
+resellers, or you must refrain from using the Licensed Work.
+
+All copies of the original and modified Licensed Work, and derivative works
+of the Licensed Work, are subject to this License. This License applies
+separately for each version of the Licensed Work and the Change Date may
+vary for each version of the Licensed Work released by Licensor.
+
+You must conspicuously display this License on each original or modified
+copy of the Licensed Work. If you receive the Licensed Work in original or
+modified form from a third party, the terms and conditions set forth in this
+License apply to your use of that work.
+
+Any use of the Licensed Work in violation of this License will automatically
+terminate your rights under this License for the current and all other
+versions of the Licensed Work.
+
+ADDITIONAL CONDITIONS:
+
+  1. NO REBRANDING:
+     You may NOT rebrand, rename, or redistribute HART OS or any
+     substantial portion of it as a different operating system, platform,
+     or product. You may NOT remove, alter, or conceal HART OS branding,
+     origin markers, master key verification, or attribution notices.
+
+  2. NO COMPETING OS:
+     You may NOT use HART OS code to create a competing operating system
+     or agentic runtime platform offered as a product or service without
+     explicit written permission from Hevolve.ai.
+
+  3. MASTER KEY INTEGRITY:
+     The master key verification system, guardrail hash chain, and origin
+     attestation are safety mechanisms. Tampering with, bypassing, removing,
+     or weakening these systems forfeits all rights under this License.
+
+  4. FEDERATION INTEGRITY:
+     Nodes joining the HART OS federation network MUST run unmodified,
+     master-key-verified builds. Modified builds that fail origin attestation
+     are rejected by the network by design.
+
+  5. ATTRIBUTION:
+     Any permitted use must preserve:
+     - "Built on HART OS by Hevolve.ai" attribution
+     - All copyright notices and license headers
+     - The master public key trust anchor
+
+  6. CONTRIBUTIONS:
+     By contributing to HART OS, you grant Hevolve.ai a perpetual,
+     irrevocable, worldwide, royalty-free license to use, modify, and
+     distribute your contributions as part of HART OS under any license.
+
+DISCLAIMER:
+
+  THE LICENSED WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+  EXPRESS OR IMPLIED. IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY
+  CLAIM, DAMAGES OR OTHER LIABILITY ARISING FROM THE LICENSED WORK.
+
+For commercial licensing: licensing@hevolve.ai
+For more information: https://mariadb.com/bsl11/

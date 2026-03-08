@@ -1090,4 +1090,132 @@ def register_shell_desktop_routes(app):
             'css_direction': 'rtl' if is_rtl else 'ltr',
         })
 
-    logger.info("Registered shell desktop routes (13 features)")
+    # ─── 10. Keyboard Shortcuts ────────────────────────────
+
+    # Two profiles: 'windows' (default) and 'mac'
+    # Users can switch between them without conflicts
+    _SHORTCUTS_CFG = _config_path('keyboard_shortcuts.json')
+
+    _SHORTCUT_PROFILES = {
+        'windows': {
+            'close_window': 'Alt+F4',
+            'minimize': 'Super+H',
+            'maximize': 'Super+Up',
+            'switch_apps': 'Alt+Tab',
+            'switch_windows': 'Alt+`',
+            'file_manager': 'Super+E',
+            'terminal': 'Ctrl+Alt+T',
+            'lock_screen': 'Super+L',
+            'search': 'Super+S',
+            'screenshot': 'Print',
+            'screenshot_window': 'Alt+Print',
+            'screenshot_area': 'Shift+Print',
+            'workspace_left': 'Super+Ctrl+Left',
+            'workspace_right': 'Super+Ctrl+Right',
+            'move_workspace_left': 'Super+Shift+Left',
+            'move_workspace_right': 'Super+Shift+Right',
+            'snap_left': 'Super+Left',
+            'snap_right': 'Super+Right',
+            'overview': 'Super',
+            'app_grid': 'Super+A',
+            'task_manager': 'Ctrl+Shift+Escape',
+            'browser': 'Super+B',
+            'calculator': 'Super+C',
+            'copy': 'Ctrl+C',
+            'paste': 'Ctrl+V',
+            'cut': 'Ctrl+X',
+            'undo': 'Ctrl+Z',
+            'redo': 'Ctrl+Shift+Z',
+            'select_all': 'Ctrl+A',
+            'save': 'Ctrl+S',
+            'find': 'Ctrl+F',
+        },
+        'mac': {
+            'close_window': 'Super+W',
+            'minimize': 'Super+M',
+            'maximize': 'Super+Ctrl+F',
+            'switch_apps': 'Super+Tab',
+            'switch_windows': 'Super+`',
+            'file_manager': 'Super+Shift+F',
+            'terminal': 'Super+Space',
+            'lock_screen': 'Super+Ctrl+Q',
+            'search': 'Super+Space',
+            'screenshot': 'Super+Shift+3',
+            'screenshot_window': 'Super+Shift+4',
+            'screenshot_area': 'Super+Shift+5',
+            'workspace_left': 'Ctrl+Left',
+            'workspace_right': 'Ctrl+Right',
+            'move_workspace_left': 'Ctrl+Shift+Left',
+            'move_workspace_right': 'Ctrl+Shift+Right',
+            'snap_left': 'Super+Ctrl+Left',
+            'snap_right': 'Super+Ctrl+Right',
+            'overview': 'Super+Up',
+            'app_grid': 'F4',
+            'task_manager': 'Super+Alt+Escape',
+            'browser': 'Super+Shift+B',
+            'calculator': 'Super+Shift+C',
+            'copy': 'Super+C',
+            'paste': 'Super+V',
+            'cut': 'Super+X',
+            'undo': 'Super+Z',
+            'redo': 'Super+Shift+Z',
+            'select_all': 'Super+A',
+            'save': 'Super+S',
+            'find': 'Super+F',
+        },
+    }
+
+    @app.route('/api/shell/shortcuts', methods=['GET'])
+    def shell_shortcuts():
+        """Get current keyboard shortcuts with active profile."""
+        cfg = _load_json(_SHORTCUTS_CFG, {
+            'profile': 'windows',
+            'custom': {},
+        })
+        profile_name = cfg.get('profile', 'windows')
+        base = dict(_SHORTCUT_PROFILES.get(profile_name, _SHORTCUT_PROFILES['windows']))
+        # Custom overrides on top of profile
+        base.update(cfg.get('custom', {}))
+        return jsonify({
+            'profile': profile_name,
+            'available_profiles': list(_SHORTCUT_PROFILES.keys()),
+            'shortcuts': base,
+        })
+
+    @app.route('/api/shell/shortcuts/profile', methods=['POST'])
+    def shell_shortcuts_set_profile():
+        """Switch shortcut profile (windows or mac)."""
+        data = request.get_json(force=True)
+        profile = data.get('profile', 'windows')
+        if profile not in _SHORTCUT_PROFILES:
+            return jsonify({'error': f'Unknown profile: {profile}. '
+                           f'Available: {list(_SHORTCUT_PROFILES.keys())}'}), 400
+        cfg = _load_json(_SHORTCUTS_CFG, {'profile': 'windows', 'custom': {}})
+        cfg['profile'] = profile
+        _save_json(_SHORTCUTS_CFG, cfg)
+        return jsonify({'profile': profile, 'shortcuts': _SHORTCUT_PROFILES[profile]})
+
+    @app.route('/api/shell/shortcuts/set', methods=['POST'])
+    def shell_shortcuts_set():
+        """Set a custom keybinding (overrides profile default)."""
+        data = request.get_json(force=True)
+        action = data.get('action', '')
+        binding = data.get('binding', '')
+        if not action or not binding:
+            return jsonify({'error': 'action and binding required'}), 400
+        cfg = _load_json(_SHORTCUTS_CFG, {'profile': 'windows', 'custom': {}})
+        if 'custom' not in cfg:
+            cfg['custom'] = {}
+        cfg['custom'][action] = binding
+        _save_json(_SHORTCUTS_CFG, cfg)
+        return jsonify({'set': True, 'action': action, 'binding': binding})
+
+    @app.route('/api/shell/shortcuts/reset', methods=['POST'])
+    def shell_shortcuts_reset():
+        """Reset all custom overrides, revert to profile defaults."""
+        cfg = _load_json(_SHORTCUTS_CFG, {'profile': 'windows', 'custom': {}})
+        cfg['custom'] = {}
+        _save_json(_SHORTCUTS_CFG, cfg)
+        return jsonify({'reset': True, 'profile': cfg['profile']})
+
+    logger.info("Registered shell desktop routes (14 features)")

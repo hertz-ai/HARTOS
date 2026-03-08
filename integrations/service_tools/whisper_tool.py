@@ -1,24 +1,21 @@
 """
-STT tool — in-process speech-to-text via sherpa-onnx (preferred) or openai-whisper (fallback).
+STT tool — in-process speech-to-text.
 
-sherpa-onnx benefits:
-  - No PyTorch dependency (~30MB wheel vs ~2GB PyTorch)
-  - 3-5x faster on CPU (ONNX INT8 quantization)
-  - Streaming support (OnlineRecognizer for real-time mic input)
-  - Multilingual (Whisper ONNX) + fast English (Moonshine)
-  - Runs on lite capability tier hardware (4GB RAM)
-  - 100% local, zero cloud costs — Nunba is forever free
+Engine priority (first available wins):
+  1. faster-whisper (CTranslate2) — preferred, 4x faster than openai-whisper,
+     multilingual, GPU+CPU, auto-downloads models from HuggingFace.
+  2. sherpa-onnx — lightweight ONNX alternative, no PyTorch dependency.
+  3. openai-whisper — legacy fallback (requires PyTorch).
 
 Model selection by hardware (via select_whisper_model):
-  - CPU, low RAM  → moonshine-tiny (69MB, English, fastest)
-  - CPU, 4-8GB    → whisper-tiny (145MB, multilingual) or moonshine-base (270MB, English)
-  - GPU, 2-5GB    → whisper-small (480MB, multilingual)
-  - GPU, 5-10GB   → whisper-medium (1.5GB, multilingual)
-  - GPU, 10+GB    → whisper-large-v3 (3GB, multilingual, best accuracy)
+  - CPU, low RAM  → tiny / moonshine-tiny (English, fastest)
+  - CPU, 4-8GB    → base / whisper-tiny (multilingual)
+  - GPU, 2-5GB    → small (multilingual)
+  - GPU, 5-10GB   → medium (multilingual)
+  - GPU, 10+GB    → large-v3 (multilingual, best accuracy)
 
 Models downloaded lazily on first use to ~/.hevolve/models/stt/
-
-Fallback: if sherpa-onnx not installed, uses openai-whisper (PyTorch).
+100% local, zero cloud costs — Nunba is forever free.
 """
 
 import json
@@ -125,9 +122,55 @@ _sherpa_model_name = None
 _whisper_model = None
 _whisper_model_name = None
 
+# faster-whisper (CTranslate2) — preferred engine
+_faster_whisper_model = None
+_faster_whisper_model_size = None
+
 
 # ═══════════════════════════════════════════════════════════════
-# Model download
+# faster-whisper (primary engine)
+# ═══════════════════════════════════════════════════════════════
+
+_FASTER_WHISPER_MODEL_SIZE = "base"  # CPU int8 — preserves GPU VRAM for TTS/VLM
+
+
+def _get_faster_whisper_model(model_size: str = "base"):
+    """Lazy-load faster-whisper model (CTranslate2, CPU int8, auto-downloads from HuggingFace)."""
+    global _faster_whisper_model, _faster_whisper_model_size
+    if _faster_whisper_model is not None and _faster_whisper_model_size == model_size:
+        return _faster_whisper_model
+
+    from faster_whisper import WhisperModel
+
+    logger.info(f"Loading faster-whisper model '{model_size}' on cpu (int8)...")
+    _faster_whisper_model = WhisperModel(
+        model_size, device="cpu", compute_type="int8"
+    )
+    _faster_whisper_model_size = model_size
+    logger.info(f"faster-whisper model '{model_size}' loaded")
+    return _faster_whisper_model
+
+
+def _faster_whisper_transcribe(audio_path: str, language: str = None) -> Optional[str]:
+    """Transcribe using faster-whisper. Returns JSON string or None on failure."""
+    try:
+        model = _get_faster_whisper_model(_FASTER_WHISPER_MODEL_SIZE)
+        kwargs = {"beam_size": 5}
+        if language:
+            kwargs["language"] = language
+        segments, info = model.transcribe(audio_path, **kwargs)
+        text = " ".join(seg.text for seg in segments).strip()
+        return json.dumps({
+            "text": text,
+            "language": info.language if info.language else "unknown",
+        })
+    except Exception as e:
+        logger.warning(f"faster-whisper transcription failed: {e}")
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════
+# Model download (sherpa-onnx)
 # ═══════════════════════════════════════════════════════════════
 
 def _get_stt_dir() -> Path:
@@ -298,10 +341,11 @@ def _select_legacy_model() -> str:
 # ═══════════════════════════════════════════════════════════════
 
 def select_whisper_model() -> str:
-    """Select best STT model for this hardware.
+    """Select best sherpa-onnx STT model for this hardware (fallback path).
 
     Returns a model name from _SHERPA_MODELS if sherpa-onnx is available,
     otherwise falls back to openai-whisper model names.
+    Primary engine is faster-whisper (base, CPU int8).
     """
     try:
         import sherpa_onnx  # noqa: F401 — check availability
@@ -329,10 +373,7 @@ def select_whisper_model() -> str:
 def whisper_transcribe(audio_path: str, language: str = None) -> str:
     """Transcribe audio file to text.
 
-    Tries sherpa-onnx first (faster, lighter), falls back to openai-whisper.
-
-    For non-English audio: automatically routes to a multilingual Whisper model
-    even if select_whisper_model() chose Moonshine (English-only).
+    Engine priority: faster-whisper → sherpa-onnx → openai-whisper.
 
     Args:
         audio_path: Path to audio file (WAV, MP3, WebM, etc.)
@@ -341,7 +382,18 @@ def whisper_transcribe(audio_path: str, language: str = None) -> str:
     Returns:
         JSON string with 'text' and 'language' keys.
     """
-    # Try sherpa-onnx (preferred — faster, no PyTorch)
+    # 1. Try faster-whisper (preferred — CTranslate2, 4x faster, multilingual)
+    try:
+        import faster_whisper  # noqa: F401
+        result = _faster_whisper_transcribe(audio_path, language)
+        if result:
+            return result
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.warning(f"faster-whisper failed, trying fallback: {e}")
+
+    # 2. Try sherpa-onnx (lightweight ONNX, no PyTorch)
     try:
         import sherpa_onnx  # noqa: F401
 
@@ -356,25 +408,23 @@ def whisper_transcribe(audio_path: str, language: str = None) -> str:
         result = _sherpa_transcribe(audio_path, model_name)
         if result:
             return result
-        # sherpa-onnx failed — fall through to legacy
     except ImportError:
         pass
     except Exception as e:
-        logger.warning(f"sherpa-onnx unavailable, trying openai-whisper: {e}")
+        logger.warning(f"sherpa-onnx failed, trying openai-whisper: {e}")
 
-    # Fallback: openai-whisper (PyTorch)
+    # 3. Fallback: openai-whisper (PyTorch)
     result = _legacy_transcribe(audio_path, language)
     if result:
         return result
 
-    return json.dumps({"error": "No STT engine available (install sherpa-onnx or openai-whisper)"})
+    return json.dumps({"error": "No STT engine available (install faster-whisper)"})
 
 
 def whisper_detect_language(audio_path: str) -> str:
     """Detect the language of an audio file.
 
-    Uses openai-whisper for language detection (sherpa-onnx doesn't have
-    a dedicated language detection API). Falls back to a default if unavailable.
+    Uses faster-whisper (preferred) or openai-whisper for language detection.
 
     Args:
         audio_path: Path to audio file.
@@ -382,6 +432,20 @@ def whisper_detect_language(audio_path: str) -> str:
     Returns:
         JSON string with 'language' and 'probability' keys.
     """
+    # Try faster-whisper first (has built-in language detection)
+    try:
+        from faster_whisper import WhisperModel  # noqa: F401
+        model = _get_faster_whisper_model(_FASTER_WHISPER_MODEL_SIZE)
+        _, info = model.transcribe(audio_path, beam_size=1)
+        return json.dumps({
+            "language": info.language if info.language else "unknown",
+            "probability": round(info.language_probability, 4) if info.language_probability else 0.0,
+        })
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.debug(f"faster-whisper language detection failed: {e}")
+
     try:
         import whisper
         model = _get_whisper_model()
@@ -416,20 +480,17 @@ def unload_whisper():
     """Unload all STT models to free memory."""
     global _sherpa_recognizer, _sherpa_model_name
     global _whisper_model, _whisper_model_name
+    global _faster_whisper_model, _faster_whisper_model_size
 
+    _faster_whisper_model = None
+    _faster_whisper_model_size = None
     _sherpa_recognizer = None
     _sherpa_model_name = None
     _whisper_model = None
     _whisper_model_name = None
 
-    try:
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-            torch.mps.empty_cache()
-    except ImportError:
-        pass
+    from .vram_manager import clear_cuda_cache
+    clear_cuda_cache()
     logger.info("STT models unloaded")
 
 

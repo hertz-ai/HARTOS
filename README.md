@@ -1,4 +1,4 @@
-# HART OS - Hevolve Agentic Runtime (OS)
+# HART OS - Hevolve Hive Agentic Runtime
 
 **Formerly Hevolve Hive Agents**
 
@@ -214,6 +214,7 @@ HART Platform
 │
 ├── Distributed Network
 │   ├── 3-Tier Hierarchy   - Central (hevolve.ai) → Regional → Local (Nunba)
+│   ├── PeerLink (HAP)     - Direct P2P WebSocket mesh, trust-aware encryption
 │   ├── Gossip Protocol    - Tier-aware with certificate verification
 │   └── Integrity Service  - Challenges, witnesses, fraud scoring
 │
@@ -224,6 +225,10 @@ HART Platform
     ├── 30+ Channel Adapters - Discord, Telegram, Slack, Matrix, etc.
     └── Coding Agent       - Idle compute contribution to the hive
 ```
+
+### HART Agent Protocol (PeerLink)
+
+Devices in the network communicate via **PeerLink** -- a direct peer-to-peer WebSocket mesh that works offline on LAN, across the internet, and on multi-device setups without a central broker. Encryption is trust-level-aware: same-user devices skip overhead, cross-user links get full E2E encryption. Crossbar is retained solely as a safety measure for kill-switch delivery and telemetry, not as the data path. See [PeerLink Technical Design](docs/architecture/peer_link.md) for the full specification.
 
 ---
 

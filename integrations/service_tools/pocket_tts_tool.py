@@ -311,14 +311,8 @@ def unload_pocket_tts():
     _tts_model = None
     _voice_states.clear()
 
-    try:
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-            torch.mps.empty_cache()
-    except ImportError:
-        pass
+    from .vram_manager import clear_cuda_cache
+    clear_cuda_cache()
 
     import gc
     gc.collect()

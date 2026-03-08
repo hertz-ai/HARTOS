@@ -23,6 +23,8 @@ import time
 import uuid
 import threading
 from collections import deque
+
+from core.port_registry import get_port
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Optional
 
@@ -269,7 +271,7 @@ class SpeculativeDispatcher:
                            goal_type: str, goal_id: str = None) -> str:
         """Send prompt to a specific model via /chat endpoint with config override."""
         import requests as req
-        base_url = os.environ.get('HEVOLVE_BASE_URL', 'http://localhost:6777')
+        base_url = os.environ.get('HEVOLVE_BASE_URL', f'http://localhost:{get_port("backend")}')
         try:
             resp = req.post(
                 f'{base_url}/chat',
@@ -293,18 +295,11 @@ class SpeculativeDispatcher:
     def _deliver_expert_response(self, user_id: str, prompt_id: str,
                                   speculation_id: str, response: str):
         """Dual-channel async delivery: Crossbar + Rasa HTTP."""
-        # Channel 1: Crossbar publish (WebSocket)
+        # Publish via canonical publish_async (MessageBus → Crossbar)
         try:
-            from create_recipe import publish_async
-            topic = f'com.sc.chat_agent_message.{user_id}_{prompt_id}'
+            from langchain_gpt_api import publish_async
+            topic = f'com.hertzai.hevolve.chat.{user_id}'
             publish_async(topic, response)
-        except Exception:
-            pass
-
-        # Channel 2: Rasa HTTP POST (fallback)
-        try:
-            from create_recipe import send_message_to_user1
-            send_message_to_user1(response)
         except Exception:
             pass
 

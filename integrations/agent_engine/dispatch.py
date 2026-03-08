@@ -21,6 +21,9 @@ import logging
 import requests
 from typing import Dict, List, Optional
 
+from core.http_pool import pooled_post
+from core.port_registry import get_port
+
 logger = logging.getLogger('hevolve_social')
 
 
@@ -288,7 +291,7 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
             logger.warning(f"Bundled dispatch failed for {goal_type} goal {goal_id}: {e}")
         return None
 
-    base_url = os.environ.get('HEVOLVE_BASE_URL', 'http://localhost:6777')
+    base_url = os.environ.get('HEVOLVE_BASE_URL', f'http://localhost:{get_port("backend")}')
     prompt_id = f"{goal_type}_{goal_id[:8]}"
 
     body = {
@@ -306,7 +309,7 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
         body['model_tier'] = _dispatch_model_tier.value
 
     try:
-        resp = requests.post(
+        resp = pooled_post(
             f'{base_url}/chat',
             json=body,
             timeout=120,
@@ -363,4 +366,159 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     except requests.RequestException as e:
         logger.warning(f"Goal dispatch failed for {goal_type} goal {goal_id}: {e}")
 
+        # Queue the instruction for later execution when compute becomes available
+        try:
+            from .instruction_queue import enqueue_instruction
+            enqueue_instruction(
+                user_id=user_id,
+                text=prompt[:2000],
+                priority=3,
+                tags=[goal_type],
+                context={
+                    'goal_id': goal_id,
+                    'goal_type': goal_type,
+                    'queued_reason': f'dispatch_failed: {e}',
+                },
+                related_goal_id=goal_id,
+            )
+            logger.info(f"Instruction queued for later: {goal_type} goal {goal_id}")
+        except Exception as eq:
+            logger.debug(f"Instruction queue unavailable: {eq}")
+
     return None
+
+
+def _dispatch_single_instruction(base_url: str, user_id: str, inst,
+                                  batch_id: str) -> tuple:
+    """Dispatch one instruction via /chat. Returns (instruction_id, response_text, error)."""
+    body = {
+        'user_id': user_id,
+        'prompt_id': f'iq_{batch_id}_{inst.id[:8]}',
+        'prompt': inst.text,
+        'create_agent': True,
+        'autonomous': True,
+        'casual_conv': False,
+        'task_source': 'own',
+    }
+    try:
+        resp = pooled_post(f'{base_url}/chat', json=body, timeout=300)
+        if resp.status_code == 200:
+            result_text = resp.json().get('response', '')
+            return (inst.id, result_text[:500], None)
+        return (inst.id, None, f'HTTP {resp.status_code}')
+    except requests.RequestException as e:
+        return (inst.id, None, str(e))
+
+
+def drain_instruction_queue(user_id: str, max_tokens: int = 8000) -> Optional[str]:
+    """Pull and execute queued instructions with dependency-aware dispatch.
+
+    Uses SmartLedger's dependency graph to determine execution order:
+    - Independent instructions dispatch in parallel (concurrent threads)
+    - Dependent instructions wait for prerequisites to complete first
+
+    Execution proceeds in waves:
+      Wave 0: all instructions with no dependencies → parallel dispatch
+      Wave 1: instructions depending on wave 0 → parallel dispatch
+      ...until all waves complete.
+
+    Falls back to single-batch dispatch when SmartLedger is unavailable.
+
+    Called by agent_daemon.py on idle tick, or manually via API.
+
+    Args:
+        user_id: User whose queue to drain
+        max_tokens: Max tokens across all instructions
+
+    Returns:
+        Combined response text, or None if queue empty or all failed
+    """
+    try:
+        from .instruction_queue import get_queue
+        q = get_queue(user_id)
+
+        # Acquire drain lock — prevents concurrent drains for same user
+        # (daemon tick + API call + another agent all trying simultaneously)
+        if not q.acquire_drain_lock():
+            logger.info(f"Drain skipped for {user_id}: another drain in progress")
+            return None
+
+        try:
+            # Try dependency-aware execution plan
+            plan = q.pull_execution_plan(max_tokens=max_tokens)
+            if plan is None:
+                return None
+
+            base_url = os.environ.get('HEVOLVE_BASE_URL', f'http://localhost:{get_port("backend")}')
+            all_results = []
+            any_success = False
+
+            logger.info(
+                f"Draining instruction queue for {user_id}: "
+                f"{plan.total_instructions} instructions in "
+                f"{len(plan.waves)} waves"
+            )
+
+            for wave_idx, wave in enumerate(plan.waves):
+                logger.info(
+                    f"Wave {wave_idx + 1}/{len(plan.waves)}: "
+                    f"{len(wave)} instruction(s)"
+                )
+
+                if len(wave) == 1:
+                    # Single instruction — dispatch directly (no thread pool overhead)
+                    inst = wave[0]
+                    iid, result, error = _dispatch_single_instruction(
+                        base_url, user_id, inst, plan.batch_id,
+                    )
+                    if error:
+                        q.fail_instruction(iid, error)
+                        logger.warning(f"Instruction [{iid}] failed: {error}")
+                    else:
+                        q.complete_instruction(iid, result)
+                        all_results.append(result)
+                        any_success = True
+                else:
+                    # Multiple independent instructions — dispatch in parallel.
+                    #
+                    # Thread safety:
+                    # - _dispatch_single_instruction() is a pure HTTP call (no shared state)
+                    # - Results collected via as_completed() on the CALLING thread
+                    # - q.complete/fail_instruction() acquires q._lock (serialized)
+                    # - SmartLedger mutations happen inside q._lock (no separate lock needed)
+                    # - File I/O uses atomic write (temp + rename)
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=min(len(wave), 4),
+                    ) as executor:
+                        futures = {
+                            executor.submit(
+                                _dispatch_single_instruction,
+                                base_url, user_id, inst, plan.batch_id,
+                            ): inst
+                            for inst in wave
+                        }
+                        for future in concurrent.futures.as_completed(futures):
+                            iid, result, error = future.result()
+                            if error:
+                                q.fail_instruction(iid, error)
+                                logger.warning(f"Instruction [{iid}] failed: {error}")
+                            else:
+                                q.complete_instruction(iid, result)
+                                all_results.append(result)
+                                any_success = True
+
+            if any_success:
+                combined = '\n---\n'.join(all_results)
+                logger.info(
+                    f"Plan {plan.batch_id} completed: "
+                    f"{len(all_results)}/{plan.total_instructions} succeeded"
+                )
+                return combined
+            return None
+        finally:
+            q.release_drain_lock()
+
+    except Exception as e:
+        logger.error(f"Queue drain error: {e}")
+        return None

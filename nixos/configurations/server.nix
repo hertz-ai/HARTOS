@@ -119,6 +119,11 @@
     settings.PermitRootLogin = lib.mkForce "yes";
     settings.PasswordAuthentication = lib.mkForce true;
     settings.UsePAM = lib.mkForce true;
+    # Belt-and-suspenders: extraConfig appends at END of sshd_config,
+    # so last-occurrence wins even if the module hardcodes UsePAM earlier.
+    extraConfig = ''
+      UsePAM yes
+    '';
   };
 
   # Fix: PAM pam_setcred() fails because pam_deny.so (required) in auth stack
@@ -141,7 +146,10 @@
     session optional pam_systemd.so
   '';
 
-  # Password: hart123 (SHA-512 hash — works on live ISO where every boot is "initial")
+  # Immutable passwords — NixOS generates /etc/shadow from these hashes exactly
+  users.mutableUsers = false;
+
+  # Password: hart123 (SHA-512 hash)
   users.users.root.hashedPassword = lib.mkForce "$6$AfVhhgH5HUHO0Dww$rb/YNzNp6Z29KRrjtweGvBj3Wh/7E92tFREXONqdHxvHFEa1y1rlk3hMbux9jE5NdycqpwQhHokxgdcX1SH6B.";
   users.users.nixos.hashedPassword = lib.mkForce "$6$AfVhhgH5HUHO0Dww$rb/YNzNp6Z29KRrjtweGvBj3Wh/7E92tFREXONqdHxvHFEa1y1rlk3hMbux9jE5NdycqpwQhHokxgdcX1SH6B.";
   users.users.nixos.openssh.authorizedKeys.keys = [
@@ -189,8 +197,12 @@ echo "--- passwd entries ---"
 getent passwd root 2>/dev/null || grep ^root: /etc/passwd
 getent passwd nixos 2>/dev/null || grep ^nixos: /etc/passwd
 getent passwd hart-admin 2>/dev/null || grep ^hart-admin: /etc/passwd
+echo "--- shadow (hash type only) ---"
+awk -F: '{if($2 ~ /^\$/) {split($2,a,"$"); printf "%s: $%s$ (len=%d)\n", $1, a[2], length($2)} else {printf "%s: [%s]\n", $1, $2}}' /etc/shadow 2>/dev/null
 echo "--- sshd_config snippet ---"
 grep -E "PermitRoot|Password|UsePAM|LogLevel|Subsystem|ForceCommand|MaxSessions|AllowUsers|DenyUsers" /etc/ssh/sshd_config 2>/dev/null
+echo "--- PAM sshd config ---"
+cat /etc/pam.d/sshd 2>/dev/null || echo "(no /etc/pam.d/sshd)"
 echo "--- sshd journal (last 100) ---"
 journalctl -u sshd.service --no-pager -n 100 2>&1
 echo "--- logind journal (last 20) ---"

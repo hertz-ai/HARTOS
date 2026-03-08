@@ -24,6 +24,8 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
+from core.port_registry import get_port
+
 logger = logging.getLogger('hevolve.compute_mesh')
 
 # ═══════════════════════════════════════════════════════════════
@@ -130,14 +132,14 @@ class ComputeMeshService:
 
     def discover_peers(self) -> List[Dict[str, Any]]:
         """Find same-user devices via discovery service."""
-        import requests
+        from core.http_pool import pooled_get
         from urllib.parse import urlparse
 
         discovered = []
 
         # Query local discovery service for peers
         try:
-            resp = requests.get('http://localhost:6777/api/social/peers', timeout=5)
+            resp = pooled_get(f'http://localhost:{get_port("backend")}/api/social/peers', timeout=5)
             if resp.status_code == 200:
                 peers = resp.json().get('peers', [])
                 for peer in peers:
@@ -155,7 +157,7 @@ class ComputeMeshService:
                     if peer_address and peer_id:
                         # Check if this peer supports mesh
                         try:
-                            mesh_resp = requests.get(
+                            mesh_resp = pooled_get(
                                 f'http://{peer_address}:{self.task_relay_port}/mesh/status',
                                 timeout=3,
                             )
@@ -192,8 +194,8 @@ class ComputeMeshService:
         prompt: str,
         options: Optional[dict] = None,
     ) -> Dict[str, Any]:
-        """Send inference request to a mesh peer."""
-        import requests
+        """Send inference request to a mesh peer — PeerLink first, HTTP fallback."""
+        from core.http_pool import pooled_post
 
         with self._lock:
             peer = self._peers.get(peer_id)
@@ -205,15 +207,34 @@ class ComputeMeshService:
             age = int(time.time() - peer.last_seen)
             return {'error': f'Peer {peer_id} is stale (last seen {age}s ago)'}
 
+        payload = {
+            'model_type': model_type,
+            'prompt': prompt,
+            'options': options or {},
+            'source_device': self._device_id,
+        }
+
+        # Try PeerLink first (encrypted for cross-user, plain for same-user)
         try:
-            resp = requests.post(
+            from core.peer_link.link_manager import get_link_manager
+            link = get_link_manager().get_link(peer_id)
+            if link:
+                result = link.send('compute', payload,
+                                  wait_response=True,
+                                  timeout=(options or {}).get('timeout', 120))
+                if result and 'error' not in result:
+                    result['offloaded_to'] = peer_id
+                    result['peer_address'] = peer.address
+                    result['transport'] = 'peerlink'
+                    return result
+        except Exception:
+            pass
+
+        # HTTP fallback
+        try:
+            resp = pooled_post(
                 f'http://{peer.address}:{self.task_relay_port}/mesh/infer',
-                json={
-                    'model_type': model_type,
-                    'prompt': prompt,
-                    'options': options or {},
-                    'source_device': self._device_id,
-                },
+                json=payload,
                 timeout=(options or {}).get('timeout', 120),
             )
 
@@ -259,12 +280,12 @@ class ComputeMeshService:
 
     def pair_device(self, peer_address: str) -> Dict[str, Any]:
         """Initiate pairing with a new device."""
-        import requests
+        from core.http_pool import pooled_post
 
         try:
             # Send pairing challenge
             challenge = hashlib.sha256(os.urandom(32)).hexdigest()
-            resp = requests.post(
+            resp = pooled_post(
                 f'http://{peer_address}:{self.task_relay_port}/mesh/pair',
                 json={
                     'action': 'challenge',
@@ -359,9 +380,9 @@ class ComputeMeshService:
             pass
 
         # Check which models are loaded
-        import requests
+        from core.http_pool import pooled_get as _pooled_get
         try:
-            resp = requests.get('http://localhost:6790/v1/models', timeout=3)
+            resp = _pooled_get(f'http://localhost:{get_port("model_bus")}/v1/models', timeout=3)
             if resp.status_code == 200:
                 models = resp.json().get('models', [])
                 caps['loaded_models'] = [m.get('type', 'unknown') for m in models]
@@ -422,7 +443,7 @@ class ComputeMeshService:
             import requests as req
             try:
                 resp = req.post(
-                    'http://localhost:6790/v1/chat',
+                    f'http://localhost:{get_port("model_bus")}/v1/chat',
                     json={'prompt': prompt, 'model_type': model_type},
                     timeout=120,
                 )

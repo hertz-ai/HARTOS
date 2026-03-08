@@ -207,8 +207,32 @@ def full_boot_verification(code_root: str = None) -> dict:
 
     # Step 3: Compare local code hash
     result = verify_local_code_matches_manifest(manifest, code_root)
+    if not result['verified']:
+        return {
+            'passed': False,
+            'enforcement': enforcement,
+            'details': result['details'],
+            'manifest': manifest,
+        }
+
+    # Step 4: Origin attestation — verify this is genuine HART OS
+    try:
+        from security.origin_attestation import verify_origin
+        origin = verify_origin(code_root)
+        if not origin['genuine']:
+            logger.warning(f"Origin attestation failed: {origin['details']}")
+            if enforcement == 'hard':
+                return {
+                    'passed': False,
+                    'enforcement': enforcement,
+                    'details': f"Origin attestation failed: {origin['details']}",
+                    'manifest': manifest,
+                }
+    except Exception as e:
+        logger.warning(f"Origin attestation check skipped: {e}")
+
     return {
-        'passed': result['verified'],
+        'passed': True,
         'enforcement': enforcement,
         'details': result['details'],
         'manifest': manifest,

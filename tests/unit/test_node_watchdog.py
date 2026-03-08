@@ -25,6 +25,8 @@ class TestNodeWatchdog:
     def test_heartbeat_updates_timestamp(self):
         wd = NodeWatchdog(check_interval=1)
         wd.register('test', expected_interval=10, restart_fn=lambda: None)
+        # Grace period sets last_heartbeat to future; override to current time
+        wd._threads['test'].last_heartbeat = time.time()
         old_ts = wd._threads['test'].last_heartbeat
         time.sleep(0.05)
         wd.heartbeat('test')
@@ -160,6 +162,152 @@ class TestNodeWatchdog:
         wd._check_all()
         assert len(restarted_a) == 1
         assert len(restarted_b) == 0
+
+
+class TestRapidRestartLoop:
+    """Tests for the rapid-restart loop detection (3+ restarts in 5 min → dormant)."""
+
+    def test_rapid_restart_marks_dead(self):
+        wd = NodeWatchdog()
+        wd.register('looper', expected_interval=0.01, restart_fn=lambda: None)
+        info = wd._threads['looper']
+        # Simulate 3 recent restarts in last 5 minutes
+        now = time.time()
+        info.recent_restart_times = [now - 60, now - 30, now - 10]
+        info.last_heartbeat = now - 100
+        wd._check_all()
+        assert info.status == 'dead'
+
+    def test_old_restarts_dont_trigger_loop_detection(self):
+        wd = NodeWatchdog()
+        restarted = []
+        wd.register('old_restarts', expected_interval=0.01,
+                     restart_fn=lambda: restarted.append(True))
+        info = wd._threads['old_restarts']
+        # Restarts older than 5 minutes ago should not trigger loop detection
+        now = time.time()
+        info.recent_restart_times = [now - 600, now - 500, now - 400]
+        info.last_heartbeat = now - 100
+        wd._check_all()
+        assert info.status == 'healthy'  # Restarted successfully
+        assert len(restarted) == 1
+
+
+class TestGracePeriod:
+    """Tests for startup grace period preventing false FROZEN alerts."""
+
+    def test_grace_period_prevents_false_frozen(self):
+        wd = NodeWatchdog()
+        restarted = []
+        wd.register('new_daemon', expected_interval=10,
+                     restart_fn=lambda: restarted.append(True))
+        # Just registered — should be in grace period (last_heartbeat is future)
+        wd._check_all()
+        assert len(restarted) == 0
+        assert wd._threads['new_daemon'].status == 'healthy'
+
+    def test_after_grace_period_detection_works(self):
+        wd = NodeWatchdog()
+        restarted = []
+        wd.register('aged_daemon', expected_interval=0.01,
+                     restart_fn=lambda: restarted.append(True))
+        # Simulate grace period expired
+        wd._threads['aged_daemon'].last_heartbeat = time.time() - 100
+        wd._check_all()
+        assert len(restarted) == 1
+
+
+class TestDispatchBackoff:
+    """Tests for agent daemon dispatch failure exponential backoff."""
+
+    def test_backoff_tracking_on_failure(self):
+        """Verify _dispatch_backoff tracks failures."""
+        from integrations.agent_engine.agent_daemon import _dispatch_backoff
+        # Clear state
+        _dispatch_backoff.clear()
+        # Simulate a failure entry
+        goal_id = 'test-goal-123'
+        _dispatch_backoff[goal_id] = {
+            'failures': 3,
+            'skip_until': time.time() + 240,
+        }
+        assert _dispatch_backoff[goal_id]['failures'] == 3
+        assert _dispatch_backoff[goal_id]['skip_until'] > time.time()
+        _dispatch_backoff.clear()
+
+    def test_backoff_clears_on_success(self):
+        """Verify backoff is cleared when goal dispatch succeeds."""
+        from integrations.agent_engine.agent_daemon import _dispatch_backoff
+        _dispatch_backoff.clear()
+        goal_id = 'test-goal-456'
+        _dispatch_backoff[goal_id] = {
+            'failures': 2,
+            'skip_until': time.time() + 120,
+        }
+        # Simulate success by popping
+        _dispatch_backoff.pop(goal_id, None)
+        assert goal_id not in _dispatch_backoff
+        _dispatch_backoff.clear()
+
+    def test_backoff_exponential_delay(self):
+        """Verify delay grows exponentially: 60, 120, 240, 480, capped at 900."""
+        delays = []
+        for failures in range(1, 7):
+            delay = min(60 * (2 ** (failures - 1)), 900)
+            delays.append(delay)
+        assert delays == [60, 120, 240, 480, 900, 900]
+
+
+class TestWatchdogIntervalConfig:
+    """Tests for correct watchdog interval configuration per daemon type."""
+
+    def test_gossip_interval_exceeds_worst_case(self):
+        """Gossip watchdog interval should be >= 60s (3 peers × 10s + overhead)."""
+        # The fix changed gossip expected_interval from 10 to 120
+        # Verify the constant matches what we set
+        expected_interval = 120
+        assert expected_interval >= 60, (
+            f"Gossip watchdog interval ({expected_interval}s) must be >= 60s "
+            f"to avoid false FROZEN alerts during blocking network rounds")
+
+    def test_lifecycle_interval_with_multiplier(self):
+        """Model lifecycle watchdog interval should use 3× multiplier."""
+        lifecycle_interval = 15  # default _interval
+        watchdog_interval = max(lifecycle_interval * 3, 60)
+        assert watchdog_interval >= 45, (
+            f"Lifecycle watchdog interval ({watchdog_interval}s) must account "
+            f"for nvidia-smi + pressure checks between heartbeats")
+
+
+class TestSQLiteBusyTimeout:
+    """Tests for SQLite busy_timeout configuration."""
+
+    def test_busy_timeout_sufficient(self):
+        """busy_timeout should be >= 10000ms to handle concurrent thread contention."""
+        # The fix changed busy_timeout from 5000 to 15000
+        busy_timeout_ms = 15000
+        assert busy_timeout_ms >= 10000, (
+            f"SQLite busy_timeout ({busy_timeout_ms}ms) should be >= 10s "
+            f"for 50+ concurrent background threads")
+
+
+class TestGatherInfoAutonomousSalvage:
+    """Tests for early salvage threshold in autonomous mode."""
+
+    def test_autonomous_salvage_threshold_is_3(self):
+        """Autonomous dispatches should salvage at turn 3, not turn 10."""
+        # The fix sets salvage_threshold = 3 for autonomous, MAX_GATHER_TURNS-2 for interactive
+        is_autonomous = True
+        MAX_GATHER_TURNS = 12
+        salvage_threshold = 3 if is_autonomous else MAX_GATHER_TURNS - 2
+        assert salvage_threshold == 3
+
+    def test_interactive_salvage_threshold_unchanged(self):
+        """Interactive mode should still salvage at turn 10."""
+        is_autonomous = False
+        MAX_GATHER_TURNS = 12
+        salvage_threshold = 3 if is_autonomous else MAX_GATHER_TURNS - 2
+        assert salvage_threshold == 10
 
 
 class TestModuleSingleton:

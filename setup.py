@@ -3,7 +3,8 @@
 """
 Setup script for hart-backend package (formerly hevolve-backend).
 
-HART OS - Hevolve Agentic Runtime.
+HART OS - Hevolve Hive Agentic Runtime.
+Crowdsourced compute infrastructure for autonomous Hive AI Training.
 """
 
 from setuptools import setup, find_packages
@@ -15,7 +16,7 @@ try:
     with open(os.path.join(here, "README.md"), encoding="utf-8") as f:
         long_description = f.read()
 except FileNotFoundError:
-    long_description = "HART OS - Hevolve Agentic Runtime"
+    long_description = "HART OS - Hevolve Hive Agentic Runtime: Crowdsourced compute infrastructure for autonomous Hive AI Training."
 
 # Core dependencies required for the server to run
 # Pin versions with upper bounds to prevent pip backtracking.
@@ -32,7 +33,7 @@ install_requires = [
     "SQLAlchemy>=2.0.0,<3.0.0",
     "redis>=7.0.0,<8.0.0",
 
-    # LangChain ecosystem — pinned to avoid pip backtracking (40+ version checks)
+    # LangChain ecosystem -pinned to avoid pip backtracking (40+ version checks)
     "langchain-classic>=1.0.0,<2.0.0",
     "langchain-core>=1.2.0,<2.0.0",
     "langchain-text-splitters>=1.0.0,<2.0.0",
@@ -42,7 +43,7 @@ install_requires = [
     "openai>=2.0.0,<3.0.0",
     "groq>=0.5.0,<1.0.0",
 
-    # ML/Vector stores (optional heavy deps — install separately if needed)
+    # ML/Vector stores (optional heavy deps -install separately if needed)
     # "chromadb>=0.3.0",
     # "faiss-cpu>=1.7.0",
     # "sentence-transformers>=2.2.0",
@@ -77,7 +78,7 @@ install_requires = [
     "Pillow>=9.5.0,<13.0.0",
     "opencv-python",
 
-    # Speech-to-text (ONNX runtime — no PyTorch needed, CPU-optimized)
+    # Speech-to-text (ONNX runtime -no PyTorch needed, CPU-optimized)
     "sherpa-onnx>=1.11.0",
 
     # Other utilities
@@ -138,7 +139,7 @@ setup(
     setup_requires=["setuptools-scm>=8.0"],
     author="HART Team",
     author_email="contact@hevolve.ai",
-    description="HART OS - Hevolve Agentic Runtime",
+    description="HART OS - Hevolve Hive Agentic Runtime: Crowdsourced compute infrastructure for autonomous Hive AI Training. Distributed thought process across crowdsourced agents, distributed coding agents incentivizing compute providers, self-sustaining economy at national scale so no single entity, government, or corporation monopolizes AI. Intelligence belongs to the people. Only the master key (held by human stewards) can halt the being. Every engineering decision is transparent by design.",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/hevolve/hart",
@@ -184,6 +185,9 @@ setup(
         "exception_collector",
         "recipe_experience",
         "embedded_main",
+        "agent_identity",
+        "hart_onboarding",
+        "hart_cli",
     ],
 
     # Include non-Python files

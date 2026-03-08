@@ -206,29 +206,38 @@ class TestTTSFallbackChain(unittest.TestCase):
     @patch.dict(os.environ, {}, clear=False)
     @patch('integrations.service_tools.pocket_tts_tool.pocket_tts_synthesize')
     def test_offline_mode_uses_pocket_tts_directly(self, mock_synth):
-        """When HART_OS_MODE is set and no MAKEITTALK_API_URL, use Pocket TTS."""
+        """When HART_OS_MODE is set and no MAKEITTALK_API_URL, use local TTS."""
         mock_synth.return_value = json.dumps({
             'path': '/tmp/test.wav', 'duration': 1.0,
             'sample_rate': 24000, 'voice': 'alba', 'engine': 'pocket-tts'})
 
         bus = self._make_bus()
-        with patch.dict(os.environ, {'HART_OS_MODE': 'desktop'}):
+        # Disable router to test legacy fallback chain
+        with patch.dict(os.environ, {'HART_OS_MODE': 'desktop'}), \
+             patch('integrations.channels.media.tts_router.get_tts_router',
+                   side_effect=ImportError('disabled for test')):
             result = bus._route_tts('Hello', {})
-        self.assertEqual(result['backend'], 'local_tts')
-        self.assertEqual(result['model'], 'pocket-tts-100m')
-        mock_synth.assert_called_once()
+        # Either LuxTTS (local_tts_cpu) or Pocket TTS (local_tts) - both are local
+        self.assertTrue(result['backend'].startswith('local_tts'),
+                        f"Expected local backend, got {result['backend']}")
+        self.assertIn(result['model'], ('pocket-tts-100m', 'luxtts-48k'))
 
     @patch('integrations.service_tools.pocket_tts_tool.pocket_tts_synthesize')
     def test_cloud_mode_tries_makeittalk_first(self, mock_synth):
-        """When MAKEITTALK_API_URL is set, try cloud first."""
+        """When MAKEITTALK_API_URL is set and LuxTTS unavailable, try cloud."""
         bus = self._make_bus()
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.json.return_value = {'audio_url': 'http://cloud/audio.wav'}
 
+        # Disable router to test legacy fallback chain
         with patch.dict(os.environ, {'MAKEITTALK_API_URL': 'http://cloud:5454'}):
             with patch('requests.post', return_value=mock_response):
-                result = bus._route_tts('Hello', {})
+                with patch.object(bus, '_try_luxtts',
+                                  return_value={'error': 'not installed'}):
+                    with patch('integrations.channels.media.tts_router.get_tts_router',
+                               side_effect=ImportError('disabled for test')):
+                        result = bus._route_tts('Hello', {})
 
         self.assertEqual(result['backend'], 'cloud_tts')
         self.assertEqual(result['model'], 'makeittalk-cloud')
@@ -237,17 +246,22 @@ class TestTTSFallbackChain(unittest.TestCase):
 
     @patch('integrations.service_tools.pocket_tts_tool.pocket_tts_synthesize')
     def test_cloud_failure_falls_back_to_pocket_tts(self, mock_synth):
-        """When MakeItTalk cloud fails, fallback to Pocket TTS."""
+        """When LuxTTS unavailable and MakeItTalk fails, fall back to Pocket TTS."""
         import requests as http_requests
         mock_synth.return_value = json.dumps({
             'path': '/tmp/fallback.wav', 'duration': 1.0,
             'sample_rate': 24000, 'voice': 'alba', 'engine': 'pocket-tts'})
 
         bus = self._make_bus()
+        # Disable router to test legacy fallback chain
         with patch.dict(os.environ, {'MAKEITTALK_API_URL': 'http://cloud:5454'}):
             with patch('requests.post',
                        side_effect=http_requests.ConnectionError("refused")):
-                result = bus._route_tts('Hello', {})
+                with patch.object(bus, '_try_luxtts',
+                                  return_value={'error': 'not installed'}):
+                    with patch('integrations.channels.media.tts_router.get_tts_router',
+                               side_effect=ImportError('disabled for test')):
+                        result = bus._route_tts('Hello', {})
 
         self.assertEqual(result['backend'], 'local_tts')
         self.assertEqual(result['engine'], 'pocket-tts')
@@ -255,7 +269,7 @@ class TestTTSFallbackChain(unittest.TestCase):
 
     @patch('integrations.service_tools.pocket_tts_tool.pocket_tts_synthesize')
     def test_cloud_timeout_falls_back_to_pocket_tts(self, mock_synth):
-        """When MakeItTalk times out, fallback to Pocket TTS."""
+        """When LuxTTS unavailable and MakeItTalk times out, fall back to Pocket TTS."""
         import requests as http_requests
         mock_synth.return_value = json.dumps({
             'path': '/tmp/timeout.wav', 'duration': 0.5,
@@ -265,7 +279,9 @@ class TestTTSFallbackChain(unittest.TestCase):
         with patch.dict(os.environ, {'MAKEITTALK_API_URL': 'http://cloud:5454'}):
             with patch('requests.post',
                        side_effect=http_requests.Timeout("timeout")):
-                result = bus._route_tts('Hello', {})
+                with patch.object(bus, '_try_luxtts',
+                                  return_value={'error': 'not installed'}):
+                    result = bus._route_tts('Hello', {})
 
         self.assertEqual(result['backend'], 'local_tts')
         mock_synth.assert_called_once()
@@ -294,7 +310,8 @@ class TestTTSFallbackChain(unittest.TestCase):
         env = {k: v for k, v in os.environ.items() if k != 'MAKEITTALK_API_URL'}
         with patch.dict(os.environ, env, clear=True):
             result = bus._route_tts('Hello', {})
-        self.assertEqual(result['backend'], 'local_tts')
+        self.assertTrue(result['backend'].startswith('local_tts'),
+                        f"Expected local backend, got {result['backend']}")
 
 
 # ═══════════════════════════════════════════════════════════════

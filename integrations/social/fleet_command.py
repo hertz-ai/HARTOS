@@ -77,19 +77,33 @@ class FleetCommandService:
         # Sign the command with this node's key
         signature = _sign_command(cmd_type, params, node_id)
 
+        issuer = issued_by or _get_self_node_id()
         cmd = FleetCommand(
             target_node_id=node_id,
             cmd_type=cmd_type,
             params_json=json.dumps(params),
-            issued_by=issued_by or _get_self_node_id(),
+            issued_by=issuer,
             signature=signature,
             status='pending',
         )
         db.add(cmd)
         db.flush()
 
+        cmd_dict = cmd.to_dict()
         logger.info(f"Fleet: queued {cmd_type} for node {node_id[:8]}...")
-        return cmd.to_dict()
+
+        # Push via MessageBus for instant WAMP delivery (DB is offline fallback)
+        try:
+            from core.peer_link.message_bus import get_message_bus
+            bus = get_message_bus()
+            bus.publish('fleet.command', {
+                **cmd_dict,
+                'params': params,
+            }, device_id=node_id)
+        except Exception:
+            pass  # DB queue is the durable fallback
+
+        return cmd_dict
 
     @staticmethod
     def push_broadcast(

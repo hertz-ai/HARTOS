@@ -69,6 +69,7 @@ AWARD_TABLE = {
     'compute_opt_in':           {'pulse': 25, 'spark': 50, 'xp': 50},
     'compute_hour':             {'spark': 10, 'xp': 20},
     'compute_day_streak':       {'spark': 25, 'pulse': 10, 'xp': 40},
+    'experiment_pledge':        {'pulse': 20, 'spark': 30, 'signal': 0.10, 'xp': 40},
     # Content sharing
     'content_shared':           {'spark': 5, 'xp': 10},
     'content_viral_10':         {'spark': 25, 'xp': 20},

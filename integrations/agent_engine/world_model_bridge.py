@@ -31,6 +31,8 @@ from typing import Dict, List, Optional
 
 import requests
 
+from core.http_pool import pooled_get, pooled_post
+
 logger = logging.getLogger('hevolve_social')
 
 
@@ -441,7 +443,7 @@ class WorldModelBridge:
                     'temperature': 0,
                     'max_tokens': 1,
                 }
-                requests.post(
+                pooled_post(
                     f'{self._api_url}/v1/chat/completions',
                     json=body,
                     timeout=self._timeout_flush,
@@ -536,7 +538,7 @@ class WorldModelBridge:
             return {'success': False, 'reason': 'Circuit breaker open'}
 
         try:
-            resp = requests.post(
+            resp = pooled_post(
                 f'{self._api_url}/v1/corrections',
                 json=body,
                 timeout=self._timeout_correction,
@@ -638,12 +640,28 @@ class WorldModelBridge:
             if not self._has_cloud_consent(user_id):
                 return None
 
+        # PeerLink path — collect thoughts from connected peers directly
+        try:
+            from core.peer_link.link_manager import get_link_manager
+            mgr = get_link_manager()
+            responses = mgr.collect('hivemind', timeout_ms=timeout_ms)
+            if responses:
+                with self._lock:
+                    self._stats['total_hivemind_queries'] += 1
+                return {
+                    'thoughts': responses,
+                    'source': 'peerlink',
+                    'peer_count': len(responses),
+                }
+        except Exception:
+            pass
+
         # HTTP fallback
         if self._cb_is_open():
             return None
 
         try:
-            resp = requests.post(
+            resp = pooled_post(
                 f'{self._api_url}/v1/hivemind/think',
                 json={'query': query_text[:2000], 'timeout_ms': timeout_ms},
                 timeout=max(30, timeout_ms / 1000 + 5),
@@ -684,7 +702,7 @@ class WorldModelBridge:
 
         # HTTP fallback
         try:
-            resp = requests.get(
+            resp = pooled_get(
                 f'{self._api_url}/v1/stats', timeout=self._timeout_default)
             if resp.status_code == 200:
                 result['learning'] = resp.json()
@@ -692,7 +710,7 @@ class WorldModelBridge:
             pass
 
         try:
-            resp = requests.get(
+            resp = pooled_get(
                 f'{self._api_url}/v1/hivemind/stats', timeout=self._timeout_default)
             if resp.status_code == 200:
                 result['hivemind'] = resp.json()
@@ -716,7 +734,7 @@ class WorldModelBridge:
 
         # HTTP fallback
         try:
-            resp = requests.get(
+            resp = pooled_get(
                 f'{self._api_url}/v1/hivemind/agents', timeout=self._timeout_default)
             if resp.status_code == 200:
                 data = resp.json()
@@ -811,7 +829,7 @@ class WorldModelBridge:
 
         # HTTP fallback
         try:
-            resp = requests.get(
+            resp = pooled_get(
                 f'{self._api_url}/health', timeout=5)
             if resp.status_code == 200:
                 data = resp.json() if resp.headers.get(
@@ -899,7 +917,7 @@ class WorldModelBridge:
             return False
 
         try:
-            resp = requests.post(
+            resp = pooled_post(
                 f'{self._api_url}/v1/actions',
                 json=action,
                 timeout=self._timeout_default,
@@ -949,7 +967,7 @@ class WorldModelBridge:
             return 0
 
         try:
-            resp = requests.post(
+            resp = pooled_post(
                 f'{self._api_url}/v1/sensors/batch',
                 json={'readings': readings},
                 timeout=self._timeout_flush,
@@ -989,7 +1007,7 @@ class WorldModelBridge:
             return None
 
         try:
-            resp = requests.get(
+            resp = pooled_get(
                 f'{self._api_url}/v1/feedback/latest',
                 timeout=self._timeout_default,
             )
@@ -1047,7 +1065,7 @@ class WorldModelBridge:
                 pass
 
         try:
-            resp = requests.post(
+            resp = pooled_post(
                 f'{self._api_url}/v1/actions/estop',
                 json=estop_action,
                 timeout=3,
@@ -1055,6 +1073,160 @@ class WorldModelBridge:
             return resp.status_code in (200, 201)
         except requests.RequestException:
             return False
+
+    # ─── Sensor frame forwarding to HevolveAI ────────────────────
+
+    def submit_sensor_frame(
+        self, user_id: str, frame_bytes: bytes,
+        channel: str = 'camera', reality_signature: float = 1.0,
+    ):
+        """Forward raw sensor frame to HevolveAI for visual encoding + learning.
+
+        HARTOS captures camera/screen frames locally. This method forwards
+        them to HevolveAI's /v1/sensor/ingest endpoint so the embodied AI
+        can: encode via Qwen -> predict next state -> compute error -> learn.
+
+        Called only on scene change (adaptive sampling) to avoid overwhelming
+        the learning pipeline.
+
+        In-process mode: calls learn_from_feedback directly with encoded frame.
+        HTTP mode: POST /v1/sensor/ingest with base64 data.
+        """
+        import base64
+
+        source = 'camera' if channel == 'camera' else 'screen'
+        sig = reality_signature if channel == 'camera' else 0.0
+
+        if self._in_process and self._provider:
+            # In-process: encode frame and feed through learning pipeline
+            try:
+                import torch
+                embodied = getattr(self._provider, 'embodied_agent', None)
+                encoder = getattr(embodied, 'encoder', None) if embodied else None
+                if encoder is None:
+                    encoder = getattr(self._provider, 'qwen_encoder', None)
+                if encoder is not None:
+                    from PIL import Image
+                    import io
+                    img = Image.open(io.BytesIO(frame_bytes)).convert('RGB')
+                    encoding = encoder.encode_image(img)
+
+                    # Route through embodied agent step() — same path as /v1/sensor/ingest
+                    if embodied is not None and hasattr(embodied, 'step'):
+                        from hevolveai.embodied_ai.types.sensor_input import SensorInput
+                        sensor = SensorInput(
+                            data=encoding if isinstance(encoding, torch.Tensor)
+                                 else torch.tensor(encoding).float(),
+                            input_type='encoded_features',
+                            modality='vision',
+                            metadata={'reality_signature': sig, 'source': source},
+                        )
+                        embodied.step(sensor)
+                    return
+            except Exception as e:
+                logger.debug(f"[WorldModelBridge] In-process sensor frame failed: {e}")
+
+        # HTTP fallback
+        if self._cb_is_open():
+            return
+
+        try:
+            data_b64 = base64.b64encode(frame_bytes).decode('ascii')
+            resp = pooled_post(
+                f'{self._api_url}/v1/sensor/ingest',
+                json={
+                    'modality': 'vision',
+                    'source': source,
+                    'data': data_b64,
+                    'format': 'jpeg',
+                    'session_id': f'{user_id}_{source}',
+                    'reality_signature': sig,
+                },
+                timeout=self._timeout_default,
+            )
+            if resp.status_code == 200:
+                self._cb_record_success()
+            else:
+                self._cb_record_failure()
+        except requests.RequestException:
+            self._cb_record_failure()
+
+    def submit_output_feedback(
+        self, output_modality: str, status: str, context: str,
+        model_used: str = 'unknown', error_message: str = None,
+        generation_time_seconds: float = 0.0, user_id: str = 'default',
+        generated_data: bytes = None, generated_format: str = None,
+    ):
+        """Report output modality generation result to HevolveAI for learning.
+
+        Routes through existing endpoints (no redundant API surface):
+        - Success with data: /v1/sensor/ingest (generated output = observation)
+        - Error/rejection: /v1/corrections (correction signal)
+        - Success without data: record_interaction (text experience)
+
+        Generated outputs are just observations with reality_signature=0.0.
+        Errors are corrections that teach modality routing.
+        """
+        import base64
+
+        # Success with generated data: treat as sensor observation
+        if status == 'completed' and generated_data is not None:
+            # Map modality format to sensor ingest format
+            modality_map = {
+                'image': 'vision',
+                'audio_speech': 'audio',
+                'audio_music': 'audio',
+                'video': 'vision',
+                'video_with_audio': 'multimodal',
+            }
+            sensor_modality = modality_map.get(output_modality, 'multimodal')
+            fmt = generated_format or 'jpeg'
+
+            if self._cb_is_open():
+                return
+
+            try:
+                data_b64 = base64.b64encode(generated_data).decode('ascii')
+                resp = pooled_post(
+                    f'{self._api_url}/v1/sensor/ingest',
+                    json={
+                        'modality': sensor_modality,
+                        'source': f'generated_{output_modality}',
+                        'data': data_b64,
+                        'format': fmt,
+                        'session_id': f'{user_id}_output_{output_modality}',
+                        'reality_signature': 0.0,
+                        'text': context[:500],
+                    },
+                    timeout=self._timeout_default,
+                )
+                if resp.status_code == 200:
+                    self._cb_record_success()
+                else:
+                    self._cb_record_failure()
+            except requests.RequestException:
+                self._cb_record_failure()
+            return
+
+        # Error/rejection: route as correction
+        if status in ('error', 'user_rejected') and error_message:
+            self.submit_correction(
+                original_response=f'[{output_modality}] {context[:500]}',
+                corrected_response=f'{output_modality} generation failed: {error_message}',
+                expert_id=user_id,
+                confidence=0.8 if status == 'user_rejected' else 0.5,
+            )
+            return
+
+        # Success without data or pending: record as text interaction
+        self.record_interaction(
+            user_id=user_id,
+            prompt_id=f'output_{output_modality}',
+            prompt=context[:2000],
+            response=f'[{output_modality} {status}] generated by {model_used} in {generation_time_seconds:.1f}s',
+            model_id=model_used,
+            latency_ms=generation_time_seconds * 1000,
+        )
 
     # ─── Federation support ───────────────────────────────────────
 

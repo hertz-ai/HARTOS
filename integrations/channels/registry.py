@@ -9,6 +9,7 @@ import asyncio
 import logging
 from typing import Dict, Optional, Callable, Any, List
 from dataclasses import dataclass, field
+from core.port_registry import get_port
 
 from .base import (
     ChannelAdapter,
@@ -25,10 +26,14 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ChannelRegistryConfig:
     """Configuration for channel registry."""
-    agent_callback_url: str = "http://localhost:6777/chat"
+    agent_callback_url: str = None
     default_user_id: int = 10077
     default_prompt_id: int = 8888
     enable_create_mode: bool = False
+
+    def __post_init__(self):
+        if self.agent_callback_url is None:
+            self.agent_callback_url = f"http://localhost:{get_port('backend')}/chat"
 
 
 class ChannelRegistry:

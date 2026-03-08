@@ -411,6 +411,24 @@ def generate_media(
 
     elapsed = round(time.time() - t0, 2)
     result['generation_time_seconds'] = elapsed
+
+    # Feed generation result to HevolveAI for dense error signal learning
+    # Success: generated output becomes prediction target
+    # Error: error pattern informs modality routing confidence
+    try:
+        from integrations.agent_engine.world_model_bridge import get_world_model_bridge
+        bridge = get_world_model_bridge()
+        bridge.submit_output_feedback(
+            output_modality=result.get('output_modality', modality),
+            status=result.get('status', 'error'),
+            context=context[:2000],
+            model_used=result.get('model_used', 'unknown'),
+            error_message=result.get('error'),
+            generation_time_seconds=elapsed,
+        )
+    except Exception as e:
+        logger.debug(f"[MediaAgent] Output feedback to HevolveAI skipped: {e}")
+
     return json.dumps(result)
 
 

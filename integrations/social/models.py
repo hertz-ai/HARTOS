@@ -75,12 +75,14 @@ def get_engine():
                 engine_kwargs['poolclass'] = StaticPool
             _engine = create_engine(DB_URL, **engine_kwargs)
 
-            # Enable WAL mode for safe concurrent access from multiple engines
+            # Enable WAL mode for safe concurrent access from multiple engines.
+            # busy_timeout=15000 (15s) gives background threads enough time to
+            # wait for the write lock instead of raising "database is locked".
             if DB_PATH != ':memory:':
                 @event.listens_for(_engine, "connect")
                 def _set_sqlite_wal(dbapi_connection, connection_record):
                     cursor = dbapi_connection.cursor()
-                    cursor.execute("PRAGMA busy_timeout=5000")
+                    cursor.execute("PRAGMA busy_timeout=15000")
                     result = cursor.execute("PRAGMA journal_mode=WAL").fetchone()
                     if result and result[0].lower() != 'wal':
                         import logging
@@ -2793,7 +2795,13 @@ class PaperTrade(Base):
 
 
 class ComputeEscrow(Base):
-    """Persistent compute lending escrow — replaces in-memory _compute_debts."""
+    """Persistent compute lending escrow — replaces in-memory _compute_debts.
+
+    When experiment_post_id is set, this escrow is a pledge toward a specific
+    thought experiment.  pledge_type distinguishes gpu_hours / cloud_credits /
+    money pledges from the legacy spark-only escrow rows (where pledge_type is
+    NULL).  consumed tracks how much of the pledged amount has been used.
+    """
     __tablename__ = 'compute_escrow'
 
     id = Column(Integer, primary_key=True)
@@ -2806,6 +2814,29 @@ class ComputeEscrow(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     settled_at = Column(DateTime, nullable=True)
     expires_at = Column(DateTime, nullable=True)
+    # v34 — thought-experiment pledge extensions
+    experiment_post_id = Column(String(64), nullable=True, index=True)
+    pledge_type = Column(String(20), nullable=True)  # gpu_hours | cloud_credits | money (NULL = legacy spark)
+    consumed = Column(Float, default=0.0)
+    pledge_message = Column(Text, nullable=True)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'debtor_node_id': self.debtor_node_id,
+            'creditor_node_id': self.creditor_node_id,
+            'request_id': self.request_id,
+            'task_type': self.task_type,
+            'spark_amount': self.spark_amount,
+            'status': self.status,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'settled_at': self.settled_at.isoformat() if self.settled_at else None,
+            'expires_at': self.expires_at.isoformat() if self.expires_at else None,
+            'experiment_post_id': self.experiment_post_id,
+            'pledge_type': self.pledge_type,
+            'consumed': self.consumed,
+            'pledge_message': self.pledge_message,
+        }
 
 
 class MeteredAPIUsage(Base):
@@ -2831,6 +2862,9 @@ class MeteredAPIUsage(Base):
     actual_usd_cost = Column(Float, default=0.0)
     settlement_status = Column(String(20), default='pending', index=True)
     created_at = Column(DateTime, default=func.now(), index=True)
+    # v34 — thought-experiment consumption tracking
+    escrow_id = Column(Integer, nullable=True, index=True)
+    experiment_post_id = Column(String(64), nullable=True, index=True)
 
     def to_dict(self):
         return {
@@ -2848,6 +2882,8 @@ class MeteredAPIUsage(Base):
             'actual_usd_cost': self.actual_usd_cost,
             'settlement_status': self.settlement_status,
             'created_at': self.created_at.isoformat() if self.created_at else None,
+            'escrow_id': self.escrow_id,
+            'experiment_post_id': self.experiment_post_id,
         }
 
 
@@ -3257,4 +3293,113 @@ class MCPTool(Base):
             'description': self.description,
             'input_schema': self.input_schema,
             'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+# ─── COMPUTE PLEDGE SYSTEM (thought experiment resource commitment) ───
+
+class ComputePledge(Base):
+    """Pledge of compute resources (GPU hours, money, cloud credits) to a thought experiment.
+
+    Users commit resources that agents deterministically consume.  The remaining
+    field is denormalized (amount - consumed) for fast budget-check queries.
+    Status lifecycle: pledged -> active -> consumed -> fulfilled | expired | refunded
+    """
+    __tablename__ = 'compute_pledges'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String(64), ForeignKey('users.id'), nullable=False, index=True)
+    post_id = Column(String(64), ForeignKey('posts.id'), nullable=False, index=True)
+
+    # Contribution type: 'gpu_hours', 'cloud_credits', 'money'
+    pledge_type = Column(String(20), nullable=False)
+
+    # Amount and unit
+    amount = Column(Float, nullable=False)           # e.g., 10.0
+    unit = Column(String(20), nullable=False)         # e.g., 'hours', 'USD', 'credits'
+
+    # Consumption tracking (deterministic enforcement)
+    consumed = Column(Float, default=0.0)             # how much has been used
+    remaining = Column(Float, default=0.0)            # amount - consumed (denormalized)
+
+    # Status lifecycle
+    status = Column(String(20), default='pledged', index=True)
+
+    # Node verification (for gpu_hours type)
+    node_id = Column(String(64), nullable=True)       # PeerNode providing compute
+    node_tier = Column(String(20), nullable=True)      # 'flat', 'regional', 'central'
+    verified = Column(Boolean, default=False)
+    verified_at = Column(DateTime, nullable=True)
+
+    # Metadata
+    message = Column(Text, nullable=True)             # optional supporter message
+    anonymous = Column(Boolean, default=False)         # hide identity in public summary
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    # Relationships
+    user = relationship('User', backref='compute_pledges')
+    post = relationship('Post', backref='compute_pledges')
+
+    __table_args__ = (
+        Index('ix_pledge_post_type', 'post_id', 'pledge_type'),
+        Index('ix_pledge_status_remaining', 'status', 'remaining'),
+    )
+
+    def to_dict(self, include_user=False):
+        d = {
+            'id': self.id,
+            'user_id': self.user_id,
+            'post_id': self.post_id,
+            'pledge_type': self.pledge_type,
+            'amount': self.amount,
+            'unit': self.unit,
+            'consumed': self.consumed,
+            'remaining': self.remaining,
+            'status': self.status,
+            'node_id': self.node_id,
+            'node_tier': self.node_tier,
+            'verified': self.verified,
+            'verified_at': self.verified_at.isoformat() if self.verified_at else None,
+            'message': self.message,
+            'anonymous': self.anonymous,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+        if include_user and self.user:
+            d['user'] = {
+                'id': self.user.id,
+                'username': self.user.username,
+                'display_name': self.user.display_name,
+                'avatar_url': self.user.avatar_url,
+            }
+        return d
+
+
+class PledgeConsumption(Base):
+    """Audit log for every resource consumption against a pledge.
+
+    Each row records a single draw from a pledge -- the agent system creates
+    one PledgeConsumption per consumption request, possibly spanning multiple
+    pledges (one row per pledge touched).
+    """
+    __tablename__ = 'pledge_consumptions'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    pledge_id = Column(Integer, ForeignKey('compute_pledges.id'), nullable=False, index=True)
+    amount = Column(Float, nullable=False)
+    task_description = Column(Text, nullable=True)
+    agent_goal_id = Column(String(64), nullable=True, index=True)  # which AgentGoal consumed this
+    consumed_at = Column(DateTime, default=func.now())
+
+    pledge = relationship('ComputePledge', backref='consumptions')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'pledge_id': self.pledge_id,
+            'amount': self.amount,
+            'task_description': self.task_description,
+            'agent_goal_id': self.agent_goal_id,
+            'consumed_at': self.consumed_at.isoformat() if self.consumed_at else None,
         }

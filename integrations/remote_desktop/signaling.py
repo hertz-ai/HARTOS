@@ -24,6 +24,7 @@ import uuid
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
+from core.port_registry import get_port
 
 logger = logging.getLogger('hevolve.remote_desktop')
 
@@ -78,7 +79,7 @@ class SignalingChannel:
             api_base: HTTP API base URL (e.g., 'http://localhost:6777')
         """
         self._device_id = device_id
-        self._api_base = api_base or 'http://localhost:6777'
+        self._api_base = api_base or f'http://localhost:{get_port("backend")}'
         self._wamp_session = None
         self._callback: Optional[Callable[[SignalingMessage], None]] = None
         self._pending_signals: List[SignalingMessage] = []

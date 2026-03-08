@@ -8,6 +8,7 @@ import secrets
 import logging
 import statistics
 import requests
+from core.http_pool import pooled_get, pooled_post
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List
 
@@ -130,7 +131,7 @@ class IntegrityService:
     def fetch_expected_hash(registry_url: str, version: str) -> Optional[str]:
         """GET expected code hash from central registry."""
         try:
-            resp = requests.get(
+            resp = pooled_get(
                 f"{registry_url}/api/social/integrity/expected-hash",
                 params={'version': version},
                 timeout=5,
@@ -181,7 +182,7 @@ class IntegrityService:
 
         # Send challenge to target node
         try:
-            resp = requests.post(
+            resp = pooled_post(
                 f"{target_url}/api/social/integrity/challenge",
                 json={'challenge_id': challenge.id, **challenge_data,
                       'challenger_node_id': challenger_node_id},
@@ -425,7 +426,7 @@ class IntegrityService:
             pass
 
         try:
-            resp = requests.post(
+            resp = pooled_post(
                 f"{peer.url}/api/social/integrity/witness-impression",
                 json=payload,
                 timeout=5,
@@ -515,7 +516,7 @@ class IntegrityService:
     def probe_peer_stats(peer_url: str, target_node_id: str) -> Optional[Dict]:
         """Query a peer for its view of a target node's stats."""
         try:
-            resp = requests.get(
+            resp = pooled_get(
                 f"{peer_url}/api/social/integrity/peer-stats",
                 params={'node_id': target_node_id},
                 timeout=5,
@@ -1102,7 +1103,7 @@ class IntegrityService:
             except Exception:
                 pass
             payload['signature'] = sign_json_payload(payload)
-            resp = requests.post(
+            resp = pooled_post(
                 f"{registry_url}/api/social/integrity/register-node",
                 json=payload,
                 timeout=10,
@@ -1115,7 +1116,7 @@ class IntegrityService:
     def check_registry_ban_list(registry_url: str) -> List[str]:
         """GET banned node_ids from registry."""
         try:
-            resp = requests.get(
+            resp = pooled_get(
                 f"{registry_url}/api/social/integrity/ban-list",
                 timeout=5,
             )
@@ -1129,7 +1130,7 @@ class IntegrityService:
     def pull_trusted_keys(registry_url: str) -> Dict[str, str]:
         """GET verified node public keys from registry."""
         try:
-            resp = requests.get(
+            resp = pooled_get(
                 f"{registry_url}/api/social/integrity/trusted-keys",
                 timeout=5,
             )

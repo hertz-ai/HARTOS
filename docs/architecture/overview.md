@@ -1,6 +1,6 @@
 # Architecture Overview
 
-HART OS (Hevolve Agentic Runtime) is a distributed multi-agent platform. The diagram below shows the high-level component relationships.
+HART OS (Hevolve Hive Agentic Runtime) is crowdsourced compute infrastructure for autonomous Hive AI Training -a distributed multi-agent platform where no single entity monopolizes AI. The diagram below shows the high-level component relationships.
 
 ## System Diagram
 
