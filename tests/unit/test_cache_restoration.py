@@ -312,6 +312,7 @@ class TestRestoreActionStates:
 
     def test_restore_from_ledger(self):
         """Should restore action_states from ledger task statuses."""
+        pytest.importorskip('agent_ledger', reason='agent_ledger not installed')
         from lifecycle_hooks import restore_action_states_from_ledger, action_states, ActionState
         from agent_ledger import TaskStatus as LedgerTaskStatus
 
@@ -339,6 +340,7 @@ class TestRestoreActionStates:
 
     def test_restore_skips_non_action_tasks(self):
         """Should skip tasks that don't start with 'action_'."""
+        pytest.importorskip('agent_ledger', reason='agent_ledger not installed')
         from lifecycle_hooks import restore_action_states_from_ledger, action_states
         from agent_ledger import TaskStatus as LedgerTaskStatus
 

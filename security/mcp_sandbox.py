@@ -116,6 +116,18 @@ class MCPSandbox:
                     )
                     return False, f"Argument '{key}' contains dangerous command pattern"
 
+        # DLP: check for PII in outbound tool arguments
+        try:
+            from security.dlp_engine import get_dlp_engine
+            for key, value in arguments.items():
+                if isinstance(value, str):
+                    allowed, reason = get_dlp_engine().check_outbound(value)
+                    if not allowed:
+                        logger.warning(f"DLP blocked MCP tool arg '{key}': {reason}")
+                        return False, f"DLP: {reason} in argument '{key}'"
+        except ImportError:
+            pass  # DLP engine not available — allow through
+
         return True, ""
 
     def validate_response(self, response: Any) -> tuple:

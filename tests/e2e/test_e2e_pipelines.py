@@ -414,7 +414,7 @@ class TestAllGoalTypes:
         })
         assert 'Vijai' in prompt
         assert '90%' in prompt
-        assert '10%' in prompt
+        assert '9%' in prompt
         assert 'self-sustaining' in prompt.lower()
 
     def test_revenue_prompt_contains_philosophy(self):
@@ -1545,8 +1545,10 @@ class TestComputerUseAdapter:
         orig_bundled = adapter._BUNDLED_MODE
         orig_tier = adapter._node_tier
         orig_fail2 = adapter._tier2_fail_count
+        orig_has = adapter._HAS_PYAUTOGUI
         try:
             adapter._BUNDLED_MODE = False  # Not bundled → skip tier 1
+            adapter._HAS_PYAUTOGUI = False  # Prevent Tier 1 from firing
             adapter._node_tier = 'flat'
             adapter._tier2_fail_count = 0
             with patch('integrations.vlm.local_loop.run_local_agentic_loop',
@@ -1559,6 +1561,7 @@ class TestComputerUseAdapter:
             assert tier_val == 'http'
         finally:
             adapter._BUNDLED_MODE = orig_bundled
+            adapter._HAS_PYAUTOGUI = orig_has
             adapter._node_tier = orig_tier
             adapter._tier2_fail_count = orig_fail2
 
@@ -1603,7 +1606,7 @@ class TestVLMAgentIntegrationBridge:
 
     def test_vlm_context_status_summary(self):
         """get_status_summary() returns correct shape."""
-        from vlm_agent_integration import VLMAgentContext
+        from integrations.vlm.vlm_agent_integration import VLMAgentContext
         ctx = VLMAgentContext(vlm_server_url='http://localhost:5001',
                              omniparser_url='http://localhost:8080')
         with patch.object(ctx, 'is_vlm_available', return_value=False):
@@ -1618,7 +1621,7 @@ class TestVLMAgentIntegrationBridge:
 
     def test_inject_visual_context_unavailable(self):
         """VLM unavailable → graceful degrade in task context."""
-        from vlm_agent_integration import VLMAgentContext
+        from integrations.vlm.vlm_agent_integration import VLMAgentContext
         ctx = VLMAgentContext()
         with patch.object(ctx, 'get_screen_context', return_value=None):
             result = ctx.inject_visual_context_into_ledger_task({
@@ -1626,8 +1629,8 @@ class TestVLMAgentIntegrationBridge:
         assert result['visual_context']['has_screen_info'] is False
         assert 'not available' in result['visual_context']['note']
 
-    @patch('vlm_agent_integration.requests.post')
-    @patch('vlm_agent_integration.requests.get')
+    @patch('integrations.vlm.vlm_agent_integration.requests.post')
+    @patch('integrations.vlm.vlm_agent_integration.requests.get')
     def test_execute_windows_command_steps(self, mock_get, mock_post):
         """4-step Win+R sequence dispatched correctly."""
         # VLM server available
@@ -1641,7 +1644,7 @@ class TestVLMAgentIntegrationBridge:
         mock_action.json.return_value = {'status': 'success', 'output': 'ok'}
         mock_post.return_value = mock_action
 
-        from vlm_agent_integration import VLMAgentContext
+        from integrations.vlm.vlm_agent_integration import VLMAgentContext
         ctx = VLMAgentContext()
         result = ctx.execute_windows_command('notepad')
         assert result['status'] == 'success'

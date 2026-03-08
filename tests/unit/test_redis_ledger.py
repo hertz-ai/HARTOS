@@ -8,6 +8,10 @@ This script:
 """
 
 import time
+import pytest
+
+pytest.importorskip('agent_ledger', reason='agent_ledger not installed')
+
 from agent_ledger import (
     SmartLedger, Task, TaskType, TaskStatus, ExecutionMode,
     create_ledger_from_actions, get_production_backend

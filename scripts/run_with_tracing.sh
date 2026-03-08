@@ -1,13 +1,13 @@
 #!/bin/bash
 # ============================================================
-# HevolveBot LangChain Agent - Server WITH Socket Tracing
+# HART OS - Server WITH Socket Tracing
 # ============================================================
 # This enables real-time PyCharm socket tracing for debugging.
 # Trace events are sent to localhost:5678 for the TrueFlow plugin.
 # ============================================================
 
 echo "========================================"
-echo " Starting HevolveBot LangChain Agent"
+echo " Starting HART OS"
 echo " WITH SOCKET TRACING"
 echo "========================================"
 echo ""

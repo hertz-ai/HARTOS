@@ -23,6 +23,8 @@ from datetime import datetime
 os.environ.setdefault('HEVOLVE_DB_PATH', ':memory:')
 os.environ.setdefault('OPENAI_API_KEY', 'test-key')
 
+pytest.importorskip('agent_ledger', reason='agent_ledger not installed')
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Fixtures

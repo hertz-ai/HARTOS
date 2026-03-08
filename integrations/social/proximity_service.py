@@ -38,18 +38,40 @@ class ProximityService:
         return (lat - dlat, lat + dlat, lon - dlon, lon + dlon)
 
     @staticmethod
-    def update_location(db, user_id, lat, lon, accuracy):
-        """Store location ping, detect nearby users, return match count."""
+    def update_location(db, user_id, lat, lon, accuracy, device_id=None):
+        """Store location ping, detect nearby users, return match count.
+        device_id — optional, for cross-device dedup (same user, multiple devices)."""
         from .models import LocationPing, User
         now = datetime.utcnow()
 
-        # Rate limit: 1 ping per 30 seconds
-        last_ping = db.query(LocationPing).filter(
+        # Rate limit: 1 ping per 30 seconds (per device if provided)
+        rate_q = db.query(LocationPing).filter(
             LocationPing.user_id == user_id,
             LocationPing.created_at > now - timedelta(seconds=PING_COOLDOWN_SECONDS)
-        ).first()
+        )
+        last_ping = rate_q.first()
         if last_ping:
             return {'nearby_count': ProximityService.get_nearby_count(db, user_id), 'rate_limited': True}
+
+        # Cross-device dedup: if same user+device has an active ping, update it
+        if device_id:
+            existing = db.query(LocationPing).filter(
+                LocationPing.user_id == user_id,
+                LocationPing.expires_at > now,
+            ).first()
+            if existing:
+                existing.lat = lat
+                existing.lon = lon
+                existing.accuracy_m = accuracy or 0.0
+                existing.created_at = now
+                existing.expires_at = now + timedelta(hours=PING_TTL_HOURS)
+                db.flush()
+                matches_created = ProximityService._detect_proximity(db, user_id, lat, lon, now)
+                return {
+                    'nearby_count': ProximityService.get_nearby_count(db, user_id),
+                    'new_matches': matches_created,
+                    'rate_limited': False,
+                }
 
         # Store ping
         ping = LocationPing(
@@ -128,15 +150,12 @@ class ProximityService:
 
             # Create notification for both users
             try:
-                from .models import Notification
+                from .services import NotificationService
                 for uid in [a_id, b_id]:
-                    notif = Notification(
-                        user_id=uid,
-                        notif_type='proximity_match',
-                        actor_id=None,  # Anonymous
+                    NotificationService.create(
+                        db, user_id=uid, type='proximity_match',
                         message='Someone is nearby! Check your encounters.',
                     )
-                    db.add(notif)
             except Exception:
                 pass  # Notifications optional
 

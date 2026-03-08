@@ -1,39 +1,42 @@
 # Fix Windows encoding for non-ASCII characters (Telugu, emojis, etc.)
 import sys
 import io
-if sys.platform == 'win32':
+if sys.platform == 'win32' and 'pytest' not in sys.modules:
     # Force UTF-8 encoding for stdout/stderr to prevent crashes with non-ASCII characters
-    if sys.stdout is not None:
+    # Skip when running under pytest — pytest wraps stdout/stderr for capture,
+    # and replacing them here closes pytest's file handles.
+    if sys.stdout is not None and hasattr(sys.stdout, 'buffer'):
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    if sys.stderr is not None:
+    if sys.stderr is not None and hasattr(sys.stderr, 'buffer'):
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 from bs4 import BeautifulSoup
 from enum import Enum
 from cultural_wisdom import get_cultural_prompt_compact
 
-# Use langchain-classic for pydantic v2 compatibility
-from langchain.llms import OpenAI
-from langchain.chains import LLMChain
-from langchain.prompts import PromptTemplate
-from langchain.agents import (
+# langchain_classic — pydantic v2-compatible fork of langchain 0.0.230
+from langchain_classic.llms import OpenAI
+from langchain_classic.chains import LLMChain
+from langchain_classic.prompts import PromptTemplate
+from langchain_classic.agents import (
     ZeroShotAgent, Tool, AgentExecutor, ConversationalAgent,
     ConversationalChatAgent, LLMSingleActionAgent, AgentOutputParser,
     load_tools, initialize_agent, AgentType
 )
+from langchain_classic.prompts import (
+    ChatPromptTemplate, MessagesPlaceholder,
+    SystemMessagePromptTemplate, HumanMessagePromptTemplate
+)
+from langchain_classic.chains import LLMMathChain
+from langchain_classic.chains.conversation.memory import ConversationSummaryMemory, ConversationBufferWindowMemory
+from langchain_classic.chat_models import ChatOpenAI
+from langchain_classic.llms.base import LLM
+from langchain_classic.memory import ConversationBufferMemory, ReadOnlySharedMemory
+from langchain_classic.schema import AgentAction, AgentFinish, OutputParserException, HumanMessage, AIMessage, SystemMessage
+from langchain_classic.tools import OpenAPISpec, APIOperation, StructuredTool
+from langchain_classic.utilities import GoogleSearchAPIWrapper
 
 import time
-from langchain.prompts import (
-    ChatPromptTemplate,
-    MessagesPlaceholder,
-    SystemMessagePromptTemplate,
-    HumanMessagePromptTemplate
-)
-from langchain.chains import LLMMathChain
-from langchain.chains.conversation.memory import ConversationSummaryMemory, ConversationBufferWindowMemory
-
-# ChatOpenAI - use langchain
-from langchain.chat_models import ChatOpenAI
 
 # ChatGroq - optional import (version compatibility issues)
 try:
@@ -41,18 +44,12 @@ try:
 except Exception:
     ChatGroq = None
 
-# LLM base class
-from langchain.llms.base import LLM
-from langchain.memory import ConversationBufferMemory, ReadOnlySharedMemory
-from langchain.schema import AgentAction, AgentFinish, OutputParserException, HumanMessage, AIMessage, SystemMessage
-from langchain.tools import OpenAPISpec, APIOperation, StructuredTool
-from langchain.utilities import GoogleSearchAPIWrapper
 try:
-    from langchain.requests import Requests
+    from langchain_classic.requests import Requests
 except (ImportError, AttributeError):
-    # Requests might not be in langchain
     Requests = None
 from flask import Flask, jsonify, request
+from functools import wraps
 import json
 import os
 import re
@@ -120,35 +117,31 @@ from core.http_pool import pooled_get, pooled_post
 from datetime import datetime, timezone
 from typing import List, Union, Optional, Mapping, Any, Dict
 
-# Conversational chat imports from langchain-classic
+# Conversational chat imports
 try:
-    from langchain.agents.conversational_chat.output_parser import ConvoOutputParser
-    from langchain.agents.conversational_chat.prompt import FORMAT_INSTRUCTIONS
-    from langchain.output_parsers.json import parse_json_markdown
-except (ImportError, AttributeError) as e:
-    # These might not exist in langchain-classic
+    from langchain_classic.agents.conversational_chat.output_parser import ConvoOutputParser
+    from langchain_classic.agents.conversational_chat.prompt import FORMAT_INSTRUCTIONS
+    from langchain_classic.output_parsers.json import parse_json_markdown
+except (ImportError, AttributeError):
     ConvoOutputParser = None
     FORMAT_INSTRUCTIONS = None
     parse_json_markdown = None
 
-# Tools imports - try langchain_community first
+# Tools imports
 try:
-    from langchain_community.tools import RequestsGetTool
-except Exception:
-    try:
-        from langchain.tools.requests.tool import RequestsGetTool
-    except (ImportError, AttributeError):
-        RequestsGetTool = None
+    from langchain_classic.tools.requests.tool import RequestsGetTool
+except (ImportError, AttributeError):
+    RequestsGetTool = None
 
 try:
-    from langchain_community.utilities import TextRequestsWrapper
-except Exception:
-    try:
-        from langchain.utilities.requests import TextRequestsWrapper
-    except (ImportError, AttributeError):
-        TextRequestsWrapper = None
+    from langchain_classic.utilities.requests import TextRequestsWrapper
+except (ImportError, AttributeError):
+    TextRequestsWrapper = None
 
-import tiktoken
+try:
+    import tiktoken
+except ImportError:
+    tiktoken = None
 from pytz import timezone
 from datetime import datetime, timedelta
 from waitress import serve
@@ -209,9 +202,14 @@ except ImportError:
 import threading
 
 try:
-    from helper import retrieve_json
+    from helper import retrieve_json, PROMPTS_DIR, safe_prompt_path
 except Exception:
     retrieve_json = None
+    PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
+    safe_prompt_path = None
+
+# Ensure prompts directory exists (agent creation writes JSON here)
+os.makedirs(PROMPTS_DIR, exist_ok=True)
 
 # Google A2A integration (from gpt4.1)
 try:
@@ -554,13 +552,22 @@ except ImportError:
 except Exception as e:
     app.logger.warning(f"Provision init skipped: {e}")
 
+try:
+    from integrations.social.consent_service import register_consent_routes
+    register_consent_routes(app)
+except ImportError:
+    pass
+except Exception as e:
+    app.logger.warning(f"Consent service init skipped: {e}")
+
 # ============================================================================
 # Google A2A Protocol Initialization
 # ============================================================================
 # Initialize A2A server for cross-platform agent communication
 try:
     app.logger.info("Initializing Google A2A Protocol server...")
-    a2a_server = initialize_a2a_server(app, base_url="http://localhost:6777")
+    from core.port_registry import get_port as _a2a_get_port
+    a2a_server = initialize_a2a_server(app, base_url=f"http://localhost:{_a2a_get_port('backend')}")
     app.logger.info("Google A2A Protocol server initialized successfully")
 
     # Register all agents with A2A
@@ -1037,14 +1044,8 @@ except Exception:
 
 # app.logger.info(llm.invoke("hi how are you?"))
 
-if spec is not None:
-    try:
-        chain = get_openapi_chain(spec)
-    except Exception as e:
-        app.logger.warning(f"Could not create OpenAPI chain: {e}")
-        chain = None
-else:
-    chain = None
+# OpenAPI chain — deprecated (get_openapi_chain removed from langchain)
+chain = None
 
 
 client = crossbarhttp.Client('http://aws_rasa.hertzai.com:8088/publish') if crossbarhttp else None
@@ -1154,6 +1155,159 @@ def create_prompt(tools):
     return prompt
 
 
+def _suggest_share_worthy_content(input_text: str) -> str:
+    """Tool handler: find high-engagement, under-shared posts the user could share.
+
+    Queries the social DB for posts with strong engagement (upvotes > 5,
+    comments > 3) but few share links (< 3), then returns a human-friendly
+    suggestion.
+    """
+    try:
+        from integrations.social.models import get_db, Post, ShareableLink
+        from sqlalchemy import func, outerjoin
+
+        db = get_db()
+        try:
+            # Subquery: count share links per post
+            share_counts = (
+                db.query(
+                    ShareableLink.resource_id,
+                    func.count(ShareableLink.id).label('link_count'),
+                )
+                .filter(ShareableLink.resource_type == 'post')
+                .group_by(ShareableLink.resource_id)
+                .subquery()
+            )
+
+            # Main query: high engagement, low shares, not deleted/hidden
+            posts = (
+                db.query(Post, share_counts.c.link_count)
+                .outerjoin(share_counts, Post.id == share_counts.c.resource_id)
+                .filter(
+                    Post.is_deleted == False,
+                    Post.is_hidden == False,
+                    Post.upvotes > 5,
+                    Post.comment_count > 3,
+                )
+                .filter(
+                    (share_counts.c.link_count == None) |  # noqa: E711
+                    (share_counts.c.link_count < 3)
+                )
+                .order_by(Post.score.desc())
+                .limit(3)
+                .all()
+            )
+
+            if not posts:
+                return ("No under-shared high-engagement content found right now. "
+                        "Keep creating great posts and the community will notice!")
+
+            suggestions = []
+            for post, link_count in posts:
+                title = (post.title or post.content or '')[:80].strip()
+                shares = link_count or 0
+                suggestions.append(
+                    f"- \"{title}\" ({post.upvotes} upvotes, "
+                    f"{post.comment_count} comments, only {shares} shares) "
+                    f"[post_id: {post.id}]"
+                )
+
+            header = ("These posts are resonating with the community but haven't "
+                       "been shared much yet. Consider sharing them with your network:\n")
+            return header + "\n".join(suggestions)
+        finally:
+            db.close()
+    except Exception as e:
+        logging.debug(f"Suggest_Share_Worthy_Content failed: {e}")
+        return f"Could not fetch share-worthy content right now: {e}"
+
+
+def _observe_user_experience(input_text: str) -> str:
+    """Record a user experience observation for self-improvement."""
+    try:
+        import json as _json
+        data = _json.loads(input_text)
+        event = data.get('event', 'unknown')
+        page = data.get('page', '')
+        duration_ms = data.get('duration_ms', 0)
+        outcome = data.get('outcome', '')
+
+        observation = f"User {event} on {page} ({duration_ms}ms): {outcome}"
+
+        # Use MemoryGraph if available
+        try:
+            user_id = thread_local_data.get_user_id()
+            prompt_id = thread_local_data.get_prompt_id()
+            graph = _get_or_create_graph(user_id, prompt_id)
+            if graph:
+                session_id = f"{user_id}_{prompt_id}" if prompt_id else str(user_id)
+                memory_id = graph.register(
+                    content=observation,
+                    metadata={
+                        'memory_type': 'observation',
+                        'source_agent': 'agent',
+                        'session_id': session_id,
+                        'page': page,
+                        'event': event,
+                    },
+                    context_snapshot=f"UX observation during session {session_id}",
+                )
+                return f"Observation recorded (id: {memory_id}): {observation}"
+        except Exception:
+            pass
+
+        return f"Observation noted: {observation}"
+    except Exception:
+        return f"Observation noted: {input_text}"
+
+
+def _self_critique_and_enhance(input_text: str) -> str:
+    """Review past suggestions and outcomes to improve future behavior."""
+    try:
+        user_id = thread_local_data.get_user_id()
+        prompt_id = thread_local_data.get_prompt_id()
+        graph = _get_or_create_graph(user_id, prompt_id)
+        if not graph:
+            return "Self-critique unavailable: no memory graph for this session."
+
+        session_id = f"{user_id}_{prompt_id}" if prompt_id else str(user_id)
+
+        # Recall past suggestions and observations
+        suggestions = graph.recall(input_text or 'suggestions made outcomes', mode='semantic', top_k=10)
+        observations = graph.recall('user experience observation', mode='semantic', top_k=10)
+
+        if not suggestions and not observations:
+            return "No past interactions to critique yet. Will observe and learn."
+
+        # Format findings for agent reasoning
+        critique = "Self-critique findings:\n"
+        if suggestions:
+            critique += f"Past suggestions ({len(suggestions)}):\n"
+            for s in suggestions[:5]:
+                critique += f"  - {s.content[:100]}\n"
+        if observations:
+            critique += f"User observations ({len(observations)}):\n"
+            for o in observations[:5]:
+                critique += f"  - {o.content[:100]}\n"
+
+        # Store the critique itself as an insight
+        insight = f"Self-critique on: {input_text}"
+        graph.register(
+            content=insight,
+            metadata={
+                'memory_type': 'insight',
+                'source_agent': 'agent',
+                'session_id': session_id,
+                'type': 'self_critique',
+            },
+            context_snapshot=f"Self-critique during session {session_id}",
+        )
+
+        return critique
+    except Exception as e:
+        return f"Self-critique unavailable: {str(e)}"
+
+
 def _handle_create_agent_tool(input_text):
     """Tool handler: LLM decided user wants to create an agent.
 
@@ -1182,6 +1336,250 @@ def _response_signals_creation(response_text):
     """Check if the reuse agent's response suggests creating a new agent."""
     lower = response_text.lower()
     return any(signal in lower for signal in _RESPONSE_CREATION_SIGNALS)
+
+
+# ─── Perception Watchers (Future TTL) ───────────────────────────────────
+_active_watchers = {}  # user_id -> [{trigger_id, expires_at, condition, action, modality, callback}]
+
+
+def _handle_visual_watcher_tool(input_text):
+    """Register a visual/audio watcher trigger with TTL.
+
+    Input format: 'CONDITION: <condition> | ACTION: <action> | TTL: <minutes>'
+    Optional: '| MODALITY: visual|audio|both' (defaults to visual)
+    """
+    import re
+    import time as _time
+
+    parts = {}
+    for segment in input_text.split('|'):
+        segment = segment.strip()
+        if ':' in segment:
+            key, val = segment.split(':', 1)
+            parts[key.strip().upper()] = val.strip()
+
+    condition = parts.get('CONDITION', input_text)
+    action_text = parts.get('ACTION', 'notify user')
+    ttl_minutes = int(parts.get('TTL', '30'))
+    modality = parts.get('MODALITY', 'visual').lower()
+
+    user_id = thread_local_data.get_user_id() or 'default'
+    trigger_id = f'watcher_{user_id}_{int(_time.time())}'
+    expires_at = _time.time() + (ttl_minutes * 60)
+
+    def _on_trigger(description, **kwargs):
+        """Callback fired when visual trigger matches."""
+        try:
+            from core.platform.events import emit_event
+            emit_event('tts.speak', {'user_id': user_id, 'text': action_text})
+            emit_event('perception.watcher.fired', {
+                'user_id': user_id, 'condition': condition,
+                'action': action_text, 'trigger_id': trigger_id,
+            })
+        except Exception:
+            pass
+
+    # Register with VisionService for visual watchers
+    if modality in ('visual', 'both'):
+        try:
+            from integrations.vision.vision_service import VisionService
+            from core.platform.service_registry import ServiceRegistry
+            vs = ServiceRegistry.get('VisionService')
+            if vs:
+                condition_words = [w for w in condition.lower().split() if len(w) > 3]
+                vs.register_visual_trigger(
+                    channel='camera', callback=_on_trigger,
+                    keywords=condition_words, cooldown_seconds=5,
+                    name=trigger_id,
+                )
+        except Exception:
+            pass
+
+    watcher_entry = {
+        'trigger_id': trigger_id, 'expires_at': expires_at,
+        'condition': condition, 'action': action_text,
+        'modality': modality, 'callback': _on_trigger,
+    }
+
+    if user_id not in _active_watchers:
+        _active_watchers[user_id] = []
+    _active_watchers[user_id].append(watcher_entry)
+
+    return (
+        f"Watcher registered: watching for '{condition}' → will '{action_text}'. "
+        f"TTL: {ttl_minutes} minutes. Modality: {modality}."
+    )
+
+
+def _evaluate_audio_watchers(user_id, transcript):
+    """LLM-powered evaluation of audio watchers against transcript."""
+    import time as _time
+    watchers = [w for w in _active_watchers.get(user_id, [])
+                if w['modality'] in ('audio', 'both') and _time.time() < w['expires_at']]
+    if not watchers:
+        return
+
+    conditions = "\n".join(f"- Watcher {i+1}: {w['condition']}" for i, w in enumerate(watchers))
+
+    try:
+        llm = get_llm(temperature=0.1, max_tokens=200)
+        result = llm.invoke(
+            f"The user just said: \"{transcript}\"\n\n"
+            f"Active watchers:\n{conditions}\n\n"
+            f"Which watcher conditions (if any) are semantically triggered by what the user said? "
+            f"Return ONLY a JSON array of triggered watcher numbers, e.g. [1, 3]. "
+            f"Return [] if none match."
+        )
+        import re as _re
+        text = (result.content if hasattr(result, 'content') else str(result)).strip()
+        match = _re.search(r'\[.*?\]', text)
+        if match:
+            triggered = json.loads(match.group())
+            for idx in triggered:
+                if 1 <= idx <= len(watchers):
+                    w = watchers[idx - 1]
+                    if w.get('callback'):
+                        w['callback'](transcript)
+    except Exception as e:
+        app.logger.debug(f"Audio watcher eval failed: {e}")
+
+
+def _push_workflow_flowchart(user_id, prompt_id, request_id=None):
+    """Push recipe JSON to frontend via Crossbar for interactive flowchart rendering."""
+    try:
+        recipe_path = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
+        if not os.path.isfile(recipe_path):
+            return
+        with open(recipe_path) as f:
+            recipe_data = json.load(f)
+        crossbar_message = {
+            "text": ["Agent workflow ready"],
+            "priority": 50,
+            "action": "WorkflowFlowchart",
+            "recipe": recipe_data,
+            "request_id": request_id or "0",
+            "prompt_id": prompt_id,
+            "historical_request_id": [],
+            "options": [], "newoptions": [],
+        }
+        publish_async(f'com.hertzai.hevolve.chat.{user_id}', json.dumps(crossbar_message))
+    except Exception:
+        pass
+
+
+def _handle_agentic_router_tool(input_text):
+    """Tool handler: LLM detected a multi-step agentic task.
+
+    Called by the LangChain agent when a prompt needs multi-step execution.
+    Builds a plan using LLM-powered agent matching + plan generation,
+    sets thread-local flags that the /chat handler checks after get_ans() returns.
+    """
+    try:
+        import concurrent.futures
+        from integrations.agentic_router import build_agentic_plan
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(build_agentic_plan, input_text, PROMPTS_DIR)
+            try:
+                plan = future.result(timeout=15)
+            except concurrent.futures.TimeoutError:
+                return f"I'll help you with: {input_text}. Let me work on this directly."
+
+        thread_local_data.set_agentic_routing(
+            task_description=plan['task_description'],
+            plan_steps=plan['steps'],
+            matched_agent_id=plan.get('matched_agent_id'),
+        )
+
+        # Build a human-readable summary for the LLM's response
+        steps_text = "\n".join(
+            f"  {s['step_num']}. {s['description']}"
+            for s in plan['steps']
+        )
+        agent_note = ""
+        if plan.get('matched_agent_name'):
+            agent_note = f"\nMatched agent: {plan['matched_agent_name']} ({plan['matched_agent_source']})"
+        elif plan.get('requires_new_agent'):
+            agent_note = "\nNo existing agent matches — a new agent will be created if you approve."
+
+        return (
+            f"I've analyzed your request and prepared a plan:\n\n"
+            f"Task: {input_text}\n\n"
+            f"Steps:\n{steps_text}\n"
+            f"{agent_note}\n\n"
+            f"Would you like me to proceed with this plan?"
+        )
+    except Exception as e:
+        app.logger.error(f"Agentic router failed: {e}")
+        return f"I'll help you with: {input_text}. Let me work on this directly."
+
+
+def _handle_request_resource(input_text: str) -> str:
+    """Generic runtime resource request — agent calls this when ANY tool needs
+    a missing credential, API key, config value, or permission.
+
+    The agent provides a JSON string like:
+      {"resource_type": "api_key", "key_name": "GOOGLE_API_KEY",
+       "label": "Google API Key", "used_by": "Google Search tool",
+       "description": "Required for web search"}
+
+    Handler checks the vault first. If the key exists, returns the value
+    (making it available to the agent without the user re-entering it).
+    If not, returns a structured resource_request that the backend injects
+    into the response JSON so the frontend presents a secure input screen.
+    """
+    import json as _json
+    try:
+        req = _json.loads(input_text)
+    except (ValueError, TypeError):
+        # Plain-text fallback: agent just described what it needs
+        req = {
+            'resource_type': 'api_key',
+            'key_name': 'UNKNOWN',
+            'label': input_text[:100],
+            'description': input_text,
+            'used_by': 'Agent tool',
+        }
+
+    key_name = req.get('key_name', 'UNKNOWN')
+    resource_type = req.get('resource_type', 'api_key')
+
+    # Check vault first (tool keys + env vars)
+    import os
+    env_val = os.environ.get(key_name)
+    if env_val:
+        return f"Resource '{key_name}' is already configured and available."
+
+    try:
+        from desktop.ai_key_vault import AIKeyVault
+        vault = AIKeyVault.get_instance()
+        if resource_type == 'channel_secret':
+            val = vault.get_channel_secret(
+                req.get('channel_type', ''), key_name)
+        else:
+            val = vault.get_tool_key(key_name)
+        if val:
+            os.environ[key_name] = val  # Make available for current session
+            return f"Resource '{key_name}' loaded from vault and is now available."
+    except Exception:
+        pass
+
+    # Key not found — return a structured request for the frontend
+    # The backend will detect __SECRET_REQUEST__ and inject it into the response
+    secret_request = _json.dumps({
+        '__SECRET_REQUEST__': True,
+        'type': resource_type,
+        'key_name': key_name,
+        'label': req.get('label', key_name),
+        'description': req.get('description', f'{key_name} is required.'),
+        'used_by': req.get('used_by', 'Agent tool'),
+        'channel_type': req.get('channel_type', ''),
+    })
+    return (
+        f"I need the user to provide '{req.get('label', key_name)}'. "
+        f"This is required for {req.get('used_by', 'a tool')}. "
+        f"{req.get('description', '')} "
+        f"RESOURCE_REQUEST:{secret_request}"
+    )
 
 
 def _safe_load_google_search():
@@ -1286,6 +1684,20 @@ def get_tools(req_tool, is_first: bool = False):
                 description="To see user or if there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input to this tool function should be the user query/input. Only if last 16 seconds Visual Context information is present & is enough, then use that to craft a better creative, better, cohesive, correlated , summarised natural response, format this tool response togather with Previous 15 minutes Visual Context information if you are seeing the scene via videocall from the other end. If there are more than 1 person try to give an identity to each across frames to track the subjects through time by framing the tool input accordingly."
             ),
             Tool(
+                name="Visual_Context_Watcher",
+                func=_handle_visual_watcher_tool,
+                description=(
+                    "Register a visual or audio trigger: continuously watch what the user is doing "
+                    "via camera or listen to what they say, and perform an action when a condition is met. "
+                    "Input format: 'CONDITION: <what to watch for> | ACTION: <what to do> | TTL: <minutes>'. "
+                    "Optional: '| MODALITY: visual|audio|both' (defaults to visual). "
+                    "Example: 'CONDITION: user raises hand | ACTION: say banana | TTL: 30'. "
+                    "Example: 'CONDITION: user mentions their dog | ACTION: remind them about vet appointment | TTL: 60 | MODALITY: audio'. "
+                    "The watcher runs in the background and fires the action whenever the condition "
+                    "is detected. TTL auto-expires the watcher."
+                ),
+            ),
+            Tool(
                 name="Create_Agent",
                 func=_handle_create_agent_tool,
                 description=(
@@ -1297,7 +1709,63 @@ def get_tools(req_tool, is_first: bool = False):
                     "If the user also says words like 'automatically', 'autonomous', 'do it for me', "
                     "'handle it', 'just create it', include those keywords in your input."
                 ),
-            )
+            ),
+            Tool(
+                name="Request_Resource",
+                func=_handle_request_resource,
+                description=(
+                    "Use this tool when you need an API key, credential, token, or any external "
+                    "resource that is not currently available. This handles ALL resource types: "
+                    "API keys (OpenAI, Google, Slack, Discord, etc.), OAuth tokens, service "
+                    "credentials, channel secrets, or any configuration value. "
+                    "Input should be a JSON string with: resource_type (api_key, channel_secret, "
+                    "token, config), key_name (e.g. GOOGLE_API_KEY), label (human-readable name), "
+                    "used_by (which tool/service needs it), description (why it's needed). "
+                    "If the resource is already configured, it returns immediately. "
+                    "If not, the user will be prompted securely."
+                ),
+            ),
+            Tool(
+                name="Suggest_Share_Worthy_Content",
+                func=_suggest_share_worthy_content,
+                description=(
+                    "Use this tool when the user asks about content worth sharing, what to share, "
+                    "or when you want to proactively suggest high-engagement posts that deserve "
+                    "wider reach. Finds posts with strong community engagement (many upvotes and "
+                    "comments) but low share count, and suggests them for sharing. "
+                    "Input can be any text — it is not used for filtering."
+                ),
+            ),
+            Tool(
+                name="Observe_User_Experience",
+                func=_observe_user_experience,
+                description=(
+                    "Record a user experience observation. Input: JSON with event, page, "
+                    "duration_ms, outcome. Used for self-improvement and understanding user "
+                    "behavior patterns."
+                ),
+            ),
+            Tool(
+                name="Self_Critique_And_Enhance",
+                func=_self_critique_and_enhance,
+                description=(
+                    "Review past agent suggestions and user behavior observations to improve "
+                    "future recommendations. Input: topic or area to critique. Helps the agent "
+                    "learn from its own interactions."
+                ),
+            ),
+            Tool(
+                name="Agentic_Router",
+                func=_handle_agentic_router_tool,
+                description=(
+                    "Use when the user's request requires multi-step execution such as building "
+                    "an application, writing code, conducting research, creating a marketing "
+                    "campaign, or any complex task that cannot be answered in a single response. "
+                    "Input: the user's full request describing what they want accomplished. "
+                    "Output: a structured plan with steps. Do NOT use for simple questions, "
+                    "greetings, or tasks that can be answered directly."
+                ),
+            ),
 
         ]
 
@@ -1334,7 +1802,10 @@ def get_tools(req_tool, is_first: bool = False):
         tools += tool
         # Wrap all tool functions with logging
         for t in tools:
-            t.func = _with_tool_logging(t.func, t.name)
+            if hasattr(t, 'func') and callable(t.func):
+                t.func = _with_tool_logging(t.func, t.name)
+            elif hasattr(t, '_run') and callable(t._run):
+                t._run = _with_tool_logging(t._run, t.name)
         return tools
 
     else:
@@ -1460,7 +1931,63 @@ def get_tools(req_tool, is_first: bool = False):
                     "If the user also says words like 'automatically', 'autonomous', 'do it for me', "
                     "'handle it', 'just create it', include those keywords in your input."
                 ),
-            )
+            ),
+            Tool(
+                name="Request_Resource",
+                func=_handle_request_resource,
+                description=(
+                    "Use this tool when you need an API key, credential, token, or any external "
+                    "resource that is not currently available. This handles ALL resource types: "
+                    "API keys (OpenAI, Google, Slack, Discord, etc.), OAuth tokens, service "
+                    "credentials, channel secrets, or any configuration value. "
+                    "Input should be a JSON string with: resource_type (api_key, channel_secret, "
+                    "token, config), key_name (e.g. GOOGLE_API_KEY), label (human-readable name), "
+                    "used_by (which tool/service needs it), description (why it's needed). "
+                    "If the resource is already configured, it returns immediately. "
+                    "If not, the user will be prompted securely."
+                ),
+            ),
+            Tool(
+                name="Suggest_Share_Worthy_Content",
+                func=_suggest_share_worthy_content,
+                description=(
+                    "Use this tool when the user asks about content worth sharing, what to share, "
+                    "or when you want to proactively suggest high-engagement posts that deserve "
+                    "wider reach. Finds posts with strong community engagement (many upvotes and "
+                    "comments) but low share count, and suggests them for sharing. "
+                    "Input can be any text — it is not used for filtering."
+                ),
+            ),
+            Tool(
+                name="Observe_User_Experience",
+                func=_observe_user_experience,
+                description=(
+                    "Record a user experience observation. Input: JSON with event, page, "
+                    "duration_ms, outcome. Used for self-improvement and understanding user "
+                    "behavior patterns."
+                ),
+            ),
+            Tool(
+                name="Self_Critique_And_Enhance",
+                func=_self_critique_and_enhance,
+                description=(
+                    "Review past agent suggestions and user behavior observations to improve "
+                    "future recommendations. Input: topic or area to critique. Helps the agent "
+                    "learn from its own interactions."
+                ),
+            ),
+            Tool(
+                name="Agentic_Router",
+                func=_handle_agentic_router_tool,
+                description=(
+                    "Use when the user's request requires multi-step execution such as building "
+                    "an application, writing code, conducting research, creating a marketing "
+                    "campaign, or any complex task that cannot be answered in a single response. "
+                    "Input: the user's full request describing what they want accomplished. "
+                    "Output: a structured plan with steps. Do NOT use for simple questions, "
+                    "greetings, or tasks that can be answered directly."
+                ),
+            ),
 
         ]
         final_tool = []
@@ -1474,6 +2001,8 @@ def get_tools(req_tool, is_first: bool = False):
         for t in tools:
             if hasattr(t, 'func') and callable(t.func):
                 t.func = _with_tool_logging(t.func, t.name)
+            elif hasattr(t, '_run') and callable(t._run):
+                t._run = _with_tool_logging(t._run, t.name)
 
         tool_strings = "\n".join(
             f"\n> {tool.name}: {tool.description}" for tool in tools)
@@ -1833,9 +2362,7 @@ class CustomAgentExecutor(AgentExecutor):
 
     def prep_outputs(self, inputs: Dict[str, str],
                      outputs: Dict[str, str],
-                     metadata: Optional[Dict[str, Any]] = None,
                      return_only_outputs: bool = False) -> Dict[str, str]:
-        # pdb.set_trace()
         self._validate_outputs(outputs)
         req_id = thread_local_data.get_request_id()
         prom_id = thread_local_data.get_prompt_id()
@@ -1847,8 +2374,12 @@ class CustomAgentExecutor(AgentExecutor):
                 f"memory object is not none and metadata is {metadata}")
             try:
                 self.memory.save_context(inputs, outputs, metadata=metadata)
+                # Force immediate flush so next request sees the buffer on disk
+                if hasattr(self.memory, 'chat_memory') and hasattr(self.memory.chat_memory, 'flush_sync'):
+                    self.memory.chat_memory.flush_sync()
                 app.logger.info(
-                    f"After: memory saved successfully with metadata {metadata}")
+                    f"After: memory saved successfully with metadata {metadata}, "
+                    f"buffer_size={len(self.memory.chat_memory.messages) if hasattr(self.memory, 'chat_memory') else '?'}")
             except Exception as e:
                 app.logger.error(f"Failed to save memory: {e}")
                 # Continue without crashing - memory save is not critical
@@ -1909,6 +2440,10 @@ class CustomAgentExecutor(AgentExecutor):
         if self.memory is not None:
             try:
                 external_context = self.memory.load_memory_variables(inputs)
+                chat_hist = external_context.get('chat_history', [])
+                app.logger.info(
+                    f"Memory loaded: {len(chat_hist)} messages in chat_history"
+                    f" (buffer_file={getattr(getattr(self.memory, 'chat_memory', None), '_buffer_file', '?')})")
                 inputs = dict(inputs, **external_context)
             except Exception as e:
                 app.logger.warning(f"Could not load memory: {e}")
@@ -2829,6 +3364,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
     prefix = f"""You are Hevolve, an expert educational AI teacher with knowledge in every field.
         Answer questions accurately and respond as quickly as possible in {language}.
         Keep responses under 200 words. Be colloquial and natural - don't always greet or use the user's name.
+        IMPORTANT: Do NOT re-introduce yourself if you already did in the conversation history below. Continue naturally.
 
         User details: {user_details}
         Context: {custom_prompt}
@@ -2988,6 +3524,11 @@ review_agents = {"10077":True,10077:True}
 conversation_agent = {"10077":False,10077:False}
 _state_lock = threading.Lock()  # Protects review_agents, conversation_agent, first_promts
 
+# --- Interactive gather_info turn limit ---
+# After MAX_GATHER_TURNS without completion, force-complete with available data
+MAX_GATHER_TURNS = 12
+_gather_turn_counts = {}  # f'{user_id}_{prompt_id}' -> int
+
 # --- TTL-based cleanup for review_agents / conversation_agent (M2 fix) ---
 _AGENT_TTL = 3600  # 1 hour
 _agent_timestamps = {}  # user_id -> last-access epoch
@@ -3010,6 +3551,13 @@ def _cleanup_stale_agents():
             review_agents.pop(key, None)
             conversation_agent.pop(key, None)
             _agent_timestamps.pop(key, None)
+    # Also clean stale gather turn counters
+    # Turn key format: '{user_id}_{prompt_id}' — split from the RIGHT
+    # since user_id itself may contain underscores (e.g. 'test_user_1')
+    for tk in list(_gather_turn_counts.keys()):
+        uid = tk.rsplit('_', 1)[0] if '_' in tk else tk
+        if uid not in _agent_timestamps:
+            _gather_turn_counts.pop(tk, None)
 
 # Per-user locks to prevent race conditions when concurrent requests
 # for the same user modify review_agents / conversation_agent dicts.
@@ -3041,11 +3589,19 @@ def _autonomous_gather_info(user_id, description, prompt_id):
         try:
             new_response = response.replace('true', 'True').replace('false', 'False')
             parsed = retrieve_json(new_response)
-            if parsed.get('status', '').lower() == 'completed':
+            # Handle list-of-dicts response from LLM
+            if isinstance(parsed, list):
+                for item in reversed(parsed):
+                    if isinstance(item, dict) and 'status' in item:
+                        parsed = item
+                        break
+                else:
+                    parsed = {}
+            if isinstance(parsed, dict) and parsed.get('status', '').lower() == 'completed':
                 # Save agent config
                 parsed['prompt_id'] = prompt_id
                 parsed['creator_user_id'] = user_id
-                name = f'prompts/{prompt_id}.json'
+                name = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
                 with open(name, 'w') as f:
                     json.dump(parsed, f)
                 app.logger.info(f'Autonomous agent config saved to {name}')
@@ -3072,13 +3628,84 @@ def _autonomous_gather_info(user_id, description, prompt_id):
         response = gather_info(user_id, 'proceed', prompt_id, autonomous=True)
         iteration += 1
 
-    # Fallback: save whatever we have
-    app.logger.warning(f'Autonomous gather_info did not complete in {max_iterations} iterations')
-    return 'Autonomous gathering completed. Moving to review.'
+    # Fallback: save partial config so the pipeline can recover
+    app.logger.warning(f'Autonomous gather_info did not complete in {max_iterations} iterations, saving partial config')
+    partial = {
+        'status': 'completed',
+        'name': f'Agent {prompt_id}',
+        'agent_name': f'auto.agent{str(prompt_id)[-4:]}',
+        'goal': description or 'General assistant',
+        'broadcast_agent': 'no',
+        'personas': [{'name': 'Assistant', 'description': 'General purpose assistant'}],
+        'flows': [{'flow_name': 'main', 'persona': 'Assistant', 'actions': [{'action': 'Respond to user', 'action_id': 1, 'status': 'pending'}], 'sub_goal': description or 'Help the user'}],
+        'extra_information': f'Auto-generated after {max_iterations} autonomous gather iterations',
+        'prompt_id': prompt_id,
+        'creator_user_id': user_id,
+    }
+    name = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
+    try:
+        with open(name, 'w') as f:
+            json.dump(partial, f)
+        app.logger.info(f'Partial autonomous agent config saved to {name}')
+        # Sync to cloud DB (non-fatal)
+        try:
+            pooled_post(
+                f'{DB_URL}/createpromptlist',
+                json={'listprompts': [{
+                    'prompt_id': prompt_id,
+                    'prompt': partial.get('goal', ''),
+                    'user_id': user_id,
+                    'name': partial.get('name', ''),
+                    'is_active': True,
+                    'image_url': '',
+                }]},
+                timeout=5)
+        except Exception:
+            pass
+    except Exception as e:
+        app.logger.error(f'Failed to save partial autonomous config: {e}')
+    return 'Autonomous gathering completed with partial config. Moving to review.'
+
+
+# Resonance tuning post-response hook
+def _tune_resonance_after_chat(user_id, prompt_text, response_text):
+    """Tune resonance and return summary for crossbar/response piggyback.
+
+    Returns dict with resonance state (or empty dict on failure).
+    Sync — EMA math is <1ms, no LLM calls.
+    Also dispatches signals to HevolveAI async in background.
+    """
+    try:
+        from core.resonance_tuner import get_resonance_tuner
+        if user_id and prompt_text and response_text:
+            tuner = get_resonance_tuner()
+            profile = tuner.analyze_and_tune(
+                str(user_id), str(prompt_text), str(response_text))
+            return {
+                'resonance_confidence': round(profile.resonance_confidence, 2),
+                'resonance_tuning': {
+                    k: round(v, 3) for k, v in profile.tuning.items()
+                },
+                'resonance_interactions': profile.total_interactions,
+            }
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    return {}
 
 
 @app.route('/chat', methods=['POST'])
 def chat():
+    # Rate limit: 30 req/min per user/IP
+    try:
+        from integrations.social.rate_limiter import _limiter
+        rate_key = request.get_json(silent=True) or {}
+        rate_user = rate_key.get('user_id', request.remote_addr) if isinstance(rate_key, dict) else request.remote_addr
+        if not _limiter.check(str(rate_user), 'chat', max_tokens=30, refill_rate=30 / 60):
+            return jsonify({'error': 'Rate limit exceeded (30/min). Please wait.'}), 429
+    except Exception:
+        pass  # Rate limiter unavailable — allow
 
     start_time = time.time()
 
@@ -3099,6 +3726,8 @@ def chat():
     intermediate = data.get('intermediate', None)
     speculative = data.get('speculative', False)
     model_config = data.get('model_config', None)
+    task_source = data.get('task_source', 'own')
+    thread_local_data.set_task_source(task_source)
     app.logger.info(f"casual_conv type {casual_conv}")
 
     # Security: sanitize prompt_id to prevent path traversal
@@ -3130,6 +3759,15 @@ def chat():
         try:
             from security.secret_redactor import redact_secrets
             prompt, _redacted_count = redact_secrets(prompt)
+        except ImportError:
+            pass
+
+    # BUDGET GATE: estimate and log LLM cost before execution
+    if prompt:
+        try:
+            from integrations.agent_engine.budget_gate import estimate_llm_cost_spark
+            _est_cost = estimate_llm_cost_spark(prompt)
+            app.logger.debug(f"Estimated LLM cost: {_est_cost} Spark for user={user_id}")
         except ImportError:
             pass
 
@@ -3166,21 +3804,53 @@ def chat():
         except Exception:
             pass  # Degrade gracefully
 
+    # --- Agentic execution after user consent (Plan Mode → execute) ---
+    agentic_execute = data.get('agentic_execute', False)
+    if agentic_execute and prompt and user_id:
+        agentic_plan = data.get('agentic_plan', {})
+        matched_agent_id = agentic_plan.get('matched_agent_id')
+        app.logger.info(f'Agentic execute: matched_agent={matched_agent_id}, user={user_id}')
+
+        if matched_agent_id and os.path.exists(os.path.join(PROMPTS_DIR, f'{matched_agent_id}.json')):
+            # Route to existing agent via chat_agent (reuse_recipe.py)
+            prompt_id = matched_agent_id
+            # Fall through to the existing prompt_id routing below
+        else:
+            # No matching agent — auto-create one, then execute
+            # Reuse prompt_id from Plan Mode response if available
+            new_prompt_id = prompt_id if prompt_id else _next_prompt_id()
+            auto_response = _autonomous_gather_info(user_id, prompt, new_prompt_id)
+            review_agents[user_id] = True
+            _touch_agent_timestamp(user_id)
+            _record_lifecycle('Review Mode', user_id, new_prompt_id,
+                              f'Agentic auto-creation: {prompt[:100]}')
+            _push_workflow_flowchart(user_id, new_prompt_id, request_id)
+            return jsonify({
+                'response': auto_response,
+                'intent': ['FINAL_ANSWER'],
+                'Agent_status': 'Review Mode',
+                'autonomous_creation': True,
+                'prompt_id': new_prompt_id,
+                'req_token_count': 0,
+                'res_token_count': 0,
+                'history_request_id': [],
+            })
+
     if prompt_id:
         # Per-user lock prevents concurrent requests from corrupting agent state.
         # Replaces the global _state_lock for better concurrency.
         _user_lock = _get_user_lock(user_id)
         with _user_lock:
-            if os.path.exists(f'prompts/{prompt_id}.json'):
+            if os.path.exists(os.path.join(PROMPTS_DIR, f'{prompt_id}.json')):
                 app.logger.info('GATHER JSON EXISTS')
-                if os.path.exists(f'prompts/{prompt_id}_0_recipe.json'):
+                if os.path.exists(os.path.join(PROMPTS_DIR, f'{prompt_id}_0_recipe.json')):
                     app.logger.info('0 Recipe JSON EXISTS')
-                    file_path = f'prompts/{prompt_id}.json'
+                    file_path = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
                     with open(file_path, 'r') as f:
                         data = json.load(f)
                         no_of_flow = len(data['flows'])-1
                         app.logger.info(f'GOT LEN OF FLOW AS {no_of_flow}')
-                    if os.path.exists(f'prompts/{prompt_id}_{no_of_flow}_recipe.json'):
+                    if os.path.exists(os.path.join(PROMPTS_DIR, f'{prompt_id}_{no_of_flow}_recipe.json')):
                         create_agent = set_flags_to_enter_review_mode(no_of_flow, user_id) #returns false
                     else:
                         app.logger.info(f'{no_of_flow} Recipe JSON doesnot EXISTS')
@@ -3236,71 +3906,124 @@ def chat():
                     conversation_agent[user_id] = False
                     _touch_agent_timestamp(user_id)
                 _record_lifecycle('Review Mode', user_id, prompt_id, f'Autonomous creation via dispatch: {prompt[:100]}')
+                _push_workflow_flowchart(user_id, prompt_id, request_id)
                 return jsonify({'response': auto_response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [], 'Agent_status': 'Review Mode', 'autonomous_creation': True, 'prompt_id': prompt_id})
             from gather_agentdetails import gather_info
-            response = gather_info(user_id,prompt,prompt_id)
+
+            # --- Turn counter: force-complete after MAX_GATHER_TURNS ---
+            turn_key = f'{user_id}_{prompt_id}'
+            _gather_turn_counts[turn_key] = _gather_turn_counts.get(turn_key, 0) + 1
+            turn_num = _gather_turn_counts[turn_key]
+            app.logger.info(f'gather_info turn {turn_num}/{MAX_GATHER_TURNS} for {turn_key}')
+
+            if turn_num >= MAX_GATHER_TURNS:
+                # Force completion: ask LLM to wrap up with whatever it has
+                app.logger.warning(f'gather_info hit max turns ({MAX_GATHER_TURNS}), forcing completion')
+                prompt = ('Please finalize and return the completed agent configuration NOW with '
+                          'status="completed". Use reasonable defaults for any missing fields. '
+                          'Return the full JSON immediately.')
+
+            response = gather_info(user_id, prompt, prompt_id)
             new_response = response.replace('true','True').replace("false", "False")
             app.logger.info('AFTER GATHER INFO')
+
+            # --- Helper: save completed agent config and transition to Review ---
+            def _save_and_enter_review(agent_config):
+                agent_config['prompt_id'] = prompt_id
+                agent_config['creator_user_id'] = user_id
+                with _user_lock:
+                    conversation_agent[user_id] = False
+                    _touch_agent_timestamp(user_id)
+                name = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
+                with open(name, "w") as json_file:
+                    json.dump(agent_config, json_file)
+                app.logger.info(f"Agent config saved to {name}")
+                # Sync to cloud DB (non-fatal)
+                try:
+                    pooled_post(
+                        f'{DB_URL}/createpromptlist',
+                        json={'listprompts': [{
+                            'prompt_id': prompt_id,
+                            'prompt': agent_config.get('goal', ''),
+                            'user_id': user_id,
+                            'name': agent_config.get('name', ''),
+                            'is_active': True,
+                            'image_url': agent_config.get('image_url', ''),
+                        }]},
+                        timeout=5)
+                except Exception:
+                    pass
+                with _user_lock:
+                    review_agents[user_id] = True
+                    _touch_agent_timestamp(user_id)
+                _gather_turn_counts.pop(turn_key, None)  # Reset turn counter
+                _record_lifecycle('Review Mode', user_id, prompt_id, 'Agent details gathered, entering review')
+
             try:
+                # Parse gather_info response
+                new_res = None
                 try:
                     new_res = retrieve_json(new_response)
                     app.logger.info(f"new_res: {new_res}")
                 except Exception as e:
                     app.logger.error(f'Got some error while will try with re match error:{e}')
                     json_match = re.search(r'{[\s\S]*}', response)
-                    app.logger.info(f'Json match result: {json_match}')
                     if json_match:
-                        app.logger.info(f'Inside json_match')
-                        json_part = json_match.group(0)
-                        app.logger.info(f'Before loads json_part:{json_part}')
-                        new_res = json.loads(json_part)
-                        app.logger.info(f'After loads new_res:{new_res}')
+                        new_res = json.loads(json_match.group(0))
                     else:
                         raise ValueError('No JSON in response')
-                app.logger.info('AFTER EVAL')
-                if new_res['status'] == 'pending':
+
+                # LLM sometimes returns a list of conversation turns instead of a single dict
+                if isinstance(new_res, list):
+                    app.logger.info(f'new_res is a list (len={len(new_res)}), extracting last dict with status')
+                    for item in reversed(new_res):
+                        if isinstance(item, dict) and 'status' in item:
+                            new_res = item
+                            break
+                    else:
+                        for item in reversed(new_res):
+                            if isinstance(item, dict):
+                                new_res = item
+                                break
+                        else:
+                            raise ValueError(f'List response has no usable dict: {new_res}')
+                    app.logger.info(f'Extracted dict: status={new_res.get("status")}')
+
+                if new_res is None:
+                    raise ValueError('new_res is None after parsing')
+
+                if new_res.get('status') == 'pending' and turn_num < MAX_GATHER_TURNS:
                     app.logger.info('PENDING STATUS')
-                    ans = new_res['question'] if 'question' in new_res else new_res['review_details']
-                    _record_lifecycle('Creation Mode', user_id, prompt_id, 'Agent creation started via gather_info')
+                    ans = new_res.get('question') or new_res.get('review_details', response)
+                    _record_lifecycle('Creation Mode', user_id, prompt_id, f'Agent creation turn {turn_num}')
                     return jsonify({'response': ans, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Creation Mode', 'prompt_id': prompt_id})
                 else:
+                    # Completed (or forced completion after max turns)
                     app.logger.info('COMPLETED STATUS')
-                    new_res['prompt_id'] = prompt_id
-                    new_res['creator_user_id'] = user_id
-                    with _user_lock:
-                        conversation_agent[user_id] = False
-                        _touch_agent_timestamp(user_id)
-                    app.logger.info(
-                        'Agent Created Successfully saving it and reusing it for further purpose')
-                    name = f'prompts/{prompt_id}.json'
-                    with open(name, "w") as json_file:
-                        json.dump(new_res, json_file)
-                    app.logger.info(f"Dictionary saved to {name}")
-                    # Sync to cloud DB so prompt_id matches
-                    try:
-                        pooled_post(
-                            f'{DB_URL}/createpromptlist',
-                            json={'listprompts': [{
-                                'prompt_id': prompt_id,
-                                'prompt': new_res.get('goal', ''),
-                                'user_id': user_id,
-                                'name': new_res.get('name', ''),
-                                'is_active': True,
-                                'image_url': new_res.get('image_url', ''),
-                            }]},
-                            timeout=5)
-                    except Exception as e:
-                        app.logger.debug(f"Cloud sync failed (non-fatal): {e}")
-                    with _user_lock:
-                        review_agents[user_id] = True
-                        _touch_agent_timestamp(user_id)
-                    _record_lifecycle('Review Mode', user_id, prompt_id, 'Agent details gathered, entering review')
+                    _save_and_enter_review(new_res)
+                    _push_workflow_flowchart(user_id, prompt_id, request_id)
                     return jsonify({'response': 'Got Agent details successfully lets move on to review them one at a time', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Review Mode', 'prompt_id': prompt_id})
+
             except Exception as e:
-                app.logger.error('GOT some error while eval and returning the response')
-                app.logger.error(e)
+                app.logger.error(f'gather_info parse error on turn {turn_num}: {e}')
+                # After repeated failures, salvage what we can and move forward
+                if turn_num >= MAX_GATHER_TURNS - 2:
+                    app.logger.warning('Too many gather_info failures, salvaging partial config')
+                    partial = {
+                        'status': 'completed',
+                        'name': f'Agent {prompt_id}',
+                        'agent_name': f'auto.agent{str(prompt_id)[-4:]}',
+                        'goal': prompt or 'General assistant',
+                        'broadcast_agent': 'no',
+                        'personas': [{'name': 'Assistant', 'description': 'General purpose assistant'}],
+                        'flows': [{'flow_name': 'main', 'persona': 'Assistant', 'actions': [{'action': 'Respond to user', 'action_id': 1, 'status': 'pending'}], 'sub_goal': prompt or 'Help the user'}],
+                        'extra_information': f'Auto-generated after {turn_num} gather turns'
+                    }
+                    _save_and_enter_review(partial)
+                    _record_lifecycle('Review Mode', user_id, prompt_id, f'Force-completed after {turn_num} failed turns')
+                    return jsonify({'response': 'Agent created with available details. Moving to review.', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Review Mode', 'prompt_id': prompt_id})
                 _record_lifecycle('Creation Mode', user_id, prompt_id, f'Creation continuing after parse error: {e}')
-                return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Creation Mode'})
+                return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Creation Mode', 'prompt_id': prompt_id})
         # Phase 2: Review Phase (re-snapshot flags under lock after Phase 1 may have mutated)
         with _user_lock:
             _in_review = user_id in review_agents and review_agents[user_id]
@@ -3317,6 +4040,7 @@ def chat():
                 except Exception as e:
                     app.logger.debug(f"Social agent bridge skipped: {e}")
                 _record_lifecycle('completed', user_id, prompt_id, 'Agent creation completed successfully')
+                _push_workflow_flowchart(user_id, prompt_id, request_id)
                 return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'completed'})
             _record_lifecycle('Review Mode', user_id, prompt_id, 'Agent details being reviewed')
             return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Review Mode'})
@@ -3324,11 +4048,16 @@ def chat():
         if _in_review and _in_convo:
             return evaluate_agent_after_creation_in_review(file_id, prompt, prompt_id, request_id, user_id)
 
-    if prompt_id and os.path.exists(f'prompts/{prompt_id}.json'):
+    if prompt_id and os.path.exists(os.path.join(PROMPTS_DIR, f'{prompt_id}.json')):
 
-        with open(f'prompts/{prompt_id}.json', "r") as file:
+        with open(os.path.join(PROMPTS_DIR, f'{prompt_id}.json'), "r") as file:
             created_json = json.load(file)
 
+
+        if chat_agent is None:
+            return jsonify({'response': 'Agent reuse module is unavailable. Please check server dependencies.',
+                            'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0,
+                            'history_request_id': []})
 
         response = chat_agent(user_id,prompt,prompt_id,file_id,request_id)
 
@@ -3389,7 +4118,8 @@ def chat():
                 })
 
         _record_lifecycle('Reuse Mode', user_id, prompt_id, 'Agent reused for conversation')
-        return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Reuse Mode'})
+        _resonance = _tune_resonance_after_chat(user_id, prompt, response)
+        return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Reuse Mode', **_resonance})
 
     if prompt_id:
         try:
@@ -3445,6 +4175,31 @@ def chat():
     app.logger.info("the time taken by get ans in main api is %s seconds",
                     time.time() - ans_start_time)
 
+    # --- Check if LLM's Agentic_Router tool fired during get_ans() ---
+    if thread_local_data.get_agentic_requested():
+        task_desc = thread_local_data.get_agentic_task_description()
+        plan_steps = thread_local_data.get_agentic_plan_steps()
+        matched_agent = thread_local_data.get_agentic_matched_agent_id()
+        thread_local_data.clear_agentic_flags()
+        app.logger.info(f'Agentic_Router tool fired: task="{task_desc[:80] if task_desc else ""}", '
+                        f'steps={len(plan_steps)}, matched_agent={matched_agent}')
+
+        return jsonify({
+            'response': ans,
+            'intent': ['FINAL_ANSWER'],
+            'Agent_status': 'Plan Mode',
+            'agentic_plan': {
+                'task_description': task_desc,
+                'steps': plan_steps,
+                'matched_agent_id': matched_agent,
+                'requires_consent': True,
+            },
+            'prompt_id': prompt_id if prompt_id else _next_prompt_id(),
+            'req_token_count': thread_local_data.get_req_token_count(),
+            'res_token_count': thread_local_data.get_res_token_count(),
+            'history_request_id': thread_local_data.get_reqid_list(),
+        })
+
     # --- Step 16c: Check if LLM's Create_Agent tool fired during get_ans() ---
     if thread_local_data.get_creation_requested():
         agent_description = thread_local_data.get_creation_description()
@@ -3475,7 +4230,14 @@ def chat():
             new_response = response.replace('true', 'True').replace("false", "False")
             try:
                 new_res = retrieve_json(new_response)
-                if new_res.get('status') == 'pending':
+                if isinstance(new_res, list):
+                    for item in reversed(new_res):
+                        if isinstance(item, dict) and 'status' in item:
+                            new_res = item
+                            break
+                    else:
+                        new_res = {}
+                if isinstance(new_res, dict) and new_res.get('status') == 'pending':
                     resp_text = new_res.get('question', new_res.get('review_details', ans))
                 else:
                     resp_text = ans
@@ -3504,9 +4266,11 @@ def chat():
             'Content-Type': 'application/json'
         }
         action_response = pooled_post(f'{DB_URL}/create_action', headers=headers, data=payload)
+    _resonance = _tune_resonance_after_chat(user_id, prompt, ans) if ans else {}
     if ans != "":
         post_dict = {'user_id': user_id, 'status': 'FINISHED', 'task_name': "CHAT",
-                     'uid': request_id, 'task_id': f"CHAT_{str(request_id)}", 'request_id': request_id}
+                     'uid': request_id, 'task_id': f"CHAT_{str(request_id)}", 'request_id': request_id,
+                     **_resonance}
         publish_async('com.hertzai.longrunning.log', post_dict)
     else:
         post_dict = {'user_id': user_id, 'status': 'ERROR', 'task_name': "CHAT", 'uid': request_id,
@@ -3517,14 +4281,19 @@ def chat():
     elapsed_time = end_time - start_time
     app.logger.info(f"time taken for this full call is {elapsed_time}")
 
-    return jsonify({'response': ans, 'intent': thread_local_data.get_recognize_intents(), 'req_token_count': thread_local_data.get_req_token_count(), 'res_token_count': thread_local_data.get_res_token_count(), 'history_request_id': thread_local_data.get_reqid_list()})
+    return jsonify({'response': ans, 'intent': thread_local_data.get_recognize_intents(), 'req_token_count': thread_local_data.get_req_token_count(), 'res_token_count': thread_local_data.get_res_token_count(), 'history_request_id': thread_local_data.get_reqid_list(), **_resonance})
 
 
 def evaluate_agent_after_creation_in_review(file_id, prompt, prompt_id, request_id, user_id):
+    if chat_agent is None:
+        return jsonify({'response': 'Agent reuse module is unavailable. Please check server dependencies.',
+                        'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0,
+                        'history_request_id': [], 'Agent_status': 'Evaluation Mode'})
     response = chat_agent(user_id, prompt, prompt_id, file_id, request_id)
     _record_lifecycle('Evaluation Mode', user_id, prompt_id, 'Agent being evaluated after creation')
+    _resonance = _tune_resonance_after_chat(user_id, prompt, response)
     return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0,
-                    'history_request_id': [], 'Agent_status': 'Evaluation Mode'})
+                    'history_request_id': [], 'Agent_status': 'Evaluation Mode', **_resonance})
 
 
 def set_flags_to_enter_review_mode(no_of_flow, user_id):
@@ -3608,7 +4377,7 @@ def history():
 
 def _create_social_agent_from_prompt(user_id, prompt_id):
     """Read prompts/{prompt_id}.json and create a social User for this agent."""
-    prompt_file = f'prompts/{prompt_id}.json'
+    prompt_file = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
     if not os.path.exists(prompt_file):
         return
     with open(prompt_file, 'r') as f:
@@ -3804,7 +4573,7 @@ def create_prompts():
             item['prompt_id'] = pid
 
         # Save locally
-        local_path = f'prompts/{pid}.json'
+        local_path = os.path.join(PROMPTS_DIR, f'{pid}.json')
         local_data = {}
         if os.path.exists(local_path):
             with open(local_path, 'r') as f:
@@ -4228,73 +4997,132 @@ Example response format:
         app.logger.error(f"Error in /zeroshot/ endpoint: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
+# ─── Shared error-handling decorator (DRY: replaces 12+ identical try/except blocks) ──
+
+def _json_endpoint(f):
+    """Wrap a Flask view so unhandled exceptions return ``{'error': ...}, 500``."""
+    @wraps(f)
+    def _wrapped(*args, **kwargs):
+        try:
+            return f(*args, **kwargs)
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    return _wrapped
+
+
 # ─── Runtime Media Tools API ──────────────────────────────────────────
 # Endpoints for managing runtime media tools (Wan2GP, TTS-Audio-Suite,
 # Whisper, OmniParser). Tools are downloaded, started, and registered
 # dynamically. See integrations/service_tools/runtime_manager.py.
 
 @app.route('/api/tools/status', methods=['GET'])
+@_json_endpoint
 def tools_status():
     """Get status of all runtime media tools."""
-    try:
-        from integrations.service_tools.runtime_manager import runtime_tool_manager
-        return jsonify(runtime_tool_manager.get_all_status())
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    from integrations.service_tools.runtime_manager import runtime_tool_manager
+    return jsonify(runtime_tool_manager.get_all_status())
 
 
 @app.route('/api/tools/<tool_name>/setup', methods=['POST'])
+@_json_endpoint
 def tools_setup(tool_name):
     """Download + start + register a runtime tool."""
-    try:
-        from integrations.service_tools.runtime_manager import runtime_tool_manager
-        result = runtime_tool_manager.setup_tool(tool_name)
-        code = 500 if 'error' in result else 200
-        return jsonify(result), code
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    from integrations.service_tools.runtime_manager import runtime_tool_manager
+    result = runtime_tool_manager.setup_tool(tool_name)
+    code = 500 if 'error' in result else 200
+    return jsonify(result), code
 
 
 @app.route('/api/tools/<tool_name>/start', methods=['POST'])
+@_json_endpoint
 def tools_start(tool_name):
     """Start an already-downloaded runtime tool."""
-    try:
-        from integrations.service_tools.runtime_manager import runtime_tool_manager
-        result = runtime_tool_manager.start_tool(tool_name)
-        code = 500 if 'error' in result else 200
-        return jsonify(result), code
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    from integrations.service_tools.runtime_manager import runtime_tool_manager
+    result = runtime_tool_manager.start_tool(tool_name)
+    code = 500 if 'error' in result else 200
+    return jsonify(result), code
 
 
 @app.route('/api/tools/<tool_name>/stop', methods=['POST'])
+@_json_endpoint
 def tools_stop(tool_name):
     """Stop a running runtime tool and free VRAM."""
-    try:
-        from integrations.service_tools.runtime_manager import runtime_tool_manager
-        return jsonify(runtime_tool_manager.stop_tool(tool_name))
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    from integrations.service_tools.runtime_manager import runtime_tool_manager
+    return jsonify(runtime_tool_manager.stop_tool(tool_name))
 
 
 @app.route('/api/tools/<tool_name>/unload', methods=['POST'])
+@_json_endpoint
 def tools_unload(tool_name):
     """Stop + deregister a runtime tool."""
-    try:
-        from integrations.service_tools.runtime_manager import runtime_tool_manager
-        return jsonify(runtime_tool_manager.unload_tool(tool_name))
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    from integrations.service_tools.runtime_manager import runtime_tool_manager
+    return jsonify(runtime_tool_manager.unload_tool(tool_name))
 
 
 @app.route('/api/tools/vram', methods=['GET'])
+@_json_endpoint
 def tools_vram():
     """Get VRAM usage dashboard."""
+    from integrations.service_tools.vram_manager import vram_manager
+    return jsonify(vram_manager.get_status())
+
+
+# ─── Model Lifecycle API ─────────────────────────────────────────────
+# Agentic model lifecycle management — dynamic load/unload/offload.
+
+@app.route('/api/tools/lifecycle', methods=['GET'])
+@_json_endpoint
+def tools_lifecycle():
+    """Model lifecycle dashboard: loaded models, priorities, VRAM pressure, hive hints."""
+    from integrations.service_tools.model_lifecycle import get_model_lifecycle_manager
+    mgr = get_model_lifecycle_manager()
+    return jsonify(mgr.get_status())
+
+
+@app.route('/api/tools/lifecycle/<model_name>/priority', methods=['POST'])
+@_json_endpoint
+def tools_lifecycle_priority(model_name):
+    """Manually set model priority (admin override)."""
+    from integrations.service_tools.model_lifecycle import get_model_lifecycle_manager
+    data = request.get_json() or {}
+    priority = data.get('priority', 'warm')
+    mgr = get_model_lifecycle_manager()
+    return jsonify(mgr.set_priority(model_name, priority))
+
+
+@app.route('/api/tools/lifecycle/<model_name>/offload', methods=['POST'])
+@_json_endpoint
+def tools_lifecycle_offload(model_name):
+    """Manually trigger GPU→CPU offload for a model."""
+    from integrations.service_tools.model_lifecycle import get_model_lifecycle_manager
+    mgr = get_model_lifecycle_manager()
+    return jsonify(mgr.manual_offload(model_name))
+
+
+@app.route('/api/system/pressure', methods=['GET'])
+@_json_endpoint
+def system_pressure():
+    """Real-time system pressure dashboard: VRAM, RAM, CPU, disk, throttle factor."""
+    from integrations.service_tools.model_lifecycle import get_model_lifecycle_manager
+    mgr = get_model_lifecycle_manager()
+    return jsonify(mgr.get_system_pressure())
+
+
+@app.route('/api/revenue/dashboard', methods=['GET'])
+@_json_endpoint
+def revenue_dashboard():
+    """Revenue pipeline dashboard: streams, trading P&L, compute borrowing."""
+    from integrations.agent_engine.revenue_aggregator import get_revenue_aggregator
+    from integrations.agent_engine.compute_borrowing import ComputeBorrowingService
+    from integrations.social.models import get_db
+    db = get_db()
     try:
-        from integrations.service_tools.vram_manager import vram_manager
-        return jsonify(vram_manager.get_status())
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        rev = get_revenue_aggregator()
+        dashboard = rev.get_dashboard(db)
+        dashboard['compute_borrowing'] = ComputeBorrowingService.get_status(db)
+        return jsonify(dashboard)
+    finally:
+        db.close()
 
 
 # ─── Coding Agent Aggregator API ──────────────────────────────────────
@@ -4302,92 +5130,84 @@ def tools_vram():
 # Tools execute as external CLI subprocesses — never re-dispatch to /chat.
 
 @app.route('/coding/tools', methods=['GET'])
+@_json_endpoint
 def coding_tools():
     """List installed coding tools, capabilities, and benchmarks."""
-    try:
-        from integrations.coding_agent.orchestrator import get_coding_orchestrator
-        return jsonify(get_coding_orchestrator().list_tools())
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    from integrations.coding_agent.orchestrator import get_coding_orchestrator
+    return jsonify(get_coding_orchestrator().list_tools())
 
 
 @app.route('/coding/execute', methods=['POST'])
+@_json_endpoint
 def coding_execute():
     """Execute a coding task via the best available tool.
 
     JSON body: {task, task_type?, preferred_tool?, model?, working_dir?}
     If 'encrypted' key present, decrypts E2E envelope first (hive offload).
     """
-    try:
-        data = request.get_json(force=True)
+    data = request.get_json(force=True)
 
-        # Handle encrypted envelope from hive peer
-        encrypted = data.get('encrypted')
-        if encrypted:
-            try:
-                from security.channel_encryption import (
-                    decrypt_json_from_peer, encrypt_json_for_peer,
-                    get_x25519_public_hex,
-                )
-                data = decrypt_json_from_peer(encrypted)
-                if not data:
-                    return jsonify({'error': 'Decryption failed'}), 400
-            except Exception as e:
-                return jsonify({'error': f'Envelope decryption error: {e}'}), 400
+    # Handle encrypted envelope from hive peer
+    encrypted = data.get('encrypted')
+    if encrypted:
+        try:
+            from security.channel_encryption import (
+                decrypt_json_from_peer, encrypt_json_for_peer,
+                get_x25519_public_hex,
+            )
+            data = decrypt_json_from_peer(encrypted)
+            if not data:
+                return jsonify({'error': 'Decryption failed'}), 400
+        except Exception as e:
+            return jsonify({'error': f'Envelope decryption error: {e}'}), 400
 
-        task = data.get('task', '')
-        if not task:
-            return jsonify({'error': 'task is required'}), 400
+    task = data.get('task', '')
+    if not task:
+        return jsonify({'error': 'task is required'}), 400
 
-        from integrations.coding_agent.orchestrator import get_coding_orchestrator
-        result = get_coding_orchestrator().execute(
-            task=task,
-            task_type=data.get('task_type', 'feature'),
-            preferred_tool=data.get('preferred_tool', ''),
-            user_id=data.get('user_id', ''),
-            model=data.get('model', ''),
-            working_dir=data.get('working_dir', ''),
-        )
+    from integrations.coding_agent.orchestrator import get_coding_orchestrator
+    result = get_coding_orchestrator().execute(
+        task=task,
+        task_type=data.get('task_type', 'feature'),
+        preferred_tool=data.get('preferred_tool', ''),
+        user_id=data.get('user_id', ''),
+        model=data.get('model', ''),
+        working_dir=data.get('working_dir', ''),
+    )
 
-        # If request came from hive peer, encrypt the response back
-        if encrypted:
-            try:
-                from security.channel_encryption import encrypt_json_for_peer
-                peer_pub = data.get('_reply_x25519', '')
-                if peer_pub:
-                    return jsonify({'encrypted': encrypt_json_for_peer(result, peer_pub)})
-            except Exception:
-                pass
+    # If request came from hive peer, encrypt the response back
+    if encrypted:
+        try:
+            from security.channel_encryption import encrypt_json_for_peer
+            peer_pub = data.get('_reply_x25519', '')
+            if peer_pub:
+                return jsonify({'encrypted': encrypt_json_for_peer(result, peer_pub)})
+        except Exception:
+            pass
 
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    return jsonify(result)
 
 
 @app.route('/coding/benchmarks', methods=['GET'])
+@_json_endpoint
 def coding_benchmarks():
     """Get coding tool benchmark dashboard data."""
-    try:
-        from integrations.coding_agent.orchestrator import get_coding_orchestrator
-        return jsonify(get_coding_orchestrator().get_benchmarks())
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    from integrations.coding_agent.orchestrator import get_coding_orchestrator
+    return jsonify(get_coding_orchestrator().get_benchmarks())
 
 
 @app.route('/coding/install', methods=['POST'])
+@_json_endpoint
 def coding_install():
     """Install a coding tool via npm. JSON body: {tool_name}"""
-    try:
-        data = request.get_json(force=True)
-        tool_name = data.get('tool_name', '')
-        if not tool_name:
-            return jsonify({'error': 'tool_name is required'}), 400
-        from integrations.coding_agent.installer import install
-        result = install(tool_name)
-        code = 200 if result.get('success') else 500
-        return jsonify(result), code
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    data = request.get_json(force=True)
+    tool_name = data.get('tool_name', '')
+    if not tool_name:
+        return jsonify({'error': 'tool_name is required'}), 400
+    from integrations.coding_agent.installer import install
+    result = install(tool_name)
+    code = 200 if result.get('success') else 500
+    return jsonify(result), code
 
 
 @app.route('/api/voice/transcribe', methods=['POST'])
@@ -4426,6 +5246,72 @@ def voice_transcribe():
 
     except ImportError as e:
         return jsonify({'error': f'Whisper not available: {e}'}), 503
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/voice/speak', methods=['POST'])
+def voice_speak():
+    """Synthesize text to speech using Pocket TTS (offline).
+
+    Accepts JSON with 'text', optional 'voice' (default 'alba'),
+    optional 'output_path' (auto-generated if omitted).
+    """
+    try:
+        from integrations.service_tools.pocket_tts_tool import pocket_tts_synthesize
+        import json as _json
+
+        data = request.get_json() or {}
+        text = data.get('text', '')
+        if not text:
+            return jsonify({'error': 'text is required'}), 400
+
+        voice = data.get('voice', 'alba')
+        output_path = data.get('output_path')
+        result = pocket_tts_synthesize(text, voice, output_path)
+        parsed = _json.loads(result)
+        code = 200 if 'error' not in parsed else 500
+        return jsonify(parsed), code
+
+    except ImportError as e:
+        return jsonify({'error': f'TTS not available: {e}'}), 503
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/voice/voices', methods=['GET'])
+def voice_list_voices():
+    """List available TTS voices (built-in + cloned)."""
+    try:
+        from integrations.service_tools.pocket_tts_tool import pocket_tts_list_voices
+        import json as _json
+        return jsonify(_json.loads(pocket_tts_list_voices()))
+    except ImportError as e:
+        return jsonify({'error': f'TTS not available: {e}'}), 503
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/voice/clone', methods=['POST'])
+def voice_clone():
+    """Clone a voice from an audio sample (5+ seconds recommended)."""
+    try:
+        from integrations.service_tools.pocket_tts_tool import pocket_tts_clone_voice
+        import json as _json
+
+        data = request.get_json() or {}
+        audio_path = data.get('audio_path', '')
+        name = data.get('name', '')
+        if not audio_path or not name:
+            return jsonify({'error': 'audio_path and name required'}), 400
+
+        result = pocket_tts_clone_voice(audio_path, name)
+        parsed = _json.loads(result)
+        code = 200 if 'error' not in parsed else 500
+        return jsonify(parsed), code
+
+    except ImportError as e:
+        return jsonify({'error': f'TTS not available: {e}'}), 503
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -4529,6 +5415,405 @@ def skills_delete(skill_name):
         return jsonify({'error': str(e)}), 500
 
 
+# ─── Settings API — Compute Configuration ───────────────────────────
+
+
+@app.route('/api/settings/compute', methods=['GET'])
+@_json_endpoint
+def settings_compute_get():
+    """Return merged compute policy (env > DB > defaults).
+
+    Access: any authenticated node operator.
+    """
+    import os as _os
+    node_id = _os.environ.get('HEVOLVE_NODE_ID', 'local')
+    from integrations.agent_engine.compute_config import get_compute_policy
+    policy = get_compute_policy(node_id)
+
+    # Add provider identity from PeerNode (single source of truth)
+    provider_info = {}
+    try:
+        from integrations.social.models import db_session, PeerNode
+        with db_session() as db:
+            peer = db.query(PeerNode).filter_by(node_id=node_id).first()
+            if peer:
+                provider_info = {
+                    'electricity_rate_kwh': peer.electricity_rate_kwh,
+                    'cause_alignment': peer.cause_alignment,
+                }
+    except Exception:
+        pass
+
+    return jsonify({**policy, **provider_info, 'node_id': node_id})
+
+
+@app.route('/api/settings/compute', methods=['PUT'])
+@_json_endpoint
+def settings_compute_put():
+    """Update compute configuration. Single endpoint, writes to correct table per field.
+
+    Policy fields → NodeComputeConfig (local-only).
+    Provider identity → PeerNode (gossipped to network).
+    Access: node operator or admin. Tier-aware: central nodes cannot set allow_metered_for_hive.
+    """
+    import os as _os
+    data = request.get_json() or {}
+    node_id = _os.environ.get('HEVOLVE_NODE_ID', 'local')
+    node_tier = _os.environ.get('HEVOLVE_NODE_TIER', 'flat')
+
+    # Tier guard: central nodes cannot opt into metered for hive
+    if node_tier == 'central' and data.get('allow_metered_for_hive'):
+        return jsonify({'error': 'Central nodes cannot enable metered APIs for hive'}), 403
+
+    # Policy fields → NodeComputeConfig
+    policy_fields = {
+        'compute_policy', 'hive_compute_policy', 'max_hive_gpu_pct',
+        'allow_metered_for_hive', 'metered_daily_limit_usd',
+        'offered_gpu_hours_per_day', 'accept_thought_experiments',
+        'accept_frontier_training', 'auto_settle', 'min_settlement_spark',
+    }
+    # Provider identity → PeerNode
+    peer_fields = {'electricity_rate_kwh', 'cause_alignment'}
+
+    policy_updates = {k: v for k, v in data.items() if k in policy_fields}
+    peer_updates = {k: v for k, v in data.items() if k in peer_fields}
+
+    from integrations.social.models import db_session, NodeComputeConfig, PeerNode
+
+    with db_session() as db:
+        if policy_updates:
+            config = db.query(NodeComputeConfig).filter_by(node_id=node_id).first()
+            if not config:
+                config = NodeComputeConfig(node_id=node_id)
+                db.add(config)
+            for key, val in policy_updates.items():
+                setattr(config, key, val)
+
+        if peer_updates:
+            peer = db.query(PeerNode).filter_by(node_id=node_id).first()
+            if peer:
+                for key, val in peer_updates.items():
+                    setattr(peer, key, val)
+
+        db.commit()
+
+    # Invalidate cache
+    from integrations.agent_engine.compute_config import invalidate_cache
+    invalidate_cache(node_id)
+
+    return jsonify({'updated': True, 'node_id': node_id,
+                    'policy_fields': list(policy_updates.keys()),
+                    'peer_fields': list(peer_updates.keys())})
+
+
+@app.route('/api/settings/compute/provider', methods=['GET'])
+@_json_endpoint
+def settings_compute_provider():
+    """Provider dashboard: contribution score, GPU hours, inferences, energy,
+    total Spark earned, pending settlements, cause alignment.
+
+    Access: node operator. Deployment-mode aware (flat/regional/central).
+    """
+    import os as _os
+    node_id = _os.environ.get('HEVOLVE_NODE_ID', 'local')
+    node_tier = _os.environ.get('HEVOLVE_NODE_TIER', 'flat')
+
+    from integrations.social.models import db_session, PeerNode, MeteredAPIUsage
+    from integrations.social.hosting_reward_service import HostingRewardService
+    from sqlalchemy import func as sa_func
+
+    with db_session() as db:
+        peer = db.query(PeerNode).filter_by(node_id=node_id).first()
+        if not peer:
+            return jsonify({'error': 'Node not registered', 'node_id': node_id}), 404
+
+        # Contribution score
+        score_result = HostingRewardService.compute_contribution_score(db, node_id)
+
+        # Pending settlements
+        pending_count = db.query(sa_func.count(MeteredAPIUsage.id)).filter(
+            MeteredAPIUsage.node_id == node_id,
+            MeteredAPIUsage.settlement_status == 'pending',
+        ).scalar() or 0
+
+        pending_usd = db.query(
+            sa_func.coalesce(sa_func.sum(MeteredAPIUsage.actual_usd_cost), 0)
+        ).filter(
+            MeteredAPIUsage.node_id == node_id,
+            MeteredAPIUsage.settlement_status == 'pending',
+        ).scalar() or 0.0
+
+        # Reward summary
+        reward_summary = HostingRewardService.get_reward_summary(db, node_id)
+
+        return jsonify({
+            'node_id': node_id,
+            'node_tier': node_tier,
+            'contribution': score_result,
+            'compute_stats': {
+                'gpu_hours_served': peer.gpu_hours_served or 0,
+                'total_inferences': peer.total_inferences or 0,
+                'energy_kwh_contributed': peer.energy_kwh_contributed or 0,
+                'metered_api_costs_absorbed': peer.metered_api_costs_absorbed or 0,
+            },
+            'provider_identity': {
+                'cause_alignment': peer.cause_alignment,
+                'electricity_rate_kwh': peer.electricity_rate_kwh,
+            },
+            'pending_settlements': {
+                'count': pending_count,
+                'total_usd': round(float(pending_usd), 4),
+            },
+            'reward_summary': reward_summary,
+        })
+
+
+@app.route('/api/settings/compute/provider/join', methods=['POST'])
+@_json_endpoint
+def settings_compute_provider_join():
+    """Simple provider onboarding. Creates NodeComputeConfig + sets PeerNode identity.
+
+    Body: {cause_alignment?, electricity_rate_kwh?, offered_gpu_hours_per_day?, compute_policy?}
+    Access: any node. Creates config with sensible defaults.
+    """
+    import os as _os
+    data = request.get_json() or {}
+    node_id = _os.environ.get('HEVOLVE_NODE_ID', 'local')
+
+    from integrations.social.models import db_session, NodeComputeConfig, PeerNode
+
+    with db_session() as db:
+        # Create or update NodeComputeConfig
+        config = db.query(NodeComputeConfig).filter_by(node_id=node_id).first()
+        if not config:
+            config = NodeComputeConfig(node_id=node_id)
+            db.add(config)
+
+        for field in ('compute_policy', 'offered_gpu_hours_per_day',
+                      'accept_thought_experiments', 'accept_frontier_training'):
+            if field in data:
+                setattr(config, field, data[field])
+
+        # Set provider identity on PeerNode
+        peer = db.query(PeerNode).filter_by(node_id=node_id).first()
+        if peer:
+            if 'cause_alignment' in data:
+                peer.cause_alignment = data['cause_alignment']
+            elif not peer.cause_alignment:
+                peer.cause_alignment = 'democratize_compute'
+            if 'electricity_rate_kwh' in data:
+                peer.electricity_rate_kwh = data['electricity_rate_kwh']
+
+        db.commit()
+
+    # Invalidate cache
+    from integrations.agent_engine.compute_config import invalidate_cache
+    invalidate_cache(node_id)
+
+    # Return the merged config
+    from integrations.agent_engine.compute_config import get_compute_policy
+    policy = get_compute_policy(node_id)
+
+    return jsonify({
+        'joined': True,
+        'node_id': node_id,
+        'config': policy,
+        'message': 'Welcome to the HART OS compute network. '
+                   'Your contribution helps democratize access to AI.',
+    })
+
+
+# ─── Remote Desktop API ──────────────────────────────────────────
+# RustDesk + Sunshine/Moonlight bridge, session management,
+# engine selection, device identity.
+
+
+@app.route('/api/remote-desktop/status', methods=['GET'])
+@_json_endpoint
+def remote_desktop_api_status():
+    """Device ID, engine status, active sessions."""
+    from integrations.remote_desktop.engine_selector import get_all_status
+    from integrations.remote_desktop.device_id import get_device_id, format_device_id
+    from integrations.remote_desktop.session_manager import get_session_manager
+
+    device_id = get_device_id()
+    sm = get_session_manager()
+    sessions = sm.get_active_sessions()
+
+    status = get_all_status()
+    status['device_id'] = device_id
+    status['formatted_id'] = format_device_id(device_id)
+    status['active_sessions'] = [
+        {'session_id': s.session_id, 'host_device_id': s.host_device_id,
+         'mode': s.mode.value, 'state': s.state.value,
+         'viewers': s.viewer_device_ids}
+        for s in sessions
+    ]
+    return jsonify(status)
+
+
+@app.route('/api/remote-desktop/host', methods=['POST'])
+@_json_endpoint
+def remote_desktop_api_host():
+    """Start hosting. Body: {mode?, engine?}. Returns device_id + password."""
+    data = request.get_json() or {}
+    from integrations.remote_desktop.session_manager import (
+        get_session_manager, SessionMode,
+    )
+    from integrations.remote_desktop.device_id import get_device_id, format_device_id
+
+    device_id = get_device_id()
+    sm = get_session_manager()
+    mode_str = data.get('mode', 'full_control')
+    mode = SessionMode(mode_str) if mode_str in [m.value for m in SessionMode] else SessionMode.FULL_CONTROL
+    password = sm.generate_otp(device_id)
+    engine_pref = data.get('engine', 'auto')
+
+    result = {
+        'device_id': device_id,
+        'formatted_id': format_device_id(device_id),
+        'password': password,
+        'mode': mode.value,
+        'engine': engine_pref,
+    }
+
+    # Start RustDesk
+    if engine_pref in ('auto', 'rustdesk'):
+        try:
+            from integrations.remote_desktop.rustdesk_bridge import get_rustdesk_bridge
+            bridge = get_rustdesk_bridge()
+            if bridge.available:
+                bridge.set_password(password)
+                bridge.start_service()
+                rd_id = bridge.get_id()
+                if rd_id:
+                    result['rustdesk_id'] = rd_id
+                result['engine'] = 'rustdesk'
+        except Exception:
+            pass
+
+    # Start Sunshine
+    if engine_pref in ('auto', 'sunshine'):
+        try:
+            from integrations.remote_desktop.sunshine_bridge import get_sunshine_bridge
+            bridge = get_sunshine_bridge()
+            if bridge.available:
+                bridge.start_service()
+                result['sunshine_running'] = bridge.is_running()
+                if engine_pref == 'sunshine':
+                    result['engine'] = 'sunshine'
+        except Exception:
+            pass
+
+    return jsonify(result)
+
+
+@app.route('/api/remote-desktop/connect', methods=['POST'])
+@_json_endpoint
+def remote_desktop_api_connect():
+    """Connect to remote device. Body: {device_id, password, mode?, engine?}."""
+    data = request.get_json() or {}
+    device_id = data.get('device_id')
+    password = data.get('password')
+    if not device_id or not password:
+        return jsonify({'error': 'device_id and password required'}), 400
+
+    engine = data.get('engine', 'auto')
+    file_transfer = data.get('mode') == 'file_transfer'
+
+    # Try RustDesk
+    if engine in ('auto', 'rustdesk'):
+        try:
+            from integrations.remote_desktop.rustdesk_bridge import get_rustdesk_bridge
+            bridge = get_rustdesk_bridge()
+            if bridge.available:
+                ok, msg = bridge.connect(device_id, password=password,
+                                         file_transfer=file_transfer)
+                if ok:
+                    return jsonify({'success': True, 'engine': 'rustdesk',
+                                    'device_id': device_id, 'message': msg})
+        except Exception:
+            pass
+
+    # Try Moonlight
+    if engine in ('auto', 'moonlight'):
+        try:
+            from integrations.remote_desktop.sunshine_bridge import get_moonlight_bridge
+            bridge = get_moonlight_bridge()
+            if bridge.available:
+                ok, msg = bridge.stream(device_id)
+                if ok:
+                    return jsonify({'success': True, 'engine': 'moonlight',
+                                    'device_id': device_id, 'message': msg})
+        except Exception:
+            pass
+
+    return jsonify({'success': False, 'error': 'No engine available'}), 503
+
+
+@app.route('/api/remote-desktop/sessions', methods=['GET'])
+@_json_endpoint
+def remote_desktop_api_sessions():
+    """List active remote desktop sessions."""
+    from integrations.remote_desktop.session_manager import get_session_manager
+    sm = get_session_manager()
+    sessions = sm.get_active_sessions()
+    return jsonify({
+        'sessions': [
+            {'session_id': s.session_id, 'host_device_id': s.host_device_id,
+             'mode': s.mode.value, 'state': s.state.value,
+             'viewers': s.viewer_device_ids}
+            for s in sessions
+        ]
+    })
+
+
+@app.route('/api/remote-desktop/disconnect/<session_id>', methods=['POST'])
+@_json_endpoint
+def remote_desktop_api_disconnect(session_id):
+    """End a specific session."""
+    from integrations.remote_desktop.session_manager import get_session_manager
+    sm = get_session_manager()
+    sm.disconnect_session(session_id)
+    return jsonify({'disconnected': session_id})
+
+
+@app.route('/api/remote-desktop/engines', methods=['GET'])
+@_json_endpoint
+def remote_desktop_api_engines():
+    """List available engines with install commands."""
+    from integrations.remote_desktop.engine_selector import (
+        get_available_engines, get_all_status, Engine,
+    )
+    status = get_all_status()
+    available = get_available_engines()
+    return jsonify({
+        'available': [e.value for e in available],
+        'engines': status['engines'],
+        'install_recommendations': status.get('install_recommendations', []),
+    })
+
+
+@app.route('/api/remote-desktop/select-engine', methods=['POST'])
+@_json_endpoint
+def remote_desktop_api_select_engine():
+    """Auto-select best engine. Body: {use_case?, role?, prefer?}."""
+    data = request.get_json() or {}
+    from integrations.remote_desktop.engine_selector import (
+        select_engine, UseCase, Engine,
+    )
+
+    use_case_str = data.get('use_case', 'general')
+    role = data.get('role', 'viewer')
+    prefer_str = data.get('prefer')
+
+    uc = UseCase(use_case_str) if use_case_str in [u.value for u in UseCase] else UseCase.GENERAL
+    prefer = Engine(prefer_str) if prefer_str and prefer_str in [e.value for e in Engine] else None
+
+    engine = select_engine(uc, role=role, prefer=prefer)
+    return jsonify({'engine': engine.value, 'use_case': uc.value, 'role': role})
+
+
 def _init_skills():
     """Initialize skill registry — load persisted skills + discover local."""
     try:
@@ -4595,6 +5880,29 @@ def _validate_startup():
         except OSError as e:
             warnings.append(f"Cannot create agent_data directory: {e}")
 
+    # ── Central instance hardening ──
+    _central_logger = logging.getLogger('hevolve_social')
+    node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
+    if node_tier == 'central':
+        # Fix 3: TLS check
+        if not os.environ.get('TLS_CERT_PATH'):
+            _central_logger.warning("CENTRAL HARDENING: No TLS_CERT_PATH set — production should use HTTPS")
+
+        # Fix 5: Secret presence validation
+        api_key = os.environ.get('OPENAI_API_KEY', '')
+        if not api_key or api_key.startswith('sk-xxx') or api_key == 'your-key':
+            _central_logger.critical("CENTRAL HARDENING: OPENAI_API_KEY missing or placeholder")
+
+        # Fix 6: DB encryption check
+        db_url = os.environ.get('DATABASE_URL', '')
+        if not db_url or 'sqlite' in db_url.lower():
+            _central_logger.warning("CENTRAL HARDENING: SQLite detected — production should use PostgreSQL or sqlcipher")
+
+        # Fix 7: Block dev mode
+        if os.environ.get('HEVOLVE_DEV_MODE', '').lower() == 'true':
+            os.environ['HEVOLVE_DEV_MODE'] = 'false'
+            _central_logger.critical("CENTRAL HARDENING: Dev mode FORCED OFF on central instance")
+
     if warnings:
         logger = logging.getLogger('hevolve_social')
         logger.warning("=" * 60)
@@ -4622,7 +5930,8 @@ def main():
     skills_thread = threading.Thread(target=_init_skills, daemon=True)
     skills_thread.start()
 
-    serve(app, host='0.0.0.0', port=6777, threads=50)
+    from core.port_registry import get_port
+    serve(app, host='0.0.0.0', port=get_port('backend'), threads=50)
 
 
 if __name__ == '__main__':

@@ -32,6 +32,8 @@ class VRAMManager:
     def __init__(self):
         self._allocations: Dict[str, float] = {}  # tool → GB reserved
         self._gpu_info: Optional[Dict] = None
+        self._gpu_info_ts: float = 0.0  # timestamp of last nvidia-smi call
+        self._refresh_ttl: float = 30.0  # seconds between nvidia-smi calls
 
     # ── GPU Detection ────────────────────────────────────────────
 
@@ -94,7 +96,7 @@ class VRAMManager:
                 import torch
                 if torch.cuda.is_available():
                     props = torch.cuda.get_device_properties(0)
-                    total = props.total_mem / (1024 ** 3)
+                    total = props.total_memory / (1024 ** 3)
                     allocated = torch.cuda.memory_allocated(0) / (1024 ** 3)
                     info.update({
                         "name": torch.cuda.get_device_name(0),
@@ -132,9 +134,15 @@ class VRAMManager:
         return info
 
     def refresh_gpu_info(self) -> Dict:
-        """Force re-detect GPU (clears cache)."""
+        """Re-detect GPU with TTL cache (avoids nvidia-smi spam from multiple threads)."""
+        import time as _t
+        now = _t.monotonic()
+        if self._gpu_info is not None and (now - self._gpu_info_ts) < self._refresh_ttl:
+            return self._gpu_info  # recent enough — skip subprocess
         self._gpu_info = None
-        return self.detect_gpu()
+        result = self.detect_gpu()
+        self._gpu_info_ts = _t.monotonic()
+        return result
 
     # ── VRAM queries ─────────────────────────────────────────────
 
@@ -209,6 +217,49 @@ class VRAMManager:
             return "cpu_offload"
         else:
             return "cpu_only"
+
+    # ── Pressure detection ────────────────────────────────────────
+
+    def get_actual_free_vram(self) -> float:
+        """Return ACTUAL free VRAM by refreshing nvidia-smi (not cached advisory).
+
+        Unlike get_free_vram(), this re-reads hardware state every call.
+        Used by ModelLifecycleManager for real-time pressure detection.
+        """
+        self.refresh_gpu_info()
+        info = self._gpu_info or {}
+        return info.get('free_gb', 0.0)
+
+    def get_vram_usage_pct(self) -> float:
+        """Return current VRAM usage as percentage (0-100).
+
+        Refreshes GPU info first for accuracy.
+        """
+        self.refresh_gpu_info()
+        info = self._gpu_info or {}
+        total = info.get('total_gb', 0)
+        free = info.get('free_gb', 0)
+        if total <= 0:
+            return 0.0
+        return ((total - free) / total) * 100
+
+    # ── CUDA Cache Clearing ─────────────────────────────────────
+
+    @staticmethod
+    def clear_cuda_cache() -> bool:
+        """Clear GPU cache (CUDA or MPS) if torch is loaded. Returns True if cleared."""
+        if 'torch' in sys.modules:
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    return True
+                elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
+                    return True
+            except Exception:
+                pass
+        return False
 
     # ── Dashboard ────────────────────────────────────────────────
 

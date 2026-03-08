@@ -1,0 +1,11 @@
+# HART Embedded Tier — Minimal dependencies for RPi Zero, IoT, robots
+# Only 4 packages. Total install: ~5 MB. Runtime: ~120 MB RAM.
+#
+# Usage:
+#   python3 -m pip install -r deploy/embedded/requirements-embedded.txt
+#   HEVOLVE_HEADLESS=true python3 embedded_main.py
+#
+cryptography>=41.0.0    # Ed25519 keypair, code signing, certificate verification
+requests>=2.28.0        # HTTP for gossip, sync queue drain, fleet commands
+python-dotenv>=1.0.0    # Load .env configuration
+SQLAlchemy>=1.4.0,<2.0  # ORM for local DB (fleet commands, sync queue)

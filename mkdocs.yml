@@ -1,0 +1,101 @@
+site_name: HART OS Documentation
+site_url: https://docs.hevolve.ai
+site_description: Hevolve Agentic Runtime — Multi-agent platform documentation
+repo_url: https://github.com/hevolve/hart
+repo_name: hevolve/hart
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: deep purple
+      toggle:
+        icon: material/brightness-7
+        name: Dark mode
+    - scheme: slate
+      primary: deep purple
+      toggle:
+        icon: material/brightness-4
+        name: Light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - search.suggest
+    - content.code.copy
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - toc:
+      permalink: true
+  - tables
+
+nav:
+  - Home: index.md
+  - Getting Started:
+    - Quick Start: getting-started/quickstart.md
+    - Installation: getting-started/installation.md
+    - Deployment Modes: getting-started/deployment-modes.md
+    - Configuration: getting-started/configuration.md
+  - Features:
+    - Overview: features/overview.md
+    - Agent Engine: features/agent-engine.md
+    - Recipe Pattern: features/recipe-pattern.md
+    - Revenue Model (90/9/1): features/revenue-model.md
+    - Compute Policies: features/compute-policies.md
+    - Budget Gating: features/budget-gating.md
+    - Contribution Scoring: features/contribution-scoring.md
+    - Metered API Cost Recovery: features/metered-api-recovery.md
+    - Federation & Gossip: features/federation.md
+    - Social Platform: features/social-platform.md
+    - Thought Experiments: features/thought-experiments.md
+    - Vision & VLM: features/vision.md
+    - Coding Agent (Idle Compute): features/coding-agent.md
+    - Trading Agents: features/trading-agents.md
+    - Channel Adapters: features/channels.md
+    - Autonomous Upgrade Pipeline: features/upgrade-pipeline.md
+    - Benchmark & Baseline Tracking: features/benchmark-tracking.md
+  - Provider Guide:
+    - Joining the Network: provider/joining.md
+    - Compute Configuration: provider/compute-config.md
+    - Contribution Dashboard: provider/dashboard.md
+    - Settlement & Compensation: provider/settlement.md
+    - Cause Alignment: provider/cause.md
+  - API Reference:
+    - Core Endpoints: api/core.md
+    - Social API: api/social.md
+    - Agent Engine API: api/agent-engine.md
+    - Settings API: api/settings.md
+    - Revenue API: api/revenue.md
+    - A2A Protocol: api/a2a.md
+  - UI Contracts:
+    - Settings UI Spec: ui/settings-spec.md
+    - Provider Dashboard UI: ui/provider-dashboard.md
+  - Developer Guide:
+    - Architecture: developer/architecture.md
+    - Key Patterns: developer/patterns.md
+    - Security Model: developer/security.md
+    - Database Schema: developer/schema.md
+    - State Machine: developer/state-machine.md
+    - Testing Guide: developer/testing.md
+    - Guardrails Audit: developer/guardrails-audit.md
+    - Contributing: developer/contributing.md
+  - Architecture:
+    - System Overview: architecture/overview.md
+    - Task Delegation: architecture/task-delegation.md
+    - Smart Ledger: architecture/smart-ledger.md
+    - Federation Protocol: architecture/federation-protocol.md
+    - Nested Task System: architecture/nested-tasks.md
+
+extra:
+  social:
+    - icon: fontawesome/solid/flask-vial
+      link: test-reports/
+      name: Test Reports & Coverage

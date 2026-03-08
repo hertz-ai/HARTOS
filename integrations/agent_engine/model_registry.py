@@ -128,6 +128,44 @@ class ModelRegistry:
             return None
         return max(candidates, key=lambda m: m.accuracy_score)
 
+    def get_local_model(self, min_accuracy: float = 0.0) -> Optional[ModelBackend]:
+        """Get the highest-accuracy local model (is_local=True, cost=0).
+
+        Used by policy-aware routing to prefer local compute for hive/idle tasks.
+        """
+        with self._lock:
+            candidates = [m for m in self._models.values()
+                          if m.is_local and m.accuracy_score >= min_accuracy]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda m: m.accuracy_score)
+
+    def get_model_by_policy(self, policy: str = 'local_preferred',
+                            task_source: str = 'own',
+                            min_accuracy: float = 0.0) -> Optional[ModelBackend]:
+        """Policy-aware model selection.
+
+        Policies:
+          local_only     — Only local models (is_local=True). Returns None if none available.
+          local_preferred — Try local first, fall through to metered if none available.
+          any            — Fastest model regardless of locality (metered costs tracked).
+
+        For hive/idle tasks, enforces at least local_preferred unless node opted into 'any'.
+        """
+        if task_source in ('hive', 'idle') and policy != 'any':
+            policy = 'local_preferred'
+
+        if policy == 'local_only':
+            return self.get_local_model(min_accuracy)
+
+        if policy == 'local_preferred':
+            local = self.get_local_model(min_accuracy)
+            if local:
+                return local
+            # Fall through to metered (will be tracked + compensated)
+
+        return self.get_fast_model(min_accuracy)
+
     def list_models(self, tier: ModelTier = None) -> List[ModelBackend]:
         """List all models, optionally filtered by tier."""
         with self._lock:
@@ -209,6 +247,25 @@ def _register_defaults():
         },
         avg_latency_ms=800.0,
         accuracy_score=0.55,
+        cost_per_1k_tokens=0.0,
+        is_local=True,
+        hardware_dependent=True,
+        gpu_tdp_watts=170.0,
+    ))
+
+    # 1b. Local Qwen3.5-4B text-only (always available — 256K context, llama.cpp b8148+)
+    model_registry.register(ModelBackend(
+        model_id='qwen3.5-4b-local',
+        display_name='Qwen3.5 4B (Local)',
+        tier=ModelTier.FAST,
+        config_list_entry={
+            'model': 'Qwen3.5-4B-Instruct',
+            'api_key': 'dummy',
+            'base_url': f'http://localhost:{os.environ.get("LLAMA_CPP_PORT", "8080")}/v1',
+            'price': [0, 0],
+        },
+        avg_latency_ms=700.0,
+        accuracy_score=0.60,
         cost_per_1k_tokens=0.0,
         is_local=True,
         hardware_dependent=True,
@@ -323,6 +380,104 @@ def _register_defaults():
             is_local=True,
             hardware_dependent=True,
             gpu_tdp_watts=0.0,  # CPU-only, no GPU power draw
+        ))
+
+    # 8. Pocket TTS — offline, CPU, 100M params, MIT (always available)
+    model_registry.register(ModelBackend(
+        model_id='pocket-tts-100m',
+        display_name='Pocket TTS 100M (Offline)',
+        tier=ModelTier.FAST,
+        config_list_entry={
+            'model': 'pocket-tts-100m',
+            'api_key': 'local',
+            'base_url': 'inprocess://pocket_tts',
+            'price': [0, 0],
+        },
+        avg_latency_ms=200.0,
+        accuracy_score=0.85,
+        cost_per_1k_tokens=0.0,
+        is_local=True,
+        hardware_dependent=False,
+        gpu_tdp_watts=0.0,
+    ))
+
+    # 9. Whisper STT — offline, sherpa-onnx or openai-whisper (always available)
+    model_registry.register(ModelBackend(
+        model_id='whisper-stt-local',
+        display_name='Whisper STT (sherpa-onnx / Local)',
+        tier=ModelTier.FAST,
+        config_list_entry={
+            'model': 'whisper-stt',
+            'api_key': 'local',
+            'base_url': 'inprocess://whisper',
+            'price': [0, 0],
+        },
+        avg_latency_ms=500.0,
+        accuracy_score=0.88,
+        cost_per_1k_tokens=0.0,
+        is_local=True,
+        hardware_dependent=True,
+        gpu_tdp_watts=0.0,
+    ))
+
+    # 10. LuxTTS — 48kHz voice cloning TTS (GPU-accelerated, Apache 2.0)
+    #     150x realtime on GPU, >1x on CPU, <1GB VRAM
+    #     ZipVoice-distilled, 4-step diffusion, voice cloning from 3s audio
+    _luxtts_available = False
+    try:
+        from zipvoice.luxvoice import LuxTTS as _LuxCheck  # noqa: F401
+        _luxtts_available = True
+    except ImportError:
+        pass
+
+    if _luxtts_available:
+        # Detect GPU for latency estimate
+        _luxtts_has_gpu = False
+        try:
+            import torch as _torch_check
+            _luxtts_has_gpu = _torch_check.cuda.is_available()
+        except ImportError:
+            pass
+
+        model_registry.register(ModelBackend(
+            model_id='luxtts-48k',
+            display_name='LuxTTS 48kHz (Voice Cloning)',
+            tier=ModelTier.FAST,
+            config_list_entry={
+                'model': 'luxtts-48k',
+                'api_key': 'local',
+                'base_url': 'inprocess://luxtts',
+                'price': [0, 0],
+            },
+            avg_latency_ms=50.0 if _luxtts_has_gpu else 800.0,
+            accuracy_score=0.93,
+            cost_per_1k_tokens=0.0,
+            is_local=True,
+            hardware_dependent=True,
+            gpu_tdp_watts=170.0 if _luxtts_has_gpu else 0.0,
+        ))
+
+    # 11. MakeItTalk Cloud — TTS + video generation (if MAKEITTALK_API_URL set)
+    #     Cloud service: Flask+Celery, 7 TTS backends, lip-sync animation
+    #     POST /video-gen/ for full pipeline, audio_generation for TTS only
+    makeittalk_url = os.environ.get('MAKEITTALK_API_URL')
+    if makeittalk_url:
+        model_registry.register(ModelBackend(
+            model_id='makeittalk-cloud',
+            display_name='MakeItTalk Cloud (TTS + Video)',
+            tier=ModelTier.BALANCED,
+            config_list_entry={
+                'model': 'makeittalk',
+                'api_key': 'cloud',
+                'base_url': makeittalk_url,
+                'price': [0, 0],  # internal service
+            },
+            avg_latency_ms=5000.0,
+            accuracy_score=0.92,
+            cost_per_1k_tokens=0.0,
+            is_local=False,
+            hardware_dependent=False,
+            gpu_tdp_watts=0.0,
         ))
 
     logger.info(f"ModelRegistry: {len(model_registry._models)} backends registered")

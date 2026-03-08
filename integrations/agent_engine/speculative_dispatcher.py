@@ -313,30 +313,19 @@ class SpeculativeDispatcher:
 
     def _check_and_reserve_budget(self, user_id: str, goal_id: str,
                                    expert_model) -> bool:
-        """Check Spark budget before expert execution (atomic row lock)."""
+        """Check Spark budget before expert execution (atomic row lock).
+
+        Delegates to shared budget_gate.check_goal_budget() to avoid duplication.
+        """
         if not goal_id:
             return True  # No goal = no budget constraint
 
         try:
-            from integrations.social.models import get_db, AgentGoal
-            db = get_db()
-            try:
-                # with_for_update() locks the row to prevent double-spend
-                goal = db.query(AgentGoal).filter_by(
-                    id=goal_id).with_for_update().first()
-                if not goal:
-                    return True
-                remaining = (goal.spark_budget or 0) - (goal.spark_spent or 0)
-                cost = expert_model.cost_per_1k_tokens
-                if remaining < cost:
-                    db.rollback()
-                    return False
-                goal.spark_spent = (goal.spark_spent or 0) + cost
-                db.commit()
-                return True
-            finally:
-                db.close()
-        except Exception:
+            from .budget_gate import check_goal_budget
+            cost = expert_model.cost_per_1k_tokens
+            allowed, remaining, reason = check_goal_budget(goal_id, cost)
+            return allowed
+        except ImportError:
             return True  # Allow if budget system unavailable
 
     def _record_compute_contribution(self, node_id: str, model_id: str,

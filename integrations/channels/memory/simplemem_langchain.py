@@ -30,9 +30,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import Field
 
-from langchain.memory.chat_memory import BaseChatMemory
-from langchain.schema import BaseChatMessageHistory
-from langchain.schema.messages import BaseMessage, HumanMessage, AIMessage
+from langchain_classic.memory.chat_memory import BaseChatMemory
+from langchain_classic.schema import BaseChatMessageHistory
+from langchain_classic.schema.messages import BaseMessage, HumanMessage, AIMessage
 
 logger = logging.getLogger('hevolve_core')
 

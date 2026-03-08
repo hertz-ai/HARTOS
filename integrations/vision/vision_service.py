@@ -40,8 +40,8 @@ class VisionService:
 
     def __init__(
         self,
-        minicpm_port: int = 9891,
-        ws_port: int = 5460,
+        minicpm_port: int = None,
+        ws_port: int = None,
         description_interval: float = 4.0,
         max_description_interval: float = 30.0,
         min_scene_change: float = 0.01,
@@ -51,8 +51,9 @@ class VisionService:
         callback_url: Optional[str] = None,
         trigger_manager=None,
     ):
-        self._minicpm_port = int(os.environ.get('HEVOLVE_MINICPM_PORT', minicpm_port))
-        self._ws_port = int(os.environ.get('VISION_WS_PORT', ws_port))
+        from core.port_registry import get_port
+        self._minicpm_port = int(os.environ.get('HEVOLVE_MINICPM_PORT', minicpm_port or get_port('vision')))
+        self._ws_port = int(os.environ.get('VISION_WS_PORT', ws_port or get_port('websocket')))
         self._description_interval = description_interval
         self._max_interval = max_description_interval
         self._min_scene_change = min_scene_change
@@ -375,6 +376,29 @@ class VisionService:
         except Exception as e:
             logger.debug(f"Visual trigger evaluation error: {e}")
 
+    # ─── Face Signature Enrollment ───
+
+    def _enroll_face_signature(self, user_id: str, frame_bytes: bytes):
+        """Dispatch face enrollment to HevolveAI via WorldModelBridge.
+
+        Piggybacks on existing frame processing. Zero extra I/O.
+        Enrolls up to 5 face samples per user, then stops.
+        All ML (embedding extraction, matching) runs in HevolveAI.
+        """
+        try:
+            from core.resonance_profile import get_or_create_profile
+            profile = get_or_create_profile(user_id)
+            if profile.face_enrollment_count >= 5:
+                return  # Already enrolled enough samples
+            from core.resonance_identifier import ResonanceIdentifier
+            identifier = ResonanceIdentifier()
+            if identifier.enroll_face(user_id, frame_bytes):
+                logger.debug(f"Face enrollment dispatched to HevolveAI for user {user_id}")
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.debug(f"Face enrollment skipped: {e}")
+
     # ─── Sidecar Management ───
 
     def _start_minicpm(self):
@@ -384,8 +408,20 @@ class VisionService:
             logger.error("MiniCPM not installed — cannot start sidecar")
             return
 
+        # In frozen builds (cx_Freeze), sys.executable is Nunba.exe — using it
+        # with -m would launch a full GUI instance instead of the module.
+        # Use the bundled python interpreter from python-embed/ instead.
+        python_exe = sys.executable
+        if getattr(sys, 'frozen', False):
+            app_dir = os.path.dirname(sys.executable)
+            embed_python = os.path.join(app_dir, 'python-embed', 'python.exe')
+            if os.path.isfile(embed_python):
+                python_exe = embed_python
+            else:
+                logger.warning("python-embed/python.exe not found — minicpm sidecar may not start correctly")
+
         cmd = [
-            sys.executable, '-m', 'integrations.vision.minicpm_server',
+            python_exe, '-m', 'integrations.vision.minicpm_server',
             '--model_dir', model_dir,
             '--port', str(self._minicpm_port),
         ]
@@ -530,12 +566,16 @@ class VisionService:
                     # Camera channel
                     frame_bytes = self.store.get_frame(user_id)
                     if frame_bytes:
+                        # Piggyback face signature enrollment (zero extra I/O)
+                        self._enroll_face_signature(user_id, frame_bytes)
                         if self._should_describe(user_id, frame_bytes, 'camera'):
                             desc = self._describe_frame(user_id, frame_bytes)
                             if desc:
                                 self.store.put_description(user_id, desc)
                                 self._post_description_to_db(user_id, desc)
                                 self._record_to_world_model(user_id, desc, 'camera')
+                                self._save_to_memory_graph(user_id, desc, 'camera')
+                                self._emit_perception_event(user_id, desc, 'camera')
                                 self._evaluate_visual_triggers(
                                     user_id, desc, 'camera'
                                 )
@@ -559,6 +599,8 @@ class VisionService:
                                     zeroshot_label='Screen Reasoning',
                                 )
                                 self._record_to_world_model(user_id, desc, 'screen')
+                                self._save_to_memory_graph(user_id, desc, 'screen')
+                                self._emit_perception_event(user_id, desc, 'screen')
                                 self._evaluate_visual_triggers(
                                     user_id, desc, 'screen'
                                 )
@@ -645,6 +687,33 @@ class VisionService:
                 user_id=user_id, prompt_id=f'vision_{channel}',
                 prompt=f'[{channel}] describe what you see',
                 response=description, model_id=model_id)
+        except Exception:
+            pass
+
+    # ─── Temporal Perception ───
+
+    def _save_to_memory_graph(self, user_id: str, description: str, channel: str):
+        """Auto-save visual description to MemoryGraph for long-term recall."""
+        try:
+            from langchain_gpt_api import _get_or_create_graph
+            graph = _get_or_create_graph(user_id)
+            if graph:
+                graph.add(
+                    content=description,
+                    metadata={'channel': channel, 'type': 'visual_context'},
+                    tags=['visual', channel],
+                )
+        except Exception:
+            pass
+
+    def _emit_perception_event(self, user_id: str, description: str, channel: str):
+        """Emit present-tense perception event on EventBus."""
+        try:
+            from core.platform.events import emit_event
+            emit_event('perception.vision.present', {
+                'user_id': user_id, 'channel': channel,
+                'content': description, 'timestamp': time.time(),
+            })
         except Exception:
             pass
 

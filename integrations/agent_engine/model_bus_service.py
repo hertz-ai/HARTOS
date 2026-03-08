@@ -13,7 +13,7 @@ Transports:
 The bus routes to the best available backend:
   1. Local llama.cpp (LLM)
   2. Local MiniCPM (vision)
-  3. Local Whisper (STT) / Piper (TTS)
+  3. Local Whisper (STT) / Pocket TTS (TTS)
   4. Compute mesh peers (same user's other devices)
   5. Remote HevolveAI/hivemind (world model)
 """
@@ -193,6 +193,19 @@ class ModelBusService:
             with self._lock:
                 self._request_count += 1
 
+            # Broadcast inference completion to EventBus
+            try:
+                from core.platform.events import emit_event
+                emit_event('inference.completed', {
+                    'model_type': model_type,
+                    'model': result.get('model', ''),
+                    'backend': result.get('backend', ''),
+                    'latency_ms': latency_ms,
+                    'success': 'error' not in result,
+                })
+            except Exception:
+                pass
+
             return result
         finally:
             self._semaphore.release()
@@ -316,22 +329,153 @@ class ModelBusService:
         return {'error': 'No vision backend available', 'response': None}
 
     def _route_tts(self, prompt: str, options: dict) -> dict:
-        """Route text-to-speech inference."""
-        # TTS backends: local Piper → mesh peer → cloud
-        return {
-            'response': 'TTS not yet implemented — install Piper model via Model Store',
-            'model': 'none',
-            'backend': 'stub',
-        }
+        """Route TTS through fallback chain:
+
+        1. LuxTTS (local, GPU/CPU, 48kHz, 150x RT on GPU) — if installed
+        2. MakeItTalk cloud (lip-sync video) — if MAKEITTALK_API_URL set
+        3. Pocket TTS (local, CPU, 24kHz) — always available
+        4. espeak-ng (robotic, instant) — ultimate fallback inside Pocket TTS
+
+        HART OS offline mode skips cloud backends.
+        """
+        makeittalk_url = os.environ.get('MAKEITTALK_API_URL')
+        is_offline = (os.environ.get('HART_OS_MODE') and not makeittalk_url)
+
+        # 1. LuxTTS (highest quality, 48kHz, voice cloning)
+        result = self._try_luxtts(prompt, options)
+        if result and 'error' not in result:
+            return result
+
+        # 2. MakeItTalk cloud (if configured and not offline)
+        if makeittalk_url and not is_offline:
+            result = self._try_makeittalk_tts(prompt, options, makeittalk_url)
+            if result and 'error' not in result:
+                return result
+            logger.info("MakeItTalk cloud unavailable, falling back to Pocket TTS")
+
+        # 3. Pocket TTS (always available, CPU)
+        return self._try_pocket_tts(prompt, options)
+
+    def _try_luxtts(self, prompt: str, options: dict) -> dict:
+        """Try LuxTTS (48kHz, GPU/CPU, voice cloning)."""
+        t0 = time.time()
+        try:
+            from integrations.service_tools.luxtts_tool import luxtts_synthesize
+            voice = options.get('voice_audio') or options.get('voice')
+            device = options.get('device')
+            result = json.loads(luxtts_synthesize(
+                prompt, voice_audio=voice, device=device,
+            ))
+            latency = (time.time() - t0) * 1000
+            if 'error' in result:
+                logger.info(f"LuxTTS unavailable: {result['error']}")
+                return result
+            return {
+                'response': result.get('path', ''),
+                'model': 'luxtts-48k',
+                'backend': f"local_tts_{result.get('device', 'cpu')}",
+                'voice': result.get('voice', ''),
+                'duration': result.get('duration', 0),
+                'sample_rate': 48000,
+                'engine': 'luxtts',
+                'rtf': result.get('rtf', 0),
+                'realtime_factor': result.get('realtime_factor', 0),
+                'latency_ms': round(latency, 1),
+            }
+        except ImportError:
+            return {'error': 'LuxTTS not installed'}
+        except Exception as e:
+            logger.warning(f"LuxTTS failed: {e}")
+            return {'error': f'LuxTTS error: {e}'}
+
+    def _try_makeittalk_tts(self, prompt: str, options: dict, base_url: str) -> dict:
+        """Try MakeItTalk cloud TTS (POST /video-gen/ with text, no image = audio-only)."""
+        import requests as http_requests
+        t0 = time.time()
+        try:
+            voice = options.get('voice', 'af_bella')
+            payload = {
+                'text': prompt,
+                'uid': options.get('user_id', 'model_bus'),
+                'voiceName': voice,
+                'kokuro': 'true',
+                'audio_only': True,  # hint: skip video pipeline
+            }
+            resp = http_requests.post(
+                f'{base_url.rstrip("/")}/video-gen/',
+                json=payload,
+                timeout=options.get('timeout', 30),
+            )
+            latency = (time.time() - t0) * 1000
+            if resp.status_code == 200:
+                data = resp.json()
+                return {
+                    'response': data.get('audio_url', data.get('url', '')),
+                    'model': 'makeittalk-cloud',
+                    'backend': 'cloud_tts',
+                    'voice': voice,
+                    'engine': 'makeittalk',
+                    'latency_ms': round(latency, 1),
+                }
+            logger.warning("MakeItTalk returned %d: %s", resp.status_code, resp.text[:200])
+            return {'error': f'MakeItTalk HTTP {resp.status_code}'}
+        except http_requests.ConnectionError:
+            logger.info("MakeItTalk cloud connection refused at %s", base_url)
+            return {'error': 'MakeItTalk connection failed'}
+        except http_requests.Timeout:
+            logger.info("MakeItTalk cloud timed out at %s", base_url)
+            return {'error': 'MakeItTalk timeout'}
+        except Exception as e:
+            logger.warning("MakeItTalk cloud error: %s", e)
+            return {'error': f'MakeItTalk error: {e}'}
+
+    def _try_pocket_tts(self, prompt: str, options: dict) -> dict:
+        """Pocket TTS offline fallback (always available, CPU, zero cost)."""
+        t0 = time.time()
+        try:
+            from integrations.service_tools.pocket_tts_tool import pocket_tts_synthesize
+            voice = options.get('voice', 'alba')
+            output_path = options.get('output_path')
+            result = json.loads(pocket_tts_synthesize(prompt, voice, output_path))
+            latency = (time.time() - t0) * 1000
+            if 'error' in result:
+                return {'error': result['error'], 'response': None}
+            return {
+                'response': result.get('path', ''),
+                'model': 'pocket-tts-100m',
+                'backend': 'local_tts',
+                'voice': result.get('voice', voice),
+                'duration': result.get('duration', 0),
+                'engine': result.get('engine', 'pocket-tts'),
+                'latency_ms': round(latency, 1),
+            }
+        except ImportError:
+            return {'error': 'Pocket TTS not available (pip install pocket-tts)', 'response': None}
+        except Exception as e:
+            return {'error': f'TTS inference failed: {e}', 'response': None}
 
     def _route_stt(self, prompt: str, options: dict) -> dict:
-        """Route speech-to-text inference."""
-        # STT backends: local Whisper → mesh peer → cloud
-        return {
-            'response': 'STT not yet implemented — install Whisper model via Model Store',
-            'model': 'none',
-            'backend': 'stub',
-        }
+        """Route speech-to-text inference via Whisper (sherpa-onnx / openai-whisper)."""
+        t0 = time.time()
+        try:
+            from integrations.service_tools.whisper_tool import whisper_transcribe
+            audio_path = options.get('audio_path', prompt)
+            language = options.get('language')
+            result = json.loads(whisper_transcribe(audio_path, language))
+            latency = (time.time() - t0) * 1000
+            if 'error' in result:
+                return {'error': result['error'], 'response': None}
+            return {
+                'response': result.get('text', ''),
+                'model': 'whisper-stt-local',
+                'backend': 'local_stt',
+                'language': result.get('language', 'auto'),
+                'latency_ms': round(latency, 1),
+            }
+        except ImportError:
+            return {'error': 'Whisper STT not available (pip install sherpa-onnx)', 'response': None}
+        except Exception as e:
+            return {'error': f'STT inference failed: {e}', 'response': None}
 
     def _route_image_gen(self, prompt: str, options: dict) -> dict:
         """Route image generation inference."""
@@ -388,6 +532,56 @@ class ModelBusService:
                 'status': 'ready',
                 'peers': self._backends['mesh'].get('peers', 0),
             })
+
+        # TTS — LuxTTS (if installed, GPU/CPU, 48kHz voice cloning)
+        try:
+            from zipvoice.luxvoice import LuxTTS as _LuxCheck  # noqa: F401
+            import torch as _t
+            _lux_device = 'cuda' if _t.cuda.is_available() else 'cpu'
+            models.append({
+                'id': 'luxtts-48k',
+                'type': 'tts',
+                'backend': 'luxtts',
+                'local': True,
+                'status': 'ready',
+                'device': _lux_device,
+                'features': ['voice_cloning', '48khz', 'gpu_accelerated', 'offline'],
+            })
+        except ImportError:
+            pass
+
+        # TTS — MakeItTalk cloud (if configured)
+        makeittalk_url = os.environ.get('MAKEITTALK_API_URL')
+        if makeittalk_url:
+            models.append({
+                'id': 'makeittalk-cloud',
+                'type': 'tts',
+                'backend': 'makeittalk',
+                'local': False,
+                'status': 'ready',
+                'url': makeittalk_url,
+                'features': ['video_gen', 'lip_sync', 'multi_voice', 'multi_language'],
+            })
+
+        # TTS — Pocket TTS (always local, CPU — fallback when cloud unavailable)
+        models.append({
+            'id': 'pocket-tts-100m',
+            'type': 'tts',
+            'backend': 'pocket_tts',
+            'local': True,
+            'status': 'ready',
+            'features': ['voice_cloning', 'zero_shot', 'offline'],
+        })
+
+        # STT — Whisper (always local, sherpa-onnx or openai-whisper)
+        models.append({
+            'id': 'whisper-stt-local',
+            'type': 'stt',
+            'backend': 'whisper',
+            'local': True,
+            'status': 'ready',
+            'features': ['multilingual', 'offline'],
+        })
 
         return models
 

@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../.
 
 from decimal import Decimal
 import json
+import pytest
 from integrations.ap2 import (
     PaymentStatus, PaymentMethod, PaymentGateway,
     PaymentRequest, PaymentLedger, MockPaymentGateway,
@@ -23,6 +24,21 @@ from integrations.ap2 import (
     create_payment_authorization_function, create_payment_processing_function,
     get_ap2_tools_for_autogen
 )
+
+
+@pytest.fixture
+def payment_id():
+    """Create a pending payment and return its ID."""
+    ledger = PaymentLedger(ledger_path="agent_data/test_payment_ledger.json")
+    payment = ledger.create_payment_request(
+        amount=Decimal("99.99"),
+        currency="USD",
+        description="Test payment for API credits",
+        requester_agent_id="test_agent_1",
+        payment_method=PaymentMethod.INTERNAL_CREDITS,
+        gateway=PaymentGateway.MOCK
+    )
+    return payment.payment_id
 
 
 def test_payment_request_creation():
@@ -87,6 +103,8 @@ def test_payment_processing(payment_id):
 
     ledger = PaymentLedger(ledger_path="agent_data/test_payment_ledger.json")
 
+    # Authorize first (required before processing)
+    ledger.authorize_payment(payment_id, "admin_user")
     result = ledger.process_payment(payment_id)
 
     assert result['success'] == True

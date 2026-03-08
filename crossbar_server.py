@@ -50,6 +50,19 @@ async def subscribe_and_return(message):
         return {"error": "No response received"}
 
 
+async def on_remote_desktop_signal(msg):
+    """Handle remote desktop signaling messages (connection requests, transport offers)."""
+    print("Remote desktop signal received:", type(msg))
+    try:
+        from integrations.remote_desktop.session_manager import get_session_manager
+        # Signal handling delegated to session manager
+        if isinstance(msg, dict):
+            sm = get_session_manager()
+            # Future: process connect_request, transport_offer, bye
+    except Exception as e:
+        print(f"Remote desktop signal error: {e}")
+
+
 @component.on_join
 async def joined(session, details):
     """Handles session join and subscription setup."""
@@ -61,6 +74,16 @@ async def joined(session, details):
         print("Subscribed to topic")
     except Exception as e:
         print(f"Could not subscribe to topic: {e}")
+
+    # Remote desktop signaling topics
+    try:
+        from integrations.remote_desktop.device_id import get_device_id
+        device_id = get_device_id()
+        signal_topic = f"com.hartos.remote_desktop.signal.{device_id}"
+        await session.subscribe(on_remote_desktop_signal, signal_topic)
+        print(f"Subscribed to remote desktop signaling: {signal_topic}")
+    except Exception as e:
+        print(f"Remote desktop signaling subscription skipped: {e}")
 
 
 def main():

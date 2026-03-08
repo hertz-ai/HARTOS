@@ -336,15 +336,14 @@ class ComputeMeshService:
             'loaded_models': [],
         }
 
-        # Detect GPU
+        # Detect GPU (delegate to VRAMManager — single source of truth)
         try:
-            import subprocess
-            result = subprocess.run(
-                ['nvidia-smi', '--query-gpu=name,memory.total', '--format=csv,noheader'],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode == 0:
-                caps['gpu'] = result.stdout.strip()
+            from integrations.service_tools.vram_manager import vram_manager
+            gpu_info = vram_manager.detect_gpu()
+            if gpu_info.get('cuda_available'):
+                caps['gpu'] = f"{gpu_info.get('name', 'GPU')}, {gpu_info.get('total_gb', 0)}GB"
+            else:
+                caps['gpu'] = gpu_info.get('name') or None
         except Exception:
             pass
 

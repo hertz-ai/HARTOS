@@ -761,9 +761,7 @@ class NotificationService:
                 on_notification(_uid, notif_dict)
             except Exception:
                 pass
-            finally:
-                event.remove(session, 'after_commit', _push_after_commit)
-        event.listen(db, 'after_commit', _push_after_commit)
+        event.listen(db, 'after_commit', _push_after_commit, once=True)
         return notif
 
     @staticmethod

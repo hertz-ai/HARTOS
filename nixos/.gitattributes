@@ -1,0 +1,4 @@
+# Force LF line endings for all Nix and shell files
+*.nix text eol=lf
+*.sh text eol=lf
+flake.lock text eol=lf

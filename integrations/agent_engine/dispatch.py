@@ -109,6 +109,7 @@ def dispatch_goal_distributed(prompt: str, user_id: str, goal_id: str,
         'user_id': user_id,
         'prompt': prompt,
         'source_node': os.environ.get('HEVOLVE_NODE_ID', 'unknown'),
+        'task_source': 'hive',
     }
 
     try:
@@ -199,6 +200,33 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     Returns:
         Response text or None on failure
     """
+    # BUDGET GATE: check goal budget + platform affordability before dispatch
+    try:
+        from integrations.agent_engine.budget_gate import pre_dispatch_budget_gate
+        bg_allowed, bg_reason = pre_dispatch_budget_gate(goal_id, prompt)
+        if not bg_allowed:
+            logger.warning(f"Dispatch blocked by budget gate for {goal_type} goal {goal_id}: {bg_reason}")
+            return None
+    except ImportError:
+        pass
+
+    # TOOL ALLOWLIST: resolve model tier and attach to dispatch context
+    _dispatch_model_tier = None
+    if model_config:
+        try:
+            from integrations.agent_engine.tool_allowlist import check_tool_allowed
+            from integrations.agent_engine.model_registry import model_registry
+            first_model = model_config[0].get('model', '') if model_config else ''
+            if first_model:
+                info = model_registry.get(first_model)
+                if info:
+                    _dispatch_model_tier = (info.get('tier') or info.get('model_tier'))
+                    if _dispatch_model_tier:
+                        logger.info(f"Dispatch model tier: {_dispatch_model_tier.value} "
+                                    f"for {goal_type} goal {goal_id}")
+        except Exception:
+            pass  # Model registry unavailable — no tier restriction
+
     # GUARDRAIL: full pre-dispatch gate (fail-closed: block if guardrails unavailable)
     try:
         from security.hive_guardrails import GuardrailEnforcer
@@ -209,6 +237,16 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     except ImportError:
         logger.error("CRITICAL: hive_guardrails not available — blocking dispatch")
         return None
+
+    # AUDIT LOG: record goal dispatch
+    try:
+        from security.immutable_audit_log import get_audit_log
+        get_audit_log().log_event(
+            'goal_dispatched', actor_id=user_id,
+            action=f'dispatch {goal_type} goal {goal_id}',
+            target_id=goal_id)
+    except Exception:
+        pass  # Audit is best-effort
 
     # ROBOT: capability-matched dispatch — prefer distributed for hardware mismatches
     if not _check_robot_capability_match(goal_type, goal_id):
@@ -232,7 +270,10 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     # to port 6777 (which doesn't run as a separate server in bundled mode).
     if os.environ.get('NUNBA_BUNDLED'):
         try:
-            from hartos_backend_adapter import chat as hevolve_chat
+            try:
+                from routes.hartos_backend_adapter import chat as hevolve_chat
+            except ImportError:
+                from hartos_backend_adapter import chat as hevolve_chat
             result = hevolve_chat(
                 text=prompt,
                 user_id=user_id,
@@ -257,9 +298,12 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
         'create_agent': True,
         'autonomous': True,
         'casual_conv': False,
+        'task_source': 'own',
     }
     if model_config:
         body['model_config'] = model_config
+    if _dispatch_model_tier:
+        body['model_tier'] = _dispatch_model_tier.value
 
     try:
         resp = requests.post(

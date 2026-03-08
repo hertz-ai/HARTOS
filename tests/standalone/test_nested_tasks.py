@@ -18,6 +18,10 @@ Tests:
 import sys
 import time
 from datetime import datetime
+
+import pytest
+pytest.importorskip('agent_ledger', reason='agent_ledger not installed')
+
 from agent_ledger import SmartLedger, Task, TaskType, TaskStatus
 
 def print_test_header(test_num: int, test_name: str):

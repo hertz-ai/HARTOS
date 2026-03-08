@@ -45,7 +45,10 @@ from lifecycle_hooks import (
     action_states, flow_lifecycle,
     initialize_deterministic_actions
 )
-from helper import Action
+try:
+    from helper import Action
+except ImportError:
+    Action = None  # autogen not installed — tests needing Action will skip
 
 
 def pytest_configure(config):
@@ -136,17 +139,27 @@ def mock_agents():
 
 @pytest.fixture
 def temp_prompts_dir(tmp_path):
-    """Create temporary prompts directory"""
+    """Create temporary prompts directory and patch PROMPTS_DIR in all modules."""
     prompts_dir = tmp_path / "prompts"
     prompts_dir.mkdir()
 
-    # Change to temp directory
+    prompts_str = str(prompts_dir)
     original_dir = os.getcwd()
     os.chdir(tmp_path)
 
+    # Patch PROMPTS_DIR in all modules that reference it
+    patches = []
+    for mod_name in ('create_recipe', 'reuse_recipe', 'helper', 'recipe_experience'):
+        mod = sys.modules.get(mod_name)
+        if mod and hasattr(mod, 'PROMPTS_DIR'):
+            p = patch.object(mod, 'PROMPTS_DIR', prompts_str)
+            p.start()
+            patches.append(p)
+
     yield prompts_dir
 
-    # Restore original directory
+    for p in patches:
+        p.stop()
     os.chdir(original_dir)
 
 
@@ -154,6 +167,10 @@ def temp_prompts_dir(tmp_path):
 def sample_config_json(temp_prompts_dir, test_prompt_id):
     """Create sample config JSON file"""
     config = {
+        "personas": [
+            {"name": "Test Assistant"},
+            {"name": "Test Reviewer"}
+        ],
         "flows": [
             {
                 "persona": "Test Assistant",

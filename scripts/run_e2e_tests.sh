@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-# HevolveBot LangChain Agent - End-to-End Test Runner
+# HART OS - End-to-End Test Runner
 # ============================================================
 # Runs comprehensive E2E tests. Starts server if not running.
 # Supports Docker-based and local test modes.
@@ -120,19 +120,20 @@ case $choice in
         ;;
     6)
         echo "Running tests with coverage..."
-        rm -rf htmlcov
+        mkdir -p test-reports/coverage
         $PYTHON_EXE -m pytest tests/integration/test_channels_e2e_regression.py -v --tb=short \
             --cov=integrations/channels \
-            --cov-report=html:htmlcov \
-            --cov-report=term-missing
-        if [ -f "htmlcov/index.html" ]; then
+            --cov-report=html:test-reports/coverage \
+            --cov-report=term-missing \
+            --cov-config=.coveragerc
+        if [ -f "test-reports/coverage/index.html" ]; then
             echo ""
-            echo "[SUCCESS] Coverage report generated at htmlcov/index.html"
+            echo "[SUCCESS] Coverage report generated at test-reports/coverage/index.html"
             # Open in browser (platform-specific)
             if command -v xdg-open &> /dev/null; then
-                xdg-open htmlcov/index.html
+                xdg-open test-reports/coverage/index.html
             elif command -v open &> /dev/null; then
-                open htmlcov/index.html
+                open test-reports/coverage/index.html
             fi
         fi
         ;;

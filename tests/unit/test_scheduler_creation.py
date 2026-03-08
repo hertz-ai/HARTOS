@@ -11,6 +11,8 @@ import json
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
+pytest.importorskip('autogen', reason='autogen not installed')
+
 from create_recipe import scheduler, time_based_execution, visual_execution
 from reuse_recipe import create_schedule, time_based_execution as reuse_time_based_execution
 
@@ -173,13 +175,15 @@ class TestSchedulerCreationReuseMode:
         assert scheduler is not None
         assert scheduler.running
 
-    def test_create_schedule_function(self, test_user_id, test_prompt_id, temp_prompts_dir):
+    def test_create_schedule_function(self, test_user_id, test_prompt_id, temp_prompts_dir, mock_flask_app):
         """Test create_schedule function in reuse mode"""
         recipe = {
             "scheduled_tasks": [
                 {
                     "task_description": "Test task",
+                    "persona": "Test Assistant",
                     "schedule_type": "date",
+                    "cron_expression": "0 9 * * *",
                     "run_date": (datetime.now() + timedelta(minutes=5)).isoformat(),
                     "action_entry_point": 1
                 }
@@ -191,18 +195,14 @@ class TestSchedulerCreationReuseMode:
             json.dump(recipe, f)
 
         with patch('reuse_recipe.scheduler') as mock_scheduler:
-            with patch('reuse_recipe.os.path.exists', return_value=True):
-                with patch('builtins.open', create=True) as mock_open:
-                    mock_open.return_value.__enter__.return_value.read.return_value = json.dumps(recipe)
+            with patch('reuse_recipe.get_flow_number', return_value=(0, 'Test Assistant')):
+                mock_scheduler.add_job.return_value = Mock()
 
-                    mock_scheduler.add_job.return_value = Mock()
-
-                    try:
-                        create_schedule(test_prompt_id, test_user_id)
-                        # Should have attempted to schedule the task
-                        assert mock_scheduler.add_job.called or True  # May not be called if file not found
-                    except Exception as e:
-                        pytest.fail(f"create_schedule failed: {e}")
+                try:
+                    create_schedule(test_prompt_id, test_user_id)
+                    assert mock_scheduler.add_job.called or True
+                except Exception as e:
+                    pytest.fail(f"create_schedule failed: {e}")
 
     def test_time_based_execution_reuse_mode(self, test_user_id, test_prompt_id, mock_flask_app):
         """Test time-based execution in reuse mode"""
@@ -223,97 +223,95 @@ class TestSchedulerCreationReuseMode:
                     # Should handle gracefully
                     pass
 
-    def test_scheduled_task_with_cron_reuse_mode(self, test_user_id, test_prompt_id, temp_prompts_dir):
+    def test_scheduled_task_with_cron_reuse_mode(self, test_user_id, test_prompt_id, temp_prompts_dir, mock_flask_app):
         """Test scheduled task with cron trigger in reuse mode"""
         recipe = {
             "scheduled_tasks": [
                 {
                     "task_description": "Daily task",
-                    "schedule_type": "cron",
-                    "hour": 9,
-                    "minute": 0,
+                    "persona": "Test Assistant",
+                    "cron_expression": "0 9 * * *",
                     "action_entry_point": 1
                 }
             ]
         }
 
+        recipe_file = temp_prompts_dir / f"{test_prompt_id}_0_recipe.json"
+        with open(recipe_file, 'w') as f:
+            json.dump(recipe, f)
+
         with patch('reuse_recipe.scheduler') as mock_scheduler:
-            with patch('reuse_recipe.os.path.exists', return_value=True):
-                with patch('builtins.open') as mock_open:
-                    mock_open.return_value.__enter__.return_value.read.return_value = json.dumps(recipe)
+            with patch('reuse_recipe.get_flow_number', return_value=(0, 'Test Assistant')):
+                mock_scheduler.add_job.return_value = Mock()
 
-                    mock_scheduler.add_job.return_value = Mock()
+                try:
+                    create_schedule(test_prompt_id, test_user_id)
+                except Exception as e:
+                    pytest.fail(f"Cron scheduling in reuse mode failed: {e}")
 
-                    try:
-                        create_schedule(test_prompt_id, test_user_id)
-                        # Should handle cron scheduling
-                    except Exception as e:
-                        pytest.fail(f"Cron scheduling in reuse mode failed: {e}")
-
-    def test_scheduled_task_with_interval_reuse_mode(self, test_user_id, test_prompt_id):
+    def test_scheduled_task_with_interval_reuse_mode(self, test_user_id, test_prompt_id, temp_prompts_dir, mock_flask_app):
         """Test scheduled task with interval trigger in reuse mode"""
         recipe = {
             "scheduled_tasks": [
                 {
                     "task_description": "Periodic task",
-                    "schedule_type": "interval",
-                    "minutes": 30,
+                    "persona": "Test Assistant",
+                    "cron_expression": "*/30 * * * *",
                     "action_entry_point": 1
                 }
             ]
         }
 
+        recipe_file = temp_prompts_dir / f"{test_prompt_id}_0_recipe.json"
+        with open(recipe_file, 'w') as f:
+            json.dump(recipe, f)
+
         with patch('reuse_recipe.scheduler') as mock_scheduler:
-            with patch('reuse_recipe.os.path.exists', return_value=True):
-                with patch('builtins.open') as mock_open:
-                    mock_open.return_value.__enter__.return_value.read.return_value = json.dumps(recipe)
+            with patch('reuse_recipe.get_flow_number', return_value=(0, 'Test Assistant')):
+                mock_scheduler.add_job.return_value = Mock()
 
-                    mock_scheduler.add_job.return_value = Mock()
+                try:
+                    create_schedule(test_prompt_id, test_user_id)
+                except Exception as e:
+                    pytest.fail(f"Interval scheduling in reuse mode failed: {e}")
 
-                    try:
-                        create_schedule(test_prompt_id, test_user_id)
-                        # Should handle interval scheduling
-                    except Exception as e:
-                        pytest.fail(f"Interval scheduling in reuse mode failed: {e}")
-
-    def test_multiple_scheduled_tasks_reuse_mode(self, test_user_id, test_prompt_id):
+    def test_multiple_scheduled_tasks_reuse_mode(self, test_user_id, test_prompt_id, temp_prompts_dir, mock_flask_app):
         """Test multiple scheduled tasks in reuse mode"""
         recipe = {
             "scheduled_tasks": [
                 {
                     "task_description": "Task 1",
-                    "schedule_type": "date",
-                    "run_date": (datetime.now() + timedelta(minutes=5)).isoformat(),
+                    "persona": "Test Assistant",
+                    "cron_expression": "0 9 * * *",
                     "action_entry_point": 1
                 },
                 {
                     "task_description": "Task 2",
-                    "schedule_type": "interval",
-                    "minutes": 15,
+                    "persona": "Test Assistant",
+                    "cron_expression": "*/15 * * * *",
                     "action_entry_point": 2
                 },
                 {
                     "task_description": "Task 3",
-                    "schedule_type": "cron",
-                    "hour": 10,
-                    "minute": 30,
+                    "persona": "Test Reviewer",
+                    "cron_expression": "30 10 * * *",
                     "action_entry_point": 3
                 }
             ]
         }
 
+        recipe_file = temp_prompts_dir / f"{test_prompt_id}_0_recipe.json"
+        with open(recipe_file, 'w') as f:
+            json.dump(recipe, f)
+
         with patch('reuse_recipe.scheduler') as mock_scheduler:
-            with patch('reuse_recipe.os.path.exists', return_value=True):
-                with patch('builtins.open') as mock_open:
-                    mock_open.return_value.__enter__.return_value.read.return_value = json.dumps(recipe)
+            with patch('reuse_recipe.get_flow_number', return_value=(0, 'Test Assistant')):
+                mock_scheduler.add_job.return_value = Mock()
 
-                    mock_scheduler.add_job.return_value = Mock()
-
-                    try:
-                        create_schedule(test_prompt_id, test_user_id)
-                        # Should handle all scheduled tasks
-                    except Exception as e:
-                        pytest.fail(f"Multiple task scheduling in reuse mode failed: {e}")
+                try:
+                    create_schedule(test_prompt_id, test_user_id)
+                except Exception as e:
+                    pytest.fail(f"Multiple task scheduling in reuse mode failed: {e}")
 
 
 class TestSchedulerRobustness:

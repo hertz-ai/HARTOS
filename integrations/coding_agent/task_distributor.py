@@ -19,6 +19,16 @@ def dispatch_to_chat(prompt: str, user_id: str, goal_id: str) -> Optional[str]:
     This is the only integration point: the CREATE/REUSE agent system
     handles decomposition, execution, verification, and persistence.
     """
+    # BUDGET GATE: platform affordability check before HTTP dispatch
+    try:
+        from integrations.agent_engine.budget_gate import check_platform_affordability
+        can_afford, details = check_platform_affordability()
+        if not can_afford:
+            logger.warning(f"Task dispatch blocked — platform not affordable: {details}")
+            return None
+    except ImportError:
+        pass
+
     base_url = os.environ.get('HEVOLVE_BASE_URL', 'http://localhost:6777')
     prompt_id = f"coding_{goal_id[:8]}"
 
@@ -31,6 +41,7 @@ def dispatch_to_chat(prompt: str, user_id: str, goal_id: str) -> Optional[str]:
                 'prompt': prompt,
                 'create_agent': True,
                 'casual_conv': False,
+                'task_source': 'idle',
             },
             timeout=120,
         )

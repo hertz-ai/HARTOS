@@ -1448,3 +1448,125 @@ class TestCrossModuleDependencies:
             content = read_nix(os.path.join(MODULES_DIR, module))
             assert "hart.target" in content, \
                 f"{module} not wantedBy hart.target"
+
+
+# ═══════════════════════════════════════════════════════════════
+# OS Feature Modules: Gaming, Devtools, OSK, DLNA, Peripheral
+# ═══════════════════════════════════════════════════════════════
+
+class TestGamingModule:
+    """Verify hart-gaming.nix options and structure."""
+
+    def test_gaming_file_exists(self):
+        path = os.path.join(MODULES_DIR, "hart-gaming.nix")
+        assert os.path.isfile(path)
+
+    def test_gaming_has_enable_option(self):
+        content = read_nix(os.path.join(MODULES_DIR, "hart-gaming.nix"))
+        assert "mkEnableOption" in content
+
+    def test_gaming_has_cpu_isolation(self):
+        content = read_nix(os.path.join(MODULES_DIR, "hart-gaming.nix"))
+        assert "cpuIsolation" in content
+        assert "isolcpus" in content
+
+    def test_gaming_has_low_latency_audio(self):
+        content = read_nix(os.path.join(MODULES_DIR, "hart-gaming.nix"))
+        assert "pipewire" in content.lower() or "bufferSize" in content
+
+    def test_gaming_has_network_tuning(self):
+        content = read_nix(os.path.join(MODULES_DIR, "hart-gaming.nix"))
+        assert "tcp_bbr" in content or "bbr" in content
+
+    def test_gaming_has_mkif_guard(self):
+        content = read_nix(os.path.join(MODULES_DIR, "hart-gaming.nix"))
+        assert "mkIf cfg.enable" in content
+
+
+class TestDevtoolsModule:
+    """Verify hart-devtools.nix options and structure."""
+
+    def test_devtools_file_exists(self):
+        path = os.path.join(MODULES_DIR, "hart-devtools.nix")
+        assert os.path.isfile(path)
+
+    def test_devtools_has_enable_option(self):
+        content = read_nix(os.path.join(MODULES_DIR, "hart-devtools.nix"))
+        assert "mkEnableOption" in content
+
+    def test_devtools_has_lsp_option(self):
+        content = read_nix(os.path.join(MODULES_DIR, "hart-devtools.nix"))
+        assert "lsp" in content
+
+    def test_devtools_has_container_toggle(self):
+        content = read_nix(os.path.join(MODULES_DIR, "hart-devtools.nix"))
+        assert "containers" in content
+        assert "podman" in content
+
+    def test_devtools_has_editor_toggle(self):
+        content = read_nix(os.path.join(MODULES_DIR, "hart-devtools.nix"))
+        assert "editors" in content
+        assert "neovim" in content
+
+    def test_devtools_has_mkif_guard(self):
+        content = read_nix(os.path.join(MODULES_DIR, "hart-devtools.nix"))
+        assert "mkIf cfg.enable" in content
+
+
+class TestOSKModule:
+    """Verify hart-osk.nix on-screen keyboard module."""
+
+    def test_osk_file_exists(self):
+        path = os.path.join(MODULES_DIR, "hart-osk.nix")
+        assert os.path.isfile(path)
+
+    def test_osk_has_enable_option(self):
+        content = read_nix(os.path.join(MODULES_DIR, "hart-osk.nix"))
+        assert "mkEnableOption" in content
+
+    def test_osk_has_backend_option(self):
+        content = read_nix(os.path.join(MODULES_DIR, "hart-osk.nix"))
+        assert "squeekboard" in content
+        assert "onboard" in content
+
+    def test_osk_has_auto_show_option(self):
+        content = read_nix(os.path.join(MODULES_DIR, "hart-osk.nix"))
+        assert "autoShow" in content
+
+    def test_osk_has_mkif_guard(self):
+        content = read_nix(os.path.join(MODULES_DIR, "hart-osk.nix"))
+        assert "mkIf cfg.enable" in content
+
+    def test_osk_in_flake_modules(self):
+        flake = read_nix(os.path.join(NIXOS_DIR, "flake.nix"))
+        assert "hart-osk.nix" in flake
+
+    def test_phone_enables_osk(self):
+        phone = read_nix(os.path.join(CONFIGS_DIR, "phone.nix"))
+        assert "osk" in phone
+
+
+class TestDLNAEnableGuard:
+    """Verify hart-dlna.nix has proper mkIf enable guard."""
+
+    def test_dlna_has_enable_option(self):
+        content = read_nix(os.path.join(MODULES_DIR, "hart-dlna.nix"))
+        assert "enable" in content
+
+    def test_dlna_has_mkif_guard(self):
+        content = read_nix(os.path.join(MODULES_DIR, "hart-dlna.nix"))
+        assert "mkIf" in content
+        assert "dlna.enable" in content
+
+
+class TestPeripheralBridgeEnableGuard:
+    """Verify hart-peripheral-bridge.nix has proper mkIf enable guard."""
+
+    def test_peripheral_bridge_has_enable_option(self):
+        content = read_nix(os.path.join(MODULES_DIR, "hart-peripheral-bridge.nix"))
+        assert "enable" in content
+
+    def test_peripheral_bridge_has_mkif_guard(self):
+        content = read_nix(os.path.join(MODULES_DIR, "hart-peripheral-bridge.nix"))
+        assert "mkIf" in content
+        assert "peripheralBridge.enable" in content

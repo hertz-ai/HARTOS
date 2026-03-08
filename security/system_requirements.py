@@ -65,11 +65,45 @@ FORCE_TIER_ENV = 'HEVOLVE_FORCE_TIER'
 
 
 # ═══════════════════════════════════════════════════════════════
+# GLOSSARY — Three Distinct Classification Systems
+# ═══════════════════════════════════════════════════════════════
+#
+# 1. CAPABILITY TIER (NodeTierLevel, this file)
+#    Values: embedded, observer, lite, standard, full, compute_host
+#    Purpose: What a node CAN do based on hardware (CPU, RAM, VRAM, disk)
+#    Set by: Auto-detected via classify_tier(), or HEVOLVE_FORCE_TIER override
+#    Stored: PeerNode.capability_tier (models.py)
+#    API: get_tier(), get_tier_name(), get_capabilities()
+#
+# 2. TOPOLOGY MODE (key_delegation.py get_node_tier())
+#    Values: flat, regional, central
+#    Purpose: Where a node sits in the network hierarchy
+#    Set by: HEVOLVE_NODE_TIER env var (name is legacy — it means topology)
+#    Stored: PeerNode.tier (models.py)
+#    API: key_delegation.get_node_tier()
+#
+# 3. MODEL TIER (model_registry.py ModelTier)
+#    Values: fast, balanced, expert
+#    Purpose: LLM backend performance/cost classification
+#    Set by: Model registration in model_registry
+#    API: ModelRegistry.select_backend()
+#
+# These are INDEPENDENT dimensions. A node can be:
+#   capability_tier=standard + topology=flat + using model_tier=expert
+# Do NOT mix or use interchangeably.
+# ═══════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════
 # Types
 # ═══════════════════════════════════════════════════════════════
 
 class NodeTierLevel(Enum):
-    """Contribution tier - what this node can offer the network."""
+    """Capability tier — what this node can offer the network based on hardware.
+
+    NOT to be confused with topology mode (flat/regional/central) which
+    describes network position, or model tier (fast/balanced/expert) which
+    classifies LLM backends.
+    """
     EMBEDDED = "embedded"           # Any device - sensors, GPIO, serial, MQTT bridge
     OBSERVER = "observer"           # Below lite - still gossips, still audits, Flask
     LITE = "lite"                   # Basic chat + gossip + audit + storage relay

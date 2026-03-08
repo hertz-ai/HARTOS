@@ -184,6 +184,9 @@ in
         "d ${ai.modelStore.path}/safetensors 0750 hart hart -" # HuggingFace models
         "d ${ai.modelStore.path}/onnx 0750 hart hart -"       # ONNX runtime models
         "d ${ai.modelStore.path}/minicpm 0750 hart hart -"    # Vision models
+        "d ${ai.modelStore.path}/pocket-tts 0750 hart hart -" # Pocket TTS (offline, CPU, MIT)
+        "d ${ai.modelStore.path}/pocket-tts/voices 0750 hart hart -" # Cloned voice states
+        "d ${ai.modelStore.path}/stt 0750 hart hart -"        # Whisper STT (sherpa-onnx)
         "d ${ai.modelStore.path}/cache 0750 hart hart -"      # Download cache
         "d ${ai.modelStore.path}/manifests 0750 hart hart -"  # Model manifests (hash → metadata)
       ];
@@ -605,9 +608,9 @@ in
                             json={'prompt': f'Describe this file in 10 words: {os.path.basename(path)} ({stat.st_size} bytes)'},
                             timeout=10
                         )
-                        description = resp.json().get('response', '')
+                        description = resp.json().get('response', '''')
                     except Exception:
-                        description = ''
+                        description = ''''
 
                     entry = {
                         'path': path,

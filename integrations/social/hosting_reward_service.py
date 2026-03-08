@@ -22,6 +22,10 @@ SCORE_WEIGHTS = {
     'agent_count': 2.0,        # 2 points per agent hosted
     'post_count': 0.5,         # 0.5 points per post served
     'ad_impressions': 0.1,     # 0.1 points per ad impression served
+    'gpu_hours': 5.0,          # 5 points per GPU-hour served
+    'inferences': 0.01,        # 0.01 points per inference
+    'energy_kwh': 2.0,         # 2 points per kWh contributed
+    'api_costs_absorbed': 10.0,  # 10 points per USD metered API absorbed for hive
 }
 
 TIER_THRESHOLDS = {
@@ -32,7 +36,11 @@ TIER_THRESHOLDS = {
 
 HOSTING_MILESTONES = [10, 50, 100, 500]  # agent_count thresholds
 
-HOSTER_REVENUE_SHARE = 0.70
+try:
+    from integrations.agent_engine.revenue_aggregator import REVENUE_SPLIT_USERS
+    HOSTER_REVENUE_SHARE = REVENUE_SPLIT_USERS  # 0.90 (was 0.70)
+except ImportError:
+    HOSTER_REVENUE_SHARE = 0.90
 
 
 class HostingRewardService:
@@ -61,6 +69,10 @@ class HostingRewardService:
             + (peer.agent_count or 0) * SCORE_WEIGHTS['agent_count']
             + (peer.post_count or 0) * SCORE_WEIGHTS['post_count']
             + ad_imp_count * SCORE_WEIGHTS['ad_impressions']
+            + (peer.gpu_hours_served or 0) * SCORE_WEIGHTS['gpu_hours']
+            + (peer.total_inferences or 0) * SCORE_WEIGHTS['inferences']
+            + (peer.energy_kwh_contributed or 0) * SCORE_WEIGHTS['energy_kwh']
+            + (peer.metered_api_costs_absorbed or 0) * SCORE_WEIGHTS['api_costs_absorbed']
         )
 
         old_tier = peer.visibility_tier
@@ -78,6 +90,10 @@ class HostingRewardService:
                 'agents': (peer.agent_count or 0) * SCORE_WEIGHTS['agent_count'],
                 'posts': (peer.post_count or 0) * SCORE_WEIGHTS['post_count'],
                 'ad_impressions': ad_imp_count * SCORE_WEIGHTS['ad_impressions'],
+                'gpu_hours': (peer.gpu_hours_served or 0) * SCORE_WEIGHTS['gpu_hours'],
+                'inferences': (peer.total_inferences or 0) * SCORE_WEIGHTS['inferences'],
+                'energy_kwh': (peer.energy_kwh_contributed or 0) * SCORE_WEIGHTS['energy_kwh'],
+                'api_costs_absorbed': (peer.metered_api_costs_absorbed or 0) * SCORE_WEIGHTS['api_costs_absorbed'],
             },
         }
 
@@ -269,6 +285,66 @@ class HostingRewardService:
             db.flush()
             return awarded.to_dict()
         return None
+
+    # ─── Queries ───
+
+    # ─── Compute Stats Aggregation ───
+
+    @staticmethod
+    def aggregate_compute_stats(db: Session, node_id: str,
+                                 period_hours: int = 24) -> Optional[Dict]:
+        """Aggregate metered API usage into PeerNode cumulative stats.
+
+        Queries MeteredAPIUsage for hive/idle tasks and updates PeerNode's
+        gpu_hours_served, total_inferences, energy_kwh_contributed,
+        metered_api_costs_absorbed columns.
+        """
+        peer = db.query(PeerNode).filter_by(node_id=node_id).first()
+        if not peer:
+            return None
+
+        try:
+            from .models import MeteredAPIUsage
+            cutoff = datetime.utcnow() - timedelta(hours=period_hours)
+            usages = db.query(MeteredAPIUsage).filter(
+                MeteredAPIUsage.node_id == node_id,
+                MeteredAPIUsage.task_source != 'own',
+                MeteredAPIUsage.created_at >= cutoff,
+            ).all()
+
+            inference_count = len(usages)
+            usd_absorbed = sum(u.actual_usd_cost or 0 for u in usages)
+            total_tokens = sum((u.tokens_in or 0) + (u.tokens_out or 0) for u in usages)
+
+            # Estimate GPU hours: ~1 GPU-second per 1K tokens (rough heuristic)
+            gpu_hours_delta = (total_tokens / 1000.0) / 3600.0
+
+            # Estimate energy: use ModelRegistry if available, else 170W TDP default
+            try:
+                from integrations.agent_engine.model_registry import model_registry
+                energy_delta = model_registry.get_total_energy_kwh(hours=period_hours)
+            except Exception:
+                energy_delta = gpu_hours_delta * 0.170  # 170W default TDP
+
+            peer.total_inferences = (peer.total_inferences or 0) + inference_count
+            peer.gpu_hours_served = round((peer.gpu_hours_served or 0) + gpu_hours_delta, 4)
+            peer.energy_kwh_contributed = round(
+                (peer.energy_kwh_contributed or 0) + energy_delta, 4)
+            peer.metered_api_costs_absorbed = round(
+                (peer.metered_api_costs_absorbed or 0) + usd_absorbed, 4)
+
+            db.flush()
+            return {
+                'node_id': node_id,
+                'period_hours': period_hours,
+                'inferences_added': inference_count,
+                'gpu_hours_added': round(gpu_hours_delta, 4),
+                'energy_kwh_added': round(energy_delta, 4),
+                'usd_absorbed_added': round(usd_absorbed, 4),
+            }
+        except Exception as e:
+            logger.debug(f"Compute stats aggregation failed: {e}")
+            return None
 
     # ─── Queries ───
 

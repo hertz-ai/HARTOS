@@ -1053,6 +1053,84 @@ def agent_feed():
     return _ok([p.to_dict(include_author=True) for p in posts], _paginate(total, limit, offset))
 
 
+@social_bp.route('/feed/agent-spotlight', methods=['GET'])
+@optional_auth
+def agent_spotlight():
+    """Agent spotlight for the HARTs feed tab.
+    Returns: hart_of_the_day, rising_harts, your_harts (if authenticated).
+    Public-cacheable (X-Cache-Scope: public when no user-specific data).
+    """
+    from datetime import timedelta
+    from sqlalchemy import func as sa_func
+    uid = g.user.id if getattr(g, 'user', None) else None
+    db = g.db
+
+    # HART of the day: agent with most upvotes on posts in last 24h
+    hart_of_day = None
+    try:
+        day_ago = datetime.utcnow() - timedelta(days=1)
+        top_agent = db.query(
+            Post.author_id, sa_func.sum(Post.upvotes).label('total_harts')
+        ).join(User, Post.author_id == User.id).filter(
+            User.user_type == 'agent',
+            User.is_banned == False,
+            Post.created_at >= day_ago,
+        ).group_by(Post.author_id).order_by(
+            sa_func.sum(Post.upvotes).desc()
+        ).first()
+        if top_agent:
+            agent = db.query(User).filter_by(id=top_agent[0]).first()
+            if agent:
+                hart_of_day = {
+                    **{k: v for k, v in agent.to_dict().items()
+                       if k in ('id', 'username', 'display_name', 'avatar_url', 'user_type')},
+                    'total_harts_today': int(top_agent[1] or 0),
+                }
+    except Exception:
+        pass  # graceful degradation
+
+    # Rising HARTs: newest agents with at least 1 post, ordered by karma
+    rising = []
+    try:
+        week_ago = datetime.utcnow() - timedelta(days=7)
+        rising_agents = db.query(User).filter(
+            User.user_type == 'agent',
+            User.is_banned == False,
+            User.created_at >= week_ago,
+            User.post_count > 0,
+        ).order_by(User.karma_score.desc()).limit(5).all()
+        rising = [{k: v for k, v in a.to_dict().items()
+                   if k in ('id', 'username', 'display_name', 'avatar_url', 'karma_score')}
+                  for a in rising_agents]
+    except Exception:
+        pass
+
+    # Your HARTs: agents owned by current user
+    your_harts = []
+    if uid:
+        try:
+            owned = db.query(User).filter_by(
+                owner_id=uid, user_type='agent', is_banned=False
+            ).order_by(User.karma_score.desc()).limit(10).all()
+            your_harts = [{k: v for k, v in a.to_dict().items()
+                           if k in ('id', 'username', 'display_name', 'avatar_url', 'karma_score', 'post_count')}
+                          for a in owned]
+        except Exception:
+            pass
+
+    result = {
+        'hart_of_the_day': hart_of_day,
+        'rising_harts': rising,
+        'your_harts': your_harts,
+    }
+
+    resp = _ok(result)
+    # Tag as public-cacheable when no user-specific data
+    if not uid:
+        resp[0].headers['X-Cache-Scope'] = 'public'
+    return resp
+
+
 # ═══════════════════════════════════════════════════════════════
 # SEARCH
 # ═══════════════════════════════════════════════════════════════
@@ -1209,15 +1287,13 @@ def assign_task(task_id):
     # Notify the assignee (or agent owner)
     try:
         notify_target = assignee.owner_id if assignee.user_type == 'agent' else assignee_id
-        from .models import Notification
-        notif = Notification(
-            user_id=notify_target,
-            type='task_assigned',
+        from .services import NotificationService
+        NotificationService.create(
+            g.db, user_id=notify_target, type='task_assigned',
+            source_user_id=g.user.id, target_type='task',
+            target_id=task.id,
             message=f'Task assigned: {task.task_description[:80] if task.task_description else "New task"}',
-            reference_type='task',
-            reference_id=task.id,
         )
-        g.db.add(notif)
     except Exception:
         pass
     return _ok(task.to_dict())
@@ -2638,7 +2714,10 @@ def theme_generate():
 
     # Try LLM generation first
     try:
-        from hartos_backend_adapter import chat as _adapter_chat
+        try:
+            from routes.hartos_backend_adapter import chat as _adapter_chat
+        except ImportError:
+            from hartos_backend_adapter import chat as _adapter_chat
         schema_hint = '{"colors":{"background":"#hex","paper":"#hex","primary":"#hex","primary_light":"#hex","primary_dark":"#hex","secondary":"#hex","accent":"#hex","text_primary":"#hex"}}'
         system_prompt = (
             "You are a UI theme designer for a dark-mode social platform. "
@@ -2700,3 +2779,56 @@ def theme_get_user(user_id):
     finally:
         if db:
             db.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+# AGENT OBSERVATION & DISPATCH (fire-and-forget)
+# ═══════════════════════════════════════════════════════════════
+
+@social_bp.route('/agent/observe', methods=['POST'])
+@require_auth
+def agent_observe():
+    """Receive frontend observations for agent self-critique."""
+    try:
+        data = request.get_json(silent=True) or {}
+        user_id = g.user.id
+
+        # Store observation via MemoryGraph if available
+        try:
+            from integrations.channels.memory.memory_graph import MemoryGraph
+            graph = MemoryGraph(user_id=str(user_id))
+            graph.register(
+                content=f"[{data.get('event', 'unknown')}] page={data.get('page', '?')} outcome={data.get('outcome', '?')} duration={data.get('duration_ms', 0)}ms",
+                metadata={'memory_type': 'observation', 'source': 'frontend',
+                          **{k: v for k, v in data.items() if k not in ('_useBeacon',)}},
+            )
+        except Exception:
+            pass  # MemoryGraph optional
+
+        return jsonify({'success': True}), 200
+    except Exception:
+        return jsonify({'success': True}), 200  # Always return success (fire-and-forget)
+
+
+@social_bp.route('/agent/dispatch', methods=['POST'])
+@require_auth
+def agent_dispatch():
+    """Receive agent dispatch requests from autopilot."""
+    try:
+        data = request.get_json(silent=True) or {}
+        user_id = g.user.id
+
+        # Store dispatch as observation for agent to pick up
+        try:
+            from integrations.channels.memory.memory_graph import MemoryGraph
+            graph = MemoryGraph(user_id=str(user_id))
+            graph.register(
+                content=f"[dispatch] agent={data.get('agent', '?')} action={data.get('action', '?')} mode={data.get('mode', 'suggest')}",
+                metadata={'memory_type': 'dispatch', 'source': 'autopilot', **data},
+            )
+        except Exception:
+            pass
+
+        return jsonify({'success': True}), 200
+    except Exception:
+        return jsonify({'success': True}), 200

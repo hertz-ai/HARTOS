@@ -164,14 +164,16 @@ class TestVRAMManager:
             # Should return safe defaults
             assert 'cuda_available' in info
 
+    @patch('subprocess.run', side_effect=FileNotFoundError)
     @patch('torch.cuda.is_available', return_value=True)
     @patch('torch.cuda.get_device_name', return_value='RTX 3070')
     @patch('torch.cuda.get_device_properties')
     @patch('torch.cuda.memory_allocated', return_value=2 * 1024**3)
     @patch('torch.cuda.memory_reserved', return_value=3 * 1024**3)
     def test_detect_gpu_with_cuda(self, mock_reserved, mock_alloc,
-                                   mock_props, mock_name, mock_avail, vm):
-        mock_props.return_value = MagicMock(total_mem=8 * 1024**3)
+                                   mock_props, mock_name, mock_avail,
+                                   mock_smi, vm):
+        mock_props.return_value = MagicMock(total_memory=8 * 1024**3)
         vm._gpu_info = None
         info = vm.detect_gpu()
         assert info['cuda_available'] is True
@@ -278,7 +280,9 @@ class TestToolWrappers:
                 'cuda_available': False, 'total_gb': 0,
                 'free_gb': 0, 'name': None,
             }
-            model = select_whisper_model()
+            # Hide sherpa_onnx to force legacy whisper path (returns 'base')
+            with patch.dict(sys.modules, {'sherpa_onnx': None}):
+                model = select_whisper_model()
             assert model == 'base'
         finally:
             vram_manager._gpu_info = original

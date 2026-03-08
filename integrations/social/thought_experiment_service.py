@@ -180,6 +180,17 @@ class ThoughtExperimentService:
             return {'error': 'experiment_not_in_voting_phase',
                     'current_status': experiment.status}
 
+        # Context-based voter eligibility check
+        try:
+            from .voting_rules import check_voter_eligibility
+            eligibility = check_voter_eligibility(experiment.to_dict(), voter_type)
+            if not eligibility['eligible']:
+                return {'error': 'voter_not_eligible',
+                        'reason': eligibility['reason'],
+                        'context': eligibility['context']}
+        except ImportError:
+            pass
+
         # Clamp vote value
         vote_value = max(VOTE_RANGE[0], min(VOTE_RANGE[1], vote_value))
 
@@ -328,8 +339,8 @@ class ThoughtExperimentService:
     def tally_votes(db: Session, experiment_id: str) -> Dict:
         """Tally all votes for an experiment.
 
-        Human votes: weight = 1.0
-        Agent votes: weight = confidence score
+        Uses context-aware weighting from voting_rules when available.
+        Fallback: human=1.0, agent=confidence.
         """
         from .models import ThoughtExperiment, ExperimentVote
 
@@ -337,6 +348,18 @@ class ThoughtExperimentService:
             id=experiment_id).first()
         if not experiment:
             return {'error': 'not_found'}
+
+        # Load context-aware voter rules
+        context_rules = None
+        decision_context = None
+        try:
+            from .voting_rules import get_voter_rules, classify_decision_context
+            exp_dict = experiment.to_dict()
+            decision_context = exp_dict.get('decision_context') or \
+                classify_decision_context(exp_dict)
+            context_rules = get_voter_rules(decision_context)
+        except ImportError:
+            pass
 
         votes = db.query(ExperimentVote).filter_by(
             experiment_id=experiment_id).all()
@@ -350,7 +373,15 @@ class ThoughtExperimentService:
         suggestions = []
 
         for v in votes:
-            weight = v.confidence if v.voter_type == 'agent' else 1.0
+            if v.voter_type == 'human':
+                human_weight = context_rules['human_weight'] if context_rules else 1.0
+                weight = human_weight
+                human_votes += 1
+            else:
+                agent_weight = context_rules['agent_weight'] if context_rules else 1.0
+                weight = v.confidence * agent_weight
+                agent_votes += 1
+
             weighted_sum += v.vote_value * weight
             total_weight += weight
 
@@ -358,11 +389,6 @@ class ThoughtExperimentService:
                 total_for += weight
             elif v.vote_value < 0:
                 total_against += weight
-
-            if v.voter_type == 'human':
-                human_votes += 1
-            else:
-                agent_votes += 1
 
             if v.suggestion:
                 suggestions.append({
@@ -372,6 +398,7 @@ class ThoughtExperimentService:
                 })
 
         weighted_score = weighted_sum / total_weight if total_weight > 0 else 0.0
+        threshold = context_rules['approval_threshold'] if context_rules else 0.5
 
         return {
             'experiment_id': experiment_id,
@@ -383,9 +410,11 @@ class ThoughtExperimentService:
             'weighted_score': round(weighted_score, 4),
             'total_weight': round(total_weight, 2),
             'suggestions': suggestions,
+            'decision_context': decision_context,
+            'approval_threshold': threshold,
             'decision_recommendation': (
-                'approve' if weighted_score > 0.5
-                else 'reject' if weighted_score < -0.5
+                'approve' if weighted_score > threshold
+                else 'reject' if weighted_score < -threshold
                 else 'inconclusive'
             ),
         }
@@ -396,13 +425,33 @@ class ThoughtExperimentService:
         """Record final decision for an experiment.
 
         Transitions to 'decided' status. Feeds outcome to WorldModelBridge.
+        Steward-required contexts block decision until steward has voted.
         """
-        from .models import ThoughtExperiment
+        from .models import ThoughtExperiment, ExperimentVote
 
         experiment = db.query(ThoughtExperiment).filter_by(
             id=experiment_id).first()
         if not experiment:
             return None
+
+        # Steward gate: certain contexts require steward vote before decision
+        try:
+            from .voting_rules import get_voter_rules, classify_decision_context
+            exp_dict = experiment.to_dict()
+            context = exp_dict.get('decision_context') or \
+                classify_decision_context(exp_dict)
+            rules = get_voter_rules(context)
+            if rules.get('steward_required'):
+                steward_voted = db.query(ExperimentVote).filter_by(
+                    experiment_id=experiment_id,
+                    voter_id='steward',
+                ).first()
+                if not steward_voted:
+                    return {'error': 'steward_vote_required',
+                            'context': context,
+                            'message': 'Steward must vote before decision on security contexts'}
+        except ImportError:
+            pass
 
         tally = ThoughtExperimentService.tally_votes(db, experiment_id)
         experiment.status = 'decided'
