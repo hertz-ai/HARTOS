@@ -34,7 +34,7 @@ logger = logging.getLogger('hevolve_security')
 
 # ── Trust Anchor ──
 # 64-char hex Ed25519 public key. The corresponding private key is a GitHub Secret.
-MASTER_PUBLIC_KEY_HEX = '906ae0b15ad4ae6bd11696a772d669a29a971c3c7de71156c621f0fe8826d1bf'
+MASTER_PUBLIC_KEY_HEX = 'ef380be7923d2b6bf88611d4ee5b9c20dc0f97549889ae51e407c4e54221bc1e'
 
 RELEASE_MANIFEST_FILENAME = 'release_manifest.json'
 

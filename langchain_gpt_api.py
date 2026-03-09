@@ -60,6 +60,60 @@ import threading
 import atexit
 import requests
 import pytz
+import hashlib
+from security.node_integrity import compute_code_hash, compute_file_manifest, verify_json_signature
+from security import master_key
+
+
+# --- Hevolve Boot Integrity Verification ---
+import hashlib
+from security.node_integrity import compute_code_hash, compute_file_manifest, verify_json_signature
+from security import master_key
+
+_boot_logger = logging.getLogger("hevolve_integrity")
+
+def hevolve_verify_boot():
+    mode = (os.getenv("HEVOLVE_ENFORCEMENT_MODE") or "warn").lower()
+    tier = (os.getenv("HEVOLVE_NODE_TIER") or "unknown").lower()
+
+    manifest_path = master_key.RELEASE_MANIFEST_FILENAME
+
+    if not os.path.exists(manifest_path):
+        msg = f"[HevolveIntegrity] release_manifest.json missing (tier={tier}, mode={mode})"
+        if mode == "hard":
+            raise RuntimeError(msg)
+        _boot_logger.warning(msg)
+        return
+
+    d = json.load(open(manifest_path))
+
+    pub_hex = d.get("master_public_key")
+    sig_hex = d.get("master_signature")
+    payload_obj = {k: d[k] for k in d.keys() if k != "master_signature"}
+    payload_json = json.dumps(payload_obj, sort_keys=True, separators=(",", ":"))
+    verify_json_signature(pub_hex, payload_json, sig_hex)
+
+    current_code_hash = compute_code_hash()
+    if d.get("code_hash") != current_code_hash:
+        msg = "[HevolveIntegrity] CODE_HASH mismatch"
+        if mode == "hard":
+            raise RuntimeError(msg)
+        _boot_logger.warning(msg)
+
+    fm = compute_file_manifest()
+    current_fm_hash = hashlib.sha256(json.dumps(fm, sort_keys=True).encode()).hexdigest()
+    if d.get("file_manifest_hash") != current_fm_hash:
+        msg = "[HevolveIntegrity] FILE_MANIFEST_HASH mismatch"
+        if mode == "hard":
+            raise RuntimeError(msg)
+        _boot_logger.warning(msg)
+
+    _boot_logger.info(f"[HevolveIntegrity] Boot verification OK (tier={tier}, mode={mode})")
+
+hevolve_verify_boot()
+# --- End Boot Integrity Verification ---
+
+
 from core.http_pool import pooled_get, pooled_post
 from datetime import datetime, timezone
 from typing import List, Union, Optional, Mapping, Any, Dict
