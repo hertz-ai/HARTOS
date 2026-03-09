@@ -89,10 +89,12 @@ nav:
     - Contributing: developer/contributing.md
   - Architecture:
     - System Overview: architecture/overview.md
+    - Technical Reference: architecture/technical-reference.md
     - Task Delegation: architecture/task-delegation.md
     - Smart Ledger: architecture/smart-ledger.md
     - Federation Protocol: architecture/federation-protocol.md
     - Nested Task System: architecture/nested-tasks.md
+    - PeerLink Protocol: architecture/peer_link.md
 
 extra:
   social:
