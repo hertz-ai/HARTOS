@@ -314,6 +314,22 @@ def main():
     # Step 3.5: Safety monitor (E-stop, workspace limits)
     _boot_safety(caps)
 
+    # Step 3.6: Platform EventBus + MessageBus
+    try:
+        from core.platform.bootstrap import bootstrap_platform
+        bootstrap_platform()
+        logger.info("Platform bootstrapped (EventBus + ServiceRegistry)")
+    except Exception as e:
+        logger.warning(f"Platform bootstrap failed: {e}")
+
+    # Step 3.7: Local Crossbar subscribers (confirmation, progress, exceptions)
+    try:
+        from core.peer_link.local_subscribers import bootstrap_local_subscribers
+        bootstrap_local_subscribers()
+        logger.info("Local subscribers bootstrapped")
+    except Exception as e:
+        logger.warning(f"Local subscribers bootstrap failed: {e}")
+
     # Step 4: Database (fleet commands, sync queue)
     db_ok = _boot_db()
 

@@ -20,6 +20,14 @@ async def on_event(msg):
     """Handle incoming messages from the WAMP subscription."""
     print("Event received:", msg)
     crossbar_multiagent(msg)
+    # Route to MessageBus so local subscribers receive it
+    try:
+        from core.peer_link.message_bus import get_message_bus
+        bus = get_message_bus()
+        data = msg if isinstance(msg, dict) else {'raw': str(msg)}
+        bus.receive_from_crossbar('com.hertzai.hevolve.agent.multichat', data)
+    except Exception:
+        pass
 
 
 async def call_rpc(message_json):
@@ -61,6 +69,14 @@ async def on_remote_desktop_signal(msg):
             # Future: process connect_request, transport_offer, bye
     except Exception as e:
         print(f"Remote desktop signal error: {e}")
+    # Route to MessageBus
+    try:
+        from core.peer_link.message_bus import get_message_bus
+        bus = get_message_bus()
+        data = msg if isinstance(msg, dict) else {'raw': str(msg)}
+        bus.receive_from_crossbar('com.hartos.remote_desktop.signal', data)
+    except Exception:
+        pass
 
 
 @component.on_join
