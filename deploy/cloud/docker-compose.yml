@@ -14,7 +14,7 @@ services:
       - "8000:8000"
     environment:
       - FLASK_ENV=development
-      - DATABASE_URL=postgresql://chatbot:chatbot_password@postgres:5432/chatbot_db
+      - HEVOLVE_DB_URL=mysql+mysqlconnector://chatbot:chatbot_password@mysql:3306/chatbot_db
       - REDIS_URL=redis://redis:6379/0
       - REDIS_HOST=redis
       - REDIS_PORT=6379
@@ -22,7 +22,7 @@ services:
     env_file:
       - .env
     depends_on:
-      postgres:
+      mysql:
         condition: service_healthy
       redis:
         condition: service_healthy
@@ -40,30 +40,30 @@ services:
       start_period: 40s
 
   # ============================================
-  # PostgreSQL Database
+  # MySQL Database
   # ============================================
-  postgres:
-    image: postgres:15-alpine
-    container_name: llm-chatbot-postgres
+  mysql:
+    image: mysql:8.0
+    container_name: llm-chatbot-mysql
     restart: unless-stopped
     environment:
-      - POSTGRES_USER=chatbot
-      - POSTGRES_PASSWORD=chatbot_password
-      - POSTGRES_DB=chatbot_db
-      - PGDATA=/var/lib/postgresql/data/pgdata
+      - MYSQL_USER=chatbot
+      - MYSQL_PASSWORD=chatbot_password
+      - MYSQL_DATABASE=chatbot_db
+      - MYSQL_ROOT_PASSWORD=chatbot_root_password
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      - mysql-data:/var/lib/mysql
       - ./init-db:/docker-entrypoint-initdb.d:ro
     ports:
-      - "5432:5432"
+      - "3306:3306"
     networks:
       - chatbot-network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U chatbot -d chatbot_db"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "chatbot", "-pchatbot_password"]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 30s
 
   # ============================================
   # Redis Cache & Session Store
@@ -126,7 +126,7 @@ networks:
 # Volumes
 # ============================================
 volumes:
-  postgres-data:
+  mysql-data:
     driver: local
   redis-data:
     driver: local

@@ -49,50 +49,27 @@ services:
       - "traefik.http.services.backend.loadbalancer.server.port=8000"
 
   # ============================================
-  # PostgreSQL - Production Settings
+  # MySQL - Production Settings
   # ============================================
-  postgres:
+  mysql:
     restart: always
     environment:
-      - POSTGRES_USER=${POSTGRES_USER:-chatbot}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRES_DB=${POSTGRES_DB:-chatbot_db}
+      - MYSQL_USER=${MYSQL_USER:-chatbot}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+      - MYSQL_DATABASE=${MYSQL_DB:-chatbot_db}
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
     command:
-      - "postgres"
-      - "-c"
-      - "max_connections=200"
-      - "-c"
-      - "shared_buffers=256MB"
-      - "-c"
-      - "effective_cache_size=768MB"
-      - "-c"
-      - "maintenance_work_mem=128MB"
-      - "-c"
-      - "checkpoint_completion_target=0.9"
-      - "-c"
-      - "wal_buffers=16MB"
-      - "-c"
-      - "default_statistics_target=100"
-      - "-c"
-      - "random_page_cost=1.1"
-      - "-c"
-      - "effective_io_concurrency=200"
-      - "-c"
-      - "work_mem=4MB"
-      - "-c"
-      - "min_wal_size=1GB"
-      - "-c"
-      - "max_wal_size=4GB"
-      - "-c"
-      - "max_worker_processes=4"
-      - "-c"
-      - "max_parallel_workers_per_gather=2"
-      - "-c"
-      - "max_parallel_workers=4"
-      - "-c"
-      - "log_statement=mod"
-      - "-c"
-      - "log_min_duration_statement=1000"
+      - "mysqld"
+      - "--max-connections=200"
+      - "--innodb-buffer-pool-size=256M"
+      - "--innodb-log-file-size=64M"
+      - "--innodb-flush-log-at-trx-commit=2"
+      - "--innodb-flush-method=O_DIRECT"
+      - "--slow-query-log=1"
+      - "--slow-query-log-file=/var/lib/mysql/slow.log"
+      - "--long-query-time=1"
+      - "--character-set-server=utf8mb4"
+      - "--collation-server=utf8mb4_unicode_ci"
     deploy:
       resources:
         limits:
@@ -167,12 +144,12 @@ services:
 # Production Volume Configuration
 # ============================================
 volumes:
-  postgres-data:
+  mysql-data:
     driver: local
     driver_opts:
       type: none
       o: bind
-      device: /opt/llm-chatbot/data/postgres
+      device: /opt/llm-chatbot/data/mysql
   redis-data:
     driver: local
     driver_opts:
