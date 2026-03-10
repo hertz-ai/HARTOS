@@ -72,7 +72,7 @@ _TIER_BANDWIDTH_MAP = {
 # Compact payload: only essential fields for gossip on constrained links
 _COMPACT_FIELDS = frozenset({
     'node_id', 'url', 'public_key', 'guardrail_hash', 'code_hash',
-    'signature', 'tier', 'capability_tier', 'timestamp',
+    'signature', 'tier', 'capability_tier', 'timestamp', 'hart_tag',
 })
 
 
@@ -136,6 +136,9 @@ class GossipProtocol:
             if u.strip()
         ]
 
+        # HART node identity (loaded on start)
+        self._hart_tag = ''
+
         # State
         self._running = False
         self._thread = None
@@ -194,6 +197,9 @@ class GossipProtocol:
                 return
             self._running = True
 
+        # Generate HART node identity if not yet established
+        self._ensure_hart_identity()
+
         # Seed peers into DB
         self._seed_initial_peers()
 
@@ -204,8 +210,49 @@ class GossipProtocol:
         self._thread = threading.Thread(target=self._background_loop, daemon=True)
         self._thread.start()
         logger.info(f"Gossip started: node={self.node_id[:8]}, "
-                    f"name={self.node_name}, seeds={len(self.seed_peers)}, "
+                    f"name={self.node_name}, hart_tag={self._hart_tag}, "
+                    f"seeds={len(self.seed_peers)}, "
                     f"bandwidth={self.bandwidth_profile}")
+
+    def _ensure_hart_identity(self):
+        """Generate HART node identity on first startup. Like getting an IP address.
+
+        - Central: picks a unique element → @element
+        - Regional: picks a unique spirit → @central.spirit
+        - Flat: no node tag needed (users get individual tags)
+        """
+        try:
+            from hart_onboarding import generate_node_identity, get_node_identity
+
+            # Check if already generated
+            existing = get_node_identity()
+            if existing and existing.get('node_tag'):
+                self._hart_tag = existing['node_tag']
+                return
+
+            # Gather known tags from peer network for collision avoidance
+            known_tags = set()
+            try:
+                peers = self._load_peers_from_db(exclude_dead=True)
+                for p in peers:
+                    tag = p.get('hart_tag', '')
+                    if tag:
+                        known_tags.add(tag)
+            except Exception:
+                pass
+
+            # Central element comes from env or the central we connect to
+            central_element = os.environ.get('HART_CENTRAL_ELEMENT', '')
+
+            identity = generate_node_identity(
+                tier=self.tier,
+                central_element=central_element or None,
+                known_tags=known_tags,
+            )
+
+            self._hart_tag = identity.get('node_tag', '')
+        except Exception as e:
+            logger.debug(f"HART identity generation skipped: {e}")
 
     def stop(self):
         """Stop the gossip background thread."""
@@ -520,6 +567,7 @@ class GossipProtocol:
             'post_count': self._get_count('post'),
             'timestamp': int(time.time()),
             'tier': self.tier,
+            'hart_tag': self._hart_tag,
         }
         # Add cryptographic identity if available
         try:
