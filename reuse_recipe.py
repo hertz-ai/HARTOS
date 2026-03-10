@@ -5,7 +5,7 @@ import autogen
 import os
 import pytz
 from core.http_pool import pooled_get, pooled_post, pooled_request
-from typing import Dict, Optional, Tuple, Any
+from typing import Dict, Optional, Tuple, Any, List
 import uuid
 import time
 import re
