@@ -826,6 +826,21 @@ class HARTNameRegistry:
                 user.settings = settings
 
             logger.info(f"HART name sealed: @{clean} for user {user_id}")
+
+            # Queue user sync to central so the HART identity propagates
+            try:
+                from integrations.social.sync_engine import SyncEngine
+                with db_session() as sync_db:
+                    SyncEngine.queue_user_sync(sync_db, {
+                        'user_id': user_id,
+                        'username': user.username,
+                        'handle': clean,
+                        'role': 'flat',
+                    }, direction='up')
+            except Exception as sync_err:
+                # Sync failure must not block the seal — it will retry later
+                logger.debug(f"User sync queue after seal failed: {sync_err}")
+
             return True
 
         except Exception as e:

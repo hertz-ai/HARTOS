@@ -1,9 +1,16 @@
 """
-Hardened JWT Manager
-Short-lived access tokens, refresh tokens, unique JTI claims, and token blocklist.
-Replaces the weak 30-day token system in auth.py.
+Hardened JWT Manager — Two-Layer Authentication
+
+Layer 1 (LOCAL): Node's own HS256 secret signs local JWTs.
+    Works offline, survives kill switch, survives central outage.
+Layer 2 (HIVE): HS256 + Ed25519 node_sig for cross-node identity.
+    Certificate chain verified — killed by master key revocation.
+
+The master key NEVER appears in JWT signing, token verification, or local auth.
+The master key's SOLE purpose is the kill switch for the distributed intelligence.
 """
 
+import json
 import os
 import time
 import uuid
@@ -76,8 +83,29 @@ class TokenBlocklist:
 _blocklist = TokenBlocklist()
 
 
+def _get_node_id() -> str:
+    """Return the first 16 hex chars of this node's Ed25519 public key."""
+    try:
+        from security.node_integrity import get_public_key_hex
+        return get_public_key_hex()[:16]
+    except Exception:
+        return 'unknown'
+
+
 class JWTManager:
-    """Secure JWT token management."""
+    """Secure JWT token management with two-layer auth.
+
+    Layer 1 — LOCAL tokens:
+        HS256 signed with per-node SOCIAL_SECRET_KEY.
+        scope='local', iss='node:{node_id}'.
+        Work offline. Survive kill switch.
+
+    Layer 2 — HIVE tokens:
+        HS256 + Ed25519 node_sig (in custom 'node_sig' claim).
+        scope='hive', iss='hive:hevolve'.
+        Verifiable by any node that knows the issuer's public key.
+        Dies with certificate chain revocation (kill switch).
+    """
 
     def __init__(self, secret_key: Optional[str] = None):
         self._secret_key = secret_key or self._load_secret_key()
@@ -128,31 +156,34 @@ class JWTManager:
             logger.warning("SOCIAL_SECRET_KEY is shorter than 32 characters. Consider using a longer key.")
 
     def generate_access_token(self, user_id: str, username: str) -> str:
-        """Generate a short-lived access token (1 hour)."""
+        """Generate a short-lived LOCAL access token (1 hour)."""
         return self._generate_token(
-            user_id, username, 'access', ACCESS_TOKEN_EXPIRY
+            user_id, username, 'access', ACCESS_TOKEN_EXPIRY, scope='local'
         )
 
     def generate_refresh_token(self, user_id: str, username: str) -> str:
-        """Generate a refresh token (7 days)."""
+        """Generate a LOCAL refresh token (7 days)."""
         return self._generate_token(
-            user_id, username, 'refresh', REFRESH_TOKEN_EXPIRY
+            user_id, username, 'refresh', REFRESH_TOKEN_EXPIRY, scope='local'
         )
 
     def generate_token_pair(self, user_id: str, username: str) -> dict:
-        """Generate both access and refresh tokens."""
+        """Generate both access and refresh tokens (local scope)."""
         return {
             'access_token': self.generate_access_token(user_id, username),
             'refresh_token': self.generate_refresh_token(user_id, username),
             'token_type': 'bearer',
             'expires_in': ACCESS_TOKEN_EXPIRY,
+            'scope': 'local',
         }
 
     def _generate_token(self, user_id: str, username: str,
-                        token_type: str, expiry: int) -> str:
+                        token_type: str, expiry: int,
+                        scope: str = 'local') -> str:
         if not HAS_JWT:
             return self._generate_hmac_token(user_id, username)
 
+        node_id = _get_node_id()
         payload = {
             'user_id': user_id,
             'username': username,
@@ -160,6 +191,9 @@ class JWTManager:
             'iat': int(time.time()),
             'exp': int(time.time()) + expiry,
             'type': token_type,
+            'scope': scope,
+            'node_id': node_id,
+            'iss': f'node:{node_id}' if scope == 'local' else 'hive:hevolve',
         }
         return pyjwt.encode(payload, self._secret_key, algorithm='HS256')
 
@@ -171,8 +205,9 @@ class JWTManager:
         ).hexdigest()
 
     def decode_token(self, token: str, expected_type: str = 'access') -> Optional[dict]:
-        """
-        Decode and validate a JWT token.
+        """Decode and validate a JWT token (any scope).
+
+        Backward compatible: tokens without 'scope' are treated as local.
         Returns payload dict or None if invalid.
         """
         if not HAS_JWT:
@@ -238,3 +273,132 @@ class JWTManager:
         return self.generate_token_pair(
             payload['user_id'], payload['username']
         )
+
+    # ── Layer 2: Hive tokens ────────────────────────────────────
+
+    def generate_hive_token(self, user_id: str, username: str) -> str:
+        """Generate a hive-scoped access token with Ed25519 node signature.
+
+        The JWT is HS256-signed (readable by this node) AND carries a
+        'node_sig' claim: the Ed25519 signature over the canonical payload
+        (minus node_sig itself).  Any peer that knows our public key can
+        verify the node_sig without needing our HS256 secret.
+        """
+        if not HAS_JWT:
+            return self._generate_hmac_token(user_id, username)
+
+        node_id = _get_node_id()
+        payload = {
+            'user_id': user_id,
+            'username': username,
+            'jti': str(uuid.uuid4()),
+            'iat': int(time.time()),
+            'exp': int(time.time()) + ACCESS_TOKEN_EXPIRY,
+            'type': 'access',
+            'scope': 'hive',
+            'node_id': node_id,
+            'iss': 'hive:hevolve',
+        }
+
+        # Sign the payload with this node's Ed25519 key
+        try:
+            from security.node_integrity import sign_json_payload
+            payload['node_sig'] = sign_json_payload(payload)
+        except Exception as e:
+            logger.warning(f"Could not sign hive token with Ed25519: {e}")
+            # Still produce a valid JWT, just without cross-node verifiability
+            payload['node_sig'] = ''
+
+        return pyjwt.encode(payload, self._secret_key, algorithm='HS256')
+
+    def verify_hive_token(self, token: str,
+                          issuer_public_key_hex: str) -> Optional[dict]:
+        """Verify a hive-scoped token from another node.
+
+        Two verification paths:
+          1. If we share the HS256 secret (same node or shared secret):
+             decode normally, then also verify node_sig.
+          2. If we only have the issuer's Ed25519 public key:
+             decode WITHOUT HS256 verification, then verify node_sig.
+
+        Returns the payload dict on success, None on failure.
+        """
+        if not HAS_JWT:
+            return None
+
+        payload = None
+
+        # Path 1: try HS256 decode (works if this is the issuing node)
+        try:
+            payload = pyjwt.decode(
+                token, self._secret_key, algorithms=['HS256']
+            )
+        except (pyjwt.InvalidTokenError, pyjwt.ExpiredSignatureError):
+            pass
+
+        # Path 2: decode without HS256 verification (cross-node)
+        if payload is None:
+            try:
+                payload = pyjwt.decode(
+                    token, options={
+                        'verify_signature': False,
+                        'verify_exp': True,
+                    }, algorithms=['HS256']
+                )
+            except (pyjwt.ExpiredSignatureError, pyjwt.InvalidTokenError):
+                return None
+
+        if not payload:
+            return None
+
+        # Must be a hive token
+        if payload.get('scope') != 'hive':
+            logger.warning("verify_hive_token called on non-hive token")
+            return None
+
+        # Check blocklist
+        jti = payload.get('jti')
+        if jti and _blocklist.is_blocked(jti):
+            logger.warning(f"Blocked hive token used: jti={jti}")
+            return None
+
+        # Verify Ed25519 node_sig
+        node_sig = payload.get('node_sig', '')
+        if not node_sig:
+            logger.warning("Hive token missing node_sig claim")
+            return None
+
+        try:
+            from security.node_integrity import verify_json_signature
+            # Strip node_sig from payload before verification — it was not
+            # present when the signature was computed during generation.
+            verify_payload = {k: v for k, v in payload.items()
+                             if k != 'node_sig'}
+            if not verify_json_signature(
+                    issuer_public_key_hex, verify_payload, node_sig):
+                logger.warning("Hive token node_sig verification failed")
+                return None
+        except Exception as e:
+            logger.warning(f"Hive token Ed25519 verification error: {e}")
+            return None
+
+        return payload
+
+    def decode_local_token(self, token: str,
+                           expected_type: str = 'access') -> Optional[dict]:
+        """Decode a local-scoped token. Backward compatible.
+
+        Tokens without a 'scope' claim are treated as local (pre-upgrade tokens).
+        Rejects hive-scoped tokens — use verify_hive_token() for those.
+        """
+        payload = self.decode_token(token, expected_type=expected_type)
+        if payload is None:
+            return None
+
+        scope = payload.get('scope')
+        if scope is not None and scope != 'local':
+            logger.warning(
+                f"decode_local_token rejected token with scope={scope}")
+            return None
+
+        return payload

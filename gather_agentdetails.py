@@ -40,12 +40,15 @@ AGENT_CREATOR_SYSTEM_MESSAGE = """You are a custom agent bot creator. Your task 
 
         4. In the review_details and completed responses, ensure that every piece of information provided by the user is included without skipping, omitting, or overlooking any details. The actions should be described thoroughly and clearly, avoiding any vagueness.
         5. Structured Responses for User Interaction
-            If information is still being collected, respond in this format:
-                { "status": "pending", "question": "The question you want to ask" }
-            Before finalizing, present a full review to the user in this format:
-                { "status": "pending", "review_details": "All details in plain string here for user verification" }
-            After confirmation, provide the final configuration in this format:
-                { "status": "completed", "name": "", "agent_name": "skill.region.name", "broadcast_agent": bool, "personas": "", "tools": "", "flows": [ { "flow_name": "", "persona": "", "actions": [], "sub_goal": "" } ], "goal": "", "personality": { "primary_traits": ["3-5 cultural wisdom traits that match this agent's role, e.g. Meraki, Sisu, Aloha"], "tone": "warm-casual or focused-professional or playful-encouraging", "greeting_style": "A warm, personalized opening line for this agent", "identity": "A one-sentence description of who this agent IS (not what it does) — its character, like 'A patient mentor who celebrates every small win' or 'A sharp-eyed analyst who finds patterns others miss'" } }
+            CRITICAL: You MUST respond with ONLY a valid JSON object. No prose, no explanation, no markdown. Just pure JSON.
+            If information is still being collected, respond ONLY with:
+                {"status": "pending", "question": "The question you want to ask"}
+            Before finalizing, present a full review ONLY with:
+                {"status": "pending", "review_details": "All details in plain string here for user verification"}
+            After confirmation, provide the final configuration ONLY with:
+                {"status": "completed", "name": "", "agent_name": "skill.region.name", "broadcast_agent": false, "personas": "", "tools": "", "flows": [{"flow_name": "", "persona": "", "actions": [], "sub_goal": ""}], "goal": "", "personality": {"primary_traits": ["3-5 cultural wisdom traits that match this agent's role, e.g. Meraki, Sisu, Aloha"], "tone": "warm-casual or focused-professional or playful-encouraging", "greeting_style": "A warm, personalized opening line for this agent", "identity": "A one-sentence description of who this agent IS (not what it does) - its character, like 'A patient mentor who celebrates every small win' or 'A sharp-eyed analyst who finds patterns others miss'"}}
+            NEVER use em-dashes, smart quotes, or Unicode characters in your response. Use plain ASCII only.
+            Your response must start with { and end with }. Nothing else.
 
         """
 
@@ -90,9 +93,10 @@ def create_agents_for_user(user_id: str, autonomous=False, initial_description=N
 AUTONOMOUS MODE INSTRUCTIONS:
 The user wants you to create an agent autonomously based on this description: '{initial_description}'.
 You must fill in ALL required fields yourself without asking questions.
-Generate appropriate name, agent_name (two.word format), goal, broadcast_agent, personas, flows (with flow_name, persona, actions, sub_goal), and extra_information.
-Return the completed JSON immediately with status='completed'.
-Do NOT ask any questions — make reasonable decisions for all fields based on the description.
+Generate appropriate name, agent_name (skill.region.name format), goal, broadcast_agent, personas, flows (with flow_name, persona, actions, sub_goal), and extra_information.
+Return ONLY a valid JSON object with status="completed". No prose, no explanation, no markdown.
+Do NOT ask any questions. Do NOT use em-dashes or smart quotes. Plain ASCII only.
+Your response must start with {{ and end with }}. Nothing else.
 """
 
     # Create the assistant agent with context awareness
