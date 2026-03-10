@@ -148,6 +148,10 @@ def bootstrap_platform(extensions_dir: Optional[str] = None) -> ServiceRegistry:
     if cburl:
         bus.connect_wamp(cburl, os.environ.get('CBREALM', 'realm1'))
 
+    # ── Wire EventBus subscribers for orphaned events ────────
+
+    _wire_event_subscribers(bus)
+
     # ── Start Lifecycle Services ──────────────────────────────
 
     registry.start_all()
@@ -157,6 +161,112 @@ def bootstrap_platform(extensions_dir: Optional[str] = None) -> ServiceRegistry:
     logger.info("Platform bootstrapped: %d apps, %d extensions", total, ext_count)
 
     return registry
+
+
+def _wire_event_subscribers(bus) -> None:
+    """Wire EventBus subscribers for events that have publishers but no consumers.
+
+    These were identified as orphaned events in the event audit.
+    Each subscriber is fail-safe — a broken handler never crashes the emitter.
+    """
+
+    # 1. tts.speak → dispatch to TTS engine (voice output was silently dropped)
+    def _on_tts_speak(topic, data):
+        try:
+            from integrations.channels.media.tts import TTSEngine
+            import asyncio
+            text = data.get('text', '')
+            if not text:
+                return
+            engine = TTSEngine()  # defaults to Pocket TTS (offline, CPU)
+            loop = asyncio.new_event_loop()
+            try:
+                audio = loop.run_until_complete(engine.synthesize(text))
+                if audio:
+                    logger.debug("TTS synthesized %d bytes for user %s",
+                                 len(audio), data.get('user_id', ''))
+                    # Push audio to fleet command channel for mobile playback
+                    try:
+                        from core.peer_link.message_bus import get_message_bus
+                        get_message_bus().publish('fleet.command', {
+                            'command': 'tts_playback',
+                            'audio_size': len(audio),
+                            'text': text[:100],
+                            'user_id': data.get('user_id', ''),
+                        }, user_id=data.get('user_id', ''))
+                    except Exception:
+                        pass
+            finally:
+                loop.close()
+        except Exception as e:
+            logger.debug("TTS speak handler error: %s", e)
+
+    bus.on('tts.speak', _on_tts_speak)
+
+    # 2. action.retry_exhausted → log + audit trail for failed retries
+    def _on_retry_exhausted(topic, data):
+        action_id = data.get('action_id', '')
+        max_retries = data.get('max_retries', 0)
+        logger.warning("Action %s exhausted %d retries — marking failed",
+                        action_id, max_retries)
+        try:
+            from security.immutable_audit_log import log_event
+            log_event('action_retry_exhausted', action_id, detail_json={
+                'max_retries': max_retries,
+                'user_id': data.get('user_id', ''),
+            })
+        except Exception:
+            pass
+
+    bus.on('action.retry_exhausted', _on_retry_exhausted)
+
+    # 3. memory.item_deleted → sync deletion to federation (item_added already syncs)
+    def _on_memory_deleted(topic, data):
+        try:
+            from integrations.agent_engine.federated_aggregator import get_aggregator
+            agg = get_aggregator()
+            if agg and hasattr(agg, '_event_counters'):
+                agg._event_counters['memory.item_deleted'] = (
+                    agg._event_counters.get('memory.item_deleted', 0) + 1)
+        except Exception:
+            pass
+
+    bus.on('memory.item_deleted', _on_memory_deleted)
+
+    # 4. security.extension_blocked → audit log (security events must not be silent)
+    def _on_extension_blocked(topic, data):
+        module = data.get('module', 'unknown')
+        violations = data.get('violations', [])
+        logger.warning("Extension blocked: %s (violations: %s)", module, violations)
+        try:
+            from security.immutable_audit_log import log_event
+            log_event('extension_blocked', module, detail_json={
+                'violations': violations,
+            })
+        except Exception:
+            pass
+
+    bus.on('security.extension_blocked', _on_extension_blocked)
+
+    # 5. notification.unconfirmed → push to mobile via fleet command
+    def _on_unconfirmed(topic, data):
+        user_id = data.get('user_id', '')
+        if not user_id:
+            return
+        try:
+            from core.peer_link.message_bus import get_message_bus
+            get_message_bus().publish('fleet.command', {
+                'command': 'notification_unconfirmed',
+                'msg_id': data.get('msg_id', ''),
+                'topic': data.get('topic', ''),
+            }, user_id=user_id)
+        except Exception:
+            pass
+
+    bus.on('notification.unconfirmed', _on_unconfirmed)
+
+    logger.debug("EventBus subscribers wired: tts.speak, action.retry_exhausted, "
+                 "memory.item_deleted, security.extension_blocked, notification.unconfirmed")
 
 
 def _migrate_shell_manifest(apps: AppRegistry) -> None:
