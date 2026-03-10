@@ -96,7 +96,13 @@ async def async_main(urls):
 # Native web crawler (in-process, no HTTP API needed)
 
 # --- Path traversal protection for prompt file access ---
-PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
+# Frozen builds install to Program Files (read-only) — redirect to user data dir
+if getattr(sys, 'frozen', False):
+    PROMPTS_DIR = os.path.abspath(os.path.join(
+        os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'prompts'))
+else:
+    PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
+os.makedirs(PROMPTS_DIR, exist_ok=True)
 
 
 def sanitize_path_component(value):
@@ -548,10 +554,14 @@ def retrieve_json(json_message):
         if prefix_match:
             json_message = prefix_match.group(1).strip()
 
-    # Normalize Unicode smart quotes BEFORE any parse attempt (local LLMs emit these)
+    # Normalize Unicode characters BEFORE any parse attempt (local LLMs emit these)
     # U+2018/2019 = curly single quotes -> ASCII apostrophe
     # U+201C/201D = curly double quotes -> ASCII quotation mark
-    json_message = json_message.replace("\u2018", "'").replace("\u2019", "'").replace("\u201c", '"').replace("\u201d", '"')
+    # U+2014 = em-dash, U+2013 = en-dash -> ASCII hyphen-minus
+    json_message = (json_message
+        .replace("\u2018", "'").replace("\u2019", "'")
+        .replace("\u201c", '"').replace("\u201d", '"')
+        .replace("\u2014", "-").replace("\u2013", "-"))
 
     try:
         return json.loads(repair_json(json_message))

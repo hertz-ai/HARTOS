@@ -109,6 +109,7 @@ def generate_api_token() -> str:
 
 
 def generate_jwt(user_id: str, username: str, role: str = 'flat') -> str:
+    """Generate a LOCAL-scoped JWT (Layer 1). Works offline, survives kill switch."""
     mgr = _get_jwt_manager()
     if mgr:
         return mgr.generate_access_token(str(user_id), username)
@@ -122,9 +123,36 @@ def generate_jwt(user_id: str, username: str, role: str = 'flat') -> str:
             'iat': int(time.time()),
             'exp': int(time.time()) + TOKEN_EXPIRY,
             'type': 'access',
+            'scope': 'local',
         }
         return pyjwt.encode(payload, SECRET_KEY, algorithm='HS256')
     return generate_api_token()
+
+
+def generate_hive_jwt(user_id: str, username: str, role: str = 'flat') -> str:
+    """Generate a HIVE-scoped JWT (Layer 2). Ed25519-signed for cross-node verification.
+
+    Dies with master key revocation (kill switch). Requires certificate chain.
+    """
+    mgr = _get_jwt_manager()
+    if mgr:
+        return mgr.generate_hive_token(str(user_id), username)
+    # Fallback: if JWTManager unavailable, produce a local token
+    # (hive features degrade gracefully)
+    logger.warning("JWTManager unavailable, falling back to local token for hive request")
+    return generate_jwt(user_id, username, role)
+
+
+def verify_hive_jwt(token: str, issuer_public_key_hex: str) -> dict:
+    """Verify a HIVE-scoped JWT from another node using its Ed25519 public key.
+
+    Returns payload dict on success, empty dict on failure.
+    """
+    mgr = _get_jwt_manager()
+    if mgr:
+        result = mgr.verify_hive_token(token, issuer_public_key_hex)
+        return result or {}
+    return {}
 
 
 def generate_token_pair(user_id: str, username: str, role: str = 'flat') -> dict:
@@ -141,15 +169,24 @@ def generate_token_pair(user_id: str, username: str, role: str = 'flat') -> dict
 
 
 def decode_jwt(token: str) -> dict:
+    """Decode a JWT token (any scope). Backward compatible.
+
+    Returns payload dict with 'scope' key ('local' for pre-upgrade tokens
+    without scope, or the actual scope value). Empty dict on failure.
+    """
     mgr = _get_jwt_manager()
     if mgr:
         result = mgr.decode_token(token, expected_type='access')
+        if result:
+            # Ensure scope is always present for callers
+            result.setdefault('scope', 'local')
         return result or {}
     if HAS_JWT:
         try:
             payload = pyjwt.decode(token, SECRET_KEY, algorithms=['HS256'])
             if payload.get('type') not in ('access', None):
                 return {}  # Reject non-access tokens (e.g. refresh tokens)
+            payload.setdefault('scope', 'local')
             return payload
         except (pyjwt.ExpiredSignatureError, pyjwt.InvalidTokenError):
             return {}
@@ -164,16 +201,28 @@ def revoke_token(token: str):
 
 
 def _get_user_from_token(token: str):
-    """Look up user by API token or JWT."""
+    """Look up user by API token or JWT (local or hive scope).
+
+    For hive tokens from other nodes: the HS256 decode will fail (different
+    secret), so we fall through to the API token lookup. Cross-node hive
+    verification should use verify_hive_jwt() explicitly in the endpoint.
+
+    Sets Flask g.token_scope to 'local', 'hive', or 'api_token' for callers.
+    """
     from .models import get_db, User
 
-    # Try JWT first
+    # Try JWT first (works for local tokens and hive tokens issued by THIS node)
     payload = decode_jwt(token)
     if payload and 'user_id' in payload:
         db = get_db()
         try:
             user = db.query(User).filter(User.id == payload['user_id']).first()
             if user and not user.is_banned:
+                try:
+                    g.token_scope = payload.get('scope', 'local')
+                    g.token_node_id = payload.get('node_id', '')
+                except RuntimeError:
+                    pass  # Outside request context (testing)
                 return user, db
         finally:
             pass  # keep session open for request lifecycle
@@ -183,6 +232,11 @@ def _get_user_from_token(token: str):
     db = get_db()
     user = db.query(User).filter(User.api_token == token).first()
     if user and not user.is_banned:
+        try:
+            g.token_scope = 'api_token'
+            g.token_node_id = ''
+        except RuntimeError:
+            pass
         return user, db
     return None, db
 

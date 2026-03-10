@@ -230,6 +230,98 @@ def guest_recover():
         return _err(str(e))
 
 
+# ─── Token refresh ───
+
+@social_bp.route('/auth/refresh', methods=['POST'])
+@rate_limit('auth')
+def refresh_token():
+    """Refresh an access token using a refresh token."""
+    data = _get_json()
+    refresh = data.get('refresh_token', '')
+    if not refresh:
+        return _err("refresh_token required")
+
+    try:
+        from security.jwt_manager import JWTManager
+        mgr = JWTManager()
+        result = mgr.refresh_access_token(refresh)
+        if not result:
+            return _err("Invalid or expired refresh token", 401)
+        return _ok(result)
+    except Exception as e:
+        logger.error(f"Token refresh failed: {e}")
+        return _err("Token refresh unavailable", 500)
+
+
+# ─── Cross-node user verification ───
+
+@social_bp.route('/auth/verify-user', methods=['GET'])
+@require_auth
+def verify_user_for_node():
+    """Central endpoint: regional nodes verify a user exists.
+
+    Requires regional or central role (node certificate holder).
+    Returns minimal user info for cross-node identity confirmation.
+    """
+    from .auth import require_regional
+    user_role = getattr(g.user, 'role', None) or 'flat'
+    if user_role not in ('central', 'regional') and not (g.user.is_admin or g.user.is_moderator):
+        return _err("Regional access required", 403)
+
+    target_user_id = request.args.get('user_id', '')
+    if not target_user_id:
+        return _err("user_id query parameter required")
+
+    target = g.db.query(User).filter_by(id=target_user_id).first()
+    if not target:
+        return _err("User not found", 404)
+
+    return _ok({
+        'user_id': str(target.id),
+        'username': target.username,
+        'handle': target.handle or '',
+        'role': target.role or 'flat',
+        'is_banned': target.is_banned,
+    })
+
+
+@social_bp.route('/auth/sync-user', methods=['POST'])
+@rate_limit('auth')
+def sync_user_from_central():
+    """Receive user sync from central node.
+
+    Requires a valid hive token with node_sig verification.
+    The calling node must present its Ed25519 public key for verification.
+    """
+    data = _get_json()
+    token = ''
+    auth_header = request.headers.get('Authorization', '')
+    if auth_header.startswith('Bearer '):
+        token = auth_header[7:]
+
+    node_public_key = data.get('node_public_key', '')
+    user_data = data.get('user_data', {})
+
+    if not token or not node_public_key or not user_data:
+        return _err("token, node_public_key, and user_data required")
+
+    # Verify the hive token from the calling node
+    from .auth import verify_hive_jwt
+    payload = verify_hive_jwt(token, node_public_key)
+    if not payload:
+        return _err("Invalid hive token or node signature", 401)
+
+    # Process the user sync
+    try:
+        from .sync_engine import SyncEngine
+        with db_session() as db:
+            SyncEngine._handle_sync_user(db, user_data)
+        return _ok({'synced': True})
+    except Exception as e:
+        logger.error(f"User sync failed: {e}")
+        return _err(str(e), 500)
+
+
 # ═══════════════════════════════════════════════════════════════
 # USERS / PROFILES
 # ═══════════════════════════════════════════════════════════════

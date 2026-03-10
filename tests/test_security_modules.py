@@ -89,9 +89,10 @@ class TestJWTTokenGeneration:
 
     def test_token_pair_structure(self, mgr):
         pair = mgr.generate_token_pair('u1', 'alice')
-        assert set(pair.keys()) == {'access_token', 'refresh_token', 'token_type', 'expires_in'}
+        assert set(pair.keys()) == {'access_token', 'refresh_token', 'token_type', 'expires_in', 'scope'}
         assert pair['token_type'] == 'bearer'
         assert pair['expires_in'] == 3600
+        assert pair['scope'] == 'local'
 
     def test_token_contains_user_claims(self, mgr):
         token = mgr.generate_access_token('user42', 'bob')

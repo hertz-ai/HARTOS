@@ -49,7 +49,7 @@ try:
     from langchain_classic.requests import Requests
 except (ImportError, AttributeError):
     Requests = None
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, g
 from functools import wraps
 import json
 import os
@@ -66,10 +66,6 @@ from security import master_key
 
 
 # --- Hevolve Boot Integrity Verification ---
-import hashlib
-from security.node_integrity import compute_code_hash, compute_file_manifest, verify_json_signature
-from security import master_key
-
 _boot_logger = logging.getLogger("hevolve_integrity")
 
 def hevolve_verify_boot():
@@ -85,13 +81,21 @@ def hevolve_verify_boot():
         _boot_logger.warning(msg)
         return
 
-    d = json.load(open(manifest_path))
+    with open(manifest_path) as f:
+        d = json.load(f)
 
     pub_hex = d.get("master_public_key")
     sig_hex = d.get("master_signature")
     payload_obj = {k: d[k] for k in d.keys() if k != "master_signature"}
     payload_json = json.dumps(payload_obj, sort_keys=True, separators=(",", ":"))
-    verify_json_signature(pub_hex, payload_json, sig_hex)
+    try:
+        verify_json_signature(pub_hex, payload_json, sig_hex)
+    except Exception as e:
+        msg = f"[HevolveIntegrity] Signature verification failed: {e}"
+        if mode == "hard":
+            raise RuntimeError(msg)
+        _boot_logger.warning(msg)
+        return
 
     current_code_hash = compute_code_hash()
     if d.get("code_hash") != current_code_hash:
@@ -110,7 +114,7 @@ def hevolve_verify_boot():
 
     _boot_logger.info(f"[HevolveIntegrity] Boot verification OK (tier={tier}, mode={mode})")
 
-hevolve_verify_boot()
+# Defer boot verification to main() — do not run at import time
 # --- End Boot Integrity Verification ---
 
 
@@ -206,7 +210,12 @@ try:
     from helper import retrieve_json, PROMPTS_DIR, safe_prompt_path
 except Exception:
     retrieve_json = None
-    PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
+    # Frozen builds install to Program Files (read-only) — redirect to user data dir
+    if getattr(sys, 'frozen', False):
+        PROMPTS_DIR = os.path.abspath(os.path.join(
+            os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'prompts'))
+    else:
+        PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
     safe_prompt_path = None
 
 # Ensure prompts directory exists (agent creation writes JSON here)
@@ -4043,6 +4052,27 @@ def chat():
     _cleanup_stale_agents()
 
     data = request.get_json()
+
+    # ── Two-layer auth: extract user_id from JWT if present ──
+    # Layer 1 (LOCAL): Bearer token signed by this node's HS256 secret
+    # Layer 2 (HIVE): Bearer token with Ed25519 node_sig (cross-node)
+    # Fallback: body user_id (backward compat for desktop/Nunba mode)
+    auth_header = request.headers.get('Authorization', '')
+    if auth_header.startswith('Bearer '):
+        try:
+            from integrations.social.auth import decode_jwt
+            jwt_payload = decode_jwt(auth_header[7:])
+            if jwt_payload and 'user_id' in jwt_payload:
+                data['user_id'] = jwt_payload['user_id']
+                g.auth_source = 'jwt'
+                g.token_scope = jwt_payload.get('scope', 'local')
+            else:
+                g.auth_source = 'body'
+        except Exception:
+            g.auth_source = 'body'
+    else:
+        g.auth_source = 'body'
+
     user_id = data.get('user_id', None)
     preferred_lang = data.get('preferred_lang', 'en')
     request_id = data.get('request_id', None)
@@ -4222,10 +4252,13 @@ def chat():
                 first_promts.append(prompt_id)
                 try:
                     res = pooled_get(
-                        f'{DB_URL}/getprompt/?prompt_id={prompt_id}').json()
-                    prompt = prompt+f" name:{res[0]['name']} goal:{res[0]['prompt']}"
-                except:
-                    app.logger.error(f'GOT DB ERROR FOR PROMPTID:{prompt_id}')
+                        f'{DB_URL}/getprompt/?prompt_id={prompt_id}', timeout=5).json()
+                    if res and isinstance(res, list) and len(res) > 0:
+                        prompt = prompt+f" name:{res[0]['name']} goal:{res[0]['prompt']}"
+                    else:
+                        app.logger.debug(f'No cloud record for prompt_id={prompt_id} (new agent)')
+                except Exception:
+                    app.logger.debug(f'Cloud DB unreachable for prompt_id={prompt_id}, using local-only')
             if not user_id or not prompt:
                 return jsonify({'response': 'Need user_id and text to create agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
             if autonomous:
@@ -4292,6 +4325,11 @@ def chat():
             try:
                 # Parse gather_info response
                 new_res = None
+
+                # Detect context-exceeded errors before parsing
+                if 'Context size has been exceeded' in response:
+                    raise ValueError('LLM context size exceeded — cannot parse gather_info response')
+
                 try:
                     new_res = retrieve_json(new_response)
                     app.logger.info(f"new_res: {new_res}")
@@ -4302,6 +4340,14 @@ def chat():
                         new_res = json.loads(json_match.group(0))
                     else:
                         raise ValueError('No JSON in response')
+
+                # retrieve_json can return None without raising — catch it early
+                if new_res is None:
+                    json_match = re.search(r'{[\s\S]*}', response)
+                    if json_match:
+                        new_res = json.loads(json_match.group(0))
+                    else:
+                        raise ValueError('retrieve_json returned None and no JSON found in response')
 
                 # LLM sometimes returns a list of conversation turns instead of a single dict
                 if isinstance(new_res, list):
@@ -4339,8 +4385,18 @@ def chat():
                 # After repeated failures, salvage what we can and move forward.
                 # For autonomous dispatches (agent daemon), salvage earlier (turn 3)
                 # to avoid tight retry loops that waste resources.
+                # For fatal errors (context exceeded, permission denied), salvage immediately.
                 is_autonomous = request.json.get('autonomous', False)
-                salvage_threshold = 3 if is_autonomous else MAX_GATHER_TURNS - 2
+                err_str = str(e)
+                is_fatal = ('context size' in err_str.lower()
+                            or 'permission denied' in err_str.lower()
+                            or 'errno 13' in err_str.lower())
+                if is_fatal:
+                    salvage_threshold = 1  # Immediate salvage — retrying won't help
+                elif is_autonomous:
+                    salvage_threshold = 3
+                else:
+                    salvage_threshold = MAX_GATHER_TURNS - 2
                 if turn_num >= salvage_threshold:
                     app.logger.warning(
                         f'Too many gather_info failures (turn {turn_num}, '
@@ -4766,12 +4822,11 @@ def get_prompts():
     prompts = []
 
     # 1. Read from local prompts/*.json files
-    prompts_dir = os.path.join(os.path.dirname(__file__), 'prompts')
-    if os.path.isdir(prompts_dir):
-        for fname in os.listdir(prompts_dir):
+    if os.path.isdir(PROMPTS_DIR):
+        for fname in os.listdir(PROMPTS_DIR):
             if fname.endswith('.json') and '_' not in fname:
                 try:
-                    fpath = os.path.join(prompts_dir, fname)
+                    fpath = os.path.join(PROMPTS_DIR, fname)
                     with open(fpath, 'r') as f:
                         data = json.load(f)
                     pid = fname.replace('.json', '')
@@ -4817,12 +4872,11 @@ def get_public_prompts():
     prompts = []
 
     # 1. Read ALL prompts from local files (no user filter)
-    prompts_dir = os.path.join(os.path.dirname(__file__), 'prompts')
-    if os.path.isdir(prompts_dir):
-        for fname in os.listdir(prompts_dir):
+    if os.path.isdir(PROMPTS_DIR):
+        for fname in os.listdir(PROMPTS_DIR):
             if fname.endswith('.json') and '_' not in fname:
                 try:
-                    fpath = os.path.join(prompts_dir, fname)
+                    fpath = os.path.join(PROMPTS_DIR, fname)
                     with open(fpath, 'r') as f:
                         data = json.load(f)
                     pid = fname.replace('.json', '')
@@ -4877,16 +4931,14 @@ def _next_prompt_id():
     timestamp into a max-11-digit space.
     """
     with _prompt_id_lock:
-        prompts_dir = os.path.join(os.path.dirname(__file__), 'prompts')
-
         # Fold ms timestamp into 1..99,999,999,999 (1–11 digits)
         pid = int(time.time() * 1000) % 100_000_000_000
         if pid == 0:
             pid = 1
 
-        if os.path.isdir(prompts_dir):
+        if os.path.isdir(PROMPTS_DIR):
             # Preserve the same collision-avoidance logic
-            while os.path.exists(os.path.join(prompts_dir, f'{pid}.json')):
+            while os.path.exists(os.path.join(PROMPTS_DIR, f'{pid}.json')):
                 pid += 1
                 # Keep pid within 1–11 digits while still allowing bumps
                 if pid >= 100_000_000_000:
@@ -6291,7 +6343,7 @@ def _validate_startup():
             _central_logger.critical("CENTRAL HARDENING: OPENAI_API_KEY missing or placeholder")
 
         # Fix 6: DB encryption check
-        db_url = os.environ.get('DATABASE_URL', '')
+        db_url = os.environ.get('HEVOLVE_DB_URL') or os.environ.get('DATABASE_URL', '')
         if not db_url or 'sqlite' in db_url.lower():
             _central_logger.warning("CENTRAL HARDENING: SQLite detected — production should use PostgreSQL or sqlcipher")
 
@@ -6316,6 +6368,9 @@ def main():
     Main entry point for hevolve-server CLI command.
     Starts the Flask server using waitress.
     """
+    # Boot integrity verification (deferred from import time)
+    hevolve_verify_boot()
+
     _validate_startup()
 
     # Bootstrap EventBus (required before local subscribers)

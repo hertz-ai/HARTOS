@@ -213,6 +213,12 @@ class SyncEngine:
                     logger.info(f"Sync: received coding task assignment from parent")
                 elif op == 'coding_submission':
                     logger.info(f"Sync: received coding submission from child")
+                elif op == 'sync_user':
+                    SyncEngine._handle_sync_user(db, payload)
+                elif op == 'revoke_token':
+                    SyncEngine._handle_revoke_token(payload)
+                elif op == 'sync_blocklist':
+                    SyncEngine._handle_sync_blocklist(payload)
                 else:
                     logger.debug(f"Sync: unknown operation type: {op}")
 
@@ -221,6 +227,84 @@ class SyncEngine:
                 errors.append({'id': item_id, 'error': str(e)})
 
         return {'processed': processed, 'errors': errors}
+
+    @staticmethod
+    def _handle_sync_user(db, payload: dict):
+        """Create or update a User record from sync data."""
+        from .models import User
+
+        user_id = payload.get('user_id')
+        username = payload.get('username', '')
+        if not user_id or not username:
+            logger.warning("sync_user: missing user_id or username")
+            return
+
+        existing = db.query(User).filter_by(id=user_id).first()
+        if existing:
+            # Update fields from sync (don't overwrite local-only fields)
+            if payload.get('handle'):
+                existing.handle = payload['handle']
+            if payload.get('display_name'):
+                existing.display_name = payload['display_name']
+            if payload.get('role'):
+                existing.role = payload['role']
+            logger.info(f"Sync: updated user {user_id} from sync")
+        else:
+            # Create new user record from sync
+            from .auth import generate_api_token
+            user = User(
+                id=user_id,
+                username=username,
+                display_name=payload.get('display_name', username),
+                handle=payload.get('handle', ''),
+                role=payload.get('role', 'flat'),
+                user_type=payload.get('user_type', 'human'),
+                api_token=generate_api_token(),
+            )
+            db.add(user)
+            logger.info(f"Sync: created user {user_id} from sync")
+
+    @staticmethod
+    def _handle_revoke_token(payload: dict):
+        """Add a JTI to the local token blocklist."""
+        jti = payload.get('jti', '')
+        if not jti:
+            logger.warning("revoke_token sync: missing jti")
+            return
+        try:
+            from security.jwt_manager import _blocklist, ACCESS_TOKEN_EXPIRY
+            expires_in = payload.get('expires_in', ACCESS_TOKEN_EXPIRY)
+            _blocklist.add(jti, expires_in)
+            logger.info(f"Sync: revoked token jti={jti}")
+        except Exception as e:
+            logger.warning(f"Sync: failed to revoke token: {e}")
+
+    @staticmethod
+    def _handle_sync_blocklist(payload: dict):
+        """Bulk sync of blocked JTIs."""
+        jtis = payload.get('jtis', [])
+        if not jtis:
+            return
+        try:
+            from security.jwt_manager import _blocklist, ACCESS_TOKEN_EXPIRY
+            expires_in = payload.get('expires_in', ACCESS_TOKEN_EXPIRY)
+            for jti in jtis:
+                _blocklist.add(jti, expires_in)
+            logger.info(f"Sync: bulk-revoked {len(jtis)} tokens")
+        except Exception as e:
+            logger.warning(f"Sync: failed to sync blocklist: {e}")
+
+    @staticmethod
+    def queue_user_sync(db, user_data: dict, direction: str = 'up'):
+        """Queue a user creation/update for sync.
+
+        Args:
+            db: Database session
+            user_data: Dict with user_id, username, handle, role, etc.
+            direction: 'up' (to central) or 'down' (from central to nodes)
+        """
+        target = 'central' if direction == 'up' else 'regional'
+        return SyncEngine.queue(db, target, 'sync_user', user_data)
 
     @staticmethod
     def is_connected_to(target_url: str) -> bool:
