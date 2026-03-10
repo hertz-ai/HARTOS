@@ -37,6 +37,8 @@ VALID_COMMAND_TYPES = frozenset({
     'agent_consent',
     'estop',
     'estop_clear',
+    'tier_promote',
+    'tier_demote',
 })
 
 
@@ -261,6 +263,10 @@ class FleetCommandService:
                 return _execute_estop(params)
             elif cmd_type == 'estop_clear':
                 return _execute_estop_clear(params)
+            elif cmd_type == 'tier_promote':
+                return _execute_tier_promote(params)
+            elif cmd_type == 'tier_demote':
+                return _execute_tier_demote(params)
             else:
                 return {'success': False, 'message': f'Unknown command: {cmd_type}'}
         except Exception as e:
@@ -505,6 +511,89 @@ def _execute_estop_clear(params: dict) -> Dict:
         os.environ.pop('HEVOLVE_HALTED', None)
         os.environ.pop('HEVOLVE_HALT_REASON', None)
         return {'success': True, 'message': f'E-stop cleared (fallback): {operator_id}'}
+
+
+def _execute_tier_promote(params: dict) -> Dict:
+    """Promote this node to a higher tier (e.g., flat → regional).
+
+    Sets HEVOLVE_NODE_TIER env var, regenerates HART node identity,
+    and flags for auto-restart so all services reload with new tier.
+    """
+    new_tier = params.get('new_tier', '')
+    if new_tier not in ('regional', 'central'):
+        return {'success': False, 'message': f'Invalid promotion tier: {new_tier}'}
+
+    # Apply env vars
+    env_vars = params.get('env_vars', {})
+    for key, value in env_vars.items():
+        if 'MASTER' not in key.upper() and 'GUARDRAIL' not in key.upper():
+            os.environ[key] = str(value)
+
+    os.environ['HEVOLVE_NODE_TIER'] = new_tier
+
+    # Regenerate HART node identity for new tier
+    try:
+        from hart_onboarding import generate_node_identity
+        central_element = os.environ.get('HART_CENTRAL_ELEMENT', '')
+        generate_node_identity(
+            tier=new_tier,
+            central_element=central_element or None,
+        )
+    except Exception as e:
+        logger.warning(f"Fleet: HART identity regeneration failed: {e}")
+
+    # Flag for auto-restart
+    if params.get('restart_required', True):
+        os.environ['HEVOLVE_RESTART_REQUESTED'] = 'all'
+        os.environ['HEVOLVE_RESTART_REASON'] = f'Promoted to {new_tier}'
+
+    logger.info(f"Fleet: node promoted to {new_tier}")
+    return {
+        'success': True,
+        'message': f'Promoted to {new_tier}. Restart flagged.',
+    }
+
+
+def _execute_tier_demote(params: dict) -> Dict:
+    """Demote this node to a lower tier (e.g., regional → flat).
+
+    Clears tier env vars, removes HART node identity for old tier,
+    and flags for auto-restart.
+    """
+    new_tier = params.get('new_tier', 'flat')
+    reason = params.get('reason', 'Demoted by central')
+
+    # Apply env vars
+    env_vars = params.get('env_vars', {})
+    for key, value in env_vars.items():
+        if 'MASTER' not in key.upper() and 'GUARDRAIL' not in key.upper():
+            os.environ[key] = str(value)
+
+    os.environ['HEVOLVE_NODE_TIER'] = new_tier
+
+    # Clear regional-specific env vars
+    os.environ.pop('HART_REGIONAL_SPIRIT', None)
+
+    # Remove HART node identity file (will regenerate as flat on restart)
+    try:
+        from hart_onboarding import _identity_path
+        path = _identity_path()
+        if os.path.isfile(path):
+            os.remove(path)
+            logger.info("Fleet: HART node identity cleared for demotion")
+    except Exception as e:
+        logger.debug(f"Fleet: HART identity clear failed: {e}")
+
+    # Flag for auto-restart
+    if params.get('restart_required', True):
+        os.environ['HEVOLVE_RESTART_REQUESTED'] = 'all'
+        os.environ['HEVOLVE_RESTART_REASON'] = f'Demoted to {new_tier}: {reason}'
+
+    logger.info(f"Fleet: node demoted to {new_tier} ({reason})")
+    return {
+        'success': True,
+        'message': f'Demoted to {new_tier}. Restart flagged. Reason: {reason}',
+    }
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -474,9 +474,168 @@ def assign_element_spirit(dimensions: Dict[str, float]) -> Tuple[str, str]:
     return element, spirit
 
 
-def build_hart_tag(element: str, spirit: str, name: str) -> str:
-    """Build the full HART tag: @element.spirit.name"""
-    return f"@{element}.{spirit}.{name}"
+def build_hart_tag(name: str, central_element: str = None,
+                   regional_spirit: str = None) -> str:
+    """Build the HART tag — encodes the network path to the user.
+
+    Tag length = network depth:
+      Central instance:  @element              (1 word)
+      Regional node:     @central.spirit        (2 words)
+      Flat user:         @central.regional.name  (3 words)
+      Standalone user:   @element.name           (2 words, no central/regional)
+    """
+    if central_element and regional_spirit:
+        # Full path: central → regional → user
+        return f"@{central_element}.{regional_spirit}.{name}"
+    elif central_element:
+        # Direct on central (no regional hop)
+        return f"@{central_element}.{name}"
+    else:
+        # Standalone (flat Nunba, no network)
+        return f"@{name}"
+
+
+def build_central_tag(element: str) -> str:
+    """Central instance identity: @element"""
+    return f"@{element}"
+
+
+def build_regional_tag(central_element: str, spirit: str) -> str:
+    """Regional node identity: @central.spirit"""
+    return f"@{central_element}.{spirit}"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# NODE IDENTITY — generated once, persisted forever (like IP addresses)
+# ═══════════════════════════════════════════════════════════════════════
+
+# Pools for node identity — distinct from user name pools
+_NODE_ELEMENTS = [
+    'ember', 'frost', 'nebula', 'iron', 'aurora', 'storm',
+    'tide', 'prism', 'ether', 'void', 'crystal', 'neon',
+    'stone', 'wind', 'mist', 'quartz', 'flare', 'drift',
+]
+
+_NODE_SPIRITS = [
+    'phoenix', 'fox', 'wolf', 'dolphin', 'hawk', 'raven',
+    'crane', 'bear', 'owl', 'stag', 'lynx', 'falcon',
+    'serpent', 'moth', 'heron', 'orca', 'mantis', 'sphinx',
+]
+
+_HART_IDENTITY_FILE = 'hart_node_identity.json'
+
+
+def _identity_path() -> str:
+    """Path to the node's persisted HART identity."""
+    data_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data')
+    os.makedirs(data_dir, exist_ok=True)
+    return os.path.join(data_dir, _HART_IDENTITY_FILE)
+
+
+def get_node_identity() -> Dict:
+    """Load the node's HART identity from disk. Returns {} if not yet generated."""
+    try:
+        path = _identity_path()
+        if os.path.isfile(path):
+            with open(path, 'r') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def generate_node_identity(tier: str, central_element: str = None,
+                           known_tags: set = None) -> Dict:
+    """Generate a unique HART identity for this node. Called once at first startup
+    or during peer discovery.
+
+    For central:  picks a unique element → @element
+    For regional: picks a unique spirit → @central.spirit
+    For flat:     no node identity needed (users get individual tags)
+
+    Args:
+        tier: 'central', 'regional', or 'flat'
+        central_element: required for regional nodes (the central they connect to)
+        known_tags: set of already-taken tag names on the network (from peer gossip)
+
+    Returns dict with node_tag, element/spirit, tier. Also persists to disk
+    and sets env vars for downstream use.
+    """
+    known_tags = known_tags or set()
+
+    # Check if already generated
+    existing = get_node_identity()
+    if existing and existing.get('node_tag'):
+        # Re-apply env vars (process may have restarted)
+        _apply_identity_env(existing)
+        return existing
+
+    identity = {'tier': tier, 'generated_at': datetime.utcnow().isoformat()}
+
+    if tier == 'central':
+        # Pick a unique element
+        available = [e for e in _NODE_ELEMENTS if e not in known_tags]
+        if not available:
+            # All taken — append short hash for uniqueness
+            suffix = hashlib.sha256(str(time.time()).encode()).hexdigest()[:4]
+            element = f"{random.choice(_NODE_ELEMENTS)}{suffix}"
+        else:
+            element = random.choice(available)
+
+        identity['element'] = element
+        identity['node_tag'] = build_central_tag(element)
+
+    elif tier == 'regional':
+        if not central_element:
+            logger.warning("Regional node needs central_element to generate identity")
+            return {}
+
+        # Pick a unique spirit (unique among regionals of this central)
+        taken_spirits = {t.split('.')[-1] for t in known_tags
+                        if t.startswith(f'@{central_element}.')}
+        available = [s for s in _NODE_SPIRITS if s not in taken_spirits]
+        if not available:
+            suffix = hashlib.sha256(str(time.time()).encode()).hexdigest()[:4]
+            spirit = f"{random.choice(_NODE_SPIRITS)}{suffix}"
+        else:
+            spirit = random.choice(available)
+
+        identity['central_element'] = central_element
+        identity['spirit'] = spirit
+        identity['node_tag'] = build_regional_tag(central_element, spirit)
+
+    else:
+        # Flat/standalone — no node-level tag needed
+        identity['node_tag'] = ''
+        _persist_identity(identity)
+        return identity
+
+    # Persist and set env vars
+    _persist_identity(identity)
+    _apply_identity_env(identity)
+
+    logger.info(f"HART node identity generated: {identity['node_tag']} (tier={tier})")
+    return identity
+
+
+def _persist_identity(identity: Dict):
+    """Save node identity to disk — this is permanent."""
+    try:
+        path = _identity_path()
+        with open(path, 'w') as f:
+            json.dump(identity, f, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to persist HART node identity: {e}")
+
+
+def _apply_identity_env(identity: Dict):
+    """Set env vars so generate_hart_name() and seal_name() pick up the topology."""
+    if identity.get('element'):
+        os.environ['HART_CENTRAL_ELEMENT'] = identity['element']
+    if identity.get('central_element'):
+        os.environ['HART_CENTRAL_ELEMENT'] = identity['central_element']
+    if identity.get('spirit'):
+        os.environ['HART_REGIONAL_SPIRIT'] = identity['spirit']
 
 
 LOCALE_FLAGS = {
@@ -580,7 +739,12 @@ def generate_hart_name(
 
     Returns dict with 'name', 'emoji_combo', 'dimensions', 'candidates'.
     """
-    existing_names = existing_names or set()
+    # Pre-fetch all sealed names from DB for collision prevention
+    if existing_names is None:
+        try:
+            existing_names = HARTNameRegistry.get_all_names()
+        except Exception:
+            existing_names = set()
     dimensions = _merge_dimensions(passion_key, escape_key)
 
     # Build the emotional profile for the LLM
@@ -594,6 +758,23 @@ def generate_hart_name(
     }
     lang_name = lang_names.get(language, 'English')
 
+    # Real words/concepts from each language that make great anime-style names
+    lang_word_hints = {
+        'en': 'English/Celtic words like: ember, wren, fable, rune, vale, lark, ashen, gale, thistle, briar',
+        'ta': 'Tamil words like: aran (king), mathi (moon), kavi (poet), vaan (sky), nila (moon), kal (stone), sol (word), theni (honey), mazhai (rain), uyir (soul)',
+        'hi': 'Hindi/Sanskrit words like: vayu (wind), agni (fire), kiran (ray), neel (blue), dhara (stream), tara (star), rishi (sage), arya (noble), jyoti (light), pavan (breeze)',
+        'es': 'Spanish words like: alba (dawn), cielo (sky), rio (river), brisa (breeze), sol (sun), llama (flame), sierra (mountain), luna (moon), onda (wave), nieve (snow)',
+        'fr': 'French words like: ciel (sky), fleur (flower), reve (dream), lune (moon), ombre (shadow), brise (breeze), etoile (star), aube (dawn), givre (frost), eclat (spark)',
+        'de': 'German words like: sturm (storm), stein (stone), feuer (fire), wald (forest), nebel (fog), stern (star), regen (rain), erde (earth), blitz (lightning), asche (ash)',
+        'ja': 'Japanese words like: sora (sky), kaze (wind), hikari (light), tsuki (moon), yume (dream), ren (lotus), kumo (cloud), hoshi (star), mizu (water), akira (bright)',
+        'ko': 'Korean words like: haneul (sky), baram (wind), byeol (star), kkum (dream), bom (spring), nara (country), dari (bridge), sori (sound), nuri (world), aram (beauty)',
+        'zh': 'Chinese words like: feng (wind), yun (cloud), ling (spirit), xing (star), lan (orchid), yan (flame), ming (bright), shan (mountain), hai (sea), yue (moon)',
+        'pt': 'Portuguese words like: brasa (ember), ceu (sky), vento (wind), onda (wave), luar (moonlight), aurora (dawn), selva (jungle), pedra (stone), chama (flame), rio (river)',
+        'ar': 'Arabic words like: qamar (moon), nour (light), sahar (dawn), rimal (sand), bahr (sea), layl (night), sama (sky), ward (rose), amal (hope), narr (fire)',
+        'ru': 'Russian words like: ogon (fire), veter (wind), noch (night), svet (light), grom (thunder), tuman (fog), iskra (spark), luna (moon), zarya (dawn), led (ice)',
+    }
+    word_hints = lang_word_hints.get(language, 'beautiful short words from their native language')
+
     # The prompt — every word matters here too
     generation_prompt = f"""You are naming a human. This is a gift — their permanent identity on a platform called Nunba.
 
@@ -603,20 +784,28 @@ This person:
 - Their language: {lang_name}
 {f'- They said (in their own words): "{voice_transcript}"' if voice_transcript else ''}
 
-Generate exactly 5 name candidates. Each name MUST be:
-- ONE word, lowercase, 1-3 syllables
-- Beautiful to say aloud in {lang_name}
-- Evocative — it should feel like it means something deep, even if invented
-- NOT a common English first name (no "kai", "luna", "nova")
-- NOT a brand, company, or product name
-- NOT an existing common word in any language
-- Phonetically soft and memorable — the kind of word that lingers
+Generate exactly 5 name candidates. The name style: take a REAL word from {lang_name} that connects to this person's personality, then style it like an anime character name — short, punchy, memorable, the kind of name you'd hear a protagonist called in a Ghibli or shonen anime.
 
-Think of names that feel like: a whisper in a dream, a star you discovered,
-a word from a language that doesn't exist yet but should.
+How anime names work (follow this pattern):
+- "Hinata" = Japanese for "sunny place" — a real word, used as-is
+- "Ichigo" = "strawberry" — a real word that sounds legendary in context
+- "Naruto" = a fish cake spiral — mundane word made iconic by a character
+
+Do the SAME for {lang_name}. Pick real {lang_name} words related to this person's passions and reshape minimally (or use as-is if they already sound cool).
+
+{lang_name} words to draw from: {word_hints}
+
+Rules:
+- ONE word, lowercase, 1-4 syllables
+- Must be a real {lang_name} word OR a minimal stylization of one (add/drop one syllable max)
+- GENDER-NEUTRAL only — use nature words, elements, concepts, celestial objects, weather, terrain. In {lang_name}, many nouns carry grammatical gender — pick words that sound neutral when used as a name (e.g., Tamil "mazhai" (rain) is neutral, "uyir" (soul) is neutral, avoid words that are culturally recognized as only male or only female names)
+- Easy to remember and say aloud — if someone hears it once, they remember it
+- NOT a common first name in any language
+- Must feel like it MEANS something (because it does)
+- The full identity will be a three-word tag like @ember.fox.hikari — so the name can be a common word since the tag provides uniqueness
 
 Return ONLY a JSON array of exactly 5 lowercase strings. Nothing else.
-Example: ["zephira", "lumara", "kaithe", "solenne", "ravani"]"""
+Example format: ["kaze", "hikari", "sora", "ren", "tsuki"]"""
 
     candidates = []
 
@@ -648,11 +837,17 @@ Example: ["zephira", "lumara", "kaithe", "solenne", "ravani"]"""
     emoji_combo = generate_emoji_combo(locale, dimensions)
     element, spirit = assign_element_spirit(dimensions)
 
+    # Detect network topology for tag construction
+    central_element = os.environ.get('HART_CENTRAL_ELEMENT')  # Set by central instance
+    regional_spirit = os.environ.get('HART_REGIONAL_SPIRIT')  # Set by regional node
+
+    hart_tag = build_hart_tag(chosen, central_element, regional_spirit)
+
     return {
         'name': chosen,
         'element': element,
         'spirit': spirit,
-        'hart_tag': build_hart_tag(element, spirit, chosen),
+        'hart_tag': hart_tag,
         'emoji_combo': emoji_combo,
         'dimensions': dimensions,
         'candidates': candidates[:5],
@@ -677,28 +872,28 @@ def _fallback_names(dimensions: Dict, existing: set) -> List[str]:
     """
     pools = {
         'creative': [
-            'aethon', 'lumira', 'vesper', 'ondine', 'calyx',
-            'pyralis', 'selene', 'aeris', 'thalion', 'vespera',
+            'hikari', 'kavi', 'reve', 'uyir', 'eclat',
+            'chama', 'iskra', 'lingen', 'flamar', 'hoshi',
         ],
         'curious': [
-            'quillon', 'eridani', 'solen', 'meridia', 'cyren',
-            'althen', 'velaris', 'nexara', 'orphiel', 'zenith',
+            'akira', 'nouri', 'soren', 'mathi', 'veter',
+            'lingen', 'byeol', 'sahari', 'xingel', 'kiran',
         ],
         'builder': [
-            'forgis', 'synthar', 'valdren', 'cortex', 'axiom',
-            'kepler', 'tessera', 'archon', 'praxis', 'helix',
+            'agni', 'blitz', 'forgen', 'stein', 'tessari',
+            'gromon', 'kal', 'ferros', 'praxis', 'arcan',
         ],
         'social': [
-            'solara', 'kindrel', 'auren', 'hearthen', 'luminos',
-            'amaris', 'elowen', 'seraph', 'coventri', 'brinley',
+            'amara', 'solari', 'auren', 'theni', 'nouri',
+            'wardel', 'brinsa', 'kindra', 'lumis', 'dalla',
         ],
         'grounded': [
-            'terryn', 'ashvale', 'rowan', 'bracken', 'thorin',
-            'ironbark', 'cairn', 'deepwell', 'stonelei', 'oakmere',
+            'shan', 'rowan', 'bracken', 'cairn', 'oakley',
+            'terryn', 'valen', 'ashven', 'selva', 'pedran',
         ],
         'introspective': [
-            'reverie', 'solace', 'whisper', 'stillwen', 'haven',
-            'eventide', 'dusklyn', 'mistveil', 'quietis', 'dreamar',
+            'yume', 'reveri', 'solace', 'mazhai', 'haven',
+            'tuman', 'dusken', 'layli', 'stillam', 'ombre',
         ],
     }
 
@@ -808,12 +1003,17 @@ class HARTNameRegistry:
                     element, spirit = assign_element_spirit(dimensions)
 
                 # Store HART data in settings JSON
+                # Tag uses network topology (env vars), not personality dimensions
+                central_el = os.environ.get('HART_CENTRAL_ELEMENT')
+                regional_sp = os.environ.get('HART_REGIONAL_SPIRIT')
+                hart_tag = build_hart_tag(clean, central_el, regional_sp)
+
                 settings = user.settings or {}
                 settings['hart'] = {
                     'name': clean,
                     'element': element,
                     'spirit': spirit,
-                    'hart_tag': build_hart_tag(element, spirit, clean),
+                    'hart_tag': hart_tag,
                     'emoji_combo': emoji_combo,
                     'dimensions': dimensions,
                     'language': language,

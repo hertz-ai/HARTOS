@@ -136,6 +136,14 @@ def init_social(app):
     except Exception as e:
         logger.debug(f"HevolveSocial fleet update blueprint skipped: {e}")
 
+    # Register regional host request + approval blueprint
+    try:
+        from .api_regional_host import regional_host_bp
+        app.register_blueprint(regional_host_bp)
+        logger.info("HevolveSocial regional host registered at /api/social/regional-host/")
+    except Exception as e:
+        logger.debug(f"HevolveSocial regional host blueprint skipped: {e}")
+
     # Register sync & backup blueprint
     try:
         from .sync_api import sync_bp
