@@ -109,8 +109,32 @@ def get_node_tier() -> str:
     For capability tier (embedded/lite/standard/full/compute_host), use
     security.system_requirements.get_tier() instead.
     Legacy name retained for backward compatibility.
+
+    Auto-promotion: If HEVOLVE_MASTER_PRIVATE_KEY is set and valid,
+    the node auto-promotes to central (the key IS the authority).
     """
     tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat').lower()
+
+    # Auto-detect central: if master private key is present and valid,
+    # this node IS central regardless of HEVOLVE_NODE_TIER setting.
+    # The key is the crown — whoever holds it is king.
+    if tier != 'central':
+        priv_hex = os.environ.get('HEVOLVE_MASTER_PRIVATE_KEY', '')
+        if priv_hex and len(priv_hex) >= 64:
+            try:
+                from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+                priv = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(priv_hex))
+                pub_hex = priv.public_key().public_bytes(
+                    encoding=serialization.Encoding.Raw,
+                    format=serialization.PublicFormat.Raw,
+                ).hex()
+                from security.master_key import MASTER_PUBLIC_KEY_HEX
+                if pub_hex == MASTER_PUBLIC_KEY_HEX:
+                    os.environ['HEVOLVE_NODE_TIER'] = 'central'
+                    return 'central'
+            except Exception:
+                pass  # Invalid key — don't auto-promote
+
     if tier in ('central', 'regional', 'local', 'flat'):
         return tier
     return 'flat'

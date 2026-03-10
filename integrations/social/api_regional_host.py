@@ -7,6 +7,10 @@ POST /api/social/regional-host/approve     - Steward approves
 POST /api/social/regional-host/reject      — Steward rejects
 POST /api/social/regional-host/revoke      — Steward revokes
 GET  /api/social/regional-host/status      — User checks their request status
+GET  /api/social/regional-host/capacity    — Region capacity metrics (public)
+GET  /api/social/regional-host/rebalance   — Elastic rebalance suggestions (admin)
+GET  /api/social/regional-host/scaling     — Horizontal scaling check (admin)
+GET  /api/social/regional-host/eligibility — User eligibility check
 """
 import logging
 from flask import Blueprint, request, jsonify, g
@@ -206,6 +210,148 @@ def check_status():
         return jsonify(result), 200
     except Exception as e:
         logger.error(f"Status check error: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+    finally:
+        db.close()
+
+
+@regional_host_bp.route('/capacity', methods=['GET'])
+def region_capacity():
+    """Get capacity metrics for a specific region or all regions."""
+    db = get_db()
+    try:
+        region_name = request.args.get('region', '')
+        from .regional_host_service import RegionalHostService
+
+        if region_name:
+            result = RegionalHostService.get_region_capacity(db, region_name)
+        else:
+            result = {
+                'regions': RegionalHostService.get_all_region_capacities(db),
+            }
+        return jsonify(result), 200
+    except Exception as e:
+        logger.error(f"Capacity check error: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+    finally:
+        db.close()
+
+
+@regional_host_bp.route('/rebalance', methods=['GET'])
+def suggest_rebalance():
+    """Get elastic rebalancing suggestions (steward dashboard)."""
+    db = get_db()
+    try:
+        user_id = _get_authenticated_user_id()
+        if not _require_admin(db, user_id):
+            return jsonify({'error': 'Admin access required'}), 403
+
+        from .regional_host_service import RegionalHostService
+        result = RegionalHostService.suggest_rebalance(db)
+        return jsonify(result), 200
+    except Exception as e:
+        logger.error(f"Rebalance suggestion error: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+    finally:
+        db.close()
+
+
+@regional_host_bp.route('/scaling', methods=['GET'])
+def scaling_check():
+    """Check if any regions need horizontal scaling."""
+    db = get_db()
+    try:
+        user_id = _get_authenticated_user_id()
+        if not _require_admin(db, user_id):
+            return jsonify({'error': 'Admin access required'}), 403
+
+        from .regional_host_service import RegionalHostService
+        result = RegionalHostService.check_scaling_needed(db)
+        return jsonify(result), 200
+    except Exception as e:
+        logger.error(f"Scaling check error: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+    finally:
+        db.close()
+
+
+@regional_host_bp.route('/eligibility', methods=['GET'])
+def check_eligibility():
+    """Check if user meets minimum requirements to request regional host.
+
+    Returns compute tier, trust score, and minimum requirements so the
+    frontend can show requirements and disable the button if not met.
+    """
+    db = get_db()
+    try:
+        user_id = _get_authenticated_user_id() or request.args.get('user_id', '')
+        if not user_id:
+            return jsonify({'error': 'Authentication required'}), 401
+
+        # Get compute tier (server-side detection)
+        compute_tier = 'UNKNOWN'
+        compute_info = {}
+        try:
+            from security.system_requirements import detect_hardware, classify_tier
+            hw = detect_hardware()
+            compute_tier = classify_tier(hw)
+            compute_info = {
+                'cpu_cores': hw.get('cpu_cores', 0),
+                'ram_gb': round(hw.get('ram_bytes', 0) / (1024**3), 1),
+                'gpu_count': hw.get('gpu_count', 0),
+                'gpu_name': hw.get('gpu_name', ''),
+            }
+        except Exception:
+            pass
+
+        # Get trust score
+        trust_score = 0.0
+        try:
+            from .rating_service import RatingService
+            ts = RatingService.get_trust_score(db, str(user_id))
+            if ts:
+                trust_score = ts.get('composite_trust', 0.0)
+        except Exception:
+            pass
+
+        # Check existing request
+        existing_request = None
+        try:
+            from .regional_host_service import RegionalHostService
+            existing_request = RegionalHostService.get_request_status(db, str(user_id))
+        except Exception:
+            pass
+
+        # Tier ranking
+        tier_rank = {'OBSERVER': 0, 'BASIC': 1, 'STANDARD': 2, 'ADVANCED': 3, 'COMPUTE_HOST': 4}
+        current_rank = tier_rank.get(compute_tier, -1)
+        min_rank = tier_rank.get('STANDARD', 2)
+
+        meets_compute = current_rank >= min_rank
+        meets_trust = trust_score >= 2.5
+        eligible = meets_compute and meets_trust
+
+        return jsonify({
+            'eligible': eligible,
+            'compute_tier': compute_tier,
+            'compute_info': compute_info,
+            'trust_score': round(trust_score, 2),
+            'requirements': {
+                'min_compute_tier': 'STANDARD',
+                'min_trust_score': 2.5,
+                'compute_tiers_ranked': ['OBSERVER', 'BASIC', 'STANDARD', 'ADVANCED', 'COMPUTE_HOST'],
+                'compute_description': {
+                    'STANDARD': '4+ CPU cores, 8+ GB RAM',
+                    'ADVANCED': '8+ CPU cores, 16+ GB RAM, GPU recommended',
+                    'COMPUTE_HOST': '16+ cores, 32+ GB RAM, dedicated GPU',
+                },
+            },
+            'meets_compute': meets_compute,
+            'meets_trust': meets_trust,
+            'existing_request': existing_request,
+        }), 200
+    except Exception as e:
+        logger.error(f"Eligibility check error: {e}")
         return jsonify({'error': 'Internal server error'}), 500
     finally:
         db.close()
