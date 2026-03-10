@@ -32,7 +32,7 @@
     "regional": {
       "description": "HART OS regional host (systemd services)",
       "entry_point": "/opt/hart/venv/bin/python langchain_gpt_api.py",
-      "database": "sqlite_or_postgres",
+      "database": "mysql",
       "certificate_tier": "regional",
       "config_file": "/etc/hart/hart.env",
       "default_port": 6777,
@@ -41,7 +41,7 @@
     "central": {
       "description": "Central authority node",
       "entry_point": "/opt/hart/venv/bin/python langchain_gpt_api.py",
-      "database": "postgres",
+      "database": "mysql",
       "certificate_tier": "central",
       "config_file": "/etc/hart/hart.env",
       "default_port": 6777,

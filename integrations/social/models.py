@@ -38,8 +38,8 @@ except ImportError:
         return _html_module.escape(text)
 
 # ── Database URL resolution ──────────────────────────────────
-# Priority: HEVOLVE_DB_URL > HEVOLVE_DB_PATH > SOCIAL_DB_PATH > auto-detect
-_DB_URL_ENV = os.environ.get('HEVOLVE_DB_URL')
+# Priority: HEVOLVE_DB_URL > DATABASE_URL > HEVOLVE_DB_PATH > SOCIAL_DB_PATH > auto-detect
+_DB_URL_ENV = os.environ.get('HEVOLVE_DB_URL') or os.environ.get('DATABASE_URL')
 _DB_PATH_ENV = os.environ.get('HEVOLVE_DB_PATH') or os.environ.get('SOCIAL_DB_PATH')
 
 if _DB_URL_ENV:
@@ -88,16 +88,27 @@ def get_engine():
                 os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
 
             if _is_sqlite:
-                engine_kwargs = dict(
-                    echo=False,
-                    future=True,
-                    connect_args={"check_same_thread": False},
-                    pool_pre_ping=True,
-                    pool_recycle=3600,
-                )
                 if _is_memory:
                     from sqlalchemy.pool import StaticPool
-                    engine_kwargs['poolclass'] = StaticPool
+                    engine_kwargs = dict(
+                        echo=False,
+                        future=True,
+                        connect_args={"check_same_thread": False},
+                        poolclass=StaticPool,
+                        pool_pre_ping=True,
+                    )
+                else:
+                    # File-based SQLite: NullPool — each thread gets its own
+                    # short-lived connection. QueuePool holds connections open
+                    # across threads → "database is locked" under concurrent
+                    # daemon writes.
+                    from sqlalchemy.pool import NullPool
+                    engine_kwargs = dict(
+                        echo=False,
+                        future=True,
+                        connect_args={"check_same_thread": False},
+                        poolclass=NullPool,
+                    )
             else:
                 # MySQL / PostgreSQL (via HEVOLVE_DB_URL)
                 engine_kwargs = dict(
@@ -110,18 +121,17 @@ def get_engine():
 
             _engine = create_engine(DB_URL, **engine_kwargs)
 
-            # Enable WAL mode for file-based SQLite (safe concurrent access)
+            # Enable WAL mode for file-based SQLite
+            # WAL allows concurrent reads + one writer without blocking readers.
+            # busy_timeout=3000 (3s) — fail fast rather than blocking daemon threads
+            # for 15-30s which triggers watchdog restarts.
             if _is_sqlite and not _is_memory:
                 @event.listens_for(_engine, "connect")
                 def _set_sqlite_wal(dbapi_connection, connection_record):
                     cursor = dbapi_connection.cursor()
-                    cursor.execute("PRAGMA busy_timeout=15000")
-                    result = cursor.execute("PRAGMA journal_mode=WAL").fetchone()
-                    if result and result[0].lower() != 'wal':
-                        import logging
-                        logging.getLogger('hevolve_social').warning(
-                            f"WAL mode not enabled (got {result[0]}). "
-                            f"Concurrent writes may corrupt data.")
+                    cursor.execute("PRAGMA journal_mode=WAL")
+                    cursor.execute("PRAGMA busy_timeout=3000")
+                    cursor.execute("PRAGMA synchronous=NORMAL")
                     cursor.close()
     return _engine
 

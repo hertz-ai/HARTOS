@@ -1,7 +1,7 @@
 # HART OS Distributed Multi-Node Test
 # Usage: docker-compose -f deploy/distributed/docker-compose.distributed.yml up
 #
-# Spins up 3 HART nodes + shared Redis for distributed task execution.
+# Spins up 3 HART nodes + shared MySQL + Redis for distributed task execution.
 # Node 1 = central (submits goals), Node 2+3 = workers (claim + execute).
 #
 # Test: POST a goal to :6777, watch workers claim and execute it.
@@ -15,7 +15,7 @@ x-hart-common: &hart-common
   environment: &hart-env
     REDIS_HOST: redis
     REDIS_PORT: "6379"
-    HEVOLVE_DB_PATH: /var/lib/hart/hart.db
+    HEVOLVE_DB_URL: mysql+mysqlconnector://hart:hart_distributed@mysql:3306/hart_distributed
     HEVOLVE_AGENT_ENGINE_ENABLED: "true"
     HEVOLVE_AGENT_POLL_INTERVAL: "10"
     HEVOLVE_WORKER_POLL_INTERVAL: "5"
@@ -25,11 +25,36 @@ x-hart-common: &hart-common
   depends_on:
     redis:
       condition: service_healthy
+    mysql:
+      condition: service_healthy
   restart: on-failure
   networks:
     - hivenet
 
 services:
+  # Shared MySQL for all nodes (central + workers share one DB)
+  mysql:
+    image: mysql:8.0
+    container_name: hart-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_USER: hart
+      MYSQL_PASSWORD: hart_distributed
+      MYSQL_DATABASE: hart_distributed
+      MYSQL_ROOT_PASSWORD: hart_root_distributed
+    volumes:
+      - mysql-data:/var/lib/mysql
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "hart", "-phart_distributed"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - hivenet
+
   # Shared Redis for distributed task coordination
   redis:
     image: redis:7-alpine
@@ -91,3 +116,7 @@ services:
 networks:
   hivenet:
     driver: bridge
+
+volumes:
+  mysql-data:
+    driver: local
