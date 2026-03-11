@@ -49,6 +49,7 @@ class RedisRateLimiter:
         'tts_speak': (20, 60),              # 20 TTS speak requests per 60 seconds
         'tts_clone': (5, 3600),             # 5 voice clones per hour
         'civic_sentinel': (20, 60),      # 20 civic sentinel ops per 60 seconds
+        'autoresearch': (5, 3600),       # 5 autoresearch sessions per hour
         'wifi': (30, 60),                # 30 wifi operations per 60 seconds
         'vpn': (20, 60),                 # 20 vpn operations per 60 seconds
         'trash': (30, 60),               # 30 trash operations per 60 seconds

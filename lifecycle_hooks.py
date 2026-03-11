@@ -36,8 +36,28 @@ def get_registered_ledger(user_prompt: str) -> Optional[Any]:
     with _state_lock:
         return _ledger_registry.get(user_prompt)
 
+def _extract_ownership_from_prompt(user_prompt: str):
+    """Extract user_id and prompt_id from the user_prompt key (format: {user_id}_{prompt_id})."""
+    parts = user_prompt.split('_', 1)
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    return user_prompt, None
+
+
+def _get_node_id():
+    """Get this machine's hostname for task ownership — cached at module level."""
+    import platform
+    return platform.node()
+
+
 def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState'):
-    """Auto-sync state change to ledger if registered."""
+    """Auto-sync state change to ledger if registered.
+
+    Wires v2.0 ledger features using KNOWN stateful variables in scope:
+    - Ownership: claim on IN_PROGRESS, release on terminal (uses user_prompt, hostname)
+    - Heartbeat: every state change records liveness
+    - Budget/SLA: checked on IN_PROGRESS entry, flagged if breached
+    """
     ledger = _ledger_registry.get(user_prompt)
     if ledger is None:
         return  # No ledger registered, skip sync
@@ -49,11 +69,13 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState')
         if task_id not in ledger.tasks:
             return  # Task doesn't exist in ledger
 
-        # Map ActionState to LedgerTaskStatus
+        task = ledger.tasks[task_id]
+
+        # Map ActionState to LedgerTaskStatus — complete 1:1 coverage
         STATE_MAP = {
             ActionState.ASSIGNED: LedgerTaskStatus.PENDING,
             ActionState.IN_PROGRESS: LedgerTaskStatus.IN_PROGRESS,
-            ActionState.STATUS_VERIFICATION_REQUESTED: LedgerTaskStatus.VALIDATING,
+            ActionState.STATUS_VERIFICATION_REQUESTED: LedgerTaskStatus.IN_PROGRESS,
             ActionState.COMPLETED: LedgerTaskStatus.COMPLETED,
             ActionState.PENDING: LedgerTaskStatus.BLOCKED,
             ActionState.ERROR: LedgerTaskStatus.FAILED,
@@ -62,12 +84,75 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState')
             ActionState.RECIPE_REQUESTED: LedgerTaskStatus.IN_PROGRESS,
             ActionState.RECIPE_RECEIVED: LedgerTaskStatus.COMPLETED,
             ActionState.TERMINATED: LedgerTaskStatus.COMPLETED,
+            # VLM / physical action states — still active execution
+            ActionState.EXECUTING_MOTION: LedgerTaskStatus.IN_PROGRESS,
+            ActionState.SENSOR_CONFIRM: LedgerTaskStatus.IN_PROGRESS,
+            # Consent / approval — task is BLOCKED until user responds
+            ActionState.PREVIEW_PENDING: LedgerTaskStatus.BLOCKED,
+            ActionState.PREVIEW_APPROVED: LedgerTaskStatus.IN_PROGRESS,
         }
 
         ledger_status = STATE_MAP.get(state)
         if ledger_status:
-            ledger.update_task_status(task_id, ledger_status, reason=f"ActionState: {state.value}")
-            logger.info(f"📋 Auto-synced {task_id} → {ledger_status.value} (ActionState: {state.value})")
+            # === OWNERSHIP: claim on IN_PROGRESS, release on terminal ===
+            if ledger_status == LedgerTaskStatus.IN_PROGRESS and not task.is_owned:
+                user_id, prompt_id = _extract_ownership_from_prompt(user_prompt)
+                task.claim(
+                    node_id=_get_node_id(),
+                    user_id=user_id,
+                    prompt_id=prompt_id,
+                )
+                logger.info(f"Claimed ownership of {task_id} for {user_prompt}")
+
+            # Handle PAUSED/BLOCKED → IN_PROGRESS via task.resume()
+            if (ledger_status == LedgerTaskStatus.IN_PROGRESS
+                    and task.status in (LedgerTaskStatus.PAUSED, LedgerTaskStatus.BLOCKED)):
+                task.resume(reason=f"Resumed via ActionState.{state.value}")
+                task.blocked_reason = None  # Clear blocked reason on resume
+                ledger.save()
+            else:
+                ledger.update_task_status(task_id, ledger_status, reason=f"ActionState: {state.value}")
+
+            # === BLOCKED REASON: set specific reason based on ActionState source ===
+            if ledger_status == LedgerTaskStatus.BLOCKED:
+                if state == ActionState.PREVIEW_PENDING:
+                    task.set_blocked_reason('approval_required')
+                elif state == ActionState.FALLBACK_REQUESTED:
+                    task.set_blocked_reason('input_required')
+                elif state == ActionState.PENDING:
+                    task.set_blocked_reason('dependency')
+
+            # === HEARTBEAT: every state change records liveness ===
+            task.heartbeat()
+
+            # === SLA CHECK: flag breach, post status request, emit notification ===
+            if task.is_sla_breached() and not task.sla_breached:
+                task.mark_sla_breached()
+                task.post_status("SLA breached — requesting status update from agent")
+                logger.warning(f"SLA breached for {task_id}")
+                try:
+                    from core.platform.events import emit_event
+                    emit_event('task.sla_breached', {
+                        'task_id': task_id,
+                        'prompt': user_prompt,
+                        'sla_target_s': task.sla_target_s,
+                        'deadline': task.deadline,
+                        'action': 'status_request',
+                    })
+                except Exception:
+                    pass
+
+            # === RELEASE OWNERSHIP on terminal states ===
+            if LedgerTaskStatus.is_terminal_state(ledger_status) and task.is_owned:
+                # Record time spent using known started_at from scope
+                if task.started_at:
+                    from datetime import datetime as _dt
+                    elapsed = (_dt.now() - _dt.fromisoformat(task.started_at)).total_seconds()
+                    task.record_spend(time_s=elapsed)
+                task.release()
+                logger.info(f"Released ownership of {task_id}")
+
+            logger.info(f"Auto-synced {task_id} -> {ledger_status.value} (ActionState: {state.value})")
     except Exception as e:
         logger.error(f"Failed to auto-sync to ledger: {e}", exc_info=True)
 
@@ -97,6 +182,47 @@ def _get_ledger_task_status():
     """Lazy import to avoid circular dependencies"""
     from agent_ledger import TaskStatus as LedgerTaskStatus
     return LedgerTaskStatus
+
+
+def block_for_user_input(user_prompt: str, action_id: int, reason: str = "Waiting for user input"):
+    """Block a task in the ledger when the agent needs user consent/input.
+
+    Call this when send_message_to_user is invoked and the action's
+    can_perform_without_user_input == "no". The task transitions to BLOCKED
+    with BlockedReason.INPUT_REQUIRED until the user responds.
+    """
+    ledger = _ledger_registry.get(user_prompt)
+    if not ledger:
+        return
+    LedgerTaskStatus = _get_ledger_task_status()
+    task_id = f"action_{action_id}"
+    task = ledger.tasks.get(task_id)
+    if not task or task.status != LedgerTaskStatus.IN_PROGRESS:
+        return
+    task.block(reason)
+    task.set_blocked_reason('input_required')
+    ledger.save()
+    logger.info(f"Blocked {task_id} for user input: {reason}")
+
+
+def resume_from_user_input(user_prompt: str, action_id: int, reason: str = "User responded"):
+    """Resume a task that was blocked waiting for user input.
+
+    Call this when the user responds to a send_message_to_user request
+    or when PREVIEW_APPROVED is received.
+    """
+    ledger = _ledger_registry.get(user_prompt)
+    if not ledger:
+        return
+    LedgerTaskStatus = _get_ledger_task_status()
+    task_id = f"action_{action_id}"
+    task = ledger.tasks.get(task_id)
+    if not task or task.status != LedgerTaskStatus.BLOCKED:
+        return
+    task.resume(reason)
+    task.blocked_reason = None
+    ledger.save()
+    logger.info(f"Resumed {task_id} from user input: {reason}")
 
 # Add new states to ActionState enum:
 class FlowState(Enum):
@@ -931,16 +1057,23 @@ def sync_action_state_to_ledger(
             return False
 
         # Get current ledger status to avoid unnecessary updates
-        current_ledger_status = ledger.tasks[task_id].status
+        task = ledger.tasks[task_id]
+        current_ledger_status = task.status
         if current_ledger_status == ledger_status:
             return True  # Already in correct state
 
-        # Update ledger
-        ledger.update_task_status(
-            task_id,
-            ledger_status,
-            reason=f"Synced from ActionState.{state.value}"
-        )
+        # Handle transitions that need Task methods instead of raw status update:
+        # PAUSED/BLOCKED → IN_PROGRESS must go through task.resume()
+        if (ledger_status == LedgerTaskStatus.IN_PROGRESS
+                and current_ledger_status in (LedgerTaskStatus.PAUSED, LedgerTaskStatus.BLOCKED)):
+            task.resume(reason=f"Resumed via ActionState.{state.value}")
+            ledger.save()
+        else:
+            ledger.update_task_status(
+                task_id,
+                ledger_status,
+                reason=f"Synced from ActionState.{state.value}"
+            )
         logger.debug(f"Synced {task_id}: ActionState.{state.value} → LedgerTaskStatus.{ledger_status.value}")
         return True
 
