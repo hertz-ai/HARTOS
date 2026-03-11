@@ -101,7 +101,7 @@ class ActionExecutionStatus(Enum):
     SCHEDULED = "SCHEDULED"
     EXECUTING = "EXECUTING"
     TIMEOUT = "TIMEOUT"
-    COMPELETED = "COMPELETED"
+    COMPLETED = "COMPLETED"
     ERROR = "ERROR"
 
 class TaskNames(Enum):
@@ -3115,7 +3115,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                         f"Cannot access recipe for current action {user_tasks[user_prompt].current_action}")
                     continue
 
-                if user_tasks[user_prompt].actions[user_tasks[user_prompt].current_action]['can_perform_without_user_input'] == 'yes':
+                if user_tasks[user_prompt].actions[user_tasks[user_prompt].current_action - 1]['can_perform_without_user_input'] == 'yes':
                     current_app.logger.info('GOT can_perform_without_user_input as true')
                     message = 'You should complete this task independently. Feel free to make reasonable assumptions where necessary'
                     helper.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)

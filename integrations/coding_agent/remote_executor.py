@@ -188,13 +188,14 @@ class RemoteDesktopExecutor:
 
         # DLP — scan for PII before sending to remote
         try:
-            from security.dlp_engine import check_outbound
-            result = check_outbound(command)
-            if result and result.get('blocked'):
+            from security.dlp_engine import get_dlp_engine
+            dlp = get_dlp_engine()
+            allowed, reason = dlp.check_outbound(command)
+            if not allowed:
                 return {
                     'success': False,
                     'output': '',
-                    'error': f'DLP blocked: {result.get("reason", "PII detected")}',
+                    'error': f'DLP blocked: {reason or "PII detected"}',
                 }
         except ImportError:
             pass
