@@ -4905,7 +4905,7 @@ def get_prompts():
                             'is_active': data.get('status', '') == 'completed',
                             'user_id': creator or req_user_id,
                             'has_recipe': os.path.exists(
-                                os.path.join(prompts_dir, f'{pid}_0_recipe.json')),
+                                os.path.join(PROMPTS_DIR, f'{pid}_0_recipe.json')),
                             'flow_count': len(data.get('flows', [])),
                             'source': 'local',
                         })
