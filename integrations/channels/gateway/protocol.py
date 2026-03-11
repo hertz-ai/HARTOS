@@ -146,7 +146,11 @@ class GatewayConfig:
         # Default to volume-mounted data directory
         import sys as _sys
         if os.environ.get('NUNBA_BUNDLED') or getattr(_sys, 'frozen', False):
-            _default = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data', 'gateway')
+            try:
+                from core.platform_paths import get_agent_data_dir
+                _default = os.path.join(get_agent_data_dir(), 'gateway')
+            except ImportError:
+                _default = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data', 'gateway')
         elif os.path.exists("/app"):
             _default = "/app/data/gateway"
         else:

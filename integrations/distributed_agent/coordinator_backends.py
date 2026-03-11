@@ -355,8 +355,12 @@ def _create_inmemory_backend(agent_id: str):
         if db_path and db_path != ':memory:' and os.path.isabs(db_path):
             storage_dir = os.path.join(os.path.dirname(db_path), 'distributed_tasks')
         else:
-            # Always fall back to user-writable Documents dir
-            storage_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data', 'distributed_tasks')
+            # Always fall back to user-writable data dir
+            try:
+                from core.platform_paths import get_agent_data_dir
+                storage_dir = os.path.join(get_agent_data_dir(), 'distributed_tasks')
+            except ImportError:
+                storage_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data', 'distributed_tasks')
         os.makedirs(storage_dir, exist_ok=True)
 
         backend = JSONBackend(storage_dir=storage_dir)

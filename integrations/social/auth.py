@@ -52,7 +52,11 @@ if not SECRET_KEY:
         if db_path and db_path != ':memory:' and os.path.isabs(db_path):
             key_file = os.path.join(os.path.dirname(db_path), '.social_secret_key')
         elif os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
-            key_file = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', '.social_secret_key')
+            try:
+                from core.platform_paths import get_db_dir
+                key_file = os.path.join(get_db_dir(), '.social_secret_key')
+            except ImportError:
+                key_file = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', '.social_secret_key')
         else:
             key_file = os.path.join('agent_data', '.social_secret_key')
         try:

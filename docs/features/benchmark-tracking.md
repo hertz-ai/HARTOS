@@ -261,6 +261,26 @@ if self._tick_count % 10 == 0:
 
 FederatedAggregator picks up the delta and distributes to peers. Each peer imports the aggregated data for hive-wide tool routing intelligence.
 
+## AutoResearch Integration
+
+**File:** `integrations/coding_agent/autoevolve_code_tools.py`
+
+The autoresearch engine feeds into the benchmark stack at three points:
+
+```python
+# After each experiment iteration
+tracker.record(task_type='autoresearch', tool_name='aider_native_backend',
+               completion_time_s=result.duration_s, success=not result.error)
+
+# After each improvement (commit)
+AgentBaselineService.capture_snapshot(trigger='autoresearch_improvement')
+
+# After session ends (report save)
+tracker.export_learning_delta()  # enriched with autoresearch session summary
+```
+
+The autoresearch hypothesis generator also queries `tracker.get_best_tool('autoresearch')` to include benchmark-informed context in its prompts. See [auto-evolve.md](auto-evolve.md).
+
 ## PR Review Service Integration
 
 **File:** `integrations/agent_engine/pr_review_service.py`

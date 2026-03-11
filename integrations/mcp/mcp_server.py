@@ -50,9 +50,13 @@ def _get_memory_graph(user_id: str = 'system'):
     global _memory_graph
     if _memory_graph is None:
         from integrations.channels.memory.memory_graph import MemoryGraph
-        db_path = os.path.join(
-            os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'memory_graph'
-        )
+        try:
+            from core.platform_paths import get_memory_graph_dir
+            db_path = get_memory_graph_dir()
+        except ImportError:
+            db_path = os.path.join(
+                os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'memory_graph'
+            )
         _memory_graph = MemoryGraph(db_path=db_path, user_id=user_id)
     return _memory_graph
 

@@ -167,7 +167,11 @@ class DashboardConfig:
             return self.persistence_path
         import sys as _sys
         if os.environ.get('NUNBA_BUNDLED') or getattr(_sys, 'frozen', False):
-            _default = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data', 'dashboard')
+            try:
+                from core.platform_paths import get_agent_data_dir
+                _default = os.path.join(get_agent_data_dir(), 'dashboard')
+            except ImportError:
+                _default = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data', 'dashboard')
         elif os.path.exists("/app"):
             _default = "/app/data/dashboard"
         else:

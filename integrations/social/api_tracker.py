@@ -75,10 +75,14 @@ def _get_agent_conversations(user_id, prompt_id, limit=50):
     try:
         from integrations.channels.memory.memory_graph import MemoryGraph
         session_key = f"{user_id}_{prompt_id}" if prompt_id else str(user_id)
-        db_path = os.path.join(
-            os.path.expanduser("~"), "Documents", "Nunba", "data",
-            "memory_graph", session_key,
-        )
+        try:
+            from core.platform_paths import get_memory_graph_dir
+            db_path = get_memory_graph_dir(session_key)
+        except ImportError:
+            db_path = os.path.join(
+                os.path.expanduser("~"), "Documents", "Nunba", "data",
+                "memory_graph", session_key,
+            )
         if not os.path.exists(db_path):
             return []
         graph = MemoryGraph(db_path=db_path, user_id=str(user_id))
