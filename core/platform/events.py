@@ -250,16 +250,30 @@ class EventBus:
             logger.info("EventBus WAMP bridge disconnected")
 
         # Run WAMP component in a background thread with its own event loop
+        # Reconnects with exponential backoff on disconnect/failure
         def _run():
-            loop = asyncio.new_event_loop()
-            bus._wamp_loop = loop
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(component.start(loop=loop))
-            except Exception as e:
-                logger.warning("WAMP component exited: %s", e)
-            finally:
-                bus._wamp_loop = None
+            import time as _time
+            backoff = 1
+            max_backoff = 60
+            while True:
+                loop = asyncio.new_event_loop()
+                bus._wamp_loop = loop
+                asyncio.set_event_loop(loop)
+                connected_at = None
+                try:
+                    connected_at = _time.time()
+                    loop.run_until_complete(component.start(loop=loop))
+                except Exception as e:
+                    logger.warning("WAMP component exited: %s — reconnecting in %ds", e, backoff)
+                finally:
+                    bus._wamp_loop = None
+                    bus._wamp_connected = False
+                    bus._wamp_session = None
+                # Reset backoff if connection lived > 60s (was a real session)
+                if connected_at and (_time.time() - connected_at) > 60:
+                    backoff = 1
+                _time.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
 
         self._wamp_thread = threading.Thread(target=_run, daemon=True, name='eventbus-wamp')
         self._wamp_thread.start()

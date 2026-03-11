@@ -287,10 +287,16 @@ class AgentDaemon:
                     dispatched += parallel_dispatched
                     continue
 
-                agent = idle_agents[dispatched]
-                if agent['user_id'] in used_agents:
+                # Find next unused agent (don't skip goal if current agent is taken)
+                agent = None
+                while dispatched < len(idle_agents) and dispatched < max_concurrent:
+                    candidate = idle_agents[dispatched]
+                    if candidate['user_id'] not in used_agents:
+                        agent = candidate
+                        break
                     dispatched += 1
-                    continue
+                if agent is None:
+                    break  # No more available agents
                 used_agents.add(agent['user_id'])
 
                 # Load product if marketing goal
@@ -306,9 +312,12 @@ class AgentDaemon:
                     logger.warning(f"Goal {goal.id}: build_prompt returned None (guardrails unavailable?), skipping")
                     continue
 
-                # BUDGET GATE: check goal budget + platform affordability
+                # BUDGET PRE-CHECK: read-only check before dispatch.
+                # The actual atomic budget reservation happens inside dispatch_goal()
+                # via pre_dispatch_budget_gate(). This is just a quick reject to
+                # avoid wasting time on goals that are clearly over budget.
                 try:
-                    from .budget_gate import pre_dispatch_budget_gate
+                    from .budget_gate import estimate_llm_cost_spark, _resolve_model_name
                     goal_key = str(goal.id)
 
                     # Skip goals already known to be budget-blocked (avoids
@@ -317,7 +326,13 @@ class AgentDaemon:
                         if goal_key in _budget_blocked_goals:
                             continue
 
-                    bg_allowed, bg_reason = pre_dispatch_budget_gate(goal.id, prompt)
+                    # Read-only check: compare remaining budget vs estimated cost
+                    # without reserving (no spark_spent increment)
+                    budget = goal.spark_budget or 0
+                    spent = goal.spark_spent or 0
+                    estimated = estimate_llm_cost_spark(prompt, _resolve_model_name())
+                    bg_allowed = (budget - spent) >= estimated
+                    bg_reason = f'insufficient_budget ({budget - spent} < {estimated})' if not bg_allowed else ''
                     if not bg_allowed:
                         # Immediately pause — budget won't change between daemon
                         # ticks, so retrying is wasteful.
@@ -352,7 +367,7 @@ class AgentDaemon:
                         logger.warning(f"Goal {goal.id} blocked by guardrail: {reason}")
                         continue
                 except ImportError:
-                    pass
+                    logger.warning("hive_guardrails not available — dispatch proceeds without guardrail pre-check")
 
                 # Store prompt_id on goal for REUSE tracking
                 prompt_id = f"{goal.goal_type}_{goal.id[:8]}"
@@ -583,6 +598,26 @@ class AgentDaemon:
                         logger.info(f"Reset monthly API quotas for {reset_count} keys")
                 except Exception:
                     pass
+
+            # CLEANUP: prune stale entries from module-level dicts every 100 ticks
+            if self._tick_count % 100 == 0:
+                active_goal_ids = {str(g.id) for g in goals}
+                with _module_lock:
+                    stale_backoff = [k for k in _dispatch_backoff if k not in active_goal_ids]
+                    for k in stale_backoff:
+                        del _dispatch_backoff[k]
+                    stale_budget = _budget_blocked_goals - active_goal_ids
+                    _budget_blocked_goals -= stale_budget
+                    # _hitl_notified: keep entries to avoid re-notifying on restart,
+                    # but cap size to prevent unbounded growth
+                    if len(_hitl_notified) > 10000:
+                        _hitl_notified.clear()
+                if stale_backoff or stale_budget:
+                    logger.debug(f"Pruned {len(stale_backoff)} backoff + {len(stale_budget)} budget-blocked stale entries")
+                # Evict completed/archived goals from ledger cache
+                stale_cache = [k for k in self._ledger_cache if k[1] not in active_goal_ids]
+                for k in stale_cache:
+                    del self._ledger_cache[k]
 
             db.commit()
 

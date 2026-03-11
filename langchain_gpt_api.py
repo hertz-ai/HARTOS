@@ -1156,7 +1156,7 @@ class TaskStatus(Enum):
     SCHEDULED = "SCHEDULED"
     EXECUTING = "EXECUTING"
     TIMEOUT = "TIMEOUT"
-    COMPELETED = "COMPELETED"
+    COMPLETED = "COMPLETED"
     ERROR = "ERROR"
 
 
@@ -2558,7 +2558,7 @@ class CustomGPT(LLM):
             end_result = str(response).replace('\n', ' ').replace('\t', '')
             app.logger.info(f"the end response is {end_result}")
 
-            return 'response_from_groq'.replace('\n', ' ').replace('\t', '')
+            return end_result
             # return response_from_groq.content.replace('\n', ' ').replace('\t', '')
         if checker == 1:
             try:
@@ -3871,8 +3871,8 @@ PROBE_TEMPLATE = ("You are Hevolve, a versatile personal AI developed by HertzAI
 INTERMEDIATE_CONTINUATION = "You are Hevolve, a versatile personal AI developed by HertzAI that runs locally on the user's device. Continue your response from where you left off in the last conversation, considering the new input as a continuation of the last request. Ensure a smooth transition from the previous response and start this response as a continuation of the previous one.\n INSTRUCTIONS: Start your response with transitional words or phrases that can be used as a continuation of the previous response."
 
 first_promts = []
-review_agents = {"10077":True,10077:True}
-conversation_agent = {"10077":False,10077:False}
+review_agents = {}  # keyed by f'{user_id}_{prompt_id}' to avoid cross-prompt collision
+conversation_agent = {}  # keyed by f'{user_id}_{prompt_id}'
 _state_lock = threading.Lock()  # Protects review_agents, conversation_agent, first_promts
 
 # --- Interactive gather_info turn limit ---
@@ -3882,12 +3882,12 @@ _gather_turn_counts = {}  # f'{user_id}_{prompt_id}' -> int
 
 # --- TTL-based cleanup for review_agents / conversation_agent (M2 fix) ---
 _AGENT_TTL = 3600  # 1 hour
-_agent_timestamps = {}  # user_id -> last-access epoch
+_agent_timestamps = {}  # f'{user_id}_{prompt_id}' -> last-access epoch
 
 
-def _touch_agent_timestamp(user_id):
+def _touch_agent_timestamp(agent_key):
     """Record that an agent entry was accessed (call under _state_lock)."""
-    _agent_timestamps[user_id] = time.time()
+    _agent_timestamps[agent_key] = time.time()
 
 
 def _cleanup_stale_agents():
@@ -3903,11 +3903,9 @@ def _cleanup_stale_agents():
             conversation_agent.pop(key, None)
             _agent_timestamps.pop(key, None)
     # Also clean stale gather turn counters
-    # Turn key format: '{user_id}_{prompt_id}' — split from the RIGHT
-    # since user_id itself may contain underscores (e.g. 'test_user_1')
+    # Both _gather_turn_counts and _agent_timestamps now use '{user_id}_{prompt_id}' keys
     for tk in list(_gather_turn_counts.keys()):
-        uid = tk.rsplit('_', 1)[0] if '_' in tk else tk
-        if uid not in _agent_timestamps:
+        if tk not in _agent_timestamps:
             _gather_turn_counts.pop(tk, None)
 
 # Per-user locks to prevent race conditions when concurrent requests
@@ -4192,8 +4190,9 @@ def chat():
             # Reuse prompt_id from Plan Mode response if available
             new_prompt_id = prompt_id if prompt_id else _next_prompt_id()
             auto_response = _autonomous_gather_info(user_id, prompt, new_prompt_id)
-            review_agents[user_id] = True
-            _touch_agent_timestamp(user_id)
+            _ak = f'{user_id}_{new_prompt_id}'
+            review_agents[_ak] = True
+            _touch_agent_timestamp(_ak)
             _record_lifecycle('Review Mode', user_id, new_prompt_id,
                               f'Agentic auto-creation: {prompt[:100]}')
             _push_workflow_flowchart(user_id, new_prompt_id, request_id)
@@ -4223,26 +4222,29 @@ def chat():
                         no_of_flow = len(data['flows'])-1
                         app.logger.info(f'GOT LEN OF FLOW AS {no_of_flow}')
                     if os.path.exists(os.path.join(PROMPTS_DIR, f'{prompt_id}_{no_of_flow}_recipe.json')):
-                        create_agent = set_flags_to_enter_review_mode(no_of_flow, user_id) #returns false
+                        create_agent = set_flags_to_enter_review_mode(no_of_flow, user_id, prompt_id) #returns false
                     else:
                         app.logger.info(f'{no_of_flow} Recipe JSON doesnot EXISTS')
                         create_agent = True
-                        review_agents[user_id] = True
-                        conversation_agent[user_id] = False
-                        _touch_agent_timestamp(user_id)
+                        _ak = f'{user_id}_{prompt_id}'
+                        review_agents[_ak] = True
+                        conversation_agent[_ak] = False
+                        _touch_agent_timestamp(_ak)
                 else:
                     app.logger.info('0 Recipe JSON doesnot EXISTS')
                     create_agent = True
-                    review_agents[user_id] = True
-                    conversation_agent[user_id] = False
-                    _touch_agent_timestamp(user_id)
+                    _ak = f'{user_id}_{prompt_id}'
+                    review_agents[_ak] = True
+                    conversation_agent[_ak] = False
+                    _touch_agent_timestamp(_ak)
 
             else:
                 app.logger.info('GATHER JSON doesnot EXISTS')
                 create_agent = True
-                review_agents[user_id] = False
-                conversation_agent[user_id] = True
-                _touch_agent_timestamp(user_id)
+                _ak = f'{user_id}_{prompt_id}'
+                review_agents[_ak] = False
+                conversation_agent[_ak] = True
+                _touch_agent_timestamp(_ak)
 
     if create_agent:
         # Generate prompt_id server-side if not provided
@@ -4251,14 +4253,15 @@ def chat():
             app.logger.info(f'Generated server-side prompt_id={prompt_id} for new agent')
         # Per-user lock: snapshot agent state flags (lock NOT held during LLM calls)
         _user_lock = _get_user_lock(user_id)
+        _ak = f'{user_id}_{prompt_id}'
         with _user_lock:
-            _in_review = user_id in review_agents and review_agents[user_id]
-            _in_convo = user_id in conversation_agent and conversation_agent[user_id]
+            _in_review = _ak in review_agents and review_agents[_ak]
+            _in_convo = _ak in conversation_agent and conversation_agent[_ak]
         # Phase 1: Gather Requirements
         if not _in_review:
             with _user_lock:
-                review_agents[user_id] = False
-                _touch_agent_timestamp(user_id)
+                review_agents[_ak] = False
+                _touch_agent_timestamp(_ak)
             prompt = data.get('prompt', None)
             if prompt_id not in first_promts:
                 first_promts.append(prompt_id)
@@ -4277,9 +4280,9 @@ def chat():
                 # Autonomous dispatch (from daemon or API): LLM self-generates agent config
                 auto_response = _autonomous_gather_info(user_id, prompt, prompt_id)
                 with _user_lock:
-                    review_agents[user_id] = True
-                    conversation_agent[user_id] = False
-                    _touch_agent_timestamp(user_id)
+                    review_agents[_ak] = True
+                    conversation_agent[_ak] = False
+                    _touch_agent_timestamp(_ak)
                 _record_lifecycle('Review Mode', user_id, prompt_id, f'Autonomous creation via dispatch: {prompt[:100]}')
                 _push_workflow_flowchart(user_id, prompt_id, request_id)
                 return jsonify({'response': auto_response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [], 'Agent_status': 'Review Mode', 'autonomous_creation': True, 'prompt_id': prompt_id})
@@ -4307,8 +4310,8 @@ def chat():
                 agent_config['prompt_id'] = prompt_id
                 agent_config['creator_user_id'] = user_id
                 with _user_lock:
-                    conversation_agent[user_id] = False
-                    _touch_agent_timestamp(user_id)
+                    conversation_agent[_ak] = False
+                    _touch_agent_timestamp(_ak)
                 name = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
                 with open(name, "w") as json_file:
                     json.dump(agent_config, json_file)
@@ -4329,8 +4332,8 @@ def chat():
                 except Exception:
                     pass
                 with _user_lock:
-                    review_agents[user_id] = True
-                    _touch_agent_timestamp(user_id)
+                    review_agents[_ak] = True
+                    _touch_agent_timestamp(_ak)
                 _gather_turn_counts.pop(turn_key, None)  # Reset turn counter
                 _record_lifecycle('Review Mode', user_id, prompt_id, 'Agent details gathered, entering review')
 
@@ -4430,14 +4433,14 @@ def chat():
                 return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Creation Mode', 'prompt_id': prompt_id})
         # Phase 2: Review Phase (re-snapshot flags under lock after Phase 1 may have mutated)
         with _user_lock:
-            _in_review = user_id in review_agents and review_agents[user_id]
-            _in_convo = user_id in conversation_agent and conversation_agent[user_id]
+            _in_review = _ak in review_agents and review_agents[_ak]
+            _in_convo = _ak in conversation_agent and conversation_agent[_ak]
         if _in_review and not _in_convo:
             response = recipe(user_id,prompt,prompt_id,file_id,request_id)
             if response =='Agent Created Successfully':
                 with _user_lock:
-                    conversation_agent[user_id] = True
-                _touch_agent_timestamp(user_id)
+                    conversation_agent[_ak] = True
+                _touch_agent_timestamp(_ak)
                 # Bridge: auto-create social identity for this agent
                 try:
                     _create_social_agent_from_prompt(user_id, prompt_id)
@@ -4453,7 +4456,7 @@ def chat():
             return evaluate_agent_after_creation_in_review(file_id, prompt, prompt_id, request_id, user_id)
 
     if prompt_id and os.path.exists(os.path.join(PROMPTS_DIR, f'{prompt_id}.json')):
-
+        _ak = f'{user_id}_{prompt_id}'  # Ensure compound key available for reuse path
         with open(os.path.join(PROMPTS_DIR, f'{prompt_id}.json'), "r") as file:
             created_json = json.load(file)
 
@@ -4470,7 +4473,7 @@ def chat():
         # 1. Autogen create_new_agent tool (intelligent — LLM decides via tool call)
         # 2. Response text pattern matching (fallback for structured agent output)
         user_prompt = f'{user_id}_{prompt_id}'
-        if not review_agents.get(user_id) and not create_agent:
+        if not review_agents.get(_ak) and not create_agent:
             # Check autogen tool signal first (intelligent detection)
             from reuse_recipe import creation_signals
             if user_prompt in creation_signals:
@@ -4483,8 +4486,9 @@ def chat():
                 if is_auto:
                     # Autonomous: run gather_info with LLM-generated answers
                     auto_response = _autonomous_gather_info(user_id, agent_desc, new_prompt_id)
-                    review_agents[user_id] = True
-                    _touch_agent_timestamp(user_id)
+                    _ak_new = f'{user_id}_{new_prompt_id}'
+                    review_agents[_ak_new] = True
+                    _touch_agent_timestamp(_ak_new)
                     _record_lifecycle('Review Mode', user_id, new_prompt_id, f'Autonomous creation from reuse: {agent_desc[:100]}')
                     return jsonify({
                         'response': auto_response,
@@ -4615,8 +4619,9 @@ def chat():
         if is_autonomous:
             # Autonomous: run gather_info with LLM-generated answers
             auto_response = _autonomous_gather_info(user_id, agent_description, new_prompt_id)
-            review_agents[user_id] = True
-            _touch_agent_timestamp(user_id)
+            _ak_new = f'{user_id}_{new_prompt_id}'
+            review_agents[_ak_new] = True
+            _touch_agent_timestamp(_ak_new)
             _record_lifecycle('Review Mode', user_id, new_prompt_id, f'Autonomous creation via LLM tool: {agent_description[:100]}')
             return jsonify({
                 'response': auto_response,
@@ -4700,12 +4705,13 @@ def evaluate_agent_after_creation_in_review(file_id, prompt, prompt_id, request_
                     'history_request_id': [], 'Agent_status': 'Evaluation Mode', **_resonance})
 
 
-def set_flags_to_enter_review_mode(no_of_flow, user_id):
+def set_flags_to_enter_review_mode(no_of_flow, user_id, prompt_id=''):
     app.logger.info(f'{no_of_flow} Recipe Json exist Going to reuse')
     create_agent = False
-    review_agents[user_id] = True
-    conversation_agent[user_id] = False
-    _touch_agent_timestamp(user_id)
+    _ak = f'{user_id}_{prompt_id}'
+    review_agents[_ak] = True
+    conversation_agent[_ak] = False
+    _touch_agent_timestamp(_ak)
     return create_agent
 
 
@@ -4753,6 +4759,7 @@ def response_ack():
     request_id = data.get('request_id',None)
     thread_local_data.set_request_id(request_id=request_id)
     prompt_id = data.get('prompt_id',None)
+    return jsonify({'status': 'acknowledged'}), 200
 
 @app.route('/add_history', methods=['POST'])
 def history():

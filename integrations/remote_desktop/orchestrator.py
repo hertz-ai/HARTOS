@@ -221,7 +221,18 @@ class RemoteDesktopOrchestrator:
         svc = get_service_manager()
         ready, msg = svc.ensure_engine(selected_engine)
         if not ready:
-            return {'status': 'error', 'error': msg, 'engine': selected_engine}
+            # Fallback: try native transport if selected engine failed
+            if selected_engine != 'native':
+                logger.warning("Viewer engine '%s' failed (%s), falling back to native",
+                               selected_engine, msg)
+                selected_engine = 'native'
+                ready, msg = svc.ensure_engine('native')
+                if not ready:
+                    return {'status': 'error',
+                            'error': f'All engines failed. Last: {msg}',
+                            'engine': selected_engine}
+            else:
+                return {'status': 'error', 'error': msg, 'engine': selected_engine}
 
         # 3. Authenticate
         auth_ok, auth_msg = self._authenticate(device_id, password, user_id)

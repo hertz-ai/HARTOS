@@ -840,7 +840,7 @@ class ModelLifecycleManager:
 
         # Sync catalog state
         try:
-            from models.orchestrator import get_orchestrator
+            from integrations.service_tools.model_orchestrator import get_orchestrator
             get_orchestrator().notify_unloaded(
                 self._guess_model_type(tool_name), tool_name)
         except Exception:

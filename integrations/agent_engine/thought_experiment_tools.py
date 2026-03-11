@@ -8,6 +8,10 @@ Tier 2 tools (agent_engine context). Same pattern as learning_tools.py.
 """
 import json
 import logging
+import threading
+
+_file_locks = {}
+_file_locks_guard = threading.Lock()
 
 logger = logging.getLogger('hevolve_social')
 
@@ -19,26 +23,22 @@ def create_thought_experiment(creator_id: str, title: str,
                                is_core_ip: bool = False) -> str:
     """Create a new constitutional thought experiment."""
     try:
-        from integrations.social.models import get_db
+        from integrations.social.models import db_session
         from integrations.social.thought_experiment_service import ThoughtExperimentService
 
-        db = get_db()
-        try:
+        with db_session() as db:
             result = ThoughtExperimentService.create_experiment(
                 db, creator_id, title, hypothesis,
                 expected_outcome=expected_outcome,
                 intent_category=intent_category,
                 is_core_ip=is_core_ip)
             if result:
-                db.commit()
                 return json.dumps({'success': True, 'experiment': result})
             else:
                 return json.dumps({
                     'success': False,
                     'reason': 'Blocked by ConstitutionalFilter or invalid input',
                 })
-        finally:
-            db.close()
     except Exception as e:
         return json.dumps({'error': str(e)})
 
@@ -51,11 +51,10 @@ def cast_experiment_vote(experiment_id: str, voter_id: str,
                           confidence: float = 0.8) -> str:
     """Cast a vote on a thought experiment (as agent or human)."""
     try:
-        from integrations.social.models import get_db
+        from integrations.social.models import db_session
         from integrations.social.thought_experiment_service import ThoughtExperimentService
 
-        db = get_db()
-        try:
+        with db_session() as db:
             result = ThoughtExperimentService.cast_vote(
                 db, experiment_id, voter_id,
                 vote_value=int(vote_value),
@@ -64,15 +63,12 @@ def cast_experiment_vote(experiment_id: str, voter_id: str,
                 voter_type=voter_type,
                 confidence=float(confidence))
             if result:
-                db.commit()
                 return json.dumps({'success': True, 'vote': result})
             else:
                 return json.dumps({
                     'success': False,
                     'reason': 'Experiment not found or not in voting phase',
                 })
-        finally:
-            db.close()
     except Exception as e:
         return json.dumps({'error': str(e)})
 
@@ -84,11 +80,10 @@ def evaluate_thought_experiment(experiment_id: str, agent_id: str,
                                   evidence: str = '') -> str:
     """Record an agent evaluation for a thought experiment."""
     try:
-        from integrations.social.models import get_db
+        from integrations.social.models import db_session
         from integrations.social.thought_experiment_service import ThoughtExperimentService
 
-        db = get_db()
-        try:
+        with db_session() as db:
             result = ThoughtExperimentService.record_agent_evaluation(
                 db, experiment_id, agent_id,
                 score=float(score),
@@ -96,12 +91,9 @@ def evaluate_thought_experiment(experiment_id: str, agent_id: str,
                 reasoning=reasoning,
                 evidence=evidence)
             if result:
-                db.commit()
                 return json.dumps({'success': True, 'experiment': result})
             else:
                 return json.dumps({'success': False, 'reason': 'not_found'})
-        finally:
-            db.close()
     except Exception as e:
         return json.dumps({'error': str(e)})
 
@@ -110,11 +102,10 @@ def get_experiment_status(experiment_id: str = '',
                            status_filter: str = '') -> str:
     """Get experiment detail or list experiments by status."""
     try:
-        from integrations.social.models import get_db
+        from integrations.social.models import db_session
         from integrations.social.thought_experiment_service import ThoughtExperimentService
 
-        db = get_db()
-        try:
+        with db_session(commit=False) as db:
             if experiment_id:
                 result = ThoughtExperimentService.get_experiment_detail(
                     db, experiment_id)
@@ -127,8 +118,6 @@ def get_experiment_status(experiment_id: str = '',
                     'experiments': results,
                     'count': len(results),
                 })
-        finally:
-            db.close()
     except Exception as e:
         return json.dumps({'error': str(e)})
 
@@ -136,15 +125,12 @@ def get_experiment_status(experiment_id: str = '',
 def tally_experiment_votes(experiment_id: str) -> str:
     """Get the current vote tally for an experiment."""
     try:
-        from integrations.social.models import get_db
+        from integrations.social.models import db_session
         from integrations.social.thought_experiment_service import ThoughtExperimentService
 
-        db = get_db()
-        try:
+        with db_session(commit=False) as db:
             tally = ThoughtExperimentService.tally_votes(db, experiment_id)
             return json.dumps({'success': True, 'tally': tally})
-        finally:
-            db.close()
     except Exception as e:
         return json.dumps({'error': str(e)})
 
@@ -153,24 +139,20 @@ def advance_experiment(experiment_id: str,
                         target_status: str = '') -> str:
     """Advance experiment to next lifecycle phase or specific status."""
     try:
-        from integrations.social.models import get_db
+        from integrations.social.models import db_session
         from integrations.social.thought_experiment_service import ThoughtExperimentService
 
-        db = get_db()
-        try:
+        with db_session() as db:
             result = ThoughtExperimentService.advance_status(
                 db, experiment_id,
                 target_status=target_status or None)
             if result:
-                db.commit()
                 return json.dumps({'success': True, 'experiment': result})
             else:
                 return json.dumps({
                     'success': False,
                     'reason': 'Cannot advance (invalid status or not found)',
                 })
-        finally:
-            db.close()
     except Exception as e:
         return json.dumps({'error': str(e)})
 
@@ -214,11 +196,10 @@ def iterate_hypothesis(experiment_id: str, hypothesis: str,
         pass
 
     try:
-        from integrations.social.models import get_db
+        from integrations.social.models import db_session
         from integrations.social.thought_experiment_service import ThoughtExperimentService
 
-        db = get_db()
-        try:
+        with db_session(commit=False) as db:
             detail = ThoughtExperimentService.get_experiment_detail(
                 db, experiment_id)
             if not detail:
@@ -251,8 +232,6 @@ def iterate_hypothesis(experiment_id: str, hypothesis: str,
                     'clarity, feasibility, and expected impact.'
                 ),
             })
-        finally:
-            db.close()
     except Exception as e:
         return json.dumps({'error': str(e)})
 
@@ -283,6 +262,7 @@ def score_hypothesis_result(experiment_id: str, iteration: int,
         JSON with score record, trend analysis, and continuation advice
     """
     import os
+    import tempfile
 
     score = max(-2.0, min(2.0, float(score)))
 
@@ -292,33 +272,49 @@ def score_hypothesis_result(experiment_id: str, iteration: int,
     os.makedirs(data_dir, exist_ok=True)
     history_path = os.path.join(data_dir, f'{experiment_id}.json')
 
-    history = []
-    if os.path.isfile(history_path):
+    # Per-experiment lock prevents read-modify-write race
+    with _file_locks_guard:
+        if experiment_id not in _file_locks:
+            _file_locks[experiment_id] = threading.Lock()
+        lock = _file_locks[experiment_id]
+
+    with lock:
+        history = []
+        if os.path.isfile(history_path):
+            try:
+                with open(history_path, 'r', encoding='utf-8') as f:
+                    history = json.load(f)
+            except Exception:
+                history = []
+
+        record = {
+            'iteration': iteration,
+            'score': score,
+            'reasoning': reasoning,
+            'rubric': {
+                'evidence_quality': max(0.0, min(1.0, float(evidence_quality))),
+                'clarity': max(0.0, min(1.0, float(clarity))),
+                'feasibility': max(0.0, min(1.0, float(feasibility))),
+                'impact': max(0.0, min(1.0, float(impact))),
+            },
+        }
+        history.append(record)
+
+        # Atomic write: temp file + rename prevents partial writes
         try:
-            with open(history_path, 'r', encoding='utf-8') as f:
-                history = json.load(f)
+            fd, tmp_path = tempfile.mkstemp(dir=data_dir, suffix='.tmp')
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    json.dump(history, f, indent=2, default=str)
+                os.replace(tmp_path, history_path)
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
         except Exception:
-            history = []
-
-    record = {
-        'iteration': iteration,
-        'score': score,
-        'reasoning': reasoning,
-        'rubric': {
-            'evidence_quality': max(0.0, min(1.0, float(evidence_quality))),
-            'clarity': max(0.0, min(1.0, float(clarity))),
-            'feasibility': max(0.0, min(1.0, float(feasibility))),
-            'impact': max(0.0, min(1.0, float(impact))),
-        },
-    }
-    history.append(record)
-
-    # Save
-    try:
-        with open(history_path, 'w', encoding='utf-8') as f:
-            json.dump(history, f, indent=2, default=str)
-    except Exception:
-        pass
+            pass
 
     # Trend analysis
     scores = [h['score'] for h in history]

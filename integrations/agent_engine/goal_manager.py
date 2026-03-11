@@ -119,7 +119,7 @@ class GoalManager:
         if created_by:
             try:
                 from security.rate_limiter_redis import get_rate_limiter
-                if not get_rate_limiter().check(f'goal_create'):
+                if not get_rate_limiter().check(f'goal_create:{created_by}'):
                     return {'success': False, 'error': 'Rate limited: too many goals created'}
             except Exception:
                 pass  # Rate limiter unavailable — allow through
