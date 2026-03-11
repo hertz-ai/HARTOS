@@ -270,57 +270,89 @@ def build_core_tool_closures(ctx):
                 "fps": 24,
             }
 
-            # Try local LTX-2 server first
-            try:
-                tool_logger.info(f"Trying local LTX-2 server at {LOCAL_LTX_URL}")
-                response = pooled_post(f"{LOCAL_LTX_URL}/generate", json=ltx_payload, headers=headers, timeout=600)
-                if response.status_code == 200:
-                    result = response.json()
-                    video_url = result.get('video_url') or result.get('output_url') or result.get('video_path')
-                    if video_url:
-                        tool_logger.info(f"LTX-2 video generated: {video_url}")
-                        return f"LTX-2 Video generated successfully. URL: {video_url}"
-            except requests.exceptions.RequestException as e:
-                tool_logger.info(f"Local LTX-2 server not available: {e}")
+            # Fast health probe — skip dead servers instantly (0ms vs 10s timeout)
+            def _is_server_up(url, name):
+                try:
+                    r = pooled_get(f"{url}/health", timeout=1.5)
+                    return r.status_code < 500
+                except Exception:
+                    tool_logger.info(f"{name} not reachable — skipping instantly")
+                    return False
 
-            # Try ComfyUI with LTX-Video workflow
-            try:
-                tool_logger.info(f"Trying ComfyUI at {LOCAL_COMFYUI_URL}")
-                comfyui_workflow = {
-                    "prompt": {
-                        "1": {"class_type": "LTXVLoader", "inputs": {"ckpt_name": "ltx-video-2b-v0.9.safetensors"}},
-                        "2": {"class_type": "LTXVConditioning", "inputs": {"positive": text, "negative": ltx_payload["negative_prompt"], "ltxv_model": ["1", 0]}},
-                        "3": {"class_type": "LTXVSampler", "inputs": {"seed": int(time.time()) % 2147483647, "steps": ltx_payload["num_inference_steps"], "cfg": ltx_payload["guidance_scale"], "width": ltx_payload["width"], "height": ltx_payload["height"], "num_frames": ltx_payload["num_frames"], "ltxv_model": ["1", 0], "conditioning": ["2", 0]}},
-                        "4": {"class_type": "LTXVDecode", "inputs": {"ltxv_model": ["1", 0], "samples": ["3", 0]}},
-                        "5": {"class_type": "VHS_VideoCombine", "inputs": {"frame_rate": ltx_payload["fps"], "filename_prefix": "ltx2_output", "format": "video/h264-mp4", "images": ["4", 0]}},
+            # Try local LTX-2 server first — only if alive
+            if _is_server_up(LOCAL_LTX_URL, "LTX-2"):
+                try:
+                    tool_logger.info(f"LTX-2 server is UP, generating...")
+                    response = pooled_post(f"{LOCAL_LTX_URL}/generate", json=ltx_payload, headers=headers, timeout=600)
+                    if response.status_code == 200:
+                        result = response.json()
+                        video_url = result.get('video_url') or result.get('output_url') or result.get('video_path')
+                        if video_url:
+                            tool_logger.info(f"LTX-2 video generated: {video_url}")
+                            return f"LTX-2 Video generated successfully. URL: {video_url}"
+                except requests.exceptions.RequestException as e:
+                    tool_logger.info(f"LTX-2 generation failed: {e}")
+
+            # Try ComfyUI — only if alive
+            if _is_server_up(LOCAL_COMFYUI_URL, "ComfyUI"):
+                try:
+                    tool_logger.info(f"ComfyUI is UP, submitting workflow...")
+                    comfyui_workflow = {
+                        "prompt": {
+                            "1": {"class_type": "LTXVLoader", "inputs": {"ckpt_name": "ltx-video-2b-v0.9.safetensors"}},
+                            "2": {"class_type": "LTXVConditioning", "inputs": {"positive": text, "negative": ltx_payload["negative_prompt"], "ltxv_model": ["1", 0]}},
+                            "3": {"class_type": "LTXVSampler", "inputs": {"seed": int(time.time()) % 2147483647, "steps": ltx_payload["num_inference_steps"], "cfg": ltx_payload["guidance_scale"], "width": ltx_payload["width"], "height": ltx_payload["height"], "num_frames": ltx_payload["num_frames"], "ltxv_model": ["1", 0], "conditioning": ["2", 0]}},
+                            "4": {"class_type": "LTXVDecode", "inputs": {"ltxv_model": ["1", 0], "samples": ["3", 0]}},
+                            "5": {"class_type": "VHS_VideoCombine", "inputs": {"frame_rate": ltx_payload["fps"], "filename_prefix": "ltx2_output", "format": "video/h264-mp4", "images": ["4", 0]}},
+                        }
                     }
-                }
-                response = pooled_post(f"{LOCAL_COMFYUI_URL}/prompt", json=comfyui_workflow, headers=headers, timeout=10)
-                if response.status_code == 200:
-                    comfy_prompt_id = response.json().get('prompt_id')
-                    tool_logger.info(f"ComfyUI LTX-2 job queued: {comfy_prompt_id}")
-                    for _ in range(120):
-                        time.sleep(5)
-                        history_response = pooled_get(f"{LOCAL_COMFYUI_URL}/history/{comfy_prompt_id}")
-                        if history_response.status_code == 200:
-                            history = history_response.json()
-                            if comfy_prompt_id in history:
-                                outputs = history[comfy_prompt_id].get('outputs', {})
-                                for node_id, output in outputs.items():
-                                    for media_key in ('gifs', 'videos'):
-                                        if media_key in output:
-                                            filename = output[media_key][0].get('filename')
-                                            if filename:
-                                                video_url = f"{LOCAL_COMFYUI_URL}/view?filename={filename}"
-                                                return f"LTX-2 Video generated via ComfyUI. URL: {video_url}"
-                    return f"LTX-2 Video generation queued in ComfyUI (prompt_id: {comfy_prompt_id}). Check ComfyUI interface for output."
-            except requests.exceptions.RequestException as e:
-                tool_logger.info(f"ComfyUI not available: {e}")
+                    response = pooled_post(f"{LOCAL_COMFYUI_URL}/prompt", json=comfyui_workflow, headers=headers, timeout=10)
+                    if response.status_code == 200:
+                        comfy_prompt_id = response.json().get('prompt_id')
+                        tool_logger.info(f"ComfyUI LTX-2 job queued: {comfy_prompt_id}")
+                        for _ in range(120):
+                            time.sleep(5)
+                            history_response = pooled_get(f"{LOCAL_COMFYUI_URL}/history/{comfy_prompt_id}")
+                            if history_response.status_code == 200:
+                                history = history_response.json()
+                                if comfy_prompt_id in history:
+                                    outputs = history[comfy_prompt_id].get('outputs', {})
+                                    for node_id, output in outputs.items():
+                                        for media_key in ('gifs', 'videos'):
+                                            if media_key in output:
+                                                filename = output[media_key][0].get('filename')
+                                                if filename:
+                                                    video_url = f"{LOCAL_COMFYUI_URL}/view?filename={filename}"
+                                                    return f"LTX-2 Video generated via ComfyUI. URL: {video_url}"
+                        return f"LTX-2 Video generation queued in ComfyUI (prompt_id: {comfy_prompt_id}). Check ComfyUI interface for output."
+                except requests.exceptions.RequestException as e:
+                    tool_logger.info(f"ComfyUI generation failed: {e}")
 
-            return ("LTX-2 video generation failed. Please ensure one of: "
-                    "(1) Local LTX-2 server at localhost:5002, "
-                    "(2) ComfyUI with LTX-Video nodes at localhost:8188, "
-                    "or (3) diffusers library with CUDA GPU")
+            # Local servers unavailable — try hive mesh peer with GPU
+            try:
+                from integrations.agent_engine.compute_config import get_compute_policy
+                policy = get_compute_policy()
+                if policy.get('compute_policy') != 'local_only':
+                    from integrations.agent_engine.compute_mesh_service import get_compute_mesh
+                    mesh = get_compute_mesh()
+                    result = mesh.offload_to_best_peer(
+                        model_type='video_gen',
+                        prompt=text,
+                        options={'model': 'ltx2', 'timeout': 300},
+                    )
+                    if result and 'error' not in result:
+                        video_url = result.get('response', result.get('video_url', ''))
+                        peer = result.get('offloaded_to', 'hive_peer')
+                        tool_logger.info(f"LTX-2 video generated via hive peer {peer}: {video_url}")
+                        return f"LTX-2 Video generated via hive peer. URL: {video_url}"
+                    tool_logger.info(f"Hive mesh video offload failed: {result.get('error')}")
+            except Exception as e:
+                tool_logger.info(f"Hive mesh offload not available: {e}")
+
+            return ("LTX-2 video generation failed. No local GPU, no hive peers with GPU. "
+                    "Options: (1) Pair a GPU device: hart compute pair <address>, "
+                    "(2) Set HEVOLVE_COMPUTE_POLICY=any, "
+                    "(3) Install local LTX-2 server with CUDA GPU")
 
         # Default: Avatar-based video generation
         from core.config_cache import get_db_url
@@ -430,7 +462,10 @@ def build_core_tool_closures(ctx):
         tool_logger.info('INSIDE img2txt')
         # Try local Qwen Vision first (bundled mode), fall back to cloud
         from core.config_cache import get_vision_api, is_bundled
-        url = get_vision_api() or "http://azurekong.hertzai.com:8000/llava/image_inference"
+        url = get_vision_api()
+        if not url:
+            tool_logger.warning("No LLAVA_API configured — vision inference may fail on no-GPU instances")
+            url = "http://azurekong.hertzai.com:8000/llava/image_inference"
 
         if is_bundled():
             # Local: use Qwen Vision via upload/vision endpoint

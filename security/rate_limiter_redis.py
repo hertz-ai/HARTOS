@@ -56,6 +56,7 @@ class RedisRateLimiter:
         'battery': (60, 60),             # 60 battery queries per 60 seconds
         'webcam': (10, 60),              # 10 webcam operations per 60 seconds
         'scanner': (5, 60),              # 5 scanner operations per 60 seconds
+        'video_gen': (5, 300),           # 5 video generations per 5 minutes
     }
 
     def __init__(self):
