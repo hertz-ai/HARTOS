@@ -1896,8 +1896,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                 )
                                 if success:
                                     current_app.logger.info(f"Added {len(json_obj['subtasks'])} subtasks to ledger for action {current_action_id}")
-                                    # Sync the blocked state to ledger
-                                    sync_action_state_to_ledger(user_prompt, current_action_id, ActionState.PENDING, user_ledgers)
+                                    # Auto-sync handles ledger update via safe_set_state below
                                 else:
                                     current_app.logger.warning(f"Failed to add subtasks to ledger")
                             safe_set_state(user_prompt, current_action_id, ActionState.PENDING, "requires breakdown into subtasks")
@@ -3256,7 +3255,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                             )
                             if success:
                                 current_app.logger.info(f"Added {len(json_obj['subtasks'])} subtasks from main loop")
-                                sync_action_state_to_ledger(user_prompt, current_action_id, ActionState.PENDING, user_ledgers)
+                                # Auto-sync handles ledger update via safe_set_state below
                         safe_set_state(user_prompt, current_action_id, ActionState.PENDING, "breakdown requested")
                         # Continue to work on subtasks
                         pending_subtasks = get_pending_subtasks(user_prompt, current_action_id, user_ledgers)
@@ -3319,8 +3318,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
 
                         force_state_through_valid_path(user_prompt, json_action_id, ActionState.COMPLETED,
                                                        "verified complete")
-                        # Sync completion to ledger with smart routing
-                        sync_action_state_to_ledger(user_prompt, json_action_id, ActionState.COMPLETED, user_ledgers)
+                        # Auto-sync handles ledger update via force_state_through_valid_path above
 
                         # Use smart ledger routing to complete and find next task
                         result_data = json_obj.get('result', json_obj.get('output', None))

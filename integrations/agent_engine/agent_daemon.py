@@ -15,6 +15,9 @@ from datetime import datetime
 
 logger = logging.getLogger('hevolve_social')
 
+# Lock protecting module-level mutable state accessed from daemon thread + API threads
+_module_lock = threading.Lock()
+
 # Track which tasks we've already sent HITL notifications for (avoid spam)
 _hitl_notified: set = set()
 
@@ -47,9 +50,10 @@ def _get_blocked_hitl_tasks(ledger, goal_id):
 def _send_hitl_notification(db, goal, task):
     """Send a one-time HITL notification for an approval-blocked task."""
     notif_key = f"{goal.id}:{task.id}"
-    if notif_key in _hitl_notified:
-        return
-    _hitl_notified.add(notif_key)
+    with _module_lock:
+        if notif_key in _hitl_notified:
+            return
+        _hitl_notified.add(notif_key)
 
     try:
         from integrations.social.services import NotificationService
@@ -298,6 +302,9 @@ class AgentDaemon:
 
                 # Build prompt using registered builder (guardrail: togetherness rewrite)
                 prompt = GoalManager.build_prompt(goal.to_dict(), product_dict)
+                if prompt is None:
+                    logger.warning(f"Goal {goal.id}: build_prompt returned None (guardrails unavailable?), skipping")
+                    continue
 
                 # BUDGET GATE: check goal budget + platform affordability
                 try:
@@ -306,8 +313,9 @@ class AgentDaemon:
 
                     # Skip goals already known to be budget-blocked (avoids
                     # re-checking every 30s when nothing has changed).
-                    if goal_key in _budget_blocked_goals:
-                        continue
+                    with _module_lock:
+                        if goal_key in _budget_blocked_goals:
+                            continue
 
                     bg_allowed, bg_reason = pre_dispatch_budget_gate(goal.id, prompt)
                     if not bg_allowed:
@@ -320,7 +328,8 @@ class AgentDaemon:
                             f'Reason: {bg_reason}')
                         cfg['paused_at'] = datetime.utcnow().isoformat()
                         goal.config_json = cfg
-                        _budget_blocked_goals.add(goal_key)
+                        with _module_lock:
+                            _budget_blocked_goals.add(goal_key)
                         logger.info(
                             f"Goal {goal.id} AUTO-PAUSED by budget gate: "
                             f"{bg_reason}")
@@ -329,7 +338,8 @@ class AgentDaemon:
                         # Budget passed — clear from blocked set if it was
                         # previously blocked (e.g. goal was resumed with
                         # more budget).
-                        _budget_blocked_goals.discard(goal_key)
+                        with _module_lock:
+                            _budget_blocked_goals.discard(goal_key)
                 except ImportError:
                     pass
 
@@ -351,7 +361,8 @@ class AgentDaemon:
 
                 # BACKOFF: skip goals that have failed repeatedly
                 goal_key = str(goal.id)
-                backoff_info = _dispatch_backoff.get(goal_key)
+                with _module_lock:
+                    backoff_info = _dispatch_backoff.get(goal_key)
                 if backoff_info and time.time() < backoff_info.get('skip_until', 0):
                     logger.debug(
                         f"Skipping goal {goal_key}: backoff "
@@ -373,7 +384,8 @@ class AgentDaemon:
                                 goal.id, goal.goal_type)
                             dispatched += 1
                             # Success — clear backoff
-                            _dispatch_backoff.pop(goal_key, None)
+                            with _module_lock:
+                                _dispatch_backoff.pop(goal_key, None)
                             continue
                     except ImportError:
                         pass
@@ -384,27 +396,38 @@ class AgentDaemon:
 
                 # Track failures for exponential backoff
                 if result is None:
-                    info = _dispatch_backoff.get(goal_key, {'failures': 0})
-                    info['failures'] = info.get('failures', 0) + 1
-                    # Exponential backoff: 60s, 120s, 240s, 480s, max 900s (15 min)
-                    delay = min(60 * (2 ** (info['failures'] - 1)), 900)
-                    info['skip_until'] = time.time() + delay
-                    _dispatch_backoff[goal_key] = info
-                    if info['failures'] >= 5:
+                    with _module_lock:
+                        info = _dispatch_backoff.get(goal_key, {'failures': 0})
+                        info['failures'] = info.get('failures', 0) + 1
+                        # Exponential backoff: 60s, 120s, 240s, 480s, max 900s (15 min)
+                        delay = min(60 * (2 ** (info['failures'] - 1)), 900)
+                        info['skip_until'] = time.time() + delay
+                        _dispatch_backoff[goal_key] = info
+                        failure_count = info['failures']
+                    if failure_count >= 5:
                         # Auto-pause after 5 consecutive failures
                         goal.status = 'paused'
                         cfg = goal.config_json or {}
                         cfg['pause_reason'] = (
-                            f'Auto-paused: {info["failures"]} consecutive '
+                            f'Auto-paused: {failure_count} consecutive '
                             f'dispatch failures')
                         cfg['paused_at'] = datetime.utcnow().isoformat()
                         goal.config_json = cfg
                         logger.warning(
                             f"Goal {goal_key} AUTO-PAUSED after "
-                            f"{info['failures']} dispatch failures")
+                            f"{failure_count} dispatch failures")
                 else:
                     # Success — clear backoff
-                    _dispatch_backoff.pop(goal_key, None)
+                    with _module_lock:
+                        _dispatch_backoff.pop(goal_key, None)
+
+                    # COMPLETION: non-continuous goals complete after successful dispatch
+                    cfg = goal.config_json or {}
+                    if not cfg.get('continuous', False):
+                        goal.status = 'completed'
+                        cfg['completed_at'] = datetime.utcnow().isoformat()
+                        goal.config_json = cfg
+                        logger.info(f"Goal {goal_key} COMPLETED (one-shot dispatch succeeded)")
 
             # ── HITL: notify owners of APPROVAL_REQUIRED tasks ──
             try:
@@ -578,7 +601,13 @@ class AgentDaemon:
 
         except Exception as e:
             db.rollback()
-            logger.debug(f"Agent daemon error: {e}")
+            # Clear module-level dicts to stay in sync with rolled-back DB state.
+            # Without this, goals marked as budget-blocked or backed-off in memory
+            # would be skipped even though their DB status was rolled back.
+            with _module_lock:
+                _budget_blocked_goals.clear()
+                _dispatch_backoff.clear()
+            logger.warning(f"Agent daemon tick error (state reset): {e}")
         finally:
             db.close()
 

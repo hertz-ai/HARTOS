@@ -2679,22 +2679,23 @@ RELATIONSHIP TYPES:
         task = self.tasks[task_id]
 
         if outcome == 'success':
-            task.completed_at = datetime.now().isoformat()
-            task.result = result
-            task.progress_pct = 100.0
-            task._record_state_transition(TaskStatus.COMPLETED, f"Task completed: {result}" if result else "Task completed")
+            task.complete(result, reason=f"Task completed: {result}" if result else "Task completed")
         else:
-            task.failure_reason = "execution_failed"
-            task.error_message = str(result) if result else "Task failed"
-            task._record_state_transition(TaskStatus.FAILED, task.error_message)
+            error_msg = str(result) if result else "Task failed"
 
             if task.retry_count < task.max_retries:
+                # Retry: don't transition to FAILED (terminal). Instead, record
+                # the retry and reset to PENDING for re-execution.
                 task.retry_count += 1
                 task.last_retry_at = datetime.now().isoformat()
-                task.retry_errors.append(task.error_message)
+                task.retry_errors.append(error_msg)
+                task.error_message = error_msg
                 task._record_state_transition(TaskStatus.PENDING, f"Retry {task.retry_count}/{task.max_retries}")
                 task.pending_reason = "queued"
                 logger.info(f"Task {task_id} failed, retry {task.retry_count}/{task.max_retries}")
+            else:
+                # No retries left — transition to terminal FAILED
+                task.fail(error_msg, reason=error_msg)
 
         # Send messages to dependent tasks
         for dep_id in task.dependent_task_ids:
