@@ -3284,16 +3284,48 @@ def _parse_pdf_in_process(input_url, user_id, request_id):
         )
 
     except ImportError as ie:
-        step(f"Import error: {ie} — falling back to HTTP")
-        # Fallback: if routes not importable (unlikely in bundled mode), use HTTP
-        payload = {'user_id': user_id, 'request_id': request_id}
-        with open(pdf_save_path, 'rb') as f:
-            files = [('file', (pdf_file_name, f, 'application/pdf'))]
-            resp = pooled_post(BOOKPARSING_API, data=payload, files=files)
-        return (
-            f"--- Progress ---\n{chr(10).join(progress)}\n"
-            f"--- Result (via HTTP fallback) ---\n{resp.text}"
-        )
+        step(f"Import error: {ie} — falling back to hive mesh or HTTP")
+
+        # Fallback 1: Try hive mesh peer with vision model
+        try:
+            from integrations.agent_engine.compute_mesh_service import get_compute_mesh
+            mesh = get_compute_mesh()
+            if mesh and mesh._peers:
+                step("No local vision model — sending document to hive peer with GPU...")
+                result = mesh.offload_to_best_peer(
+                    model_type='vision',
+                    prompt=f'Parse PDF document: {pdf_file_name}',
+                    options={'image_path': pdf_save_path, 'timeout': 120},
+                )
+                if result and 'error' not in result:
+                    step("Document parsed by hive peer", percentage=100)
+                    return (
+                        f"--- Progress ---\n{chr(10).join(progress)}\n"
+                        f"--- Result (via hive peer) ---\n{result.get('response', '')}"
+                    )
+        except Exception as mesh_err:
+            step(f"Hive mesh unavailable: {mesh_err}")
+
+        # Fallback 2: Cloud HTTP
+        if BOOKPARSING_API:
+            step("Sending to cloud parsing service...")
+            try:
+                payload = {'user_id': user_id, 'request_id': request_id}
+                with open(pdf_save_path, 'rb') as f:
+                    files = [('file', (pdf_file_name, f, 'application/pdf'))]
+                    resp = pooled_post(BOOKPARSING_API, data=payload, files=files, timeout=60)
+                return (
+                    f"--- Progress ---\n{chr(10).join(progress)}\n"
+                    f"--- Result (via cloud) ---\n{resp.text}"
+                )
+            except Exception as cloud_err:
+                step(f"Cloud parsing service unavailable: {cloud_err}")
+
+        # All paths exhausted
+        step("Document parsing requires a vision model (GPU). "
+             "No local GPU, no hive peers with GPU, and the cloud service "
+             "is not responding. Please try again when a GPU device is connected.")
+        return "\n".join(progress)
     finally:
         try:
             os.remove(pdf_save_path)
@@ -3377,19 +3409,33 @@ def parse_visual_context(inp: str):
         except Exception as e:
             app.logger.debug(f"Local MiniCPM sidecar unavailable, falling back to cloud: {e}")
 
-        # Tier 2: Cloud MiniCPM fallback
-        url = "http://azurekong.hertzai.com:8000/minicpm/upload"
+        # Tier 2: Hive mesh peer with GPU
+        try:
+            from integrations.agent_engine.compute_mesh_service import get_compute_mesh
+            mesh = get_compute_mesh()
+            result = mesh.offload_to_best_peer(
+                model_type='vision', prompt=prompt_text,
+                options={'image_path': image_path, 'timeout': 60},
+            )
+            if result and 'error' not in result:
+                return result.get('response', str(result))
+        except Exception as e:
+            app.logger.debug("Hive mesh vision offload not available: %s", e)
+
+        # Tier 3: Cloud MiniCPM fallback
+        from core.config_cache import get_vision_api
+        url = get_vision_api() or "http://azurekong.hertzai.com:8000/minicpm/upload"
         payload = {'prompt': prompt_text}
         fh = open(image_path, 'rb')
         try:
             files = [
                 ('file', ('call.jpg', fh, 'image/jpeg'))
             ]
-            response = pooled_post(url, headers={}, data=payload, files=files)
+            response = pooled_post(url, headers={}, data=payload, files=files, timeout=30)
             app.logger.info(response.text)
             return response.text
         except Exception as e:
-            app.logger.error('Got error in visual QA (cloud fallback)')
+            app.logger.error('Got error in visual QA (cloud fallback): %s', e)
         finally:
             fh.close()
 
@@ -4052,7 +4098,7 @@ def chat():
         rate_key = request.get_json(silent=True) or {}
         rate_user = rate_key.get('user_id', request.remote_addr) if isinstance(rate_key, dict) else request.remote_addr
         if not _limiter.check(str(rate_user), 'chat', max_tokens=30, refill_rate=30 / 60):
-            return jsonify({'error': 'Rate limit exceeded (30/min). Please wait.'}), 429
+            return jsonify({'error': 'Rate limit exceeded (30/min). Please wait.', 'response': None}), 429
     except Exception:
         pass  # Rate limiter unavailable — allow
 
@@ -4104,7 +4150,7 @@ def chat():
     if prompt_id is not None:
         prompt_id = str(prompt_id)
         if not re.match(r'^[a-zA-Z0-9_-]+$', prompt_id):
-            return jsonify({'error': 'Invalid prompt_id format'}), 400
+            return jsonify({'error': 'Invalid prompt_id format', 'response': None}), 400
 
     # Per-request model config override (speculative execution)
     if model_config:
@@ -4120,7 +4166,7 @@ def chat():
             from security.hive_guardrails import GuardrailEnforcer
             allowed, reason, prompt = GuardrailEnforcer.before_dispatch(prompt)
             if not allowed:
-                return jsonify({'error': f'Guardrail: {reason}'}), 403
+                return jsonify({'error': f'Guardrail: {reason}', 'response': None}), 403
         except ImportError:
             pass
 
@@ -4170,7 +4216,7 @@ def chat():
             is_safe, reason = check_prompt_injection(prompt)
             if not is_safe:
                 app.logger.warning(f"Prompt injection detected: {reason}")
-                return jsonify({'error': f'Input rejected: {reason}'}), 400
+                return jsonify({'error': f'Input rejected: {reason}', 'response': None}), 400
         except Exception:
             pass  # Degrade gracefully
 
@@ -5782,6 +5828,63 @@ def voice_audio(filename):
             from flask import send_file
             return send_file(fpath, mimetype='audio/wav')
     return jsonify({'error': 'file not found'}), 404
+
+
+# ---------------------------------------------------------------------------
+# Video Generation API — orchestrates GPU tasks via hive mesh
+# ---------------------------------------------------------------------------
+
+@app.route('/video-gen/', methods=['POST'])
+def video_gen():
+    """Video generation endpoint — drop-in replacement for MakeItTalk.
+
+    Accepts the same request format as MakeItTalk's /video-gen/ endpoint.
+    Dispatches GPU subtasks (TTS, face crop, lip-sync) to local GPU or
+    hive mesh peers. Returns 202 with queue position + ETA.
+
+    Chatbot pipeline can point here instead of MakeItTalk.
+    """
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        data = {}
+
+    if not data:
+        return jsonify({'error': 'No JSON body'}), 400
+
+    # Map user_id if present (chatbot sends 'uid' as request_id)
+    if 'uid' not in data:
+        data['uid'] = data.get('request_id', '')
+
+    try:
+        from integrations.agent_engine.video_orchestrator import get_video_orchestrator
+        orch = get_video_orchestrator()
+        result = orch.generate(data)
+
+        if 'error' in result and 'status' not in result:
+            return jsonify(result), 400
+
+        # Return 202 Accepted (async processing) — same as MakeItTalk
+        # Wrap in 'response' key for chatbot_pipeline compatibility
+        return jsonify({'response': result}), 202
+
+    except Exception as e:
+        logger.error("Video generation error: %s", e, exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/video-gen/status/<job_id>', methods=['GET'])
+def video_gen_status(job_id):
+    """Check status of a video generation job."""
+    try:
+        from integrations.agent_engine.video_orchestrator import get_video_orchestrator
+        orch = get_video_orchestrator()
+        status = orch.get_job_status(job_id)
+        if status:
+            return jsonify(status)
+        return jsonify({'error': 'Job not found'}), 404
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 # ---------------------------------------------------------------------------

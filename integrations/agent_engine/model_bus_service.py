@@ -29,12 +29,51 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger('hevolve.model_bus')
 
+
+# ─── Routing Status Publisher ─────────────────────────────
+# Pushes conversational "Thinking" bubbles to the user's chat topic
+# so the client shows real-time routing progress.
+# Uses the same Crossbar channel the frontend already subscribes to.
+
+def _publish_routing_status(user_id: str, message: str, request_id: str = ''):
+    """Push routing progress to user's UI via Crossbar thinking bubble.
+
+    The client (WebWorker/React Native) renders these as thinking indicators
+    so the user sees: "Processing locally..." → "Checking hive network..." etc.
+    """
+    if not user_id:
+        return
+    try:
+        import json as _json
+        # Lazy import — only needed when actually publishing
+        from langchain_gpt_api import publish_async
+        payload = _json.dumps({
+            'text': [message],
+            'priority': 49,
+            'action': 'Thinking',
+            'bot_type': 'ComputeRouter',
+            'request_id': request_id or '',
+            'historical_request_id': [],
+            'options': [], 'newoptions': [],
+        })
+        publish_async(f'com.hertzai.hevolve.chat.{user_id}', payload)
+    except Exception:
+        pass  # Never block inference on status publishing
+
 # ═══════════════════════════════════════════════════════════════
 # Model Bus Service
 # ═══════════════════════════════════════════════════════════════
 
 class ModelBusService:
     """Unified model access — any app, any model, any device."""
+
+    # Backend health cache — avoids wasting seconds on dead backends.
+    # Key = backend name, Value = (is_alive: bool, last_checked: float)
+    # TTL: alive backends re-checked every 60s, dead every 15s (fast recovery).
+    _health_cache: Dict[str, tuple] = {}
+    _ALIVE_TTL = 60.0   # Re-probe alive backends every 60s
+    _DEAD_TTL = 15.0     # Retry dead backends every 15s
+    _PROBE_TIMEOUT = 1.5  # Health probe: 1.5s max (not 10-60s)
 
     def __init__(
         self,
@@ -66,6 +105,46 @@ class ModelBusService:
             f"ModelBusService initialized: socket={socket_path}, "
             f"http={http_port}, strategy={routing_strategy}"
         )
+
+    # ─── Fast Backend Health Check ────────────────────────────
+
+    def _is_backend_alive(self, name: str, url: str,
+                          health_path: str = '/health') -> bool:
+        """Check if backend is alive using cached health probe.
+
+        Returns instantly for cached results. Only probes when cache is stale.
+        Dead backends are skipped immediately (0ms) until retry TTL expires.
+        This is what prevents 10-60 second waits on dead backends.
+        """
+        now = time.time()
+        cached = self._health_cache.get(name)
+        if cached:
+            is_alive, last_checked = cached
+            ttl = self._ALIVE_TTL if is_alive else self._DEAD_TTL
+            if now - last_checked < ttl:
+                return is_alive
+
+        # Cache miss or stale — quick probe
+        try:
+            from core.http_pool import pooled_get
+            resp = pooled_get(f'{url}{health_path}', timeout=self._PROBE_TIMEOUT)
+            alive = resp.status_code < 500
+        except Exception:
+            alive = False
+
+        self._health_cache[name] = (alive, now)
+        if not alive:
+            logger.debug("Backend %s at %s is DOWN (skipping for %.0fs)",
+                         name, url, self._DEAD_TTL)
+        return alive
+
+    def _mark_backend_dead(self, name: str):
+        """Mark a backend as dead after a request failure (instant skip next time)."""
+        self._health_cache[name] = (False, time.time())
+
+    def _mark_backend_alive(self, name: str):
+        """Mark backend alive after successful request."""
+        self._health_cache[name] = (True, time.time())
 
     # ─── Backend Discovery ───────────────────────────────────
 
@@ -182,6 +261,8 @@ class ModelBusService:
                 result = self._route_tts(prompt, options)
             elif model_type == 'stt':
                 result = self._route_stt(prompt, options)
+            elif model_type == 'video_gen':
+                result = self._route_video_gen(prompt, options)
             elif model_type == 'image_gen':
                 result = self._route_image_gen(prompt, options)
             else:
@@ -211,21 +292,48 @@ class ModelBusService:
             self._semaphore.release()
 
     def _route_llm(self, prompt: str, options: dict) -> dict:
-        """Route LLM inference to best backend."""
-        from core.http_pool import pooled_post
+        """Route LLM inference to best backend.
 
-        # Strategy: try local first, then mesh, then cloud
+        Uses health cache to skip dead backends instantly (0ms) instead of
+        waiting 10-60s for timeout. Marks backends dead on failure so
+        subsequent requests don't waste time on them either.
+        """
+        from core.http_pool import pooled_post
+        uid = options.get('user_id', '')
+        rid = options.get('request_id', '')
+
+        # Build candidate list — skip backends we KNOW are dead (instant)
         backends_to_try = []
 
         if 'llm' in self._backends:
-            backends_to_try.append(('local_llm', self._backends['llm']['url']))
+            url = self._backends['llm']['url']
+            if self._is_backend_alive('local_llm', url):
+                backends_to_try.append(('local_llm', url))
+            else:
+                logger.debug("Skipping local_llm (health cache: dead)")
         if 'mesh' in self._backends:
-            backends_to_try.append(('mesh', self._backends['mesh']['url']))
+            url = self._backends['mesh']['url']
+            if self._is_backend_alive('mesh', url, '/health'):
+                backends_to_try.append(('mesh', url))
         if 'backend' in self._backends:
-            backends_to_try.append(('backend', self._backends['backend']['url']))
+            url = self._backends['backend']['url']
+            if self._is_backend_alive('backend', url, '/status'):
+                backends_to_try.append(('backend', url))
 
         if not backends_to_try:
-            return {'error': 'No LLM backend available', 'response': None}
+            _publish_routing_status(uid,
+                "Looking for an available AI backend...", rid)
+            # Force re-discover (all cached as dead)
+            self.discover_backends()
+            # Rebuild from fresh discovery
+            if 'llm' in self._backends:
+                backends_to_try.append(('local_llm', self._backends['llm']['url']))
+            if 'mesh' in self._backends:
+                backends_to_try.append(('mesh', self._backends['mesh']['url']))
+            if 'backend' in self._backends:
+                backends_to_try.append(('backend', self._backends['backend']['url']))
+            if not backends_to_try:
+                return {'error': 'No LLM backend available', 'response': None}
 
         for backend_name, url in backends_to_try:
             try:
@@ -241,6 +349,7 @@ class ModelBusService:
                         timeout=options.get('timeout', 60),
                     )
                     if resp.status_code == 200:
+                        self._mark_backend_alive('local_llm')
                         data = resp.json()
                         choices = data.get('choices', [])
                         content = choices[0].get('message', {}).get('content', '') if choices else ''
@@ -250,6 +359,8 @@ class ModelBusService:
                             'backend': 'local_llm',
                         }
                 elif backend_name == 'mesh':
+                    _publish_routing_status(uid,
+                        'Routing to hive peer...', rid)
                     # Compute mesh offload
                     resp = pooled_post(
                         f'{url}/mesh/infer',
@@ -257,6 +368,7 @@ class ModelBusService:
                         timeout=options.get('timeout', 120),
                     )
                     if resp.status_code == 200:
+                        self._mark_backend_alive('mesh')
                         data = resp.json()
                         return {
                             'response': data.get('response', ''),
@@ -264,6 +376,8 @@ class ModelBusService:
                             'backend': 'mesh',
                         }
                 elif backend_name == 'backend':
+                    _publish_routing_status(uid,
+                        'Routing to cloud backend...', rid)
                     # HART backend (may route to cloud or world model)
                     resp = pooled_post(
                         f'{url}/chat',
@@ -271,6 +385,7 @@ class ModelBusService:
                         timeout=options.get('timeout', 60),
                     )
                     if resp.status_code == 200:
+                        self._mark_backend_alive('backend')
                         data = resp.json()
                         return {
                             'response': data.get('response', str(data)),
@@ -278,7 +393,9 @@ class ModelBusService:
                             'backend': 'backend',
                         }
             except Exception as e:
-                logger.warning(f"Backend {backend_name} failed: {e}")
+                self._mark_backend_dead(backend_name)
+                logger.warning(f"Backend {backend_name} failed (marked dead for "
+                               f"{self._DEAD_TTL}s): {e}")
                 continue
 
         return {'error': 'All LLM backends failed', 'response': None}
@@ -288,6 +405,8 @@ class ModelBusService:
         from core.http_pool import pooled_post
 
         image_path = options.get('image_path', '')
+        uid = options.get('user_id', '')
+        rid = options.get('request_id', '')
         if not image_path:
             return {'error': 'image_path required for vision inference'}
 
@@ -311,6 +430,8 @@ class ModelBusService:
 
         # Fallback to mesh
         if 'mesh' in self._backends:
+            _publish_routing_status(uid,
+                'No local vision model — checking hive network...', rid)
             try:
                 resp = pooled_post(
                     f"{self._backends['mesh']['url']}/mesh/infer",
@@ -326,6 +447,9 @@ class ModelBusService:
             except Exception:
                 pass
 
+        _publish_routing_status(uid,
+            "I can't analyze this image right now — no vision model available "
+            "locally or on the hive. Try connecting a device with GPU.", rid)
         return {'error': 'No vision backend available', 'response': None}
 
     def _route_tts(self, prompt: str, options: dict) -> dict:
@@ -335,6 +459,8 @@ class ModelBusService:
         policy, hive peers, and urgency. Falls back to legacy chain if
         router is unavailable.
         """
+        uid = options.get('user_id', '')
+        rid = options.get('request_id', '')
         try:
             from integrations.channels.media.tts_router import get_tts_router
             router = get_tts_router()
@@ -359,6 +485,7 @@ class ModelBusService:
             logger.debug("TTS router unavailable (%s), using legacy chain", e)
 
         # Legacy fallback chain (preserved for robustness)
+        _publish_routing_status(uid, 'Generating speech...', rid)
         result = self._try_luxtts(prompt, options)
         if result and 'error' not in result:
             return result
@@ -366,6 +493,8 @@ class ModelBusService:
         makeittalk_url = os.environ.get('MAKEITTALK_API_URL')
         is_offline = (os.environ.get('HART_OS_MODE') and not makeittalk_url)
         if makeittalk_url and not is_offline:
+            _publish_routing_status(uid,
+                'Local TTS engine unavailable, using cloud voice service...', rid)
             result = self._try_makeittalk_tts(prompt, options, makeittalk_url)
             if result and 'error' not in result:
                 return result
@@ -492,6 +621,116 @@ class ModelBusService:
             return {'error': 'Whisper STT not available (pip install sherpa-onnx)', 'response': None}
         except Exception as e:
             return {'error': f'STT inference failed: {e}', 'response': None}
+
+    def _route_video_gen(self, prompt: str, options: dict) -> dict:
+        """Route video generation: local GPU → hive mesh peer → cloud fallback.
+
+        For no-GPU central instances, this offloads to a hive peer that has
+        a GPU with LTX-2, ComfyUI, or Wan2GP loaded.
+
+        Publishes routing status to the user's chat topic so the UI shows
+        real-time progress ("Generating video locally..." → "Checking hive...").
+        """
+        from core.http_pool import pooled_post
+
+        model = options.get('model', 'ltx2')
+        timeout = options.get('timeout', 300)
+        uid = options.get('user_id', '')
+        rid = options.get('request_id', '')
+
+        # 1. Try local GPU servers — skip instantly if health cache says dead
+        local_servers = [
+            ('ltx2', f"http://localhost:{get_port('ltx2_server', 5002)}"),
+            ('comfyui', f"http://localhost:{get_port('comfyui', 8188)}"),
+        ]
+        for name, local_url in local_servers:
+            if not self._is_backend_alive(f'video_{name}', local_url):
+                continue  # 0ms — skip dead server
+            _publish_routing_status(uid, 'Generating video on this device...', rid)
+            try:
+                resp = pooled_post(
+                    f'{local_url}/generate',
+                    json={'prompt': prompt, 'model': model},
+                    timeout=timeout,
+                )
+                if resp.status_code == 200:
+                    self._mark_backend_alive(f'video_{name}')
+                    data = resp.json()
+                    video_url = data.get('video_url') or data.get('output_url', '')
+                    return {
+                        'response': video_url,
+                        'model': model,
+                        'backend': 'local_gpu',
+                    }
+            except Exception:
+                self._mark_backend_dead(f'video_{name}')
+                continue
+
+        # 2. Try hive mesh peer with GPU (central has no GPU → offload)
+        _publish_routing_status(uid,
+            'No local GPU available. Checking hive network for a device with GPU...', rid)
+        try:
+            from integrations.agent_engine.compute_config import get_compute_policy
+            policy = get_compute_policy()
+            if policy.get('compute_policy') != 'local_only':
+                from integrations.agent_engine.compute_mesh_service import get_compute_mesh
+                mesh = get_compute_mesh()
+                result = mesh.offload_to_best_peer(
+                    model_type='video_gen',
+                    prompt=prompt,
+                    options={**options, 'timeout': timeout},
+                )
+                if result and 'error' not in result:
+                    peer = result.get('offloaded_to', 'peer')
+                    _publish_routing_status(uid,
+                        f'Video generation running on hive peer {peer}...', rid)
+                    result['backend'] = 'hive_peer'
+                    return result
+                logger.info("Hive mesh video offload: %s",
+                            result.get('error', 'no result'))
+        except Exception as e:
+            logger.debug("Hive mesh video offload unavailable: %s", e)
+
+        # 3. Cloud fallback (MakeItTalk or external service) — skip if known dead
+        makeittalk_url = os.environ.get('MAKEITTALK_API_URL')
+        if makeittalk_url and self._is_backend_alive(
+                'makeittalk_cloud', makeittalk_url, '/health'):
+            _publish_routing_status(uid,
+                'No hive peers with GPU. Sending to cloud service...', rid)
+            try:
+                resp = pooled_post(
+                    f'{makeittalk_url.rstrip("/")}/video-gen/',
+                    json={
+                        'text': prompt,
+                        'uid': options.get('user_id', 'model_bus'),
+                        **{k: v for k, v in options.items()
+                           if k in ('avatar_id', 'image_url', 'voice_id')},
+                    },
+                    timeout=min(timeout, 60),
+                )
+                if resp.status_code == 200:
+                    self._mark_backend_alive('makeittalk_cloud')
+                    data = resp.json()
+                    return {
+                        'response': data.get('video_url', data.get('url', '')),
+                        'model': 'makeittalk-cloud',
+                        'backend': 'cloud',
+                    }
+            except Exception as e:
+                self._mark_backend_dead('makeittalk_cloud')
+                logger.warning("MakeItTalk video cloud (marked dead): %s", e)
+
+        # All paths exhausted — conversational fallback
+        _publish_routing_status(uid,
+            "I wasn't able to generate the video right now. "
+            "There's no GPU available on this server, no hive peers are online "
+            "with a free GPU, and the cloud video service didn't respond. "
+            "You can try again shortly, or connect a GPU device to your hive "
+            "with: hart compute pair <device-address>", rid)
+        return {'error': 'No video generation backend available',
+                'response': ("I couldn't generate the video — no GPU is available "
+                             "locally or on the hive network right now. "
+                             "Try again in a moment or pair a GPU device.")}
 
     def _route_image_gen(self, prompt: str, options: dict) -> dict:
         """Route image generation inference."""

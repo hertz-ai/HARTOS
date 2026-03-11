@@ -1353,7 +1353,8 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     def img2txt(image_url: Annotated[str, "image url of which you want text"], text: Annotated[
         str, "the details you want from image"] = 'Describe the Images & Text data in this image in detail') -> str:
         current_app.logger.info('INSIDE img2txt')
-        url = "http://azurekong.hertzai.com:8000/llava/image_inference"
+        from core.config_cache import get_vision_api
+        url = get_vision_api() or "http://azurekong.hertzai.com:8000/llava/image_inference"
 
         payload = {
             'url': image_url,
@@ -1593,7 +1594,8 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             image = Image.fromarray(frame)
             # Save the image
             image.save(image_path)
-            url = "http://azurekong.hertzai.com:8000/minicpm/upload"
+            from core.config_cache import get_vision_api
+            url = get_vision_api() or "http://azurekong.hertzai.com:8000/minicpm/upload"
             payload = {
                 'prompt': f'Instruction: Respond in second person point of view\ninput:-{inp}'}
             files = [
