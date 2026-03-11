@@ -68,6 +68,8 @@ TOPIC_MAP = {
     'mock_interview': 'com.hertzai.mock_interview.{user_id}',
     # Telemetry (node → central only, metadata, never content)
     'telemetry.node': 'com.hartos.telemetry.{node_id}',
+    # Compute routing status (client shows real-time routing info)
+    'compute.routing': 'com.hertzai.hevolve.compute.routing.{user_id}',
     # Remote desktop
     'remote_desktop.signal': 'com.hartos.remote_desktop.signal.{device_id}',
 }

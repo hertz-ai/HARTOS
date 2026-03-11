@@ -341,7 +341,9 @@ def top5_results(query):
     return final_res
 
 def parse_user_id(user_id:int):
-    url = 'http://azurekong.hertzai.com:8000/db/getstudent_by_user_id'
+    from core.config_cache import get_db_url
+    base = get_db_url() or 'https://mailer.hertzai.com'
+    url = f'{base}/getstudent_by_user_id'
 
     headers = {
         'Content-Type': 'application/json'
@@ -351,7 +353,7 @@ def parse_user_id(user_id:int):
         "user_id": user_id
     })
 
-    response = pooled_request("POST", url, headers=headers, data=payload)
+    response = pooled_request("POST", url, headers=headers, data=payload, timeout=15)
     return response.text
 
 def topological_sort(actions):
@@ -1503,7 +1505,8 @@ def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual c
         image = Image.fromarray(frame)
         # Save the image
         image.save(image_path)
-        url = "http://azurekong.hertzai.com:8000/minicpm/upload"
+        from core.config_cache import get_vision_api
+        url = get_vision_api() or "http://azurekong.hertzai.com:8000/minicpm/upload"
         payload = {
             'prompt': f'Instruction: Respond in second person point of view\ninput:-{inp}'}
         files = [
@@ -1512,13 +1515,13 @@ def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual c
         headers = {}
         try:
             response = pooled_post(
-                url, headers=headers, data=payload, files=files)
+                url, headers=headers, data=payload, files=files, timeout=30)
             current_app.logger.info(response.text)
             response = response.text
 
             return response
         except Exception as e:
-            current_app.logger.info('ERROR: Got error in visal QA')
+            current_app.logger.info('ERROR: Got error in visual QA: %s', e)
             return 'failed to get visual context ask user to check if the camera is turned on'
     else:
         return 'failed to get visual context ask user to check if the camera is turned on'
