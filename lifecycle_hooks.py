@@ -1009,18 +1009,22 @@ def sync_action_state_to_ledger(
     Returns:
         bool: True if sync was successful, False otherwise
 
-    State Mapping:
+    State Mapping (must match _auto_sync_to_ledger):
         ActionState.ASSIGNED → LedgerTaskStatus.PENDING
         ActionState.IN_PROGRESS → LedgerTaskStatus.IN_PROGRESS
         ActionState.STATUS_VERIFICATION_REQUESTED → LedgerTaskStatus.IN_PROGRESS
         ActionState.COMPLETED → LedgerTaskStatus.COMPLETED
         ActionState.PENDING → LedgerTaskStatus.BLOCKED
         ActionState.ERROR → LedgerTaskStatus.FAILED
-        ActionState.FALLBACK_REQUESTED → LedgerTaskStatus.PAUSED
+        ActionState.FALLBACK_REQUESTED → LedgerTaskStatus.BLOCKED
         ActionState.FALLBACK_RECEIVED → LedgerTaskStatus.IN_PROGRESS
         ActionState.RECIPE_REQUESTED → LedgerTaskStatus.IN_PROGRESS
-        ActionState.RECIPE_RECEIVED → LedgerTaskStatus.IN_PROGRESS
+        ActionState.RECIPE_RECEIVED → LedgerTaskStatus.COMPLETED
         ActionState.TERMINATED → LedgerTaskStatus.COMPLETED
+        ActionState.EXECUTING_MOTION → LedgerTaskStatus.IN_PROGRESS
+        ActionState.SENSOR_CONFIRM → LedgerTaskStatus.IN_PROGRESS
+        ActionState.PREVIEW_PENDING → LedgerTaskStatus.BLOCKED
+        ActionState.PREVIEW_APPROVED → LedgerTaskStatus.IN_PROGRESS
     """
     if user_prompt not in user_ledgers:
         logger.debug(f"No ledger found for {user_prompt}, skipping sync")
@@ -1036,7 +1040,7 @@ def sync_action_state_to_ledger(
     try:
         LedgerTaskStatus = _get_ledger_task_status()
 
-        # Map ActionState to LedgerTaskStatus
+        # Map ActionState to LedgerTaskStatus — must match _auto_sync_to_ledger
         STATE_MAP = {
             ActionState.ASSIGNED: LedgerTaskStatus.PENDING,
             ActionState.IN_PROGRESS: LedgerTaskStatus.IN_PROGRESS,
@@ -1044,11 +1048,17 @@ def sync_action_state_to_ledger(
             ActionState.COMPLETED: LedgerTaskStatus.COMPLETED,
             ActionState.PENDING: LedgerTaskStatus.BLOCKED,
             ActionState.ERROR: LedgerTaskStatus.FAILED,
-            ActionState.FALLBACK_REQUESTED: LedgerTaskStatus.PAUSED,
+            ActionState.FALLBACK_REQUESTED: LedgerTaskStatus.BLOCKED,
             ActionState.FALLBACK_RECEIVED: LedgerTaskStatus.IN_PROGRESS,
             ActionState.RECIPE_REQUESTED: LedgerTaskStatus.IN_PROGRESS,
-            ActionState.RECIPE_RECEIVED: LedgerTaskStatus.IN_PROGRESS,
+            ActionState.RECIPE_RECEIVED: LedgerTaskStatus.COMPLETED,
             ActionState.TERMINATED: LedgerTaskStatus.COMPLETED,
+            # VLM / physical action states
+            ActionState.EXECUTING_MOTION: LedgerTaskStatus.IN_PROGRESS,
+            ActionState.SENSOR_CONFIRM: LedgerTaskStatus.IN_PROGRESS,
+            # Consent / approval
+            ActionState.PREVIEW_PENDING: LedgerTaskStatus.BLOCKED,
+            ActionState.PREVIEW_APPROVED: LedgerTaskStatus.IN_PROGRESS,
         }
 
         ledger_status = STATE_MAP.get(state)

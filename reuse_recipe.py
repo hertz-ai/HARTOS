@@ -1854,7 +1854,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
                         for i, action in enumerate(recipes[user_prompt]['actions']):
                             if action.get("action_id") == action_id:
-                                recipes[user_prompt]['actions'][i] == vlm_action
+                                recipes[user_prompt]['actions'][i] = vlm_action
                                 action_exists = True
                                 break
 
