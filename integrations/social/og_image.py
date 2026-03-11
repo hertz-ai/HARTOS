@@ -13,7 +13,11 @@ from pathlib import Path
 logger = logging.getLogger('hevolve_social')
 
 # Cache directory for generated OG images
-OG_CACHE_DIR = Path(os.path.expanduser('~/Documents/Nunba/data/og-cache'))
+try:
+    from core.platform_paths import get_db_dir as _get_db_dir_og
+    OG_CACHE_DIR = Path(_get_db_dir_og()) / 'og-cache'
+except ImportError:
+    OG_CACHE_DIR = Path(os.path.expanduser('~/Documents/Nunba/data/og-cache'))
 
 # Image dimensions (Facebook/LinkedIn recommended)
 WIDTH = 1200

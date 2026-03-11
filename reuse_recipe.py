@@ -970,9 +970,13 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     try:
         from integrations.channels.memory.memory_graph import MemoryGraph
         import os
-        graph_db_path = os.path.join(
-            os.path.expanduser("~"), "Documents", "Nunba", "data", "memory_graph", user_prompt
-        )
+        try:
+            from core.platform_paths import get_memory_graph_dir
+            graph_db_path = get_memory_graph_dir(user_prompt)
+        except ImportError:
+            graph_db_path = os.path.join(
+                os.path.expanduser("~"), "Documents", "Nunba", "data", "memory_graph", user_prompt
+            )
         memory_graph = MemoryGraph(db_path=graph_db_path, user_id=str(user_id))
         current_app.logger.info(f"MemoryGraph initialized for {user_prompt}")
     except Exception as e:
@@ -3018,6 +3022,22 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
         count = 0
         while True:
             current_app.logger.info('inside reuse while1')
+
+            # === LEDGER v2.0: Heartbeat + Budget/SLA using KNOWN state ===
+            _reuse_current_action = user_tasks[user_prompt].current_action
+            _reuse_ledger = user_ledgers.get(user_prompt)
+            if _reuse_ledger:
+                _reuse_task_id = f"action_{_reuse_current_action}"
+                _reuse_task = _reuse_ledger.tasks.get(_reuse_task_id)
+                if _reuse_task:
+                    _reuse_task.heartbeat()
+                    if _reuse_task.is_budget_exhausted():
+                        current_app.logger.warning(f"[BUDGET] Task {_reuse_task_id} budget exhausted in reuse loop")
+                        break
+                    if _reuse_task.is_sla_breached() and not _reuse_task.sla_breached:
+                        _reuse_task.mark_sla_breached()
+                        current_app.logger.warning(f"[SLA] Task {_reuse_task_id} SLA breached in reuse loop")
+
             if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
                 current_app.logger.info(
                     f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
@@ -3028,8 +3048,14 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                         json_obj = ast.literal_eval(group_chat.messages[-2]["content"])
                     current_app.logger.info(f'got json object {json_obj}')
                     if json_obj['status'].lower() == 'completed':
-                        current_app.logger.info(f'UPDATING CURRENT ACTION AS :{int(json_obj["action_id"])}')
-                        user_tasks[user_prompt].current_action = int(json_obj['action_id'])
+                        # === LLM CLAIM VALIDATION: cross-reference against known state ===
+                        _llm_action_id = int(json_obj.get("action_id", _reuse_current_action))
+                        if _llm_action_id != _reuse_current_action:
+                            current_app.logger.warning(
+                                f"[HALLUCINATION?] LLM claims action_id={_llm_action_id} "
+                                f"but pipeline assigned {_reuse_current_action} — using known value")
+                        current_app.logger.info(f'UPDATING CURRENT ACTION AS :{_reuse_current_action}')
+                        user_tasks[user_prompt].current_action = _reuse_current_action
                         action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)[
                             'action']
                         steps = [{x['steps']: {'tool_name': x.get('tool_name', None),
@@ -3050,8 +3076,15 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                             json_obj = json.loads(json_part)
                             current_app.logger.info(f'got json object {json_obj}')
                             if json_obj['status'].lower() == 'completed':
-                                current_app.logger.info(f'UPDATING CURRENT ACTION AS :{int(json_obj["action_id"])}')
-                                user_tasks[user_prompt].current_action = int(json_obj['action_id'])
+                                # Use KNOWN action_id from scope, not LLM's claim
+                                _known_action = user_tasks[user_prompt].current_action
+                                _llm_claimed = int(json_obj.get("action_id", _known_action))
+                                if _llm_claimed != _known_action:
+                                    current_app.logger.warning(
+                                        f"[HALLUCINATION?] LLM claims action_id={_llm_claimed} "
+                                        f"but pipeline has {_known_action}")
+                                current_app.logger.info(f'UPDATING CURRENT ACTION AS :{_known_action}')
+                                user_tasks[user_prompt].current_action = _known_action
                                 action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)['action']
                                 steps = [{x['steps']: {'tool_name': x.get('tool_name', None),
                                                        'code': x.get('generalized_functions', None)}} for x in
@@ -3500,6 +3533,20 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                 count = 0
                 while True:
                     current_app.logger.info('inside while2')
+
+                    # === LEDGER v2.0: Heartbeat + Budget/SLA ===
+                    _w2_current = user_tasks[user_prompt].current_action
+                    _w2_ledger = user_ledgers.get(user_prompt)
+                    if _w2_ledger:
+                        _w2_task = _w2_ledger.tasks.get(f"action_{_w2_current}")
+                        if _w2_task:
+                            _w2_task.heartbeat()
+                            if _w2_task.is_budget_exhausted():
+                                current_app.logger.warning(f"[BUDGET] action_{_w2_current} budget exhausted in while2")
+                                break
+                            if _w2_task.is_sla_breached() and not _w2_task.sla_breached:
+                                _w2_task.mark_sla_breached()
+
                     if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
                         current_app.logger.info(
                             f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
@@ -3510,8 +3557,14 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                 json_obj = ast.literal_eval(group_chat.messages[-2]["content"])
                             current_app.logger.info(f'got json object {json_obj}')
                             if json_obj['status'].lower() == 'completed':
-                                current_app.logger.info(f'UPDATIN CURRENT ACTION AS :{int(json_obj["action_id"])}')
-                                user_tasks[user_prompt].current_action = int(json_obj['action_id'])
+                                # Use KNOWN action_id, not LLM's claim
+                                _llm_aid = int(json_obj.get("action_id", _w2_current))
+                                if _llm_aid != _w2_current:
+                                    current_app.logger.warning(
+                                        f"[HALLUCINATION?] LLM claims action_id={_llm_aid} "
+                                        f"but pipeline has {_w2_current}")
+                                current_app.logger.info(f'UPDATING CURRENT ACTION AS :{_w2_current}')
+                                user_tasks[user_prompt].current_action = _w2_current
                                 action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)['action']
                                 steps = [{x['steps']: {'tool_name': x.get('tool_name', None),
                                                        'code': x.get('generalized_functions', None)}} for x in
@@ -3529,9 +3582,15 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                     json_obj = json.loads(json_part)
                                     current_app.logger.info(f'got json object {json_obj}')
                                     if json_obj['status'].lower() == 'completed':
+                                        # Use KNOWN action_id, not LLM's claim
+                                        _llm_aid2 = int(json_obj.get("action_id", _w2_current))
+                                        if _llm_aid2 != _w2_current:
+                                            current_app.logger.warning(
+                                                f"[HALLUCINATION?] LLM claims action_id={_llm_aid2} "
+                                                f"but pipeline has {_w2_current}")
                                         current_app.logger.info(
-                                            f'UPDATIN CURRENT ACTION AS :{int(json_obj["action_id"])}')
-                                        user_tasks[user_prompt].current_action = int(json_obj['action_id'])
+                                            f'UPDATING CURRENT ACTION AS :{_w2_current}')
+                                        user_tasks[user_prompt].current_action = _w2_current
                                         action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)['action']
                                         steps = [{x['steps']: {'tool_name': x.get('tool_name', None),
                                                                'code': x.get('generalized_functions', None)}} for x in

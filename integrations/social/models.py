@@ -54,8 +54,12 @@ else:
     if _DB_PATH_ENV:
         DB_PATH = _DB_PATH_ENV
     elif os.environ.get('NUNBA_BUNDLED') or getattr(_sys_models, 'frozen', False):
-        # Bundled mode: use writable user directory (Program Files is read-only)
-        DB_PATH = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'hevolve_database.db')
+        # Bundled mode: cross-platform writable data dir
+        try:
+            from core.platform_paths import get_db_path as _get_db_path
+            DB_PATH = _get_db_path('hevolve_database.db')
+        except ImportError:
+            DB_PATH = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'hevolve_database.db')
     else:
         DB_PATH = os.path.join(
             os.path.dirname(__file__), '..', '..', 'agent_data', 'hevolve_database.db')

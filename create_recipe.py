@@ -132,13 +132,21 @@ from integrations.expert_agents import (
 # Set up a dedicated logger that doesn't depend on Flask context
 # Use writable log dir: ~/Documents/Nunba/logs in bundled mode, else relative 'logs'
 if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
-    log_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'logs')
+    try:
+        from core.platform_paths import get_log_dir as _get_log_dir
+        log_dir = _get_log_dir()
+    except ImportError:
+        log_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'logs')
 else:
     log_dir = "logs"
 try:
     os.makedirs(log_dir, exist_ok=True)
 except PermissionError:
-    log_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'logs')
+    try:
+        from core.platform_paths import get_log_dir as _get_log_dir
+        log_dir = _get_log_dir()
+    except ImportError:
+        log_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'logs')
     os.makedirs(log_dir, exist_ok=True)
 
 # Create a custom logger with timestamp in filename
@@ -773,9 +781,13 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     try:
         from integrations.channels.memory.memory_graph import MemoryGraph
         import os
-        graph_db_path = os.path.join(
-            os.path.expanduser("~"), "Documents", "Nunba", "data", "memory_graph", user_prompt
-        )
+        try:
+            from core.platform_paths import get_memory_graph_dir
+            graph_db_path = get_memory_graph_dir(user_prompt)
+        except ImportError:
+            graph_db_path = os.path.join(
+                os.path.expanduser("~"), "Documents", "Nunba", "data", "memory_graph", user_prompt
+            )
         memory_graph = MemoryGraph(db_path=graph_db_path, user_id=str(user_id))
         tool_logger.info(f"MemoryGraph initialized for {user_prompt}")
     except Exception as e:
@@ -3171,6 +3183,32 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
 
             current_app.logger.info(f"WHILE LOOP ITERATION #{while_loop_iterations} , Current Action Id:{current_action_id}")
 
+            # === LEDGER v2.0: Heartbeat + Budget/SLA using KNOWN state (not LLM) ===
+            _ledger = user_ledgers.get(user_prompt)
+            if _ledger:
+                _task_id = f"action_{current_action_id}"
+                _task = _ledger.tasks.get(_task_id)
+                if _task:
+                    # Heartbeat: agent is alive and working on this action
+                    _task.heartbeat()
+
+                    # Budget enforcement: abort if budget exhausted
+                    if _task.is_budget_exhausted():
+                        current_app.logger.warning(
+                            f"[BUDGET] Task {_task_id} budget exhausted "
+                            f"(spark={_task.spark_spent}/{_task.spark_budget}, "
+                            f"time={_task.time_spent_s}/{_task.time_budget_s})")
+                        _task.post_status("Budget exhausted — aborting", progress_pct=_task.progress_pct)
+                        safe_set_state(user_prompt, current_action_id, ActionState.ERROR,
+                                       "budget exhausted")
+                        break
+
+                    # SLA advisory: flag breach but don't block
+                    if _task.is_sla_breached() and not _task.sla_breached:
+                        _task.mark_sla_breached()
+                        _task.post_status("SLA breached — continuing but flagged")
+                        current_app.logger.warning(f"[SLA] Task {_task_id} SLA breached")
+
             track_lifecycle_hooks(current_action_id, group_chat, user_prompt)
 
             # Load persona info from config
@@ -3229,6 +3267,55 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         continue
                     elif json_obj['status'].lower() == 'completed' and 'recipe' not in json_obj.keys():
                         json_action_id = int(json_obj.get('action_id', current_action_id))
+
+                        # === LLM HALLUCINATION DEFENSE ===
+                        # Cross-reference LLM-claimed action_id against KNOWN state.
+                        # The pipeline knows which action was assigned — the LLM can lie.
+                        _claim_valid = True
+                        _rejection_reason = None
+                        _claim_ledger = user_ledgers.get(user_prompt)
+
+                        # Check 1: Does the LLM-claimed action_id match what we assigned?
+                        if json_action_id != current_action_id:
+                            current_app.logger.warning(
+                                f"[HALLUCINATION?] LLM claims action_id={json_action_id} "
+                                f"but pipeline assigned action_id={current_action_id}")
+                            # Use the KNOWN action_id from scope — not the LLM's claim
+                            json_action_id = current_action_id
+
+                        if _claim_ledger:
+                            _claimed_task_id = f"action_{json_action_id}"
+                            _claimed_task = _claim_ledger.tasks.get(_claimed_task_id)
+
+                            if _claimed_task:
+                                # Check 2: Is the task in a state where completion makes sense?
+                                from agent_ledger import TaskStatus as _TS
+                                if _claimed_task.status in (_TS.COMPLETED, _TS.TERMINATED,
+                                                            _TS.CANCELLED, _TS.SKIPPED):
+                                    _claim_valid = False
+                                    _rejection_reason = (
+                                        f"Task {_claimed_task_id} already in terminal state "
+                                        f"{_claimed_task.status.value} — LLM cannot re-complete it")
+
+                                # Check 3: Integrity — has task data been corrupted?
+                                if _claim_valid and not _claimed_task.verify_integrity():
+                                    _claim_valid = False
+                                    _rejection_reason = (
+                                        f"Task {_claimed_task_id} integrity check failed — "
+                                        f"data_hash mismatch, possible corruption")
+                            else:
+                                # Check 4: Task doesn't exist in ledger at all
+                                _claim_valid = False
+                                _rejection_reason = f"Task {_claimed_task_id} not found in ledger"
+
+                        if not _claim_valid:
+                            current_app.logger.error(f"[CLAIM REJECTED] {_rejection_reason}")
+                            # Don't accept — force the LLM to retry
+                            message = (f"Your completion claim was rejected: {_rejection_reason}. "
+                                       f"Continue working on action {current_action_id}.")
+                            result = chat_instructor.initiate_chat(
+                                recipient=manager, message=message, clear_history=False)
+                            continue
 
                         force_state_through_valid_path(user_prompt, json_action_id, ActionState.COMPLETED,
                                                        "verified complete")

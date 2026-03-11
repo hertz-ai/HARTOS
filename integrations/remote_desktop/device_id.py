@@ -24,10 +24,16 @@ def _resolve_key_dir() -> str:
     if data_dir:
         return os.path.join(data_dir, 'mesh', 'keys')
     # Fallback: agent_data in project root or user home
+    # Try platform_paths first for cross-platform support
+    try:
+        from core.platform_paths import get_agent_data_dir
+        _pp_agent_dir = get_agent_data_dir()
+    except ImportError:
+        _pp_agent_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data')
     for candidate in [
         os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
             os.path.abspath(__file__)))), 'agent_data'),
-        os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data'),
+        _pp_agent_dir,
     ]:
         if os.path.isdir(candidate):
             return candidate

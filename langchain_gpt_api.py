@@ -212,8 +212,12 @@ except Exception:
     retrieve_json = None
     # Frozen builds install to Program Files (read-only) — redirect to user data dir
     if getattr(sys, 'frozen', False):
-        PROMPTS_DIR = os.path.abspath(os.path.join(
-            os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'prompts'))
+        try:
+            from core.platform_paths import get_prompts_dir
+            PROMPTS_DIR = os.path.abspath(get_prompts_dir())
+        except ImportError:
+            PROMPTS_DIR = os.path.abspath(os.path.join(
+                os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'prompts'))
     else:
         PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
     safe_prompt_path = None
@@ -249,9 +253,13 @@ def _get_or_create_graph(user_id, prompt_id=None):
         session_key = f"{user_id}_{prompt_id}" if prompt_id else str(user_id)
         with _memory_graph_lock:
             if session_key not in _memory_graphs:
-                db_path = os.path.join(
-                    os.path.expanduser("~"), "Documents", "Nunba", "data", "memory_graph", session_key
-                )
+                try:
+                    from core.platform_paths import get_memory_graph_dir
+                    db_path = get_memory_graph_dir(session_key)
+                except ImportError:
+                    db_path = os.path.join(
+                        os.path.expanduser("~"), "Documents", "Nunba", "data", "memory_graph", session_key
+                    )
                 _memory_graphs[session_key] = MemoryGraph(
                     db_path=db_path,
                     user_id=str(user_id),
@@ -462,7 +470,11 @@ logging.setLogRecordFactory(RequestLogRecord)
 _is_bundled = bool(os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False))
 
 if _is_bundled:
-    _nunba_log_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'logs')
+    try:
+        from core.platform_paths import get_log_dir as _get_log_dir_lc
+        _nunba_log_dir = _get_log_dir_lc()
+    except ImportError:
+        _nunba_log_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'logs')
     try:
         os.makedirs(_nunba_log_dir, exist_ok=True)
     except PermissionError:
@@ -6320,7 +6332,11 @@ def _validate_startup():
     if _db_p and _db_p != ':memory:' and os.path.isabs(_db_p):
         db_dir = os.path.join(os.path.dirname(_db_p), 'agent_data')
     elif os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
-        db_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data')
+        try:
+            from core.platform_paths import get_agent_data_dir as _get_ad_dir
+            db_dir = _get_ad_dir()
+        except ImportError:
+            db_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data')
     else:
         db_dir = os.path.join(os.path.dirname(__file__), 'agent_data')
     if not os.path.isdir(db_dir):

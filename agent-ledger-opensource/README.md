@@ -13,13 +13,22 @@ Agent Ledger is a production-ready, standalone task tracking system with persist
 ## Features
 
 - **Persistent Memory** - Tasks survive restarts, crashes, and interruptions
-- **12 Task States** - Comprehensive lifecycle (PENDING, IN_PROGRESS, BLOCKED, COMPLETED, etc.)
+- **15 Task States** - Comprehensive lifecycle (PENDING, IN_PROGRESS, BLOCKED, DELEGATED, DEFERRED, COMPLETED, ROLLED_BACK, etc.)
 - **Parent-Child Tasks** - Hierarchical task relationships with auto-resume
 - **Dynamic Reprioritization** - Change priorities on-the-fly
 - **Multiple Backends** - Redis, JSON, MongoDB, PostgreSQL, or in-memory
 - **State History** - Complete audit trail of all state transitions
+- **Ownership Tracking** - Claim/release/transfer tasks across nodes with audit trail
+- **Budget & SLA** - Time budgets, Spark budgets, deadlines with breach notification
+- **Integrity Verification** - SHA-256 hash sealing detects corruption/tampering
+- **Heartbeat & Observability** - Agent liveness tracking, progress reporting, status messages
+- **Delegation** - Hand off tasks to sub-agents with result tracking
+- **Locality & Sensitivity** - Control where tasks can execute (local-only to global)
+- **LLM Hallucination Defense** - Cross-reference LLM claims against pipeline state
 - **Framework Agnostic** - Works with AutoGen, LangChain, CrewAI, or custom agents
 - **Zero Core Dependencies** - Pure Python 3.7+ (optional backends need their packages)
+
+> **Full integration guide**: See [AGENT_LEDGER_GUIDE.md](AGENT_LEDGER_GUIDE.md) for complete lifecycle documentation, HARTOS wiring details, and what NOT to do.
 
 ---
 
@@ -256,16 +265,19 @@ class TaskType(Enum):
 
 class TaskStatus(Enum):
     PENDING          # Not started
+    DEFERRED         # Intentionally postponed
     IN_PROGRESS      # Currently executing
+    DELEGATED        # Handed to another agent
     PAUSED           # Paused by system
     USER_STOPPED     # User stopped
-    BLOCKED          # Blocked by dependencies
+    BLOCKED          # Blocked (see BlockedReason for why)
     COMPLETED        # Successfully finished
     FAILED           # Failed with error
     CANCELLED        # Cancelled by user
     TERMINATED       # Forcefully killed
     SKIPPED          # Not needed
     NOT_APPLICABLE   # No longer relevant
+    ROLLED_BACK      # Completed then undone
     RESUMING         # Being resumed
 
 class ExecutionMode(Enum):

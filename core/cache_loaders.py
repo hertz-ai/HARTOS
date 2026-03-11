@@ -17,9 +17,10 @@ def _resolve_agent_data_dir():
     db_path = os.environ.get('HEVOLVE_DB_PATH', '')
     if db_path and db_path != ':memory:' and os.path.isabs(db_path):
         return os.path.join(os.path.dirname(db_path), 'agent_data')
-    # Bundled/frozen mode: use writable user directory (Program Files is read-only)
+    # Bundled/frozen mode: use cross-platform data dir (Program Files is read-only)
     if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
-        return os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data')
+        from core.platform_paths import get_agent_data_dir
+        return get_agent_data_dir()
     return os.path.join(os.path.dirname(os.path.dirname(__file__)), 'agent_data')
 
 AGENT_DATA_DIR = _resolve_agent_data_dir()
@@ -28,9 +29,10 @@ def _resolve_prompts_dir():
     base = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'prompts')
     if os.path.isdir(base):
         return base
-    # Bundled mode fallback: prompts next to agent_data
+    # Bundled mode fallback: cross-platform prompts dir
     if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
-        return os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'prompts')
+        from core.platform_paths import get_prompts_dir
+        return get_prompts_dir()
     return base
 
 PROMPTS_DIR = _resolve_prompts_dir()
