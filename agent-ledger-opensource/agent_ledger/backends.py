@@ -16,6 +16,7 @@ Usage:
 """
 
 import json
+import os
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional, List
 from datetime import datetime
@@ -103,16 +104,28 @@ class JSONBackend(StorageBackend):
         self.storage_dir.mkdir(exist_ok=True)
 
     def _get_path(self, key: str):
-        return self.storage_dir / f"{key}.json"
+        # Sanitize key to prevent path traversal
+        safe_key = key.replace('..', '_').replace('/', '_').replace('\\', '_')
+        return self.storage_dir / f"{safe_key}.json"
 
     def save(self, key: str, data: Dict[str, Any]) -> bool:
         try:
             path = self._get_path(key)
-            with open(path, 'w', encoding='utf-8') as f:
+            tmp_path = path.with_suffix('.tmp')
+            with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(str(tmp_path), str(path))
             return True
         except Exception as e:
             print(f"[JSONBackend] Save error: {e}")
+            # Clean up temp file on failure
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
             return False
 
     def load(self, key: str) -> Optional[Dict[str, Any]]:

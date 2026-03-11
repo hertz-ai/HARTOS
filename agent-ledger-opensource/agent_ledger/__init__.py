@@ -41,6 +41,8 @@ from .core import (
     TaskType,
     TaskStatus,
     ExecutionMode,
+    TaskLocality,
+    TaskSensitivity,
     # Reason enums for sub-states
     BlockedReason,
     FailureReason,
@@ -82,7 +84,7 @@ from .pubsub import LedgerPubSub
 from .heartbeat import AgentHeartbeat
 from .distributed import DistributedTaskLock
 
-__version__ = "1.2.0"
+__version__ = "2.0.0"
 __author__ = "Agent Ledger Contributors"
 __license__ = "MIT"
 
@@ -93,6 +95,8 @@ __all__ = [
     "TaskType",
     "TaskStatus",
     "ExecutionMode",
+    "TaskLocality",
+    "TaskSensitivity",
 
     # Reason enums (sub-states)
     "BlockedReason",

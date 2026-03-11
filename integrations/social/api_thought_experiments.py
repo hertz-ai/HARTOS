@@ -14,6 +14,12 @@ POST /api/social/experiments/<id>/evaluate — Trigger agent evaluation
 POST /api/social/experiments/<id>/decide  — Record decision
 GET  /api/social/experiments/<id>/votes   — Get all votes
 GET  /api/social/experiments/<id>/timeline — Get lifecycle timeline
+
+Auto Evolve:
+POST /api/social/experiments/auto-evolve        — Start democratic auto-evolve cycle
+GET  /api/social/experiments/auto-evolve/status  — Get auto-evolve status
+POST /api/social/experiments/<id>/pause-evolve   — Owner pause iteration
+POST /api/social/experiments/<id>/resume-evolve  — Owner resume iteration
 """
 import logging
 
@@ -355,3 +361,84 @@ def contribute_to_experiment(experiment_id):
         return jsonify({'success': False, 'error': str(e)}), 500
     finally:
         db.close()
+
+
+# ─── Auto Evolve Endpoints ───
+
+
+@thought_experiments_bp.route('/api/social/experiments/auto-evolve',
+                               methods=['POST'])
+def start_auto_evolve():
+    """Start a democratic auto-evolve cycle.
+
+    Gathers eligible experiments → constitutional filter → vote tally →
+    dispatch top-N winners to type-aware iteration loops.
+    """
+    body = request.get_json(silent=True) or {}
+    user_id = body.get('user_id', 'system')
+    max_experiments = body.get('max_experiments', 5)
+    min_approval = body.get('min_approval_score', 0.3)
+
+    try:
+        from integrations.agent_engine.auto_evolve import get_auto_evolve_orchestrator
+        orch = get_auto_evolve_orchestrator()
+        result = orch.start(
+            max_experiments=int(max_experiments),
+            min_approval_score=float(min_approval),
+            user_id=user_id,
+        )
+        status_code = 200 if result.get('success') else 409
+        return jsonify(result), status_code
+    except Exception as e:
+        logger.error(f"Auto-evolve start error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@thought_experiments_bp.route('/api/social/experiments/auto-evolve/status',
+                               methods=['GET'])
+def auto_evolve_status():
+    """Get the current auto-evolve cycle status."""
+    try:
+        from integrations.agent_engine.auto_evolve import get_auto_evolve_orchestrator
+        orch = get_auto_evolve_orchestrator()
+        return jsonify(orch.get_status()), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@thought_experiments_bp.route(
+    '/api/social/experiments/<experiment_id>/pause-evolve', methods=['POST'])
+def pause_evolve(experiment_id):
+    """Pause a running experiment's evolution (owner only)."""
+    body = request.get_json(silent=True) or {}
+    user_id = body.get('user_id', '')
+
+    if not user_id:
+        return jsonify({'success': False, 'error': 'user_id required'}), 400
+
+    try:
+        from integrations.agent_engine.auto_evolve import pause_experiment_evolution
+        result = pause_experiment_evolution(experiment_id, user_id)
+        status_code = 200 if result.get('success') else 403
+        return jsonify(result), status_code
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@thought_experiments_bp.route(
+    '/api/social/experiments/<experiment_id>/resume-evolve', methods=['POST'])
+def resume_evolve(experiment_id):
+    """Resume a paused experiment's evolution (owner only)."""
+    body = request.get_json(silent=True) or {}
+    user_id = body.get('user_id', '')
+
+    if not user_id:
+        return jsonify({'success': False, 'error': 'user_id required'}), 400
+
+    try:
+        from integrations.agent_engine.auto_evolve import resume_experiment_evolution
+        result = resume_experiment_evolution(experiment_id, user_id)
+        status_code = 200 if result.get('success') else 403
+        return jsonify(result), status_code
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500

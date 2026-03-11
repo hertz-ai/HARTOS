@@ -1250,3 +1250,74 @@ def _build_self_build_prompt(goal_dict: Dict, product_dict: Optional[Dict] = Non
 
 register_goal_type('self_build', _build_self_build_prompt,
                     tool_tags=['self_build'])
+
+
+# ─── AutoResearch — Autonomous Experiment Loop ───
+
+def _build_autoresearch_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
+    """Build prompt for autonomous research loop agent.
+
+    Inspired by karpathy/autoresearch: edit code → run experiments → score →
+    keep best → iterate. At hive scale across distributed compute.
+    """
+    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    repo_path = config.get('repo_path', '')
+    target_file = config.get('target_file', '')
+    run_command = config.get('run_command', '')
+    metric_name = config.get('metric_name', 'score')
+    metric_direction = config.get('metric_direction', 'higher_is_better')
+    max_iterations = config.get('max_iterations', 50)
+    time_budget_s = config.get('time_budget_s', 300)
+    hive_parallel = config.get('hive_parallel', False)
+    experiment_id = config.get('experiment_id', '')
+
+    return (
+        f"YOU ARE AN AUTONOMOUS RESEARCH AGENT.\n\n"
+        f"Goal: {goal_dict.get('title', '')}\n"
+        f"Description: {goal_dict.get('description', '')}\n\n"
+
+        f"YOUR MISSION:\n"
+        f"Run an autonomous experiment loop: edit code, run experiments, "
+        f"measure results, keep improvements, iterate until budget exhausted.\n\n"
+
+        f"CONFIGURATION:\n"
+        f"  Repository: {repo_path}\n"
+        f"  Target file: {target_file}\n"
+        f"  Run command: {run_command}\n"
+        f"  Metric: {metric_name} ({metric_direction})\n"
+        f"  Max iterations: {max_iterations}\n"
+        f"  Time budget per iteration: {time_budget_s}s\n"
+        f"  Hive parallel: {hive_parallel}\n"
+        f"  Thought experiment ID: {experiment_id}\n\n"
+
+        f"WORKFLOW:\n"
+        f"1. Call start_autoresearch() with the configuration above\n"
+        f"2. Monitor progress with get_autoresearch_status()\n"
+        f"3. The engine autonomously:\n"
+        f"   a) Runs the baseline (unmodified code)\n"
+        f"   b) Proposes a hypothesis (code modification)\n"
+        f"   c) Applies the edit to {target_file}\n"
+        f"   d) Runs: {run_command}\n"
+        f"   e) Extracts {metric_name} from output\n"
+        f"   f) If improved → commits and advances\n"
+        f"   g) If not improved → reverts to last good state\n"
+        f"   h) Repeats until budget or {max_iterations} iterations\n"
+        f"4. Report final results via save_data_in_memory\n\n"
+
+        f"HIVE SCALE:\n"
+        f"When hive_parallel=True, the engine distributes N hypothesis variants "
+        f"across hive peers simultaneously. Each peer runs a different modification. "
+        f"The best result across all peers wins (tournament selection).\n\n"
+
+        f"RULES:\n"
+        f"- NEVER modify the evaluation metric or test harness\n"
+        f"- One change per iteration — small, testable, reversible\n"
+        f"- Simplicity wins: prefer deleting code over adding complexity\n"
+        f"- Every improvement is git-committed and saved as a recipe step\n"
+        f"- If stuck: reread the code, try combinations, try radical changes\n"
+        f"- Report progress as dynamic_layout JSON for the tracker UI\n"
+    )
+
+
+register_goal_type('autoresearch', _build_autoresearch_prompt,
+                    tool_tags=['autoresearch', 'coding'])

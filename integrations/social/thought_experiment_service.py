@@ -257,9 +257,16 @@ class ThoughtExperimentService:
 
     @staticmethod
     def request_agent_evaluation(db: Session, experiment_id: str) -> Dict:
-        """Request parallel agent evaluation of a thought experiment.
+        """Request agent-native iterative evaluation of a thought experiment.
 
-        Creates AgentGoal for multi-agent evaluation dispatch.
+        Creates an AgentGoal with a type-aware iteration recipe. The agent
+        loop (autogen group chat) drives hypothesis→execute→score→iterate
+        for ALL experiment types — not just software.
+
+        - software:     uses autoresearch tools (code edit → run → metric)
+        - traditional:  uses LLM scoring (propose → evaluate → refine)
+        - physical_ai:  uses visual context (hypothesis → observe → measure)
+        - research:     uses web search (search → synthesize → score)
         """
         from .models import ThoughtExperiment
 
@@ -270,6 +277,10 @@ class ThoughtExperimentService:
 
         experiment.status = 'evaluating'
         db.flush()
+
+        exp_type = getattr(experiment, 'experiment_type', 'traditional') or 'traditional'
+        recipe = ThoughtExperimentService._build_iteration_recipe(
+            experiment, exp_type)
 
         # Create evaluation goal for agent dispatch
         try:
@@ -283,19 +294,114 @@ class ThoughtExperimentService:
                 db, user_id=user_id,
                 goal_type='thought_experiment',
                 title=f'Evaluate: {experiment.title}',
-                description=(
-                    f'Evaluate thought experiment: {experiment.hypothesis}\n'
-                    f'Expected outcome: {experiment.expected_outcome}\n'
-                    f'Intent: {experiment.intent_category}\n'
-                    f'Provide: score (-2 to +2), confidence (0-1), '
-                    f'reasoning, and evidence.'
-                ),
-                config_json={'experiment_id': experiment_id},
+                description=recipe['description'],
+                config_json={
+                    'experiment_id': experiment_id,
+                    'experiment_type': exp_type,
+                    'iteration_recipe': recipe,
+                    'autonomous': True,
+                },
             )
-            return {'success': True, 'goal_id': goal.get('id') if goal else None}
+            return {
+                'success': True,
+                'goal_id': goal.get('id') if goal else None,
+                'experiment_type': exp_type,
+                'iteration_strategy': recipe['strategy'],
+            }
         except Exception as e:
             logger.debug(f"Agent evaluation goal creation failed: {e}")
             return {'success': False, 'reason': str(e)}
+
+    @staticmethod
+    def _build_iteration_recipe(experiment, exp_type: str) -> Dict:
+        """Build a type-aware iteration recipe for the agent loop.
+
+        The recipe tells the agent HOW to iterate — which tools to use,
+        what constitutes improvement, and when to stop. The agent's own
+        conversation loop (autogen group chat) drives the iteration,
+        not a hardcoded Python while loop.
+        """
+        base_context = (
+            f'Hypothesis: {experiment.hypothesis}\n'
+            f'Expected outcome: {experiment.expected_outcome}\n'
+            f'Intent: {experiment.intent_category}\n'
+        )
+
+        if exp_type == 'software':
+            return {
+                'strategy': 'autoresearch',
+                'description': (
+                    f'ITERATIVE SOFTWARE EXPERIMENT\n\n{base_context}\n'
+                    f'LOOP PATTERN: Use launch_experiment_autoresearch to start '
+                    f'the code iteration loop. Monitor with get_experiment_research_status. '
+                    f'When complete, use evaluate_thought_experiment to record findings.\n\n'
+                    f'TOOLS: launch_experiment_autoresearch, get_experiment_research_status, '
+                    f'evaluate_thought_experiment\n\n'
+                    f'The autoresearch engine handles: code edit → run → metric → keep/revert.'
+                ),
+                'tools': [
+                    'launch_experiment_autoresearch',
+                    'get_experiment_research_status',
+                    'evaluate_thought_experiment',
+                ],
+                'max_iterations': 50,
+                'scoring': 'metric_extraction',
+            }
+        elif exp_type == 'physical_ai':
+            return {
+                'strategy': 'observe_and_measure',
+                'description': (
+                    f'ITERATIVE PHYSICAL AI EXPERIMENT\n\n{base_context}\n'
+                    f'LOOP PATTERN:\n'
+                    f'1. Use iterate_hypothesis to propose a testable physical hypothesis\n'
+                    f'2. Observe via visual context tools (camera feed if available)\n'
+                    f'3. Use score_hypothesis_result to evaluate observations\n'
+                    f'4. Use get_iteration_history to review what worked\n'
+                    f'5. Repeat with refined hypothesis until convergence\n'
+                    f'6. Use evaluate_thought_experiment to record final findings\n\n'
+                    f'TOOLS: iterate_hypothesis, score_hypothesis_result, '
+                    f'get_iteration_history, evaluate_thought_experiment\n\n'
+                    f'Score each iteration -2 to +2. Stop when 3 consecutive '
+                    f'iterations show no improvement.'
+                ),
+                'tools': [
+                    'iterate_hypothesis', 'score_hypothesis_result',
+                    'get_iteration_history', 'evaluate_thought_experiment',
+                ],
+                'max_iterations': 20,
+                'scoring': 'llm_rubric',
+            }
+        else:
+            # traditional, research, or any future type
+            return {
+                'strategy': 'reason_and_refine',
+                'description': (
+                    f'ITERATIVE THOUGHT EXPERIMENT\n\n{base_context}\n'
+                    f'LOOP PATTERN:\n'
+                    f'1. Use iterate_hypothesis to propose a refinement or test angle\n'
+                    f'2. Research/reason about the hypothesis (use web search, '
+                    f'recall_memory, or domain tools as needed)\n'
+                    f'3. Use score_hypothesis_result to evaluate quality against rubric\n'
+                    f'4. Use get_iteration_history to see what approaches scored well\n'
+                    f'5. Repeat with refined hypothesis until convergence or budget\n'
+                    f'6. Use evaluate_thought_experiment to record final evaluation\n\n'
+                    f'TOOLS: iterate_hypothesis, score_hypothesis_result, '
+                    f'get_iteration_history, evaluate_thought_experiment\n\n'
+                    f'SCORING RUBRIC:\n'
+                    f'- Evidence quality: is the reasoning backed by data/research?\n'
+                    f'- Hypothesis clarity: is it specific and testable?\n'
+                    f'- Expected impact: how significant would the outcome be?\n'
+                    f'- Feasibility: can this realistically be tested/implemented?\n\n'
+                    f'Score each iteration -2 to +2. Stop when 3 consecutive '
+                    f'iterations show no improvement or after 10 iterations.'
+                ),
+                'tools': [
+                    'iterate_hypothesis', 'score_hypothesis_result',
+                    'get_iteration_history', 'evaluate_thought_experiment',
+                ],
+                'max_iterations': 10,
+                'scoring': 'llm_rubric',
+            }
 
     @staticmethod
     def record_agent_evaluation(db: Session, experiment_id: str,
