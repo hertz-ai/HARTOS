@@ -210,11 +210,11 @@ def _wire_event_subscribers(bus) -> None:
         logger.warning("Action %s exhausted %d retries — marking failed",
                         action_id, max_retries)
         try:
-            from security.immutable_audit_log import log_event
-            log_event('action_retry_exhausted', action_id, detail_json={
-                'max_retries': max_retries,
-                'user_id': data.get('user_id', ''),
-            })
+            from security.immutable_audit_log import get_audit_log
+            get_audit_log().log_event(
+                'action_retry_exhausted', actor_id=action_id,
+                action=f'exhausted {max_retries} retries',
+                detail={'max_retries': max_retries, 'user_id': data.get('user_id', '')})
         except Exception:
             pass
 
@@ -239,10 +239,11 @@ def _wire_event_subscribers(bus) -> None:
         violations = data.get('violations', [])
         logger.warning("Extension blocked: %s (violations: %s)", module, violations)
         try:
-            from security.immutable_audit_log import log_event
-            log_event('extension_blocked', module, detail_json={
-                'violations': violations,
-            })
+            from security.immutable_audit_log import get_audit_log
+            get_audit_log().log_event(
+                'extension_blocked', actor_id=module,
+                action=f'extension blocked: {module}',
+                detail={'violations': violations})
         except Exception:
             pass
 
@@ -395,6 +396,21 @@ def _register_orchestrator_services(registry: ServiceRegistry) -> None:
         registry.register('federation', _make_federated_aggregator, singleton=True)
     except Exception:
         pass
+
+    # Remote Desktop Orchestrator — lazy startup on OS mode
+    try:
+        from integrations.remote_desktop.orchestrator import get_orchestrator
+        orchestrator = get_orchestrator()
+        registry.register('remote_desktop', lambda: orchestrator, singleton=True)
+        # Startup in background thread to avoid blocking boot
+        import threading
+        threading.Thread(
+            target=orchestrator.startup, daemon=True,
+            name='orchestrator-boot').start()
+    except ImportError:
+        logger.debug("Remote Desktop Orchestrator not available — skipping")
+    except Exception as e:
+        logger.warning("Remote Desktop Orchestrator startup: %s", e)
 
 
 def _verify_extension_signatures(extensions_dir: str) -> None:

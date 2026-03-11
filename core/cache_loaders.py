@@ -19,8 +19,12 @@ def _resolve_agent_data_dir():
         return os.path.join(os.path.dirname(db_path), 'agent_data')
     # Bundled/frozen mode: use cross-platform data dir (Program Files is read-only)
     if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
-        from core.platform_paths import get_agent_data_dir
-        return get_agent_data_dir()
+        try:
+            from core.platform_paths import get_agent_data_dir
+            return get_agent_data_dir()
+        except ImportError:
+            return os.path.join(
+                os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data')
     return os.path.join(os.path.dirname(os.path.dirname(__file__)), 'agent_data')
 
 AGENT_DATA_DIR = _resolve_agent_data_dir()
@@ -31,8 +35,12 @@ def _resolve_prompts_dir():
         return base
     # Bundled mode fallback: cross-platform prompts dir
     if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
-        from core.platform_paths import get_prompts_dir
-        return get_prompts_dir()
+        try:
+            from core.platform_paths import get_prompts_dir
+            return get_prompts_dir()
+        except ImportError:
+            return os.path.join(
+                os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'prompts')
     return base
 
 PROMPTS_DIR = _resolve_prompts_dir()

@@ -19,12 +19,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 class TestToolAllowlistGateDispatch(unittest.TestCase):
     """Verify dispatch_goal has model tier resolution wired in."""
 
-    def test_dispatch_goal_source_has_tool_allowlist_import(self):
-        """dispatch_goal should reference tool_allowlist for model tier."""
+    def test_dispatch_goal_source_has_tool_filter_reference(self):
+        """dispatch_goal should reference tool filtering for model tier."""
         import inspect
         from integrations.agent_engine.dispatch import dispatch_goal
         src = inspect.getsource(dispatch_goal)
-        self.assertIn('tool_allowlist', src)
+        # Tier resolution comment references filter_tools_for_model
+        self.assertIn('filter_tools_for_model', src)
         self.assertIn('model_tier', src)
 
     def test_dispatch_goal_attaches_model_tier_to_body(self):

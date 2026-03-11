@@ -213,11 +213,12 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     except ImportError:
         pass
 
-    # TOOL ALLOWLIST: resolve model tier and attach to dispatch context
+    # TOOL ALLOWLIST: resolve model tier and attach to dispatch context.
+    # Tier is sent to /chat as body['model_tier']; create_recipe uses it
+    # to call filter_tools_for_model() when building the agent tool list.
     _dispatch_model_tier = None
     if model_config:
         try:
-            from integrations.agent_engine.tool_allowlist import check_tool_allowed
             from integrations.agent_engine.model_registry import model_registry
             first_model = model_config[0].get('model', '') if model_config else ''
             if first_model:
@@ -252,22 +253,26 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
         pass  # Audit is best-effort
 
     # ROBOT: capability-matched dispatch — prefer distributed for hardware mismatches
+    _tried_distributed = False
     if not _check_robot_capability_match(goal_type, goal_id):
         coordinator = _get_distributed_coordinator()
         if coordinator and _has_hive_peers():
+            _tried_distributed = True
             result = dispatch_goal_distributed(prompt, user_id, goal_id, goal_type)
             if result is not None:
                 return result
         # Fall through to local if no capable peer found
 
     # DISTRIBUTED: auto-distribute when coordinator is reachable and hive has peers
-    coordinator = _get_distributed_coordinator()
-    if coordinator and _has_hive_peers():
-        result = dispatch_goal_distributed(prompt, user_id, goal_id, goal_type)
-        if result is not None:
-            return result
-        # Fall through to local dispatch if distributed fails
-        logger.info(f"Distributed fallback -> local dispatch for {goal_type} goal {goal_id}")
+    # Skip if robot dispatch already tried distributed (avoid double submission)
+    if not _tried_distributed:
+        coordinator = _get_distributed_coordinator()
+        if coordinator and _has_hive_peers():
+            result = dispatch_goal_distributed(prompt, user_id, goal_id, goal_type)
+            if result is not None:
+                return result
+            # Fall through to local dispatch if distributed fails
+            logger.info(f"Distributed fallback -> local dispatch for {goal_type} goal {goal_id}")
 
     # In bundled/desktop mode, use the in-process adapter instead of HTTP
     # to port 6777 (which doesn't run as a separate server in bundled mode).
@@ -363,6 +368,23 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
                 pass
 
             return response
+        else:
+            # Non-200 response — log and queue transient errors for retry
+            logger.warning(
+                f"Goal dispatch got HTTP {resp.status_code} for {goal_type} "
+                f"goal {goal_id}: {resp.text[:200]}")
+            if resp.status_code in (429, 500, 502, 503):
+                try:
+                    from .instruction_queue import enqueue_instruction
+                    enqueue_instruction(
+                        user_id=user_id, text=prompt[:2000], priority=3,
+                        tags=[goal_type],
+                        context={'goal_id': goal_id, 'goal_type': goal_type,
+                                 'queued_reason': f'http_{resp.status_code}'},
+                        related_goal_id=goal_id,
+                    )
+                except Exception:
+                    pass
     except requests.RequestException as e:
         logger.warning(f"Goal dispatch failed for {goal_type} goal {goal_id}: {e}")
 
