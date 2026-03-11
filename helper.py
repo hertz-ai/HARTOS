@@ -98,8 +98,12 @@ async def async_main(urls):
 # --- Path traversal protection for prompt file access ---
 # Frozen builds install to Program Files (read-only) — redirect to user data dir
 if getattr(sys, 'frozen', False):
-    PROMPTS_DIR = os.path.abspath(os.path.join(
-        os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'prompts'))
+    try:
+        from core.platform_paths import get_prompts_dir
+        PROMPTS_DIR = os.path.abspath(get_prompts_dir())
+    except ImportError:
+        PROMPTS_DIR = os.path.abspath(os.path.join(
+            os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'prompts'))
 else:
     PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
 os.makedirs(PROMPTS_DIR, exist_ok=True)
@@ -1917,7 +1921,11 @@ def _resolve_agent_data_dir():
     # Bundled/frozen mode: use writable user directory (Program Files is read-only)
     from core.config_cache import is_bundled as _is_bundled_check
     if _is_bundled_check():
-        return os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data')
+        try:
+            from core.platform_paths import get_agent_data_dir
+            return get_agent_data_dir()
+        except ImportError:
+            return os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data')
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'agent_data')
 
 AGENT_DATA_DIR = _resolve_agent_data_dir()
@@ -1926,7 +1934,11 @@ try:
         os.makedirs(AGENT_DATA_DIR, exist_ok=True)
 except PermissionError:
     # Fallback: user home directory (e.g. bundled app in Program Files)
-    AGENT_DATA_DIR = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data')
+    try:
+        from core.platform_paths import get_agent_data_dir as _get_agent_fallback
+        AGENT_DATA_DIR = _get_agent_fallback()
+    except ImportError:
+        AGENT_DATA_DIR = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data')
     os.makedirs(AGENT_DATA_DIR, exist_ok=True)
     logging.getLogger(__name__).warning(f"agent_data dir redirected to {AGENT_DATA_DIR} (install dir not writable)")
 

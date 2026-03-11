@@ -194,7 +194,7 @@ class TaskBaseline:
                     "was": snap_status,
                     "now": current_val,
                 })
-                if current_val == "COMPLETED":
+                if current_val == "completed":
                     completed_since.append(task_id)
 
         return {

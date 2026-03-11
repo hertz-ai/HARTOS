@@ -544,6 +544,30 @@ SEED_BOOTSTRAP_GOALS = [
         'spark_budget': 150,
         'use_product': False,
     },
+    # ─── AutoResearch — Autonomous Experiment Loop ───
+    {
+        'slug': 'bootstrap_autoresearch_coordinator',
+        'goal_type': 'autoresearch',
+        'title': 'Autonomous Research Loop Coordinator',
+        'description': (
+            'Coordinate autonomous research experiments triggered by thought '
+            'experiments with experiment_type=software. When a software thought '
+            'experiment reaches evaluating phase: '
+            '1) Parse the hypothesis into repo_path, target_file, run_command, metric, '
+            '2) Call start_autoresearch() to begin the edit-run-score-iterate loop, '
+            '3) Monitor progress with get_autoresearch_status(), '
+            '4) Post results back to the thought experiment tracker, '
+            '5) If hive peers available, run parallel variants for faster convergence. '
+            'Budget-gated by ComputeEscrow pledges from community contributors.'
+        ),
+        'config': {
+            'mode': 'coordinator',
+            'continuous': True,
+            'hive_parallel': True,
+        },
+        'spark_budget': 200,
+        'use_product': False,
+    },
     {
         'slug': 'bootstrap_revenue_trading_pipeline',
         'goal_type': 'finance',

@@ -187,10 +187,11 @@ class VerificationProtocol:
         if not task:
             return
 
-        # Use existing rollback if available, else manually reset
-        if hasattr(self._ledger, 'rollback_task'):
-            self._ledger.rollback_task(task_id, reason)
-        else:
-            self._ledger.update_task_status(task_id, TaskStatus.PENDING)
+        # Rollback completed task, then retry from PENDING if rollback succeeds
+        if task.status == TaskStatus.COMPLETED:
+            task.rollback(reason=reason)
+        # For non-terminal states, fail the task so it can be retried
+        if not task.is_terminal():
+            task.fail(error=reason, reason="Verification rejected")
 
         logger.info(f"Task {task_id} rejected and reset to PENDING: {reason}")

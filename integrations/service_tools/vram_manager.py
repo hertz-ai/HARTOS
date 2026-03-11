@@ -270,16 +270,47 @@ class VRAMManager:
                 pass
         return False
 
+    # ── Allocation drift detection ───────────────────────────────
+
+    def detect_allocation_drift(self) -> Dict:
+        """Compare advisory allocations vs actual VRAM usage.
+
+        Returns drift info — positive drift means something is using
+        more VRAM than we budgeted (possible leak or untracked process).
+        """
+        self.refresh_gpu_info()
+        info = self._gpu_info or {}
+        total = info.get('total_gb', 0)
+        actual_free = info.get('free_gb', 0)
+        actual_used = total - actual_free if total > 0 else 0
+
+        advisory_used = sum(self._allocations.values())
+        # Some baseline VRAM is always used by OS/drivers (~0.5-1.5GB typically)
+        os_baseline = min(1.5, total * 0.1) if total > 0 else 0
+
+        drift_gb = actual_used - advisory_used - os_baseline
+
+        return {
+            'actual_used_gb': round(actual_used, 2),
+            'advisory_used_gb': round(advisory_used, 2),
+            'os_baseline_gb': round(os_baseline, 2),
+            'drift_gb': round(drift_gb, 2),
+            'drift_pct': round((drift_gb / total * 100) if total > 0 else 0, 1),
+            'untracked_process': drift_gb > 1.0,  # >1GB unaccounted = suspicious
+        }
+
     # ── Dashboard ────────────────────────────────────────────────
 
     def get_status(self) -> Dict:
         """Full VRAM status for dashboard."""
         gpu = self.detect_gpu()
+        drift = self.detect_allocation_drift()
         return {
             "gpu": gpu,
             "allocations": self.get_allocations(),
             "total_allocated_gb": round(sum(self._allocations.values()), 2),
             "effective_free_gb": round(self.get_free_vram(), 2),
+            "drift": drift,
         }
 
 
