@@ -25,7 +25,11 @@ BACKUP_DIR_NAME = 'backups'
 
 
 def _get_backup_dir():
-    base = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', BACKUP_DIR_NAME)
+    try:
+        from core.platform_paths import get_db_dir
+        base = os.path.join(get_db_dir(), BACKUP_DIR_NAME)
+    except ImportError:
+        base = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', BACKUP_DIR_NAME)
     os.makedirs(base, exist_ok=True)
     return base
 

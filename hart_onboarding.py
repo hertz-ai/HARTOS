@@ -527,7 +527,11 @@ _HART_IDENTITY_FILE = 'hart_node_identity.json'
 
 def _identity_path() -> str:
     """Path to the node's persisted HART identity."""
-    data_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data')
+    try:
+        from core.platform_paths import get_db_dir
+        data_dir = get_db_dir()
+    except ImportError:
+        data_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data')
     os.makedirs(data_dir, exist_ok=True)
     return os.path.join(data_dir, _HART_IDENTITY_FILE)
 

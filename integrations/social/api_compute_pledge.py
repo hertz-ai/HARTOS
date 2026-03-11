@@ -450,10 +450,14 @@ def experiment_insights(post_id):
                 creator_id = goal.owner_id or (goal.created_by if goal.created_by else None)
                 if creator_id:
                     session_key = f"{creator_id}_{goal.prompt_id}"
-                    db_path = os.path.join(
-                        os.path.expanduser("~"), "Documents", "Nunba", "data",
-                        "memory_graph", session_key,
-                    )
+                    try:
+                        from core.platform_paths import get_memory_graph_dir
+                        db_path = get_memory_graph_dir(session_key)
+                    except ImportError:
+                        db_path = os.path.join(
+                            os.path.expanduser("~"), "Documents", "Nunba", "data",
+                            "memory_graph", session_key,
+                        )
                     if os.path.exists(db_path):
                         graph = MemoryGraph(db_path=db_path, user_id=str(creator_id))
                         nodes = graph.get_session_memories(session_key, limit=20)

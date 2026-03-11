@@ -402,7 +402,11 @@ def _detect_read_only_fs() -> bool:
     try:
         import tempfile
         # Prefer the Nunba data directory (always user-writable)
-        user_data = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data')
+        try:
+            from core.platform_paths import get_db_dir
+            user_data = get_db_dir()
+        except ImportError:
+            user_data = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data')
         if os.path.isdir(user_data):
             test_dir = user_data
         else:

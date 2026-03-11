@@ -33,7 +33,11 @@ def _resolve_baseline_dir():
     if db_path and db_path != ':memory:' and os.path.isabs(db_path):
         return os.path.join(os.path.dirname(db_path), 'agent_data', 'baselines')
     if os.environ.get('NUNBA_BUNDLED') or getattr(_sys, 'frozen', False):
-        return os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data', 'baselines')
+        try:
+            from core.platform_paths import get_agent_data_dir
+            return os.path.join(get_agent_data_dir(), 'baselines')
+        except ImportError:
+            return os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data', 'baselines')
     return os.path.join('agent_data', 'baselines')
 
 BASELINE_DIR = _resolve_baseline_dir()

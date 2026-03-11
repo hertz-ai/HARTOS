@@ -1280,7 +1280,11 @@ def hierarchy_verify_upgrade():
     # Signature valid — upgrade to central
     # Note: private key is NOT stored. Only the tier is persisted.
     try:
-        data_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data')
+        try:
+            from core.platform_paths import get_db_dir
+            data_dir = get_db_dir()
+        except ImportError:
+            data_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data')
         os.makedirs(data_dir, exist_ok=True)
         config_path = os.path.join(data_dir, 'node_config.json')
         config = {}
