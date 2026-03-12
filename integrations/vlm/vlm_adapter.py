@@ -127,8 +127,10 @@ def _probe_local_services() -> bool:
     try:
         import requests as _req
         # Quick health checks with short timeout
-        omni_ok = _req.get('http://localhost:8080/', timeout=2).status_code < 500
-        gui_ok = _req.get('http://localhost:5001/', timeout=2).status_code < 500
+        omni_port = os.environ.get('OMNIPARSER_PORT', '8080')
+        gui_port = os.environ.get('VLM_GUI_PORT', '5001')
+        omni_ok = _req.get(f'http://localhost:{omni_port}/', timeout=2).status_code < 500
+        gui_ok = _req.get(f'http://localhost:{gui_port}/', timeout=2).status_code < 500
         result = omni_ok and gui_ok
     except Exception:
         result = False

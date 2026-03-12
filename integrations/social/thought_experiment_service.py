@@ -280,7 +280,14 @@ class ThoughtExperimentService:
 
         exp_type = getattr(experiment, 'experiment_type', 'traditional') or 'traditional'
         recipe = ThoughtExperimentService._build_iteration_recipe(
-            experiment, exp_type)
+            experiment, exp_type, config={})
+
+        # Map experiment_type to goal_type so the right tools get loaded
+        goal_type_map = {
+            'software': 'autoresearch',
+            'code_evolution': 'code_evolution',
+        }
+        goal_type = goal_type_map.get(exp_type, 'thought_experiment')
 
         # Create evaluation goal for agent dispatch
         try:
@@ -291,20 +298,21 @@ class ThoughtExperimentService:
             user_id = system_user.id if system_user else 'system'
 
             goal = GoalManager.create_goal(
-                db, user_id=user_id,
-                goal_type='thought_experiment',
+                db,
+                goal_type=goal_type,
                 title=f'Evaluate: {experiment.title}',
                 description=recipe['description'],
-                config_json={
+                config={
                     'experiment_id': experiment_id,
                     'experiment_type': exp_type,
                     'iteration_recipe': recipe,
                     'autonomous': True,
                 },
+                created_by=str(user_id),
             )
             return {
                 'success': True,
-                'goal_id': goal.get('id') if goal else None,
+                'goal_id': goal.get('goal', {}).get('id') if goal else None,
                 'experiment_type': exp_type,
                 'iteration_strategy': recipe['strategy'],
             }
@@ -313,7 +321,7 @@ class ThoughtExperimentService:
             return {'success': False, 'reason': str(e)}
 
     @staticmethod
-    def _build_iteration_recipe(experiment, exp_type: str) -> Dict:
+    def _build_iteration_recipe(experiment, exp_type: str, config: dict = None) -> Dict:
         """Build a type-aware iteration recipe for the agent loop.
 
         The recipe tells the agent HOW to iterate — which tools to use,
@@ -327,7 +335,35 @@ class ThoughtExperimentService:
             f'Intent: {experiment.intent_category}\n'
         )
 
-        if exp_type == 'software':
+        if exp_type == 'code_evolution':
+            config = config or {}
+            repo_path = config.get('repo_path', '')
+            repo_name = config.get('repo_name', '')
+            target_files = config.get('target_files', [])
+            scope = config.get('scope', 'interfaces')
+            return {
+                'strategy': 'code_evolution',
+                'description': (
+                    f'CODE EVOLUTION EXPERIMENT\n\n{base_context}\n'
+                    f'REPOSITORY: {repo_name or repo_path or "specified in config"}\n'
+                    f'SCOPE: {scope} (agents see signatures, not implementations)\n'
+                    f'TARGET FILES: {", ".join(target_files) if target_files else "auto-detected"}\n\n'
+                    f'WORKFLOW:\n'
+                    f'1. Use the coding tools to edit files in the target repo\n'
+                    f'2. The shard engine provides interface-only views for privacy\n'
+                    f'3. Validate changes pass tests\n'
+                    f'4. Use evaluate_thought_experiment to record findings\n\n'
+                    f'TOOLS: coding tools, evaluate_thought_experiment\n\n'
+                    f'The repo owner\'s node is the trusted node. '
+                    f'Changes are applied locally, then go through the upgrade pipeline.'
+                ),
+                'tools': [
+                    'evaluate_thought_experiment',
+                ],
+                'max_iterations': 30,
+                'scoring': 'metric_extraction',
+            }
+        elif exp_type == 'software':
             return {
                 'strategy': 'autoresearch',
                 'description': (

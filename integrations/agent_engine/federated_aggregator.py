@@ -31,7 +31,10 @@ DELTA_MAX_AGE_SECONDS = 3600  # 1 hour freshness window
 
 def _sign_delta(delta_dict):
     """Sign a federation delta with node key (HMAC-SHA256)."""
-    node_key = os.environ.get('HART_NODE_KEY', 'default-dev-key')
+    node_key = os.environ.get('HART_NODE_KEY')
+    if not node_key:
+        logger.warning('HART_NODE_KEY not set — delta will be unsigned')
+        return delta_dict
     # Work on a copy without any existing hmac_signature
     to_sign = {k: v for k, v in delta_dict.items() if k != 'hmac_signature'}
     payload = json.dumps(to_sign, sort_keys=True).encode()
@@ -46,7 +49,10 @@ def _verify_delta_signature(delta_dict):
     if not sig:
         return False
     to_verify = {k: v for k, v in delta_dict.items() if k != 'hmac_signature'}
-    node_key = os.environ.get('HART_NODE_KEY', 'default-dev-key')
+    node_key = os.environ.get('HART_NODE_KEY')
+    if not node_key:
+        logger.warning('HART_NODE_KEY not set — cannot verify delta signature')
+        return False
     payload = json.dumps(to_verify, sort_keys=True).encode()
     expected = hmac.new(node_key.encode(), payload, hashlib.sha256).hexdigest()
     return hmac.compare_digest(sig, expected)

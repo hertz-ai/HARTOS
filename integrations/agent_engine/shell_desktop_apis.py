@@ -80,6 +80,33 @@ _clipboard_counter = 0
 # Route registration
 # ═══════════════════════════════════════════════════════════════
 
+def _require_desktop_auth(f):
+    """Decorator: require local shell auth for destructive desktop ops."""
+    from functools import wraps
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        from flask import request, jsonify
+        remote = request.remote_addr or ''
+        if remote not in ('127.0.0.1', '::1', 'localhost'):
+            token = request.headers.get('X-Shell-Token', '')
+            expected = os.environ.get('HART_SHELL_TOKEN', '')
+            if not expected or token != expected:
+                return jsonify({'error': 'Unauthorized'}), 403
+        return f(*args, **kwargs)
+    return decorated
+
+
+def _audit_desktop_op(action, detail=None):
+    """Log a desktop operation to the immutable audit log (best-effort)."""
+    try:
+        from security.immutable_audit_log import get_audit_log
+        get_audit_log().log_event(
+            'shell_ops', 'shell_desktop_api', action,
+            detail=detail or {})
+    except Exception:
+        pass
+
+
 def register_shell_desktop_routes(app):
     """Register all desktop experience API routes."""
     from flask import jsonify, request
@@ -1218,4 +1245,173 @@ def register_shell_desktop_routes(app):
         _save_json(_SHORTCUTS_CFG, cfg)
         return jsonify({'reset': True, 'profile': cfg['profile']})
 
-    logger.info("Registered shell desktop routes (14 features)")
+    # ─── 15. On-Screen Keyboard ─────────────────────────────
+
+    @app.route('/api/shell/keyboard/osk-status', methods=['GET'])
+    def shell_osk_status():
+        """Get on-screen keyboard status."""
+        backends = ['squeekboard', 'onboard', 'maliit-keyboard']
+        running = None
+        for name in backends:
+            r = _run(['pgrep', '-x', name], timeout=3)
+            if r and r.returncode == 0:
+                running = name
+                break
+
+        enabled = False
+        r = _run(['systemctl', '--user', 'is-active', 'squeekboard'], timeout=3)
+        if r and r.returncode == 0 and 'active' in r.stdout:
+            enabled = True
+
+        return jsonify({
+            'enabled': enabled,
+            'running': running is not None,
+            'backend': running or 'none',
+            'available': [b for b in backends
+                         if _run(['which', b], timeout=2) is not None
+                         and _run(['which', b], timeout=2).returncode == 0],
+        })
+
+    @app.route('/api/shell/keyboard/osk-toggle', methods=['POST'])
+    @_require_desktop_auth
+    def shell_osk_toggle():
+        """Toggle on-screen keyboard."""
+        body = request.get_json(silent=True) or {}
+        enable = body.get('enable')  # None = toggle
+
+        # Check current state
+        r = _run(['pgrep', '-x', 'squeekboard'], timeout=3)
+        is_running = r and r.returncode == 0
+
+        if enable is None:
+            enable = not is_running
+
+        if enable and not is_running:
+            _run(['systemctl', '--user', 'start', 'squeekboard'], timeout=5)
+        elif not enable and is_running:
+            _run(['systemctl', '--user', 'stop', 'squeekboard'], timeout=5)
+
+        return jsonify({'enabled': enable})
+
+    # ─── Voice Control (AI-native: Whisper STT → HART agent) ──
+
+    _voice_state = {'listening': False, 'pid': None, 'last_transcript': None}
+    _voice_lock = threading.Lock()
+
+    @app.route('/api/shell/voice/status', methods=['GET'])
+    def shell_voice_status():
+        """Get voice control status."""
+        with _voice_lock:
+            return jsonify({
+                'listening': _voice_state['listening'],
+                'stt_available': _check_whisper_available(),
+                'last_transcript': _voice_state['last_transcript'],
+            })
+
+    def _check_whisper_available():
+        """Check if Whisper STT is available."""
+        try:
+            from integrations.service_tools.whisper_tool import whisper_transcribe
+            return True
+        except ImportError:
+            return False
+
+    @app.route('/api/shell/voice/start', methods=['POST'])
+    @_require_desktop_auth
+    def shell_voice_start():
+        """Start listening for voice commands.
+
+        AI-native: Uses Whisper STT (local, offline) to transcribe,
+        then dispatches the transcript to the HART agent pipeline
+        for full natural language understanding — not keyword matching.
+        """
+        with _voice_lock:
+            if _voice_state['listening']:
+                return jsonify({'error': 'already listening'}), 409
+
+        if not _check_whisper_available():
+            return jsonify({'error': 'whisper STT not available'}), 503
+
+        with _voice_lock:
+            _voice_state['listening'] = True
+
+        _audit_desktop_op('voice_start', {})
+        return jsonify({'started': True, 'mode': 'whisper_stt_to_agent'})
+
+    @app.route('/api/shell/voice/stop', methods=['POST'])
+    @_require_desktop_auth
+    def shell_voice_stop():
+        """Stop voice control listening."""
+        with _voice_lock:
+            _voice_state['listening'] = False
+            _voice_state['pid'] = None
+        _audit_desktop_op('voice_stop', {})
+        return jsonify({'stopped': True})
+
+    @app.route('/api/shell/voice/process', methods=['POST'])
+    @_require_desktop_auth
+    def shell_voice_process():
+        """Process a voice command: transcribe audio → dispatch to HART agent.
+
+        This is the AI-native pipeline:
+        1. Audio file → Whisper STT (local, offline) → transcript
+        2. Transcript → HART /chat endpoint → agent executes task
+        3. Agent response returned to caller
+
+        Unlike Siri/Cortana/Alexa that use keyword matching and fixed intents,
+        this sends the full natural language to the agent for understanding.
+        The agent can execute ANY task — file ops, code, web search, etc.
+        """
+        body = request.get_json(silent=True) or {}
+        audio_path = body.get('audio_path', '')
+        text = body.get('text', '')  # Pre-transcribed text (skip STT)
+
+        # Step 1: Transcribe if audio provided
+        if audio_path and not text:
+            if not os.path.isfile(audio_path):
+                return jsonify({'error': 'audio file not found'}), 404
+            try:
+                from integrations.service_tools.whisper_tool import whisper_transcribe
+                result = json.loads(whisper_transcribe(audio_path))
+                text = result.get('text', '').strip()
+            except Exception as e:
+                return jsonify({'error': f'transcription failed: {e}'}), 500
+
+        if not text:
+            return jsonify({'error': 'no audio_path or text provided'}), 400
+
+        with _voice_lock:
+            _voice_state['last_transcript'] = text
+
+        # Step 2: Dispatch to HART agent pipeline
+        try:
+            import urllib.request
+            from core.port_registry import get_port
+            port = get_port('backend')
+            payload = json.dumps({
+                'user_id': 'voice_user',
+                'prompt_id': 'voice_cmd',
+                'prompt': text,
+            }).encode('utf-8')
+            req = urllib.request.Request(
+                f'http://localhost:{port}/chat',
+                data=payload,
+                headers={'Content-Type': 'application/json'},
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                agent_response = json.loads(resp.read().decode('utf-8'))
+            return jsonify({
+                'transcript': text,
+                'agent_response': agent_response,
+                'mode': 'ai_native',
+            })
+        except Exception as e:
+            # Even if agent dispatch fails, return the transcript
+            return jsonify({
+                'transcript': text,
+                'agent_response': None,
+                'error': f'agent dispatch failed: {e}',
+                'mode': 'ai_native',
+            }), 200
+
+    logger.info("Registered shell desktop routes (16 features)")

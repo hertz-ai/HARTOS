@@ -84,6 +84,11 @@ def _execute_inprocess(action: dict) -> dict:
     coord = action.get('coordinate')
     text = action.get('text', action.get('value', ''))
 
+    # Validate coordinate format (VLM output can be malformed)
+    if coord is not None:
+        if not isinstance(coord, (list, tuple)) or len(coord) < 2:
+            return {'output': '', 'error': f'Invalid coordinate format: {coord}'}
+
     # File/wait actions don't need pyautogui
     _NO_GUI_ACTIONS = {
         'list_folders_and_files', 'read_file_and_understand', 'write_file',

@@ -159,14 +159,15 @@ def check_port_available(port: int, host: str = '0.0.0.0') -> bool:
     Returns:
         True if port is available.
     """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(1)
         s.bind((host, port))
-        s.close()
         return True
     except OSError:
         return False
+    finally:
+        s.close()
 
 
 def get_mode_label() -> str:

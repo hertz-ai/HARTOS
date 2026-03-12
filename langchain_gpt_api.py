@@ -207,7 +207,7 @@ except ImportError:
 import threading
 
 try:
-    from helper import retrieve_json, PROMPTS_DIR, safe_prompt_path
+    from helper import retrieve_json, PROMPTS_DIR, safe_prompt_path, _is_terminate_msg
 except Exception:
     retrieve_json = None
     # Frozen builds install to Program Files (read-only) — redirect to user data dir
@@ -3617,8 +3617,7 @@ if autogen is not None:
         assistant = autogen.AssistantAgent(
             name=f"assistant_{user_id}",
             llm_config=llm_config,
-            is_termination_msg=lambda x: True if "TERMINATE" in x.get(
-                "content") else False,
+            is_termination_msg=_is_terminate_msg,
             system_message="""You are a custom agent bot creator. Your task is to interact with the user to gather all the necessary details to create an agent. Once you have collected all the required information, you will generate a complete agent configuration.
 
             The information you need to collect includes:
@@ -3645,8 +3644,7 @@ if autogen is not None:
         user_proxy = autogen.UserProxyAgent(
             name=f"user_proxy_{user_id}",
             human_input_mode="NEVER",
-            is_termination_msg=lambda x: True if "TERMINATE" in x.get(
-                "content") else False,
+            is_termination_msg=_is_terminate_msg,
             code_execution_config={"work_dir": "coding", "use_docker": False}
         )
 
@@ -3702,16 +3700,14 @@ if autogen is not None:
         assistant = autogen.ConversableAgent(
             name=f"assistant_{user_id}",
             llm_config=llm_config,
-            is_termination_msg=lambda x: True if "TERMINATE" in x.get(
-                "content") else False,
+            is_termination_msg=_is_terminate_msg,
             system_message=recipe
         )
 
         # Create user agent
         user = autogen.ConversableAgent(
             name=f"user_{user_id}",
-            is_termination_msg=lambda x: True if "TERMINATE" in x.get(
-                "content") else False,
+            is_termination_msg=_is_terminate_msg,
             llm_config=None,  # User agent doesn't need LLM
             human_input_mode="NEVER",  # We'll manually send messages
             max_consecutive_auto_reply=1  # Limit to 1 auto reply
@@ -4144,6 +4140,9 @@ def chat():
     model_config = data.get('model_config', None)
     task_source = data.get('task_source', 'own')
     thread_local_data.set_task_source(task_source)
+    channel_context = data.get('channel_context', None)
+    if channel_context:
+        thread_local_data.channel_context = channel_context
     app.logger.info(f"casual_conv type {casual_conv}")
 
     # Security: sanitize prompt_id to prevent path traversal
@@ -4592,8 +4591,8 @@ def chat():
                     f' The Language selected is {language}'
                 app.logger.info(f"custom prompt is: {custom_prompt}")
 
-        except:
-            app.logger.error(f'failed to get prompt from id:- {prompt_id}')
+        except Exception as e:
+            app.logger.error(f'failed to get prompt from id:- {prompt_id}: {e}')
             custom_prompt = Hevolve
     elif probe:
         custom_prompt = PROBE_TEMPLATE
@@ -4769,7 +4768,7 @@ def time_agent():
     user_id = data.get('user_id',None)
     request_from = data.get('request_from',"Reuse")
     prompt_id = data.get('prompt_id',None)
-    action_entry_point = data.get('prompt_id',0)
+    action_entry_point = data.get('action_entry_point',0)
     if not task_description or not user_id or not prompt_id:
         return jsonify({'error':'user_id or task_description or prompt_id is missing'}), 404
     app.logger.info(f'GOT user_id:{user_id} & prompt_id:{prompt_id} & task_description:{task_description}')

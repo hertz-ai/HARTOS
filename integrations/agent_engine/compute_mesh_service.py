@@ -65,7 +65,11 @@ class MeshPeer:
 
 
 class ComputeMeshService:
-    """Same-user device compute aggregation."""
+    """Same-user device compute aggregation.
+
+    get_available_peers() and score() provide the interface used by
+    CodingAgentOrchestrator for trust-based hive offload of coding tasks.
+    """
 
     def __init__(
         self,
@@ -109,12 +113,14 @@ class ComputeMeshService:
         try:
             mesh_ip_file = os.path.join(key_dir, 'mesh_ip')
             if os.path.exists(mesh_ip_file):
-                self._mesh_ip = open(mesh_ip_file).read().strip()
+                with open(mesh_ip_file) as f:
+                    self._mesh_ip = f.read().strip()
                 logger.info(f"Mesh IP: {self._mesh_ip}")
 
             pub_key_file = os.path.join(key_dir, 'public.key')
             if os.path.exists(pub_key_file):
-                pub_key = open(pub_key_file).read().strip()
+                with open(pub_key_file) as f:
+                    pub_key = f.read().strip()
                 self._device_id = hashlib.sha256(pub_key.encode()).hexdigest()[:16]
                 logger.info(f"Device ID: {self._device_id}")
 
@@ -276,6 +282,17 @@ class ComputeMeshService:
 
         return self.offload_inference(best.peer_id, model_type, prompt, options)
 
+    def get_available_peers(self) -> List[Dict[str, Any]]:
+        """Return non-stale peers as dicts (used by CodingAgentOrchestrator)."""
+        with self._lock:
+            return [p.to_dict() for p in self._peers.values() if not p.is_stale()]
+
+    def score(self, peer: Dict) -> float:
+        """Score a peer dict by compute availability and latency."""
+        compute = peer.get('available_compute', 0)
+        latency = peer.get('latency_ms') or 500
+        return compute * 5 - latency / 100
+
     # ─── Device Pairing ──────────────────────────────────────
 
     def pair_device(self, peer_address: str) -> Dict[str, Any]:
@@ -368,16 +385,21 @@ class ComputeMeshService:
         except Exception:
             pass
 
-        # Detect RAM
+        # Detect RAM (cross-platform: psutil first, /proc/meminfo fallback)
         try:
-            with open('/proc/meminfo') as f:
-                for line in f:
-                    if line.startswith('MemTotal:'):
-                        kb = int(line.split()[1])
-                        caps['ram_gb'] = round(kb / 1024 / 1024, 1)
-                        break
-        except Exception:
-            pass
+            import psutil
+            mem = psutil.virtual_memory()
+            caps['ram_gb'] = round(mem.total / (1024 ** 3), 1)
+        except ImportError:
+            try:
+                with open('/proc/meminfo') as f:
+                    for line in f:
+                        if line.startswith('MemTotal:'):
+                            kb = int(line.split()[1])
+                            caps['ram_gb'] = round(kb / 1024 / 1024, 1)
+                            break
+            except Exception:
+                pass
 
         # Check which models are loaded
         from core.http_pool import pooled_get as _pooled_get
@@ -499,3 +521,18 @@ class ComputeMeshService:
             serve(app, host='0.0.0.0', port=self.task_relay_port, threads=4)
         except ImportError:
             app.run(host='0.0.0.0', port=self.task_relay_port, threaded=True)
+
+
+# ─── Module-level singleton ─────────────────────────────────
+_mesh_instance: Optional[ComputeMeshService] = None
+_mesh_lock = threading.Lock()
+
+
+def get_compute_mesh() -> ComputeMeshService:
+    """Get or create the singleton ComputeMeshService."""
+    global _mesh_instance
+    if _mesh_instance is None:
+        with _mesh_lock:
+            if _mesh_instance is None:
+                _mesh_instance = ComputeMeshService()
+    return _mesh_instance

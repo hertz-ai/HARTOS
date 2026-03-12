@@ -184,9 +184,11 @@ def vote_experiment(experiment_id):
             voter_type=body.get('voter_type', 'human'),
             confidence=body.get('confidence', 1.0),
         )
-        if result:
+        if result and 'error' not in result:
             db.commit()
             return jsonify({'success': True, 'data': result}), 200
+        if result and 'error' in result:
+            return jsonify({'success': False, 'error': result['error']}), 400
         return jsonify({'success': False, 'error': 'not_found'}), 404
     except Exception as e:
         db.rollback()
@@ -260,9 +262,11 @@ def decide_experiment(experiment_id):
     try:
         result = ThoughtExperimentService.decide(
             db, experiment_id, decision_text)
-        if result:
+        if result and 'error' not in result:
             db.commit()
             return jsonify({'success': True, 'data': result}), 200
+        if result and 'error' in result:
+            return jsonify({'success': False, 'error': result['error']}), 400
         return jsonify({'success': False, 'error': 'not_found'}), 404
     except Exception as e:
         db.rollback()

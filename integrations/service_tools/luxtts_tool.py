@@ -116,6 +116,10 @@ def _ensure_models() -> Path:
 
         logger.info("Extracting models...")
         with tarfile.open(str(tarball_path), 'r:bz2') as tar:
+            # CVE-2007-4559: validate member paths before extraction
+            for member in tar.getmembers():
+                if member.name.startswith('/') or '..' in member.name:
+                    raise ValueError(f"Unsafe tar member: {member.name}")
             tar.extractall(str(_get_tts_dir()))
         tarball_path.unlink(missing_ok=True)
         logger.info("Models extracted.")

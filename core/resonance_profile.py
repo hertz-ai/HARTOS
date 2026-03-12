@@ -64,6 +64,9 @@ class UserResonanceProfile:
     tuning_history: List[List[float]] = field(default_factory=list)  # last 20 snapshots
     gradient_active: bool = False  # True when oscillation detected, flags HevolveAI
 
+    # Per-user EMA alpha (None = use global default from RESONANCE_EMA_ALPHA)
+    ema_alpha: Optional[float] = None
+
     # Metadata
     total_interactions: int = 0
     resonance_confidence: float = 0.0  # 0.0=untuned, 1.0=highly tuned

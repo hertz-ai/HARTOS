@@ -1,8 +1,9 @@
 """
 Unified Agent Goal Engine - Background Daemon
 
-Finds active goals of ANY type, detects idle agents, and dispatches
-work through /chat. Replaces separate per-type daemons.
+Finds active goals, detects idle agents, and dispatches work through /chat.
+Skips CODING_GOAL_TYPES — those are handled by coding_daemon which adds
+idle-agent detection and benchmark sync for the coding backends.
 
 Uses prompt builder registry to build the right prompt per goal type.
 Dispatches with autonomous=True so agents self-configure.
@@ -223,7 +224,7 @@ class AgentDaemon:
 
         from integrations.social.models import get_db, AgentGoal, Product
         from integrations.coding_agent.idle_detection import IdleDetectionService
-        from .goal_manager import GoalManager
+        from .goal_manager import GoalManager, CODING_GOAL_TYPES
         from .dispatch import dispatch_goal
 
         # RESOURCE GATE: throttle dispatch when system is under pressure
@@ -247,7 +248,12 @@ class AgentDaemon:
         db = get_db()
         try:
             # DETERMINISTIC STOP: no goals = no action = system is inert
-            goals = db.query(AgentGoal).filter_by(status='active').all()
+            # Skip CODING_GOAL_TYPES — coding_daemon handles those with
+            # idle-agent detection + benchmark sync for backend routing.
+            goals = db.query(AgentGoal).filter(
+                AgentGoal.status == 'active',
+                ~AgentGoal.goal_type.in_(CODING_GOAL_TYPES),
+            ).all()
             if not goals:
                 return
 
@@ -330,7 +336,7 @@ class AgentDaemon:
                     # without reserving (no spark_spent increment)
                     budget = goal.spark_budget or 0
                     spent = goal.spark_spent or 0
-                    estimated = estimate_llm_cost_spark(prompt, _resolve_model_name())
+                    estimated = estimate_llm_cost_spark(prompt, _resolve_model_name('gpt-4o'))
                     bg_allowed = (budget - spent) >= estimated
                     bg_reason = f'insufficient_budget ({budget - spent} < {estimated})' if not bg_allowed else ''
                     if not bg_allowed:

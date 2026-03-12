@@ -601,8 +601,8 @@ class TestFederationDeltaSigning(unittest.TestCase):
         with patch.dict(os.environ, {'HART_NODE_KEY': 'key-B'}):
             self.assertFalse(_verify_delta_signature(delta))
 
-    def test_sign_delta_uses_default_key(self):
-        """_sign_delta should use default key when HART_NODE_KEY not set."""
+    def test_sign_delta_skips_when_no_key(self):
+        """_sign_delta should skip signing when HART_NODE_KEY not set."""
         from integrations.agent_engine.federated_aggregator import _sign_delta
 
         delta = {'version': 1, 'node_id': 'test'}
@@ -611,10 +611,10 @@ class TestFederationDeltaSigning(unittest.TestCase):
         env.pop('HART_NODE_KEY', None)
         with patch.dict(os.environ, env, clear=True):
             _sign_delta(delta)
-            self.assertIn('hmac_signature', delta)
+            self.assertNotIn('hmac_signature', delta)
 
     def test_broadcast_signs_delta(self):
-        """broadcast_delta should sign the delta before sending."""
+        """broadcast_delta should sign the delta when HART_NODE_KEY is set."""
         from integrations.agent_engine.federated_aggregator import FederatedAggregator
 
         agg = FederatedAggregator()
@@ -624,8 +624,9 @@ class TestFederationDeltaSigning(unittest.TestCase):
             'timestamp': time.time(),
         }
 
-        # Mock out the actual broadcast (DB + HTTP)
-        with patch('integrations.social.models.get_db', side_effect=ImportError):
+        # Mock out the actual broadcast (DB + HTTP), provide signing key
+        with patch('integrations.social.models.get_db', side_effect=ImportError), \
+             patch.dict(os.environ, {'HART_NODE_KEY': 'test-broadcast-key'}):
             agg.broadcast_delta(delta)
             # Delta should now have hmac_signature
             self.assertIn('hmac_signature', delta)

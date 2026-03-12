@@ -284,11 +284,13 @@ def pocket_tts_clone_voice(audio_path: str, name: str) -> str:
         model = _load_model()
         voice_state = model.get_state_for_audio_prompt(audio_path)
 
-        # Export voice state for fast loading
+        # Export voice embedding for fast loading (not full model weights)
         save_path = _get_custom_voices_dir() / f"{name}.safetensors"
-        state_dict = model.export_model_state()
         from safetensors.torch import save_file
-        save_file(state_dict, str(save_path))
+        if isinstance(voice_state, dict):
+            save_file(voice_state, str(save_path))
+        else:
+            save_file({"voice_embedding": voice_state}, str(save_path))
 
         # Cache it
         _voice_states[name] = voice_state

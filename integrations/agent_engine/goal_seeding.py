@@ -544,6 +544,27 @@ SEED_BOOTSTRAP_GOALS = [
         'spark_budget': 150,
         'use_product': False,
     },
+    # ─── Code Evolution — Shard-Based Private Repo Coding ───
+    {
+        'slug': 'bootstrap_code_evolution',
+        'goal_type': 'code_evolution',
+        'title': 'Full-Context Code Evolution with Trust-Based Access',
+        'description': (
+            'Handle code evolution thought experiments: '
+            '1) Use create_code_shard to load full source for target files, '
+            '2) Use execute_coding_task with working_dir to make edits '
+            'via the best coding tool (KiloCode, Claude Code, OpenCode, AiderNative), '
+            '3) Hive offload only to trusted peers (SAME_USER or autotrust with 5+ '
+            'validated tasks) — full source E2E encrypted, never interface-only. '
+            'Security is encryption-based, not info-hiding. Accuracy > security theater.'
+        ),
+        'config': {
+            'mode': 'coordinator',
+            'continuous': True,
+        },
+        'spark_budget': 200,
+        'use_product': False,
+    },
     # ─── AutoResearch — Autonomous Experiment Loop ───
     {
         'slug': 'bootstrap_autoresearch_coordinator',

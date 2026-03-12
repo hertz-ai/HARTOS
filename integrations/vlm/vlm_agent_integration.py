@@ -19,6 +19,7 @@ This module integrates VLM feedback into the agent ledger for:
 
 import json
 import logging
+import os
 import requests
 from typing import Dict, Any, Optional, List
 from datetime import datetime
@@ -38,7 +39,11 @@ class VLMAgentContext:
     4. Update ledger with visual verification results
     """
 
-    def __init__(self, vlm_server_url: str = "http://localhost:5001", omniparser_url: str = "http://localhost:8080"):
+    def __init__(self, vlm_server_url: str = None, omniparser_url: str = None):
+        if vlm_server_url is None:
+            vlm_server_url = f"http://localhost:{os.environ.get('VLM_GUI_PORT', '5001')}"
+        if omniparser_url is None:
+            omniparser_url = f"http://localhost:{os.environ.get('OMNIPARSER_PORT', '8080')}"
         """
         Initialize VLM agent context manager.
 
@@ -56,7 +61,7 @@ class VLMAgentContext:
         try:
             response = requests.get(f"{self.vlm_server_url}/health", timeout=2)
             return response.status_code == 200
-        except:
+        except Exception:
             return False
 
     def is_omniparser_available(self) -> bool:
@@ -64,7 +69,7 @@ class VLMAgentContext:
         try:
             response = requests.get(f"{self.omniparser_url}/probe", timeout=2)
             return response.status_code == 200
-        except:
+        except Exception:
             return False
 
     def get_screen_context(self) -> Optional[Dict[str, Any]]:
@@ -393,7 +398,7 @@ class VLMAgentContext:
 # Singleton instance
 _vlm_context = None
 
-def get_vlm_context(vlm_server_url: str = "http://localhost:5001", omniparser_url: str = "http://localhost:8080") -> VLMAgentContext:
+def get_vlm_context(vlm_server_url: str = None, omniparser_url: str = None) -> VLMAgentContext:
     """Get or create the singleton VLM context instance."""
     global _vlm_context
     if _vlm_context is None:

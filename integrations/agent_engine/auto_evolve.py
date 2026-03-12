@@ -201,20 +201,17 @@ class AutoEvolveOrchestrator:
                            statuses: List[str]) -> List[Dict]:
         """Gather eligible thought experiments from DB."""
         try:
-            from integrations.social.models import get_db
+            from integrations.social.models import db_session
             from integrations.social.thought_experiment_service import (
                 ThoughtExperimentService)
 
-            db = get_db()
-            try:
+            with db_session(commit=False) as db:
                 all_experiments = []
                 for status in statuses:
                     exps = ThoughtExperimentService.get_active_experiments(
                         db, status=status, limit=50)
                     all_experiments.extend(exps)
                 return all_experiments
-            finally:
-                db.close()
         except Exception as e:
             logger.warning(f"[{session.session_id}] Gather failed: {e}")
             return []
@@ -244,12 +241,11 @@ class AutoEvolveOrchestrator:
         """Tally votes and rank by approval score."""
         scored = []
         try:
-            from integrations.social.models import get_db
+            from integrations.social.models import db_session
             from integrations.social.thought_experiment_service import (
                 ThoughtExperimentService)
 
-            db = get_db()
-            try:
+            with db_session(commit=False) as db:
                 for exp in candidates:
                     tally = ThoughtExperimentService.tally_votes(
                         db, exp['id'])
@@ -258,8 +254,6 @@ class AutoEvolveOrchestrator:
                     exp['_tally'] = tally
                     if score >= min_score:
                         scored.append(exp)
-            finally:
-                db.close()
         except Exception as e:
             logger.warning(f"[{session.session_id}] Vote tally failed: {e}")
             return candidates  # Fall through unranked
@@ -274,20 +268,21 @@ class AutoEvolveOrchestrator:
 
         Uses ThoughtExperimentService.request_agent_evaluation() which
         creates an agent goal with the type-aware iteration recipe.
+
+        Special case: experiments with experiment_type='code_evolution' and
+        target_repo='hevolveai' are dispatched to the HevolveAI evolution
+        orchestrator inshghtead of the standard evaluation pipeline.
         """
-        from integrations.social.models import get_db
+        from integrations.social.models import db_session
         from integrations.social.thought_experiment_service import (
             ThoughtExperimentService)
 
-        db = get_db()
-        try:
+        with db_session(commit=False) as db:
             result = ThoughtExperimentService.request_agent_evaluation(
                 db, exp['id'])
             if result.get('success'):
                 db.commit()
             return result
-        finally:
-            db.close()
 
     def _emit_event(self, topic: str, data: Dict):
         """Emit progress event via EventBus."""
@@ -329,10 +324,9 @@ def pause_experiment_evolution(experiment_id: str, user_id: str) -> Dict:
     """
     # Verify ownership
     try:
-        from integrations.social.models import get_db
+        from integrations.social.models import db_session
         from integrations.social.thought_experiment_service import ThoughtExperimentService
-        db = get_db()
-        try:
+        with db_session(commit=False) as db:
             detail = ThoughtExperimentService.get_experiment_detail(
                 db, experiment_id)
             if not detail:
@@ -340,8 +334,6 @@ def pause_experiment_evolution(experiment_id: str, user_id: str) -> Dict:
             if detail.get('creator_id') != user_id:
                 return {'success': False, 'reason': 'not_owner',
                         'message': 'Only the experiment creator can pause it'}
-        finally:
-            db.close()
     except Exception as e:
         return {'success': False, 'reason': str(e)}
 

@@ -118,9 +118,15 @@ class CodingAgentOrchestrator:
     def _offload_to_hive(self, task: str, task_type: str,
                           preferred_tool: str, user_id: str,
                           model: str, working_dir: str) -> Dict:
-        """Offload to a hive peer with sufficient compute.
+        """Offload to a trusted hive peer with sufficient compute.
 
-        Uses E2E encryption via channel_encryption.py (X25519 + AES-256-GCM).
+        Security: E2E encryption (X25519 + AES-256-GCM) with full source context.
+        Trust: Only offload code tasks to peers with sufficient trust score.
+        Accuracy > Security theater: peers get full file content (encrypted),
+        not interface stubs. An LLM without full context produces broken code.
+
+        Autotrust: peers earn trust through successful task completion.
+        After 5+ validated code tasks, a peer auto-promotes to code-trusted.
         """
         try:
             from integrations.agent_engine.compute_mesh_service import get_compute_mesh
@@ -133,13 +139,23 @@ class CodingAgentOrchestrator:
             peers = mesh.get_available_peers()
 
             if not peers:
-                # No peers available, try locally anyway
                 logger.info("No hive peers available, attempting local execution")
                 return self._execute_local(task, task_type, preferred_tool,
                                             user_id, model, working_dir)
 
-            # Pick best peer
-            best_peer = max(peers, key=lambda p: mesh.score(p))
+            # Filter to code-trusted peers only
+            trusted_peers = [
+                p for p in peers
+                if self._is_code_trusted(p)
+            ]
+
+            if not trusted_peers:
+                logger.info("No code-trusted peers, executing locally")
+                return self._execute_local(task, task_type, preferred_tool,
+                                            user_id, model, working_dir)
+
+            # Pick best trusted peer (by compute score)
+            best_peer = max(trusted_peers, key=lambda p: mesh.score(p))
             peer_pub = best_peer.get('x25519_public_hex')
             peer_url = best_peer.get('url', '')
 
@@ -147,12 +163,20 @@ class CodingAgentOrchestrator:
                 return self._execute_local(task, task_type, preferred_tool,
                                             user_id, model, working_dir)
 
-            # Encrypt payload (forward secrecy via ephemeral keys)
+            # Include full source context for target files (encrypted)
+            # Accuracy > security theater: the peer needs full context to code well
+            file_content = {}
+            if working_dir:
+                file_content = self._read_target_files(task, working_dir)
+
+            # Encrypt full payload (forward secrecy via ephemeral keys)
             payload = {
                 'task': task,
                 'task_type': task_type,
                 'preferred_tool': preferred_tool,
                 'model': model,
+                'file_content': file_content,
+                'working_dir_name': os.path.basename(working_dir) if working_dir else '',
             }
             envelope = encrypt_json_for_peer(payload, peer_pub)
 
@@ -163,13 +187,30 @@ class CodingAgentOrchestrator:
                 timeout=300,
             )
 
+            peer_id = best_peer.get('node_id', 'unknown')
             if resp.status_code == 200:
                 encrypted_result = resp.json().get('encrypted')
                 if encrypted_result:
                     result = decrypt_json_from_peer(encrypted_result)
                     if result:
                         result['offloaded'] = True
-                        # Record benchmark as offloaded
+                        result['peer_id'] = peer_id
+
+                        # Validate diffs only touch expected files
+                        diffs = result.get('diffs', {})
+                        if file_content and diffs:
+                            unauthorized = [
+                                f for f in diffs
+                                if f not in file_content
+                            ]
+                            if unauthorized:
+                                logger.warning(
+                                    f"Peer {peer_id} returned diffs for "
+                                    f"unauthorized files: {unauthorized}")
+                                result['success'] = False
+                                result['error'] = 'Unauthorized file modifications'
+
+                        # Record benchmark
                         from .benchmark_tracker import get_benchmark_tracker
                         tracker = get_benchmark_tracker()
                         tracker.record(
@@ -181,7 +222,14 @@ class CodingAgentOrchestrator:
                             user_id=user_id,
                             offloaded=True,
                         )
+
+                        # Autotrust: successful validated tasks build trust
+                        if result.get('success'):
+                            self._record_peer_trust(peer_id, success=True)
                         return result
+
+            # Peer failed — record for trust scoring
+            self._record_peer_trust(peer_id, success=False)
 
         except Exception as e:
             logger.warning(f"Hive offload failed ({e}), falling back to local")
@@ -189,6 +237,94 @@ class CodingAgentOrchestrator:
         # Fallback to local
         return self._execute_local(task, task_type, preferred_tool,
                                     user_id, model, working_dir)
+
+    @staticmethod
+    def _is_code_trusted(peer: Dict) -> bool:
+        """Check if a peer is trusted for code tasks.
+
+        Trust sources (any one is sufficient):
+        - SAME_USER: peer belongs to the same user (their other machine)
+        - Explicit grant: peer has 'code_trusted' flag
+        - Autotrust: peer has 5+ successful validated code tasks
+        """
+        if peer.get('trust_level') == 'SAME_USER':
+            return True
+        if peer.get('code_trusted'):
+            return True
+        # Autotrust: earned through track record
+        successful_tasks = peer.get('successful_code_tasks', 0)
+        return successful_tasks >= 5
+
+    @staticmethod
+    def _record_peer_trust(peer_id: str, success: bool):
+        """Record a peer's code task result for autotrust scoring."""
+        try:
+            from integrations.social.models import get_db, PeerNode
+            db = get_db()
+            try:
+                node = db.query(PeerNode).filter_by(node_id=peer_id).first()
+                if node:
+                    if not hasattr(node, 'successful_code_tasks'):
+                        return
+                    if success:
+                        node.successful_code_tasks = (
+                            node.successful_code_tasks or 0) + 1
+                    else:
+                        # Failed tasks reduce trust (but floor at 0)
+                        node.successful_code_tasks = max(
+                            0, (node.successful_code_tasks or 0) - 2)
+                    db.commit()
+            finally:
+                db.close()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _read_target_files(task: str, working_dir: str) -> Dict[str, str]:
+        """Read target files for the task from the working directory.
+
+        Uses the shard engine's keyword matching to find relevant files,
+        limited to a reasonable context window.
+        """
+        file_content = {}
+        max_files = 10
+        max_total_chars = 200_000  # ~50K tokens
+        total_chars = 0
+        try:
+            from integrations.agent_engine.shard_engine import ShardEngine
+            engine = ShardEngine(code_root=working_dir)
+            imap = engine.get_interface_map()
+
+            # Score files by task keyword relevance
+            task_lower = task.lower()
+            scored = []
+            for rel_path, spec in imap.items():
+                names = (
+                    [f['name'] for f in spec.functions] +
+                    [c['name'] for c in spec.classes] +
+                    [rel_path]
+                )
+                score = sum(1 for n in names if n.lower() in task_lower)
+                if score > 0:
+                    scored.append((rel_path, score))
+            scored.sort(key=lambda x: -x[1])
+
+            for rel_path, _ in scored[:max_files]:
+                full_path = os.path.join(working_dir, rel_path)
+                if os.path.exists(full_path):
+                    try:
+                        with open(full_path, 'r', encoding='utf-8',
+                                  errors='ignore') as f:
+                            content = f.read()
+                        if total_chars + len(content) > max_total_chars:
+                            break
+                        file_content[rel_path] = content
+                        total_chars += len(content)
+                    except IOError:
+                        pass
+        except Exception as e:
+            logger.debug(f"Target file reading: {e}")
+        return file_content
 
     def list_tools(self) -> Dict:
         """List all tools with install status, capabilities, and benchmarks."""

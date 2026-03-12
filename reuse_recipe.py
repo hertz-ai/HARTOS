@@ -1,7 +1,10 @@
 """reuse_recipe.py"""
 from enum import Enum
 import random
-import autogen
+try:
+    import autogen
+except ImportError:
+    autogen = None
 import os
 import pytz
 from core.http_pool import pooled_get, pooled_post, pooled_request
@@ -24,7 +27,7 @@ from PIL import Image
 
 
 from flask import current_app
-from helper import ToolMessageHandler, strip_json_values, get_time_based_history, retrieve_json, load_vlm_agent_files
+from helper import ToolMessageHandler, strip_json_values, get_time_based_history, retrieve_json, load_vlm_agent_files, _is_terminate_msg
 try:
     from helper import PROMPTS_DIR
 except Exception:
@@ -75,12 +78,21 @@ from integrations.expert_agents import (
 )
 
 # Add Smart Ledger for persistent task tracking in reuse mode - using agent_ledger package
-from agent_ledger import (
-    SmartLedger, Task, TaskType,
-    TaskStatus as LedgerTaskStatus,  # Agent ledger task status (PENDING, IN_PROGRESS, etc.)
-    ExecutionMode,
-    create_ledger_from_actions, get_production_backend
-)
+try:
+    from agent_ledger import (
+        SmartLedger, Task, TaskType,
+        TaskStatus as LedgerTaskStatus,  # Agent ledger task status (PENDING, IN_PROGRESS, etc.)
+        ExecutionMode,
+        create_ledger_from_actions, get_production_backend
+    )
+except ImportError:
+    SmartLedger = None
+    Task = None
+    TaskType = None
+    LedgerTaskStatus = None
+    ExecutionMode = None
+    create_ledger_from_actions = None
+    get_production_backend = None
 
 # Import helper_ledger functions for subtask management and ledger awareness
 from helper_ledger import (
@@ -777,10 +789,10 @@ def visual_based_execution(task_description: str, user_id: int, prompt_id: int):
         result = user.initiate_chat(manager, message=text, speaker_selection={"speaker": "assistant"},
                                     clear_history=False)
 
-        last_message = group_chat.messages[-1]
+        last_message = chat.messages[-1]
         if last_message['content'] == 'TERMINATE':
-            if len(group_chat.messages) > 1:
-                last_message = group_chat.messages[-2]
+            if len(chat.messages) > 1:
+                last_message = chat.messages[-2]
             if 'message2userfinal' in last_message['content'].lower():
                 try:
                     json_obj = retrieve_json(last_message['content'])
@@ -831,7 +843,7 @@ def create_agents_for_role(user_id: str, prompt_id):
             name=f"assistant",
             llm_config=llm_config,
             max_consecutive_auto_reply=10,
-            is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+            is_termination_msg=_is_terminate_msg,
             code_execution_config={"work_dir": "coding", "use_docker": False},
             system_message=agent_prompt
         )
@@ -839,7 +851,7 @@ def create_agents_for_role(user_id: str, prompt_id):
             name=f"user",
             human_input_mode="NEVER",
             llm_config=False,
-            is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+            is_termination_msg=_is_terminate_msg,
             max_consecutive_auto_reply=0,
             code_execution_config=False,
         )
@@ -849,7 +861,7 @@ def create_agents_for_role(user_id: str, prompt_id):
             code_execution_config={"work_dir": "coding", "use_docker": False},
             system_message="""You Help the assistant agent to complete the task, you are helper agent not user/n
             if you get any request related you user redicrect that conversation to user don't asumer anything or answer anything on your own""",
-            is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+            is_termination_msg=_is_terminate_msg,
         )
 
         @helper.register_for_execution()
@@ -1159,7 +1171,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         name='Assistant',
         llm_config=llm_config,
         max_consecutive_auto_reply=10,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
         code_execution_config={"work_dir": "coding", "use_docker": False},
         system_message=agent_prompt
     )
@@ -1184,7 +1196,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         name=f"User",
         human_input_mode="NEVER",
         llm_config=False,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
         max_consecutive_auto_reply=0,
         code_execution_config=False,
     )
@@ -1212,7 +1224,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
             When writing code, always print the final response just before returning it.
         """,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
     executor = autogen.AssistantAgent(
         name="Executor",
@@ -1243,7 +1255,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             if you get any conversation which is not related to coding ask the manager to route this conversation to user
             When writing code, always print the final response just before returning it.
         ''',
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
 
     multi_role_agent = autogen.AssistantAgent(
@@ -1272,7 +1284,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             Use "requires_breakdown" when an action is too complex and needs to be split into smaller subtasks. Each subtask should have a unique subtask_id (e.g., "1.1", "1.2").
 
         """,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
 
     chat_instructor = autogen.UserProxyAgent(
@@ -1281,7 +1293,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         max_consecutive_auto_reply=10,
         default_auto_reply="TERMINATE",
         code_execution_config=False,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
 
     context_handling = transform_messages.TransformMessages(
@@ -2220,7 +2232,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         name='time_agent',
         llm_config=llm_config,
         max_consecutive_auto_reply=10,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
         code_execution_config={"work_dir": "coding", "use_docker": False},
         system_message="You are an helpful AI assistant used to perform time based tasks given to you. "
                        f"""You can refer below details to perform task:
@@ -2240,7 +2252,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         name=f"user_proxy_{user_id}",
         human_input_mode="NEVER",
         llm_config=False,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
         max_consecutive_auto_reply=0,
         code_execution_config=False,
     )
@@ -2264,7 +2276,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
             When writing code, always print the final response just before returning it.
         """,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
     executor1 = autogen.AssistantAgent(
         name="Executor",
@@ -2291,7 +2303,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             if you get any conversation which is not related to coding ask the manager to route this conversation to user
             When writing code, always print the final response just before returning it.
         ''',
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
     multi_role_agent1 = autogen.AssistantAgent(
         name="multi_role_agent",
@@ -2317,7 +2329,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             Report status only—do not perform actions yourself.
 
         """,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
 
     chat_instructor1 = autogen.UserProxyAgent(
@@ -2326,7 +2338,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         max_consecutive_auto_reply=10,
         default_auto_reply="TERMINATE",
         code_execution_config=False,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
 
     context_handling = transform_messages.TransformMessages(

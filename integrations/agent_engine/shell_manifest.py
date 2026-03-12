@@ -476,7 +476,10 @@ SYSTEM_PANELS = {
     'media_library': {
         'title': 'Media Library', 'icon': 'perm_media',
         'group': 'System', 'default_size': [800, 600],
-        'apis': ['/api/shell/media/status', '/api/shell/media/photos'],
+        'apis': ['/api/shell/media/status', '/api/shell/media/photos',
+                 '/api/shell/media/music', '/api/shell/media/videos',
+                 '/api/shell/media/play', '/api/shell/media/stop',
+                 '/api/shell/media/player-status'],
     },
     # ─── OS Feature Panels ───
     'calculator': {
@@ -494,35 +497,51 @@ SYSTEM_PANELS = {
         'group': 'System', 'default_size': [600, 500],
         'apis': ['/api/shell/notes'],
     },
+    'cloud_sync': {
+        'title': 'Cloud Sync', 'icon': 'cloud_sync',
+        'group': 'System', 'default_size': [700, 500],
+        'apis': ['/api/shell/cloud-sync/remotes', '/api/shell/cloud-sync/pairs',
+                 '/api/shell/cloud-sync/run', '/api/shell/cloud-sync/status'],
+    },
     'app_store': {
         'title': 'App Store', 'icon': 'storefront',
         'group': 'System', 'default_size': [900, 700],
-        'apis': ['/api/apps/search', '/api/apps/install'],
+        'apis': ['/api/apps/search', '/api/apps/installed',
+                 '/api/apps/install', '/api/apps/uninstall'],
     },
     'app_permissions': {
         'title': 'App Permissions', 'icon': 'admin_panel_settings',
         'group': 'System', 'default_size': [700, 500],
-        'apis': ['/api/apps/installed'],
+        'apis': ['/api/apps/installed',
+                 '/api/apps/{app_id}/permissions',
+                 '/api/apps/{app_id}/permission/{type}',
+                 '/api/apps/{app_id}/permissions/reset'],
     },
     'battery_monitor': {
         'title': 'Battery', 'icon': 'battery_full',
         'group': 'System', 'default_size': [400, 300],
-        'apis': ['/api/shell/battery'],
+        'apis': ['/api/shell/battery', '/api/shell/battery/profile'],
     },
     'wifi_manager': {
         'title': 'WiFi', 'icon': 'wifi',
         'group': 'System', 'default_size': [500, 400],
-        'apis': ['/api/shell/wifi/scan', '/api/shell/wifi/status'],
+        'apis': ['/api/shell/wifi/networks', '/api/shell/wifi/status',
+                 '/api/shell/wifi/connect', '/api/shell/wifi/disconnect',
+                 '/api/shell/wifi/saved', '/api/shell/wifi/forget',
+                 '/api/shell/wifi/toggle'],
     },
     'vpn_manager': {
         'title': 'VPN', 'icon': 'vpn_key',
         'group': 'System', 'default_size': [500, 400],
-        'apis': ['/api/shell/vpn/list'],
+        'apis': ['/api/shell/vpn/list', '/api/shell/vpn/status',
+                 '/api/shell/vpn/connect', '/api/shell/vpn/disconnect',
+                 '/api/shell/vpn/import'],
     },
     'trash_bin': {
         'title': 'Trash', 'icon': 'delete',
         'group': 'System', 'default_size': [600, 500],
-        'apis': ['/api/shell/trash'],
+        'apis': ['/api/shell/trash', '/api/shell/trash/move',
+                 '/api/shell/trash/restore', '/api/shell/trash/empty'],
     },
     'webcam_viewer': {
         'title': 'Camera', 'icon': 'videocam',
@@ -532,12 +551,55 @@ SYSTEM_PANELS = {
     'scanner': {
         'title': 'Scanner', 'icon': 'scanner',
         'group': 'System', 'default_size': [600, 500],
-        'apis': ['/api/shell/scanner/list'],
+        'apis': ['/api/shell/scanner/list', '/api/shell/scanner/scan'],
     },
     'weather_widget': {
         'title': 'Weather', 'icon': 'cloud',
         'group': 'System', 'default_size': [400, 350],
-        'apis': [],
+        'apis': ['/api/shell/weather'],
+    },
+    'file_tags': {
+        'title': 'File Tags', 'icon': 'label',
+        'group': 'System', 'default_size': [600, 500],
+        'apis': ['/api/shell/files/tags', '/api/shell/files/search-by-tag'],
+    },
+    'hotspot': {
+        'title': 'Hotspot', 'icon': 'wifi_tethering',
+        'group': 'System', 'default_size': [400, 350],
+        'apis': ['/api/shell/hotspot/status', '/api/shell/hotspot/start',
+                 '/api/shell/hotspot/stop'],
+    },
+    'dns_settings': {
+        'title': 'DNS Settings', 'icon': 'dns',
+        'group': 'System', 'default_size': [500, 400],
+        'apis': ['/api/shell/dns/status', '/api/shell/dns/set'],
+    },
+    'auto_update': {
+        'title': 'Auto Update', 'icon': 'system_update',
+        'group': 'System', 'default_size': [500, 400],
+        'apis': ['/api/shell/auto-update/status', '/api/shell/auto-update/run'],
+    },
+    'sso_ldap': {
+        'title': 'Enterprise Login', 'icon': 'domain',
+        'group': 'System', 'default_size': [600, 500],
+        'apis': ['/api/shell/sso/status', '/api/shell/sso/join',
+                 '/api/shell/sso/leave', '/api/shell/sso/test'],
+    },
+    'email': {
+        'title': 'Email', 'icon': 'email',
+        'group': 'System', 'default_size': [800, 600],
+        'apis': ['/api/shell/email/status', '/api/shell/email/launch'],
+    },
+    'voice_control': {
+        'title': 'Voice Control', 'icon': 'mic',
+        'group': 'System', 'default_size': [500, 400],
+        'apis': ['/api/shell/voice/status', '/api/shell/voice/start',
+                 '/api/shell/voice/stop', '/api/shell/voice/process'],
+    },
+    'screen_rotation': {
+        'title': 'Screen Rotation', 'icon': 'screen_rotation',
+        'group': 'System', 'default_size': [400, 350],
+        'apis': ['/api/shell/display/rotation', '/api/shell/display/auto-rotate'],
     },
     'keyboard_shortcuts': {
         'title': 'Keyboard Shortcuts', 'icon': 'keyboard_command_key',

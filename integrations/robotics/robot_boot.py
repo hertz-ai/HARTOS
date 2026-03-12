@@ -160,8 +160,8 @@ def _sensor_ingest_tick():
         if latest:
             readings = [r.to_dict() for r in latest.values()]
             bridge.ingest_sensor_batch(readings)
-    except Exception:
-        pass  # Silently skip — control loop handles errors
+    except Exception as e:
+        logger.debug(f"Sensor tick error: {e}")
 
 
 def _feedback_poll_tick():
@@ -174,5 +174,5 @@ def _feedback_poll_tick():
         feedback = bridge.get_learning_feedback()
         if feedback:
             logger.debug(f"Learning feedback: {feedback}")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Feedback poll error: {e}")

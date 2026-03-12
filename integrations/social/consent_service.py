@@ -209,6 +209,10 @@ class ConsentService:
             if blanket:
                 return True
 
+        import logging as _log
+        _log.getLogger('hevolve.consent').warning(
+            "Consent check denied: user=%s type=%s scope=%s agent=%s",
+            user_id, consent_type, scope, agent_id)
         return False
 
     # Alias for readability
