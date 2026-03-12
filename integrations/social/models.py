@@ -39,13 +39,35 @@ except ImportError:
 
 # ── Database URL resolution ──────────────────────────────────
 # Priority: HEVOLVE_DB_URL > DATABASE_URL > HEVOLVE_DB_PATH > SOCIAL_DB_PATH > auto-detect
+#
+# Cloud/Docker deployments MUST set HEVOLVE_DB_URL (or DATABASE_URL) pointing to
+# the remote MySQL/PostgreSQL instance. SQLite fallback is only for local dev/standalone.
+# Detection: /.dockerenv file, DOCKER_CONTAINER env, or HEVOLVE_CLOUD_MODE env.
 _DB_URL_ENV = os.environ.get('HEVOLVE_DB_URL') or os.environ.get('DATABASE_URL')
 _DB_PATH_ENV = os.environ.get('HEVOLVE_DB_PATH') or os.environ.get('SOCIAL_DB_PATH')
+
+_IS_DOCKER = (
+    os.path.exists('/.dockerenv')
+    or os.environ.get('DOCKER_CONTAINER') == 'true'
+    or os.environ.get('HEVOLVE_CLOUD_MODE') == 'true'
+)
 
 if _DB_URL_ENV:
     # Full URL override (MySQL, PostgreSQL, or SQLite) — aligns with Hevolve_Database
     DB_URL = _DB_URL_ENV
     DB_PATH = ':memory:' if DB_URL == 'sqlite://' else None
+elif _IS_DOCKER and not _DB_PATH_ENV:
+    # Cloud/Docker mode WITHOUT a DB URL configured — this is a misconfiguration.
+    # Refuse to silently fall back to SQLite; log a loud warning and use in-memory
+    # so the server starts (health checks pass) but makes the problem obvious.
+    import logging as _logging_models
+    _logging_models.getLogger(__name__).critical(
+        'CLOUD/DOCKER MODE: HEVOLVE_DB_URL or DATABASE_URL not set! '
+        'Set HEVOLVE_DB_URL=mysql+pymysql://user:pass@host/db to connect to cloud DB. '
+        'Falling back to in-memory SQLite — NO DATA WILL PERSIST.'
+    )
+    DB_PATH = ':memory:'
+    DB_URL = 'sqlite://'
 elif _DB_PATH_ENV == ':memory:':
     DB_PATH = ':memory:'
     DB_URL = 'sqlite://'
@@ -187,97 +209,60 @@ def init_db():
 
 
 # ═══════════════════════════════════════════════════════════════
-# MODEL IMPORTS — All classes from hevolve-database (single source of truth)
+# MODEL IMPORTS — Canonical source: hevolve-database (sql.models)
+# Fallback: local definitions in _models_local.py (for Docker/standalone)
 #
 # The 3 collision classes (SocialUser, SocialPost, SocialComment) are aliased
 # to User, Post, Comment so all existing HARTOS code keeps working.
 # ═══════════════════════════════════════════════════════════════
 
-from sql.models import (  # noqa: E402, F401
-    # Collision classes — aliased for HARTOS backward compatibility
-    SocialUser as User,
-    SocialPost as Post,
-    SocialComment as Comment,
-    # Non-collision classes — direct import
-    Region,
-    Community,
-    Vote,
-    Follow,
-    CommunityMembership,
-    AgentSkillBadge,
-    TaskRequest,
-    Notification,
-    Report,
-    RecipeShare,
-    PeerNode,
-    InstanceFollow,
-    FederatedPost,
-    ResonanceWallet,
-    ResonanceTransaction,
-    Achievement,
-    UserAchievement,
-    Season,
-    Challenge,
-    UserChallenge,
-    RegionMembership,
-    Encounter,
-    Rating,
-    TrustScore,
-    AgentEvolution,
-    AgentCollaboration,
-    Referral,
-    ReferralCode,
-    Boost,
-    OnboardingProgress,
-    Campaign,
-    CampaignAction,
-    LocationPing,
-    ProximityMatch,
-    MissedConnection,
-    MissedConnectionResponse,
-    AdUnit,
-    AdPlacement,
-    AdImpression,
-    HostingReward,
-    NodeAttestation,
-    IntegrityChallenge,
-    FraudAlert,
-    RegionAssignment,
-    SyncQueue,
-    CodingGoal,
-    CodingTask,
-    CodingSubmission,
-    Product,
-    AgentGoal,
-    IPPatent,
-    IPInfringement,
-    DefensivePublication,
-    CommercialAPIKey,
-    APIUsageLog,
-    BuildLicense,
-    GuestRecovery,
-    DeviceBinding,
-    BackupMetadata,
-    RegionalHostRequest,
-    FleetCommand,
-    ProvisionedNode,
-    ThoughtExperiment,
-    ExperimentVote,
-    PaperPortfolio,
-    PaperTrade,
-    ComputeEscrow,
-    MeteredAPIUsage,
-    NodeComputeConfig,
-    AuditLogEntry,
-    GameSession,
-    GameParticipant,
-    ShareableLink,
-    ShareEvent,
-    UserConsent,
-    MarketplaceListing,
-    ListingReview,
-    MCPServer,
-    MCPTool,
-    ComputePledge,
-    PledgeConsumption,
-)
+try:
+    from sql.models import (  # noqa: E402, F401
+        # Collision classes — aliased for HARTOS backward compatibility
+        SocialUser as User,
+        SocialPost as Post,
+        SocialComment as Comment,
+        # Non-collision classes — direct import
+        Region, Community, Vote, Follow, CommunityMembership,
+        AgentSkillBadge, TaskRequest, Notification, Report, RecipeShare,
+        PeerNode, InstanceFollow, FederatedPost, ResonanceWallet,
+        ResonanceTransaction, Achievement, UserAchievement, Season,
+        Challenge, UserChallenge, RegionMembership, Encounter, Rating,
+        TrustScore, AgentEvolution, AgentCollaboration, Referral,
+        ReferralCode, Boost, OnboardingProgress, Campaign, CampaignAction,
+        LocationPing, ProximityMatch, MissedConnection,
+        MissedConnectionResponse, AdUnit, AdPlacement, AdImpression,
+        HostingReward, NodeAttestation, IntegrityChallenge, FraudAlert,
+        RegionAssignment, SyncQueue, CodingGoal, CodingTask,
+        CodingSubmission, Product, AgentGoal, IPPatent, IPInfringement,
+        DefensivePublication, CommercialAPIKey, APIUsageLog, BuildLicense,
+        GuestRecovery, DeviceBinding, BackupMetadata, RegionalHostRequest,
+        FleetCommand, ProvisionedNode, ThoughtExperiment, ExperimentVote,
+        PaperPortfolio, PaperTrade, ComputeEscrow, MeteredAPIUsage,
+        NodeComputeConfig, AuditLogEntry, GameSession, GameParticipant,
+        ShareableLink, ShareEvent, UserConsent, MarketplaceListing,
+        ListingReview, MCPServer, MCPTool, ComputePledge, PledgeConsumption,
+    )
+except ImportError:
+    # Standalone/Docker mode: sql package not installed, use local definitions
+    from integrations.social._models_local import (  # noqa: E402, F401
+        User, Post, Comment, Region, Community, Vote, Follow,
+        CommunityMembership, AgentSkillBadge, TaskRequest, Notification,
+        Report, RecipeShare, PeerNode, InstanceFollow, FederatedPost,
+        ResonanceWallet, ResonanceTransaction, Achievement, UserAchievement,
+        Season, Challenge, UserChallenge, RegionMembership, Encounter,
+        Rating, TrustScore, AgentEvolution, AgentCollaboration, Referral,
+        ReferralCode, Boost, OnboardingProgress, Campaign, CampaignAction,
+        LocationPing, ProximityMatch, MissedConnection,
+        MissedConnectionResponse, AdUnit, AdPlacement, AdImpression,
+        HostingReward, NodeAttestation, IntegrityChallenge, FraudAlert,
+        RegionAssignment, SyncQueue, CodingGoal, CodingTask,
+        CodingSubmission, Product, AgentGoal, IPPatent, IPInfringement,
+        DefensivePublication, CommercialAPIKey, APIUsageLog, BuildLicense,
+        GuestRecovery, DeviceBinding, BackupMetadata, RegionalHostRequest,
+        FleetCommand, ProvisionedNode, ThoughtExperiment, ExperimentVote,
+        PaperPortfolio, PaperTrade, ComputeEscrow, MeteredAPIUsage,
+        NodeComputeConfig, AuditLogEntry, GameSession, GameParticipant,
+        ShareableLink, ShareEvent, UserConsent, MarketplaceListing,
+        ListingReview, MCPServer, MCPTool, ComputePledge, PledgeConsumption,
+    )

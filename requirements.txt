@@ -178,6 +178,9 @@ pystray>=0.19.0
 # luxtts>=0.1.0  # not on PyPI — install from source
 soundfile>=0.12.0
 
+# MySQL driver for cloud/Docker deployments (pure Python, no C compiler needed)
+pymysql>=1.1.0
+
 # Aider Core — vendored modules for code intelligence (repo map, search/replace, linting)
 diskcache>=5.6.3
 grep-ast>=0.3.0
