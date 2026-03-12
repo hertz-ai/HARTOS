@@ -58,6 +58,33 @@ _media_lock = threading.Lock()
 # Route registration
 # ═══════════════════════════════════════════════════════════════
 
+def _require_system_auth(f):
+    """Decorator: require local shell auth for destructive system ops."""
+    from functools import wraps
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        from flask import request, jsonify
+        remote = request.remote_addr or ''
+        if remote not in ('127.0.0.1', '::1', 'localhost'):
+            token = request.headers.get('X-Shell-Token', '')
+            expected = os.environ.get('HART_SHELL_TOKEN', '')
+            if not expected or token != expected:
+                return jsonify({'error': 'Unauthorized'}), 403
+        return f(*args, **kwargs)
+    return decorated
+
+
+def _audit_system_op(action, detail=None):
+    """Log a system operation to the immutable audit log (best-effort)."""
+    try:
+        from security.immutable_audit_log import get_audit_log
+        get_audit_log().log_event(
+            'shell_ops', 'shell_system_api', action,
+            detail=detail or {})
+    except Exception:
+        pass
+
+
 def register_shell_system_routes(app):
     """Register all system management API routes."""
     from flask import jsonify, request
@@ -876,6 +903,97 @@ Hidden=false
             'total': len(videos), 'page': page,
         })
 
+    # ─── 15b. Media Player Controls ─────────────────────────────
+
+    _player_proc = {'pid': None, 'path': None, 'engine': None}
+    _player_lock = threading.Lock()
+
+    @app.route('/api/shell/media/play', methods=['POST'])
+    @_require_system_auth
+    def shell_media_play():
+        """Play a media file using mpv (background process)."""
+        body = request.get_json(silent=True) or {}
+        path = body.get('path')
+        if not path:
+            return jsonify({'error': 'path required'}), 400
+        if not os.path.isfile(path):
+            return jsonify({'error': 'File not found'}), 404
+
+        # Path safety: only allow files under user home or /tmp
+        home = os.path.expanduser('~')
+        real = os.path.realpath(path)
+        import tempfile
+        allowed = [os.path.realpath(home), os.path.realpath(tempfile.gettempdir())]
+        if not any(real.startswith(a) for a in allowed):
+            return jsonify({'error': 'Path outside allowed roots'}), 403
+
+        # Stop any existing playback
+        with _player_lock:
+            if _player_proc['pid']:
+                try:
+                    os.kill(_player_proc['pid'], signal.SIGTERM)
+                except (OSError, ProcessLookupError):
+                    pass
+
+        # Try mpv first, then xdg-open fallback
+        for engine in ['mpv', 'vlc', 'xdg-open']:
+            r = _run(['which', engine], timeout=2)
+            if r and r.returncode == 0:
+                try:
+                    proc = subprocess.Popen(
+                        [engine, '--', path],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL)
+                    with _player_lock:
+                        _player_proc['pid'] = proc.pid
+                        _player_proc['path'] = path
+                        _player_proc['engine'] = engine
+                    _audit_system_op('media_play', {'path': path, 'engine': engine})
+                    return jsonify({
+                        'playing': True, 'path': path,
+                        'engine': engine, 'pid': proc.pid,
+                    })
+                except Exception as e:
+                    continue
+
+        return jsonify({'error': 'No media player found (install mpv)'}), 500
+
+    @app.route('/api/shell/media/stop', methods=['POST'])
+    @_require_system_auth
+    def shell_media_stop():
+        """Stop current media playback."""
+        with _player_lock:
+            pid = _player_proc.get('pid')
+            if not pid:
+                return jsonify({'stopped': False, 'error': 'Nothing playing'})
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (OSError, ProcessLookupError):
+                pass
+            _player_proc['pid'] = None
+            _player_proc['path'] = None
+            _player_proc['engine'] = None
+        return jsonify({'stopped': True})
+
+    @app.route('/api/shell/media/player-status', methods=['GET'])
+    def shell_media_player_status():
+        """Get current media player status."""
+        with _player_lock:
+            pid = _player_proc.get('pid')
+            running = False
+            if pid:
+                try:
+                    os.kill(pid, 0)  # Signal 0 = check existence
+                    running = True
+                except (OSError, ProcessLookupError):
+                    _player_proc['pid'] = None
+                    _player_proc['path'] = None
+        return jsonify({
+            'playing': running,
+            'path': _player_proc.get('path'),
+            'engine': _player_proc.get('engine'),
+        })
+
     # ─── 16. Webcam / Camera ───────────────────────────────────
 
     @app.route('/api/shell/webcam/list', methods=['GET'])
@@ -939,4 +1057,666 @@ Hidden=false
         return jsonify({'status': 'error',
                        'error': r.stderr if r else 'scanimage not available'}), 500
 
-    logger.info("Registered shell system routes (6 features)")
+    # ─── 18. Battery / Power Monitoring ──────────────────────
+
+    def _read_sysfs(path, default=''):
+        """Read a single sysfs file, return stripped string or default."""
+        try:
+            with open(path) as f:
+                return f.read().strip()
+        except (FileNotFoundError, PermissionError, OSError):
+            return default
+
+    def _battery_info():
+        """Gather battery information from psutil + Linux sysfs."""
+        info = {
+            'present': False, 'status': 'unknown', 'capacity': None,
+            'voltage_v': None, 'power_w': None, 'temperature_c': None,
+            'technology': None, 'health': 'unknown',
+            'remaining_minutes': None, 'plugged_in': False,
+        }
+
+        # Try psutil first (cross-platform)
+        try:
+            import psutil
+            bat = psutil.sensors_battery()
+            if bat:
+                info['present'] = True
+                info['capacity'] = round(bat.percent, 1)
+                info['plugged_in'] = bat.power_plugged
+                if bat.power_plugged:
+                    info['status'] = 'charging' if bat.percent < 100 else 'full'
+                else:
+                    info['status'] = 'discharging'
+                if bat.secsleft and bat.secsleft > 0:
+                    info['remaining_minutes'] = round(bat.secsleft / 60, 0)
+        except (ImportError, RuntimeError):
+            pass
+
+        # Enrich with Linux sysfs (more detail)
+        import glob as _glob
+        bat_dirs = sorted(_glob.glob('/sys/class/power_supply/BAT*'))
+        if bat_dirs:
+            d = bat_dirs[0]
+            info['present'] = True
+            sysfs_status = _read_sysfs(f'{d}/status')
+            if sysfs_status:
+                info['status'] = sysfs_status.lower()
+
+            cap = _read_sysfs(f'{d}/capacity')
+            if cap.isdigit():
+                info['capacity'] = int(cap)
+
+            voltage = _read_sysfs(f'{d}/voltage_now')
+            if voltage.isdigit():
+                info['voltage_v'] = round(int(voltage) / 1_000_000, 2)
+
+            power = _read_sysfs(f'{d}/power_now')
+            if power.isdigit():
+                info['power_w'] = round(int(power) / 1_000_000, 2)
+
+            temp = _read_sysfs(f'{d}/temp')
+            if temp.isdigit():
+                info['temperature_c'] = round(int(temp) / 10, 1)
+
+            info['technology'] = _read_sysfs(f'{d}/technology') or None
+
+        # Health classification
+        if info['capacity'] is not None:
+            if info['capacity'] > 20:
+                info['health'] = 'good'
+            elif info['capacity'] > 5:
+                info['health'] = 'low'
+            else:
+                info['health'] = 'critical'
+
+        # AC adapter
+        ac_dirs = sorted(_glob.glob('/sys/class/power_supply/AC*') +
+                         _glob.glob('/sys/class/power_supply/ADP*'))
+        if ac_dirs:
+            online = _read_sysfs(f'{ac_dirs[0]}/online')
+            if online == '1':
+                info['plugged_in'] = True
+
+        return info
+
+    @app.route('/api/shell/battery', methods=['GET'])
+    def shell_battery_status():
+        """Get current battery status."""
+        return jsonify(_battery_info())
+
+    @app.route('/api/shell/battery/profile', methods=['GET'])
+    def shell_battery_profile():
+        """Get current power profile."""
+        profiles = []
+        r = _run(['powerprofilesctl', 'list'], timeout=5)
+        current = None
+        if r and r.returncode == 0:
+            for line in r.stdout.strip().split('\n'):
+                line = line.strip()
+                if line.endswith(':'):
+                    name = line.rstrip(':').lstrip('* ')
+                    profiles.append(name)
+                    if line.startswith('*'):
+                        current = name
+        if not profiles:
+            # Fallback: check TLP or cpufreq
+            r2 = _run(['cat', '/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor'],
+                       timeout=5)
+            if r2 and r2.returncode == 0:
+                current = r2.stdout.strip()
+                profiles = ['performance', 'powersave', 'schedutil']
+        return jsonify({
+            'current_profile': current,
+            'available': profiles,
+        })
+
+    @app.route('/api/shell/battery/profile', methods=['POST'])
+    @_require_system_auth
+    def shell_battery_set_profile():
+        """Set power profile."""
+        body = request.get_json(silent=True) or {}
+        profile = body.get('profile')
+        if not profile:
+            return jsonify({'error': 'profile required'}), 400
+        r = _run(['powerprofilesctl', 'set', profile], timeout=5)
+        if r and r.returncode == 0:
+            _audit_system_op('battery_profile', {'profile': profile})
+            return jsonify({'success': True, 'profile': profile})
+        return jsonify({'error': 'Failed to set profile',
+                       'detail': r.stderr if r else 'powerprofilesctl not available'}), 500
+
+    # ─── 19. WiFi Management ──────────────────────────────────
+
+    @app.route('/api/shell/wifi/status', methods=['GET'])
+    def shell_wifi_status():
+        """Get current WiFi connection status."""
+        info = {'enabled': False, 'connected': False, 'ssid': None,
+                'signal': None, 'frequency': None, 'ip': None}
+        # Check if WiFi is enabled
+        r = _run(['nmcli', 'radio', 'wifi'], timeout=5)
+        if r and r.returncode == 0:
+            info['enabled'] = r.stdout.strip().lower() == 'enabled'
+
+        # Current connection
+        r = _run(['nmcli', '-t', '-f', 'ACTIVE,SSID,SIGNAL,FREQ',
+                  'device', 'wifi'], timeout=5)
+        if r and r.returncode == 0:
+            for line in r.stdout.strip().split('\n'):
+                parts = line.split(':')
+                if len(parts) >= 2 and parts[0] == 'yes':
+                    info['connected'] = True
+                    info['ssid'] = parts[1]
+                    if len(parts) >= 3:
+                        info['signal'] = int(parts[2]) if parts[2].isdigit() else None
+                    if len(parts) >= 4:
+                        info['frequency'] = parts[3]
+                    break
+
+        # IP address
+        if info['connected']:
+            r = _run(['nmcli', '-t', '-f', 'IP4.ADDRESS', 'device', 'show',
+                      'type', 'wifi'], timeout=5)
+            if r and r.returncode == 0:
+                for line in r.stdout.strip().split('\n'):
+                    if 'IP4.ADDRESS' in line:
+                        info['ip'] = line.split(':', 1)[1].strip() if ':' in line else None
+                        break
+        return jsonify(info)
+
+    @app.route('/api/shell/wifi/networks', methods=['GET'])
+    def shell_wifi_networks():
+        """Scan and list available WiFi networks."""
+        rescan = request.args.get('rescan', 'false').lower() == 'true'
+        if rescan:
+            _run(['nmcli', 'device', 'wifi', 'rescan'], timeout=10)
+            time.sleep(2)  # Give scan time to populate
+
+        r = _run(['nmcli', '-t', '-f', 'SSID,SIGNAL,SECURITY,FREQ,BSSID',
+                  'device', 'wifi', 'list'], timeout=10)
+        networks = []
+        seen = set()
+        if r and r.returncode == 0:
+            for line in r.stdout.strip().split('\n'):
+                parts = line.split(':')
+                if len(parts) >= 3 and parts[0] and parts[0] not in seen:
+                    seen.add(parts[0])
+                    networks.append({
+                        'ssid': parts[0],
+                        'signal': int(parts[1]) if parts[1].isdigit() else 0,
+                        'security': parts[2] if len(parts) > 2 else '',
+                        'frequency': parts[3] if len(parts) > 3 else '',
+                    })
+        networks.sort(key=lambda n: n['signal'], reverse=True)
+        return jsonify({'networks': networks, 'count': len(networks)})
+
+    @app.route('/api/shell/wifi/connect', methods=['POST'])
+    @_require_system_auth
+    def shell_wifi_connect():
+        """Connect to a WiFi network."""
+        body = request.get_json(silent=True) or {}
+        ssid = body.get('ssid')
+        if not ssid:
+            return jsonify({'error': 'ssid required'}), 400
+        password = body.get('password')
+        hidden = body.get('hidden', False)
+
+        cmd = ['nmcli', 'device', 'wifi', 'connect', ssid]
+        if password:
+            cmd += ['password', password]
+        if hidden:
+            cmd += ['hidden', 'yes']
+
+        r = _run(cmd, timeout=30)
+        if r and r.returncode == 0:
+            _audit_system_op('wifi_connect', {'ssid': ssid})
+            return jsonify({'connected': True, 'ssid': ssid})
+        return jsonify({'connected': False,
+                       'error': r.stderr.strip() if r else 'nmcli not available'}), 400
+
+    @app.route('/api/shell/wifi/disconnect', methods=['POST'])
+    @_require_system_auth
+    def shell_wifi_disconnect():
+        """Disconnect from current WiFi network."""
+        r = _run(['nmcli', 'device', 'disconnect', 'type', 'wifi'], timeout=10)
+        if r and r.returncode == 0:
+            return jsonify({'disconnected': True})
+        # Try finding the wifi device name
+        r2 = _run(['nmcli', '-t', '-f', 'DEVICE,TYPE', 'device'], timeout=5)
+        if r2 and r2.returncode == 0:
+            for line in r2.stdout.strip().split('\n'):
+                parts = line.split(':')
+                if len(parts) >= 2 and parts[1] == 'wifi':
+                    r3 = _run(['nmcli', 'device', 'disconnect', parts[0]], timeout=10)
+                    if r3 and r3.returncode == 0:
+                        return jsonify({'disconnected': True})
+        return jsonify({'disconnected': False,
+                       'error': 'Failed to disconnect'}), 400
+
+    @app.route('/api/shell/wifi/saved', methods=['GET'])
+    def shell_wifi_saved():
+        """List saved WiFi connections."""
+        r = _run(['nmcli', '-t', '-f', 'NAME,TYPE,AUTOCONNECT',
+                  'connection', 'show'], timeout=5)
+        connections = []
+        if r and r.returncode == 0:
+            for line in r.stdout.strip().split('\n'):
+                parts = line.split(':')
+                if len(parts) >= 2 and '802-11-wireless' in parts[1]:
+                    connections.append({
+                        'ssid': parts[0],
+                        'autoconnect': parts[2].lower() == 'yes' if len(parts) > 2 else True,
+                    })
+        return jsonify({'connections': connections})
+
+    @app.route('/api/shell/wifi/forget', methods=['POST'])
+    @_require_system_auth
+    def shell_wifi_forget():
+        """Forget a saved WiFi connection."""
+        body = request.get_json(silent=True) or {}
+        ssid = body.get('ssid')
+        if not ssid:
+            return jsonify({'error': 'ssid required'}), 400
+        r = _run(['nmcli', 'connection', 'delete', ssid], timeout=10)
+        if r and r.returncode == 0:
+            _audit_system_op('wifi_forget', {'ssid': ssid})
+            return jsonify({'forgotten': True, 'ssid': ssid})
+        return jsonify({'forgotten': False,
+                       'error': r.stderr.strip() if r else 'nmcli not available'}), 400
+
+    @app.route('/api/shell/wifi/toggle', methods=['POST'])
+    @_require_system_auth
+    def shell_wifi_toggle():
+        """Enable or disable WiFi radio."""
+        body = request.get_json(silent=True) or {}
+        enable = body.get('enable', True)
+        state = 'on' if enable else 'off'
+        r = _run(['nmcli', 'radio', 'wifi', state], timeout=5)
+        if r and r.returncode == 0:
+            return jsonify({'enabled': enable})
+        return jsonify({'error': 'Failed to toggle WiFi'}), 500
+
+    # ─── 20. VPN Client ───────────────────────────────────────
+
+    @app.route('/api/shell/vpn/list', methods=['GET'])
+    def shell_vpn_list():
+        """List configured VPN connections."""
+        r = _run(['nmcli', '-t', '-f', 'NAME,TYPE,ACTIVE',
+                  'connection', 'show'], timeout=5)
+        vpns = []
+        if r and r.returncode == 0:
+            for line in r.stdout.strip().split('\n'):
+                parts = line.split(':')
+                if len(parts) >= 2 and 'vpn' in parts[1].lower():
+                    vpns.append({
+                        'name': parts[0],
+                        'type': parts[1],
+                        'active': parts[2].lower() == 'yes' if len(parts) > 2 else False,
+                    })
+        return jsonify({'connections': vpns})
+
+    @app.route('/api/shell/vpn/status', methods=['GET'])
+    def shell_vpn_status():
+        """Get VPN connection status."""
+        r = _run(['nmcli', '-t', '-f', 'NAME,TYPE,IP4.ADDRESS',
+                  'connection', 'show', '--active'], timeout=5)
+        vpn_active = None
+        if r and r.returncode == 0:
+            for line in r.stdout.strip().split('\n'):
+                parts = line.split(':')
+                if len(parts) >= 2 and 'vpn' in parts[1].lower():
+                    vpn_active = {
+                        'name': parts[0],
+                        'type': parts[1],
+                        'ip': parts[2] if len(parts) > 2 else None,
+                    }
+                    break
+        return jsonify({
+            'connected': vpn_active is not None,
+            'vpn': vpn_active,
+        })
+
+    @app.route('/api/shell/vpn/connect', methods=['POST'])
+    @_require_system_auth
+    def shell_vpn_connect():
+        """Activate a VPN connection."""
+        body = request.get_json(silent=True) or {}
+        name = body.get('name')
+        if not name:
+            return jsonify({'error': 'name required'}), 400
+        r = _run(['nmcli', 'connection', 'up', name], timeout=30)
+        if r and r.returncode == 0:
+            _audit_system_op('vpn_connect', {'name': name})
+            return jsonify({'connected': True, 'name': name})
+        return jsonify({'connected': False,
+                       'error': r.stderr.strip() if r else 'nmcli not available'}), 400
+
+    @app.route('/api/shell/vpn/disconnect', methods=['POST'])
+    @_require_system_auth
+    def shell_vpn_disconnect():
+        """Deactivate VPN connection."""
+        body = request.get_json(silent=True) or {}
+        name = body.get('name')
+        if not name:
+            return jsonify({'error': 'name required'}), 400
+        r = _run(['nmcli', 'connection', 'down', name], timeout=10)
+        if r and r.returncode == 0:
+            _audit_system_op('vpn_disconnect', {'name': name})
+            return jsonify({'disconnected': True})
+        return jsonify({'disconnected': False,
+                       'error': r.stderr.strip() if r else 'nmcli not available'}), 400
+
+    @app.route('/api/shell/vpn/import', methods=['POST'])
+    @_require_system_auth
+    def shell_vpn_import():
+        """Import a VPN configuration file."""
+        body = request.get_json(silent=True) or {}
+        config_path = body.get('config_path')
+        vpn_type = body.get('type', 'openvpn')
+        if not config_path:
+            return jsonify({'error': 'config_path required'}), 400
+        if not os.path.isfile(config_path):
+            return jsonify({'error': 'Config file not found'}), 404
+
+        r = _run(['nmcli', 'connection', 'import', 'type', vpn_type,
+                  'file', config_path], timeout=10)
+        if r and r.returncode == 0:
+            # Extract connection name from output
+            name = r.stdout.strip().split("'")[1] if "'" in r.stdout else os.path.basename(config_path)
+            return jsonify({'imported': True, 'name': name})
+        return jsonify({'imported': False,
+                       'error': r.stderr.strip() if r else 'nmcli not available'}), 400
+
+    @app.route('/api/shell/vpn/<name>', methods=['DELETE'])
+    @_require_system_auth
+    def shell_vpn_delete(name):
+        """Delete a VPN connection."""
+        r = _run(['nmcli', 'connection', 'delete', name], timeout=10)
+        if r and r.returncode == 0:
+            _audit_system_op('vpn_delete', {'name': name})
+            return jsonify({'deleted': True})
+        return jsonify({'deleted': False,
+                       'error': r.stderr.strip() if r else 'not found'}), 400
+
+    # ─── 21. Trash / Recycle Bin ──────────────────────────────
+
+    def _trash_dir():
+        """Get XDG trash directory."""
+        return os.path.join(os.path.expanduser('~'), '.local', 'share', 'Trash')
+
+    def _trash_list():
+        """List items in trash with metadata."""
+        trash = _trash_dir()
+        info_dir = os.path.join(trash, 'info')
+        files_dir = os.path.join(trash, 'files')
+        items = []
+        if not os.path.isdir(info_dir):
+            return items
+
+        for fname in os.listdir(info_dir):
+            if not fname.endswith('.trashinfo'):
+                continue
+            item_name = fname[:-len('.trashinfo')]
+            item_path = os.path.join(files_dir, item_name)
+            info_path = os.path.join(info_dir, fname)
+
+            entry = {'id': item_name, 'name': item_name}
+            try:
+                cp = configparser.ConfigParser()
+                cp.read(info_path)
+                if cp.has_section('Trash Info'):
+                    entry['original_path'] = cp.get('Trash Info', 'Path', fallback='')
+                    entry['deleted_time'] = cp.get('Trash Info', 'DeletionDate', fallback='')
+            except Exception:
+                pass
+
+            if os.path.exists(item_path):
+                try:
+                    st = os.stat(item_path)
+                    entry['size_bytes'] = st.st_size
+                    entry['is_dir'] = os.path.isdir(item_path)
+                except OSError:
+                    entry['size_bytes'] = 0
+            items.append(entry)
+
+        items.sort(key=lambda x: x.get('deleted_time', ''), reverse=True)
+        return items
+
+    @app.route('/api/shell/trash', methods=['GET'])
+    def shell_trash_list():
+        """List items in trash."""
+        items = _trash_list()
+        total_size = sum(i.get('size_bytes', 0) for i in items)
+        return jsonify({
+            'items': items,
+            'total_items': len(items),
+            'total_size_mb': round(total_size / 1048576, 2),
+        })
+
+    @app.route('/api/shell/trash/move', methods=['POST'])
+    @_require_system_auth
+    def shell_trash_move_to():
+        """Move a file to trash (instead of permanent delete)."""
+        body = request.get_json(silent=True) or {}
+        path = body.get('path')
+        if not path:
+            return jsonify({'error': 'path required'}), 400
+        if not os.path.exists(path):
+            return jsonify({'error': 'File not found'}), 404
+
+        r = _run(['gio', 'trash', path], timeout=10)
+        if r and r.returncode == 0:
+            _audit_system_op('trash_move', {'path': path})
+            return jsonify({'trashed': True, 'path': path})
+        # Fallback: manual move to ~/.local/share/Trash
+        try:
+            trash = _trash_dir()
+            files_dir = os.path.join(trash, 'files')
+            info_dir = os.path.join(trash, 'info')
+            os.makedirs(files_dir, exist_ok=True)
+            os.makedirs(info_dir, exist_ok=True)
+
+            name = os.path.basename(path)
+            dst = os.path.join(files_dir, name)
+            # Handle name collision
+            counter = 1
+            while os.path.exists(dst):
+                base, ext = os.path.splitext(name)
+                dst = os.path.join(files_dir, f'{base}.{counter}{ext}')
+                name = f'{base}.{counter}{ext}'
+                counter += 1
+
+            import shutil
+            shutil.move(path, dst)
+
+            # Write .trashinfo
+            from datetime import datetime, timezone
+            info_path = os.path.join(info_dir, f'{name}.trashinfo')
+            with open(info_path, 'w') as f:
+                f.write('[Trash Info]\n')
+                f.write(f'Path={os.path.abspath(path)}\n')
+                f.write(f'DeletionDate={datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")}\n')
+            return jsonify({'trashed': True, 'path': path})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/shell/trash/restore', methods=['POST'])
+    @_require_system_auth
+    def shell_trash_restore():
+        """Restore item(s) from trash to original location."""
+        body = request.get_json(silent=True) or {}
+        item_id = body.get('id')
+        restore_all = body.get('all', False)
+
+        trash = _trash_dir()
+        files_dir = os.path.join(trash, 'files')
+        info_dir = os.path.join(trash, 'info')
+        restored = []
+
+        items_to_restore = _trash_list() if restore_all else []
+        if item_id and not restore_all:
+            items_to_restore = [i for i in _trash_list() if i['id'] == item_id]
+
+        for item in items_to_restore:
+            try:
+                src = os.path.join(files_dir, item['id'])
+                dst = item.get('original_path', '')
+                if not dst or not src:
+                    continue
+                dst_dir = os.path.dirname(dst)
+                if dst_dir:
+                    os.makedirs(dst_dir, exist_ok=True)
+                import shutil
+                shutil.move(src, dst)
+                # Remove .trashinfo
+                info_path = os.path.join(info_dir, f"{item['id']}.trashinfo")
+                if os.path.isfile(info_path):
+                    os.remove(info_path)
+                restored.append(dst)
+            except Exception as e:
+                logger.debug(f"Trash restore failed for {item['id']}: {e}")
+
+        return jsonify({
+            'restored_count': len(restored),
+            'restored_paths': restored,
+        })
+
+    @app.route('/api/shell/trash/empty', methods=['DELETE'])
+    @_require_system_auth
+    def shell_trash_empty():
+        """Empty the trash (permanent delete)."""
+        body = request.get_json(silent=True) or {}
+        older_than_days = body.get('older_than_days')
+
+        r = _run(['gio', 'trash', '--empty'], timeout=30)
+        if r and r.returncode == 0 and not older_than_days:
+            return jsonify({'emptied': True})
+
+        # Fallback or age-filtered empty
+        trash = _trash_dir()
+        files_dir = os.path.join(trash, 'files')
+        info_dir = os.path.join(trash, 'info')
+        freed = 0
+
+        if older_than_days:
+            from datetime import datetime, timezone, timedelta
+            cutoff = datetime.now(timezone.utc) - timedelta(days=older_than_days)
+            items = _trash_list()
+            for item in items:
+                try:
+                    dt_str = item.get('deleted_time', '')
+                    if dt_str:
+                        dt = datetime.fromisoformat(dt_str)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        if dt > cutoff:
+                            continue
+                except (ValueError, TypeError):
+                    pass
+
+                item_path = os.path.join(files_dir, item['id'])
+                info_path = os.path.join(info_dir, f"{item['id']}.trashinfo")
+                try:
+                    freed += item.get('size_bytes', 0)
+                    import shutil
+                    if os.path.isdir(item_path):
+                        shutil.rmtree(item_path)
+                    elif os.path.isfile(item_path):
+                        os.remove(item_path)
+                    if os.path.isfile(info_path):
+                        os.remove(info_path)
+                except Exception as e:
+                    logger.debug(f"Trash empty failed for {item['id']}: {e}")
+        else:
+            # Full empty fallback
+            import shutil
+            for d in [files_dir, info_dir]:
+                if os.path.isdir(d):
+                    for item in os.listdir(d):
+                        p = os.path.join(d, item)
+                        try:
+                            if os.path.isdir(p):
+                                shutil.rmtree(p)
+                            else:
+                                os.remove(p)
+                        except Exception:
+                            pass
+
+        _audit_system_op('trash_empty', {'freed_mb': round(freed / 1048576, 2)})
+        return jsonify({'emptied': True, 'freed_mb': round(freed / 1048576, 2)})
+
+    # ─── 22. Screen Rotation ──────────────────────────────────
+
+    @app.route('/api/shell/display/rotation', methods=['GET'])
+    def shell_display_rotation():
+        """Get current display rotation/orientation."""
+        outputs = []
+        r = _run(['swaymsg', '-t', 'get_outputs', '-r'], timeout=5)
+        if r and r.returncode == 0:
+            try:
+                for out in json.loads(r.stdout):
+                    outputs.append({
+                        'name': out.get('name', ''),
+                        'transform': out.get('transform', 'normal'),
+                        'active': out.get('active', False),
+                    })
+            except (json.JSONDecodeError, TypeError):
+                pass
+        if not outputs:
+            # xrandr fallback
+            r2 = _run(['xrandr', '--query'], timeout=5)
+            if r2 and r2.returncode == 0:
+                for line in r2.stdout.split('\n'):
+                    if ' connected' in line:
+                        parts = line.split()
+                        name = parts[0] if parts else 'unknown'
+                        rotation = 'normal'
+                        for kw in ('left', 'right', 'inverted'):
+                            if kw in line:
+                                rotation = kw
+                                break
+                        outputs.append({'name': name, 'transform': rotation,
+                                        'active': 'primary' in line or '+' in line})
+        return jsonify({'outputs': outputs})
+
+    @app.route('/api/shell/display/rotation', methods=['POST'])
+    @_require_system_auth
+    def shell_display_set_rotation():
+        """Set display rotation. transform: normal|90|180|270|flipped."""
+        body = request.get_json(silent=True) or {}
+        output = body.get('output', '')
+        transform = body.get('transform', 'normal')
+        if not output:
+            return jsonify({'error': 'output name required'}), 400
+
+        valid = {'normal', '90', '180', '270', 'flipped',
+                 'flipped-90', 'flipped-180', 'flipped-270'}
+        if transform not in valid:
+            return jsonify({'error': f'transform must be one of: {sorted(valid)}'}), 400
+
+        # Try swaymsg (Wayland)
+        r = _run(['swaymsg', 'output', output, 'transform', transform], timeout=5)
+        if r and r.returncode == 0:
+            _audit_system_op('display_rotate', {'output': output, 'transform': transform})
+            return jsonify({'rotated': True, 'output': output, 'transform': transform})
+
+        # xrandr fallback (X11)
+        xrandr_map = {'normal': 'normal', '90': 'left', '180': 'inverted',
+                      '270': 'right', 'flipped': 'normal'}
+        xr = xrandr_map.get(transform, 'normal')
+        r2 = _run(['xrandr', '--output', output, '--rotate', xr], timeout=5)
+        if r2 and r2.returncode == 0:
+            _audit_system_op('display_rotate', {'output': output, 'transform': transform})
+            return jsonify({'rotated': True, 'output': output, 'transform': transform})
+
+        return jsonify({'error': 'rotation failed (no swaymsg or xrandr)'}), 500
+
+    @app.route('/api/shell/display/auto-rotate', methods=['GET'])
+    def shell_display_auto_rotate_status():
+        """Check if auto-rotate is available (iio-sensor-proxy)."""
+        r = _run(['monitor-sensor', '--help'], timeout=3)
+        available = r is not None
+        return jsonify({'available': available,
+                        'sensor': 'iio-sensor-proxy' if available else None})
+
+    logger.info("Registered shell system routes (10 features)")

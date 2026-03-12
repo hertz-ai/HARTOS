@@ -182,7 +182,7 @@ class GossipTaskBridge:
             if not peer_url:
                 continue
             try:
-                import requests
+                from core.http_pool import pooled_post
                 send_payload = payload
                 peer_x25519 = peer.get('x25519_public', '')
                 if peer_x25519:
@@ -192,7 +192,7 @@ class GossipTaskBridge:
                                         'envelope': encrypt_json_for_peer(payload, peer_x25519)}
                     except Exception:
                         pass  # Encryption unavailable, send plaintext
-                resp = requests.post(
+                resp = pooled_post(
                     f'{peer_url}/api/distributed/tasks/announce',
                     json=send_payload,
                     timeout=5,
@@ -221,8 +221,8 @@ class GossipTaskBridge:
             if not peer_url:
                 continue
             try:
-                import requests
-                resp = requests.get(
+                from core.http_pool import pooled_get
+                resp = pooled_get(
                     f'{peer_url}/api/distributed/tasks/available',
                     timeout=5,
                 )

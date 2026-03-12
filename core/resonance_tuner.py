@@ -316,7 +316,7 @@ class ResonanceTuner:
         The deep learning (Hebbian, Bayesian, etc.) happens asynchronously
         in HevolveAI and corrections flow back via apply_hevolveai_corrections().
         """
-        a = self._alpha
+        a = profile.ema_alpha if profile.ema_alpha is not None else self._alpha
         current_vector = [profile.tuning[k] for k in TUNING_DIM_KEYS]
 
         # EMA blend each dimension

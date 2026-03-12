@@ -3,7 +3,7 @@ import autogen
 import os
 from flask import current_app
 
-from helper import retrieve_json, retrieve_json
+from helper import retrieve_json, retrieve_json, _is_terminate_msg
 from cultural_wisdom import get_cultural_prompt
 # Store user-specific agents & their chat history
 user_agents: Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]] = {}
@@ -104,7 +104,7 @@ Your response must start with {{ and end with }}. Nothing else.
         name=f"assistant_{user_id}",
         llm_config=llm_config,
         max_consecutive_auto_reply=10,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
         code_execution_config={"work_dir": "coding", "use_docker": False},
         system_message=system_message
     )
@@ -115,7 +115,7 @@ Your response must start with {{ and end with }}. Nothing else.
     user_proxy = autogen.UserProxyAgent(
         name=f"user_proxy_{user_id}",
         human_input_mode="NEVER",
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
         max_consecutive_auto_reply=10 if autonomous else 0,
         code_execution_config=False
     )

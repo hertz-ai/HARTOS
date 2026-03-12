@@ -798,5 +798,181 @@ class TestShellRTL(unittest.TestCase):
         self.assertEqual(data['css_direction'], 'ltr')
 
 
+# ═══════════════════════════════════════════════════════════════
+# On-Screen Keyboard (Feature 4 - P0 OS Credibility)
+# ═══════════════════════════════════════════════════════════════
+
+class TestOnScreenKeyboard(unittest.TestCase):
+    """Tests for OSK status and toggle endpoints."""
+
+    @patch('integrations.agent_engine.shell_desktop_apis._run')
+    def test_osk_status_none_running(self, mock_run):
+        """When no OSK backend is running, returns correct status."""
+        mock_run.return_value = MagicMock(returncode=1, stdout='')
+        client = _make_desktop_app()
+        r = client.get('/api/shell/keyboard/osk-status')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertFalse(data['running'])
+        self.assertEqual(data['backend'], 'none')
+        self.assertIn('enabled', data)
+        self.assertIn('available', data)
+
+    @patch('integrations.agent_engine.shell_desktop_apis._run')
+    def test_osk_status_squeekboard_running(self, mock_run):
+        """When squeekboard is running, status reflects it."""
+        def side_effect(cmd, **kwargs):
+            if 'pgrep' in cmd and 'squeekboard' in cmd:
+                return MagicMock(returncode=0, stdout='1234')
+            if 'systemctl' in cmd and 'is-active' in cmd:
+                return MagicMock(returncode=0, stdout='active')
+            if 'which' in cmd:
+                return MagicMock(returncode=0)
+            return MagicMock(returncode=1, stdout='')
+
+        mock_run.side_effect = side_effect
+        client = _make_desktop_app()
+        r = client.get('/api/shell/keyboard/osk-status')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertTrue(data['running'])
+        self.assertEqual(data['backend'], 'squeekboard')
+        self.assertTrue(data['enabled'])
+
+    @patch('integrations.agent_engine.shell_desktop_apis._run')
+    def test_osk_toggle_start(self, mock_run):
+        """Toggle starts OSK when not running."""
+        def side_effect(cmd, **kwargs):
+            if 'pgrep' in cmd:
+                return MagicMock(returncode=1, stdout='')
+            return MagicMock(returncode=0, stdout='')
+
+        mock_run.side_effect = side_effect
+        client = _make_desktop_app()
+        r = client.post('/api/shell/keyboard/osk-toggle',
+                        data=json.dumps({'enable': True}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertTrue(data['enabled'])
+
+    @patch('integrations.agent_engine.shell_desktop_apis._run')
+    def test_osk_toggle_stop(self, mock_run):
+        """Toggle stops OSK when running and enable=False."""
+        def side_effect(cmd, **kwargs):
+            if 'pgrep' in cmd:
+                return MagicMock(returncode=0, stdout='1234')
+            return MagicMock(returncode=0, stdout='')
+
+        mock_run.side_effect = side_effect
+        client = _make_desktop_app()
+        r = client.post('/api/shell/keyboard/osk-toggle',
+                        data=json.dumps({'enable': False}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertFalse(data['enabled'])
+
+    @patch('integrations.agent_engine.shell_desktop_apis._run')
+    def test_osk_auto_toggle(self, mock_run):
+        """Toggle without enable param auto-toggles based on current state."""
+        # Not running → should enable
+        def side_effect(cmd, **kwargs):
+            if 'pgrep' in cmd:
+                return MagicMock(returncode=1, stdout='')
+            return MagicMock(returncode=0, stdout='')
+
+        mock_run.side_effect = side_effect
+        client = _make_desktop_app()
+        r = client.post('/api/shell/keyboard/osk-toggle',
+                        data=json.dumps({}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertTrue(data['enabled'])
+
+    @patch('integrations.agent_engine.shell_desktop_apis._run')
+    def test_osk_available_list(self, mock_run):
+        """Available backends only includes those found on system."""
+        def side_effect(cmd, **kwargs):
+            if 'pgrep' in cmd:
+                return MagicMock(returncode=1, stdout='')
+            if 'systemctl' in cmd and 'is-active' in cmd:
+                return MagicMock(returncode=1, stdout='inactive')
+            if 'which' in cmd and 'squeekboard' in cmd[-1:]:
+                return MagicMock(returncode=0)
+            if 'which' in cmd:
+                return MagicMock(returncode=1)
+            return MagicMock(returncode=1, stdout='')
+
+        mock_run.side_effect = side_effect
+        client = _make_desktop_app()
+        r = client.get('/api/shell/keyboard/osk-status')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertIsInstance(data['available'], list)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Voice Control (P2 Competitive Parity)
+# ═══════════════════════════════════════════════════════════════
+
+class TestVoiceControl(unittest.TestCase):
+    """Tests for /api/shell/voice/*. AI-native voice control."""
+
+    def test_voice_status(self):
+        client = _make_desktop_app()
+        r = client.get('/api/shell/voice/status')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertIn('listening', data)
+        self.assertFalse(data['listening'])
+
+    def test_voice_start(self):
+        client = _make_desktop_app()
+        with patch.dict('sys.modules', {'integrations.service_tools.whisper_tool': MagicMock()}):
+            r = client.post('/api/shell/voice/start')
+            self.assertEqual(r.status_code, 200)
+            data = json.loads(r.data)
+            self.assertTrue(data['started'])
+
+    def test_voice_stop(self):
+        client = _make_desktop_app()
+        r = client.post('/api/shell/voice/stop')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertTrue(data['stopped'])
+
+    def test_voice_process_no_input(self):
+        client = _make_desktop_app()
+        r = client.post('/api/shell/voice/process',
+                        data=json.dumps({}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 400)
+
+    def test_voice_process_with_text(self):
+        """Voice process with pre-transcribed text dispatches to agent."""
+        client = _make_desktop_app()
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = json.dumps({'response': 'done'}).encode()
+        with patch('urllib.request.urlopen', return_value=mock_resp):
+            r = client.post('/api/shell/voice/process',
+                            data=json.dumps({'text': 'open the file manager'}),
+                            content_type='application/json')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(data['transcript'], 'open the file manager')
+        self.assertEqual(data['mode'], 'ai_native')
+
+    def test_voice_process_audio_not_found(self):
+        client = _make_desktop_app()
+        r = client.post('/api/shell/voice/process',
+                        data=json.dumps({'audio_path': '/nonexistent/audio.wav'}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 404)
+
+
 if __name__ == '__main__':
     unittest.main()

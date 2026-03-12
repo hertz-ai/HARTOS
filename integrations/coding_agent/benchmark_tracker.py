@@ -108,16 +108,20 @@ class BenchmarkTracker:
             return (rows[0][0], rows[0][1], rows[0][2])
         return None
 
-    def get_hive_best_tool(self, task_type: str) -> Optional[str]:
-        """Get best tool from hive-aggregated intelligence."""
+    def get_hive_best_tool(self, task_type: str) -> Optional[Tuple[str, float, float]]:
+        """Get best tool from hive-aggregated intelligence.
+
+        Returns (tool_name, success_rate, avg_time_s) or None — same shape
+        as get_best_tool() so callers can index consistently.
+        """
         with self._lock:
             conn = sqlite3.connect(self._db_path)
             row = conn.execute(
-                'SELECT best_tool FROM hive_routing WHERE task_type = ?',
+                'SELECT best_tool, success_rate, avg_time_s FROM hive_routing WHERE task_type = ?',
                 (task_type,)
             ).fetchone()
             conn.close()
-        return row[0] if row else None
+        return (row[0], row[1], row[2]) if row else None
 
     def get_summary(self) -> Dict:
         """Dashboard summary data."""

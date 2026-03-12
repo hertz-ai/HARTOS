@@ -223,26 +223,24 @@ class TestTTSFallbackChain(unittest.TestCase):
         self.assertIn(result['model'], ('pocket-tts-100m', 'luxtts-48k'))
 
     @patch('integrations.service_tools.pocket_tts_tool.pocket_tts_synthesize')
-    def test_cloud_mode_tries_makeittalk_first(self, mock_synth):
-        """When MAKEITTALK_API_URL is set and LuxTTS unavailable, try cloud."""
+    def test_router_unavailable_falls_back_to_pocket_tts(self, mock_synth):
+        """When TTSRouter unavailable, legacy fallback goes straight to Pocket TTS.
+
+        MakeItTalk is now handled BY the router — the legacy chain skips it
+        entirely and goes to pocket_tts (guaranteed CPU, always available).
+        """
+        mock_synth.return_value = json.dumps({
+            'path': '/tmp/fallback.wav', 'duration': 1.0,
+            'sample_rate': 24000, 'voice': 'alba', 'engine': 'pocket-tts'})
+
         bus = self._make_bus()
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {'audio_url': 'http://cloud/audio.wav'}
+        with patch('integrations.channels.media.tts_router.get_tts_router',
+                   side_effect=ImportError('disabled for test')):
+            result = bus._route_tts('Hello', {})
 
-        # Disable router to test legacy fallback chain
-        with patch.dict(os.environ, {'MAKEITTALK_API_URL': 'http://cloud:5454'}):
-            with patch('requests.post', return_value=mock_response):
-                with patch.object(bus, '_try_luxtts',
-                                  return_value={'error': 'not installed'}):
-                    with patch('integrations.channels.media.tts_router.get_tts_router',
-                               side_effect=ImportError('disabled for test')):
-                        result = bus._route_tts('Hello', {})
-
-        self.assertEqual(result['backend'], 'cloud_tts')
-        self.assertEqual(result['model'], 'makeittalk-cloud')
-        self.assertEqual(result['engine'], 'makeittalk')
-        mock_synth.assert_not_called()
+        self.assertEqual(result['backend'], 'local_tts')
+        self.assertEqual(result['engine'], 'pocket-tts')
+        mock_synth.assert_called_once()
 
     @patch('integrations.service_tools.pocket_tts_tool.pocket_tts_synthesize')
     def test_cloud_failure_falls_back_to_pocket_tts(self, mock_synth):
@@ -268,22 +266,24 @@ class TestTTSFallbackChain(unittest.TestCase):
         mock_synth.assert_called_once()
 
     @patch('integrations.service_tools.pocket_tts_tool.pocket_tts_synthesize')
-    def test_cloud_timeout_falls_back_to_pocket_tts(self, mock_synth):
-        """When LuxTTS unavailable and MakeItTalk times out, fall back to Pocket TTS."""
-        import requests as http_requests
+    def test_router_unavailable_skips_makeittalk(self, mock_synth):
+        """Without router, legacy fallback does NOT try makeittalk — straight to pocket.
+
+        Previously: luxtts fail → makeittalk timeout → pocket_tts
+        Now: router fail → pocket_tts (router handles makeittalk internally)
+        """
         mock_synth.return_value = json.dumps({
             'path': '/tmp/timeout.wav', 'duration': 0.5,
             'sample_rate': 24000, 'voice': 'alba', 'engine': 'pocket-tts'})
 
         bus = self._make_bus()
         with patch.dict(os.environ, {'MAKEITTALK_API_URL': 'http://cloud:5454'}):
-            with patch('requests.post',
-                       side_effect=http_requests.Timeout("timeout")):
-                with patch.object(bus, '_try_luxtts',
-                                  return_value={'error': 'not installed'}):
-                    result = bus._route_tts('Hello', {})
+            with patch('integrations.channels.media.tts_router.get_tts_router',
+                       side_effect=ImportError('disabled for test')):
+                result = bus._route_tts('Hello', {})
 
         self.assertEqual(result['backend'], 'local_tts')
+        self.assertEqual(result['engine'], 'pocket-tts')
         mock_synth.assert_called_once()
 
     def test_makeittalk_http_error_returns_error(self):

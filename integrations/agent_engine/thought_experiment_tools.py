@@ -10,7 +10,11 @@ import json
 import logging
 import threading
 
-_file_locks = {}
+try:
+    from core.session_cache import TTLCache
+    _file_locks = TTLCache(ttl_seconds=86400, max_size=50000, name='thought_exp_locks')
+except ImportError:
+    _file_locks = {}
 _file_locks_guard = threading.Lock()
 
 logger = logging.getLogger('hevolve_social')

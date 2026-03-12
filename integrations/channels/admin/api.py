@@ -402,24 +402,91 @@ def disable_channel(channel_type: str):
 @admin_bp.route("/channels/<channel_type>/test", methods=["POST"])
 @api_response
 def test_channel(channel_type: str):
-    """Test channel connection."""
+    """Test channel connection against the live adapter registry."""
     api = get_api()
     if channel_type not in api._channels:
         raise FileNotFoundError(f"Channel {channel_type} not found")
 
-    # Simulate connection test
-    return {"channel": channel_type, "test_result": "success", "latency_ms": 45}
+    config = api._channels[channel_type]
+    if not config.get('enabled'):
+        return {"channel": channel_type, "test_result": "disabled", "latency_ms": 0}
+
+    try:
+        from integrations.channels.registry import get_registry
+        registry = get_registry()
+        adapter = registry.get(channel_type)
+        if adapter:
+            import time as _time
+            t0 = _time.time()
+            import asyncio as _asyncio
+            loop = _asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(_asyncio.wait_for(adapter.connect(), timeout=10))
+                latency = int((_time.time() - t0) * 1000)
+                return {"channel": channel_type, "test_result": "success", "latency_ms": latency}
+            finally:
+                loop.close()
+        else:
+            return {"channel": channel_type, "test_result": "not_registered", "latency_ms": 0}
+    except Exception as e:
+        return {"channel": channel_type, "test_result": "failed", "error": str(e), "latency_ms": 0}
 
 
 @admin_bp.route("/channels/<channel_type>/reconnect", methods=["POST"])
 @api_response
 def reconnect_channel(channel_type: str):
-    """Force channel reconnection."""
+    """Force channel reconnection via the live adapter registry."""
     api = get_api()
     if channel_type not in api._channels:
         raise FileNotFoundError(f"Channel {channel_type} not found")
 
-    return {"channel": channel_type, "reconnected": True}
+    try:
+        from integrations.channels.registry import get_registry
+        registry = get_registry()
+        adapter = registry.get(channel_type)
+        if adapter:
+            import asyncio as _asyncio
+            loop = _asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(adapter.disconnect())
+                loop.run_until_complete(adapter.connect())
+                return {"channel": channel_type, "reconnected": True}
+            except Exception as e:
+                return {"channel": channel_type, "reconnected": False, "error": str(e)}
+            finally:
+                loop.close()
+        return {"channel": channel_type, "reconnected": False, "error": "Adapter not registered"}
+    except Exception as e:
+        return {"channel": channel_type, "reconnected": False, "error": str(e)}
+
+
+@admin_bp.route("/channels/<channel_type>/activate", methods=["POST"])
+@api_response
+def activate_channel(channel_type: str):
+    """Activate a channel by registering its adapter with the live registry."""
+    api = get_api()
+    config = api._channels.get(channel_type)
+    if not config:
+        raise FileNotFoundError(f"Channel {channel_type} not found")
+    if not config.get('enabled'):
+        raise ValueError(f"Channel {channel_type} is disabled — enable it first")
+
+    token = config.get('token') or config.get('api_key')
+    if not token:
+        raise ValueError(f"No token/api_key configured for {channel_type}")
+
+    try:
+        from integrations.channels.flask_integration import get_channel_integration
+        integration = get_channel_integration()
+        register_fn = getattr(integration, f'register_{channel_type}', None)
+        if register_fn:
+            register_fn(token=token)
+            return {"channel": channel_type, "activated": True}
+        else:
+            return {"channel": channel_type, "activated": False,
+                    "error": f"No register_{channel_type}() method available"}
+    except Exception as e:
+        return {"channel": channel_type, "activated": False, "error": str(e)}
 
 
 @admin_bp.route("/channels/<channel_type>/metrics", methods=["GET"])

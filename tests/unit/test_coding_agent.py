@@ -25,7 +25,7 @@ os.environ['HEVOLVE_DB_PATH'] = ':memory:'
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
-from integrations.social.models import Base, User, CodingGoal
+from integrations.social.models import Base, User, CodingGoal, AgentGoal
 
 
 # =====================================================================
@@ -79,12 +79,16 @@ def regular_user(db):
 
 @pytest.fixture
 def sample_goal(db):
-    goal = CodingGoal(
+    """Create a coding goal via the unified AgentGoal table."""
+    goal = AgentGoal(
+        goal_type='coding',
         title='Activate HiveMind',
         description='Enable distributed thinking',
-        repo_url='hertz-ai/Hevolve-Continual-Learner-Framework-Zero-Forgetting',
-        repo_branch='main-withpycharmplugin-and-slowness',
-        target_path='src/hevolveai/embodied_ai',
+        config_json={
+            'repo_url': 'hertz-ai/Hevolve-Continual-Learner-Framework-Zero-Forgetting',
+            'repo_branch': 'main-withpycharmplugin-and-slowness',
+            'target_path': 'src/hevolveai/embodied_ai',
+        },
         status='active', created_by='admin',
     )
     db.add(goal)
@@ -241,7 +245,8 @@ class TestGoalManager:
 
     def test_update_status(self, db):
         from integrations.coding_agent.goal_manager import CodingGoalManager
-        goal = CodingGoal(title='S', description='d', repo_url='a/b', status='active')
+        goal = AgentGoal(goal_type='coding', title='S', description='d',
+                         config_json={'repo_url': 'a/b'}, status='active')
         db.add(goal)
         db.flush()
         result = CodingGoalManager.update_goal_status(db, goal.id, 'paused')

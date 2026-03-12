@@ -59,8 +59,10 @@ def _get_og_metadata(db, resource_type, resource_id):
             og['title'] = content[:60].strip() or 'Thought Experiment'
             og['description'] = content[:200].strip()
             og['type'] = 'article'
-            if post.media_url:
-                og['image'] = post.media_url
+            if post.media_urls:
+                urls = post.media_urls if isinstance(post.media_urls, list) else [post.media_urls]
+                if urls:
+                    og['image'] = urls[0]
 
     elif resource_type == 'comment':
         comment = db.query(Comment).filter_by(id=resource_id).first()

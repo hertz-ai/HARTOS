@@ -1373,12 +1373,10 @@ def agent_delegate(ctx, task, specialist):
     json_output = ctx.obj['json_output']
 
     try:
-        from integrations.internal_comm.skill_registry import get_skill_registry
-        from integrations.internal_comm.delegation import create_delegation_function
+        from integrations.internal_comm import create_delegation_function
 
-        registry = get_skill_registry()
-        delegate_fn = create_delegation_function('cli_user', registry)
-        result = delegate_fn(task, specialist_type=specialist)
+        delegate_fn = create_delegation_function('cli_user')
+        result = delegate_fn(task, required_skills=[specialist] if specialist else [])
 
         if json_output:
             click.echo(json.dumps({'result': result}, default=str))
@@ -1405,11 +1403,11 @@ def agent_goal_list(ctx, goal_type, status):
     json_output = ctx.obj['json_output']
 
     try:
-        from integrations.agent_engine.goal_manager import AgentGoal
+        from integrations.agent_engine.goal_manager import GoalManager
         from integrations.social.models import db_session
 
         with db_session() as db:
-            goals = AgentGoal.list_goals(db, goal_type=goal_type, status=status)
+            goals = GoalManager.list_goals(db, goal_type=goal_type, status=status)
 
         if json_output:
             click.echo(json.dumps(goals, indent=2, default=str))
@@ -1437,11 +1435,11 @@ def agent_goal_create(ctx, title, goal_type, description):
     json_output = ctx.obj['json_output']
 
     try:
-        from integrations.agent_engine.goal_manager import AgentGoal
+        from integrations.agent_engine.goal_manager import GoalManager
         from integrations.social.models import db_session
 
         with db_session() as db:
-            result = AgentGoal.create_goal(
+            result = GoalManager.create_goal(
                 db, goal_type=goal_type, title=title, description=description)
 
         if json_output:

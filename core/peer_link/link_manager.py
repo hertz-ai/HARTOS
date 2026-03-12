@@ -54,7 +54,8 @@ class PeerLinkManager:
         self._maintenance_thread: Optional[threading.Thread] = None
         self._http_exchange_counts: Dict[str, int] = {}  # peer_id -> successful exchanges
         self._channel_handlers: Dict[str, List[Callable]] = {}
-        self._reconnect_backoff: Dict[str, float] = {}  # peer_id -> next retry time
+        self._reconnect_backoff: Dict[str, float] = {}  # peer_id -> backoff duration (seconds)
+        self._reconnect_last_attempt: Dict[str, float] = {}  # peer_id -> last attempt timestamp
 
         # Determine connection budget from tier
         try:
@@ -325,16 +326,18 @@ class PeerLinkManager:
             ]
 
         for peer_id, link in disconnected:
-            retry_at = self._reconnect_backoff.get(peer_id, 0)
-            if now < retry_at:
+            backoff = self._reconnect_backoff.get(peer_id, _RECONNECT_MIN)
+            last_attempt = self._reconnect_last_attempt.get(peer_id, 0)
+            if now < last_attempt + backoff:
                 continue
 
+            self._reconnect_last_attempt[peer_id] = now
             if link.connect():
                 self._reconnect_backoff.pop(peer_id, None)
+                self._reconnect_last_attempt.pop(peer_id, None)
             else:
-                # Exponential backoff
-                current = self._reconnect_backoff.get(peer_id, _RECONNECT_MIN)
-                self._reconnect_backoff[peer_id] = now + min(current * 2, _RECONNECT_MAX)
+                # Exponential backoff (duration doubles, capped at max)
+                self._reconnect_backoff[peer_id] = min(backoff * 2, _RECONNECT_MAX)
 
     def _evict_weakest_link(self) -> bool:
         """Evict the least useful connected link to make room."""

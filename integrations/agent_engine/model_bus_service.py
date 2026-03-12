@@ -71,6 +71,7 @@ class ModelBusService:
     # Key = backend name, Value = (is_alive: bool, last_checked: float)
     # TTL: alive backends re-checked every 60s, dead every 15s (fast recovery).
     _health_cache: Dict[str, tuple] = {}
+    _health_lock = threading.Lock()  # Guards _health_cache across threads
     _ALIVE_TTL = 60.0   # Re-probe alive backends every 60s
     _DEAD_TTL = 15.0     # Retry dead backends every 15s
     _PROBE_TIMEOUT = 1.5  # Health probe: 1.5s max (not 10-60s)
@@ -117,14 +118,15 @@ class ModelBusService:
         This is what prevents 10-60 second waits on dead backends.
         """
         now = time.time()
-        cached = self._health_cache.get(name)
+        with self._health_lock:
+            cached = self._health_cache.get(name)
         if cached:
             is_alive, last_checked = cached
             ttl = self._ALIVE_TTL if is_alive else self._DEAD_TTL
             if now - last_checked < ttl:
                 return is_alive
 
-        # Cache miss or stale — quick probe
+        # Cache miss or stale — quick probe (outside lock to avoid blocking)
         try:
             from core.http_pool import pooled_get
             resp = pooled_get(f'{url}{health_path}', timeout=self._PROBE_TIMEOUT)
@@ -132,7 +134,8 @@ class ModelBusService:
         except Exception:
             alive = False
 
-        self._health_cache[name] = (alive, now)
+        with self._health_lock:
+            self._health_cache[name] = (alive, now)
         if not alive:
             logger.debug("Backend %s at %s is DOWN (skipping for %.0fs)",
                          name, url, self._DEAD_TTL)
@@ -140,11 +143,13 @@ class ModelBusService:
 
     def _mark_backend_dead(self, name: str):
         """Mark a backend as dead after a request failure (instant skip next time)."""
-        self._health_cache[name] = (False, time.time())
+        with self._health_lock:
+            self._health_cache[name] = (False, time.time())
 
     def _mark_backend_alive(self, name: str):
         """Mark backend alive after successful request."""
-        self._health_cache[name] = (True, time.time())
+        with self._health_lock:
+            self._health_cache[name] = (True, time.time())
 
     # ─── Backend Discovery ───────────────────────────────────
 
@@ -484,21 +489,11 @@ class ModelBusService:
         except (ImportError, Exception) as e:
             logger.debug("TTS router unavailable (%s), using legacy chain", e)
 
-        # Legacy fallback chain (preserved for robustness)
-        _publish_routing_status(uid, 'Generating speech...', rid)
-        result = self._try_luxtts(prompt, options)
-        if result and 'error' not in result:
-            return result
-
-        makeittalk_url = os.environ.get('MAKEITTALK_API_URL')
-        is_offline = (os.environ.get('HART_OS_MODE') and not makeittalk_url)
-        if makeittalk_url and not is_offline:
-            _publish_routing_status(uid,
-                'Local TTS engine unavailable, using cloud voice service...', rid)
-            result = self._try_makeittalk_tts(prompt, options, makeittalk_url)
-            if result and 'error' not in result:
-                return result
-
+        # Legacy fallback: skip the full chain (luxtts→makeittalk→pocket)
+        # which ignores language/GPU/policy. Go straight to pocket_tts
+        # (guaranteed CPU, always available). The TTSRouter already handles
+        # luxtts, makeittalk, and GPU engines with proper awareness.
+        _publish_routing_status(uid, 'Generating speech (fallback)...', rid)
         return self._try_pocket_tts(prompt, options)
 
     def _try_luxtts(self, prompt: str, options: dict) -> dict:

@@ -251,11 +251,13 @@ class EventBus:
 
         # Run WAMP component in a background thread with its own event loop
         # Reconnects with exponential backoff on disconnect/failure
+        bus._wamp_stop = False
+
         def _run():
             import time as _time
             backoff = 1
             max_backoff = 60
-            while True:
+            while not bus._wamp_stop:
                 loop = asyncio.new_event_loop()
                 bus._wamp_loop = loop
                 asyncio.set_event_loop(loop)
@@ -281,6 +283,7 @@ class EventBus:
 
     def disconnect_wamp(self):
         """Disconnect from Crossbar WAMP router."""
+        self._wamp_stop = True
         self._wamp_connected = False
         session = self._wamp_session
         self._wamp_session = None

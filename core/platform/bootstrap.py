@@ -223,8 +223,8 @@ def _wire_event_subscribers(bus) -> None:
     # 3. memory.item_deleted → sync deletion to federation (item_added already syncs)
     def _on_memory_deleted(topic, data):
         try:
-            from integrations.agent_engine.federated_aggregator import get_aggregator
-            agg = get_aggregator()
+            from integrations.agent_engine.federated_aggregator import get_federated_aggregator
+            agg = get_federated_aggregator()
             if agg and hasattr(agg, '_event_counters'):
                 agg._event_counters['memory.item_deleted'] = (
                     agg._event_counters.get('memory.item_deleted', 0) + 1)

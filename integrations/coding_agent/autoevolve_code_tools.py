@@ -350,7 +350,12 @@ class AutoResearchEngine:
         try:
             from integrations.coding_agent.recipe_bridge import CodingRecipeBridge
             bridge = CodingRecipeBridge()
-            bridge.capture_edit_as_recipe_step(result.edits)
+            bridge.capture_edit_as_recipe_step(
+                task=f'autoresearch: {session.metric_name} optimization',
+                tool_name='autoresearch',
+                file_edits=result.edits,
+                working_dir=session.repo_path,
+            )
         except Exception:
             pass
 

@@ -366,7 +366,7 @@ class TestOSPanelRegistrations(unittest.TestCase):
 
     def test_wifi_manager_panel_registered(self):
         self.assertIn('wifi_manager', self.panels)
-        self.assertIn('/api/shell/wifi/scan', self.panels['wifi_manager']['apis'])
+        self.assertIn('/api/shell/wifi/networks', self.panels['wifi_manager']['apis'])
 
     def test_vpn_manager_panel_registered(self):
         self.assertIn('vpn_manager', self.panels)
@@ -407,6 +407,33 @@ class TestOSPanelRegistrations(unittest.TestCase):
         manifest = AppManifest.from_system_panel('calculator', self.panels['calculator'])
         self.assertEqual(manifest.type, AppType.SYSTEM_PANEL.value)
         self.assertEqual(manifest.name, 'Calculator')
+
+
+    # ─── P2 Competitive Parity Panels ─────────────────────────
+
+    def test_file_tags_panel_registered(self):
+        self.assertIn('file_tags', self.panels)
+
+    def test_hotspot_panel_registered(self):
+        self.assertIn('hotspot', self.panels)
+
+    def test_dns_settings_panel_registered(self):
+        self.assertIn('dns_settings', self.panels)
+
+    def test_auto_update_panel_registered(self):
+        self.assertIn('auto_update', self.panels)
+
+    def test_sso_ldap_panel_registered(self):
+        self.assertIn('sso_ldap', self.panels)
+
+    def test_email_panel_registered(self):
+        self.assertIn('email', self.panels)
+
+    def test_voice_control_panel_registered(self):
+        self.assertIn('voice_control', self.panels)
+
+    def test_screen_rotation_panel_registered(self):
+        self.assertIn('screen_rotation', self.panels)
 
 
 if __name__ == '__main__':

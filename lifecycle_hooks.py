@@ -11,6 +11,7 @@ import logging
 import os
 import threading
 from typing import Dict, Optional, Any
+from core.session_cache import TTLCache
 
 try:
     from helper import PROMPTS_DIR
@@ -22,8 +23,22 @@ logger = logging.getLogger(__name__)
 # Lock protecting _ledger_registry and action_states (accessed by multiple Waitress/Gunicorn threads)
 _state_lock = threading.RLock()
 
-# Global ledger registry for auto-sync
-_ledger_registry: Dict[str, Any] = {}
+def _load_ledger_on_miss(user_prompt: str) -> Optional[Any]:
+    """Cache-miss loader: recover ledger from persistent storage."""
+    try:
+        from agent_ledger.factory import get_or_create_ledger
+        user_id, prompt_id = _extract_ownership_from_prompt(user_prompt)
+        if user_id and prompt_id:
+            return get_or_create_ledger(user_id, prompt_id)
+    except Exception:
+        pass
+    return None
+
+# Global ledger registry for auto-sync (TTL-bounded, auto-recovers from disk on cache miss)
+_ledger_registry = TTLCache(
+    ttl_seconds=28800, max_size=10000, name='ledger_registry',
+    loader=_load_ledger_on_miss,
+)
 
 def register_ledger_for_session(user_prompt: str, ledger: Any):
     """Register a ledger instance for a session to enable auto-sync."""
@@ -32,7 +47,7 @@ def register_ledger_for_session(user_prompt: str, ledger: Any):
     logger.debug(f"Registered ledger for {user_prompt}")
 
 def get_registered_ledger(user_prompt: str) -> Optional[Any]:
-    """Get the registered ledger for a session."""
+    """Get the registered ledger for a session. Auto-recovers from disk on cache miss."""
     with _state_lock:
         return _ledger_registry.get(user_prompt)
 

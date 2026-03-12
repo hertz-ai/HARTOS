@@ -57,6 +57,17 @@ class RedisRateLimiter:
         'webcam': (10, 60),              # 10 webcam operations per 60 seconds
         'scanner': (5, 60),              # 5 scanner operations per 60 seconds
         'video_gen': (5, 300),           # 5 video generations per 5 minutes
+        'keyboard': (20, 60),            # 20 keyboard operations per 60 seconds
+        'app_permissions': (10, 60),     # 10 permission changes per 60 seconds
+        'file_tags': (30, 60),           # 30 file tag operations per 60 seconds
+        'hotspot': (10, 60),             # 10 hotspot operations per 60 seconds
+        'weather': (10, 60),             # 10 weather queries per 60 seconds
+        'auto_update': (3, 3600),        # 3 update runs per hour
+        'dns': (5, 60),                  # 5 DNS config changes per 60 seconds
+        'sso': (5, 60),                  # 5 SSO operations per 60 seconds
+        'email': (10, 60),               # 10 email operations per 60 seconds
+        'voice_control': (30, 60),       # 30 voice operations per 60 seconds
+        'screen_rotation': (10, 60),     # 10 rotation changes per 60 seconds
     }
 
     def __init__(self):
@@ -107,19 +118,20 @@ class RedisRateLimiter:
         """Redis sliding window counter."""
         try:
             now = time.time()
+            # Step 1: clean old entries and count current
             pipe = self._redis.pipeline()
-            # Remove old entries
             pipe.zremrangebyscore(key, 0, now - window)
-            # Count current entries
             pipe.zcard(key)
-            # Add current request
-            pipe.zadd(key, {str(now): now})
-            # Set expiry on the key
-            pipe.expire(key, window + 1)
             results = pipe.execute()
 
             current_count = results[1]
-            return current_count < max_requests
+            if current_count >= max_requests:
+                return False
+
+            # Step 2: only record if under limit
+            self._redis.zadd(key, {str(now): now})
+            self._redis.expire(key, window + 1)
+            return True
         except Exception as e:
             logger.warning(f"Redis rate limit check failed, falling back to memory: {e}")
             # Fail-closed: fall back to in-memory limiter, NOT open allow

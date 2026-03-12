@@ -32,6 +32,14 @@ except ImportError:
     HAS_AUTOBAHN = False
 
 from ..base import Message, SendResult
+
+
+def _get_crossbar_port() -> int:
+    try:
+        from core.port_registry import get_port
+        return get_port('crossbar')
+    except ImportError:
+        return 8088
 from ..registry import ChannelRegistry
 
 logger = logging.getLogger(__name__)
@@ -103,7 +111,7 @@ class BridgeConfig:
     def from_env(cls) -> "BridgeConfig":
         """Create config from environment variables."""
         return cls(
-            crossbar_url=os.getenv("CBURL", "ws://localhost:8088/ws"),
+            crossbar_url=os.getenv("CBURL", f"ws://localhost:{_get_crossbar_port()}/ws"),
             realm=os.getenv("CBREALM", "realm1"),
             rules_file=os.getenv("BRIDGE_RULES_FILE", "/app/data/bridge_rules.json"),
         )

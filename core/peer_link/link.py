@@ -290,14 +290,15 @@ class PeerLink:
         """Close the connection."""
         if self._state == LinkState.CLOSING:
             return
-        self._state = LinkState.CLOSING
 
-        # Send bye
+        # Send bye BEFORE setting state — send() checks is_connected (state==CONNECTED)
         try:
             if self._ws:
                 self.send('control', {'type': 'bye'})
         except Exception:
             pass
+
+        self._state = LinkState.CLOSING
 
         try:
             if self._ws:

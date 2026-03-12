@@ -1,28 +1,23 @@
 """
-Shard Engine — Privacy-preserving task decomposition.
-
-Hybrid architecture (Option C):
-  User's Node (TRUSTED) — full repo, shard engine, validation
-  Cloud Orchestrator (PARTIAL TRUST) — dependency graph, interfaces, routing
-  Compute Agents (ZERO TRUST) — see only their shard, can't reconstruct whole
+Shard Engine — Context-scoped task decomposition.
 
 When a code task arrives:
-  1. Extract interface map (function signatures, types, imports — NOT implementations)
-  2. Decompose task into isolated shards (each shard = subset of files + interfaces)
-  3. Each shard contains ONLY what's needed for that sub-task
-  4. Agents work on shards independently
-  5. Results reassembled and validated on the trusted node
+  1. Identify target function(s) to modify
+  2. Build call-chain context: upstream callers + downstream callees (FULL source)
+  3. Everything else: interfaces only (signatures + types + docstrings)
+  4. Agent sees enough to code accurately, exposure proportional to task
 
-Privacy guarantee:
-  - No single agent sees more than ~20% of the codebase
-  - Shards contain interfaces (signatures) not implementations
-  - File paths can be obfuscated (optional)
-  - Shard contents are ephemeral (auto-expire after task completion)
+Context model (CALL_CHAIN scope):
+  Target function:     FULL implementation (what you're modifying)
+  Upstream callers:    FULL implementation (who calls it, input contracts)
+  Downstream callees:  FULL implementation (what it calls, output contracts)
+  Everything else:     Interfaces only (signatures + types)
 
-Design constraints:
-  - Agents CAN'T understand the full picture — by design
-  - The orchestrator (trusted node or cloud) understands interfaces
-  - Reassembly + testing happens ONLY on the trusted node
+Security model:
+  - Exposure proportional to task, not whole codebase
+  - E2E encrypted between nodes
+  - Trust-based peer access (SAME_USER / autotrust)
+  - Validation on trusted node before applying diffs
 """
 
 import ast
@@ -41,6 +36,7 @@ logger = logging.getLogger('hevolve.shard_engine')
 class ShardScope(str, Enum):
     """What a shard agent is allowed to see."""
     FULL_FILE = 'full_file'         # See complete file(s) — trusted agent only
+    CALL_CHAIN = 'call_chain'       # Target func + upstream/downstream FULL, rest interfaces
     INTERFACES = 'interfaces'       # See signatures + types, not implementations
     SIGNATURES = 'signatures'       # See function/class names + params only
     MINIMAL = 'minimal'             # See only the specific function to modify
@@ -97,6 +93,195 @@ class ShardResult:
     test_results: Optional[str]  # stdout from test run
     success: bool
     error: Optional[str] = None
+
+
+class CallGraphExtractor:
+    """Extract upstream callers and downstream callees for a target function.
+
+    Primary: Trueflow MCP (port 5681) — has runtime call tree + coverage.
+    Fallback: AST-based static analysis — walks function bodies for Name references.
+    """
+
+    @staticmethod
+    def get_call_chain(file_path: str, function_name: str,
+                       code_root: str = '') -> Dict[str, List[str]]:
+        """Get upstream (callers) and downstream (callees) for a function.
+
+        Returns:
+            {'target': 'func_name',
+             'upstream': ['caller1', 'caller2'],
+             'downstream': ['callee1', 'callee2'],
+             'source': 'trueflow' | 'ast'}
+        """
+        # Try Trueflow MCP first (richer: runtime coverage + dynamic call tree)
+        try:
+            chain = CallGraphExtractor._from_trueflow(file_path, function_name)
+            if chain.get('upstream') or chain.get('downstream'):
+                return chain
+        except Exception:
+            pass
+
+        # Fallback: static AST analysis
+        return CallGraphExtractor._from_ast(file_path, function_name, code_root)
+
+    @staticmethod
+    def _from_trueflow(file_path: str, function_name: str) -> Dict:
+        """Get call chain from Trueflow MCP (IDE must be running)."""
+        from core.http_pool import pooled_post
+        trueflow_url = os.environ.get('TRUEFLOW_MCP_URL',
+                                       'http://localhost:5681')
+        resp = pooled_post(
+            f'{trueflow_url}/analyze_call_tree',
+            json={'file': file_path, 'function': function_name},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return {
+                'target': function_name,
+                'upstream': data.get('callers', []),
+                'downstream': data.get('callees', []),
+                'source': 'trueflow',
+            }
+        return {'target': function_name, 'upstream': [], 'downstream': [],
+                'source': 'trueflow'}
+
+    @staticmethod
+    def _from_ast(file_path: str, function_name: str,
+                  code_root: str = '') -> Dict:
+        """Static call graph via AST. Scans target file + importers."""
+        result = {
+            'target': function_name,
+            'upstream': [],
+            'downstream': [],
+            'source': 'ast',
+        }
+
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                source = f.read()
+            tree = ast.parse(source)
+        except (IOError, SyntaxError):
+            return result
+
+        all_functions = {}  # name → ast node
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                all_functions[node.name] = node
+
+        # Downstream: what does the target function call?
+        target_node = all_functions.get(function_name)
+        if target_node:
+            for node in ast.walk(target_node):
+                if isinstance(node, ast.Call):
+                    callee = None
+                    if isinstance(node.func, ast.Name):
+                        callee = node.func.id
+                    elif isinstance(node.func, ast.Attribute):
+                        callee = node.func.attr
+                    if callee and callee != function_name:
+                        if callee not in result['downstream']:
+                            result['downstream'].append(callee)
+
+        # Upstream: which functions in this file call the target?
+        for fname, fnode in all_functions.items():
+            if fname == function_name:
+                continue
+            for node in ast.walk(fnode):
+                if isinstance(node, ast.Call):
+                    callee = None
+                    if isinstance(node.func, ast.Name):
+                        callee = node.func.id
+                    elif isinstance(node.func, ast.Attribute):
+                        callee = node.func.attr
+                    if callee == function_name:
+                        if fname not in result['upstream']:
+                            result['upstream'].append(fname)
+                        break
+
+        # Cross-file upstream: scan other files that import from this module
+        if code_root:
+            target_module = os.path.relpath(file_path, code_root)
+            target_module = target_module.replace(os.sep, '.').rstrip('.py')
+            result['upstream'].extend(
+                CallGraphExtractor._find_cross_file_callers(
+                    code_root, target_module, function_name))
+
+        return result
+
+    @staticmethod
+    def _find_cross_file_callers(code_root: str, target_module: str,
+                                  function_name: str) -> List[str]:
+        """Find functions in other files that import and call the target."""
+        callers = []
+        exclude = {'__pycache__', 'venv', '.venv', 'venv310', '.git',
+                    'node_modules', 'agent_data', 'tests', 'build'}
+        for root, dirs, files in os.walk(code_root):
+            dirs[:] = [d for d in dirs if d not in exclude]
+            for fname in files:
+                if not fname.endswith('.py'):
+                    continue
+                full_path = os.path.join(root, fname)
+                try:
+                    with open(full_path, 'r', encoding='utf-8',
+                              errors='ignore') as f:
+                        src = f.read()
+                    tree = ast.parse(src)
+                except (IOError, SyntaxError):
+                    continue
+
+                # Check if this file imports our target function
+                imports_target = False
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.ImportFrom):
+                        if node.module and target_module in node.module:
+                            for alias in node.names:
+                                if alias.name == function_name:
+                                    imports_target = True
+                                    break
+                    if imports_target:
+                        break
+                if not imports_target:
+                    continue
+
+                # Find which functions call it
+                rel = os.path.relpath(full_path, code_root)
+                for node in ast.walk(tree):
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        for child in ast.walk(node):
+                            if isinstance(child, ast.Call):
+                                cname = None
+                                if isinstance(child.func, ast.Name):
+                                    cname = child.func.id
+                                elif isinstance(child.func, ast.Attribute):
+                                    cname = child.func.attr
+                                if cname == function_name:
+                                    caller_id = f"{rel}:{node.name}"
+                                    if caller_id not in callers:
+                                        callers.append(caller_id)
+                                    break
+                if len(callers) >= 20:  # Cap cross-file search
+                    break
+        return callers
+
+    @staticmethod
+    def extract_function_source(file_path: str, function_name: str) -> str:
+        """Extract the full source code of a specific function from a file."""
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = f.readlines()
+            source = ''.join(lines)
+            tree = ast.parse(source)
+        except (IOError, SyntaxError):
+            return ''
+
+        for node in ast.walk(tree):
+            if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name == function_name):
+                start = node.lineno - 1
+                end = getattr(node, 'end_lineno', start + 1)
+                return ''.join(lines[start:end])
+        return ''
 
 
 class InterfaceExtractor:
@@ -250,14 +435,18 @@ class InterfaceExtractor:
 
 
 class ShardEngine:
-    """Decomposes code tasks into isolated, privacy-preserving shards.
+    """Context-scoped task decomposition engine.
 
-    The engine runs on the TRUSTED node (user's machine). It:
-      1. Understands the full repo
-      2. Creates shards with minimal scope
-      3. Sends shards to compute agents
-      4. Reassembles results
-      5. Runs validation (tests)
+    Runs on the TRUSTED node (user's machine). Creates shards with
+    context proportional to the task — not the whole codebase.
+
+    CALL_CHAIN scope (default for distributed work):
+      Target function: FULL source
+      Upstream callers: FULL source (input contracts)
+      Downstream callees: FULL source (output contracts)
+      Everything else: Interfaces only (signatures + types)
+
+    Call graph from Trueflow MCP (when IDE running) or AST fallback.
     """
 
     def __init__(self, code_root: str = None, shard_ttl: int = 3600):
@@ -369,6 +558,111 @@ class ShardEngine:
             f"Shard [{shard_id}]: {len(target_files)} target files, "
             f"scope={scope.value}, task={task[:60]}..."
         )
+        return shard
+
+    def create_call_chain_shard(self, task: str, target_file: str,
+                                target_function: str) -> CodeShard:
+        """Create a shard with call-chain context for a specific function.
+
+        Context model:
+          Target function:    FULL source
+          Upstream callers:   FULL source (who calls it)
+          Downstream callees: FULL source (what it calls)
+          Same-file others:   Interfaces only
+          Other files:        Interfaces only (imported modules)
+
+        Uses Trueflow MCP (analyze_call_tree) when IDE is running,
+        falls back to AST-based static analysis on headless nodes.
+        """
+        shard_id = hashlib.sha256(
+            f"cc:{target_file}:{target_function}:{time.time()}".encode()
+        ).hexdigest()[:12]
+
+        full_path = os.path.join(self.code_root, target_file)
+
+        # Get call chain (Trueflow → AST fallback)
+        chain = CallGraphExtractor.get_call_chain(
+            full_path, target_function, self.code_root)
+
+        # Build context: full source for call chain, interfaces for rest
+        full_content = {}
+        interface_specs = []
+
+        # 1. Target function — FULL source
+        target_src = CallGraphExtractor.extract_function_source(
+            full_path, target_function)
+        if target_src:
+            full_content[f'{target_file}::{target_function}'] = target_src
+
+        # 2. Upstream callers — FULL source
+        for caller in chain.get('upstream', []):
+            if ':' in caller:  # Cross-file: "path/file.py:func_name"
+                cfile, cfunc = caller.rsplit(':', 1)
+                cfull = os.path.join(self.code_root, cfile)
+                src = CallGraphExtractor.extract_function_source(cfull, cfunc)
+                if src:
+                    full_content[f'{cfile}::{cfunc}'] = src
+            else:  # Same file
+                src = CallGraphExtractor.extract_function_source(
+                    full_path, caller)
+                if src:
+                    full_content[f'{target_file}::{caller}'] = src
+
+        # 3. Downstream callees — FULL source (same file only;
+        #    cross-file callees get interfaces via imports)
+        for callee in chain.get('downstream', []):
+            src = CallGraphExtractor.extract_function_source(
+                full_path, callee)
+            if src:
+                full_content[f'{target_file}::{callee}'] = src
+
+        # 4. Same-file interfaces (everything NOT in the call chain)
+        spec = InterfaceExtractor.extract_from_file(full_path)
+        call_chain_names = (
+            {target_function} |
+            set(chain.get('upstream', [])) |
+            set(chain.get('downstream', []))
+        )
+        # Strip cross-file references from the set
+        call_chain_names = {
+            n.split(':')[-1] if ':' in n else n for n in call_chain_names
+        }
+        # Keep only interface entries for functions NOT in call chain
+        spec.functions = [
+            f for f in spec.functions if f['name'] not in call_chain_names
+        ]
+        interface_specs.append(spec)
+
+        # 5. Imported module interfaces (downstream cross-file context)
+        for imp in spec.imports:
+            # Resolve "from X import Y" to file path
+            if imp.startswith('from '):
+                parts = imp.split()
+                if len(parts) >= 2:
+                    mod_path = parts[1].replace('.', os.sep) + '.py'
+                    mod_full = os.path.join(self.code_root, mod_path)
+                    if os.path.exists(mod_full):
+                        mod_spec = InterfaceExtractor.extract_from_file(mod_full)
+                        interface_specs.append(mod_spec)
+
+        shard = CodeShard(
+            shard_id=shard_id,
+            task_description=task,
+            scope=ShardScope.CALL_CHAIN,
+            target_files=[target_file],
+            interface_specs=interface_specs,
+            full_content=full_content,
+            test_expectations=[],
+            dependencies=[],
+            expires_at=time.time() + self.shard_ttl,
+        )
+        self._active_shards[shard_id] = shard
+
+        logger.info(
+            f"Call-chain shard [{shard_id}]: {target_file}::{target_function}, "
+            f"{len(chain.get('upstream', []))} upstream, "
+            f"{len(chain.get('downstream', []))} downstream, "
+            f"source={chain.get('source', 'unknown')}")
         return shard
 
     def decompose_task(self, task: str, scope: ShardScope = ShardScope.INTERFACES,

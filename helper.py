@@ -67,6 +67,17 @@ try:
 except Exception as _search_err:
     logging.getLogger(__name__).info(f"Google Search unavailable (expected in local mode): {_search_err}")
     search = None
+
+
+def _is_terminate_msg(msg: dict) -> bool:
+    """Null-safe AutoGen termination check.
+
+    AutoGen tool-call messages can have content=None.
+    Using ``"TERMINATE" in msg.get("content")`` crashes with TypeError
+    when content is None.  This helper guards against that.
+    """
+    content = msg.get("content") if isinstance(msg, dict) else None
+    return content is not None and "TERMINATE" in content
 redis_client = redis.StrictRedis(
     host='azure_all_vms.hertzai.com', port=6369, db=0)
 
@@ -1803,7 +1814,7 @@ def create_visual_agent(user_id,prompt_id):
         name='visual_agent',
         llm_config=llm_config,
         max_consecutive_auto_reply=10,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
         code_execution_config={"work_dir": "coding", "use_docker": False},
         system_message="You are an helpful AI assistant used to perform visual based tasks given to you. "
     )
@@ -1812,7 +1823,7 @@ def create_visual_agent(user_id,prompt_id):
         name=f"UserProxy",
         human_input_mode="NEVER",
         llm_config=False,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
         max_consecutive_auto_reply=0,
         code_execution_config=False,
     )
@@ -1832,7 +1843,7 @@ def create_visual_agent(user_id,prompt_id):
             10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
             When writing code, always print the final response just before returning it.
         """,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
     executor2 = autogen.AssistantAgent(
         name="Executor",
@@ -1856,7 +1867,7 @@ def create_visual_agent(user_id,prompt_id):
             if you get any conversation which is not related to coding ask the manager to route this conversation to user
             When writing code, always print the final response just before returning it.
         ''',
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
     multi_role_agent2 = autogen.AssistantAgent(
         name="multi_role_agent",
@@ -1884,7 +1895,7 @@ def create_visual_agent(user_id,prompt_id):
             Use "requires_breakdown" when an action is too complex and needs to be split into smaller subtasks.
 
         """,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
 
     chat_instructor2 = autogen.UserProxyAgent(
@@ -1893,7 +1904,7 @@ def create_visual_agent(user_id,prompt_id):
         max_consecutive_auto_reply=10,
         default_auto_reply="TERMINATE",
         code_execution_config=False,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
 
     context_handling = transform_messages.TransformMessages(

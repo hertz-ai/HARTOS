@@ -48,15 +48,12 @@ def _has_hive_peers() -> bool:
     pick up work. Single-node setups always dispatch locally.
     """
     try:
-        from integrations.social.models import get_db, PeerNode
-        db = get_db()
-        try:
+        from integrations.social.models import db_session, PeerNode
+        with db_session(commit=False) as db:
             count = db.query(PeerNode).filter(
                 PeerNode.status == 'active'
             ).count()
             return count > 1  # >1 because self is in the table too
-        finally:
-            db.close()
     except Exception:
         return False
 
@@ -142,9 +139,8 @@ def _check_robot_capability_match(goal_type: str, goal_id: str) -> bool:
         return True
 
     try:
-        from integrations.social.models import get_db, AgentGoal
-        db = get_db()
-        try:
+        from integrations.social.models import db_session, AgentGoal
+        with db_session(commit=False) as db:
             goal = db.query(AgentGoal).filter_by(id=goal_id).first()
             if not goal:
                 return True
@@ -168,8 +164,6 @@ def _check_robot_capability_match(goal_type: str, goal_id: str) -> bool:
                     f"(score={score}), prefer distributed dispatch")
                 return False
             return True
-        finally:
-            db.close()
     except Exception as e:
         logger.debug(f"Robot capability check skipped: {e}")
         return True

@@ -14,6 +14,13 @@ from sqlalchemy.orm import Session
 
 logger = logging.getLogger('hevolve_social')
 
+# ─── Goal Type Groups ───
+# Coding-related goal types — handled by coding_daemon with idle detection
+# + benchmark sync.  agent_daemon skips these to avoid double dispatch.
+CODING_GOAL_TYPES = frozenset({
+    'coding', 'code_evolution', 'self_heal', 'autoresearch', 'self_build',
+})
+
 # ─── Prompt Builder Registry ───
 # Maps goal_type → callable(goal_dict, product_dict?) → str
 _prompt_builders: Dict[str, Callable] = {}
@@ -524,7 +531,11 @@ def _build_coding_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -
     """
     from .hive_sdk_spec import get_hive_embedding_instructions, CODE_QUALITY_CONSTITUTIONAL_RULES
 
-    config = goal_dict
+    # Support both flat fields (legacy CodingGoal) and nested config_json (AgentGoal)
+    config = goal_dict.get('config_json', {}) or goal_dict.get('config', {}) or {}
+    repo_url = config.get('repo_url', goal_dict.get('repo_url', ''))
+    repo_branch = config.get('repo_branch', goal_dict.get('repo_branch', 'main'))
+    target_path = config.get('target_path', goal_dict.get('target_path', ''))
     platform_identity = _get_platform_identity()
     hive_instructions = get_hive_embedding_instructions()
 
@@ -556,9 +567,9 @@ def _build_coding_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -
 
     return (
         f"{platform_identity}\n\n"
-        f"You are working on the GitHub repository {config.get('repo_url', '')} "
-        f"(branch {config.get('repo_branch', 'main')}).\n"
-        f"Target path: {config.get('target_path', '(entire repo)')}\n\n"
+        f"You are working on the GitHub repository {repo_url} "
+        f"(branch {repo_branch}).\n"
+        f"Target path: {target_path or '(entire repo)'}\n\n"
         f"Goal: {goal_dict['title']}\n"
         f"Description: {goal_dict.get('description', '')}\n\n"
         f"Clone the repo, analyze the codebase, and make improvements "
@@ -1321,3 +1332,45 @@ def _build_autoresearch_prompt(goal_dict: Dict, product_dict: Optional[Dict] = N
 
 register_goal_type('autoresearch', _build_autoresearch_prompt,
                     tool_tags=['autoresearch', 'coding'])
+
+
+# ─── Code Evolution Goal (any private repo, full context) ─────────
+
+def _build_code_evolution_prompt(goal_dict, product_dict=None):
+    config = goal_dict.get('config_json', {}) or goal_dict.get('config', {})
+    task_desc = goal_dict.get('description', '')
+    target_files = config.get('target_files', [])
+    repo_path = config.get('repo_path', '')
+
+    files_str = ', '.join(target_files) if target_files else 'auto-detected'
+    return (
+        "You are a coding agent working on a repository with FULL context.\n\n"
+        f"TASK: {task_desc}\n"
+        f"REPO: {repo_path or 'specified by the task owner'}\n"
+        f"TARGET FILES: {files_str}\n\n"
+
+        "TOOLS:\n"
+        f"1. Use create_code_shard(task, target_files, repo_path='{repo_path}') "
+        "to load full file contents for the target files\n"
+        f"2. Use execute_coding_task(task, working_dir='{repo_path}') "
+        "to make edits via the best available coding tool\n"
+        "3. Use get_coding_benchmarks() to check which tool performs best\n\n"
+
+        "TRUST MODEL:\n"
+        "- You have full source access — security is trust-based, not info-hiding\n"
+        "- Only trusted peers (SAME_USER or explicitly granted) receive code tasks\n"
+        "- Untrusted peers get non-code work (inference, embeddings)\n\n"
+
+        "After changes are validated, the upgrade pipeline runs: "
+        "BUILD→TEST→AUDIT→BENCHMARK→SIGN→CANARY→DEPLOY.\n\n"
+
+        "RULES:\n"
+        "- Only modify target files\n"
+        "- Keep changes minimal and focused\n"
+        "- Verify changes pass tests before reporting success\n"
+        "- Report progress via save_data_in_memory\n"
+    )
+
+
+register_goal_type('code_evolution', _build_code_evolution_prompt,
+                    tool_tags=['coding'])

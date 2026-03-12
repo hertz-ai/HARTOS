@@ -7,6 +7,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from core.http_pool import pooled_get, pooled_post, pooled_patch, pooled_request
+from core.port_registry import get_port as _get_llm_port
 from autobahn.asyncio.component import Component, run
 import uuid
 import asyncio
@@ -20,9 +21,9 @@ import json
 from autogen import ConversableAgent
 from flask import current_app
 try:
-    from helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup, load_vlm_agent_files, PROMPTS_DIR
+    from helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup, load_vlm_agent_files, PROMPTS_DIR, _is_terminate_msg
 except Exception:
-    from helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup, load_vlm_agent_files
+    from helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup, load_vlm_agent_files, _is_terminate_msg
     PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
 os.makedirs(PROMPTS_DIR, exist_ok=True)
 import helper as helper_fun
@@ -294,7 +295,6 @@ elif _active_cloud and os.environ.get('HEVOLVE_LLM_API_KEY'):
     config_list = [_cloud_cfg]
 else:
     # Dynamic: reads from user's LLM Setup Wizard config (set by Nunba app.py)
-    from core.port_registry import get_port as _get_llm_port
     _llama_port = os.environ.get('LLAMA_CPP_PORT', str(_get_llm_port('llm')))
     _local_llm_url = os.environ.get('HEVOLVE_LOCAL_LLM_URL', f'http://localhost:{_llama_port}/v1')
     config_list = [{
@@ -406,7 +406,11 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
     time_manager = time_agents[user_prompt]['time_manager']
     chat_instructor = time_agents[user_prompt]['chat_instructor1']
     time_actions[user_prompt].current_action = action_entry_point
-    current_action = time_actions[user_prompt].get_action_byaction_id(action_entry_point)['action']
+    _action_entry = time_actions[user_prompt].get_action_byaction_id(action_entry_point)
+    if _action_entry is None:
+        current_app.logger.error(f"Action {action_entry_point} not found in time_actions")
+        return
+    current_action = _action_entry['action']
     text = f'This is the time now {current_time}\n your overall task description which might span multiple actions: {task_description}\n the current Action to execute: {current_action}'
     result = time_user.initiate_chat(time_manager, message=text,speaker_selection={"speaker": "assistant"}, clear_history=False)
     restart = False
@@ -416,7 +420,11 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
             current_app.logger.info(f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
             json_obj = retrieve_json(group_chat.messages[-2]["content"])
             if json_obj and type(json_obj)==dict and 'status' in json_obj.keys() and json_obj['status'].lower() == 'completed':
-                current_action = time_actions[user_prompt].get_action_byaction_id(time_actions[user_prompt].current_action)['action']
+                _next_action = time_actions[user_prompt].get_action_byaction_id(time_actions[user_prompt].current_action)
+                if _next_action is None:
+                    current_app.logger.error(f"Action {time_actions[user_prompt].current_action} not found")
+                    break
+                current_action = _next_action['action']
                 text = f'This is the time now {current_time}\n your overall task description which might span multiple actions: {task_description}\n the current Action to execute: {current_action}'
             else:
                 current_app.logger.warning(f'it is not a json object the error is:')
@@ -428,8 +436,9 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
             continue
         if restart == True:
             break
-        current_app.logger.info(f'checking can_perform_without_user_input from {time_actions[user_prompt].get_action_byaction_id(action_entry_point)} ')
-        if time_actions[user_prompt].get_action_byaction_id(action_entry_point)['can_perform_without_user_input'] == 'yes':
+        _check_action = time_actions[user_prompt].get_action_byaction_id(action_entry_point)
+        current_app.logger.info(f'checking can_perform_without_user_input from {_check_action} ')
+        if _check_action and _check_action.get('can_perform_without_user_input') == 'yes':
             restart = True
             text = 'You can assume things on your own to complete this task'
             result = chat_instructor.initiate_chat(time_manager, message=text,speaker_selection={"speaker": "assistant"}, clear_history=False)
@@ -851,13 +860,13 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         max_consecutive_auto_reply=10,
         default_auto_reply="TERMINATE",
         code_execution_config=False,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
 
     author = autogen.UserProxyAgent(
         name="UserProxy",
         human_input_mode="NEVER",
-        is_termination_msg=lambda x: True if x.get("content").strip()=='' else False,
+        is_termination_msg=lambda x: x.get("content") is not None and not x["content"].strip(),
         max_consecutive_auto_reply=0,
         code_execution_config=False,
     )
@@ -889,7 +898,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     #         name=i['name'],
     #         human_input_mode="NEVER",
     #         default_auto_reply="TERMINATE",
-    #         is_termination_msg=lambda x: True if x.get("content").strip()=='' else False,
+    #         is_termination_msg=lambda x: not (x.get("content") or "").strip(),
     #         max_consecutive_auto_reply=0,
     #         code_execution_config=False,
     #     )
@@ -1445,9 +1454,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     async def execute_coding_task(
         task: Annotated[str, "The coding task to execute (e.g., 'review this function for bugs', 'implement a login form')"],
         task_type: Annotated[str, "Task type: code_review, feature, bug_fix, refactor, app_build, debugging, multi_session"] = "feature",
-        preferred_tool: Annotated[str, "Optional tool override: kilocode, claude_code, or opencode (empty = auto-select best)"] = "",
+        preferred_tool: Annotated[str, "Optional tool override: kilocode, claude_code, opencode, or aider_native (empty = auto-select best)"] = "",
+        working_dir: Annotated[str, "Working directory / repo path for the coding task (empty = use HEVOLVE_CODING_WORKDIR env or cwd)"] = "",
     ) -> str:
-        """Execute a coding task using the best available coding agent tool (KiloCode, Claude Code, or OpenCode).
+        """Execute a coding task using the best available coding agent tool (KiloCode, Claude Code, OpenCode, or AiderNative).
 
         Routes to the best tool based on benchmarks and task type.
         This is for writing, reviewing, refactoring, or debugging code —
@@ -1460,9 +1470,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                 task=task,
                 task_type=task_type,
                 preferred_tool=preferred_tool,
-                user_id=user_prompt,
+                user_id=user_id,
                 model=os.environ.get('HEVOLVE_CODING_MODEL', ''),
-                working_dir=os.environ.get('HEVOLVE_CODING_WORKDIR', ''),
+                working_dir=working_dir or os.environ.get('HEVOLVE_CODING_WORKDIR', ''),
             )
             import json
             return json.dumps(result, indent=2)
@@ -1471,7 +1481,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
     helper.register_for_llm(
         name="execute_coding_task",
-        description="Execute a coding task (write, review, refactor, debug code) using the best available coding agent tool. Routes to KiloCode, Claude Code, or OpenCode based on benchmarks."
+        description="Execute a coding task (write, review, refactor, debug code) using the best available coding agent tool. Routes to KiloCode, Claude Code, OpenCode, or AiderNative based on benchmarks. Pass working_dir for the target repo path."
     )(execute_coding_task)
     assistant.register_for_execution(name="execute_coding_task")(execute_coding_task)
 
@@ -1498,6 +1508,96 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         tool_logger.info("Registered get_repository_map tool")
     except ImportError:
         tool_logger.debug("Repository map tool not available (aider_core not installed)")
+
+    # Shard Engine: Call-chain context for coding tasks.
+    # Target function + upstream callers + downstream callees = FULL source.
+    # Everything else = interfaces only. Exposure proportional to task.
+    # Call graph from Trueflow MCP (IDE) or AST fallback (headless).
+    try:
+        async def create_code_shard(
+            task: Annotated[str, "Description of the coding task"],
+            target_file: Annotated[str, "Relative path to the file containing the target function"],
+            target_function: Annotated[str, "Name of the function to modify"],
+            repo_path: Annotated[str, "Path to the repository (default: HART OS install dir)"] = "",
+        ) -> str:
+            """Create a code shard with call-chain context for a coding task.
+
+            Returns:
+            - Target function: FULL source (what you're modifying)
+            - Upstream callers: FULL source (who calls it, input contracts)
+            - Downstream callees: FULL source (what it calls, output contracts)
+            - Everything else: Interfaces only (signatures + types)
+
+            Call graph sourced from Trueflow MCP (when IDE running) or AST fallback.
+            Security: exposure proportional to the task. E2E encrypted for peer offload.
+            Use execute_coding_task with working_dir to actually apply edits.
+            """
+            from integrations.agent_engine.shard_engine import ShardEngine
+            import json
+            engine = ShardEngine(code_root=repo_path) if repo_path else ShardEngine()
+            shard = engine.create_call_chain_shard(
+                task=task, target_file=target_file,
+                target_function=target_function)
+            return json.dumps({
+                'shard_id': shard.shard_id,
+                'task': shard.task_description,
+                'scope': shard.scope.value,
+                'target_files': shard.target_files,
+                'call_chain_source': shard.full_content,
+                'interfaces': [{'file': s.file_path, 'functions': s.functions,
+                               'classes': s.classes} for s in shard.interface_specs],
+            }, indent=2, default=str)
+
+        helper.register_for_llm(
+            name="create_code_shard",
+            description="Create a code shard with call-chain context: target function + upstream callers + downstream callees (FULL source), everything else interfaces only."
+        )(create_code_shard)
+        assistant.register_for_execution(name="create_code_shard")(create_code_shard)
+        tool_logger.info("Registered shard engine tool (create_code_shard)")
+    except Exception:
+        tool_logger.debug("Shard engine tool not available")
+
+    # Benchmark Tracker: Query which coding tool performs best for each task type
+    try:
+        async def get_coding_benchmarks(
+            task_type: Annotated[str, "Task type to check (code_review, feature, bug_fix, refactor, app_build, debugging, multi_session, or 'all')"] = "all",
+        ) -> str:
+            """Get coding tool benchmarks — which tool (KiloCode, Claude Code, OpenCode, AiderNative) performs best.
+
+            Returns success rates, average times, and sample counts per tool per task type.
+            Includes both local benchmarks and hive-aggregated intelligence from peers.
+            """
+            from integrations.coding_agent.benchmark_tracker import get_benchmark_tracker
+            import json
+            tracker = get_benchmark_tracker()
+            result = {'local': {}, 'hive': {}}
+
+            if task_type == 'all':
+                delta = tracker.export_learning_delta()
+                result['local'] = delta.get('coding_benchmarks', {})
+            else:
+                best = tracker.get_best_tool(task_type)
+                if best:
+                    result['local'][task_type] = {
+                        'best_tool': best[0], 'success_rate': best[1],
+                        'avg_time_s': best[2],
+                    }
+                hive_best = tracker.get_hive_best_tool(task_type)
+                if hive_best:
+                    result['hive'][task_type] = {
+                        'best_tool': hive_best[0], 'success_rate': hive_best[1],
+                        'avg_time_s': hive_best[2],
+                    }
+            return json.dumps(result, indent=2, default=str)
+
+        helper.register_for_llm(
+            name="get_coding_benchmarks",
+            description="Query coding tool benchmarks — which tool performs best per task type. Includes local and hive-aggregated data."
+        )(get_coding_benchmarks)
+        assistant.register_for_execution(name="get_coding_benchmarks")(get_coding_benchmarks)
+        tool_logger.info("Registered get_coding_benchmarks tool")
+    except Exception:
+        tool_logger.debug("Benchmark tracker tool not available")
 
     # MCP Integration: Load and register user-provided MCP server tools
     try:
@@ -2294,7 +2394,7 @@ def instantiate_status_verifier_agent(user_prompt):
 
         """ + f"\nExtra Information: below are the list of actions the chat_manager will give you, keep this in mind but don't use this directly only use this if there is any update in any action or you want to insert/delete the actions & return the entire array as entire_actions\n{user_tasks[user_prompt].actions}",
 
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
     return verify
 
@@ -2342,7 +2442,7 @@ def instantiate_helper_agent():
             When receiving responses from tools that should return JSON, always use the validate_json_response tool to ensure valid JSON formatting before processing further. This helps prevent errors when parsing tool output.
         Data Management:
             Use the get_set_internal_memory tool to store or retrieve user information as needed.""",
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
     return helper
 
@@ -2459,7 +2559,7 @@ def instantiate_assistant_agent(list_of_persona, user_prompt, personality=None, 
 
         •Reminder: If camera input is needed, ask the user to turn on their camera. All responses should be played via TTS with a talking-head animation.
         """ + _personality_block + _expert_block + f"\nExtra Information: below are the list of actions the chat_manager is gonna give you keep this in mind but dont use this directly\n{user_tasks[user_prompt].actions}",
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
     return assistant
 
@@ -2472,7 +2572,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         name='time_agent',
         llm_config=llm_config,
         max_consecutive_auto_reply=10,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
         code_execution_config={"work_dir": "coding", "use_docker": False},
         system_message="You are an helpful AI assistant used to perform time based tasks given to you. "
         f"""You can refer below details to perform task:
@@ -2492,7 +2592,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         name=f"user_proxy_{user_id}",
         human_input_mode="NEVER",
         llm_config=False,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
         max_consecutive_auto_reply=0,
         code_execution_config=False,
     )
@@ -2517,7 +2617,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
 
             When writing code, always print the final response just before returning it.
         """,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
     executor1 = autogen.AssistantAgent(
         name="Executor",
@@ -2544,7 +2644,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             if you get any conversation which is not related to coding ask the manager to route this conversation to user
             When writing code, always print the final response just before returning it.
         ''',
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
     multi_role_agent1 = autogen.AssistantAgent(
         name="multi_role_agent",
@@ -2570,7 +2670,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             Report status only—do not perform actions yourself.
 
         """,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
 
     chat_instructor1 = autogen.UserProxyAgent(
@@ -2579,7 +2679,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         max_consecutive_auto_reply=10,
         default_auto_reply="TERMINATE",
         code_execution_config=False,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
 
     # --- Core tools for time_agent (reuse same definitions) ---

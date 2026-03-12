@@ -704,5 +704,318 @@ class TestBluetoothTimeout(unittest.TestCase):
         self.assertIn('Thread(target=_do_scan', source)
 
 
+# ═══════════════════════════════════════════════════════════════
+# Media Player (P1 Daily Driver)
+# ═══════════════════════════════════════════════════════════════
+
+class TestMediaPlayer(unittest.TestCase):
+    """Tests for media player control endpoints."""
+
+    @patch('integrations.agent_engine.shell_system_apis._run')
+    def test_player_status_nothing_playing(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=1)
+        client = _make_system_app()
+        r = client.get('/api/shell/media/player-status')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertFalse(data['playing'])
+
+    @patch('integrations.agent_engine.shell_system_apis._run')
+    def test_play_no_path(self, mock_run):
+        client = _make_system_app()
+        r = client.post('/api/shell/media/play',
+                        data=json.dumps({}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 400)
+
+    @patch('integrations.agent_engine.shell_system_apis._run')
+    def test_play_file_not_found(self, mock_run):
+        client = _make_system_app()
+        r = client.post('/api/shell/media/play',
+                        data=json.dumps({'path': '/nonexistent/file.mp3'}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 404)
+
+    @patch('integrations.agent_engine.shell_system_apis._run')
+    def test_stop_nothing_playing(self, mock_run):
+        client = _make_system_app()
+        r = client.post('/api/shell/media/stop',
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertFalse(data['stopped'])
+
+
+# ═══════════════════════════════════════════════════════════════
+# Battery / Power Monitoring (Feature 1)
+# ═══════════════════════════════════════════════════════════════
+
+class TestBatteryMonitor(unittest.TestCase):
+
+    def test_battery_status_endpoint(self):
+        client = _make_system_app()
+        r = client.get('/api/shell/battery')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertIn('present', data)
+        self.assertIn('status', data)
+        self.assertIn('health', data)
+
+    def test_battery_info_structure(self):
+        """_battery_info returns all expected fields."""
+        import inspect
+        from integrations.agent_engine.shell_system_apis import register_shell_system_routes
+        source = inspect.getsource(register_shell_system_routes)
+        self.assertIn('def _battery_info', source)
+        self.assertIn('capacity', source)
+        self.assertIn('voltage_v', source)
+        self.assertIn('power_w', source)
+        self.assertIn('temperature_c', source)
+
+    def test_battery_profile_endpoint(self):
+        client = _make_system_app()
+        r = client.get('/api/shell/battery/profile')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertIn('current_profile', data)
+        self.assertIn('available', data)
+
+    def test_battery_set_profile_no_body(self):
+        client = _make_system_app()
+        r = client.post('/api/shell/battery/profile',
+                        data=json.dumps({}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 400)
+
+
+# ═══════════════════════════════════════════════════════════════
+# WiFi Management (Feature 2)
+# ═══════════════════════════════════════════════════════════════
+
+class TestWiFiManagement(unittest.TestCase):
+
+    @patch('integrations.agent_engine.shell_system_apis._run')
+    def test_wifi_status(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout='enabled\n')
+        client = _make_system_app()
+        r = client.get('/api/shell/wifi/status')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertIn('enabled', data)
+        self.assertIn('connected', data)
+
+    @patch('integrations.agent_engine.shell_system_apis._run')
+    def test_wifi_networks(self, mock_run):
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout='HomeNet:85:WPA2:5 GHz\nCafe:42:WPA:2.4 GHz\n')
+        client = _make_system_app()
+        r = client.get('/api/shell/wifi/networks')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertIn('networks', data)
+        self.assertIn('count', data)
+
+    def test_wifi_connect_no_ssid(self):
+        client = _make_system_app()
+        r = client.post('/api/shell/wifi/connect',
+                        data=json.dumps({}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 400)
+
+    @patch('integrations.agent_engine.shell_system_apis._run')
+    def test_wifi_connect_success(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout='')
+        client = _make_system_app()
+        r = client.post('/api/shell/wifi/connect',
+                        data=json.dumps({'ssid': 'TestNet', 'password': 'pass123'}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertTrue(data['connected'])
+
+    def test_wifi_forget_no_ssid(self):
+        client = _make_system_app()
+        r = client.post('/api/shell/wifi/forget',
+                        data=json.dumps({}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 400)
+
+    @patch('integrations.agent_engine.shell_system_apis._run')
+    def test_wifi_saved(self, mock_run):
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout='HomeNet:802-11-wireless:yes\nWorkNet:802-11-wireless:no\n')
+        client = _make_system_app()
+        r = client.get('/api/shell/wifi/saved')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertIn('connections', data)
+
+    @patch('integrations.agent_engine.shell_system_apis._run')
+    def test_wifi_toggle(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout='')
+        client = _make_system_app()
+        r = client.post('/api/shell/wifi/toggle',
+                        data=json.dumps({'enable': False}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 200)
+
+
+# ═══════════════════════════════════════════════════════════════
+# VPN Client (Feature 3)
+# ═══════════════════════════════════════════════════════════════
+
+class TestVPNClient(unittest.TestCase):
+
+    @patch('integrations.agent_engine.shell_system_apis._run')
+    def test_vpn_list(self, mock_run):
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout='Work VPN:vpn:no\nHome WG:wireguard:yes\n')
+        client = _make_system_app()
+        r = client.get('/api/shell/vpn/list')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertIn('connections', data)
+
+    @patch('integrations.agent_engine.shell_system_apis._run')
+    def test_vpn_status(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout='')
+        client = _make_system_app()
+        r = client.get('/api/shell/vpn/status')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertIn('connected', data)
+
+    def test_vpn_connect_no_name(self):
+        client = _make_system_app()
+        r = client.post('/api/shell/vpn/connect',
+                        data=json.dumps({}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 400)
+
+    def test_vpn_disconnect_no_name(self):
+        client = _make_system_app()
+        r = client.post('/api/shell/vpn/disconnect',
+                        data=json.dumps({}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 400)
+
+    def test_vpn_import_no_config(self):
+        client = _make_system_app()
+        r = client.post('/api/shell/vpn/import',
+                        data=json.dumps({}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 400)
+
+    def test_vpn_import_file_not_found(self):
+        client = _make_system_app()
+        r = client.post('/api/shell/vpn/import',
+                        data=json.dumps({'config_path': '/nonexistent/vpn.ovpn'}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 404)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Trash / Recycle Bin (Feature 5)
+# ═══════════════════════════════════════════════════════════════
+
+class TestTrashBin(unittest.TestCase):
+
+    def test_trash_list_empty(self):
+        client = _make_system_app()
+        with patch('os.path.isdir', return_value=False):
+            r = client.get('/api/shell/trash')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(data['total_items'], 0)
+        self.assertIn('items', data)
+
+    def test_trash_move_no_path(self):
+        client = _make_system_app()
+        r = client.post('/api/shell/trash/move',
+                        data=json.dumps({}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 400)
+
+    def test_trash_move_not_found(self):
+        client = _make_system_app()
+        r = client.post('/api/shell/trash/move',
+                        data=json.dumps({'path': '/nonexistent/file.txt'}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 404)
+
+    def test_trash_restore_empty(self):
+        client = _make_system_app()
+        with patch('os.path.isdir', return_value=False):
+            r = client.post('/api/shell/trash/restore',
+                            data=json.dumps({'id': 'nonexistent'}),
+                            content_type='application/json')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(data['restored_count'], 0)
+
+    def test_trash_xdg_dir(self):
+        """_trash_dir follows XDG spec."""
+        import inspect
+        from integrations.agent_engine.shell_system_apis import register_shell_system_routes
+        source = inspect.getsource(register_shell_system_routes)
+        self.assertIn('.local/share/Trash', source)
+        self.assertIn('.trashinfo', source)
+
+    def test_trash_freedesktop_format(self):
+        """Trash info files follow freedesktop.org Trash specification."""
+        import inspect
+        from integrations.agent_engine.shell_system_apis import register_shell_system_routes
+        source = inspect.getsource(register_shell_system_routes)
+        self.assertIn('[Trash Info]', source)
+        self.assertIn('Path=', source)
+        self.assertIn('DeletionDate=', source)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Screen Rotation (P2 Competitive Parity)
+# ═══════════════════════════════════════════════════════════════
+
+class TestScreenRotation(unittest.TestCase):
+    """Tests for /api/shell/display/rotation and /api/shell/display/auto-rotate."""
+
+    @patch('integrations.agent_engine.shell_system_apis._run')
+    def test_get_rotation_swaymsg(self, mock_run):
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps([{'name': 'eDP-1', 'transform': 'normal', 'active': True}]))
+        client = _make_system_app()
+        r = client.get('/api/shell/display/rotation')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertIn('outputs', data)
+        self.assertEqual(len(data['outputs']), 1)
+
+    def test_set_rotation_no_output(self):
+        client = _make_system_app()
+        r = client.post('/api/shell/display/rotation',
+                        data=json.dumps({'transform': '90'}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 400)
+
+    def test_set_rotation_invalid_transform(self):
+        client = _make_system_app()
+        r = client.post('/api/shell/display/rotation',
+                        data=json.dumps({'output': 'eDP-1', 'transform': 'upside_down'}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 400)
+
+    @patch('integrations.agent_engine.shell_system_apis._run')
+    def test_auto_rotate_status(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0)
+        client = _make_system_app()
+        r = client.get('/api/shell/display/auto-rotate')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertIn('available', data)
+
+
 if __name__ == '__main__':
     unittest.main()

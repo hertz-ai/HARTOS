@@ -262,13 +262,19 @@ BACKENDS = {
 
 def get_available_backends() -> Dict[str, CodingToolBackend]:
     """Return instantiated backends for installed tools only."""
-    return {
-        name: cls()
-        for name, cls in BACKENDS.items()
-        if cls().is_installed()
-    }
+    result = {}
+    for name, cls in BACKENDS.items():
+        instance = cls()
+        if instance is not None and instance.is_installed():
+            result[name] = instance
+    return result
 
 
 def get_all_backends() -> Dict[str, CodingToolBackend]:
     """Return all backend instances regardless of installation."""
-    return {name: cls() for name, cls in BACKENDS.items()}
+    result = {}
+    for name, cls in BACKENDS.items():
+        instance = cls()
+        if instance is not None:
+            result[name] = instance
+    return result

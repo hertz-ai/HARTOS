@@ -93,13 +93,15 @@ class ContextEngine:
         try:
             variant_file = '/etc/hart/variant'
             if os.path.exists(variant_file):
-                context['variant'] = open(variant_file).read().strip()
+                with open(variant_file) as f:
+                    context['variant'] = f.read().strip()
         except Exception:
             pass
         try:
             tier_file = os.path.join(data_dir, 'capability_tier')
             if os.path.exists(tier_file):
-                context['tier'] = open(tier_file).read().strip()
+                with open(tier_file) as f:
+                    context['tier'] = f.read().strip()
         except Exception:
             pass
         import datetime

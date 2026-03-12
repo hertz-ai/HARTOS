@@ -53,7 +53,7 @@ class SpeculativeDispatcher:
         self._active: Dict[str, dict] = {}  # speculation_id → metadata
         self._lock = threading.Lock()
         self._results: Dict[str, dict] = {}  # speculation_id → expert result
-        self._results_deque: deque = deque(maxlen=1000)  # TTL cleanup
+        self._results_max = 1000  # evict oldest when exceeded
 
     # ─── Gate: should we speculate? ───
 
@@ -83,7 +83,8 @@ class SpeculativeDispatcher:
         if goal and goal.get('spark_budget', 0) > 0:
             spent = goal.get('spark_spent', 0)
             remaining = goal['spark_budget'] - spent
-            if remaining < expert.cost_per_1k_tokens:
+            # Estimate ~4k tokens per speculation (prompt + response)
+            if remaining < expert.cost_per_1k_tokens * 4:
                 return False
 
         return True
@@ -218,6 +219,7 @@ class SpeculativeDispatcher:
                             'latency_ms': round(elapsed_ms, 1),
                             'improved': True,
                         }
+                        self._evict_old_results()
                 else:
                     logger.warning(f"Expert response blocked by guardrail: {reason}")
             else:
@@ -228,6 +230,7 @@ class SpeculativeDispatcher:
                         'latency_ms': round(elapsed_ms, 1),
                         'improved': False,
                     }
+                    self._evict_old_results()
 
         except Exception as e:
             logger.debug(f"Expert background task failed for {speculation_id}: {e}")
@@ -344,6 +347,14 @@ class SpeculativeDispatcher:
                 db.close()
         except Exception as e:
             logger.debug(f"Compute contribution recording skipped: {e}")
+
+    def _evict_old_results(self):
+        """Evict oldest results when over capacity. Must be called under self._lock."""
+        if len(self._results) > self._results_max:
+            # Remove oldest entries (dict preserves insertion order in Python 3.7+)
+            excess = len(self._results) - self._results_max
+            for key in list(self._results.keys())[:excess]:
+                del self._results[key]
 
     # ─── Status / results ───
 

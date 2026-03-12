@@ -1162,5 +1162,481 @@ class TestShellOpenWith(unittest.TestCase):
         self.assertIn('error', data)
 
 
+# ═══════════════════════════════════════════════════════════════
+# App Store (Feature 6 - P0 OS Credibility)
+# ═══════════════════════════════════════════════════════════════
+
+class TestAppStore(unittest.TestCase):
+    """Tests for app search, install, uninstall endpoints."""
+
+    def test_search_no_query(self):
+        """Search without q parameter returns 400."""
+        client = _make_os_app()
+        r = client.get('/api/apps/search')
+        self.assertEqual(r.status_code, 400)
+        data = json.loads(r.data)
+        self.assertIn('error', data)
+
+    @patch('integrations.agent_engine.shell_os_apis.AppInstaller', create=True)
+    def test_search_with_query(self, _mock_cls):
+        """Search with query delegates to AppInstaller."""
+        client = _make_os_app()
+        with patch('integrations.agent_engine.app_installer.AppInstaller') as mock_ai:
+            mock_inst = MagicMock()
+            mock_inst.search.return_value = [{'name': 'firefox', 'platform': 'flatpak'}]
+            mock_ai.return_value = mock_inst
+            r = client.get('/api/apps/search?q=firefox')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(data['query'], 'firefox')
+        self.assertIn('results', data)
+        self.assertIn('count', data)
+
+    def test_search_empty_query(self):
+        """Empty string query returns 400."""
+        client = _make_os_app()
+        r = client.get('/api/apps/search?q=')
+        self.assertEqual(r.status_code, 400)
+
+    def test_installed_apps(self):
+        """Installed apps endpoint returns list."""
+        client = _make_os_app()
+        r = client.get('/api/apps/installed')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertIn('apps', data)
+        self.assertIn('count', data)
+        self.assertIsInstance(data['apps'], list)
+
+    @patch('integrations.agent_engine.shell_os_apis._require_shell_auth',
+           lambda f: f)
+    def test_install_no_source(self):
+        """Install without source returns 400."""
+        client = _make_os_app()
+        r = client.post('/api/apps/install',
+                        data=json.dumps({}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 400)
+        data = json.loads(r.data)
+        self.assertIn('error', data)
+
+    @patch('integrations.agent_engine.shell_os_apis._require_shell_auth',
+           lambda f: f)
+    def test_uninstall_no_app_id(self):
+        """Uninstall without app_id returns 400."""
+        client = _make_os_app()
+        r = client.post('/api/apps/uninstall',
+                        data=json.dumps({}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 400)
+        data = json.loads(r.data)
+        self.assertIn('error', data)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Cloud File Sync (P1 Daily Driver)
+# ═══════════════════════════════════════════════════════════════
+
+class TestCloudSync(unittest.TestCase):
+    """Tests for cloud file sync (rclone wrapper) endpoints."""
+
+    @patch('integrations.agent_engine.shell_os_apis.subprocess.run',
+           side_effect=FileNotFoundError)
+    def test_remotes_rclone_not_installed(self, mock_run):
+        """When rclone not installed, returns empty list."""
+        client = _make_os_app()
+        r = client.get('/api/shell/cloud-sync/remotes')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(data['remotes'], [])
+        self.assertFalse(data['rclone_available'])
+
+    @patch('integrations.agent_engine.shell_os_apis.subprocess.run')
+    def test_remotes_with_rclone(self, mock_run):
+        """rclone listremotes returns configured remotes."""
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout='gdrive:\ns3bucket:\n')
+        client = _make_os_app()
+        r = client.get('/api/shell/cloud-sync/remotes')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(len(data['remotes']), 2)
+        names = [rem['name'] for rem in data['remotes']]
+        self.assertIn('gdrive', names)
+
+    def test_pairs_empty(self):
+        """No pairs configured returns empty list."""
+        client = _make_os_app()
+        r = client.get('/api/shell/cloud-sync/pairs')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertIsInstance(data['pairs'], list)
+
+    def test_add_pair_missing_fields(self):
+        """Adding pair without required fields returns 400."""
+        client = _make_os_app()
+        r = client.post('/api/shell/cloud-sync/pairs',
+                        data=json.dumps({'local_path': '/home/user/docs'}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 400)
+
+    @patch('integrations.agent_engine.shell_os_apis.subprocess.run')
+    def test_sync_status(self, mock_run):
+        """Sync status shows rclone availability."""
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout='rclone v1.65.0\n')
+        client = _make_os_app()
+        r = client.get('/api/shell/cloud-sync/status')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertTrue(data['rclone_installed'])
+        self.assertIn('rclone v', data['rclone_version'])
+
+    def test_run_no_pairs(self):
+        """Running sync with no pairs returns 400."""
+        # Use a temp dir so no pre-existing config is loaded
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {'HOME': tmpdir, 'USERPROFILE': tmpdir}):
+                from flask import Flask
+                app2 = Flask(__name__)
+                app2.config['TESTING'] = True
+                from integrations.agent_engine.shell_os_apis import register_shell_os_routes
+                register_shell_os_routes(app2)
+                client = app2.test_client()
+                r = client.post('/api/shell/cloud-sync/run',
+                                data=json.dumps({}),
+                                content_type='application/json')
+        self.assertEqual(r.status_code, 400)
+
+
+# ═══════════════════════════════════════════════════════════════
+# App Permissions (Feature 7 - P0 OS Credibility)
+# ═══════════════════════════════════════════════════════════════
+
+class TestAppPermissions(unittest.TestCase):
+    """Tests for app permission management endpoints."""
+
+    def test_get_permissions_unknown_app(self):
+        """Get permissions for unknown app returns empty list."""
+        client = _make_os_app()
+        with patch('integrations.agent_engine.shell_os_apis.open',
+                   side_effect=FileNotFoundError):
+            r = client.get('/api/apps/unknown_app_xyz/permissions')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(data['app_id'], 'unknown_app_xyz')
+        self.assertIsInstance(data['permissions'], list)
+
+    def test_set_permission(self):
+        """Set permission for an app stores it correctly."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            perm_file = os.path.join(tmpdir, 'app-permissions.json')
+            # Patch the module-level _PERMISSIONS_FILE used inside closures
+            from flask import Flask
+            app = Flask(__name__)
+            app.config['TESTING'] = True
+            import integrations.agent_engine.shell_os_apis as mod
+            # Store original and override
+            orig = getattr(mod, '_PERMISSIONS_FILE', None)
+            # The _PERMISSIONS_FILE is set inside register, we need to patch
+            # before routes register. Use a fresh app.
+            with patch.dict(os.environ, {'HOME': tmpdir, 'USERPROFILE': tmpdir}):
+                app2 = Flask(__name__)
+                app2.config['TESTING'] = True
+                from integrations.agent_engine.shell_os_apis import register_shell_os_routes
+                register_shell_os_routes(app2)
+                client = app2.test_client()
+                r = client.post(
+                    '/api/apps/test_app/permission/camera',
+                    data=json.dumps({'granted': False}),
+                    content_type='application/json')
+            self.assertEqual(r.status_code, 200)
+            data = json.loads(r.data)
+            self.assertTrue(data['updated'])
+            self.assertEqual(data['type'], 'camera')
+            self.assertFalse(data['granted'])
+
+    def test_reset_permissions(self):
+        """Reset removes all stored permissions for an app."""
+        from flask import Flask
+        with tempfile.TemporaryDirectory() as tmpdir:
+            perm_file = os.path.join(tmpdir, '.config', 'hart', 'app-permissions.json')
+            os.makedirs(os.path.dirname(perm_file), exist_ok=True)
+            with open(perm_file, 'w') as f:
+                json.dump({'test_app': {'camera': {'granted': False}}}, f)
+            with patch.dict(os.environ, {'HOME': tmpdir, 'USERPROFILE': tmpdir}):
+                app2 = Flask(__name__)
+                app2.config['TESTING'] = True
+                from integrations.agent_engine.shell_os_apis import register_shell_os_routes
+                register_shell_os_routes(app2)
+                client = app2.test_client()
+                r = client.post('/api/apps/test_app/permissions/reset')
+            self.assertEqual(r.status_code, 200)
+            data = json.loads(r.data)
+            self.assertTrue(data['reset'])
+            self.assertEqual(data['app_id'], 'test_app')
+
+    def test_permissions_response_shape(self):
+        """Permission entries have type, granted, requested fields."""
+        client = _make_os_app()
+        # Create mock permissions file content
+        mock_data = json.dumps({'some_app': {'camera': {'granted': False, 'updated': 1}}})
+        m = MagicMock()
+        m.__enter__ = MagicMock(return_value=MagicMock(
+            read=MagicMock(return_value=mock_data)))
+        m.__exit__ = MagicMock(return_value=False)
+        with patch('builtins.open', return_value=m):
+            with patch('json.load', return_value={'some_app': {'camera': {'granted': False}}}):
+                r = client.get('/api/apps/some_app/permissions')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        if data['permissions']:
+            perm = data['permissions'][0]
+            self.assertIn('type', perm)
+            self.assertIn('granted', perm)
+
+
+# ═══════════════════════════════════════════════════════════════
+# File Tagging (P2 Competitive Parity)
+# ═══════════════════════════════════════════════════════════════
+
+class TestFileTagging(unittest.TestCase):
+    """Tests for /api/shell/files/tags and /api/shell/files/search-by-tag."""
+
+    def test_get_tags_no_path(self):
+        client = _make_os_app()
+        r = client.get('/api/shell/files/tags')
+        self.assertEqual(r.status_code, 400)
+
+    def test_get_tags_nonexistent_path(self):
+        client = _make_os_app()
+        r = client.get('/api/shell/files/tags?path=/nonexistent/file')
+        self.assertEqual(r.status_code, 400)
+
+    def test_set_tags_no_path(self):
+        client = _make_os_app()
+        r = client.post('/api/shell/files/tags',
+                        data=json.dumps({'tags': ['work']}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 400)
+
+    def test_set_tags_invalid_type(self):
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            tmppath = f.name
+        try:
+            client = _make_os_app()
+            r = client.post('/api/shell/files/tags',
+                            data=json.dumps({'path': tmppath, 'tags': 'not_a_list'}),
+                            content_type='application/json')
+            self.assertEqual(r.status_code, 400)
+        finally:
+            os.unlink(tmppath)
+
+    def test_search_by_tag_no_tag(self):
+        client = _make_os_app()
+        r = client.get('/api/shell/files/search-by-tag')
+        self.assertEqual(r.status_code, 400)
+
+    def test_search_by_tag_outside_home(self):
+        client = _make_os_app()
+        r = client.get('/api/shell/files/search-by-tag?tag=x&dir=/etc')
+        self.assertEqual(r.status_code, 403)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Hotspot (P2 Competitive Parity)
+# ═══════════════════════════════════════════════════════════════
+
+class TestHotspot(unittest.TestCase):
+    """Tests for /api/shell/hotspot/*."""
+
+    @patch('integrations.agent_engine.shell_os_apis.subprocess.run')
+    def test_hotspot_status(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout='')
+        client = _make_os_app()
+        r = client.get('/api/shell/hotspot/status')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertIn('active', data)
+
+    @patch('integrations.agent_engine.shell_os_apis.subprocess.run')
+    def test_hotspot_start(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout='success')
+        client = _make_os_app()
+        r = client.post('/api/shell/hotspot/start',
+                        data=json.dumps({'ssid': 'TestHotspot'}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 200)
+
+    @patch('integrations.agent_engine.shell_os_apis.subprocess.run')
+    def test_hotspot_stop(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0)
+        client = _make_os_app()
+        r = client.post('/api/shell/hotspot/stop')
+        self.assertEqual(r.status_code, 200)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Weather (P2 Competitive Parity)
+# ═══════════════════════════════════════════════════════════════
+
+class TestWeather(unittest.TestCase):
+    """Tests for /api/shell/weather."""
+
+    @patch('urllib.request.urlopen')
+    def test_weather_success(self, mock_urlopen):
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = json.dumps({
+            'current_condition': [{
+                'temp_C': '22', 'temp_F': '72', 'humidity': '50',
+                'FeelsLikeC': '21', 'windspeedKmph': '10',
+                'winddir16Point': 'N', 'uvIndex': '3', 'visibility': '10',
+                'weatherDesc': [{'value': 'Sunny'}],
+            }]
+        }).encode('utf-8')
+        mock_urlopen.return_value = mock_resp
+        client = _make_os_app()
+        r = client.get('/api/shell/weather?location=London')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(data['temp_c'], '22')
+        self.assertEqual(data['description'], 'Sunny')
+
+    @patch('urllib.request.urlopen', side_effect=Exception('network error'))
+    def test_weather_unavailable(self, mock_urlopen):
+        client = _make_os_app()
+        r = client.get('/api/shell/weather')
+        self.assertEqual(r.status_code, 503)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Auto Update (P2 Competitive Parity)
+# ═══════════════════════════════════════════════════════════════
+
+class TestAutoUpdate(unittest.TestCase):
+    """Tests for /api/shell/auto-update/*."""
+
+    @patch('integrations.agent_engine.shell_os_apis.subprocess.run')
+    def test_auto_update_status(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=1, stdout='inactive')
+        client = _make_os_app()
+        r = client.get('/api/shell/auto-update/status')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertIn('flatpak_auto_update', data)
+        self.assertIn('nixos_auto_upgrade', data)
+
+    @patch('integrations.agent_engine.shell_os_apis.subprocess.run')
+    def test_auto_update_run(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout='Updated')
+        client = _make_os_app()
+        r = client.post('/api/shell/auto-update/run',
+                        data=json.dumps({'target': 'flatpak'}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 200)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Secure DNS (P2 Competitive Parity)
+# ═══════════════════════════════════════════════════════════════
+
+class TestSecureDNS(unittest.TestCase):
+    """Tests for /api/shell/dns/*."""
+
+    @patch('integrations.agent_engine.shell_os_apis.subprocess.run')
+    def test_dns_status(self, mock_run):
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout='DNS Servers: 1.1.1.1\nDNS over TLS: yes\n')
+        client = _make_os_app()
+        r = client.get('/api/shell/dns/status')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertIn('servers', data)
+
+    @patch('integrations.agent_engine.shell_os_apis.subprocess.run')
+    def test_dns_set_cloudflare(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0)
+        client = _make_os_app()
+        r = client.post('/api/shell/dns/set',
+                        data=json.dumps({'provider': 'cloudflare', 'dot': True}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertTrue(data['set'])
+        self.assertEqual(data['provider'], 'cloudflare')
+
+    def test_dns_set_unknown_provider(self):
+        client = _make_os_app()
+        r = client.post('/api/shell/dns/set',
+                        data=json.dumps({'provider': 'unknown'}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 400)
+
+
+# ═══════════════════════════════════════════════════════════════
+# SSO / Enterprise Login (P2 Competitive Parity)
+# ═══════════════════════════════════════════════════════════════
+
+class TestSSO(unittest.TestCase):
+    """Tests for /api/shell/sso/*."""
+
+    @patch('integrations.agent_engine.shell_os_apis.subprocess.run')
+    def test_sso_status(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=1, stdout='inactive')
+        client = _make_os_app()
+        r = client.get('/api/shell/sso/status')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertIn('sssd_active', data)
+
+    def test_sso_join_missing_domain(self):
+        client = _make_os_app()
+        r = client.post('/api/shell/sso/join',
+                        data=json.dumps({'username': 'admin'}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 400)
+
+    def test_sso_leave_missing_domain(self):
+        client = _make_os_app()
+        r = client.post('/api/shell/sso/leave',
+                        data=json.dumps({}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 400)
+
+    def test_sso_test_missing_uri(self):
+        client = _make_os_app()
+        r = client.post('/api/shell/sso/test',
+                        data=json.dumps({}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 400)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Email Launcher (P2 Competitive Parity)
+# ═══════════════════════════════════════════════════════════════
+
+class TestEmailLauncher(unittest.TestCase):
+    """Tests for /api/shell/email/*."""
+
+    @patch('integrations.agent_engine.shell_os_apis.subprocess.run')
+    def test_email_status(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=1)
+        client = _make_os_app()
+        r = client.get('/api/shell/email/status')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertIn('installed', data)
+        self.assertEqual(data['client'], 'thunderbird')
+
+    @patch('integrations.agent_engine.shell_os_apis.subprocess.Popen',
+           side_effect=FileNotFoundError)
+    def test_email_launch_not_installed(self, mock_popen):
+        client = _make_os_app()
+        r = client.post('/api/shell/email/launch')
+        self.assertEqual(r.status_code, 404)
+
+
 if __name__ == '__main__':
     unittest.main()
