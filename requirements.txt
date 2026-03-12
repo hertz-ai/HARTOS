@@ -27,7 +27,7 @@ distro==1.8.0
 duckdb==0.8.1
 exceptiongroup==1.1.1
 faiss-cpu==1.7.4
-fastapi==0.98.0
+fastapi>=0.100.0
 filelock==3.12.2
 Flask==2.3.2
 flatbuffers==23.5.26
@@ -65,13 +65,12 @@ Jinja2==3.1.2
 joblib==1.2.0
 jsonpatch==1.33
 jsonpointer==2.4
-langchain==0.0.230
-langchain-anthropic==0.1.13
-langchain-core==0.1.44
-langchain-google-genai==0.1.0
-langchain-groq==0.1.2
-langchainplus-sdk==0.0.20
-langsmith==0.1.49
+langchain-classic==1.0.1
+langchain-anthropic>=1.0.0
+langchain-core>=1.2.0,<2.0.0
+langchain-google-genai>=1.0.0
+langchain-groq>=1.0.0
+langsmith>=0.1.49
 lit==16.0.6
 lz4==4.3.2
 MarkupSafe==2.1.3
@@ -89,8 +88,8 @@ nltk==3.8.1
 numexpr==2.8.4
 numpy==1.25.2
 onnxruntime==1.16.3
-openai==0.27.8
-openapi-schema-pydantic==1.2.4
+openai>=1.0.0
+# openapi-schema-pydantic==1.2.4  # pydantic v1 only, not used
 opencv-python
 orjson==3.10.1
 overrides==7.3.1
@@ -105,7 +104,7 @@ pyarrow==14.0.1
 pyarrow-hotfix==0.6
 pyasn1==0.5.0
 pyasn1-modules==0.3.0
-pydantic==1.10.9
+pydantic>=2.0.0
 PyJWT==2.7.0
 pyparsing==3.1.0
 pypdf==3.17.1
@@ -130,7 +129,7 @@ six==1.16.0
 sniffio==1.3.0
 soupsieve==2.5
 SQLAlchemy==2.0.16
-starlette==0.27.0
+starlette>=0.27.0
 sympy==1.12
 tenacity==8.2.2
 threadpoolctl==3.1.0

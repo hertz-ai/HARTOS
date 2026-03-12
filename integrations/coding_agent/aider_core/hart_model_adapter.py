@@ -107,14 +107,14 @@ def send_completion(
         if config.get('api_key'):
             client_kwargs['api_key'] = config['api_key']
         if config.get('api_base'):
-            client_kwargs['api_base'] = config['api_base']
+            client_kwargs['base_url'] = config['api_base']
 
-        response = openai.ChatCompletion.create(
+        client = openai.OpenAI(**client_kwargs)
+        response = client.chat.completions.create(
             model=model,
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
-            **client_kwargs,
         )
 
         result_text = response.choices[0].message.content
@@ -122,12 +122,12 @@ def send_completion(
         # Record metered usage if budget gate available
         try:
             from integrations.agent_engine.budget_gate import record_metered_usage
-            usage = response.get('usage', {})
+            usage = response.usage
             record_metered_usage(
                 user_id=user_id or 'coding_agent',
                 model=model,
-                prompt_tokens=usage.get('prompt_tokens', 0),
-                completion_tokens=usage.get('completion_tokens', 0),
+                prompt_tokens=usage.prompt_tokens if usage else 0,
+                completion_tokens=usage.completion_tokens if usage else 0,
                 source='aider_native',
             )
         except ImportError:
