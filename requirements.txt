@@ -154,7 +154,7 @@ xxhash==3.4.1
 yarl==1.9.2
 
 zipp==3.15.0
-zstandard==0.21.0
+zstandard>=0.23.0
 #streamlit~=1.19.0
 
 # Agent Lightning - Custom implementation in integrations/agent_lightning/
