@@ -351,16 +351,6 @@ class TestSyncEngineBasics:
 class TestRuntimeIntegrityMonitorHeartbeat:
     """Runtime monitor heartbeat during tamper checks."""
 
-    def test_monitor_skips_when_disabled(self):
-        """Monitor should skip entirely when HEVOLVE_TAMPER_CHECK_SKIP=true."""
-        from security.runtime_monitor import RuntimeIntegrityMonitor
-        m = RuntimeIntegrityMonitor.__new__(RuntimeIntegrityMonitor)
-        m._running = True
-        with patch.dict(os.environ, {'HEVOLVE_TAMPER_CHECK_SKIP': 'true'}):
-            # _check_loop should return immediately
-            m._check_loop()
-        # If it returned, the test passes (didn't hang)
-
     def test_monitor_has_check_loop(self):
         from security.runtime_monitor import RuntimeIntegrityMonitor
         assert hasattr(RuntimeIntegrityMonitor, '_check_loop')

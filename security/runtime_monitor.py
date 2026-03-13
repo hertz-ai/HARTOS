@@ -68,14 +68,7 @@ class RuntimeIntegrityMonitor:
             pass
 
     def _check_loop(self) -> None:
-        """Background loop: periodic code hash + guardrail hash verification.
-
-        Skipped entirely when HEVOLVE_TAMPER_CHECK_SKIP=true (read-only FS,
-        embedded devices where code can't change at runtime).
-        """
-        if os.environ.get('HEVOLVE_TAMPER_CHECK_SKIP', '').lower() == 'true':
-            logger.info("Runtime monitor: tamper checks disabled (HEVOLVE_TAMPER_CHECK_SKIP)")
-            return
+        """Background loop: periodic code hash + guardrail hash verification."""
         while self._running:
             time.sleep(self._check_interval)
             if not self._running:

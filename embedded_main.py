@@ -10,7 +10,6 @@ Usage:
 Environment variables:
     HEVOLVE_HEADLESS=true           Required. Enables headless mode.
     HEVOLVE_CODE_HASH_PRECOMPUTED   Skip code hash computation (ROM/SD card).
-    HEVOLVE_TAMPER_CHECK_SKIP=true  Skip periodic tamper checks (read-only FS).
     HEVOLVE_FORCE_TIER=embedded     Force embedded tier (optional, auto-detected).
     HEVOLVE_GOSSIP_BANDWIDTH        Override gossip bandwidth profile (minimal/constrained/full).
     HEVOLVE_MQTT_BROKER             MQTT broker for sensor bridge (optional).
