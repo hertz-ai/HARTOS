@@ -55,7 +55,7 @@ in
 
     systemd.services.hart-usbipd = lib.mkIf config.hart.peripheralBridge.usbip.enable {
       description = "HART USB/IP Daemon";
-      documentation = [ "https://github.com/hevolve-ai/hart" ];
+      documentation = [ "https://github.com/hertz-ai/HARTOS" ];
       after = [ "network.target" ];
       partOf = [ "hart.target" ];
       wantedBy = [ "hart.target" ];

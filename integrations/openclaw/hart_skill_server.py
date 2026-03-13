@@ -179,7 +179,7 @@ def generate_hart_skills() -> List[str]:
 name: {tool_name}
 description: {tool_def['description']}
 version: 1.0.0
-homepage: https://github.com/hevolve/hartos
+homepage: https://github.com/hertz-ai/HARTOS
 metadata: {{"openclaw": {{"emoji": "\\U0001f916", "requires": {{"env": ["HART_BACKEND_URL"]}}}}}}
 ---
 

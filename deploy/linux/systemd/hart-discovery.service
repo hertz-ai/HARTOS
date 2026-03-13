@@ -1,6 +1,6 @@
 [Unit]
 Description=HART OS Peer Discovery (UDP Beacon)
-Documentation=https://github.com/hevolve-ai/hart
+Documentation=https://github.com/hertz-ai/HARTOS
 After=hart-backend.service
 BindsTo=hart-backend.service
 

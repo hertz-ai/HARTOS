@@ -13,7 +13,7 @@ in
 
     systemd.services.hart-backend = {
       description = "HART OS Backend (Flask/Waitress)";
-      documentation = [ "https://github.com/hevolve-ai/hart" ];
+      documentation = [ "https://github.com/hertz-ai/HARTOS" ];
       after = [ "network-online.target" "hart-first-boot.service" ];
       wants = [ "network-online.target" ];
       partOf = [ "hart.target" ];

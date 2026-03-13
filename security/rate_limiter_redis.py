@@ -49,6 +49,18 @@ class RedisRateLimiter:
         'tts_speak': (20, 60),              # 20 TTS speak requests per 60 seconds
         'tts_clone': (5, 3600),             # 5 voice clones per hour
         'civic_sentinel': (20, 60),      # 20 civic sentinel ops per 60 seconds
+        'p2p_rideshare': (30, 60),       # 30 ride ops per 60 seconds
+        'p2p_marketplace': (30, 60),     # 30 marketplace ops per 60 seconds
+        'p2p_grocery': (20, 60),         # 20 grocery ops per 60 seconds
+        'p2p_food': (20, 60),            # 20 food delivery ops per 60 seconds
+        'p2p_bills': (15, 60),           # 15 bill payments per 60 seconds
+        'p2p_tickets': (15, 60),         # 15 ticket bookings per 60 seconds
+        'p2p_freelance': (20, 60),       # 20 freelance ops per 60 seconds
+        'p2p_tutoring': (20, 60),        # 20 tutoring ops per 60 seconds
+        'p2p_services': (20, 60),        # 20 service ops per 60 seconds
+        'p2p_rental': (20, 60),          # 20 rental ops per 60 seconds
+        'p2p_health': (15, 60),          # 15 health ops per 60 seconds
+        'p2p_logistics': (20, 60),       # 20 logistics ops per 60 seconds
         'autoresearch': (5, 3600),       # 5 autoresearch sessions per hour
         'wifi': (30, 60),                # 30 wifi operations per 60 seconds
         'vpn': (20, 60),                 # 20 vpn operations per 60 seconds

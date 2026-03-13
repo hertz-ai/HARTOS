@@ -72,7 +72,7 @@ in
 
     flakeRef = lib.mkOption {
       type = lib.types.str;
-      default = "github:hevolve-ai/hart";
+      default = "github:hertz-ai/HARTOS";
       description = "Nix flake reference for pulling updates";
     };
 

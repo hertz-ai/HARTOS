@@ -110,8 +110,8 @@ in
         ID=hart-os
         ID_LIKE=nixos
         HOME_URL="https://hevolve.ai"
-        SUPPORT_URL="https://github.com/hevolve-ai/hart/issues"
-        BUG_REPORT_URL="https://github.com/hevolve-ai/hart/issues"
+        SUPPORT_URL="https://github.com/hertz-ai/HARTOS/issues"
+        BUG_REPORT_URL="https://github.com/hertz-ai/HARTOS/issues"
         PRIVACY_POLICY_URL="https://hevolve.ai/privacy"
       '';
 

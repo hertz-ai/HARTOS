@@ -33,7 +33,7 @@ VERSION_FILE = os.path.join(INSTALL_DIR, 'VERSION')
 UPDATE_CHECK_FILE = os.path.join(DATA_DIR, '.last-update-check')
 
 # Configurable update URL — reads from env file, falls back to default
-DEFAULT_UPDATE_URL = 'https://api.github.com/repos/hevolve-ai/hart/releases/latest'
+DEFAULT_UPDATE_URL = 'https://api.github.com/repos/hertz-ai/HARTOS/releases/latest'
 UPDATE_URL = os.environ.get('HART_UPDATE_URL', '')
 if not UPDATE_URL:
     try:

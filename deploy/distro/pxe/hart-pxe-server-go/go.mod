@@ -1,3 +1,3 @@
-module github.com/hevolve/hart-pxe-server
+module github.com/hertz-ai/hart-pxe-server
 
 go 1.21
