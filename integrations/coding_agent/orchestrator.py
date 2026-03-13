@@ -94,6 +94,20 @@ class CodingAgentOrchestrator:
             user_id=user_id,
         )
 
+        # Capture successful edits as recipe steps for REUSE mode
+        if result.get('success') and result.get('edits'):
+            try:
+                from .recipe_bridge import CodingRecipeBridge
+                bridge = CodingRecipeBridge()
+                bridge.capture_edit_as_recipe_step(
+                    task=task,
+                    tool_name=result.get('tool', backend.name),
+                    file_edits=result['edits'],
+                    working_dir=working_dir,
+                )
+            except Exception as e:
+                logger.debug(f"Recipe capture: {e}")
+
         return result
 
     def _can_run_locally(self) -> bool:

@@ -36,8 +36,8 @@ fsspec==2023.6.0
 future==1.0.0
 grpcio>=1.57.0,<2
 grpcio-status>=1.57.0,<2
-google-auth>=2.49.0,<3
-google-api-core>=2.28.0,<3
+google-auth==2.49.0
+google-api-core==2.28.0
 google-api-python-client==2.190.0
 google-auth-httplib2>=0.1.0
 google-cloud-core>=2.3.3
@@ -152,7 +152,7 @@ uvicorn==0.22.0
 uvloop==0.17.0 ; sys_platform != "win32"
 waitress==2.1.2
 watchfiles==0.19.0
-websockets>=14.2,<17
+websockets==14.2
 Werkzeug==2.3.6
 xxhash==3.4.1
 yarl==1.9.2
@@ -160,13 +160,13 @@ yarl==1.9.2
 zipp==3.15.0
 zstandard>=0.23.0
 
-# Transitive deps pinned to prevent pip resolution-too-deep in Docker
-jiter>=0.4.0,<1
-httpx-sse>=0.4.0,<1
-grpc-google-iam-v1>=0.14.0,<1
-uuid-utils>=0.9.0,<1
-anthropic>=0.83.0,<1
-docstring-parser>=0.16,<1
+# Transitive deps — exact pins to prevent pip resolution-too-deep in Docker
+jiter==0.9.0
+httpx-sse==0.4.0
+grpc-google-iam-v1==0.14.2
+uuid-utils==0.14.0
+anthropic==0.83.0
+docstring-parser==0.16
 #streamlit~=1.19.0
 
 # Agent Lightning - Custom implementation in integrations/agent_lightning/
