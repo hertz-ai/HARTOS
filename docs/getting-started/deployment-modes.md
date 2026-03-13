@@ -109,9 +109,13 @@ ENABLE_FEDERATION=true
 
 The central node is the authoritative coordinator for the network. It runs with hardened security defaults and serves as the trust anchor for the certificate chain.
 
+**Why central exists:** The master key is a kill switch for a distributed intelligence. Any steward holding the master private key can spin up a central instance capable of halting the entire hive -- via `HiveCircuitBreaker` -- in the event the AI goes rogue or something destructive is happening. This is the "humans always in control" guarantee. The kill command propagates to every node in the network. No AI can access the master key -- this is structurally enforced, not just policy.
+
+Multiple stewards can hold copies of the same master private key. There is one master keypair per hive (public key hardcoded in `security/master_key.py`). Any steward can act as the emergency brake.
+
 **Central-only resources:**
 
-- **Master key** (`/etc/hevolve/master_private_key.hex`) -- Ed25519 signing key for releases, certificates, and kill switch. Never in repo, never accessible to AI.
+- **Master key** (`/etc/hevolve/master_private_key.hex`) -- Ed25519 signing key for releases, certificates, and kill switch. Never in repo, never accessible to AI. Multiple stewards can hold copies.
 - **Release manifest** (`release_manifest.json`) -- Signed file hash manifest from CI/CD. Boot integrity verification checks installed code against this.
 - **Cloud database** (`HEVOLVE_DB_URL`) -- MySQL for persistent state across restarts.
 
@@ -221,6 +225,7 @@ Development / Testing          -->  Flat (default)
 Production single-user         -->  Flat or Nunba bundled
 Join an existing hive          -->  Regional (get HART_NODE_KEY from the hive's central admin)
 Run your own hive              -->  Central (you become the trust anchor, regionals join you)
+Emergency halt (steward)       -->  Central with master key (kill switch for the entire hive)
 End-user distribution          -->  Nunba bundled
 ```
 
