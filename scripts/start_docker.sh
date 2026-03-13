@@ -238,6 +238,12 @@ do_run() {
     # ── Auto-detect CORS for hevolve.ai production ──
     _configure_cors
 
+    # ── Enable daemons on central/regional (flywheel requires them) ──
+    if [ "${TIER}" = "central" ] || [ "${TIER}" = "regional" ]; then
+        RUN_ARGS="${RUN_ARGS} -e HEVOLVE_AGENT_ENGINE_ENABLED=true"
+        RUN_ARGS="${RUN_ARGS} -e HEVOLVE_CODING_AGENT_ENABLED=true"
+    fi
+
     # ── Central-only: master key + signed manifest ──
     if [ "${TIER}" = "central" ]; then
         RUN_ARGS="${RUN_ARGS} -e HEVOLVE_ENFORCEMENT_MODE=hard"

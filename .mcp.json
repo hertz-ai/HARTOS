@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "hartos": {
+      "command": "python",
+      "args": ["-m", "integrations.mcp.mcp_server"],
+      "type": "stdio"
+    }
+  }
+}

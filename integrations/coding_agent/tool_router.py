@@ -18,15 +18,17 @@ logger = logging.getLogger('hevolve.coding_agent')
 # aider_native preferred for tasks where in-process code intelligence excels.
 # Falls through to subprocess backends if aider_native isn't available.
 HEURISTIC_DEFAULTS = {
-    'code_review': 'aider_native',
-    'debugging': 'aider_native',
+    'code_review': 'claude_code',
+    'debugging': 'claude_code',
+    'complex_reasoning': 'claude_code',
+    'terminal_workflows': 'claude_code',
     'app_build': 'kilocode',
     'feature': 'kilocode',
     'refactor': 'aider_native',
     'bug_fix': 'aider_native',
     'multi_session': 'opencode',
     'multi_file_edit': 'aider_native',
-    'architecture': 'aider_native',
+    'architecture': 'claude_code',
 }
 
 
