@@ -214,15 +214,14 @@ python langchain_gpt_api.py
 
 ---
 
-## Choosing a Mode
+## Choosing a Tier
 
 ```
 Development / Testing          -->  Flat (default)
 Production single-user         -->  Flat or Nunba bundled
-Community node (join hive)     -->  Regional
-Production multi-node cluster  -->  Regional + Central
+Join an existing hive          -->  Regional (get HART_NODE_KEY from the hive's central admin)
+Run your own hive              -->  Central (you become the trust anchor, regionals join you)
 End-user distribution          -->  Nunba bundled
-Network coordinator            -->  Central (one per network)
 ```
 
 ---
