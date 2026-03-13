@@ -553,17 +553,6 @@ class TestCrawlIntegrityWatcher:
         assert watcher.is_healthy is True
         assert len(fired) == 0
 
-    def test_skip_env_var_disables_loop(self):
-        """HEVOLVE_TAMPER_CHECK_SKIP=true causes _check_loop to exit."""
-        from security.source_protection import CrawlIntegrityWatcher
-        with patch('security.source_protection.compute_dependency_hash',
-                   return_value='hash123'):
-            watcher = CrawlIntegrityWatcher(check_interval=1)
-        with patch.dict(os.environ, {'HEVOLVE_TAMPER_CHECK_SKIP': 'true'}):
-            watcher._running = True
-            watcher._check_loop()  # Should return immediately
-        assert watcher.is_healthy is True
-
     def test_hevolveai_not_installed_no_false_tamper(self):
         """Empty hash from missing HevolveAI doesn't trigger false tamper."""
         from security.source_protection import CrawlIntegrityWatcher

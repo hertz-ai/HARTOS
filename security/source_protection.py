@@ -287,7 +287,6 @@ class CrawlIntegrityWatcher:
 
     Env vars:
         HEVOLVE_TAMPER_CHECK_INTERVAL  — seconds between checks (default 300)
-        HEVOLVE_TAMPER_CHECK_SKIP      — set 'true' to disable (read-only FS)
     """
 
     def __init__(self, check_interval: int = None):
@@ -344,12 +343,6 @@ class CrawlIntegrityWatcher:
 
     def _check_loop(self) -> None:
         """Background loop: re-hash HevolveAI every interval."""
-        if os.environ.get('HEVOLVE_TAMPER_CHECK_SKIP', '').lower() == 'true':
-            logger.info(
-                "[CrawlIntegrityWatcher] Checks disabled "
-                "(HEVOLVE_TAMPER_CHECK_SKIP)")
-            return
-
         while self._running:
             time.sleep(self._check_interval)
             if not self._running:
