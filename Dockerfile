@@ -19,6 +19,8 @@ RUN pip install --upgrade pip
 #    Installing these first pins all their transitive deps, so the main install
 #    doesn't backtrack through thousands of version combinations.
 RUN pip install --no-cache-dir \
+        "grpcio==1.57.0" \
+        "grpcio-status==1.57.0" \
         "google-cloud-aiplatform==1.130.0" \
         "google-cloud-bigquery==3.13.0" \
         "google-cloud-storage==3.9.0" \
