@@ -289,7 +289,7 @@ deploy/linux/hart-cli/
 ├── commands.go       # status, start, stop, restart, logs, health, join, provision, update, node-id, version
 ├── api.go            # api_get(), api_post() HTTP helpers (net/http)
 ├── systemctl.go      # exec.Command wrappers for systemctl, journalctl
-├── go.mod            # module github.com/hevolve/hart-cli
+├── go.mod            # module github.com/hertz-ai/hart-cli
 └── go.sum
 ```
 

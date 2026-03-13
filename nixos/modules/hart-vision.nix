@@ -34,7 +34,7 @@ in
 
     systemd.services.hart-vision = {
       description = "HART OS Vision Service (MiniCPM)";
-      documentation = [ "https://github.com/hevolve-ai/hart" ];
+      documentation = [ "https://github.com/hertz-ai/HARTOS" ];
       after = [ "hart-backend.service" ];
       partOf = [ "hart.target" ];
       wantedBy = [ "hart.target" ];

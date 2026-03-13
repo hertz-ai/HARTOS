@@ -85,7 +85,7 @@ def sample_goal(db):
         title='Activate HiveMind',
         description='Enable distributed thinking',
         config_json={
-            'repo_url': 'hertz-ai/Hevolve-Continual-Learner-Framework-Zero-Forgetting',
+            'repo_url': 'hertz-ai/HevolveAI',
             'repo_branch': 'main-withpycharmplugin-and-slowness',
             'target_path': 'src/hevolveai/embodied_ai',
         },
@@ -112,7 +112,7 @@ class TestCodingModels:
     def test_goal_to_dict(self, db, sample_goal):
         d = sample_goal.to_dict()
         assert d['title'] == 'Activate HiveMind'
-        assert d['repo_url'] == 'hertz-ai/Hevolve-Continual-Learner-Framework-Zero-Forgetting'
+        assert d['repo_url'] == 'hertz-ai/HevolveAI'
         assert 'id' in d and 'created_at' in d
 
     def test_user_idle_compute_column(self, db):

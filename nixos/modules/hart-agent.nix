@@ -22,7 +22,7 @@ in
 
     systemd.services.hart-agent-daemon = {
       description = "HART OS Agent Daemon (Goal Engine)";
-      documentation = [ "https://github.com/hevolve-ai/hart" ];
+      documentation = [ "https://github.com/hertz-ai/HARTOS" ];
       after = [ "hart-backend.service" ];
       bindsTo = [ "hart-backend.service" ];
       partOf = [ "hart.target" ];

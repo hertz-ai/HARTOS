@@ -132,7 +132,7 @@ in
     {
       systemd.services.hart-app-bridge = {
         description = "HART OS App Bridge — Cross-Subsystem Agent Routing";
-        documentation = [ "https://github.com/hevolve-ai/hart" ];
+        documentation = [ "https://github.com/hertz-ai/HARTOS" ];
         after = [ "hart.target" "hart-model-bus.service" ];
         wants = [ "hart-model-bus.service" ];
         wantedBy = [ "hart.target" ];

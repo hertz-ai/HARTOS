@@ -1,6 +1,6 @@
 [Unit]
 Description=HART OS Local LLM (llama.cpp)
-Documentation=https://github.com/hevolve-ai/hart
+Documentation=https://github.com/hertz-ai/HARTOS
 After=network.target
 ConditionPathExists=/opt/hart/models/default.gguf
 

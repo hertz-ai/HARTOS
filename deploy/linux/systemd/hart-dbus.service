@@ -1,6 +1,6 @@
 [Unit]
 Description=HART OS D-Bus Agent Service
-Documentation=https://github.com/hevolve-ai/hart
+Documentation=https://github.com/hertz-ai/HARTOS
 After=hart-backend.service dbus.service
 BindsTo=hart-backend.service
 Requires=dbus.service

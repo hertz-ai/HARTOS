@@ -154,7 +154,7 @@ in
     {
       systemd.services.hart-liquid-ui = {
         description = "HART OS LiquidUI — AI-Generated Adaptive Interface";
-        documentation = [ "https://github.com/hevolve-ai/hart" ];
+        documentation = [ "https://github.com/hertz-ai/HARTOS" ];
         after = [ "hart.target" "hart-model-bus.service" ];
         wants = [ "hart-model-bus.service" ];
         wantedBy = [ "hart.target" ];
