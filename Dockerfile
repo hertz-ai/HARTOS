@@ -12,12 +12,42 @@ RUN apt-get update && apt-get install -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Layer 2: Python deps (only rebuilds when requirements.txt changes) ──
+# ── Layer 2a: Upgrade pip ──
+RUN pip install --upgrade pip
+
+# ── Layer 2b: Google/gRPC stack (biggest backtracking source — install first) ──
+#    Installing these first pins all their transitive deps, so the main install
+#    doesn't backtrack through thousands of version combinations.
+RUN pip install --no-cache-dir \
+        "google-cloud-aiplatform==1.130.0" \
+        "google-cloud-bigquery==3.13.0" \
+        "google-cloud-storage==3.9.0" \
+        "google-cloud-resource-manager==1.10.4" \
+        "google-api-python-client==2.190.0" \
+        "google-auth==2.49.0" \
+        "google-api-core==2.28.0" \
+        "googleapis-common-protos==1.59.1" \
+        "grpc-google-iam-v1==0.14.2" \
+        "proto-plus==1.22.3" \
+        "protobuf==4.23.3" \
+        "langchain-google-genai==4.2.1"
+
+# ── Layer 2c: LLM/AI stack (second backtracking source) ──
+RUN pip install --no-cache-dir \
+        "openai==1.82.0" \
+        "anthropic==0.83.0" \
+        "langchain-classic==1.0.1" \
+        "langchain-community==0.4.1" \
+        "langchain-anthropic==1.0.0" \
+        "langchain-core==1.2.15" \
+        "langchain-text-splitters==1.1.1" \
+        "langchain-groq==1.1.2"
+
+# ── Layer 2d: Remaining requirements (deps already pinned above) ──
 COPY requirements.txt .
 COPY agent-ledger-opensource/ ./agent-ledger-opensource/
 
-RUN pip install --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt && \
+RUN pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir ./agent-ledger-opensource && \
     pip install --no-cache-dir \
         autogen-agentchat==0.2.37 \
