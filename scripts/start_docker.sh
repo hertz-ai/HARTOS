@@ -102,6 +102,56 @@ if ! docker info > /dev/null 2>&1; then
     fi
 fi
 
+# ── CORS auto-config (only when this server resolves to hevolve.ai) ──
+_configure_cors() {
+    # Skip if CORS_ORIGINS already in .env
+    if [ -f "${ENV_FILE}" ] && grep -q "^CORS_ORIGINS=" "${ENV_FILE}" 2>/dev/null; then
+        info "CORS_ORIGINS already configured in .env"
+        return
+    fi
+
+    # Resolve hevolve.ai to IP(s)
+    HEVOLVE_IPS=""
+    if command -v dig > /dev/null 2>&1; then
+        HEVOLVE_IPS=$(dig +short hevolve.ai A 2>/dev/null | grep -E '^[0-9]+\.' || true)
+    elif command -v nslookup > /dev/null 2>&1; then
+        HEVOLVE_IPS=$(nslookup hevolve.ai 2>/dev/null | awk '/^Address:/{if(NR>2) print $2}' | grep -E '^[0-9]+\.' || true)
+    elif command -v getent > /dev/null 2>&1; then
+        HEVOLVE_IPS=$(getent ahosts hevolve.ai 2>/dev/null | awk '{print $1}' | sort -u | grep -E '^[0-9]+\.' || true)
+    fi
+
+    if [ -z "${HEVOLVE_IPS}" ]; then
+        info "Could not resolve hevolve.ai — skipping CORS auto-config"
+        return
+    fi
+
+    # Get this server's public IP
+    MY_IP=""
+    for svc in "https://api.ipify.org" "https://ifconfig.me" "https://icanhazip.com"; do
+        MY_IP=$(curl -s --max-time 5 "${svc}" 2>/dev/null | grep -Eo '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' || true)
+        [ -n "${MY_IP}" ] && break
+    done
+
+    if [ -z "${MY_IP}" ]; then
+        info "Could not detect public IP — skipping CORS auto-config"
+        return
+    fi
+
+    # Check if this server's IP matches any hevolve.ai A record
+    if echo "${HEVOLVE_IPS}" | grep -qF "${MY_IP}"; then
+        info "This server (${MY_IP}) resolves to hevolve.ai — configuring CORS"
+        {
+            echo ""
+            echo "# Auto-configured: this server resolves to hevolve.ai"
+            echo "CORS_ORIGINS=https://hevolve.ai,https://www.hevolve.ai,http://localhost:3000"
+            echo "ALLOWED_HOSTS=localhost,127.0.0.1,azurekong.hertzai.com"
+        } >> "${ENV_FILE}"
+        info "Appended CORS_ORIGINS and ALLOWED_HOSTS to .env"
+    else
+        info "Server IP (${MY_IP}) does not match hevolve.ai (${HEVOLVE_IPS}) — no CORS auto-config"
+    fi
+}
+
 # ── Build ────────────────────────────────────────────────────
 do_build() {
     info "Building ${IMAGE} from ${REPO_DIR}..."
@@ -184,6 +234,9 @@ do_run() {
             echo ""
         fi
     fi
+
+    # ── Auto-detect CORS for hevolve.ai production ──
+    _configure_cors
 
     # ── Central-only: master key + signed manifest ──
     if [ "${TIER}" = "central" ]; then
