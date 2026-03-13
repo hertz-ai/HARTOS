@@ -1,0 +1,65 @@
+#cloud-config
+autoinstall:
+  version: 1
+
+  identity:
+    hostname: hart-node
+    username: hart
+    # Password: "hart" (change on first login)
+    password: "$6$rounds=4096$HART OS$RJo8GhZFq0Hw/oLvzM5Z3t5Rn.xLjfZdNqBw8yK0sG7E6k4FtTkNQu2w9Y1vDgA6FxrQ3HjV1w0JzJcV8MJq."
+
+  locale: en_US.UTF-8
+
+  keyboard:
+    layout: us
+
+  storage:
+    layout:
+      name: lvm
+
+  network:
+    version: 2
+    ethernets:
+      id0:
+        match:
+          name: "en*"
+        dhcp4: true
+
+  ssh:
+    install-server: true
+    allow-pw: true
+
+  packages:
+    - python3.10
+    - python3.10-venv
+    - python3.10-dev
+    - python3-pip
+    - ufw
+    - git
+    - curl
+    - rsync
+    - xxd
+    - htop
+    - nvtop
+
+  late-commands:
+    # Copy HART OS from ISO media to target
+    - curtin in-target -- mkdir -p /opt/hart
+    - cp -r /cdrom/hart-os/ /target/opt/hart/ || true
+    # Install HART OS
+    - curtin in-target -- bash /opt/hart/deploy/linux/install.sh --from-iso
+    # Enable first-boot wizard
+    - curtin in-target -- cp /opt/hart/deploy/distro/first-boot/hart-first-boot.service /etc/systemd/system/
+    - curtin in-target -- systemctl enable hart-first-boot.service
+    # Install branding
+    - cp /opt/hart/deploy/distro/branding/hart-os-release /target/etc/os-release
+    - cp /opt/hart/deploy/distro/branding/hart-issue /target/etc/issue
+    - cp /opt/hart/deploy/distro/branding/hart-motd.sh /target/etc/update-motd.d/99-hart
+    - chmod +x /target/etc/update-motd.d/99-hart
+    # Kernel tuning
+    - cp /opt/hart/deploy/distro/kernel/99-hart-sysctl.conf /target/etc/sysctl.d/
+    - cp /opt/hart/deploy/distro/kernel/hart-limits.conf /target/etc/security/limits.d/
+
+  user-data:
+    runcmd:
+      - systemctl enable hart.target

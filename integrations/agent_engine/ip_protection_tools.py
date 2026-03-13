@@ -88,7 +88,7 @@ def register_ip_protection_tools(helper, assistant, user_id: str):
     def draft_provisional_patent(
         patent_id: Annotated[str, "ID of existing draft patent to build into provisional"],
         inventors: Annotated[str, "Comma-separated inventor names"],
-        assignee: Annotated[str, "Assignee organization name"] = 'Hevolve AI',
+        assignee: Annotated[str, "Assignee organization name"] = 'HART AI',
     ) -> str:
         """Build complete USPTO provisional patent application from a draft.
         Updates the patent with full provisional structure."""
@@ -304,6 +304,63 @@ def register_ip_protection_tools(helper, assistant, user_id: str):
          'Measure technical irreproducibility — latent dynamics moat depth vs code clone',
          measure_moat),
     ]
+
+    # ─── Defensive IP tools ───
+
+    def create_defensive_pub(
+        title: Annotated[str, "Title of the defensive publication"],
+        content: Annotated[str, "Full content to publish (hashed for proof)"],
+        abstract: Annotated[str, "Brief abstract"] = '',
+    ) -> str:
+        """Create a timestamped defensive publication — prior art proof, not a patent."""
+        from integrations.social.models import get_db
+        from .ip_service import IPService
+        import subprocess
+
+        db = get_db()
+        try:
+            git_commit = None
+            try:
+                result = subprocess.run(
+                    ['git', 'rev-parse', 'HEAD'],
+                    capture_output=True, text=True, timeout=5)
+                if result.returncode == 0:
+                    git_commit = result.stdout.strip()
+            except Exception:
+                pass
+
+            pub = IPService.create_defensive_publication(
+                db, title=title, content=content,
+                abstract=abstract, git_commit=git_commit,
+                created_by=user_id)
+            db.commit()
+            return json.dumps({'created': True, 'publication': pub})
+        except Exception as e:
+            db.rollback()
+            return json.dumps({'error': str(e)})
+        finally:
+            db.close()
+
+    def get_provenance_record() -> str:
+        """Get the full provenance chain — all defensive publications, patents, and evidence."""
+        from integrations.social.models import get_db
+        from .ip_service import IPService
+
+        db = get_db()
+        try:
+            record = IPService.get_provenance_record(db)
+            return json.dumps(record, default=str)
+        finally:
+            db.close()
+
+    tools.extend([
+        ('create_defensive_pub',
+         'Create a timestamped defensive publication — prior art proof for legal defence',
+         create_defensive_pub),
+        ('get_provenance_record',
+         'Get the full provenance chain: all publications, patents, moat, and evidence',
+         get_provenance_record),
+    ])
 
     for name, desc, func in tools:
         helper.register_for_llm(name=name, description=desc)(func)

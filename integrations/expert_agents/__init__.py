@@ -20,12 +20,16 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+_experts_registered = False
+_registered_agents: Dict[str, "ExpertAgent"] = {}
+
 
 def register_all_experts(skill_registry) -> Dict[str, ExpertAgent]:
     """
     Register all 96 expert agents with the AgentSkillRegistry.
 
     This makes expert agents discoverable via the existing skill registry system.
+    Idempotent — safe to call multiple times (only registers once).
 
     Args:
         skill_registry: Instance of AgentSkillRegistry from internal_comm
@@ -33,6 +37,10 @@ def register_all_experts(skill_registry) -> Dict[str, ExpertAgent]:
     Returns:
         Dictionary of expert_id -> ExpertAgent
     """
+    global _experts_registered, _registered_agents
+    if _experts_registered:
+        return _registered_agents
+
     logger.info("Registering 96 expert agents with skill registry...")
 
     # Load expert registry
@@ -61,6 +69,8 @@ def register_all_experts(skill_registry) -> Dict[str, ExpertAgent]:
         skill_registry.register_agent(agent_id, skills)
 
     logger.info(f"Successfully registered {len(expert_registry.agents)} expert agents")
+    _experts_registered = True
+    _registered_agents = expert_registry.agents
     return expert_registry.agents
 
 
@@ -242,6 +252,60 @@ Focus on your area of expertise and provide practical, actionable guidance."""
     return agent
 
 
+def match_expert_for_context(task_description: str, top_k: int = 1,
+                              min_score: int = 4) -> Optional[Dict[str, Any]]:
+    """Match an expert agent and return a prompt enhancement block.
+
+    Non-interactive alternative to get_expert_for_task(). Returns structured
+    data for prompt injection, following the build_personality_prompt() pattern.
+
+    Args:
+        task_description: Description of the task or action.
+        top_k: Number of top matches to consider.
+        min_score: Minimum score threshold (higher = stricter matching).
+
+    Returns:
+        Dict with keys: agent_id, name, description, prompt_block, capabilities.
+        None if no match exceeds min_score.
+    """
+    if not task_description or not task_description.strip():
+        return None
+
+    try:
+        registry = ExpertAgentRegistry()
+        scored = registry.score_match(task_description)
+
+        if not scored or scored[0][1] < min_score:
+            return None
+
+        agent, score = scored[0]
+
+        # Build prompt block (same pattern as build_personality_prompt)
+        cap_lines = '\n'.join(
+            f'- {c.name}: {c.description}' for c in agent.capabilities[:3]
+        )
+        prompt_block = (
+            f"\n[Expert Guidance: {agent.name}]\n"
+            f"Domain: {agent.description}\n"
+            f"Relevant capabilities:\n{cap_lines}\n"
+        )
+
+        return {
+            'agent_id': agent.agent_id,
+            'name': agent.name,
+            'description': agent.description,
+            'prompt_block': prompt_block,
+            'capabilities': [
+                {'name': c.name, 'description': c.description}
+                for c in agent.capabilities
+            ],
+            'score': score,
+        }
+    except Exception as e:
+        logger.debug(f"Expert matching failed: {e}")
+        return None
+
+
 def recommend_experts_for_dream(dream_statement: str, top_k: int = 5) -> List[ExpertAgent]:
     """
     Recommend expert agents for achieving a dream.
@@ -273,5 +337,6 @@ __all__ = [
     'get_expert_for_task',
     'get_expert_info',
     'create_autogen_expert_wrapper',
-    'recommend_experts_for_dream'
+    'recommend_experts_for_dream',
+    'match_expert_for_context',
 ]

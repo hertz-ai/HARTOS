@@ -1,0 +1,122 @@
+# HART OS Distributed Multi-Node Test
+# Usage: docker-compose -f deploy/distributed/docker-compose.distributed.yml up
+#
+# Spins up 3 HART nodes + shared MySQL + Redis for distributed task execution.
+# Node 1 = central (submits goals), Node 2+3 = workers (claim + execute).
+#
+# Test: POST a goal to :6777, watch workers claim and execute it.
+
+version: '3.8'
+
+x-hart-common: &hart-common
+  build:
+    context: ../..
+    dockerfile: deploy/cloud/Dockerfile.prod
+  environment: &hart-env
+    REDIS_HOST: redis
+    REDIS_PORT: "6379"
+    HEVOLVE_DB_URL: mysql+mysqlconnector://hart:hart_distributed@mysql:3306/hart_distributed
+    HEVOLVE_AGENT_ENGINE_ENABLED: "true"
+    HEVOLVE_AGENT_POLL_INTERVAL: "10"
+    HEVOLVE_WORKER_POLL_INTERVAL: "5"
+    PYTHONDONTWRITEBYTECODE: "1"
+    OPENAI_API_KEY: "${OPENAI_API_KEY:-test-key}"
+    GROQ_API_KEY: "${GROQ_API_KEY:-}"
+  depends_on:
+    redis:
+      condition: service_healthy
+    mysql:
+      condition: service_healthy
+  restart: on-failure
+  networks:
+    - hivenet
+
+services:
+  # Shared MySQL for all nodes (central + workers share one DB)
+  mysql:
+    image: mysql:8.0
+    container_name: hart-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_USER: hart
+      MYSQL_PASSWORD: hart_distributed
+      MYSQL_DATABASE: hart_distributed
+      MYSQL_ROOT_PASSWORD: hart_root_distributed
+    volumes:
+      - mysql-data:/var/lib/mysql
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "hart", "-phart_distributed"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - hivenet
+
+  # Shared Redis for distributed task coordination
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - hivenet
+
+  # Central node — submits goals, runs agent daemon
+  node-central:
+    <<: *hart-common
+    container_name: hart-central
+    hostname: hart-central
+    ports:
+      - "6777:6777"
+    environment:
+      <<: *hart-env
+      HEVOLVE_NODE_ID: node-central
+      HEVOLVE_NODE_NAME: hart-central
+      HEVOLVE_NODE_TIER: central
+      HEVOLVE_ENFORCEMENT_MODE: hard
+      HEVOLVE_DEV_MODE: "false"
+      HEVOLVE_BASE_URL: http://hart-central:6777
+      HEVOLVE_SEED_PEERS: http://hart-worker-1:6777,http://hart-worker-2:6777
+
+  # Worker node 1 — claims tasks, executes via local /chat
+  node-worker-1:
+    <<: *hart-common
+    container_name: hart-worker-1
+    hostname: hart-worker-1
+    ports:
+      - "6778:6777"
+    environment:
+      <<: *hart-env
+      HEVOLVE_NODE_ID: node-worker-1
+      HEVOLVE_NODE_NAME: hart-worker-1
+      HEVOLVE_BASE_URL: http://hart-worker-1:6777
+      HEVOLVE_SEED_PEERS: http://hart-central:6777,http://hart-worker-2:6777
+
+  # Worker node 2 — claims tasks, executes via local /chat
+  node-worker-2:
+    <<: *hart-common
+    container_name: hart-worker-2
+    hostname: hart-worker-2
+    ports:
+      - "6779:6777"
+    environment:
+      <<: *hart-env
+      HEVOLVE_NODE_ID: node-worker-2
+      HEVOLVE_NODE_NAME: hart-worker-2
+      HEVOLVE_BASE_URL: http://hart-worker-2:6777
+      HEVOLVE_SEED_PEERS: http://hart-central:6777,http://hart-worker-1:6777
+
+networks:
+  hivenet:
+    driver: bridge
+
+volumes:
+  mysql-data:
+    driver: local

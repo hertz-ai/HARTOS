@@ -1,0 +1,25 @@
+#!/bin/bash
+# HART OS pre-removal script
+# Runs before .deb package files are removed
+
+set -e
+
+echo "[HART OS] Stopping services..."
+
+systemctl stop hart.target 2>/dev/null || true
+systemctl disable hart.target 2>/dev/null || true
+
+# Remove service files
+rm -f /etc/systemd/system/hart-backend.service
+rm -f /etc/systemd/system/hart-discovery.service
+rm -f /etc/systemd/system/hart-vision.service
+rm -f /etc/systemd/system/hart-llm.service
+rm -f /etc/systemd/system/hart-agent-daemon.service
+rm -f /etc/systemd/system/hart.target
+
+systemctl daemon-reload
+
+rm -f /usr/local/bin/hart
+
+echo "[HART OS] Services stopped and disabled."
+echo "[HART OS] Data directory /var/lib/hart preserved."

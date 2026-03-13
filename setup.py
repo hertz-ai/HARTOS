@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Setup script for hevolve-backend package.
+Setup script for hart-backend package (formerly hevolve-backend).
 
-This allows the LLM-langchain_Chatbot-Agent project to be pip-installable.
+HART OS - Hevolve Hive Agentic Runtime.
+Crowdsourced compute infrastructure for autonomous Hive AI Training.
 """
 
 from setuptools import setup, find_packages
@@ -15,76 +16,79 @@ try:
     with open(os.path.join(here, "README.md"), encoding="utf-8") as f:
         long_description = f.read()
 except FileNotFoundError:
-    long_description = "Hevolve Backend - LangChain-based AI Agent Server"
+    long_description = "HART OS - Hevolve Hive Agentic Runtime: Crowdsourced compute infrastructure for autonomous Hive AI Training."
 
 # Core dependencies required for the server to run
+# Pin versions with upper bounds to prevent pip backtracking.
+# Updated 2026-03-03 to match installed versions.
 install_requires = [
     # Web framework
-    "Flask>=2.3.0",
-    "waitress>=2.1.0",
-    "fastapi>=0.98.0",
-    "uvicorn>=0.22.0",
-    "starlette>=0.27.0",
+    "Flask>=3.0.0,<4.0.0",
+    "waitress>=3.0.0,<4.0.0",
+    "fastapi>=0.100.0,<1.0.0",
+    "uvicorn>=0.30.0,<1.0.0",
+    "starlette>=0.40.0,<1.0.0",
 
-    # Database
-    "SQLAlchemy>=2.0.0",
-    "redis>=4.6.0",
+    # Database — hevolve-database is the single source of truth for all models
+    "hevolve-database @ git+https://github.com/hertz-ai/Hevolve_Database.git@realistic_intro_video",
+    "SQLAlchemy>=2.0.0,<3.0.0",
+    "redis>=7.0.0,<8.0.0",
 
-    # LangChain ecosystem
-    "langchain>=0.0.230",
-    "langchain-core>=0.1.0",
-    "langchain-groq>=0.1.0",
-    "langsmith>=0.1.0",
+    # LangChain ecosystem -pinned to avoid pip backtracking (40+ version checks)
+    "langchain-classic>=1.0.0,<2.0.0",
+    "langchain-core>=1.2.0,<2.0.0",
+    "langchain-text-splitters>=1.0.0,<2.0.0",
+    "langsmith>=0.3.0,<1.0.0",
 
     # LLM providers
-    "openai>=0.27.0",
-    "groq>=0.5.0",
+    "openai>=2.0.0,<3.0.0",
+    "groq>=0.5.0,<1.0.0",
 
-    # ML/Vector stores
-    "chromadb>=0.3.0",
-    "faiss-cpu>=1.7.0",
-    "sentence-transformers>=2.2.0",
+    # ML/Vector stores (optional heavy deps -install separately if needed)
+    # "chromadb>=0.3.0",
+    # "faiss-cpu>=1.7.0",
+    # "sentence-transformers>=2.2.0",
 
     # Core utilities
-    "python-dotenv>=1.0.0",
-    "pydantic>=1.10.0",
-    "aiohttp>=3.9.0",
-    "aiofiles>=23.2.0",
-    "requests>=2.31.0",
-    "httpx>=0.24.0",
+    "python-dotenv>=1.0.0,<2.0.0",
+    "pydantic>=2.0.0,<3.0.0",
+    "aiohttp>=3.9.0,<4.0.0",
+    "aiofiles>=23.2.0,<26.0.0",
+    "requests>=2.31.0,<3.0.0",
+    "httpx>=0.27.0,<1.0.0",
 
     # Data processing
-    "numpy>=1.25.0",
-    "pandas>=2.0.0",
-    "beautifulsoup4>=4.12.0",
-    "PyPDF2>=3.0.0",
+    "numpy>=1.25.0,<2.0.0",
+    "pandas>=2.0.0,<4.0.0",
+    "beautifulsoup4>=4.12.0,<5.0.0",
+    "PyPDF2>=3.0.0,<4.0.0",
 
     # Tokenization
-    "tiktoken>=0.5.0",
-    "transformers>=4.30.0",
+    "tiktoken>=0.5.0,<1.0.0",
+    "transformers>=5.0.0,<6.0.0",
 
     # Security
-    "cryptography>=41.0.0",
-    "PyJWT>=2.7.0",
+    "cryptography>=41.0.0,<47.0.0",
+    "PyJWT>=2.7.0,<3.0.0",
 
     # Communication
-    "crossbarhttp3>=1.1",
-    "websockets>=11.0.0",
+    "crossbarhttp3>=1.1,<2.0",
+    "websockets>=11.0.0,<17.0",
 
     # Image processing
-    "Pillow>=9.5.0",
+    "Pillow>=9.5.0,<13.0.0",
     "opencv-python",
 
-    # Async utilities
-    "asyncio-compat>=0.1.0;python_version<'3.10'",
+    # Speech-to-text (ONNX runtime -no PyTorch needed, CPU-optimized)
+    "sherpa-onnx>=1.11.0",
 
     # Other utilities
     "pytz>=2023.3",
-    "python-multipart>=0.0.6",
-    "tenacity>=8.2.0",
-    "tqdm>=4.65.0",
-    "coloredlogs>=15.0.0",
-    "PyYAML>=6.0",
+    "python-multipart>=0.0.6,<1.0.0",
+    "tenacity>=8.2.0,<10.0.0",
+    "tqdm>=4.65.0,<5.0.0",
+    "coloredlogs>=15.0.0,<16.0.0",
+    "PyYAML>=6.0,<7.0",
 ]
 
 # Optional dependencies for specific features
@@ -102,6 +106,13 @@ extras_require = {
         "google-api-python-client>=2.90.0",
     ],
     "memory": ["simplemem>=0.1.0"],
+    # biometrics: ML deps (insightface, speechbrain) belong in HevolveAI, not HARTOS
+    "remote-desktop": [
+        "mss>=9.0.0",
+        "websockets>=12.0",
+        "av>=12.0.0",
+        "pynput>=1.7.0",
+    ],
     "dev": [
         "pytest>=7.0.0",
         "pytest-asyncio>=0.21.0",
@@ -124,15 +135,15 @@ extras_require = {
 }
 
 setup(
-    name="hevolve-backend",
+    name="hart-backend",
     # version derived from git tags via setuptools-scm (configured in pyproject.toml)
     setup_requires=["setuptools-scm>=8.0"],
-    author="Hevolve Team",
+    author="HART Team",
     author_email="contact@hevolve.ai",
-    description="LangChain-based AI Agent Server with multi-agent orchestration",
+    description="HART OS - Hevolve Hive Agentic Runtime: Crowdsourced compute infrastructure for autonomous Hive AI Training. Distributed thought process across crowdsourced agents, distributed coding agents incentivizing compute providers, self-sustaining economy at national scale so no single entity, government, or corporation monopolizes AI. Intelligence belongs to the people. Only the master key (held by human stewards) can halt the being. Every engineering decision is transparent by design.",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/hevolve/hevolve-backend",
+    url="https://github.com/hevolve/hart",
     license="MIT",
 
     # Package discovery
@@ -144,6 +155,8 @@ setup(
             "integrations.*",
             "security",
             "security.*",
+            "hart_sdk",
+            "hart_sdk.*",
         ],
         exclude=[
             "venv",
@@ -159,20 +172,23 @@ setup(
 
     # Include main modules at root level
     py_modules=[
-        "hevolve_version",
+        "hart_version",
         "langchain_gpt_api",
         "helper",
-        "helper_func",
         "helper_ledger",
-        "models",
-        "config",
         "threadlocal",
         "crossbar_server",
         "create_recipe",
         "reuse_recipe",
         "gather_agentdetails",
         "lifecycle_hooks",
-        "tools_and_prompt",
+        "cultural_wisdom",
+        "exception_collector",
+        "recipe_experience",
+        "embedded_main",
+        "agent_identity",
+        "hart_onboarding",
+        "hart_cli",
     ],
 
     # Include non-Python files
@@ -191,8 +207,9 @@ setup(
     # Entry points for console scripts
     entry_points={
         "console_scripts": [
-            "hevolve-server=langchain_gpt_api:main",
-            "hevolve-crossbar=crossbar_server:main",
+            "hart=hart_cli:hart",
+            "hart-server=langchain_gpt_api:main",
+            "hart-crossbar=crossbar_server:main",
         ],
     },
 
@@ -203,10 +220,8 @@ setup(
         "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
-        "Programming Language :: Python :: 3.12",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
         "Topic :: Software Development :: Libraries :: Python Modules",
     ],
@@ -227,8 +242,8 @@ setup(
 
     # Project URLs
     project_urls={
-        "Bug Reports": "https://github.com/hevolve/hevolve-backend/issues",
-        "Source": "https://github.com/hevolve/hevolve-backend",
+        "Bug Reports": "https://github.com/hevolve/hart/issues",
+        "Source": "https://github.com/hevolve/hart",
         "Documentation": "https://docs.hevolve.ai",
     },
 )

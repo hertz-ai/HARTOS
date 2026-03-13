@@ -3,26 +3,26 @@ requires = ["setuptools>=61.0", "wheel", "setuptools-scm>=8.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "hevolve-backend"
+name = "hart-backend"
 dynamic = ["version"]
-description = "LangChain-based AI Agent Server with multi-agent orchestration"
+description = "HART OS - Hevolve Hive Agentic Runtime: Crowdsourced compute infrastructure for autonomous Hive AI Training. Distributed thought process across crowdsourced agents, distributed coding agents incentivizing compute providers, self-sustaining economy at national scale so no single entity, government, or corporation monopolizes AI. Intelligence belongs to the people. Only the master key (held by human stewards) can halt the being. Every engineering decision is transparent by design."
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
 authors = [
-    {name = "Hevolve Team", email = "contact@hevolve.ai"}
+    {name = "HART Team", email = "contact@hevolve.ai"}
 ]
 keywords = [
-    "langchain",
+    "hart",
+    "hevolve",
     "ai",
-    "chatbot",
-    "agent",
-    "llm",
-    "openai",
-    "groq",
-    "flask",
+    "agents",
+    "hivemind",
+    "crowdsourced",
     "multi-agent",
     "orchestration",
+    "langchain",
+    "llm",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -39,72 +39,88 @@ classifiers = [
 ]
 
 dependencies = [
+    # Pin versions to match installed — prevents pip backtracking.
+    # Updated 2026-03-03.
+
+    # Multi-agent orchestration
+    "autogen-agentchat==0.2.37",
+    "autogen-agentchat[long-context]~=0.2",
+    "apscheduler>=3.10.0,<4.0.0",
+    "json-repair>=0.25.0,<1.0.0",
+
+    # Communication (autobahn + extras on one line to avoid duplicates)
+    "autobahn>=23.1.2",
+    "autobahn[serialization]",
+    "autobahn[twisted]",
+    "crossbarhttp3>=1.1,<2.0",
+    "websockets>=11.0.0,<17.0",
+
     # Web framework
-    "Flask>=2.3.0",
-    "waitress>=2.1.0",
-    "fastapi>=0.98.0",
-    "uvicorn>=0.22.0",
-    "starlette>=0.27.0",
+    "Flask>=3.0.0,<4.0.0",
+    "waitress>=3.0.0,<4.0.0",
+    "fastapi>=0.100.0,<1.0.0",
+    "uvicorn>=0.30.0,<1.0.0",
+    "starlette>=0.40.0,<1.0.0",
 
-    # Database
-    "SQLAlchemy>=2.0.0",
-    "redis>=4.6.0",
+    # Database — hevolve-database is the single source of truth for all models
+    "hevolve-database @ git+https://github.com/hertz-ai/Hevolve_Database.git@realistic_intro_video",
+    "SQLAlchemy>=2.0.0,<3.0.0",
+    "redis>=7.0.0,<8.0.0",
 
-    # LangChain ecosystem
-    "langchain>=0.0.230",
-    "langchain-core>=0.1.0",
-    "langchain-groq>=0.1.0",
-    "langsmith>=0.1.0",
+    # LangChain ecosystem — pinned to avoid pip backtracking (40+ version checks)
+    "langchain-classic>=1.0.0,<2.0.0",
+    "langchain-core>=1.2.0,<2.0.0",
+    "langchain-text-splitters>=1.0.0,<2.0.0",
+    "langsmith>=0.3.0,<1.0.0",
 
     # LLM providers
-    "openai>=0.27.0",
-    "groq>=0.5.0",
+    "openai>=2.0.0,<3.0.0",
+    "groq>=0.5.0,<1.0.0",
 
-    # ML/Vector stores
-    "chromadb>=0.3.0",
-    "faiss-cpu>=1.7.0",
-    "sentence-transformers>=2.2.0",
+    # ML/Vector stores (optional heavy deps — install separately if needed)
+    # "chromadb>=0.3.0",
+    # "faiss-cpu>=1.7.0",
+    # "sentence-transformers>=2.2.0",
 
     # Core utilities
-    "python-dotenv>=1.0.0",
-    "pydantic>=1.10.0",
-    "aiohttp>=3.9.0",
-    "aiofiles>=23.2.0",
-    "requests>=2.31.0",
-    "httpx>=0.24.0",
+    "python-dotenv>=1.0.0,<2.0.0",
+    "pydantic>=2.0.0,<3.0.0",
+    "aiohttp>=3.9.0,<4.0.0",
+    "aiofiles>=23.2.0,<26.0.0",
+    "requests>=2.31.0,<3.0.0",
+    "httpx>=0.27.0,<1.0.0",
 
     # Data processing
-    "numpy>=1.25.0",
-    "pandas>=2.0.0",
-    "beautifulsoup4>=4.12.0",
-    "PyPDF2>=3.0.0",
+    "numpy>=1.25.0,<2.0.0",
+    "pandas>=2.0.0,<4.0.0",
+    "beautifulsoup4>=4.12.0,<5.0.0",
+    "PyPDF2>=3.0.0,<4.0.0",
 
     # Tokenization
-    "tiktoken>=0.5.0",
-    "transformers>=4.30.0",
+    "tiktoken>=0.5.0,<1.0.0",
+    "transformers>=5.0.0,<6.0.0",
 
     # Embodied AI — learning pipeline, hivemind, distributed intelligence
-    "embodied-ai @ git+https://github.com/hertz-ai/crawl4ai.git@main",
+    "embodied-ai @ git+ssh://git@github.com/hertz-ai/hevolveai.git@main",
 
     # Security
-    "cryptography>=41.0.0",
-    "PyJWT>=2.7.0",
-
-    # Communication
-    "crossbarhttp3>=1.1",
-    "websockets>=11.0.0",
+    "cryptography>=41.0.0,<47.0.0",
+    "PyJWT>=2.7.0,<3.0.0",
 
     # Image processing
-    "Pillow>=9.5.0",
+    "Pillow>=9.5.0,<13.0.0",
     "opencv-python",
+
+    # Speech-to-text (ONNX runtime — no PyTorch needed, CPU-optimized)
+    "sherpa-onnx>=1.11.0",
 
     # Other utilities
     "pytz>=2023.3",
-    "python-multipart>=0.0.6",
-    "tenacity>=8.2.0",
-    "tqdm>=4.65.0",
-    "coloredlogs>=15.0.0",
-    "PyYAML>=6.0",
+    "python-multipart>=0.0.6,<1.0.0",
+    "tenacity>=8.2.0,<10.0.0",
+    "tqdm>=4.65.0,<5.0.0",
+    "coloredlogs>=15.0.0,<16.0.0",
+    "PyYAML>=6.0,<7.0",
 ]
 
 [project.optional-dependencies]
@@ -121,6 +137,14 @@ google = [
     "google-api-python-client>=2.90.0",
 ]
 memory = ["simplemem>=0.1.0"]
+remote-desktop = [
+    "mss>=9.0.0",
+    "websockets>=12.0",
+    "av>=12.0.0",
+    "pynput>=1.7.0",
+]
+sdk = []
+mobile = []
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
@@ -128,6 +152,9 @@ dev = [
     "black>=23.0.0",
     "flake8>=6.0.0",
     "mypy>=1.0.0",
+    "bandit[toml]>=1.7.0",
+    "pip-audit>=2.6.0",
+    "pre-commit>=3.5.0",
 ]
 all = [
     "python-telegram-bot>=21.0",
@@ -142,35 +169,39 @@ all = [
 ]
 
 [project.scripts]
-hevolve-server = "langchain_gpt_api:main"
-hevolve-crossbar = "crossbar_server:main"
+hart = "hart_cli:hart"
+hart-server = "langchain_gpt_api:main"
+hart-crossbar = "crossbar_server:main"
 
 [project.urls]
-Homepage = "https://github.com/hevolve/hevolve-backend"
+Homepage = "https://github.com/hevolve/hart"
 Documentation = "https://docs.hevolve.ai"
-Repository = "https://github.com/hevolve/hevolve-backend"
-Issues = "https://github.com/hevolve/hevolve-backend/issues"
+Repository = "https://github.com/hevolve/hart"
+Issues = "https://github.com/hevolve/hart/issues"
 
 [tool.setuptools]
 py-modules = [
-    "hevolve_version",
+    "hart_version",
     "langchain_gpt_api",
     "helper",
-    "helper_func",
     "helper_ledger",
-    "models",
-    "config",
     "threadlocal",
     "crossbar_server",
     "create_recipe",
     "reuse_recipe",
     "gather_agentdetails",
     "lifecycle_hooks",
-    "tools_and_prompt",
+    "cultural_wisdom",
+    "exception_collector",
+    "recipe_experience",
+    "embedded_main",
+    "agent_identity",
+    "hart_onboarding",
+    "hart_cli",
 ]
 
 [tool.setuptools.packages.find]
-include = ["core*", "integrations*", "security*"]
+include = ["core*", "integrations*", "security*", "hart_sdk*"]
 exclude = ["venv*", "tests*", "docs*"]
 
 [tool.setuptools.package-data]
@@ -180,7 +211,7 @@ exclude = ["venv*", "tests*", "docs*"]
 version_scheme = "guess-next-dev"
 local_scheme = "no-local-version"
 fallback_version = "0.0.0"
-write_to = "hevolve_version.py"
+write_to = "hart_version.py"
 tag_regex = "^v(?P<version>\\d+\\.\\d+\\.\\d+)$"
 
 [tool.black]
@@ -232,3 +263,7 @@ exclude = [
     "dist",
 ]
 ignore = ["E501", "W503", "E203"]
+
+[tool.bandit]
+exclude_dirs = ["venv", "venv310", "tests", "autogen-0.2.37", ".pycharm_plugin", "build", "dist"]
+skips = ["B101", "B404", "B603", "B607"]

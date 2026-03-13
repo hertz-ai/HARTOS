@@ -1,10 +1,26 @@
 from collections import deque
+import logging
+import sys
+
+_fallback_logger = logging.getLogger(__name__)
+
+
+def _safe_log(level, msg):
+    """Log via Flask current_app if available, else fallback to module logger."""
+    try:
+        getattr(current_app.logger, level)(msg)
+    except (RuntimeError, AttributeError):
+        getattr(_fallback_logger, level)(msg)
 import requests
 import re
 import ast
-import autogen
-
-from autogen.agentchat.contrib.capabilities import transform_messages, transforms
+try:
+    import autogen
+    from autogen.agentchat.contrib.capabilities import transform_messages, transforms
+except ImportError:
+    autogen = None
+    transform_messages = None
+    transforms = None
 import json
 from flask import current_app
 from typing import List, Dict, Tuple, Annotated, Set, FrozenSet, Any
@@ -14,19 +30,19 @@ import uuid
 from datetime import datetime, timedelta
 import time
 import redis
-from langchain.schema import AgentAction, AgentFinish, OutputParserException, HumanMessage, AIMessage, SystemMessage
+from langchain_classic.schema import AgentAction, AgentFinish, OutputParserException, HumanMessage, AIMessage, SystemMessage
 import pytz
-from langchain.utilities import GoogleSearchAPIWrapper
+from langchain_classic.utilities import GoogleSearchAPIWrapper
 import aiohttp
 import asyncio
 import os
 from bs4 import BeautifulSoup
-from langchain.memory import ZepMemory
+from langchain_classic.memory import ZepMemory
 from json_repair import repair_json
 import traceback
 
 # Performance: cached config loading (single read instead of 3+)
-from core.config_cache import get_config as _get_config
+from core.config_cache import get_config as _get_config, get_visual_context_api
 # Performance: connection-pooled HTTP sessions
 from core.http_pool import get_http_session, pooled_post, pooled_get, pooled_request
 # Performance: singleton event loop
@@ -34,18 +50,34 @@ from core.event_loop import get_or_create_event_loop
 
 config = _get_config()
 
-os.environ["OPENAI_API_KEY"] = config.get('OPENAI_API_KEY', '')
-os.environ["GOOGLE_CSE_ID"] = config.get('GOOGLE_CSE_ID', '')
-os.environ["GOOGLE_API_KEY"] = config.get('GOOGLE_API_KEY', '')
-os.environ["NEWS_API_KEY"] = config.get('NEWS_API_KEY', '')
-os.environ["SERPAPI_API_KEY"] = config.get('SERPAPI_API_KEY', '')
+# Only set env vars when config actually has non-empty values
+# (empty string would clobber a valid env var and fail pydantic validation)
+for _key in ('OPENAI_API_KEY', 'GOOGLE_CSE_ID', 'GOOGLE_API_KEY', 'NEWS_API_KEY', 'SERPAPI_API_KEY'):
+    _val = config.get(_key, '')
+    if _val:
+        os.environ[_key] = _val
 
 ACTION_API = config.get('ACTION_API', '')
 STUDENT_API = config.get('STUDENT_API', '')
 ZEP_API_URL = config.get('ZEP_API_URL', '')
 ZEP_API_KEY = config.get('ZEP_API_KEY', '')
 
-search = GoogleSearchAPIWrapper(k=4)
+try:
+    search = GoogleSearchAPIWrapper(k=4)
+except Exception as _search_err:
+    logging.getLogger(__name__).info(f"Google Search unavailable (expected in local mode): {_search_err}")
+    search = None
+
+
+def _is_terminate_msg(msg: dict) -> bool:
+    """Null-safe AutoGen termination check.
+
+    AutoGen tool-call messages can have content=None.
+    Using ``"TERMINATE" in msg.get("content")`` crashes with TypeError
+    when content is None.  This helper guards against that.
+    """
+    content = msg.get("content") if isinstance(msg, dict) else None
+    return content is not None and "TERMINATE" in content
 redis_client = redis.StrictRedis(
     host='azure_all_vms.hertzai.com', port=6369, db=0)
 
@@ -65,112 +97,91 @@ async def fetch(session, url):
 
 
 async def async_main(urls):
-    async with aiohttp.ClientSession() as session:
+    timeout = aiohttp.ClientTimeout(total=30, connect=5)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
         tasks = [fetch(session, url) for url in urls]
         return await asyncio.gather(*tasks)
 
 
 
-# Configuration for Crawl4AI API service
-CRAWL4AI_API_URL = "http://localhost:8094"  # Update this to your actual service URL
+# Native web crawler (in-process, no HTTP API needed)
+
+# --- Path traversal protection for prompt file access ---
+# Frozen builds install to Program Files (read-only) — redirect to user data dir
+if getattr(sys, 'frozen', False):
+    try:
+        from core.platform_paths import get_prompts_dir
+        PROMPTS_DIR = os.path.abspath(get_prompts_dir())
+    except ImportError:
+        PROMPTS_DIR = os.path.abspath(os.path.join(
+            os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'prompts'))
+else:
+    PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
+os.makedirs(PROMPTS_DIR, exist_ok=True)
+
+
+def sanitize_path_component(value):
+    """Reject any value containing path separators or traversal sequences.
+
+    Accepts alphanumeric characters, underscores, and hyphens only.
+    Returns the value unchanged if safe, raises ValueError otherwise.
+    """
+    s = str(value)
+    if not re.match(r'^[a-zA-Z0-9_\-]+$', s):
+        raise ValueError(f"Invalid path component: {s!r}")
+    return s
+
+
+def safe_prompt_path(*parts, ext='.json'):
+    """Build a path under prompts/ safely.
+
+    Usage:
+        safe_prompt_path(prompt_id)                    -> prompts/{prompt_id}.json
+        safe_prompt_path(prompt_id, flow)              -> prompts/{prompt_id}_{flow}.json
+        safe_prompt_path(prompt_id, flow, action)      -> prompts/{prompt_id}_{flow}_{action}.json
+        safe_prompt_path(prompt_id, flow, 'recipe')    -> prompts/{prompt_id}_{flow}_recipe.json
+
+    Raises ValueError if any component contains path traversal characters.
+    """
+    sanitized = [sanitize_path_component(p) for p in parts]
+    filename = '_'.join(sanitized) + ext
+    full = os.path.join(PROMPTS_DIR, filename)
+    # Belt-and-suspenders: verify the resolved path is under PROMPTS_DIR
+    if not os.path.abspath(full).startswith(PROMPTS_DIR):
+        raise ValueError(f"Path escapes prompts directory: {full}")
+    return full
 
 
 
 def crawl4ai_fetch(url: str, timeout: int = 30) -> str:
-    """
-    Fetch content from URL using Crawl4AI API service
-    Simple HTTP client - no dependency conflicts!
-    """
+    """Fetch content from URL using native in-process crawler."""
     try:
-        current_app.logger.info(f"Fetching via Crawl4AI API: {url}")
-
-        # Prepare request
-        payload = {
-            "url": url,
-            "word_count_threshold": 50,
-            "timeout": timeout * 1000,  # Convert to milliseconds
-            "bypass_cache": True,
-            "wait_for": "css:body"
-        }
-
-        # Call Crawl4AI API (connection pooled)
-        response = pooled_post(
-            f"{CRAWL4AI_API_URL}/crawl",
-            json=payload,
-            timeout=timeout + 10,  # Add buffer for API processing
-            headers={"Content-Type": "application/json"}
-        )
-
-        if response.status_code == 200:
-            result = response.json()
-
-            if result["success"] and result["markdown"]:
-                content = result["markdown"]
-                current_app.logger.info(f"Crawl4AI success: {result['word_count']} words from {url}")
-                return content
-            else:
-                error_msg = result.get("error_message", "Unknown error")
-                current_app.logger.warning(f"Crawl4AI failed for {url}: {error_msg}")
-                return ""
-        else:
-            current_app.logger.error(f"Crawl4AI API error {response.status_code} for {url}")
-            return ""
-
-    except requests.exceptions.Timeout:
-        current_app.logger.warning(f"Crawl4AI API timeout for {url}")
-        return ""
-    except requests.exceptions.ConnectionError:
-        current_app.logger.error(f"Cannot connect to Crawl4AI API service for {url}")
+        from integrations.web_crawler import crawl_url
+        result = crawl_url(url, timeout)
+        if result['success']:
+            current_app.logger.info(f"Crawl success: {result['word_count']} words from {url}")
+            return result['markdown']
+        current_app.logger.warning(f"Crawl failed for {url}: {result.get('error')}")
         return ""
     except Exception as e:
-        current_app.logger.error(f"Crawl4AI API error for {url}: {e}")
+        current_app.logger.error(f"Crawl error for {url}: {e}")
         return ""
 
 
 def crawl4ai_batch_fetch(urls: List[str], max_concurrent: int = 2) -> List[str]:
-    """
-    Fetch multiple URLs using Crawl4AI batch API
-    """
+    """Fetch multiple URLs using native in-process crawler."""
     try:
-        current_app.logger.info(f"Batch fetching {len(urls)} URLs via Crawl4AI API")
-
-        # Prepare batch request
-        payload = {
-            "urls": urls,
-            "word_count_threshold": 50,
-            "timeout": 30000,  # 30 seconds per URL
-            "max_concurrent": max_concurrent
-        }
-
-        # Call Crawl4AI batch API (connection pooled)
-        response = pooled_post(
-            f"{CRAWL4AI_API_URL}/crawl/batch",
-            json=payload,
-            timeout=120,  # 2 minutes for batch processing
-            headers={"Content-Type": "application/json"}
-        )
-
-        if response.status_code == 200:
-            result = response.json()
-
-            # Extract content from results
-            extracted_content = []
-            for crawl_result in result["results"]:
-                if crawl_result["success"] and crawl_result["markdown"]:
-                    extracted_content.append(crawl_result["markdown"])
-                else:
-                    extracted_content.append("")  # Empty string for failed URLs
-
-            current_app.logger.info(
-                f"Batch crawl completed: {result['successful_crawls']}/{result['total_urls']} successful")
-            return extracted_content
-        else:
-            current_app.logger.error(f"Crawl4AI batch API error {response.status_code}")
-            return [""] * len(urls)  # Return empty strings for all URLs
-
+        from integrations.web_crawler import crawl_urls
+        results = crawl_urls(urls, timeout=30, max_concurrent=max_concurrent)
+        extracted = []
+        for r in results:
+            extracted.append(r['markdown'] if r['success'] else "")
+        success_count = sum(1 for r in results if r['success'])
+        current_app.logger.info(f"Batch crawl: {success_count}/{len(urls)} succeeded")
+        return extracted
     except Exception as e:
-        current_app.logger.error(f"Crawl4AI batch API error: {e}")
-        return [""] * len(urls)  # Return empty strings for all URLs
+        current_app.logger.error(f"Batch crawl error: {e}")
+        return [""] * len(urls)
 
 
 def fallback_fetch(url: str) -> str:
@@ -201,14 +212,8 @@ def fallback_fetch(url: str) -> str:
 
 
 def check_crawl4ai_service() -> bool:
-    """
-    Check if Crawl4AI API service is available
-    """
-    try:
-        response = pooled_get(f"{CRAWL4AI_API_URL}/health", timeout=5)
-        return response.status_code == 200
-    except:
-        return False
+    """Check if web crawling is available (in-process, always True)."""
+    return True  # Native in-process — no external service to check
 
 
 def top5_results(query):
@@ -222,6 +227,8 @@ def top5_results(query):
 
     try:
         # Your existing Google search
+        if search is None:
+            return []
         top_2_search_res = search.results(query, 2)
         top_2_search_res_link = [res['link'] for res in top_2_search_res]
 
@@ -345,7 +352,9 @@ def top5_results(query):
     return final_res
 
 def parse_user_id(user_id:int):
-    url = 'http://azurekong.hertzai.com:8000/db/getstudent_by_user_id'
+    from core.config_cache import get_db_url
+    base = get_db_url() or 'https://mailer.hertzai.com'
+    url = f'{base}/getstudent_by_user_id'
 
     headers = {
         'Content-Type': 'application/json'
@@ -355,7 +364,7 @@ def parse_user_id(user_id:int):
         "user_id": user_id
     })
 
-    response = pooled_request("POST", url, headers=headers, data=payload)
+    response = pooled_request("POST", url, headers=headers, data=payload, timeout=15)
     return response.text
 
 def topological_sort(actions):
@@ -363,8 +372,8 @@ def topological_sort(actions):
     adj_list = {action["action_id"]: [] for action in actions}
     in_degree = {action["action_id"]: 0 for action in actions}
     action_map = {action["action_id"]: action for action in actions}  # Map ID to full action
-    current_app.logger.info(f'got the actions in topological function')
-    current_app.logger.info(f'the actions in topological function: - \n {actions}')
+    _safe_log('info', f'got the actions in topological function')
+    _safe_log('info', f'the actions in topological function: - \n {actions}')
     # Build the graph
     for action in actions:
 
@@ -545,10 +554,10 @@ def fix_json(json_text):
         response = pooled_post(url, headers=headers, data=payload)
         response = response.json()
         x = ast.literal_eval(response['text'])
-        current_app.logger.info(f'got json object')
+        _safe_log('info', f'got json object')
         return x
     except Exception as e:
-        current_app.logger.info(f'GOT ERROR WHILE JSON FIX:{e}')
+        _safe_log('info', f'GOT ERROR WHILE JSON FIX:{e}')
         return None
 
 
@@ -562,20 +571,27 @@ def retrieve_json(json_message):
         if prefix_match:
             json_message = prefix_match.group(1).strip()
 
+    # Normalize Unicode characters BEFORE any parse attempt (local LLMs emit these)
+    # U+2018/2019 = curly single quotes -> ASCII apostrophe
+    # U+201C/201D = curly double quotes -> ASCII quotation mark
+    # U+2014 = em-dash, U+2013 = en-dash -> ASCII hyphen-minus
+    json_message = (json_message
+        .replace("\u2018", "'").replace("\u2019", "'")
+        .replace("\u201c", '"').replace("\u201d", '"')
+        .replace("\u2014", "-").replace("\u2013", "-"))
+
     try:
         return json.loads(repair_json(json_message))
     except Exception as e:
-        current_app.logger.info(f'json_repair failed: {e}')
-
-    json_message = json_message.replace(''', "'").replace(''', "'").replace('"', '"').replace('"', '"')
+        _safe_log('info', f'json_repair failed: {e}')
 
     # Try using ast.literal_eval which can handle Python dict syntax with single quotes
     try:
         json_obj = ast.literal_eval(json_message)
-        current_app.logger.info('got json object using ast.literal_eval')
+        _safe_log('info', 'got json object using ast.literal_eval')
         return json_obj
     except Exception as e:
-        current_app.logger.info(f'ast.literal_eval failed: {e}')
+        _safe_log('info', f'ast.literal_eval failed: {e}')
         json_obj = None
 
     # Fall back to regex + json.loads approach with more careful quote handling
@@ -591,11 +607,11 @@ def retrieve_json(json_message):
             processed_json = re.sub(r':\s*\'([^\']*)\'', r': "\1"', processed_json)
 
             json_obj = json.loads(processed_json)
-            current_app.logger.info('got json object')
+            _safe_log('info', 'got json object')
             return json_obj
         return None
     except Exception as e:
-        current_app.logger.info(f'json processing failed: {e}')
+        _safe_log('info', f'json processing failed: {e}')
         json_obj = fix_json(json_message)
         return json_obj
 
@@ -1429,8 +1445,48 @@ def txt2img(text: Annotated[str, "Text to create image"]) -> str:
     return response.json()['img_url']
 
 
-def get_frame(user_id):
+def get_frame(user_id, frame_store=None):
+    """Get latest camera frame - FrameStore first, Redis fallback.
+
+    Args:
+        user_id: User/device ID.
+        frame_store: Optional FrameStore instance for direct injection.
+            Used by embedded devices running headless (no Flask app).
+    """
     current_app.logger.info('inside get_frame')
+
+    # Direct FrameStore injection (embedded headless mode)
+    if frame_store is not None:
+        frame_bytes = frame_store.get_frame(str(user_id))
+        if frame_bytes is not None:
+            import cv2
+            frame = cv2.imdecode(
+                np.frombuffer(frame_bytes, np.uint8), cv2.IMREAD_COLOR,
+            )
+            if frame is not None:
+                current_app.logger.info(
+                    f"Frame for user_id {user_id} from injected FrameStore")
+                return frame[:, :, ::-1]  # BGR → RGB
+
+    # Primary: FrameStore via VisionService (in-process, zero latency)
+    try:
+        from langchain_gpt_api import get_vision_service
+        svc = get_vision_service()
+        if svc:
+            frame_bytes = svc.store.get_frame(str(user_id))
+            if frame_bytes is not None:
+                import cv2
+                frame = cv2.imdecode(
+                    np.frombuffer(frame_bytes, np.uint8), cv2.IMREAD_COLOR,
+                )
+                if frame is not None:
+                    current_app.logger.info(
+                        f"Frame for user_id {user_id} from FrameStore")
+                    return frame[:, :, ::-1]  # BGR → RGB
+    except Exception:
+        pass
+
+    # Fallback: Redis (legacy path)
     serialized_frame = redis_client.get(user_id)
     current_app.logger.info('after redis client')
     try:
@@ -1438,7 +1494,7 @@ def get_frame(user_id):
             from security.safe_deserialize import safe_load_frame
             frame_bgr = safe_load_frame(serialized_frame)
             current_app.logger.info(
-                f"Frame for user_id {user_id} retrieved successfully.")
+                f"Frame for user_id {user_id} from Redis")
             frame = frame_bgr[:, :, ::-1]
             return frame
         else:
@@ -1460,7 +1516,8 @@ def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual c
         image = Image.fromarray(frame)
         # Save the image
         image.save(image_path)
-        url = "http://azurekong.hertzai.com:8000/minicpm/upload"
+        from core.config_cache import get_vision_api
+        url = get_vision_api() or "http://azurekong.hertzai.com:8000/minicpm/upload"
         payload = {
             'prompt': f'Instruction: Respond in second person point of view\ninput:-{inp}'}
         files = [
@@ -1469,13 +1526,13 @@ def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual c
         headers = {}
         try:
             response = pooled_post(
-                url, headers=headers, data=payload, files=files)
+                url, headers=headers, data=payload, files=files, timeout=30)
             current_app.logger.info(response.text)
             response = response.text
 
             return response
         except Exception as e:
-            current_app.logger.info('ERROR: Got error in visal QA')
+            current_app.logger.info('ERROR: Got error in visual QA: %s', e)
             return 'failed to get visual context ask user to check if the camera is turned on'
     else:
         return 'failed to get visual context ask user to check if the camera is turned on'
@@ -1571,7 +1628,7 @@ def get_visual_context(user_id,mins=5):
         This function help to extract action that user have perfomed till time
     '''
     # action_url = f"{ACTION_API}?user_id={user_id}"
-    action_url = f"https://mailer.hertzai.com/get_visual_bymins?user_id={user_id}&mins={mins}"
+    action_url = get_visual_context_api(user_id, mins)
     # Todo: get, and populate timezone from client
     time_zone = "Asia/Kolkata"
 
@@ -1612,9 +1669,9 @@ def get_visual_context(user_id,mins=5):
 def get_screen_context(user_id, mins=2):
     '''
         Get recent screen understanding descriptions (shorter window than visual).
-        Screen context goes stale faster — default 2 minute window.
+        Screen context goes stale faster - default 2 minute window.
     '''
-    action_url = f"https://mailer.hertzai.com/get_visual_bymins?user_id={user_id}&mins={mins}"
+    action_url = get_visual_context_api(user_id, mins)
     time_zone = "Asia/Kolkata"
     india_tz = pytz.timezone(time_zone)
 
@@ -1649,7 +1706,7 @@ def search_visual_history(user_id, query, mins=30, channel='both'):
         Reuses the same DB endpoint as get_visual_context/get_screen_context.
         channel: 'camera', 'screen', or 'both'
     '''
-    action_url = f"https://mailer.hertzai.com/get_visual_bymins?user_id={user_id}&mins={mins}"
+    action_url = get_visual_context_api(user_id, mins)
     time_zone = "Asia/Kolkata"
     india_tz = pytz.timezone(time_zone)
 
@@ -1727,13 +1784,24 @@ def history(user_id,prompt_id,role,message):
         return "Memory object not found"
 
 
-# Local llama.cpp server (Qwen3-VL)
-config_list = [{
-    "model": 'Qwen3-VL-4B-Instruct',
-    "api_key": 'dummy',
-    "base_url": 'http://localhost:8080/v1',
-    "price": [0, 0]
-}]
+# Mode-aware config_list: cloud/regional use external LLM, flat uses local llama.cpp
+_node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
+if _node_tier in ('regional', 'central') and os.environ.get('HEVOLVE_LLM_ENDPOINT_URL'):
+    config_list = [{
+        "model": os.environ.get('HEVOLVE_LLM_MODEL_NAME', 'gpt-4.1-mini'),
+        "api_key": os.environ.get('HEVOLVE_LLM_API_KEY', 'dummy'),
+        "base_url": os.environ['HEVOLVE_LLM_ENDPOINT_URL'],
+        "price": [0.0025, 0.01]
+    }]
+else:
+    from core.port_registry import get_port as _get_llm_port
+    _llama_port = os.environ.get('LLAMA_CPP_PORT', str(_get_llm_port('llm')))
+    config_list = [{
+        "model": 'Qwen3-VL-4B-Instruct',
+        "api_key": 'dummy',
+        "base_url": f'http://localhost:{_llama_port}/v1',
+        "price": [0, 0]
+    }]
 
 llm_config = {
     "config_list": config_list,
@@ -1746,7 +1814,7 @@ def create_visual_agent(user_id,prompt_id):
         name='visual_agent',
         llm_config=llm_config,
         max_consecutive_auto_reply=10,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
         code_execution_config={"work_dir": "coding", "use_docker": False},
         system_message="You are an helpful AI assistant used to perform visual based tasks given to you. "
     )
@@ -1755,7 +1823,7 @@ def create_visual_agent(user_id,prompt_id):
         name=f"UserProxy",
         human_input_mode="NEVER",
         llm_config=False,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
         max_consecutive_auto_reply=0,
         code_execution_config=False,
     )
@@ -1775,7 +1843,7 @@ def create_visual_agent(user_id,prompt_id):
             10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
             When writing code, always print the final response just before returning it.
         """,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
     executor2 = autogen.AssistantAgent(
         name="Executor",
@@ -1799,7 +1867,7 @@ def create_visual_agent(user_id,prompt_id):
             if you get any conversation which is not related to coding ask the manager to route this conversation to user
             When writing code, always print the final response just before returning it.
         ''',
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
     multi_role_agent2 = autogen.AssistantAgent(
         name="multi_role_agent",
@@ -1823,11 +1891,11 @@ def create_visual_agent(user_id,prompt_id):
             Only mark an action as "Completed" if the Assistant Agent confirms successful completion.
             For pending tasks or ongoing actions, respond to helper to complete the task.
             Verify the action performed by assistant and make sure the action is performed correctly as per instructions. if action performed was not as per instructions give the pending actions to the helper agent.
-            Report status only—do not perform actions yourself.
+            Report status only-do not perform actions yourself.
             Use "requires_breakdown" when an action is too complex and needs to be split into smaller subtasks.
 
         """,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
 
     chat_instructor2 = autogen.UserProxyAgent(
@@ -1836,7 +1904,7 @@ def create_visual_agent(user_id,prompt_id):
         max_consecutive_auto_reply=10,
         default_auto_reply="TERMINATE",
         code_execution_config=False,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
 
     context_handling = transform_messages.TransformMessages(
@@ -1855,10 +1923,38 @@ def create_visual_agent(user_id,prompt_id):
     return visual_agent, visual_user, helper2, executor2, multi_role_agent2, verify2, chat_instructor2
 
 
-# Create agent_data directory if it doesn't exist
-AGENT_DATA_DIR = "agent_data"
-if not os.path.exists(AGENT_DATA_DIR):
-    os.makedirs(AGENT_DATA_DIR)
+# Create agent_data directory if it doesn't exist.
+# When running from a read-only install dir (e.g. C:\Program Files on Windows),
+# derive the path from HEVOLVE_DB_PATH so writes go to a writable user directory.
+def _resolve_agent_data_dir():
+    """Resolve agent_data directory, preferring the DB path's parent for bundled apps."""
+    db_path = os.environ.get('HEVOLVE_DB_PATH', '')
+    if db_path and db_path != ':memory:' and os.path.isabs(db_path):
+        # Use sibling directory to the database file
+        return os.path.join(os.path.dirname(db_path), 'agent_data')
+    # Bundled/frozen mode: use writable user directory (Program Files is read-only)
+    from core.config_cache import is_bundled as _is_bundled_check
+    if _is_bundled_check():
+        try:
+            from core.platform_paths import get_agent_data_dir
+            return get_agent_data_dir()
+        except ImportError:
+            return os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data')
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'agent_data')
+
+AGENT_DATA_DIR = _resolve_agent_data_dir()
+try:
+    if not os.path.exists(AGENT_DATA_DIR):
+        os.makedirs(AGENT_DATA_DIR, exist_ok=True)
+except PermissionError:
+    # Fallback: user home directory (e.g. bundled app in Program Files)
+    try:
+        from core.platform_paths import get_agent_data_dir as _get_agent_fallback
+        AGENT_DATA_DIR = _get_agent_fallback()
+    except ImportError:
+        AGENT_DATA_DIR = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data')
+    os.makedirs(AGENT_DATA_DIR, exist_ok=True)
+    logging.getLogger(__name__).warning(f"agent_data dir redirected to {AGENT_DATA_DIR} (install dir not writable)")
 
 
 def get_agent_data_file_path(prompt_id: int) -> str:

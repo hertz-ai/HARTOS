@@ -281,7 +281,7 @@ class IMessageAdapter(ChannelAdapter):
             return None
 
         handle = msg_data.get("handle", {})
-        chat = msg_data.get("chat", {}) or msg_data.get("chats", [{}])[0] if msg_data.get("chats") else {}
+        chat = msg_data.get("chat", {}) or (msg_data.get("chats", [{}])[0] if msg_data.get("chats") else {})
 
         # Get sender info
         sender_id = handle.get("address", "") or handle.get("id", "")

@@ -89,7 +89,7 @@ class FeedImporter:
         """
         self.db = db_session
         self.timeout = timeout
-        self.user_agent = 'HevolveSocial/1.0 (+https://hevolve.ai)'
+        self.user_agent = 'HARTSocial/1.0 (+https://hevolve.ai)'
 
     def _detect_format(self, content: str) -> FeedFormat:
         """Detect feed format from content."""

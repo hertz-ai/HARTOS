@@ -14,6 +14,7 @@ from typing import Optional, Dict, Any
 from functools import wraps
 
 import requests
+from core.http_pool import pooled_post
 
 from .base import Message, ChannelConfig
 from .registry import ChannelRegistry, ChannelRegistryConfig, get_registry
@@ -30,15 +31,20 @@ class FlaskChannelIntegration:
 
     def __init__(
         self,
-        agent_api_url: str = "http://localhost:6777/chat",
+        agent_api_url: str = None,
         default_user_id: int = 10077,
         default_prompt_id: int = 8888,
         create_mode: bool = False,
+        device_id: str = None,
     ):
+        if agent_api_url is None:
+            from core.port_registry import get_port
+            agent_api_url = f"http://localhost:{get_port('backend')}/chat"
         self.agent_api_url = agent_api_url
         self.default_user_id = default_user_id
         self.default_prompt_id = default_prompt_id
         self.create_mode = create_mode
+        self._device_id = device_id
 
         self.registry = get_registry()
         self.registry.set_agent_handler(self._handle_message)
@@ -46,8 +52,9 @@ class FlaskChannelIntegration:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
 
-        # User session mapping: (channel, sender_id) -> (user_id, prompt_id)
-        self._user_sessions: Dict[tuple, tuple] = {}
+        # Persistent session manager (LRU cache + JSON persistence + 24h cleanup)
+        from .session_manager import get_session_manager
+        self._session_manager = get_session_manager()
 
     def _handle_message(self, message: Message) -> str:
         """
@@ -56,12 +63,16 @@ class FlaskChannelIntegration:
         Routes to Flask API and returns response.
         """
         try:
-            # Get or create user session
-            session_key = (message.channel, message.sender_id)
-            user_id, prompt_id = self._user_sessions.get(
-                session_key,
-                (self.default_user_id, self.default_prompt_id)
+            # Get or create persistent session (replaces plain dict)
+            session = self._session_manager.get_session(
+                message.channel, message.sender_id
             )
+            user_id = session.user_id if session and session.user_id else self.default_user_id
+            prompt_id = session.prompt_id if session and session.prompt_id else self.default_prompt_id
+
+            # Track message in session history
+            if session:
+                session.add_message('user', message.content)
 
             # Skip if group and bot not mentioned (configurable)
             adapter = self.registry.get(message.channel)
@@ -76,6 +87,7 @@ class FlaskChannelIntegration:
                 "prompt_id": prompt_id,
                 "prompt": message.content,
                 "create_agent": self.create_mode,
+                "device_id": self._device_id,
                 "channel_context": {
                     "channel": message.channel,
                     "sender_id": message.sender_id,
@@ -89,7 +101,7 @@ class FlaskChannelIntegration:
             logger.info(f"Routing message from {message.channel}:{message.sender_id} to agent")
 
             # Call agent API
-            response = requests.post(
+            response = pooled_post(
                 self.agent_api_url,
                 json=payload,
                 timeout=120,  # 2 minute timeout for agent processing
@@ -97,7 +109,33 @@ class FlaskChannelIntegration:
 
             if response.status_code == 200:
                 result = response.json()
-                return result.get("response", "I processed your request.")
+                agent_reply = result.get("response", "I processed your request.")
+
+                # Track response in session history
+                if session:
+                    session.add_message('assistant', agent_reply)
+
+                # Notify user's desktop UI about the channel interaction (Gap 6)
+                try:
+                    from langchain_gpt_api import publish_async
+                    notification = {
+                        "text": [f"[{message.channel}] {message.sender_name}: {message.content[:100]}"],
+                        "priority": 48,
+                        "action": "ChannelMessage",
+                        "channel": message.channel,
+                        "sender": message.sender_name,
+                        "response": agent_reply[:200],
+                        "historical_request_id": [],
+                        "options": [], "newoptions": [],
+                    }
+                    publish_async(
+                        f'com.hertzai.hevolve.chat.{user_id}',
+                        json.dumps(notification)
+                    )
+                except Exception:
+                    pass  # Non-blocking — notification is supplementary
+
+                return agent_reply
             else:
                 logger.error(f"Agent API error: {response.status_code} - {response.text}")
                 return "Sorry, I encountered an error processing your request."
@@ -146,7 +184,7 @@ class FlaskChannelIntegration:
         prompt_id: int,
     ) -> None:
         """Set user session mapping for a channel sender."""
-        self._user_sessions[(channel, sender_id)] = (user_id, prompt_id)
+        session = self._session_manager.get_session(channel, sender_id, user_id=user_id, prompt_id=prompt_id)
 
     def _run_async_loop(self) -> None:
         """Run asyncio event loop in background thread."""
@@ -227,6 +265,7 @@ def init_channels(app=None, config: Dict[str, Any] = None) -> FlaskChannelIntegr
         default_user_id=config.get("default_user_id", 10077),
         default_prompt_id=config.get("default_prompt_id", 8888),
         create_mode=config.get("create_mode", False),
+        device_id=config.get("device_id"),
     )
 
     global _integration

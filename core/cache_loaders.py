@@ -7,18 +7,52 @@ auto-restore evicted or expired entries from disk/Redis.
 """
 
 import os
+import sys
 import json
 import logging
 
 logger = logging.getLogger('hevolve_core')
 
-AGENT_DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'agent_data')
-PROMPTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'prompts')
+def _resolve_agent_data_dir():
+    db_path = os.environ.get('HEVOLVE_DB_PATH', '')
+    if db_path and db_path != ':memory:' and os.path.isabs(db_path):
+        return os.path.join(os.path.dirname(db_path), 'agent_data')
+    # Bundled/frozen mode: use cross-platform data dir (Program Files is read-only)
+    if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
+        try:
+            from core.platform_paths import get_agent_data_dir
+            return get_agent_data_dir()
+        except ImportError:
+            return os.path.join(
+                os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data')
+    return os.path.join(os.path.dirname(os.path.dirname(__file__)), 'agent_data')
+
+AGENT_DATA_DIR = _resolve_agent_data_dir()
+
+def _resolve_prompts_dir():
+    base = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'prompts')
+    if os.path.isdir(base):
+        return base
+    # Bundled mode fallback: cross-platform prompts dir
+    if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
+        try:
+            from core.platform_paths import get_prompts_dir
+            return get_prompts_dir()
+        except ImportError:
+            return os.path.join(
+                os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'prompts')
+    return base
+
+PROMPTS_DIR = _resolve_prompts_dir()
 
 
 def load_agent_data(prompt_id):
     """Load agent_data from disk. Key is prompt_id (int or str)."""
-    file_path = os.path.join(AGENT_DATA_DIR, f"{prompt_id}_agent_data.json")
+    # Sanitize to prevent path traversal
+    safe_id = str(prompt_id)
+    if not safe_id.replace('_', '').replace('-', '').isalnum():
+        return None
+    file_path = os.path.join(AGENT_DATA_DIR, f"{safe_id}_agent_data.json")
     if not os.path.exists(file_path):
         return None
 

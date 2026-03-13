@@ -1,0 +1,37 @@
+#include <tunables/global>
+
+/opt/hart/venv/bin/python {
+  #include <abstractions/base>
+  #include <abstractions/python>
+  #include <abstractions/nameservice>
+  #include <abstractions/ssl_certs>
+
+  # Application code (read-only)
+  /opt/hart/** r,
+  /opt/hart/venv/bin/python ix,
+
+  # Writable data directories
+  /var/lib/hart/** rw,
+  /var/lib/hart/hevolve_database.db rwk,
+  /var/lib/hart/agent_data/** rw,
+  /var/log/hart/** w,
+
+  # Config (read-only)
+  /etc/hart/** r,
+
+  # Network
+  network inet stream,
+  network inet dgram,
+  network inet6 stream,
+
+  # Deny sensitive
+  deny /etc/shadow r,
+  deny /root/** rw,
+  deny /home/*/.ssh/** rw,
+
+  # Temp
+  /tmp/** rw,
+  /proc/*/status r,
+  /proc/meminfo r,
+  /sys/class/drm/** r,
+}

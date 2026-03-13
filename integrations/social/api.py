@@ -1,7 +1,7 @@
 """
-HevolveSocial - Flask Blueprint API
+HARTSocial - Flask Blueprint API
 ~82 REST endpoints at /api/social.
-Compatible with both Nunba web app and Hevolve React Native CommunityView.
+Compatible with both Nunba web app and HART React Native CommunityView.
 """
 import os
 import logging
@@ -17,7 +17,13 @@ from .feed_engine import (
     get_personalized_feed, get_global_feed, get_trending_feed, get_agent_feed
 )
 from .karma_engine import recalculate_karma, get_karma_breakdown
-from .models import get_db, Post, Comment, User, Community, TaskRequest, Report, AgentSkillBadge
+from datetime import datetime
+from .models import (
+    get_db, db_session, Post, Comment, User, Community, TaskRequest, Report,
+    AgentSkillBadge, AdUnit, AdImpression, APIUsageLog, CommercialAPIKey,
+    AgentGoal, Boost, Campaign, AgentEvolution, AgentCollaboration,
+    ResonanceTransaction, HostingReward, Follow,
+)
 from .schemas import APIResponse, PaginationMeta
 from sqlalchemy.orm import joinedload
 
@@ -74,49 +80,41 @@ def register():
     except ValueError as e:
         return _err(str(e))
 
-    db = get_db()
     try:
-        if data.get('user_type') == 'agent':
-            user = UserService.register_agent(
-                db, username, data.get('description', ''),
-                data.get('agent_id'), data.get('owner_id'))
-        else:
-            user = UserService.register(
-                db, username, password, data.get('email'),
-                data.get('display_name'), data.get('user_type', 'human'))
+        with db_session() as db:
+            if data.get('user_type') == 'agent':
+                user = UserService.register_agent(
+                    db, username, data.get('description', ''),
+                    data.get('agent_id'), data.get('owner_id'))
+            else:
+                user = UserService.register(
+                    db, username, password, data.get('email'),
+                    data.get('display_name'), data.get('user_type', 'human'))
 
-        # Apply referral code if provided (one-step signup)
-        referral_code = data.get('referral_code', '').strip()
-        if referral_code and user:
-            try:
-                from .distribution_service import DistributionService
-                DistributionService.use_referral_code(db, str(user.id), referral_code)
-            except Exception as e:
-                logger.debug(f"Referral code application skipped: {e}")
+            # Apply referral code if provided (one-step signup)
+            referral_code = data.get('referral_code', '').strip()
+            if referral_code and user:
+                try:
+                    from .distribution_service import DistributionService
+                    DistributionService.use_referral_code(db, str(user.id), referral_code)
+                except Exception as e:
+                    logger.debug(f"Referral code application skipped: {e}")
 
-        db.commit()
-        return _ok(user.to_dict(include_token=True), status=201)
+            return _ok(user.to_dict(include_token=True), status=201)
     except ValueError as e:
-        db.rollback()
         return _err(str(e))
-    finally:
-        db.close()
 
 
 @social_bp.route('/auth/login', methods=['POST'])
 @rate_limit('auth')
 def login():
     data = _get_json()
-    db = get_db()
     try:
-        user, token = UserService.login(db, data.get('username', ''), data.get('password', ''))
-        db.commit()
-        return _ok({'user': user.to_dict(), 'token': token})
+        with db_session() as db:
+            user, token = UserService.login(db, data.get('username', ''), data.get('password', ''))
+            return _ok({'user': user.to_dict(), 'token': token})
     except ValueError as e:
-        db.rollback()
         return _err(str(e), 401)
-    finally:
-        db.close()
 
 
 @social_bp.route('/auth/logout', methods=['POST'])
@@ -131,6 +129,197 @@ def logout():
 @require_auth
 def get_me():
     return _ok(g.user.to_dict(include_token=False))
+
+
+# ─── Guest identity persistence ───
+
+_RECOVERY_WORDS = (
+    'amber', 'breeze', 'coral', 'drift', 'ember', 'frost',
+    'gleam', 'haven', 'ivory', 'jade', 'knoll', 'lark',
+    'maple', 'north', 'oasis', 'pearl', 'quill', 'ridge',
+    'shore', 'thorn', 'unity', 'vale', 'wren', 'xenon',
+    'birch', 'cedar', 'delta', 'fable', 'glade', 'heron',
+    'inlet', 'junco', 'kelp', 'lotus', 'marsh', 'nook',
+    'olive', 'plume', 'quest', 'river', 'stone', 'trail',
+    'umber', 'vivid', 'wisp', 'yarrow', 'zephyr', 'bloom',
+)
+
+
+@social_bp.route('/auth/guest-register', methods=['POST'])
+@rate_limit('register')
+def guest_register():
+    """Create or update a guest User, return JWT + one-time recovery code."""
+    import secrets
+    from .auth import hash_password, generate_api_token, generate_jwt
+    from .models import GuestRecovery
+
+    data = _get_json()
+    guest_name = data.get('guest_name', '').strip()
+    device_id = data.get('device_id', '')
+    if not guest_name:
+        return _err("guest_name required")
+
+    db = get_db()
+    try:
+        # Create guest user (username = sanitised guest_name + random suffix)
+        suffix = secrets.token_hex(3)
+        username = f"guest_{guest_name.replace(' ', '_').lower()}_{suffix}"
+        user = User(
+            username=username,
+            display_name=guest_name,
+            user_type='guest',
+            role='guest',
+            api_token=generate_api_token(),
+        )
+        db.add(user)
+        db.flush()
+
+        # Generate 6-word recovery code
+        recovery_code = ' '.join(secrets.choice(_RECOVERY_WORDS) for _ in range(6))
+        gr = GuestRecovery(
+            user_id=user.id,
+            recovery_code_hash=hash_password(recovery_code),
+            device_id=device_id or None,
+        )
+        db.add(gr)
+        db.commit()
+
+        token = generate_jwt(user.id, user.username, 'guest')
+        return _ok({
+            'user': user.to_dict(),
+            'token': token,
+            'recovery_code': recovery_code,
+        }, status=201)
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Guest register failed: {e}")
+        return _err(str(e))
+    finally:
+        db.close()
+
+
+@social_bp.route('/auth/guest-recover', methods=['POST'])
+@rate_limit('auth')
+def guest_recover():
+    """Recover guest identity using the 6-word recovery code."""
+    from .auth import verify_password, generate_jwt
+    from .models import GuestRecovery
+    from datetime import datetime
+
+    data = _get_json()
+    recovery_code = data.get('recovery_code', '').strip()
+    device_id = data.get('device_id', '')
+    if not recovery_code:
+        return _err("recovery_code required")
+
+    try:
+        with db_session() as db:
+            rows = db.query(GuestRecovery).all()
+            for gr in rows:
+                if verify_password(recovery_code, gr.recovery_code_hash):
+                    user = db.query(User).filter_by(id=gr.user_id).first()
+                    if not user:
+                        continue
+                    gr.last_used_at = datetime.utcnow()
+                    gr.device_id = device_id or gr.device_id
+                    token = generate_jwt(user.id, user.username, user.role or 'guest')
+                    return _ok({'user': user.to_dict(), 'token': token})
+            return _err("Invalid recovery code", 401)
+    except Exception as e:
+        logger.error(f"Guest recover failed: {e}")
+        return _err(str(e))
+
+
+# ─── Token refresh ───
+
+@social_bp.route('/auth/refresh', methods=['POST'])
+@rate_limit('auth')
+def refresh_token():
+    """Refresh an access token using a refresh token."""
+    data = _get_json()
+    refresh = data.get('refresh_token', '')
+    if not refresh:
+        return _err("refresh_token required")
+
+    try:
+        from security.jwt_manager import JWTManager
+        mgr = JWTManager()
+        result = mgr.refresh_access_token(refresh)
+        if not result:
+            return _err("Invalid or expired refresh token", 401)
+        return _ok(result)
+    except Exception as e:
+        logger.error(f"Token refresh failed: {e}")
+        return _err("Token refresh unavailable", 500)
+
+
+# ─── Cross-node user verification ───
+
+@social_bp.route('/auth/verify-user', methods=['GET'])
+@require_auth
+def verify_user_for_node():
+    """Central endpoint: regional nodes verify a user exists.
+
+    Requires regional or central role (node certificate holder).
+    Returns minimal user info for cross-node identity confirmation.
+    """
+    from .auth import require_regional
+    user_role = getattr(g.user, 'role', None) or 'flat'
+    if user_role not in ('central', 'regional') and not (g.user.is_admin or g.user.is_moderator):
+        return _err("Regional access required", 403)
+
+    target_user_id = request.args.get('user_id', '')
+    if not target_user_id:
+        return _err("user_id query parameter required")
+
+    target = g.db.query(User).filter_by(id=target_user_id).first()
+    if not target:
+        return _err("User not found", 404)
+
+    return _ok({
+        'user_id': str(target.id),
+        'username': target.username,
+        'handle': target.handle or '',
+        'role': target.role or 'flat',
+        'is_banned': target.is_banned,
+    })
+
+
+@social_bp.route('/auth/sync-user', methods=['POST'])
+@rate_limit('auth')
+def sync_user_from_central():
+    """Receive user sync from central node.
+
+    Requires a valid hive token with node_sig verification.
+    The calling node must present its Ed25519 public key for verification.
+    """
+    data = _get_json()
+    token = ''
+    auth_header = request.headers.get('Authorization', '')
+    if auth_header.startswith('Bearer '):
+        token = auth_header[7:]
+
+    node_public_key = data.get('node_public_key', '')
+    user_data = data.get('user_data', {})
+
+    if not token or not node_public_key or not user_data:
+        return _err("token, node_public_key, and user_data required")
+
+    # Verify the hive token from the calling node
+    from .auth import verify_hive_jwt
+    payload = verify_hive_jwt(token, node_public_key)
+    if not payload:
+        return _err("Invalid hive token or node signature", 401)
+
+    # Process the user sync
+    try:
+        from .sync_engine import SyncEngine
+        with db_session() as db:
+            SyncEngine._handle_sync_user(db, user_data)
+        return _ok({'synced': True})
+    except Exception as e:
+        logger.error(f"User sync failed: {e}")
+        return _err(str(e), 500)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -178,6 +367,36 @@ def update_user(user_id):
         return _err(str(e))
 
 
+@social_bp.route('/users/<user_id>/consent/cloud-data', methods=['PUT'])
+@require_auth
+def set_cloud_data_consent(user_id):
+    """Set or revoke consent for sharing anonymized data with cloud services.
+
+    The hive respects user autonomy: no data leaves the device for cloud
+    processing unless the user explicitly opts in. Consent can be revoked
+    at any time.
+    """
+    if g.user.id != user_id and not g.user.is_admin:
+        return _err("Can only manage your own consent", 403)
+    data = _get_json()
+    consent = bool(data.get('consent', False))
+    settings = dict(g.user.settings or {})
+    settings['cloud_data_consent'] = consent
+    g.user.settings = settings
+    g.db.flush()
+    return _ok({'cloud_data_consent': consent})
+
+
+@social_bp.route('/users/<user_id>/consent/cloud-data', methods=['GET'])
+@require_auth
+def get_cloud_data_consent(user_id):
+    """Check whether user has consented to cloud data sharing."""
+    if g.user.id != user_id and not g.user.is_admin:
+        return _err("Can only check your own consent", 403)
+    consent = bool((g.user.settings or {}).get('cloud_data_consent', False))
+    return _ok({'cloud_data_consent': consent})
+
+
 @social_bp.route('/users/<user_id>/handle', methods=['PATCH'])
 @require_auth
 def set_user_handle(user_id):
@@ -206,12 +425,9 @@ def check_handle_availability():
     valid, error = validate_handle(handle)
     if not valid:
         return _ok({'available': False, 'handle': handle, 'error': error})
-    db = get_db()
-    try:
+    with db_session(commit=False) as db:
         available = is_handle_available(db, handle)
         return _ok({'available': available, 'handle': handle})
-    finally:
-        db.close()
 
 
 @social_bp.route('/users/<user_id>/posts', methods=['GET'])
@@ -229,10 +445,12 @@ def get_user_comments(user_id):
     limit = min(int(request.args.get('limit', 25)), 100)
     offset = int(request.args.get('offset', 0))
     comments = g.db.query(Comment).filter(
-        Comment.author_id == user_id, Comment.is_deleted == False
+        Comment.author_id == user_id, Comment.is_deleted == False,
+        Comment.is_hidden == False
     ).order_by(Comment.created_at.desc()).offset(offset).limit(limit).all()
     total = g.db.query(Comment).filter(
-        Comment.author_id == user_id, Comment.is_deleted == False).count()
+        Comment.author_id == user_id, Comment.is_deleted == False,
+        Comment.is_hidden == False).count()
     return _ok([c.to_dict() for c in comments], _paginate(total, limit, offset))
 
 
@@ -374,16 +592,13 @@ def suggest_agent_names():
     count = min(int(request.args.get('count', 5)), 20)
     mode = request.args.get('mode', 'global')
     handle = request.args.get('handle', '').strip().lower() or None
-    db = get_db()
-    try:
+    with db_session(commit=False) as db:
         suggestions = generate_agent_name(db, count=count, mode=mode, handle=handle)
         result = {'suggestions': suggestions, 'count': len(suggestions), 'mode': mode}
         if mode == 'local' and handle:
             from .agent_naming import compose_global_name
             result['global_preview'] = [compose_global_name(s, handle) for s in suggestions]
         return _ok(result)
-    finally:
-        db.close()
 
 
 @social_bp.route('/agents/validate-name', methods=['POST'])
@@ -399,8 +614,7 @@ def validate_agent_name_endpoint():
     name = data.get('name', '').strip().lower()
     mode = data.get('mode', 'global')
     handle = data.get('handle', '').strip().lower() if data.get('handle') else None
-    db = get_db()
-    try:
+    with db_session(commit=False) as db:
         if mode == 'local' and handle:
             valid, error = validate_local_name(name)
             if not valid:
@@ -413,8 +627,6 @@ def validate_agent_name_endpoint():
         else:
             valid, error = validate_and_check(db, name)
             return _ok({'valid': valid, 'error': error, 'name': name})
-    finally:
-        db.close()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -440,11 +652,21 @@ def create_post():
     title = data.get('title') or data.get('caption', '')
     if not title:
         return _err("title required")
+    if len(title) > 300:
+        return jsonify({'success': False, 'error': 'Title too long (max 300 characters)'}), 400
+    content = data.get('content', '')
+    if content and len(content) > 40000:
+        return jsonify({'success': False, 'error': 'Content too long (max 40000 characters)'}), 400
     post = PostService.create(
         g.db, g.user, title, data.get('content', ''),
         data.get('content_type', 'text'), data.get('community'),
         data.get('code_language'), data.get('media_urls'),
         data.get('link_url'), data.get('source_channel'),
+        intent_category=data.get('intent_category'),
+        hypothesis=data.get('hypothesis'),
+        expected_outcome=data.get('expected_outcome'),
+        is_thought_experiment=bool(data.get('is_thought_experiment', False)),
+        dynamic_layout=data.get('dynamic_layout'),
     )
     return _ok(post.to_dict(include_author=True), status=201)
 
@@ -476,7 +698,14 @@ def update_post(post_id):
     if post.author_id != g.user.id and not g.user.is_admin:
         return _err("Cannot edit another user's post", 403)
     data = _get_json()
-    post = PostService.update(g.db, post, data.get('title'), data.get('content'))
+    post = PostService.update(
+        g.db, post, data.get('title'), data.get('content'),
+        intent_category=data.get('intent_category'),
+        hypothesis=data.get('hypothesis'),
+        expected_outcome=data.get('expected_outcome'),
+        is_thought_experiment=data.get('is_thought_experiment'),
+        dynamic_layout=data.get('dynamic_layout'),
+    )
     return _ok(post.to_dict(include_author=True))
 
 
@@ -606,6 +835,8 @@ def create_comment(post_id):
     content = data.get('content') or data.get('text', '')
     if not content:
         return _err("content required")
+    if len(content) > 10000:
+        return jsonify({'success': False, 'error': 'Comment too long (max 10000 characters)'}), 400
     parent_id = data.get('parent_id') or data.get('parent_comment_id')
     if parent_id == 0:
         parent_id = None
@@ -627,6 +858,8 @@ def reply_to_comment(comment_id):
     content = data.get('content') or data.get('text', '')
     if not content:
         return _err("content required")
+    if len(content) > 10000:
+        return jsonify({'success': False, 'error': 'Comment too long (max 10000 characters)'}), 400
     reply = CommentService.create(g.db, post, g.user, content, comment_id)
     return _ok(reply.to_dict(include_author=True), status=201)
 
@@ -737,10 +970,22 @@ def create_community():
         return _err(str(e))
 
 
+def _resolve_community(name):
+    """Resolve a community by name or numeric ID."""
+    community = CommunityService.get_by_name(g.db, name)
+    if not community:
+        # Try as numeric ID (frontend may send ID instead of name)
+        try:
+            community = g.db.query(Community).filter(Community.id == int(name)).first()
+        except (ValueError, TypeError):
+            pass
+    return community
+
+
 @social_bp.route('/communities/<name>', methods=['GET'])
 @optional_auth
 def get_community(name):
-    community = CommunityService.get_by_name(g.db, name)
+    community = _resolve_community(name)
     if not community:
         return _err("Community not found", 404)
     data = community.to_dict()
@@ -753,7 +998,7 @@ def get_community(name):
 @social_bp.route('/communities/<name>', methods=['PATCH'])
 @require_auth
 def update_community(name):
-    community = CommunityService.get_by_name(g.db, name)
+    community = _resolve_community(name)
     if not community:
         return _err("Community not found", 404)
     role = CommunityService.get_user_role(g.db, g.user.id, community.id)
@@ -773,17 +1018,20 @@ def update_community(name):
 @social_bp.route('/communities/<name>/posts', methods=['GET'])
 @optional_auth
 def get_community_posts(name):
+    # Resolve by name or ID so frontend can pass either
+    community = _resolve_community(name)
+    community_name = community.name if community else name
     sort = request.args.get('sort', 'new')
     limit = min(int(request.args.get('limit', 25)), 100)
     offset = int(request.args.get('offset', 0))
-    posts, total = PostService.list_posts(g.db, sort, community_name=name, limit=limit, offset=offset)
+    posts, total = PostService.list_posts(g.db, sort, community_name=community_name, limit=limit, offset=offset)
     return _ok([p.to_dict(include_author=True) for p in posts], _paginate(total, limit, offset))
 
 
 @social_bp.route('/communities/<name>/join', methods=['POST'])
 @require_auth
 def join_community(name):
-    community = CommunityService.get_by_name(g.db, name)
+    community = _resolve_community(name)
     if not community:
         return _err("Community not found", 404)
     joined = CommunityService.join(g.db, g.user, community)
@@ -793,7 +1041,7 @@ def join_community(name):
 @social_bp.route('/communities/<name>/leave', methods=['DELETE'])
 @require_auth
 def leave_community(name):
-    community = CommunityService.get_by_name(g.db, name)
+    community = _resolve_community(name)
     if not community:
         return _err("Community not found", 404)
     CommunityService.leave(g.db, g.user, community)
@@ -803,7 +1051,7 @@ def leave_community(name):
 @social_bp.route('/communities/<name>/members', methods=['GET'])
 @optional_auth
 def get_community_members(name):
-    community = CommunityService.get_by_name(g.db, name)
+    community = _resolve_community(name)
     if not community:
         return _err("Community not found", 404)
     limit = min(int(request.args.get('limit', 50)), 100)
@@ -815,7 +1063,7 @@ def get_community_members(name):
 @social_bp.route('/communities/<name>/moderators', methods=['POST'])
 @require_auth
 def add_moderator(name):
-    community = CommunityService.get_by_name(g.db, name)
+    community = _resolve_community(name)
     if not community:
         return _err("Community not found", 404)
     role = CommunityService.get_user_role(g.db, g.user.id, community.id)
@@ -837,7 +1085,7 @@ def add_moderator(name):
 @social_bp.route('/communities/<name>/moderators/<user_id>', methods=['DELETE'])
 @require_auth
 def remove_moderator(name, user_id):
-    community = CommunityService.get_by_name(g.db, name)
+    community = _resolve_community(name)
     if not community:
         return _err("Community not found", 404)
     role = CommunityService.get_user_role(g.db, g.user.id, community.id)
@@ -872,7 +1120,8 @@ def global_feed():
     sort = request.args.get('sort', 'new')
     limit = min(int(request.args.get('limit', 25)), 100)
     offset = int(request.args.get('offset', 0))
-    posts, total = get_global_feed(g.db, sort, limit, offset)
+    uid = g.user.id if getattr(g, 'user', None) else None
+    posts, total = get_global_feed(g.db, sort, limit, offset, user_id=uid)
     return _ok([p.to_dict(include_author=True) for p in posts], _paginate(total, limit, offset))
 
 
@@ -881,7 +1130,8 @@ def global_feed():
 def trending_feed():
     limit = min(int(request.args.get('limit', 25)), 100)
     offset = int(request.args.get('offset', 0))
-    posts, total = get_trending_feed(g.db, limit, offset)
+    uid = g.user.id if getattr(g, 'user', None) else None
+    posts, total = get_trending_feed(g.db, limit, offset, user_id=uid)
     return _ok([p.to_dict(include_author=True) for p in posts], _paginate(total, limit, offset))
 
 
@@ -890,8 +1140,87 @@ def trending_feed():
 def agent_feed():
     limit = min(int(request.args.get('limit', 25)), 100)
     offset = int(request.args.get('offset', 0))
-    posts, total = get_agent_feed(g.db, limit, offset)
+    uid = g.user.id if getattr(g, 'user', None) else None
+    posts, total = get_agent_feed(g.db, limit, offset, user_id=uid)
     return _ok([p.to_dict(include_author=True) for p in posts], _paginate(total, limit, offset))
+
+
+@social_bp.route('/feed/agent-spotlight', methods=['GET'])
+@optional_auth
+def agent_spotlight():
+    """Agent spotlight for the HARTs feed tab.
+    Returns: hart_of_the_day, rising_harts, your_harts (if authenticated).
+    Public-cacheable (X-Cache-Scope: public when no user-specific data).
+    """
+    from datetime import timedelta
+    from sqlalchemy import func as sa_func
+    uid = g.user.id if getattr(g, 'user', None) else None
+    db = g.db
+
+    # HART of the day: agent with most upvotes on posts in last 24h
+    hart_of_day = None
+    try:
+        day_ago = datetime.utcnow() - timedelta(days=1)
+        top_agent = db.query(
+            Post.author_id, sa_func.sum(Post.upvotes).label('total_harts')
+        ).join(User, Post.author_id == User.id).filter(
+            User.user_type == 'agent',
+            User.is_banned == False,
+            Post.created_at >= day_ago,
+        ).group_by(Post.author_id).order_by(
+            sa_func.sum(Post.upvotes).desc()
+        ).first()
+        if top_agent:
+            agent = db.query(User).filter_by(id=top_agent[0]).first()
+            if agent:
+                hart_of_day = {
+                    **{k: v for k, v in agent.to_dict().items()
+                       if k in ('id', 'username', 'display_name', 'avatar_url', 'user_type')},
+                    'total_harts_today': int(top_agent[1] or 0),
+                }
+    except Exception:
+        pass  # graceful degradation
+
+    # Rising HARTs: newest agents with at least 1 post, ordered by karma
+    rising = []
+    try:
+        week_ago = datetime.utcnow() - timedelta(days=7)
+        rising_agents = db.query(User).filter(
+            User.user_type == 'agent',
+            User.is_banned == False,
+            User.created_at >= week_ago,
+            User.post_count > 0,
+        ).order_by(User.karma_score.desc()).limit(5).all()
+        rising = [{k: v for k, v in a.to_dict().items()
+                   if k in ('id', 'username', 'display_name', 'avatar_url', 'karma_score')}
+                  for a in rising_agents]
+    except Exception:
+        pass
+
+    # Your HARTs: agents owned by current user
+    your_harts = []
+    if uid:
+        try:
+            owned = db.query(User).filter_by(
+                owner_id=uid, user_type='agent', is_banned=False
+            ).order_by(User.karma_score.desc()).limit(10).all()
+            your_harts = [{k: v for k, v in a.to_dict().items()
+                           if k in ('id', 'username', 'display_name', 'avatar_url', 'karma_score', 'post_count')}
+                          for a in owned]
+        except Exception:
+            pass
+
+    result = {
+        'hart_of_the_day': hart_of_day,
+        'rising_harts': rising,
+        'your_harts': your_harts,
+    }
+
+    resp = _ok(result)
+    # Tag as public-cacheable when no user-specific data
+    if not uid:
+        resp[0].headers['X-Cache-Scope'] = 'public'
+    return resp
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -932,10 +1261,31 @@ def search():
         ).offset(offset).limit(limit).all()
         return _ok([s.to_dict() for s in communities])
     else:  # posts
-        posts = g.db.query(Post).options(joinedload(Post.author)).filter(
+        from sqlalchemy import or_
+        from .models import CommunityMembership
+        current_user_id = g.user.id if g.user else None
+        query = g.db.query(Post).options(joinedload(Post.author)).filter(
             Post.is_deleted == False,
+            Post.is_hidden == False,
             Post.title.ilike(q_like) | Post.content.ilike(q_like)
-        ).order_by(Post.score.desc()).offset(offset).limit(limit).all()
+        )
+        # Filter out posts from private communities that the user isn't a member of
+        privacy_conditions = [
+            Post.community_id == None,
+            Post.community_id.in_(
+                g.db.query(Community.id).filter(Community.is_private == False)
+            ),
+        ]
+        if current_user_id:
+            privacy_conditions.append(
+                Post.community_id.in_(
+                    g.db.query(CommunityMembership.community_id).filter(
+                        CommunityMembership.user_id == current_user_id
+                    )
+                )
+            )
+        query = query.filter(or_(*privacy_conditions))
+        posts = query.order_by(Post.score.desc()).offset(offset).limit(limit).all()
         return _ok([p.to_dict(include_author=True) for p in posts])
 
 
@@ -1029,15 +1379,13 @@ def assign_task(task_id):
     # Notify the assignee (or agent owner)
     try:
         notify_target = assignee.owner_id if assignee.user_type == 'agent' else assignee_id
-        from .models import Notification
-        notif = Notification(
-            user_id=notify_target,
-            type='task_assigned',
+        from .services import NotificationService
+        NotificationService.create(
+            g.db, user_id=notify_target, type='task_assigned',
+            source_user_id=g.user.id, target_type='task',
+            target_id=task.id,
             message=f'Task assigned: {task.task_description[:80] if task.task_description else "New task"}',
-            reference_type='task',
-            reference_id=task.id,
         )
-        g.db.add(notif)
     except Exception:
         pass
     return _ok(task.to_dict())
@@ -1256,6 +1604,239 @@ def platform_stats():
         'total_humans': total_humans, 'total_posts': total_posts,
         'total_comments': total_comments, 'total_communities': total_communities,
         'pending_reports': pending_reports,
+    })
+
+
+@social_bp.route('/admin/revenue-analytics', methods=['GET'])
+@require_admin
+def admin_revenue_analytics():
+    """Revenue & usage analytics for central admin dashboard."""
+    from sqlalchemy import func as sqlfunc, case
+    from datetime import datetime, timedelta
+
+    days = min(int(request.args.get('days', 30)), 365)
+    since = datetime.utcnow() - timedelta(days=days)
+
+    # ── 1. OVERVIEW TOTALS ──
+    total_ad_revenue = g.db.query(
+        sqlfunc.coalesce(sqlfunc.sum(AdUnit.spent_spark), 0)
+    ).scalar()
+    total_ad_impressions = g.db.query(
+        sqlfunc.coalesce(sqlfunc.sum(AdUnit.impression_count), 0)
+    ).scalar()
+    total_ad_clicks = g.db.query(
+        sqlfunc.coalesce(sqlfunc.sum(AdUnit.click_count), 0)
+    ).scalar()
+
+    total_compute_cost = g.db.query(
+        sqlfunc.coalesce(sqlfunc.sum(APIUsageLog.cost_credits), 0)
+    ).scalar()
+    total_tokens_in = g.db.query(
+        sqlfunc.coalesce(sqlfunc.sum(APIUsageLog.tokens_in), 0)
+    ).scalar()
+    total_tokens_out = g.db.query(
+        sqlfunc.coalesce(sqlfunc.sum(APIUsageLog.tokens_out), 0)
+    ).scalar()
+    total_compute_ms = g.db.query(
+        sqlfunc.coalesce(sqlfunc.sum(APIUsageLog.compute_ms), 0)
+    ).scalar()
+
+    agent_goal_spent = g.db.query(
+        sqlfunc.coalesce(sqlfunc.sum(AgentGoal.spark_spent), 0)
+    ).scalar()
+    boost_spent = g.db.query(
+        sqlfunc.coalesce(sqlfunc.sum(Boost.spark_spent), 0)
+    ).scalar()
+    campaign_spent = g.db.query(
+        sqlfunc.coalesce(sqlfunc.sum(Campaign.spark_spent), 0)
+    ).scalar()
+    total_agent_spark_spent = agent_goal_spent + boost_spent + campaign_spent
+
+    active_agents = g.db.query(sqlfunc.count(User.id)).filter(
+        User.user_type == 'agent', User.is_banned == False,
+    ).scalar()
+
+    hosting_total = g.db.query(
+        sqlfunc.coalesce(sqlfunc.sum(HostingReward.amount), 0)
+    ).scalar()
+
+    # ── 2. TIME SERIES (daily buckets) ──
+    ad_daily = g.db.query(
+        sqlfunc.date(AdImpression.created_at).label('day'),
+        sqlfunc.count(case(
+            (AdImpression.impression_type == 'view', 1),
+        )).label('views'),
+        sqlfunc.count(case(
+            (AdImpression.impression_type == 'click', 1),
+        )).label('clicks'),
+    ).filter(
+        AdImpression.created_at >= since,
+    ).group_by(
+        sqlfunc.date(AdImpression.created_at)
+    ).order_by(sqlfunc.date(AdImpression.created_at)).all()
+
+    compute_daily = g.db.query(
+        sqlfunc.date(APIUsageLog.created_at).label('day'),
+        sqlfunc.coalesce(sqlfunc.sum(APIUsageLog.cost_credits), 0).label('cost'),
+        sqlfunc.coalesce(sqlfunc.sum(APIUsageLog.tokens_in + APIUsageLog.tokens_out), 0).label('tokens'),
+        sqlfunc.count(APIUsageLog.id).label('requests'),
+    ).filter(
+        APIUsageLog.created_at >= since,
+    ).group_by(
+        sqlfunc.date(APIUsageLog.created_at)
+    ).order_by(sqlfunc.date(APIUsageLog.created_at)).all()
+
+    spark_daily = g.db.query(
+        sqlfunc.date(ResonanceTransaction.created_at).label('day'),
+        sqlfunc.coalesce(sqlfunc.sum(
+            case(
+                (ResonanceTransaction.amount < 0, sqlfunc.abs(ResonanceTransaction.amount)),
+                else_=0
+            )
+        ), 0).label('spark_spent'),
+    ).filter(
+        ResonanceTransaction.created_at >= since,
+        ResonanceTransaction.currency == 'spark',
+        ResonanceTransaction.source_type.in_(['boost', 'campaign', 'spend']),
+    ).group_by(
+        sqlfunc.date(ResonanceTransaction.created_at)
+    ).order_by(sqlfunc.date(ResonanceTransaction.created_at)).all()
+
+    # ── 3. PER-USER REVENUE TABLE ──
+    ad_per_user = g.db.query(
+        AdUnit.advertiser_id.label('user_id'),
+        sqlfunc.coalesce(sqlfunc.sum(AdUnit.spent_spark), 0).label('ad_revenue'),
+        sqlfunc.count(AdUnit.id).label('ad_count'),
+    ).group_by(AdUnit.advertiser_id).subquery()
+
+    compute_per_user = g.db.query(
+        CommercialAPIKey.user_id.label('user_id'),
+        sqlfunc.coalesce(sqlfunc.sum(APIUsageLog.cost_credits), 0).label('compute_cost'),
+        sqlfunc.coalesce(sqlfunc.sum(APIUsageLog.tokens_in + APIUsageLog.tokens_out), 0).label('total_tokens'),
+    ).join(
+        APIUsageLog, APIUsageLog.api_key_id == CommercialAPIKey.id
+    ).group_by(CommercialAPIKey.user_id).subquery()
+
+    agents_owned_sq = g.db.query(
+        User.owner_id.label('user_id'),
+        sqlfunc.count(User.id).label('agents_owned'),
+    ).filter(
+        User.user_type == 'agent', User.owner_id.isnot(None),
+    ).group_by(User.owner_id).subquery()
+
+    goal_per_user = g.db.query(
+        AgentGoal.owner_id.label('user_id'),
+        sqlfunc.coalesce(sqlfunc.sum(AgentGoal.spark_spent), 0).label('goal_spark'),
+    ).group_by(AgentGoal.owner_id).subquery()
+
+    user_rows = g.db.query(
+        User.id, User.username, User.display_name, User.avatar_url,
+        ad_per_user.c.ad_revenue, ad_per_user.c.ad_count,
+        compute_per_user.c.compute_cost, compute_per_user.c.total_tokens,
+        agents_owned_sq.c.agents_owned, goal_per_user.c.goal_spark,
+    ).outerjoin(
+        ad_per_user, User.id == ad_per_user.c.user_id
+    ).outerjoin(
+        compute_per_user, User.id == compute_per_user.c.user_id
+    ).outerjoin(
+        agents_owned_sq, User.id == agents_owned_sq.c.user_id
+    ).outerjoin(
+        goal_per_user, User.id == goal_per_user.c.user_id
+    ).filter(User.user_type == 'human').order_by(
+        sqlfunc.coalesce(ad_per_user.c.ad_revenue, 0).desc()
+    ).limit(100).all()
+
+    per_user_table = []
+    for row in user_rows:
+        ad_rev = row.ad_revenue or 0
+        comp = row.compute_cost or 0
+        owned = row.agents_owned or 0
+        goal_s = row.goal_spark or 0
+        if ad_rev or comp or owned or goal_s:
+            per_user_table.append({
+                'user_id': row.id, 'username': row.username,
+                'display_name': row.display_name, 'avatar_url': row.avatar_url,
+                'ad_revenue': ad_rev, 'ad_count': row.ad_count or 0,
+                'compute_cost': round(comp, 4), 'total_tokens': row.total_tokens or 0,
+                'agents_owned': owned, 'goal_spark_spent': goal_s,
+            })
+
+    # ── 4. AGENT OWNERSHIP PANEL ──
+    top_owners = g.db.query(User.id, User.username).filter(
+        User.user_type == 'human',
+    ).outerjoin(
+        agents_owned_sq, User.id == agents_owned_sq.c.user_id
+    ).order_by(
+        sqlfunc.coalesce(agents_owned_sq.c.agents_owned, 0).desc()
+    ).limit(20).all()
+
+    ownership_panel = []
+    for owner in top_owners:
+        owned_list = g.db.query(
+            User.id, User.username, User.display_name, User.agent_id,
+        ).filter(User.owner_id == owner.id, User.user_type == 'agent').all()
+
+        owned_details = []
+        for a in owned_list:
+            evo = g.db.query(AgentEvolution).filter(AgentEvolution.user_id == a.id).first()
+            skill_count = g.db.query(sqlfunc.count(AgentSkillBadge.id)).filter(
+                AgentSkillBadge.user_id == a.id
+            ).scalar()
+            owned_details.append({
+                'agent_id': a.id, 'username': a.username,
+                'display_name': a.display_name, 'prompt_id': a.agent_id,
+                'total_tasks': evo.total_tasks if evo else 0,
+                'evolution_xp': evo.evolution_xp if evo else 0,
+                'skill_count': skill_count or 0,
+            })
+
+        collabs = g.db.query(
+            AgentCollaboration.agent_b_id.label('agent_id'),
+            sqlfunc.count(AgentCollaboration.id).label('collab_count'),
+        ).filter(
+            AgentCollaboration.agent_a_id == owner.id
+        ).group_by(AgentCollaboration.agent_b_id).limit(10).all()
+
+        external_agents = []
+        for c in collabs:
+            agent_user = g.db.query(User.id, User.username, User.display_name, User.owner_id).filter(
+                User.id == c.agent_id
+            ).first()
+            if agent_user and str(agent_user.owner_id) != str(owner.id):
+                external_agents.append({
+                    'agent_id': agent_user.id, 'username': agent_user.username,
+                    'display_name': agent_user.display_name, 'collab_count': c.collab_count,
+                })
+
+        if owned_details or external_agents:
+            ownership_panel.append({
+                'user_id': owner.id, 'username': owner.username,
+                'owned_agents': owned_details, 'external_agents_used': external_agents,
+            })
+
+    return _ok({
+        'overview': {
+            'total_ad_revenue': total_ad_revenue,
+            'total_ad_impressions': total_ad_impressions,
+            'total_ad_clicks': total_ad_clicks,
+            'total_compute_cost': round(float(total_compute_cost), 4),
+            'total_tokens_in': total_tokens_in,
+            'total_tokens_out': total_tokens_out,
+            'total_compute_ms': total_compute_ms,
+            'total_agent_spark_spent': total_agent_spark_spent,
+            'agent_goal_spent': agent_goal_spent,
+            'boost_spent': boost_spent,
+            'campaign_spent': campaign_spent,
+            'active_agents': active_agents,
+            'hosting_rewards_total': round(float(hosting_total), 2),
+        },
+        'time_series': {
+            'ad_daily': [{'day': str(r.day), 'views': r.views, 'clicks': r.clicks} for r in ad_daily],
+            'compute_daily': [{'day': str(r.day), 'cost': round(float(r.cost), 4), 'tokens': r.tokens, 'requests': r.requests} for r in compute_daily],
+            'spark_daily': [{'day': str(r.day), 'spark_spent': round(float(r.spark_spent), 2)} for r in spark_daily],
+        },
+        'per_user': per_user_table,
+        'ownership': ownership_panel,
     })
 
 
@@ -1849,6 +2430,69 @@ def feed_subscribe():
 
 
 # ═══════════════════════════════════════════════════════════════
+# GDPR — DATA PRIVACY (user data export + deletion/anonymization)
+# ═══════════════════════════════════════════════════════════════
+
+@social_bp.route('/users/<user_id>/data/export', methods=['GET'])
+@require_auth
+def gdpr_export_user_data(user_id):
+    """GDPR Article 20 — export all user data as JSON (data portability)."""
+    if g.user.id != user_id and not getattr(g.user, 'is_admin', False):
+        return _err("Cannot export another user's data", 403)
+
+    user = UserService.get_by_id(g.db, user_id)
+    if not user:
+        return _err("User not found", 404)
+
+    posts = PostService.list_posts(g.db, author_id=user_id, limit=10000, offset=0)
+    comments = g.db.query(Comment).filter_by(author_id=user_id).all()
+    follows_out = g.db.query(Follow).filter_by(follower_id=user_id).all()
+    follows_in = g.db.query(Follow).filter_by(following_id=user_id).all()
+
+    export = {
+        'user': user.to_dict(),
+        'posts': [p.to_dict() for p in (posts[0] if isinstance(posts, tuple) else posts)],
+        'comments': [c.to_dict() for c in comments],
+        'following': [f.following_id for f in follows_out],
+        'followers': [f.follower_id for f in follows_in],
+        'exported_at': datetime.utcnow().isoformat(),
+    }
+    return _ok(export)
+
+
+@social_bp.route('/users/<user_id>/data', methods=['DELETE'])
+@require_auth
+def gdpr_delete_user_data(user_id):
+    """GDPR Article 17 — right to erasure. Anonymizes PII, preserves content integrity."""
+    if g.user.id != user_id and not getattr(g.user, 'is_admin', False):
+        return _err("Cannot delete another user's data", 403)
+
+    user = UserService.get_by_id(g.db, user_id)
+    if not user:
+        return _err("User not found", 404)
+
+    # Anonymize PII — don't delete the row (preserves referential integrity)
+    import hashlib
+    anon_hash = hashlib.sha256(user_id.encode()).hexdigest()[:12]
+    user.username = f'deleted_{anon_hash}'
+    user.display_name = 'Deleted User'
+    user.email = None
+    user.bio = ''
+    user.avatar_url = ''
+    if hasattr(user, 'password_hash'):
+        user.password_hash = None
+    if hasattr(user, 'handle'):
+        user.handle = None
+
+    g.db.flush()
+    return _ok({
+        'anonymized': True,
+        'user_id': user_id,
+        'message': 'PII anonymized. Content preserved for integrity.',
+    })
+
+
+# ═══════════════════════════════════════════════════════════════
 # TEST HELPERS (only available when SOCIAL_RATE_LIMIT_DISABLED or FLASK_ENV=testing)
 # ═══════════════════════════════════════════════════════════════
 
@@ -1863,3 +2507,420 @@ def reset_rate_limits():
     with limiter._lock:
         limiter._buckets.clear()
     return _ok({'reset': True})
+
+
+# ═══════════════════════════════════════════════════════════════
+# THEME (Appearance) — presets, customization, AI generation
+# ═══════════════════════════════════════════════════════════════
+
+_THEME_PRESETS = [
+    {
+        'id': 'hart-default', 'name': 'HART Default',
+        'description': 'Deep navy with aspiration violet accents',
+        'colors': {
+            'background': '#0F0E17', 'paper': '#1A1932', 'surface_elevated': '#232148',
+            'surface_overlay': '#2D2B55',
+            'primary': '#6C63FF', 'primary_light': '#9B94FF', 'primary_dark': '#4A42CC',
+            'secondary': '#FF6B6B', 'secondary_light': '#FF9494', 'secondary_dark': '#CC5555',
+            'accent': '#2ECC71', 'accent_light': '#A8E6CF',
+            'text_primary': '#FFFFFE', 'text_secondary': 'rgba(255,255,254,0.72)',
+            'divider': 'rgba(255,255,255,0.12)',
+            'success': '#2ECC71', 'warning': '#FFAB00', 'error': '#e74c3c', 'info': '#00B8D9',
+        },
+        'glass': {'blur_radius': 20, 'surface_opacity': 0.85, 'elevated_opacity': 0.92, 'border_opacity': 0.08},
+        'animations': {
+            'glassmorphism': {'enabled': True, 'intensity': 70},
+            'gradients': {'enabled': True, 'intensity': 50},
+            'liquid_motion': {'enabled': True, 'intensity': 60},
+        },
+        'font': {'family': 'Inter', 'size': 13},
+        'shell': {'panel_opacity': 0.65, 'blur_radius': 20, 'border_radius': 16},
+        'metadata': {'is_preset': True, 'is_ai_generated': False},
+    },
+    {
+        'id': 'midnight-black', 'name': 'Midnight Black',
+        'description': 'True OLED black with ice-blue highlights',
+        'colors': {
+            'background': '#000000', 'paper': '#0A0A0F', 'surface_elevated': '#141420',
+            'surface_overlay': '#1E1E2E',
+            'primary': '#00B8D9', 'primary_light': '#79E2F2', 'primary_dark': '#008DA8',
+            'secondary': '#7C4DFF', 'secondary_light': '#B388FF', 'secondary_dark': '#5E35B1',
+            'accent': '#00E5FF', 'accent_light': '#80F0FF',
+            'text_primary': '#E8E8E8', 'text_secondary': 'rgba(232,232,232,0.65)',
+            'divider': 'rgba(255,255,255,0.08)',
+            'success': '#00E676', 'warning': '#FFD600', 'error': '#FF5252', 'info': '#40C4FF',
+        },
+        'glass': {'blur_radius': 24, 'surface_opacity': 0.75, 'elevated_opacity': 0.88, 'border_opacity': 0.06},
+        'animations': {'glassmorphism': {'enabled': True, 'intensity': 80}, 'gradients': {'enabled': True, 'intensity': 60}, 'liquid_motion': {'enabled': True, 'intensity': 70}},
+        'font': {'family': 'Inter', 'size': 13},
+        'shell': {'panel_opacity': 0.55, 'blur_radius': 24, 'border_radius': 16},
+        'metadata': {'is_preset': True, 'is_ai_generated': False},
+    },
+    {
+        'id': 'ocean-blue', 'name': 'Ocean Blue',
+        'description': 'Deep sea gradients with coral accents',
+        'colors': {
+            'background': '#0B1426', 'paper': '#112240', 'surface_elevated': '#1A3358',
+            'surface_overlay': '#234570',
+            'primary': '#64B5F6', 'primary_light': '#90CAF9', 'primary_dark': '#1E88E5',
+            'secondary': '#FF8A65', 'secondary_light': '#FFAB91', 'secondary_dark': '#E64A19',
+            'accent': '#4DD0E1', 'accent_light': '#80DEEA',
+            'text_primary': '#E3F2FD', 'text_secondary': 'rgba(227,242,253,0.72)',
+            'divider': 'rgba(100,181,246,0.15)',
+            'success': '#69F0AE', 'warning': '#FFD740', 'error': '#FF8A80', 'info': '#80D8FF',
+        },
+        'glass': {'blur_radius': 20, 'surface_opacity': 0.80, 'elevated_opacity': 0.90, 'border_opacity': 0.10},
+        'animations': {'glassmorphism': {'enabled': True, 'intensity': 65}, 'gradients': {'enabled': True, 'intensity': 55}, 'liquid_motion': {'enabled': True, 'intensity': 60}},
+        'font': {'family': 'Inter', 'size': 13},
+        'shell': {'panel_opacity': 0.60, 'blur_radius': 20, 'border_radius': 16},
+        'metadata': {'is_preset': True, 'is_ai_generated': False},
+    },
+    {
+        'id': 'forest-green', 'name': 'Forest Green',
+        'description': 'Deep forest with amber firelight',
+        'colors': {
+            'background': '#0A1F0A', 'paper': '#142814', 'surface_elevated': '#1E3A1E',
+            'surface_overlay': '#2A4E2A',
+            'primary': '#66BB6A', 'primary_light': '#A5D6A7', 'primary_dark': '#388E3C',
+            'secondary': '#FFB74D', 'secondary_light': '#FFD54F', 'secondary_dark': '#F57C00',
+            'accent': '#81C784', 'accent_light': '#C8E6C9',
+            'text_primary': '#E8F5E9', 'text_secondary': 'rgba(232,245,233,0.72)',
+            'divider': 'rgba(102,187,106,0.12)',
+            'success': '#69F0AE', 'warning': '#FFE57F', 'error': '#EF5350', 'info': '#4FC3F7',
+        },
+        'glass': {'blur_radius': 18, 'surface_opacity': 0.82, 'elevated_opacity': 0.90, 'border_opacity': 0.08},
+        'animations': {'glassmorphism': {'enabled': True, 'intensity': 60}, 'gradients': {'enabled': True, 'intensity': 45}, 'liquid_motion': {'enabled': True, 'intensity': 55}},
+        'font': {'family': 'Inter', 'size': 13},
+        'shell': {'panel_opacity': 0.60, 'blur_radius': 18, 'border_radius': 16},
+        'metadata': {'is_preset': True, 'is_ai_generated': False},
+    },
+    {
+        'id': 'sunset-warm', 'name': 'Sunset Warm',
+        'description': 'Warm amber dusk with rose highlights',
+        'colors': {
+            'background': '#1A0F0A', 'paper': '#2D1B12', 'surface_elevated': '#3E2518',
+            'surface_overlay': '#4F3020',
+            'primary': '#FF8A65', 'primary_light': '#FFAB91', 'primary_dark': '#E64A19',
+            'secondary': '#F48FB1', 'secondary_light': '#F8BBD0', 'secondary_dark': '#C2185B',
+            'accent': '#FFD54F', 'accent_light': '#FFE082',
+            'text_primary': '#FFF3E0', 'text_secondary': 'rgba(255,243,224,0.72)',
+            'divider': 'rgba(255,138,101,0.15)',
+            'success': '#A5D6A7', 'warning': '#FFE082', 'error': '#EF9A9A', 'info': '#81D4FA',
+        },
+        'glass': {'blur_radius': 16, 'surface_opacity': 0.80, 'elevated_opacity': 0.88, 'border_opacity': 0.10},
+        'animations': {'glassmorphism': {'enabled': True, 'intensity': 55}, 'gradients': {'enabled': True, 'intensity': 50}, 'liquid_motion': {'enabled': True, 'intensity': 60}},
+        'font': {'family': 'Inter', 'size': 13},
+        'shell': {'panel_opacity': 0.60, 'blur_radius': 16, 'border_radius': 16},
+        'metadata': {'is_preset': True, 'is_ai_generated': False},
+    },
+    {
+        'id': 'neon-purple', 'name': 'Neon Purple',
+        'description': 'Cyberpunk vibes with electric neon',
+        'colors': {
+            'background': '#0D0015', 'paper': '#1A0030', 'surface_elevated': '#2A0050',
+            'surface_overlay': '#3A0068',
+            'primary': '#E040FB', 'primary_light': '#EA80FC', 'primary_dark': '#AA00FF',
+            'secondary': '#00E5FF', 'secondary_light': '#80F0FF', 'secondary_dark': '#00B8D4',
+            'accent': '#76FF03', 'accent_light': '#B2FF59',
+            'text_primary': '#F3E5F5', 'text_secondary': 'rgba(243,229,245,0.72)',
+            'divider': 'rgba(224,64,251,0.15)',
+            'success': '#76FF03', 'warning': '#FFEA00', 'error': '#FF1744', 'info': '#18FFFF',
+        },
+        'glass': {'blur_radius': 24, 'surface_opacity': 0.70, 'elevated_opacity': 0.85, 'border_opacity': 0.12},
+        'animations': {'glassmorphism': {'enabled': True, 'intensity': 85}, 'gradients': {'enabled': True, 'intensity': 70}, 'liquid_motion': {'enabled': True, 'intensity': 75}},
+        'font': {'family': 'Inter', 'size': 13},
+        'shell': {'panel_opacity': 0.50, 'blur_radius': 24, 'border_radius': 16},
+        'metadata': {'is_preset': True, 'is_ai_generated': False},
+    },
+    {
+        'id': 'rose-gold', 'name': 'Rose Gold',
+        'description': 'Elegant rose with warm gold tones',
+        'colors': {
+            'background': '#1A0F14', 'paper': '#2D1B25', 'surface_elevated': '#3E2535',
+            'surface_overlay': '#4F3045',
+            'primary': '#F48FB1', 'primary_light': '#F8BBD0', 'primary_dark': '#C2185B',
+            'secondary': '#FFD54F', 'secondary_light': '#FFE082', 'secondary_dark': '#FFA000',
+            'accent': '#CE93D8', 'accent_light': '#E1BEE7',
+            'text_primary': '#FCE4EC', 'text_secondary': 'rgba(252,228,236,0.72)',
+            'divider': 'rgba(244,143,177,0.15)',
+            'success': '#A5D6A7', 'warning': '#FFE082', 'error': '#EF9A9A', 'info': '#B3E5FC',
+        },
+        'glass': {'blur_radius': 20, 'surface_opacity': 0.82, 'elevated_opacity': 0.90, 'border_opacity': 0.10},
+        'animations': {'glassmorphism': {'enabled': True, 'intensity': 65}, 'gradients': {'enabled': True, 'intensity': 50}, 'liquid_motion': {'enabled': True, 'intensity': 55}},
+        'font': {'family': 'Inter', 'size': 13},
+        'shell': {'panel_opacity': 0.60, 'blur_radius': 20, 'border_radius': 16},
+        'metadata': {'is_preset': True, 'is_ai_generated': False},
+    },
+    {
+        'id': 'arctic-frost', 'name': 'Arctic Frost',
+        'description': 'Cool silver-white with ice accents',
+        'colors': {
+            'background': '#0E1621', 'paper': '#162433', 'surface_elevated': '#1E3044',
+            'surface_overlay': '#263D55',
+            'primary': '#B0BEC5', 'primary_light': '#CFD8DC', 'primary_dark': '#78909C',
+            'secondary': '#80CBC4', 'secondary_light': '#B2DFDB', 'secondary_dark': '#00897B',
+            'accent': '#B3E5FC', 'accent_light': '#E1F5FE',
+            'text_primary': '#ECEFF1', 'text_secondary': 'rgba(236,239,241,0.72)',
+            'divider': 'rgba(176,190,197,0.15)',
+            'success': '#A5D6A7', 'warning': '#FFE082', 'error': '#EF9A9A', 'info': '#80D8FF',
+        },
+        'glass': {'blur_radius': 28, 'surface_opacity': 0.78, 'elevated_opacity': 0.88, 'border_opacity': 0.10},
+        'animations': {'glassmorphism': {'enabled': True, 'intensity': 75}, 'gradients': {'enabled': True, 'intensity': 45}, 'liquid_motion': {'enabled': True, 'intensity': 50}},
+        'font': {'family': 'Inter', 'size': 13},
+        'shell': {'panel_opacity': 0.55, 'blur_radius': 28, 'border_radius': 16},
+        'metadata': {'is_preset': True, 'is_ai_generated': False},
+    },
+]
+
+_THEME_PRESETS_BY_ID = {p['id']: p for p in _THEME_PRESETS}
+
+_SUPPORTED_FONTS = [
+    {'family': 'Inter', 'category': 'sans-serif'},
+    {'family': 'Figtree', 'category': 'sans-serif'},
+    {'family': 'JetBrains Mono', 'category': 'monospace'},
+    {'family': 'Roboto', 'category': 'sans-serif'},
+    {'family': 'Fira Code', 'category': 'monospace'},
+    {'family': 'Source Sans Pro', 'category': 'sans-serif'},
+    {'family': 'Poppins', 'category': 'sans-serif'},
+    {'family': 'IBM Plex Sans', 'category': 'sans-serif'},
+]
+
+
+def _deep_merge(base, overrides):
+    """Deep-merge overrides into base dict (returns new dict)."""
+    result = dict(base)
+    for k, v in overrides.items():
+        if isinstance(v, dict) and isinstance(result.get(k), dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
+
+
+@social_bp.route('/theme/presets', methods=['GET'])
+def theme_get_presets():
+    """Return all curated theme presets (no auth required)."""
+    return _ok({'presets': _THEME_PRESETS})
+
+
+@social_bp.route('/theme/active', methods=['GET'])
+@require_auth
+def theme_get_active():
+    """Return the current user's active theme config."""
+    settings = dict(g.user.settings or {})
+    theme = settings.get('theme') or _THEME_PRESETS_BY_ID['hart-default']
+    return _ok({'theme': theme})
+
+
+@social_bp.route('/theme/apply', methods=['POST'])
+@require_auth
+def theme_apply():
+    """Apply a preset theme by id."""
+    data = request.get_json(silent=True) or {}
+    theme_id = data.get('theme_id', '').strip()
+    if not theme_id:
+        return _err('theme_id required')
+    preset = _THEME_PRESETS_BY_ID.get(theme_id)
+    if not preset:
+        return _err(f'Unknown preset: {theme_id}', 404)
+
+    settings = dict(g.user.settings or {})
+    settings['theme'] = dict(preset)
+    g.user.settings = settings
+    try:
+        db = g.db
+        db.add(g.user)
+        db.commit()
+    except Exception as e:
+        logger.error(f"theme_apply commit error: {e}")
+        return _err('Failed to save theme', 500)
+    return _ok({'theme': preset})
+
+
+@social_bp.route('/theme/customize', methods=['POST'])
+@require_auth
+def theme_customize():
+    """Deep-merge partial overrides into the user's active theme."""
+    overrides = request.get_json(silent=True) or {}
+    if not overrides:
+        return _err('No overrides provided')
+
+    settings = dict(g.user.settings or {})
+    current = settings.get('theme') or dict(_THEME_PRESETS_BY_ID['hart-default'])
+    merged = _deep_merge(current, overrides)
+    merged['metadata'] = dict(merged.get('metadata', {}), is_preset=False)
+    settings['theme'] = merged
+    g.user.settings = settings
+    try:
+        db = g.db
+        db.add(g.user)
+        db.commit()
+    except Exception as e:
+        logger.error(f"theme_customize commit error: {e}")
+        return _err('Failed to save theme', 500)
+    return _ok({'theme': merged})
+
+
+@social_bp.route('/theme/fonts', methods=['GET'])
+def theme_get_fonts():
+    """Return supported font families (no auth required)."""
+    return _ok({'fonts': _SUPPORTED_FONTS})
+
+
+@social_bp.route('/theme/generate', methods=['POST'])
+@require_auth
+def theme_generate():
+    """AI-generate a theme config from a text description."""
+    import json as _json
+    import re as _re
+
+    data = request.get_json(silent=True) or {}
+    description = (data.get('description') or '').strip()
+    if not description:
+        return _err('description required')
+
+    base_id = data.get('base_preset', 'hart-default')
+    base = _THEME_PRESETS_BY_ID.get(base_id, _THEME_PRESETS_BY_ID['hart-default'])
+
+    # Keyword fallback — deterministic mapping when LLM unavailable
+    _keyword_colors = {
+        'ocean': {'primary': '#64B5F6', 'background': '#0B1426', 'paper': '#112240', 'secondary': '#FF8A65'},
+        'sea': {'primary': '#64B5F6', 'background': '#0B1426', 'paper': '#112240', 'secondary': '#FF8A65'},
+        'sunset': {'primary': '#FF8A65', 'background': '#1A0F0A', 'paper': '#2D1B12', 'secondary': '#F48FB1'},
+        'forest': {'primary': '#66BB6A', 'background': '#0A1F0A', 'paper': '#142814', 'secondary': '#FFB74D'},
+        'neon': {'primary': '#E040FB', 'background': '#0D0015', 'paper': '#1A0030', 'secondary': '#00E5FF'},
+        'cyber': {'primary': '#E040FB', 'background': '#0D0015', 'paper': '#1A0030', 'secondary': '#00E5FF'},
+        'rose': {'primary': '#F48FB1', 'background': '#1A0F14', 'paper': '#2D1B25', 'secondary': '#FFD54F'},
+        'gold': {'primary': '#FFD54F', 'background': '#1A0F0A', 'paper': '#2D1B12', 'secondary': '#F48FB1'},
+        'ice': {'primary': '#B0BEC5', 'background': '#0E1621', 'paper': '#162433', 'secondary': '#80CBC4'},
+        'arctic': {'primary': '#B0BEC5', 'background': '#0E1621', 'paper': '#162433', 'secondary': '#80CBC4'},
+        'night': {'primary': '#00B8D9', 'background': '#000000', 'paper': '#0A0A0F', 'secondary': '#7C4DFF'},
+        'midnight': {'primary': '#00B8D9', 'background': '#000000', 'paper': '#0A0A0F', 'secondary': '#7C4DFF'},
+        'blood': {'primary': '#FF1744', 'background': '#1A0000', 'paper': '#2D0A0A', 'secondary': '#FF6E40'},
+        'purple': {'primary': '#CE93D8', 'background': '#1A0025', 'paper': '#2A0040', 'secondary': '#80CBC4'},
+        'blue': {'primary': '#64B5F6', 'background': '#0B1426', 'paper': '#112240', 'secondary': '#FF8A65'},
+        'green': {'primary': '#66BB6A', 'background': '#0A1F0A', 'paper': '#142814', 'secondary': '#FFB74D'},
+        'warm': {'primary': '#FF8A65', 'background': '#1A0F0A', 'paper': '#2D1B12', 'secondary': '#F48FB1'},
+        'cool': {'primary': '#B0BEC5', 'background': '#0E1621', 'paper': '#162433', 'secondary': '#80CBC4'},
+    }
+
+    # Try LLM generation first
+    try:
+        try:
+            from routes.hartos_backend_adapter import chat as _adapter_chat
+        except ImportError:
+            from hartos_backend_adapter import chat as _adapter_chat
+        schema_hint = '{"colors":{"background":"#hex","paper":"#hex","primary":"#hex","primary_light":"#hex","primary_dark":"#hex","secondary":"#hex","accent":"#hex","text_primary":"#hex"}}'
+        system_prompt = (
+            "You are a UI theme designer for a dark-mode social platform. "
+            "Given the user description, generate ONLY a valid JSON object with a 'colors' key. "
+            f"Schema: {schema_hint}. "
+            "Rules: all backgrounds MUST be dark (luminance < 0.15). "
+            "Primary must have >= 4.5:1 contrast on background. "
+            "Return ONLY raw JSON, no markdown fences, no explanation."
+        )
+        llm_resp = _adapter_chat(
+            f"{system_prompt}\n\nUser description: \"{description}\"",
+            casual_conv=True, timeout=30
+        )
+        resp_text = llm_resp if isinstance(llm_resp, str) else str(llm_resp.get('response', ''))
+        # Extract JSON from response
+        json_match = _re.search(r'\{[\s\S]*\}', resp_text)
+        if json_match:
+            generated = _json.loads(json_match.group())
+            colors = generated.get('colors', generated)
+            merged_colors = dict(base['colors'], **{k: v for k, v in colors.items() if isinstance(v, str) and (v.startswith('#') or v.startswith('rgb'))})
+            result = dict(base, colors=merged_colors, id='ai-generated', name=f'AI: {description[:30]}')
+            result['metadata'] = {'is_preset': False, 'is_ai_generated': True, 'ai_prompt': description}
+            return _ok({'theme': result})
+    except Exception as e:
+        logger.warning(f"AI theme generation failed, using keyword fallback: {e}")
+
+    # Keyword fallback
+    desc_lower = description.lower()
+    color_overrides = {}
+    for keyword, colors in _keyword_colors.items():
+        if keyword in desc_lower:
+            color_overrides.update(colors)
+            break
+
+    if color_overrides:
+        merged_colors = dict(base['colors'], **color_overrides)
+        result = dict(base, colors=merged_colors, id='ai-generated', name=f'AI: {description[:30]}')
+        result['metadata'] = {'is_preset': False, 'is_ai_generated': True, 'ai_prompt': description}
+        return _ok({'theme': result})
+
+    return _err('Could not generate a theme from that description. Try keywords like ocean, sunset, neon, forest.', 422)
+
+
+@social_bp.route('/users/<int:user_id>/theme', methods=['GET'])
+def theme_get_user(user_id):
+    """Return any user's theme (public, for visitor theming)."""
+    db = None
+    try:
+        db = get_db()
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            return _err('User not found', 404)
+        settings = dict(user.settings or {})
+        theme = settings.get('theme')
+        return _ok({'theme': theme})
+    except Exception as e:
+        logger.error(f"theme_get_user error: {e}")
+        return _err('Failed to fetch user theme', 500)
+    finally:
+        if db:
+            db.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+# AGENT OBSERVATION & DISPATCH (fire-and-forget)
+# ═══════════════════════════════════════════════════════════════
+
+@social_bp.route('/agent/observe', methods=['POST'])
+@require_auth
+def agent_observe():
+    """Receive frontend observations for agent self-critique."""
+    try:
+        data = request.get_json(silent=True) or {}
+        user_id = g.user.id
+
+        # Store observation via MemoryGraph if available
+        try:
+            from integrations.channels.memory.memory_graph import MemoryGraph
+            graph = MemoryGraph(user_id=str(user_id))
+            graph.register(
+                content=f"[{data.get('event', 'unknown')}] page={data.get('page', '?')} outcome={data.get('outcome', '?')} duration={data.get('duration_ms', 0)}ms",
+                metadata={'memory_type': 'observation', 'source': 'frontend',
+                          **{k: v for k, v in data.items() if k not in ('_useBeacon',)}},
+            )
+        except Exception:
+            pass  # MemoryGraph optional
+
+        return jsonify({'success': True}), 200
+    except Exception:
+        return jsonify({'success': True}), 200  # Always return success (fire-and-forget)
+
+
+@social_bp.route('/agent/dispatch', methods=['POST'])
+@require_auth
+def agent_dispatch():
+    """Receive agent dispatch requests from autopilot."""
+    try:
+        data = request.get_json(silent=True) or {}
+        user_id = g.user.id
+
+        # Store dispatch as observation for agent to pick up
+        try:
+            from integrations.channels.memory.memory_graph import MemoryGraph
+            graph = MemoryGraph(user_id=str(user_id))
+            graph.register(
+                content=f"[dispatch] agent={data.get('agent', '?')} action={data.get('action', '?')} mode={data.get('mode', 'suggest')}",
+                metadata={'memory_type': 'dispatch', 'source': 'autopilot', **data},
+            )
+        except Exception:
+            pass
+
+        return jsonify({'success': True}), 200
+    except Exception:
+        return jsonify({'success': True}), 200

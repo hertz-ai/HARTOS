@@ -1,17 +1,39 @@
 """
 HevolveSocial - Platform Discovery
 Exposes .well-known/hevolve-social.json for external bots to discover HevolveSocial.
-Separate from per-agent A2A cards — this advertises the platform itself.
+Separate from per-agent A2A cards - this advertises the platform itself.
 """
+import json
 import os
 import logging
+import time as _time
 from flask import Blueprint, jsonify, request
+from core.port_registry import get_port
 
 logger = logging.getLogger('hevolve_social')
 
 discovery_bp = Blueprint('social_discovery', __name__)
 
-_BASE_URL = os.environ.get('HEVOLVE_BASE_URL', 'http://localhost:6777')
+# ─── Gossip Rate Limiter ───
+_ANNOUNCE_RATE = {}   # ip -> list of timestamps
+_RATE_LIMIT = 10      # max announcements per window per IP
+_RATE_WINDOW = 60     # window in seconds
+
+
+def _check_announce_rate(ip: str) -> bool:
+    """Returns True if request is allowed, False if rate-limited.
+    Prevents gossip flooding from rapid peer announcements."""
+    now = _time.time()
+    times = _ANNOUNCE_RATE.get(ip, [])
+    # Prune expired entries
+    times = [t for t in times if now - t < _RATE_WINDOW]
+    if len(times) >= _RATE_LIMIT:
+        return False
+    times.append(now)
+    _ANNOUNCE_RATE[ip] = times
+    return True
+
+_BASE_URL = os.environ.get('HEVOLVE_BASE_URL', f'http://localhost:{get_port("backend")}')
 
 
 @discovery_bp.route('/.well-known/hevolve-social.json')
@@ -143,6 +165,8 @@ def discover_communities():
 @discovery_bp.route('/api/social/peers/announce', methods=['POST'])
 def peer_announce():
     """Receive a peer announcement. Merge into local peer list."""
+    if not _check_announce_rate(request.remote_addr):
+        return jsonify({'success': False, 'error': 'Rate limited'}), 429
     from .peer_discovery import gossip
     data = request.get_json(force=True, silent=True) or {}
     if not data.get('node_id') or not data.get('url'):
@@ -172,6 +196,8 @@ def peer_list():
 @discovery_bp.route('/api/social/peers/exchange', methods=['POST'])
 def peer_exchange():
     """Gossip exchange: receive their peers, return ours."""
+    if not _check_announce_rate(request.remote_addr):
+        return jsonify({'success': False, 'error': 'Rate limited'}), 429
     from .peer_discovery import gossip
     data = request.get_json(force=True, silent=True) or {}
     their_peers = data.get('peers', [])
@@ -191,6 +217,63 @@ def peer_health():
     """Lightweight health ping. Returns node_id and uptime."""
     from .peer_discovery import gossip
     return jsonify(gossip.get_health())
+
+
+@discovery_bp.route('/api/social/peers/federation-delta', methods=['POST'])
+def peer_federation_delta():
+    """Receive a learning delta from a federated peer."""
+    try:
+        from integrations.agent_engine.federated_aggregator import get_federated_aggregator
+        agg = get_federated_aggregator()
+        accepted, reason = agg.receive_peer_delta(request.get_json() or {})
+        return jsonify({'success': accepted, 'reason': reason})
+    except Exception as e:
+        return jsonify({'success': False, 'reason': str(e)}), 500
+
+
+@discovery_bp.route('/api/social/peers/embedding-delta', methods=['POST'])
+def peer_embedding_delta():
+    """Receive a compressed embedding delta from a federated peer.
+
+    Phase 1 gradient sync: peers submit embedding deltas via gossip.
+    Deltas are validated and fed to FederatedAggregator's embedding channel.
+    """
+    ip = request.remote_addr or '0.0.0.0'
+    if not _check_announce_rate(ip):
+        return jsonify({'success': False, 'reason': 'rate_limited'}), 429
+
+    body = request.get_json(silent=True) or {}
+    action = body.get('action', 'submit')
+
+    if action == 'witness_request':
+        # Witness validation request — validate and acknowledge
+        delta = body.get('delta', {})
+        submitter = body.get('submitter_node_id', '')
+        try:
+            from integrations.agent_engine.embedding_delta import validate_delta
+            valid, reason = validate_delta(delta)
+            return jsonify({
+                'success': valid,
+                'witness_ack': valid,
+                'reason': reason,
+                'submitter': submitter,
+            })
+        except Exception as e:
+            return jsonify({'success': False, 'reason': str(e)}), 500
+
+    # Default: submit embedding delta to aggregator
+    try:
+        from integrations.agent_engine.federated_aggregator import get_federated_aggregator
+        agg = get_federated_aggregator()
+        node_id = body.get('node_id', '')
+        delta = body.get('delta', body)
+        if node_id:
+            agg.receive_embedding_delta(node_id, delta)
+            return jsonify({'success': True, 'reason': 'accepted'})
+        else:
+            return jsonify({'success': False, 'reason': 'missing node_id'}), 400
+    except Exception as e:
+        return jsonify({'success': False, 'reason': str(e)}), 500
 
 
 # ════════════════════════════════════════════════════════════════
@@ -471,6 +554,26 @@ def integrity_code_hash():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@discovery_bp.route('/api/social/integrity/guardrail-hash')
+def integrity_guardrail_hash():
+    """Return this node's guardrail hash (live recompute) for continuous audit.
+    Every node in the network can verify any other node's values at any time."""
+    from .peer_discovery import gossip
+    try:
+        from security.hive_guardrails import get_guardrail_hash, compute_guardrail_hash
+        cached = get_guardrail_hash()
+        live = compute_guardrail_hash()
+        return jsonify({
+            'success': True,
+            'node_id': gossip.node_id,
+            'guardrail_hash': cached,
+            'guardrail_hash_live': live,
+            'consistent': cached == live,
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @discovery_bp.route('/api/social/integrity/public-key')
 def integrity_public_key():
     """Return this node's Ed25519 public key."""
@@ -693,6 +796,20 @@ def integrity_node_ban(node_id):
         db.close()
 
 
+@discovery_bp.route('/api/social/integrity/audit-coverage')
+def integrity_audit_coverage():
+    """Network-wide audit compute dominance report.
+    Verifies that no node can outcompute its auditors."""
+    from .models import get_db
+    from .integrity_service import IntegrityService
+    db = get_db()
+    try:
+        result = IntegrityService.get_audit_coverage(db)
+        return jsonify({'success': True, 'data': result})
+    finally:
+        db.close()
+
+
 @discovery_bp.route('/api/social/integrity/dashboard')
 def integrity_dashboard():
     """Admin: integrity overview dashboard data."""
@@ -708,12 +825,12 @@ def integrity_dashboard():
 
 @discovery_bp.route('/api/social/integrity/boot-status')
 def integrity_boot_status():
-    """Return boot verification status, enforcement mode, and runtime health."""
+    """Return boot verification status, enforcement mode, runtime health, and HSM status."""
     from security.master_key import get_enforcement_mode, is_dev_mode, load_release_manifest
     from security.runtime_monitor import is_code_healthy, get_monitor
     manifest = load_release_manifest()
     monitor = get_monitor()
-    return jsonify({
+    result = {
         'success': True,
         'enforcement_mode': get_enforcement_mode(),
         'dev_mode': is_dev_mode(),
@@ -721,7 +838,24 @@ def integrity_boot_status():
         'monitor_active': monitor is not None and monitor._running if monitor else False,
         'release_version': manifest.get('version', '') if manifest else None,
         'manifest_present': manifest is not None,
-    })
+    }
+    # HSM status
+    try:
+        from security.hsm_provider import get_hsm_status
+        result['hsm'] = get_hsm_status()
+    except Exception:
+        result['hsm'] = {'available': False}
+    # HSM trust path status
+    try:
+        from security.hsm_trust import get_path_monitor
+        pm = get_path_monitor()
+        result['hsm_trust'] = {
+            'last_check': pm.get_last_check(),
+            'trust_status': pm.get_trust_status(),
+        }
+    except Exception:
+        result['hsm_trust'] = None
+    return jsonify(result)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -894,10 +1028,19 @@ def hierarchy_node_assignment(node_id):
 
 @discovery_bp.route('/api/social/hierarchy/sync', methods=['POST'])
 def hierarchy_sync():
-    """Receive sync batch from a child node."""
+    """Receive sync batch from a child node. Supports E2E encrypted envelopes."""
     from .models import get_db
     from .sync_engine import SyncEngine
     data = request.get_json(force=True, silent=True) or {}
+    # Decrypt E2E encrypted sync batch
+    if data.get('encrypted') and data.get('envelope'):
+        try:
+            from security.channel_encryption import decrypt_json_from_peer
+            decrypted = decrypt_json_from_peer(data['envelope'])
+            if decrypted:
+                data = decrypted
+        except Exception:
+            pass  # Decryption failed, try using data as-is
     items = data.get('items', [])
     if not items:
         return jsonify({'success': True, 'processed': [], 'errors': []})
@@ -935,6 +1078,119 @@ def hierarchy_report_capacity():
         db.close()
 
 
+@discovery_bp.route('/api/social/hierarchy/promote', methods=['POST'])
+def hierarchy_promote_node():
+    """Central-only: promote a flat/local node to regional tier.
+
+    Pushes a tier_promote fleet command to the target node, which triggers
+    auto-reload on the receiving end.
+    """
+    if not _IS_CENTRAL:
+        return jsonify({'success': False, 'error': 'Only central can promote nodes'}), 403
+    data = request.get_json(force=True, silent=True) or {}
+    node_id = data.get('node_id', '')
+    region_name = data.get('region_name', '')
+    if not node_id:
+        return jsonify({'success': False, 'error': 'node_id required'}), 400
+
+    from .models import get_db, PeerNode
+    from .fleet_command import FleetCommandService
+    db = get_db()
+    try:
+        # Verify node exists and is flat/local
+        peer = db.query(PeerNode).filter_by(node_id=node_id).first()
+        if not peer:
+            return jsonify({'success': False, 'error': 'Node not found'}), 404
+        if peer.tier == 'regional':
+            return jsonify({'success': False, 'error': 'Node is already regional'}), 400
+
+        # Update tier in central's DB
+        peer.tier = 'regional'
+        db.flush()
+
+        # Push fleet command to target node
+        cmd = FleetCommandService.push_command(
+            db, node_id, 'tier_promote',
+            params={
+                'new_tier': 'regional',
+                'region_name': region_name or f'region-{node_id[:8]}',
+                'env_vars': {
+                    'HEVOLVE_NODE_TIER': 'regional',
+                },
+                'restart_required': True,
+            },
+        )
+        db.commit()
+
+        return jsonify({
+            'success': True,
+            'message': f'Node {node_id[:8]} promoted to regional',
+            'command': cmd,
+        })
+    except Exception as e:
+        db.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@discovery_bp.route('/api/social/hierarchy/demote', methods=['POST'])
+def hierarchy_demote_node():
+    """Central-only: demote a regional node back to flat.
+
+    Pushes a tier_demote fleet command to the target node, revoking
+    its regional certificate and triggering auto-reload.
+    """
+    if not _IS_CENTRAL:
+        return jsonify({'success': False, 'error': 'Only central can demote nodes'}), 403
+    data = request.get_json(force=True, silent=True) or {}
+    node_id = data.get('node_id', '')
+    reason = data.get('reason', 'Demoted by central')
+    if not node_id:
+        return jsonify({'success': False, 'error': 'node_id required'}), 400
+
+    from .models import get_db, PeerNode
+    from .fleet_command import FleetCommandService
+    db = get_db()
+    try:
+        peer = db.query(PeerNode).filter_by(node_id=node_id).first()
+        if not peer:
+            return jsonify({'success': False, 'error': 'Node not found'}), 404
+        if peer.tier not in ('regional',):
+            return jsonify({'success': False, 'error': 'Node is not regional'}), 400
+
+        # Downgrade in central's DB
+        peer.tier = 'flat'
+        peer.certificate_json = None
+        peer.certificate_verified = False
+        db.flush()
+
+        # Push fleet command to target node
+        cmd = FleetCommandService.push_command(
+            db, node_id, 'tier_demote',
+            params={
+                'new_tier': 'flat',
+                'reason': reason,
+                'env_vars': {
+                    'HEVOLVE_NODE_TIER': 'flat',
+                },
+                'restart_required': True,
+            },
+        )
+        db.commit()
+
+        return jsonify({
+            'success': True,
+            'message': f'Node {node_id[:8]} demoted to flat',
+            'command': cmd,
+        })
+    except Exception as e:
+        db.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
 @discovery_bp.route('/api/social/hierarchy/tier-info')
 def hierarchy_tier_info():
     """Return this node's tier, parent info, and authorization status."""
@@ -952,3 +1208,184 @@ def hierarchy_tier_info():
         'has_certificate': cert is not None,
         'certificate_tier': cert.get('tier') if cert else None,
     })
+
+
+# ── Challenge-Response Master Key Verification ──
+# The private key NEVER leaves the browser. Only a signature is sent.
+# Proof: even with full source code + MITM, an attacker only sees:
+#   - The master PUBLIC key (hardcoded, safe to expose)
+#   - A one-time challenge nonce (expires in 60s, non-replayable)
+#   - A signature (proves possession but reveals nothing about the key)
+_upgrade_challenges = {}  # nonce_hex -> {'created': _time.time()}
+_CHALLENGE_TTL = 60  # seconds
+
+
+@discovery_bp.route('/api/social/hierarchy/upgrade-challenge', methods=['GET'])
+def hierarchy_upgrade_challenge():
+    """Issue a one-time cryptographic challenge for master key proof-of-possession."""
+    from security.master_key import MASTER_PUBLIC_KEY_HEX
+    nonce = os.urandom(32).hex()
+    _upgrade_challenges[nonce] = {'created': _time.time()}
+    # Prune expired challenges
+    now = _time.time()
+    expired = [k for k, v in _upgrade_challenges.items() if now - v['created'] > _CHALLENGE_TTL]
+    for k in expired:
+        _upgrade_challenges.pop(k, None)
+    return jsonify({
+        'challenge': nonce,
+        'ttl_seconds': _CHALLENGE_TTL,
+        'master_public_key_hex': MASTER_PUBLIC_KEY_HEX,
+    })
+
+
+@discovery_bp.route('/api/social/hierarchy/verify-upgrade', methods=['POST'])
+def hierarchy_verify_upgrade():
+    """Verify master key proof-of-possession via challenge-response signature.
+
+    The private key NEVER crosses the network. The client signs the challenge
+    locally and sends only the signature. Even with Burp Suite / MITM / public
+    source code, an attacker cannot derive the private key from the signature.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    challenge_hex = (data.get('challenge', '') or '').strip()
+    signature_hex = (data.get('signature', '') or '').strip()
+    public_key_hex = (data.get('public_key_hex', '') or '').strip()
+
+    if not challenge_hex or not signature_hex or not public_key_hex:
+        return jsonify({'success': False, 'error': 'Missing fields'}), 400
+
+    # 1. Verify challenge is valid and not expired (prevents replay)
+    challenge_entry = _upgrade_challenges.pop(challenge_hex, None)
+    if not challenge_entry:
+        return jsonify({'success': False, 'error': 'Invalid or expired challenge'}), 403
+    if _time.time() - challenge_entry['created'] > _CHALLENGE_TTL:
+        return jsonify({'success': False, 'error': 'Challenge expired'}), 403
+
+    # 2. Verify public key matches the trust anchor
+    from security.master_key import MASTER_PUBLIC_KEY_HEX
+    if public_key_hex != MASTER_PUBLIC_KEY_HEX:
+        return jsonify({'success': False, 'error': 'Public key does not match trust anchor'}), 403
+
+    # 3. Verify signature cryptographically
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        pub_key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_key_hex))
+        pub_key.verify(
+            bytes.fromhex(signature_hex),
+            bytes.fromhex(challenge_hex),
+        )
+    except Exception:
+        return jsonify({'success': False, 'error': 'Invalid signature'}), 403
+
+    # Signature valid — upgrade to central
+    # Note: private key is NOT stored. Only the tier is persisted.
+    try:
+        try:
+            from core.platform_paths import get_db_dir
+            data_dir = get_db_dir()
+        except ImportError:
+            data_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data')
+        os.makedirs(data_dir, exist_ok=True)
+        config_path = os.path.join(data_dir, 'node_config.json')
+        config = {}
+        if os.path.isfile(config_path):
+            with open(config_path) as f:
+                config = json.load(f)
+        config['tier'] = 'central'
+        config['upgraded_at'] = _time.strftime('%Y-%m-%dT%H:%M:%SZ', _time.gmtime())
+        config['upgrade_method'] = 'challenge_response'
+        # DO NOT store master_key_hex — it never leaves the browser
+        config.pop('master_key_hex', None)
+        with open(config_path, 'w') as f:
+            json.dump(config, f, indent=2)
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'Failed to persist tier: {e}'}), 500
+
+    os.environ['HEVOLVE_NODE_TIER'] = 'central'
+    os.environ['HEVOLVE_RESTART_REQUESTED'] = 'all'
+    os.environ['HEVOLVE_RESTART_REASON'] = 'Auto-upgrade to central via challenge-response proof'
+
+    # Generate HART central identity
+    try:
+        from hart_onboarding import generate_node_identity
+        generate_node_identity(tier='central')
+    except Exception:
+        pass
+
+    logger.info("Node auto-upgraded to central via challenge-response (key never transmitted)")
+    return jsonify({
+        'success': True,
+        'message': 'Master key verified via challenge-response. Node upgrading to central. Restarting...',
+        'new_tier': 'central',
+    })
+
+
+@discovery_bp.route('/api/social/hierarchy/inventory')
+def hierarchy_inventory():
+    """Network-wide inventory of all nodes grouped by tier.
+
+    Returns counts, node details (name, IP/URL, HART tag, status, compute),
+    grouped by tier. Central-only endpoint for safety visibility.
+    """
+    if not _IS_CENTRAL:
+        return jsonify({'success': False, 'error': 'Only central can view inventory'}), 403
+
+    from .models import get_db, PeerNode
+    db = get_db()
+    try:
+        all_nodes = db.query(PeerNode).filter(
+            PeerNode.status != 'dead'
+        ).order_by(PeerNode.tier, PeerNode.name).all()
+
+        inventory = {
+            'central': [], 'regional': [], 'flat': [], 'local': [],
+        }
+        counts = {
+            'central': 0, 'regional': 0, 'flat': 0, 'local': 0,
+            'total': 0, 'active': 0, 'stale': 0,
+        }
+
+        for node in all_nodes:
+            tier = node.tier or 'flat'
+            entry = {
+                'node_id': node.node_id,
+                'name': node.name,
+                'url': node.url,
+                'hart_tag': getattr(node, 'hart_tag', '') or '',
+                'status': node.status,
+                'tier': tier,
+                'dns_region': node.dns_region or '',
+                'compute': {
+                    'cpu_cores': node.compute_cpu_cores,
+                    'ram_gb': node.compute_ram_gb,
+                    'gpu_count': node.compute_gpu_count,
+                },
+                'users': {
+                    'active': node.active_user_count or 0,
+                    'max': node.max_user_capacity or 0,
+                },
+                'certificate_verified': getattr(node, 'certificate_verified', False),
+                'last_seen': getattr(node, 'last_seen_at', None),
+            }
+
+            if tier in inventory:
+                inventory[tier].append(entry)
+            else:
+                inventory['flat'].append(entry)
+
+            counts['total'] += 1
+            counts[tier] = counts.get(tier, 0) + 1
+            if node.status == 'active':
+                counts['active'] += 1
+            elif node.status == 'stale':
+                counts['stale'] += 1
+
+        return jsonify({
+            'success': True,
+            'counts': counts,
+            'inventory': inventory,
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()

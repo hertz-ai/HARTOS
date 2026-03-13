@@ -4,8 +4,8 @@ and periodic description loop with intelligent adaptive sampling.
 
 Architecture:
     VisionService.start()
-        +-> MiniCPM subprocess (port 9890)       [sidecar]
-        +-> WebSocket server (port 5459)          [receives camera frames]
+        +-> MiniCPM subprocess (port 9891)       [sidecar]
+        +-> WebSocket server (port 5460)          [receives camera/screen frames]
         +-> Description loop (adaptive interval)  [sends frame to MiniCPM only when scene changes]
         +-> FrameStore                            [in-process, replaces Redis]
         +-> Visual trigger evaluation             [fires callbacks on description match]
@@ -25,6 +25,7 @@ import requests
 
 from .frame_store import FrameStore, compute_frame_difference, decode_jpeg
 from .minicpm_installer import MiniCPMInstaller
+from .lightweight_backend import get_vision_backend, VisionBackend
 
 logger = logging.getLogger('hevolve_vision')
 
@@ -39,8 +40,8 @@ class VisionService:
 
     def __init__(
         self,
-        minicpm_port: int = 9890,
-        ws_port: int = 5459,
+        minicpm_port: int = None,
+        ws_port: int = None,
         description_interval: float = 4.0,
         max_description_interval: float = 30.0,
         min_scene_change: float = 0.01,
@@ -50,8 +51,9 @@ class VisionService:
         callback_url: Optional[str] = None,
         trigger_manager=None,
     ):
-        self._minicpm_port = minicpm_port
-        self._ws_port = ws_port
+        from core.port_registry import get_port
+        self._minicpm_port = int(os.environ.get('HEVOLVE_MINICPM_PORT', minicpm_port or get_port('vision')))
+        self._ws_port = int(os.environ.get('VISION_WS_PORT', ws_port or get_port('websocket')))
         self._description_interval = description_interval
         self._max_interval = max_description_interval
         self._min_scene_change = min_scene_change
@@ -60,7 +62,12 @@ class VisionService:
             model_dir=minicpm_model_dir or MiniCPMInstaller().model_dir
         )
         self._config = self._load_config(config_path)
-        self._callback_url = callback_url or self._config.get('database_url')
+        # In bundled Nunba mode, use local server for action/DB callbacks
+        from core.config_cache import is_bundled, get_db_url
+        if not callback_url and is_bundled():
+            self._callback_url = get_db_url()
+        else:
+            self._callback_url = callback_url or self._config.get('database_url')
         self._trigger_manager = trigger_manager  # Optional TriggerManager
 
         self._minicpm_process: Optional[subprocess.Popen] = None
@@ -73,6 +80,9 @@ class VisionService:
         self._max_failures = 5
         self._circuit_open = False
 
+        # Lightweight vision backend (auto-selected when MiniCPM unavailable)
+        self._vision_backend: Optional[VisionBackend] = None
+
         # Intelligent sampling state (per-user)
         self._last_described_frame: Dict[str, np.ndarray] = {}  # user_id → numpy
         self._user_intervals: Dict[str, float] = {}  # user_id → current interval
@@ -82,24 +92,63 @@ class VisionService:
 
     # ─── Public API ───
 
-    def start(self):
-        """Start the vision pipeline (non-blocking)."""
+    def start(self, mode: str = 'auto'):
+        """Start the vision pipeline (non-blocking).
+
+        Args:
+            mode: 'full' (MiniCPM+WS+desc), 'lite' (lightweight backend+WS+desc),
+                  'headless' (FrameStore only), 'auto' (detect from hardware tier).
+        """
         if self._running:
             logger.warning("VisionService already running")
             return
 
         self._running = True
 
-        if not self._installer.is_installed():
-            if self._installer.detect_gpu():
-                logger.info("MiniCPM not installed — downloading...")
-                self._installer.install()
-            else:
-                logger.warning("No GPU — vision sidecar will not start")
-                self._running = False
-                return
+        # Auto-detect mode from hardware tier
+        if mode == 'auto':
+            mode = self._detect_mode()
 
-        self._start_minicpm()
+        if mode == 'headless':
+            logger.info("VisionService started in headless mode (FrameStore only)")
+            return
+
+        if mode == 'lite':
+            # Use lightweight CPU backend instead of MiniCPM sidecar
+            self._vision_backend = get_vision_backend()
+            if self._vision_backend.name == 'none':
+                logger.warning("No vision backend available — headless mode")
+                return
+            if not self._vision_backend.start():
+                logger.warning(f"Failed to start {self._vision_backend.name} — headless mode")
+                self._vision_backend = None
+                return
+            logger.info(f"Vision backend: {self._vision_backend.name} "
+                        f"(RAM: {self._vision_backend.ram_mb}MB)")
+        else:
+            # Full mode — MiniCPM sidecar
+            if not self._installer.is_installed():
+                if self._installer.detect_gpu():
+                    logger.info("MiniCPM not installed — downloading...")
+                    self._installer.install()
+                else:
+                    # Fall back to lightweight backend
+                    logger.info("No GPU — trying lightweight vision backend")
+                    self._vision_backend = get_vision_backend()
+                    if self._vision_backend.name != 'none':
+                        self._vision_backend.start()
+                        logger.info(f"Fell back to {self._vision_backend.name} backend")
+                    else:
+                        logger.warning("No vision backend available")
+                        self._vision_backend = None
+                        self._running = False
+                        return
+
+            if self._vision_backend is None:
+                self._start_minicpm()
+                # Register atexit handler to prevent orphan subprocess on crash
+                import atexit
+                atexit.register(self._cleanup_subprocess)
 
         self._ws_thread = threading.Thread(
             target=self._run_ws_server, daemon=True, name='vision-ws',
@@ -111,7 +160,35 @@ class VisionService:
         )
         self._desc_thread.start()
 
-        logger.info("VisionService started (adaptive sampling enabled)")
+        backend_name = self._vision_backend.name if self._vision_backend else 'minicpm'
+        logger.info(f"VisionService started (backend={backend_name}, adaptive sampling)")
+
+    def _detect_mode(self) -> str:
+        """Detect vision mode from hardware tier."""
+        try:
+            from security.system_requirements import get_capabilities
+            caps = get_capabilities()
+            tier = getattr(caps, 'tier_name', '').lower()
+            if tier == 'embedded':
+                return 'headless'
+            elif tier in ('observer', 'lite'):
+                return 'lite'
+            else:
+                return 'full'
+        except Exception:
+            return 'full'
+
+    def _cleanup_subprocess(self):
+        """atexit handler — ensures MiniCPM subprocess is killed on exit."""
+        if self._minicpm_process and self._minicpm_process.poll() is None:
+            try:
+                self._minicpm_process.terminate()
+                self._minicpm_process.wait(timeout=3)
+            except Exception:
+                try:
+                    self._minicpm_process.kill()
+                except Exception:
+                    pass
 
     def stop(self):
         """Stop all vision components."""
@@ -124,6 +201,10 @@ class VisionService:
                 self._minicpm_process.kill()
             self._minicpm_process = None
             logger.info("MiniCPM sidecar stopped")
+        if self._vision_backend is not None:
+            self._vision_backend.stop()
+            logger.info(f"Vision backend {self._vision_backend.name} stopped")
+            self._vision_backend = None
         logger.info(
             f"VisionService stopped (described={self._frames_described}, "
             f"skipped={self._frames_skipped})"
@@ -166,6 +247,7 @@ class VisionService:
                 user_id, desc, label='Screen Context',
                 zeroshot_label='Screen Reasoning'
             )
+            self._record_to_world_model(user_id, desc, 'screen', frame_bytes)
             self._evaluate_visual_triggers(user_id, desc, 'screen')
             self._frames_described += 1
         return desc
@@ -211,9 +293,12 @@ class VisionService:
 
     def get_status(self) -> Dict:
         """Return service status for health dashboards."""
-        minicpm_alive = self._check_minicpm_health()
+        backend_name = self._vision_backend.name if self._vision_backend else 'minicpm'
+        minicpm_alive = (self._check_minicpm_health()
+                         if self._vision_backend is None else False)
         return {
             'running': self._running,
+            'backend': backend_name,
             'minicpm_alive': minicpm_alive,
             'minicpm_port': self._minicpm_port,
             'ws_port': self._ws_port,
@@ -296,6 +381,29 @@ class VisionService:
         except Exception as e:
             logger.debug(f"Visual trigger evaluation error: {e}")
 
+    # ─── Face Signature Enrollment ───
+
+    def _enroll_face_signature(self, user_id: str, frame_bytes: bytes):
+        """Dispatch face enrollment to HevolveAI via WorldModelBridge.
+
+        Piggybacks on existing frame processing. Zero extra I/O.
+        Enrolls up to 5 face samples per user, then stops.
+        All ML (embedding extraction, matching) runs in HevolveAI.
+        """
+        try:
+            from core.resonance_profile import get_or_create_profile
+            profile = get_or_create_profile(user_id)
+            if profile.face_enrollment_count >= 5:
+                return  # Already enrolled enough samples
+            from core.resonance_identifier import ResonanceIdentifier
+            identifier = ResonanceIdentifier()
+            if identifier.enroll_face(user_id, frame_bytes):
+                logger.debug(f"Face enrollment dispatched to HevolveAI for user {user_id}")
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.debug(f"Face enrollment skipped: {e}")
+
     # ─── Sidecar Management ───
 
     def _start_minicpm(self):
@@ -305,16 +413,29 @@ class VisionService:
             logger.error("MiniCPM not installed — cannot start sidecar")
             return
 
+        # In frozen builds (cx_Freeze), sys.executable is Nunba.exe — using it
+        # with -m would launch a full GUI instance instead of the module.
+        # Use the bundled python interpreter from python-embed/ instead.
+        python_exe = sys.executable
+        if getattr(sys, 'frozen', False):
+            app_dir = os.path.dirname(sys.executable)
+            embed_python = os.path.join(app_dir, 'python-embed', 'python.exe')
+            if os.path.isfile(embed_python):
+                python_exe = embed_python
+            else:
+                logger.warning("python-embed/python.exe not found — minicpm sidecar may not start correctly")
+
         cmd = [
-            sys.executable, '-m', 'integrations.vision.minicpm_server',
+            python_exe, '-m', 'integrations.vision.minicpm_server',
             '--model_dir', model_dir,
             '--port', str(self._minicpm_port),
         ]
         logger.info(f"Starting MiniCPM sidecar: {' '.join(cmd)}")
 
-        self._minicpm_process = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
+        _popen_kw = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if sys.platform == 'win32':
+            _popen_kw['creationflags'] = subprocess.CREATE_NO_WINDOW
+        self._minicpm_process = subprocess.Popen(cmd, **_popen_kw)
         self._wait_for_minicpm(timeout=120)
 
     def _wait_for_minicpm(self, timeout: float = 120):
@@ -366,16 +487,32 @@ class VisionService:
             logger.error("websockets not installed — frame receiver disabled")
             return
 
-        async with websockets.serve(self._ws_handler, '0.0.0.0', self._ws_port):
-            logger.info(f"WebSocket frame receiver on port {self._ws_port}")
+        server = await websockets.serve(self._ws_handler, '0.0.0.0', self._ws_port)
+        # Read actual bound port (important when ws_port=0 for dynamic allocation)
+        if server.sockets:
+            actual_port = server.sockets[0].getsockname()[1]
+            self._ws_port = actual_port
+        logger.info(f"WebSocket frame receiver on port {self._ws_port}")
+        try:
             while self._running:
                 await asyncio.sleep(1)
+        finally:
+            server.close()
+            await server.wait_closed()
 
     async def _ws_handler(self, websocket, path=None):
-        """Handle a single WebSocket connection (one per user)."""
+        """Handle a single WebSocket connection (one per user).
+
+        Protocol:
+            1. Client sends user_id (digit string)
+            2. Client sends "video_start" (camera, default) or "screen_start"
+            3. Client sends binary JPEG frames
+            4. Client sends "video_stop" to end
+        """
         import cv2
 
         user_id = None
+        channel = 'camera'  # default channel
         try:
             async for message in websocket:
                 if isinstance(message, bytes):
@@ -387,18 +524,27 @@ class VisionService:
                             frame, None, 10, 10, 7, 21
                         )
                         _, encoded = cv2.imencode('.jpg', frame)
-                        self.store.put_frame(user_id, encoded.tobytes())
+                        jpeg_bytes = encoded.tobytes()
+                        if channel == 'screen':
+                            self.store.put_screen_frame(user_id, jpeg_bytes)
+                        else:
+                            self.store.put_frame(user_id, jpeg_bytes)
                 elif isinstance(message, str):
                     if message.isdigit():
                         user_id = message
                         logger.info(f"Frame session started for user {user_id}")
+                    elif message == 'screen_start':
+                        channel = 'screen'
+                        logger.info(f"User {user_id} switched to screen channel")
+                    elif message == 'video_start':
+                        channel = 'camera'
                     elif message == 'video_stop':
                         break
         except Exception as e:
             logger.debug(f"WebSocket session ended: {e}")
         finally:
             if user_id:
-                logger.info(f"Frame session ended for user {user_id}")
+                logger.info(f"Frame session ended for user {user_id} ({channel})")
 
     # ─── Description Loop ───
 
@@ -408,6 +554,7 @@ class VisionService:
         Only calls MiniCPM when frame difference exceeds threshold.
         Backs off interval for static scenes (4s → 8s → ... → 30s cap).
         Evaluates visual triggers after each new description.
+        Processes both camera and screen channels.
         """
         while self._running:
             if self._circuit_open:
@@ -420,21 +567,51 @@ class VisionService:
                 for user_id in users:
                     if not self._running:
                         return
-                    frame_bytes = self.store.get_frame(user_id)
-                    if not frame_bytes:
-                        continue
 
-                    if self._should_describe(user_id, frame_bytes, 'camera'):
-                        desc = self._describe_frame(user_id, frame_bytes)
-                        if desc:
-                            self.store.put_description(user_id, desc)
-                            self._post_description_to_db(user_id, desc)
-                            self._evaluate_visual_triggers(
-                                user_id, desc, 'camera'
+                    # Camera channel
+                    frame_bytes = self.store.get_frame(user_id)
+                    if frame_bytes:
+                        # Piggyback face signature enrollment (zero extra I/O)
+                        self._enroll_face_signature(user_id, frame_bytes)
+                        if self._should_describe(user_id, frame_bytes, 'camera'):
+                            desc = self._describe_frame(user_id, frame_bytes)
+                            if desc:
+                                self.store.put_description(user_id, desc)
+                                self._post_description_to_db(user_id, desc)
+                                self._record_to_world_model(user_id, desc, 'camera', frame_bytes)
+                                self._save_to_memory_graph(user_id, desc, 'camera')
+                                self._emit_perception_event(user_id, desc, 'camera')
+                                self._evaluate_visual_triggers(
+                                    user_id, desc, 'camera'
+                                )
+                                self._frames_described += 1
+                        else:
+                            self._frames_skipped += 1
+
+                    # Screen channel
+                    screen_bytes = self.store.get_screen_frame(user_id)
+                    if screen_bytes:
+                        if self._should_describe(user_id, screen_bytes, 'screen'):
+                            desc = self._describe_frame(
+                                user_id, screen_bytes,
+                                prompt='describe what is on the computer screen in 20 words',
                             )
-                            self._frames_described += 1
-                    else:
-                        self._frames_skipped += 1
+                            if desc:
+                                self.store.put_screen_description(user_id, desc)
+                                self._post_description_to_db(
+                                    user_id, desc,
+                                    label='Screen Context',
+                                    zeroshot_label='Screen Reasoning',
+                                )
+                                self._record_to_world_model(user_id, desc, 'screen', screen_bytes)
+                                self._save_to_memory_graph(user_id, desc, 'screen')
+                                self._emit_perception_event(user_id, desc, 'screen')
+                                self._evaluate_visual_triggers(
+                                    user_id, desc, 'screen'
+                                )
+                                self._frames_described += 1
+                        else:
+                            self._frames_skipped += 1
             except Exception as e:
                 logger.debug(f"Description loop error: {e}")
 
@@ -451,9 +628,19 @@ class VisionService:
         self, user_id: str, frame_bytes: bytes,
         prompt: str = 'describe what the user is doing in 20 words',
     ) -> Optional[str]:
-        """Send frame to MiniCPM /describe endpoint and return text."""
+        """Describe a frame using the active backend (MiniCPM or lightweight)."""
         if self._circuit_open:
             return None
+
+        # Use lightweight backend if available
+        if self._vision_backend is not None:
+            try:
+                return self._vision_backend.describe(frame_bytes)
+            except Exception as e:
+                logger.debug(f"Lightweight backend error: {e}")
+                return None
+
+        # MiniCPM sidecar path
         try:
             r = requests.post(
                 f'http://localhost:{self._minicpm_port}/describe',
@@ -491,6 +678,80 @@ class VisionService:
                 timeout=5,
             )
         except requests.RequestException:
+            pass
+
+    # ─── World Model Integration ───
+
+    def _record_to_world_model(self, user_id: str, description: str,
+                                channel: str = 'camera',
+                                frame_bytes: bytes = None):
+        """Feed scene descriptions AND raw frames to world model for learning.
+
+        Two data paths to HevolveAI:
+        1. Text description -> record_interaction() (language learning)
+        2. Raw frame bytes -> submit_sensor_frame() (visual prediction learning)
+        Both are needed: text for semantic understanding, frames for
+        autoregressive visual prediction error (predict next frame -> compare).
+        """
+        try:
+            from integrations.agent_engine.world_model_bridge import get_world_model_bridge
+            bridge = get_world_model_bridge()
+            model_id = self._vision_backend.name if self._vision_backend else 'minicpm-v2'
+
+            # 1. Text description (existing path)
+            bridge.record_interaction(
+                user_id=user_id, prompt_id=f'vision_{channel}',
+                prompt=f'[{channel}] describe what you see',
+                response=description, model_id=model_id)
+
+            # 2. Raw frame for visual encoding + autoregressive learning
+            # Only when frame bytes available and scene changed (caller already filtered)
+            if frame_bytes is not None:
+                # Submit async to avoid blocking description loop
+                self._flush_executor_submit(
+                    bridge.submit_sensor_frame,
+                    user_id, frame_bytes, channel,
+                    1.0 if channel == 'camera' else 0.0,
+                )
+        except Exception:
+            pass
+
+    def _flush_executor_submit(self, fn, *args):
+        """Submit work to a background thread (reuse VisionService's thread pool)."""
+        try:
+            import concurrent.futures
+            if not hasattr(self, '_frame_forward_executor'):
+                self._frame_forward_executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix='frame_fwd')
+            self._frame_forward_executor.submit(fn, *args)
+        except Exception:
+            pass
+
+    # ─── Temporal Perception ───
+
+    def _save_to_memory_graph(self, user_id: str, description: str, channel: str):
+        """Auto-save visual description to MemoryGraph for long-term recall."""
+        try:
+            from langchain_gpt_api import _get_or_create_graph
+            graph = _get_or_create_graph(user_id)
+            if graph:
+                graph.add(
+                    content=description,
+                    metadata={'channel': channel, 'type': 'visual_context'},
+                    tags=['visual', channel],
+                )
+        except Exception:
+            pass
+
+    def _emit_perception_event(self, user_id: str, description: str, channel: str):
+        """Emit present-tense perception event on EventBus."""
+        try:
+            from core.platform.events import emit_event
+            emit_event('perception.vision.present', {
+                'user_id': user_id, 'channel': channel,
+                'content': description, 'timestamp': time.time(),
+            })
+        except Exception:
             pass
 
     # ─── Config ───

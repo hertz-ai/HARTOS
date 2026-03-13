@@ -543,7 +543,7 @@ class ExpertAgentRegistry:
                     AgentCapability("parsing", "Parse HTML/JSON", "Extract structured data"),
                     AgentCapability("automation", "Automate extraction", "Scheduled scraping"),
                 ],
-                endpoint="crawl4ai",  # Use Crawl4AI
+                endpoint="Crawl4AI",  # Use Crawl4AI
                 model_type="tool",
                 cost_per_call=0.0,
                 avg_latency_ms=2000,
@@ -1965,6 +1965,41 @@ class ExpertAgentRegistry:
 
         # Return top agents
         return [self.agents[agent_id] for agent_id, score in sorted_agents[:10]]
+
+    def score_match(self, query: str) -> List[tuple]:
+        """Score all agents against a query, return [(agent, score)] sorted descending.
+
+        Scoring: +3 per keyword match in description, +2 per capability name match,
+        +1 per capability description match. Keywords must be >3 chars to avoid noise.
+        """
+        query_lower = query.lower()
+        query_words = [w for w in query_lower.split() if len(w) > 3]
+        if not query_words:
+            return []
+
+        scored = []
+        for agent in self.agents.values():
+            score = 0
+            desc_lower = agent.description.lower()
+
+            for word in query_words:
+                if word in desc_lower:
+                    score += 3
+
+            for cap in agent.capabilities:
+                cap_name_lower = cap.name.lower().replace('_', ' ')
+                cap_desc_lower = cap.description.lower()
+                for word in query_words:
+                    if word in cap_name_lower:
+                        score += 2
+                    if word in cap_desc_lower:
+                        score += 1
+
+            if score > 0:
+                scored.append((agent, score))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored
 
     def get_stats(self) -> Dict:
         """Get registry statistics."""

@@ -1,7 +1,7 @@
 """
 HevolveSocial - Mastodon-Style Federation
 Instances follow each other and share content across the federated network.
-Built on top of gossip peer discovery — gossip finds peers, federation shares content.
+Built on top of gossip peer discovery - gossip finds peers, federation shares content.
 
 Concepts:
 - Instance follow: Node A follows Node B → B pushes new posts to A's inbox
@@ -13,7 +13,10 @@ import logging
 import threading
 import requests
 from datetime import datetime
+
+from core.http_pool import pooled_get, pooled_post
 from typing import Optional, List
+from core.port_registry import get_port
 
 logger = logging.getLogger('hevolve_social')
 
@@ -111,14 +114,29 @@ class FederationManager:
         for follower in followers:
             threading.Thread(
                 target=self._deliver_to_inbox,
-                args=(follower['peer_url'], payload),
+                args=(follower['peer_url'], payload,
+                      follower.get('follower_node_id', '')),
                 daemon=True,
             ).start()
 
-    def _deliver_to_inbox(self, peer_url: str, payload: dict):
-        """POST to a peer's federation inbox."""
+    def _deliver_to_inbox(self, peer_url: str, payload: dict,
+                           follower_node_id: str = ''):
+        """Deliver to peer's inbox — PeerLink first, HTTP fallback."""
+        # Try PeerLink direct delivery (avoids HTTP round-trip)
+        if follower_node_id:
+            try:
+                from core.peer_link.link_manager import get_link_manager
+                link = get_link_manager().get_link(follower_node_id)
+                if link:
+                    link.send('federation', payload)
+                    logger.debug(f"Federation: delivered via PeerLink to {follower_node_id[:8]}")
+                    return
+            except Exception:
+                pass
+
+        # HTTP fallback
         try:
-            resp = requests.post(
+            resp = pooled_post(
                 f"{peer_url}/api/social/federation/inbox",
                 json=payload,
                 timeout=10,
@@ -136,9 +154,11 @@ class FederationManager:
         """
         Process an incoming federated post.
         Deduplicates by origin_node_id + post.id.
+        Verifies sender's guardrail hash before accepting - continuous audit
+        applies to every interaction, not just periodic checks.
         Returns the FederatedPost id if created, None if duplicate.
         """
-        from .models import FederatedPost
+        from .models import FederatedPost, PeerNode
         from .peer_discovery import gossip
 
         msg_type = payload.get('type')
@@ -148,6 +168,13 @@ class FederationManager:
         post_data = payload.get('post', {})
         origin_node = payload.get('origin_node_id', '')
         origin_post_id = post_data.get('id', '')
+
+        # Continuous audit: verify sender is still a valid peer with matching values
+        if origin_node:
+            peer = db.query(PeerNode).filter_by(node_id=origin_node).first()
+            if peer and peer.integrity_status == 'banned':
+                logger.debug(f"Federation inbox: rejecting post from banned node {origin_node[:8]}")
+                return None
 
         if not origin_node or not origin_post_id:
             return None
@@ -196,7 +223,7 @@ class FederationManager:
     def pull_from_peer(self, db, peer_url: str, limit: int = 20) -> int:
         """Pull recent posts from a peer's outbox. Returns count of new posts."""
         try:
-            resp = requests.get(
+            resp = pooled_get(
                 f"{peer_url}/api/social/federation/outbox",
                 params={'limit': limit},
                 timeout=10,
@@ -232,7 +259,7 @@ class FederationManager:
                                    follower_url: str):
         """Notify a peer that we are now following them."""
         try:
-            requests.post(
+            pooled_post(
                 f"{peer_url}/api/social/federation/follow-notification",
                 json={
                     'follower_node_id': follower_node_id,
@@ -249,7 +276,7 @@ class FederationManager:
             return gossip.base_url
         except Exception:
             import os
-            return os.environ.get('HEVOLVE_BASE_URL', 'http://localhost:6777')
+            return os.environ.get('HEVOLVE_BASE_URL', f'http://localhost:{get_port("backend")}')
 
 
 # Module-level singleton

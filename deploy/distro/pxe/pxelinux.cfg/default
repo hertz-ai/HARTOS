@@ -1,0 +1,20 @@
+# HART OS PXE Boot Menu
+# Served by hart-pxe-server.py via TFTP
+
+DEFAULT hart-os
+TIMEOUT 100
+PROMPT 1
+
+LABEL hart-os
+    MENU LABEL ^HART OS 1.0 (Automated Install)
+    KERNEL vmlinuz
+    APPEND initrd=initrd ip=dhcp autoinstall ds=nocloud-net;s=http://${pxe_server}:8888/autoinstall/ ---
+
+LABEL hart-os-manual
+    MENU LABEL HART OS 1.0 (^Manual Install)
+    KERNEL vmlinuz
+    APPEND initrd=initrd ip=dhcp ---
+
+LABEL local
+    MENU LABEL Boot from ^local disk
+    LOCALBOOT 0

@@ -1,0 +1,43 @@
+[Unit]
+Description=HART OS Peer Discovery (UDP Beacon)
+Documentation=https://github.com/hevolve-ai/hart
+After=hart-backend.service
+BindsTo=hart-backend.service
+
+[Service]
+Type=simple
+User=hart
+Group=hart
+WorkingDirectory=/opt/hart
+ExecStart=/opt/hart/venv/bin/python -c "from integrations.social.peer_discovery import AutoDiscovery; d = AutoDiscovery(); d.start(); import time; time.sleep(999999)"
+EnvironmentFile=/etc/hart/hart.env
+Restart=on-failure
+RestartSec=10
+StartLimitBurst=3
+StartLimitIntervalSec=60
+
+# Needs UDP broadcast capability
+AmbientCapabilities=CAP_NET_BROADCAST
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/hart
+PrivateTmp=yes
+
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+MemoryDenyWriteExecute=no
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hart-discovery
+
+[Install]
+WantedBy=hart.target

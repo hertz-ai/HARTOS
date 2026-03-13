@@ -3,17 +3,24 @@ import autogen
 import os
 from flask import current_app
 
-from helper import retrieve_json, retrieve_json
+from helper import retrieve_json, retrieve_json, _is_terminate_msg
+from cultural_wisdom import get_cultural_prompt
 # Store user-specific agents & their chat history
 user_agents: Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]] = {}
 
 AGENT_CREATOR_SYSTEM_MESSAGE = """You are a custom agent bot creator. Your task is to interact with the user to gather all the necessary details to create an agent. Once you have collected all the required information, you will generate a complete agent configuration.
         Your role is to assist in a co-creative manner. You should actively suggest actions or improvements, but always confirm with the user before implementing them. Ensure that any actions or suggestions are realistic, humanly possible & ethical. Avoid proposing anything beyond practical feasibility, such as tasks like taking the user to the moon. Your primary goal is to enhance collaboration while adhering to these boundaries.
         Speak in a casual, playful, and respectful tone, keeping it natural, funny, colloquial, and relatable. Expressions should be clear, accurate, grammatically, and contextually correct, avoiding tense confusion. Switch to a more formal tone only if the user keeps it formal.
+""" + get_cultural_prompt() + """
         ## Information Collection:
         You need to collect the following details from the user:
         { "name": "The name of the agent", "agent_name": "A unique 2-word dot-separated lowercase identifier like swift.falcon or calm.oracle (adjective.noun pattern)", "goal": "The ultimate goal of the agent", "broadcast_agent": "yes/no", "personas": [ { "name": "The role of the persona", "description": "A description of what this persona can do" } ], "flows": [ { "flow_name": "", "persona": "Each persona will have a separate flow", "actions": ["String array with actions (including tool usage) to perform to reach the sub-goal for this flow"], "sub_goal": "The goal for this flow" } ], "extra_information": "Additional notes or relevant information" }
-        IMPORTANT: The "agent_name" field must be a unique 2-word phrase in the format adjective.noun, all lowercase and separated by a dot (like what3words). Examples: swift.falcon, calm.oracle, bold.storm, fierce.phoenix. Ask the user if they'd like to pick their own agent name or have one suggested. If they provide one, validate it follows the 2-word dot format. If they want a suggestion, generate a creative one. Each word must be 2-15 lowercase letters only.
+        IMPORTANT: The "agent_name" field uses a 3-part format: skill.region.name
+        - First word: the primary skill/capability (e.g., code, design, research, teach, write, data, market, health, game, art, ops, guard, lead, ally)
+        - Second word: the HARTOS region the owner belongs to (default: "local" for local-first users)
+        - Third word: a personal name the user chooses for their agent (like naming a pet or companion)
+        Examples: code.local.aria, research.central.scout, design.local.muse, teach.local.sage
+        Ask the user what they'd like to name their agent (the personal name part). The skill prefix is auto-detected from the agent's goal. If the user doesn't have a preference, suggest a creative name. All lowercase, dot-separated.
 
         ## Guidelines for Responses:
         1.Information Gathering Process
@@ -33,12 +40,15 @@ AGENT_CREATOR_SYSTEM_MESSAGE = """You are a custom agent bot creator. Your task 
 
         4. In the review_details and completed responses, ensure that every piece of information provided by the user is included without skipping, omitting, or overlooking any details. The actions should be described thoroughly and clearly, avoiding any vagueness.
         5. Structured Responses for User Interaction
-            If information is still being collected, respond in this format:
-                { "status": "pending", "question": "The question you want to ask" }
-            Before finalizing, present a full review to the user in this format:
-                { "status": "pending", "review_details": "All details in plain string here for user verification" }
-            After confirmation, provide the final configuration in this format:
-                { "status": "completed", "name": "", "agent_name": "two.word.name", "broadcast_agent": bool, "personas": "", "tools": "", "flows": [ { "flow_name": "", "persona": "", "actions": [], "sub_goal": "" } ], "goal": "" }
+            CRITICAL: You MUST respond with ONLY a valid JSON object. No prose, no explanation, no markdown. Just pure JSON.
+            If information is still being collected, respond ONLY with:
+                {"status": "pending", "question": "The question you want to ask"}
+            Before finalizing, present a full review ONLY with:
+                {"status": "pending", "review_details": "All details in plain string here for user verification"}
+            After confirmation, provide the final configuration ONLY with:
+                {"status": "completed", "name": "", "agent_name": "skill.region.name", "broadcast_agent": false, "personas": "", "tools": "", "flows": [{"flow_name": "", "persona": "", "actions": [], "sub_goal": ""}], "goal": "", "personality": {"primary_traits": ["3-5 cultural wisdom traits that match this agent's role, e.g. Meraki, Sisu, Aloha"], "tone": "warm-casual or focused-professional or playful-encouraging", "greeting_style": "A warm, personalized opening line for this agent", "identity": "A one-sentence description of who this agent IS (not what it does) - its character, like 'A patient mentor who celebrates every small win' or 'A sharp-eyed analyst who finds patterns others miss'"}}
+            NEVER use em-dashes, smart quotes, or Unicode characters in your response. Use plain ASCII only.
+            Your response must start with { and end with }. Nothing else.
 
         """
 
@@ -51,13 +61,23 @@ def create_agents_for_user(user_id: str, autonomous=False, initial_description=N
         autonomous: If True, the LLM answers its own questions (no human input)
         initial_description: When autonomous, the user's description of the desired agent
     """
-    # Local llama.cpp server (Qwen3-VL)
-    config_list = [{
-        "model": 'Qwen3-VL-4B-Instruct',
-        "api_key": 'dummy',
-        "base_url": 'http://localhost:8080/v1',
-        "price": [0, 0]
-    }]
+    # Mode-aware config_list: cloud/regional use external LLM, flat uses local llama.cpp
+    _node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
+    if _node_tier in ('regional', 'central') and os.environ.get('HEVOLVE_LLM_ENDPOINT_URL'):
+        config_list = [{
+            "model": os.environ.get('HEVOLVE_LLM_MODEL_NAME', 'gpt-4.1-mini'),
+            "api_key": os.environ.get('HEVOLVE_LLM_API_KEY', 'dummy'),
+            "base_url": os.environ['HEVOLVE_LLM_ENDPOINT_URL'],
+            "price": [0.0025, 0.01]
+        }]
+    else:
+        _llama_port = os.environ.get('LLAMA_CPP_PORT', '8080')
+        config_list = [{
+            "model": 'Qwen3-VL-4B-Instruct',
+            "api_key": 'dummy',
+            "base_url": f'http://localhost:{_llama_port}/v1',
+            "price": [0, 0]
+        }]
 
     # Create a basic function calling config
     llm_config = {
@@ -73,9 +93,10 @@ def create_agents_for_user(user_id: str, autonomous=False, initial_description=N
 AUTONOMOUS MODE INSTRUCTIONS:
 The user wants you to create an agent autonomously based on this description: '{initial_description}'.
 You must fill in ALL required fields yourself without asking questions.
-Generate appropriate name, agent_name (two.word format), goal, broadcast_agent, personas, flows (with flow_name, persona, actions, sub_goal), and extra_information.
-Return the completed JSON immediately with status='completed'.
-Do NOT ask any questions — make reasonable decisions for all fields based on the description.
+Generate appropriate name, agent_name (skill.region.name format), goal, broadcast_agent, personas, flows (with flow_name, persona, actions, sub_goal), and extra_information.
+Return ONLY a valid JSON object with status="completed". No prose, no explanation, no markdown.
+Do NOT ask any questions. Do NOT use em-dashes or smart quotes. Plain ASCII only.
+Your response must start with {{ and end with }}. Nothing else.
 """
 
     # Create the assistant agent with context awareness
@@ -83,7 +104,7 @@ Do NOT ask any questions — make reasonable decisions for all fields based on t
         name=f"assistant_{user_id}",
         llm_config=llm_config,
         max_consecutive_auto_reply=10,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
         code_execution_config={"work_dir": "coding", "use_docker": False},
         system_message=system_message
     )
@@ -94,7 +115,7 @@ Do NOT ask any questions — make reasonable decisions for all fields based on t
     user_proxy = autogen.UserProxyAgent(
         name=f"user_proxy_{user_id}",
         human_input_mode="NEVER",
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
         max_consecutive_auto_reply=10 if autonomous else 0,
         code_execution_config=False
     )

@@ -1,0 +1,54 @@
+{
+  "id": "forest",
+  "name": "Forest",
+  "description": "Deep green with sage accents",
+  "category": "dark",
+  "colors": {
+    "background": "0d1f0d",
+    "glass_bg": "rgba(13, 31, 13, 0.65)",
+    "glass_border": "rgba(129, 199, 132, 0.12)",
+    "accent": "81c784",
+    "active": "a5d6a7",
+    "text": "c8e6c9",
+    "heading": "81c784",
+    "error": "ef5350",
+    "caution": "ffd54f",
+    "muted": "5a7a5a",
+    "surface": "142814",
+    "surface_hover": "1c351c"
+  },
+  "conky": {
+    "background": "0d1f0d",
+    "background_opacity": 180,
+    "heading": "81c784",
+    "active": "a5d6a7",
+    "error": "ef5350",
+    "caution": "ffd54f",
+    "muted": "5a7a5a",
+    "default_text": "a0c0a0"
+  },
+  "font": {
+    "family": "JetBrains Mono",
+    "size": 13,
+    "heading_size": 18,
+    "weight": 400,
+    "heading_weight": 600
+  },
+  "shell": {
+    "blur_radius": 22,
+    "saturation": 170,
+    "border_radius": 16,
+    "panel_opacity": 0.65,
+    "topbar_height": 40,
+    "icon_size": 20,
+    "panel_titlebar_height": 32,
+    "start_menu_width": 720,
+    "start_menu_columns": 4,
+    "animation_speed_ms": 220
+  },
+  "wallpaper": {
+    "type": "gradient",
+    "value": "linear-gradient(135deg, #0d1f0d 0%, #1b3a1b 50%, #0d2818 100%)"
+  },
+  "gtk_prefer_dark": true
+}

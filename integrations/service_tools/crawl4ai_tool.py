@@ -1,18 +1,35 @@
 """
 Crawl4AI tool wrapper — web scraping to markdown conversion.
 
-Service: Crawl4AI (https://github.com/unclecode/crawl4ai)
-Default port: 11235
-Deployment: docker run -d -p 11235:11235 --shm-size=1g unclecode/crawl4ai:latest
+Now uses native in-process crawl4ai (no Docker/HTTP required).
+Falls back to requests+BeautifulSoup if crawl4ai not installed.
+
+The agent sees intermediate progress and full extracted content.
 """
 
+import json
+import os
 from .registry import ServiceToolInfo, service_tool_registry
 
 
-class Crawl4AITool:
-    """Thin wrapper to register Crawl4AI with the ServiceToolRegistry."""
+def _native_crawl(params_json: str) -> str:
+    """Execute crawl in-process. Returns agent-visible progress + content."""
+    from integrations.web_crawler import crawl_url_for_agent, crawl_urls_for_agent
 
-    DEFAULT_URL = "http://localhost:11235"
+    try:
+        params = json.loads(params_json) if isinstance(params_json, str) else params_json
+    except (json.JSONDecodeError, TypeError):
+        params = {'url': str(params_json)}
+
+    # Handle both 'url' and 'urls' param names
+    url = params.get('url') or params.get('urls', '')
+    if isinstance(url, list):
+        return crawl_urls_for_agent(url)
+    return crawl_url_for_agent(str(url))
+
+
+class Crawl4AITool:
+    """Register web crawling as a native tool (in-process, no Docker)."""
 
     @classmethod
     def create_tool_info(cls, base_url: str = None) -> ServiceToolInfo:
@@ -21,37 +38,26 @@ class Crawl4AITool:
             description=(
                 "Web scraping and content extraction. Crawls URLs and converts "
                 "web pages to clean markdown optimized for LLM consumption. "
-                "Supports JavaScript rendering, screenshots, and PDF generation."
+                "Supports JavaScript rendering via crawl4ai or BeautifulSoup fallback. "
+                "Runs in-process — no external service needed."
             ),
-            base_url=base_url or cls.DEFAULT_URL,
+            base_url="native://in-process",
             endpoints={
                 "crawl": {
                     "path": "/crawl",
                     "method": "POST",
                     "description": (
                         "Crawl a URL and extract content as clean markdown. "
-                        "Input: JSON with 'urls' (string URL to crawl). "
-                        "Returns markdown text of the page content."
+                        "Input: JSON with 'url' (string URL to crawl). "
+                        "Returns progress log + markdown text of the page content."
                     ),
                     "params_schema": {
-                        "urls": {"type": "string", "description": "URL to crawl"},
-                        "word_count_threshold": {"type": "integer", "default": 10},
-                        "screenshot": {"type": "boolean", "default": False},
+                        "url": {"type": "string", "description": "URL to crawl"},
                     },
-                },
-                "screenshot": {
-                    "path": "/screenshot",
-                    "method": "POST",
-                    "description": (
-                        "Take a screenshot of a web page. "
-                        "Input: JSON with 'url' (string). Returns base64 image."
-                    ),
-                    "params_schema": {
-                        "url": {"type": "string", "description": "URL to screenshot"},
-                    },
+                    "native_handler": _native_crawl,
                 },
             },
-            health_endpoint="/health",
+            health_endpoint=None,  # No external service to check
             tags=["web", "scraping", "markdown", "crawling"],
             timeout=60,
         )

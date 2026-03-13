@@ -1,0 +1,8 @@
+[Unit]
+Description=HART OS Daily Backup
+After=hart-backend.service
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/opt/hart/deploy/distro/backup/hart-backup.sh

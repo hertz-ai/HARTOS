@@ -1,0 +1,98 @@
+-- ============================================================
+-- HART OS Conky Dashboard Configuration
+-- Crowdsourced Agentic Intelligence — Always-visible overlay
+-- ============================================================
+
+conky.config = {
+    -- ── Window ──
+    own_window = true,
+    own_window_class = 'HARTConky',
+    own_window_type = 'override',       -- Stays on all desktops
+    own_window_transparent = false,
+    own_window_argb_visual = true,
+    own_window_argb_value = 180,         -- 70% opacity dark background
+    own_window_colour = '0a0a0a',        -- Near-black
+    own_window_hints = 'undecorated,below,sticky,skip_taskbar,skip_pager',
+
+    -- ── Position & Size ──
+    alignment = 'top_right',
+    gap_x = 20,
+    gap_y = 40,
+    minimum_width = 280,
+    minimum_height = 400,
+    maximum_width = 280,
+
+    -- ── Appearance ──
+    border_width = 1,
+    border_inner_margin = 12,
+    border_outer_margin = 4,
+    draw_borders = true,
+    draw_outline = false,
+    draw_shades = false,
+    stippled_borders = 0,
+
+    -- ── Fonts ──
+    use_xft = true,
+    font = 'JetBrains Mono:size=9',
+    override_utf8_locale = true,
+    uppercase = false,
+
+    -- ── Colors (HART brand: cyan + green) ──
+    default_color = 'b0b0b0',            -- Light gray for body text
+    color0 = '00e5ff',                    -- Cyan (headings, accents)
+    color1 = '00e676',                    -- Green (positive/active)
+    color2 = 'ff5252',                    -- Red (errors/warnings)
+    color3 = 'ffab40',                    -- Amber (caution)
+    color4 = '78909c',                    -- Muted (secondary text)
+
+    -- ── Behavior ──
+    update_interval = 5,                  -- 5 second refresh
+    double_buffer = true,
+    no_buffers = true,
+    cpu_avg_samples = 4,
+    net_avg_samples = 2,
+    text_buffer_size = 4096,
+    out_to_console = false,
+    out_to_stderr = false,
+
+    -- ── Lua ──
+    lua_load = '/run/current-system/sw/share/hart/hart-conky.lua',
+};
+
+conky.text = [[
+${lua_parse hart_color heading}${font JetBrains Mono:bold:size=14}HART${font}${lua_parse hart_color muted} OS${alignr}${lua_parse hart_color active}${font JetBrains Mono:size=8}SENTIENT${font}
+${lua_parse hart_color muted}${hr 1}
+${lua_parse hart_color heading}${font JetBrains Mono:bold:size=9}NODE${font}
+${lua_parse hart_color muted}  ID:${alignr}${color}${lua hart_node_id}
+  Tier:${alignr}${lua_parse hart_color active}${lua hart_tier}${color}
+  Uptime:${alignr}${color}${uptime_short}
+
+${lua_parse hart_color heading}${font JetBrains Mono:bold:size=9}HIVE${font}
+${lua_parse hart_color muted}  Peers:${alignr}${color}${lua hart_peer_count}
+  Active Agents:${alignr}${lua_parse hart_color active}${lua hart_agent_count}${color}
+  LLM:${alignr}${lua hart_llm_status}
+
+${lua_parse hart_color heading}${font JetBrains Mono:bold:size=9}SYSTEM${font}
+${lua_parse hart_color muted}  CPU:${alignr}${color}${cpu}%
+  ${lua_parse hart_color active}${cpubar 6}${color}
+  RAM:${alignr}${color}${mem} / ${memmax}
+  ${lua_parse hart_color active}${membar 6}${color}
+  Disk:${alignr}${color}${fs_used /} / ${fs_size /}
+  ${lua_parse hart_color active}${fs_bar 6 /}${color}
+${if_existing /sys/class/drm/card0/device/gpu_busy_percent}\
+  GPU:${alignr}${color}${cat /sys/class/drm/card0/device/gpu_busy_percent}%
+${endif}\
+
+${lua_parse hart_color heading}${font JetBrains Mono:bold:size=9}NETWORK${font}
+${lua_parse hart_color muted}  IP:${alignr}${color}${addr eth0}${if_empty ${addr eth0}}${addr wlan0}${endif}
+  Down:${alignr}${color}${downspeed eth0}${if_empty ${downspeed eth0}}${downspeed wlan0}${endif}
+  Up:${alignr}${color}${upspeed eth0}${if_empty ${upspeed eth0}}${upspeed wlan0}${endif}
+
+${lua_parse hart_color heading}${font JetBrains Mono:bold:size=9}GOAL${font}
+${lua_parse hart_color muted}  Current:${alignr}${color}${lua hart_current_goal}
+  Progress:${alignr}${color}${lua hart_goal_progress}
+  ${lua_parse hart_color active}${lua hart_goal_bar}${color}
+
+${lua_parse hart_color muted}${hr 1}
+${lua_parse hart_color muted}${font JetBrains Mono:size=7}  "Humans are always in control"${font}
+]];

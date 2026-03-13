@@ -1,7 +1,7 @@
 """
 HevolveSocial - Ad Service
 Ad creation, serving, impression/click tracking, anti-fraud, revenue sharing.
-Advertisers spend Spark to run ads; peer node hosters earn 70% of ad revenue.
+Advertisers spend Spark to run ads; peer node hosters earn 90% of ad revenue (90/9/1 split).
 """
 import logging
 from datetime import datetime, timedelta
@@ -29,9 +29,13 @@ AD_COSTS = {
 MAX_IMPRESSIONS_PER_USER_PER_AD_PER_HOUR = 3
 MAX_CLICKS_PER_USER_PER_AD_PER_HOUR = 1
 
-HOSTER_REVENUE_SHARE = 0.70       # 70% to node hoster (witnessed)
-HOSTER_UNWITNESSED_SHARE = 0.50   # 50% to node hoster (unwitnessed)
-PLATFORM_REVENUE_SHARE = 0.30     # 30% to platform
+try:
+    from integrations.agent_engine.revenue_aggregator import REVENUE_SPLIT_USERS
+    HOSTER_REVENUE_SHARE = REVENUE_SPLIT_USERS          # 0.90 (was 0.70)
+except ImportError:
+    HOSTER_REVENUE_SHARE = 0.90
+HOSTER_UNWITNESSED_SHARE = 0.50   # fraud-penalty rate (unchanged)
+PLATFORM_REVENUE_SHARE = 1.0 - HOSTER_REVENUE_SHARE    # 0.10 (was 0.30)
 
 # Default placements to seed
 DEFAULT_PLACEMENTS = [
@@ -274,12 +278,21 @@ class AdService:
         if node_id:
             try:
                 from .integrity_service import IntegrityService
-                witnessed = IntegrityService.request_nearest_witness(
+                witness_result = IntegrityService.request_nearest_witness(
                     db, imp.id, ad_id, node_id)
+                if witness_result:
+                    witnessed = True
+                    # Seal the impression with witness data
+                    imp.witness_node_id = witness_result.get(
+                        'attester_node_id', '')
+                    imp.witness_signature = witness_result.get(
+                        'signature', '')
+                    imp.sealed_hash = imp.compute_seal_hash
+                    imp.sealed_at = datetime.utcnow()
             except Exception:
                 pass
 
-            # Credit node hoster: 70% if witnessed, 50% if not
+            # Credit node hoster: 90% if witnessed, 50% if not (fraud penalty)
             share = HOSTER_REVENUE_SHARE if witnessed else HOSTER_UNWITNESSED_SHARE
             hoster_share = cost * share
             AdService._credit_node_hoster(

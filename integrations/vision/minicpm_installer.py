@@ -29,20 +29,37 @@ class MiniCPMInstaller:
         self._gpu_available = False
 
     def detect_gpu(self) -> bool:
-        """Check if CUDA GPU is available."""
+        """Check if a compatible GPU is available (CUDA or Apple Metal/MPS)."""
         try:
-            import torch
-            self._gpu_available = torch.cuda.is_available()
-            if self._gpu_available:
-                name = torch.cuda.get_device_name(0)
-                mem = torch.cuda.get_device_properties(0).total_mem / (1024**3)
-                logger.info(f"GPU detected: {name} ({mem:.1f} GB)")
-            else:
-                logger.warning("No CUDA GPU detected — MiniCPM requires GPU")
+            from integrations.service_tools.vram_manager import detect_gpu as _detect_gpu
+            info = _detect_gpu()
+            self._gpu_available = info.get('cuda_available', False) or info.get('metal_available', False)
+            if info.get('name'):
+                logger.info(f"GPU detected: {info['name']} ({info.get('total_gb', 0):.1f} GB)")
+            elif not self._gpu_available:
+                logger.warning("No compatible GPU detected — MiniCPM requires GPU")
             return self._gpu_available
         except ImportError:
-            logger.warning("PyTorch not installed — cannot detect GPU")
-            return False
+            # Fallback: inline detection when running standalone
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    self._gpu_available = True
+                    name = torch.cuda.get_device_name(0)
+                    mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                    logger.info(f"CUDA GPU detected: {name} ({mem:.1f} GB)")
+                elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                    self._gpu_available = True
+                    import platform
+                    chip = platform.processor() or 'Apple Silicon'
+                    logger.info(f"Apple Metal (MPS) detected: {chip}")
+                else:
+                    self._gpu_available = False
+                    logger.warning("No compatible GPU detected — MiniCPM requires GPU")
+                return self._gpu_available
+            except ImportError:
+                logger.warning("PyTorch not installed — cannot detect GPU")
+                return False
 
     def is_installed(self) -> bool:
         """Check if model weights are already cached."""

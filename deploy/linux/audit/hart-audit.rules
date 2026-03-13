@@ -1,0 +1,23 @@
+## HART OS security audit rules
+## Install: cp to /etc/audit/rules.d/hart.rules && augenrules --load
+
+# Monitor node private key access
+-w /var/lib/hart/node_private.key -p rwa -k hart_key_access
+
+# Monitor config changes
+-w /etc/hart/hart.env -p wa -k hart_config_change
+-w /etc/hart/ -p wa -k hart_config_change
+
+# Monitor code directory modifications
+-w /opt/hart/ -p wa -k hart_code_change
+
+# Monitor service management (who restarts services?)
+-w /usr/bin/systemctl -p x -k hart_service_mgmt
+
+# Monitor user/group changes
+-w /etc/passwd -p wa -k hart_identity
+-w /etc/group -p wa -k hart_identity
+
+# Track all process execution by hart user
+-a always,exit -F arch=b64 -S execve -F uid=hart -k hart_exec
+-a always,exit -F arch=b32 -S execve -F uid=hart -k hart_exec

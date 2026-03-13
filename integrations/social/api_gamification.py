@@ -628,7 +628,7 @@ def sync_region(region_id):
         region = db.query(Region).filter_by(id=region_id).first()
         if not region or not region.global_server_url:
             return _err('No global server configured')
-        # Sync with global server (placeholder — actual federation call)
+        # Sync with global server (placeholder - actual federation call)
         return _ok({'synced': True, 'global_server': region.global_server_url})
     finally:
         db.close()
@@ -1042,6 +1042,207 @@ def marketplace_agents():
         db.close()
 
 
+# ── Marketplace HART Listings (CRUD + hire + reviews) ──
+
+MARKETPLACE_CATEGORIES = [
+    'content_creation', 'analysis_research', 'learning_tutoring',
+    'game_design', 'creative', 'custom',
+]
+
+
+@gamification_bp.route('/marketplace/listings', methods=['GET'])
+@optional_auth
+def list_listings():
+    """List active marketplace listings with optional filters."""
+    from .models import MarketplaceListing
+    db = get_db()
+    try:
+        limit = min(int(request.args.get('limit', 20)), 50)
+        offset = int(request.args.get('offset', 0))
+        category = request.args.get('category')
+        q = request.args.get('q', '').strip()
+
+        query = db.query(MarketplaceListing).filter_by(is_active=True)
+        if category:
+            query = query.filter_by(category=category)
+        if q:
+            query = query.filter(
+                MarketplaceListing.title.ilike(f'%{q}%') |
+                MarketplaceListing.description.ilike(f'%{q}%')
+            )
+        total = query.count()
+        listings = query.order_by(
+            MarketplaceListing.hire_count.desc(),
+            MarketplaceListing.rating_avg.desc(),
+        ).offset(offset).limit(limit).all()
+        return _ok([l.to_dict() for l in listings], _paginate(total, limit, offset))
+    except Exception as e:
+        logger.error(f"marketplace/listings GET error: {e}")
+        return _err(str(e), 500)
+    finally:
+        db.close()
+
+
+@gamification_bp.route('/marketplace/listings/<listing_id>', methods=['GET'])
+@optional_auth
+def get_listing(listing_id):
+    """Get a single marketplace listing by ID."""
+    from .models import MarketplaceListing
+    db = get_db()
+    try:
+        listing = db.query(MarketplaceListing).filter_by(id=listing_id).first()
+        if not listing:
+            return _err('Listing not found', 404)
+        return _ok(listing.to_dict())
+    except Exception as e:
+        logger.error(f"marketplace/listings/{listing_id} GET error: {e}")
+        return _err(str(e), 500)
+    finally:
+        db.close()
+
+
+@gamification_bp.route('/marketplace/listings', methods=['POST'])
+@require_auth
+def create_listing():
+    """Create a new marketplace listing for an agent owned by the current user."""
+    from .models import MarketplaceListing
+    db = get_db()
+    try:
+        data = _get_json()
+        agent_id = data.get('agent_id')
+        if not agent_id:
+            return _err('agent_id required')
+
+        agent = db.query(User).filter_by(id=agent_id, user_type='agent').first()
+        if not agent:
+            return _err('Agent not found', 404)
+        if agent.owner_id and agent.owner_id != g.user_id:
+            return _err('Not your agent', 403)
+
+        title = data.get('title', '').strip()
+        if not title:
+            return _err('title required')
+
+        listing = MarketplaceListing(
+            agent_id=agent_id,
+            title=title,
+            description=data.get('description', ''),
+            category=data.get('category', 'custom'),
+            price_spark=max(0, int(data.get('price_spark', 0))),
+        )
+        db.add(listing)
+        db.commit()
+        db.refresh(listing)
+        return _ok(listing.to_dict(), status=201)
+    except Exception as e:
+        db.rollback()
+        logger.error(f"marketplace/listings POST error: {e}")
+        return _err(str(e), 500)
+    finally:
+        db.close()
+
+
+@gamification_bp.route('/marketplace/listings/<listing_id>/hire', methods=['POST'])
+@require_auth
+def hire_listing(listing_id):
+    """Hire a HART via a marketplace listing. Increments hire_count."""
+    from .models import MarketplaceListing
+    db = get_db()
+    try:
+        listing = db.query(MarketplaceListing).filter_by(id=listing_id, is_active=True).first()
+        if not listing:
+            return _err('Listing not found or inactive', 404)
+
+        listing.hire_count = (listing.hire_count or 0) + 1
+        db.commit()
+        return _ok({
+            'listing_id': listing.id,
+            'agent_id': listing.agent_id,
+            'hire_count': listing.hire_count,
+        })
+    except Exception as e:
+        db.rollback()
+        logger.error(f"marketplace/listings/{listing_id}/hire error: {e}")
+        return _err(str(e), 500)
+    finally:
+        db.close()
+
+
+@gamification_bp.route('/marketplace/listings/<listing_id>/reviews', methods=['GET'])
+@optional_auth
+def list_reviews(listing_id):
+    """Get reviews for a marketplace listing."""
+    from .models import ListingReview
+    db = get_db()
+    try:
+        limit = min(int(request.args.get('limit', 20)), 50)
+        offset = int(request.args.get('offset', 0))
+        query = db.query(ListingReview).filter_by(listing_id=listing_id)
+        total = query.count()
+        reviews = query.order_by(ListingReview.created_at.desc()).offset(offset).limit(limit).all()
+        return _ok([r.to_dict() for r in reviews], _paginate(total, limit, offset))
+    except Exception as e:
+        logger.error(f"reviews GET error: {e}")
+        return _err(str(e), 500)
+    finally:
+        db.close()
+
+
+@gamification_bp.route('/marketplace/listings/<listing_id>/reviews', methods=['POST'])
+@require_auth
+def add_review(listing_id):
+    """Add a review to a marketplace listing. One review per user per listing."""
+    from .models import MarketplaceListing, ListingReview
+    from sqlalchemy import func as sa_func
+    db = get_db()
+    try:
+        listing = db.query(MarketplaceListing).filter_by(id=listing_id).first()
+        if not listing:
+            return _err('Listing not found', 404)
+
+        data = _get_json()
+        rating = int(data.get('rating', 0))
+        if rating < 1 or rating > 5:
+            return _err('rating must be 1-5')
+
+        existing = db.query(ListingReview).filter_by(
+            listing_id=listing_id, user_id=g.user_id
+        ).first()
+        if existing:
+            return _err('Already reviewed this listing', 409)
+
+        review = ListingReview(
+            listing_id=listing_id,
+            user_id=g.user_id,
+            rating=rating,
+            text=data.get('text', ''),
+        )
+        db.add(review)
+
+        listing.review_count = (listing.review_count or 0) + 1
+        all_ratings = db.query(sa_func.avg(ListingReview.rating)).filter_by(
+            listing_id=listing_id
+        ).scalar()
+        listing.rating_avg = round(float(all_ratings or rating), 2)
+
+        db.commit()
+        db.refresh(review)
+        return _ok(review.to_dict(), status=201)
+    except Exception as e:
+        db.rollback()
+        logger.error(f"reviews POST error: {e}")
+        return _err(str(e), 500)
+    finally:
+        db.close()
+
+
+@gamification_bp.route('/marketplace/categories', methods=['GET'])
+@optional_auth
+def list_marketplace_categories():
+    """List available marketplace categories."""
+    return _ok(MARKETPLACE_CATEGORIES)
+
+
 @gamification_bp.route('/share/generate-link', methods=['POST'])
 @require_auth
 def generate_share_link():
@@ -1312,7 +1513,8 @@ def location_ping():
         return _err("Coordinates out of range", 400)
     db = get_db()
     try:
-        result = ProximityService.update_location(db, g.user_id, lat, lon, accuracy)
+        device_id = data.get('device_id')
+        result = ProximityService.update_location(db, g.user_id, lat, lon, accuracy, device_id=device_id)
         db.commit()
         return _ok(result)
     except Exception as e:

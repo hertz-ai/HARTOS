@@ -1,0 +1,149 @@
+# HART OS Plymouth Boot Splash Script
+# Displays the HART OS logo with a pulsing animation, progress bar,
+# and boot status messages during startup.
+
+# ─── Window setup ───
+Window.SetBackgroundTopColor(0.05, 0.05, 0.10);
+Window.SetBackgroundBottomColor(0.02, 0.02, 0.05);
+
+# ─── Logo ───
+logo.image = Image("hart-logo.png");
+logo.sprite = Sprite(logo.image);
+logo.sprite.SetX(Window.GetWidth() / 2 - logo.image.GetWidth() / 2);
+logo.sprite.SetY(Window.GetHeight() / 2 - logo.image.GetHeight() / 2 - 60);
+
+# ─── Title: "HART OS" ───
+title_text = Image.Text("HART OS", 0.30, 0.80, 0.77, 1, "Sans 24");
+title_sprite = Sprite(title_text);
+title_sprite.SetX(Window.GetWidth() / 2 - title_text.GetWidth() / 2);
+title_sprite.SetY(Window.GetHeight() / 2 + logo.image.GetHeight() / 2 - 20);
+
+# ─── Subtitle ───
+sub_text = Image.Text("Crowdsourced Agentic Intelligence", 0.50, 0.50, 0.55, 1, "Sans 12");
+sub_sprite = Sprite(sub_text);
+sub_sprite.SetX(Window.GetWidth() / 2 - sub_text.GetWidth() / 2);
+sub_sprite.SetY(Window.GetHeight() / 2 + logo.image.GetHeight() / 2 + 15);
+
+# ─── Progress bar configuration ───
+progress_bar.x = Window.GetWidth() * 0.25;
+progress_bar.y = Window.GetHeight() * 0.78;
+progress_bar.width = Window.GetWidth() * 0.50;
+progress_bar.height = 6;
+progress_bar.current = 0.0;
+
+# Progress bar background (dark track)
+progress_bar.bg_image = Image.Text("", 0.15, 0.15, 0.20);
+progress_bar.bg_box = Image(progress_bar.width, progress_bar.height);
+progress_bar.bg_box.SetColor(0.15, 0.15, 0.20, 0.8);
+
+progress_bar.bg_sprite = Sprite();
+progress_bar.bg_sprite.SetPosition(progress_bar.x, progress_bar.y, 1);
+
+# Draw progress bar track using a filled rectangle via pixel iteration
+# Plymouth script doesn't have Image() with size, so we use a single-pixel
+# approach: create a 1x1 colored image and scale it
+progress_bar.track_pixel = Image("progress-bar.png");
+# Fallback: if no progress-bar.png, create a text-based bar indicator
+progress_bar.track_sprite = Sprite();
+progress_bar.track_sprite.SetPosition(progress_bar.x, progress_bar.y, 1);
+progress_bar.track_sprite.SetOpacity(0.3);
+
+# Progress bar fill (bright accent - HART teal)
+progress_bar.fill_sprite = Sprite();
+progress_bar.fill_sprite.SetPosition(progress_bar.x, progress_bar.y, 2);
+
+# ─── Boot status message display ───
+message_sprite = Sprite();
+message_sprite.SetPosition(Window.GetWidth() / 2, Window.GetHeight() * 0.84, 3);
+
+# ─── Status phase messages ───
+# Maps progress ranges to descriptive boot phase text
+status_messages = [];
+status_messages[0] = "Initializing node identity...";
+status_messages[1] = "Detecting hardware...";
+status_messages[2] = "Loading kernel modules...";
+status_messages[3] = "Mounting filesystems...";
+status_messages[4] = "Configuring network...";
+status_messages[5] = "Starting services...";
+status_messages[6] = "Verifying boot integrity...";
+status_messages[7] = "Joining the hive...";
+status_messages[8] = "Almost ready...";
+status_messages[9] = "Welcome to HART OS";
+
+# ─── Pulsing animation counter ───
+pulse_counter = 0;
+
+# ─── Refresh callback (called every frame) ───
+fun refresh_callback() {
+    pulse_counter++;
+    # Pulse logo opacity between 0.4 and 1.0
+    opacity = 0.4 + 0.6 * Math.Abs(Math.Sin(pulse_counter * 0.04));
+    logo.sprite.SetOpacity(opacity);
+}
+
+Plymouth.SetRefreshFunction(refresh_callback);
+
+# ─── Boot progress callback (called by systemd with duration + progress) ───
+fun progress_callback(duration, progress) {
+    # progress is 0.0 to 1.0
+    progress_bar.current = progress;
+
+    # Update fill bar width based on progress
+    fill_width = Math.Int(progress_bar.width * progress);
+    if (fill_width < 1) fill_width = 1;
+
+    # Create progress fill indicator using text-rendered block
+    # Build a string of block characters proportional to progress
+    bar_text = "";
+    num_blocks = Math.Int(50 * progress);
+    for (i = 0; i < num_blocks; i++) {
+        bar_text = bar_text + "|";
+    }
+
+    fill_image = Image.Text(bar_text, 0.30, 0.80, 0.77, 1, "Sans 6");
+    progress_bar.fill_sprite.SetImage(fill_image);
+    progress_bar.fill_sprite.SetPosition(progress_bar.x, progress_bar.y, 2);
+
+    # Draw track (remaining empty portion)
+    track_text = "";
+    for (i = num_blocks; i < 50; i++) {
+        track_text = track_text + "|";
+    }
+    track_image = Image.Text(track_text, 0.15, 0.15, 0.20, 1, "Sans 6");
+    progress_bar.track_sprite.SetImage(track_image);
+    progress_bar.track_sprite.SetPosition(
+        progress_bar.x + fill_image.GetWidth(), progress_bar.y, 1);
+    progress_bar.track_sprite.SetOpacity(0.4);
+
+    # Select status message based on progress phase
+    phase = Math.Int(progress * 10);
+    if (phase > 9) phase = 9;
+
+    phase_text = status_messages[phase];
+    phase_image = Image.Text(phase_text, 0.60, 0.60, 0.65, 1, "Sans 11");
+    message_sprite.SetImage(phase_image);
+    message_sprite.SetPosition(
+        Window.GetWidth() / 2 - phase_image.GetWidth() / 2,
+        Window.GetHeight() * 0.84,
+        3);
+
+    # Show percentage text below the bar
+    pct = Math.Int(progress * 100);
+    pct_image = Image.Text(pct + "%", 0.40, 0.40, 0.45, 1, "Sans 10");
+    progress_bar.fill_sprite.SetOpacity(1.0);
+}
+
+Plymouth.SetBootProgressFunction(progress_callback);
+
+# ─── Message callback (called by Plymouth with boot/fsck messages) ───
+fun message_callback(text) {
+    # Display arbitrary boot messages (fsck status, service names, etc.)
+    msg_image = Image.Text(text, 0.55, 0.55, 0.60, 1, "Sans 10");
+    message_sprite.SetImage(msg_image);
+    message_sprite.SetPosition(
+        Window.GetWidth() / 2 - msg_image.GetWidth() / 2,
+        Window.GetHeight() * 0.88,
+        3);
+}
+
+Plymouth.SetMessageFunction(message_callback);

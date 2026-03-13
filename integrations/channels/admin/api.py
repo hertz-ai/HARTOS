@@ -18,13 +18,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 import time
 import uuid
 from datetime import datetime
 from functools import wraps
 from typing import Optional, Dict, List, Any, Callable, TYPE_CHECKING
 
-from flask import Blueprint, request, jsonify, Response, current_app
+from flask import Blueprint, request, jsonify, Response, current_app, g
 
 from .schemas import (
     APIResponse,
@@ -63,13 +64,19 @@ admin_bp = Blueprint("admin", __name__, url_prefix="/api/admin")
 
 @admin_bp.before_request
 def _admin_auth_gate():
-    """Require admin Bearer token for ALL admin endpoints."""
+    """Require authenticated user for channel/device config endpoints.
+
+    Channel config (settings, identity, channels, workflows) is local device
+    configuration — any registered (flat+) user can manage their own device.
+    Network-wide admin operations (user management, moderation) are protected
+    by separate @require_central decorators on the social admin blueprint.
+    """
     from integrations.social.auth import _get_user_from_token
     from flask import g
 
     auth_header = request.headers.get('Authorization', '')
     if not auth_header.startswith('Bearer '):
-        return jsonify({'success': False, 'error': 'Admin authentication required'}), 401
+        return jsonify({'success': False, 'error': 'Authentication required'}), 401
 
     token = auth_header[7:]
     user, db = _get_user_from_token(token)
@@ -77,10 +84,6 @@ def _admin_auth_gate():
         if db:
             db.close()
         return jsonify({'success': False, 'error': 'Invalid or expired token'}), 401
-
-    if not user.is_admin:
-        db.close()
-        return jsonify({'success': False, 'error': 'Admin access required'}), 403
 
     g.user = user
     g.user_id = str(user.id)
@@ -150,7 +153,7 @@ class AdminAPI:
             logger.warning("Failed to load admin config: %s", e)
 
     def _save_config(self) -> None:
-        """Save configuration to file."""
+        """Save configuration to file using atomic write (temp + rename)."""
         config_path = os.path.join(
             os.path.dirname(__file__),
             "..",
@@ -160,9 +163,17 @@ class AdminAPI:
             "admin_config.json"
         )
         try:
-            os.makedirs(os.path.dirname(config_path), exist_ok=True)
-            with open(config_path, "w") as f:
-                json.dump(self._config, f, indent=2, default=str)
+            config_dir = os.path.dirname(config_path)
+            os.makedirs(config_dir, exist_ok=True)
+            # Write to temp file first, then atomic rename to prevent corruption
+            fd, tmp_path = tempfile.mkstemp(dir=config_dir, suffix='.tmp')
+            try:
+                with os.fdopen(fd, 'w') as f:
+                    json.dump(self._config, f, indent=2, default=str)
+                os.replace(tmp_path, config_path)  # atomic rename
+            except:
+                os.unlink(tmp_path)
+                raise
             logger.info("Saved admin configuration to %s", config_path)
         except Exception as e:
             logger.warning("Failed to save admin config: %s", e)
@@ -391,24 +402,91 @@ def disable_channel(channel_type: str):
 @admin_bp.route("/channels/<channel_type>/test", methods=["POST"])
 @api_response
 def test_channel(channel_type: str):
-    """Test channel connection."""
+    """Test channel connection against the live adapter registry."""
     api = get_api()
     if channel_type not in api._channels:
         raise FileNotFoundError(f"Channel {channel_type} not found")
 
-    # Simulate connection test
-    return {"channel": channel_type, "test_result": "success", "latency_ms": 45}
+    config = api._channels[channel_type]
+    if not config.get('enabled'):
+        return {"channel": channel_type, "test_result": "disabled", "latency_ms": 0}
+
+    try:
+        from integrations.channels.registry import get_registry
+        registry = get_registry()
+        adapter = registry.get(channel_type)
+        if adapter:
+            import time as _time
+            t0 = _time.time()
+            import asyncio as _asyncio
+            loop = _asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(_asyncio.wait_for(adapter.connect(), timeout=10))
+                latency = int((_time.time() - t0) * 1000)
+                return {"channel": channel_type, "test_result": "success", "latency_ms": latency}
+            finally:
+                loop.close()
+        else:
+            return {"channel": channel_type, "test_result": "not_registered", "latency_ms": 0}
+    except Exception as e:
+        return {"channel": channel_type, "test_result": "failed", "error": str(e), "latency_ms": 0}
 
 
 @admin_bp.route("/channels/<channel_type>/reconnect", methods=["POST"])
 @api_response
 def reconnect_channel(channel_type: str):
-    """Force channel reconnection."""
+    """Force channel reconnection via the live adapter registry."""
     api = get_api()
     if channel_type not in api._channels:
         raise FileNotFoundError(f"Channel {channel_type} not found")
 
-    return {"channel": channel_type, "reconnected": True}
+    try:
+        from integrations.channels.registry import get_registry
+        registry = get_registry()
+        adapter = registry.get(channel_type)
+        if adapter:
+            import asyncio as _asyncio
+            loop = _asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(adapter.disconnect())
+                loop.run_until_complete(adapter.connect())
+                return {"channel": channel_type, "reconnected": True}
+            except Exception as e:
+                return {"channel": channel_type, "reconnected": False, "error": str(e)}
+            finally:
+                loop.close()
+        return {"channel": channel_type, "reconnected": False, "error": "Adapter not registered"}
+    except Exception as e:
+        return {"channel": channel_type, "reconnected": False, "error": str(e)}
+
+
+@admin_bp.route("/channels/<channel_type>/activate", methods=["POST"])
+@api_response
+def activate_channel(channel_type: str):
+    """Activate a channel by registering its adapter with the live registry."""
+    api = get_api()
+    config = api._channels.get(channel_type)
+    if not config:
+        raise FileNotFoundError(f"Channel {channel_type} not found")
+    if not config.get('enabled'):
+        raise ValueError(f"Channel {channel_type} is disabled — enable it first")
+
+    token = config.get('token') or config.get('api_key')
+    if not token:
+        raise ValueError(f"No token/api_key configured for {channel_type}")
+
+    try:
+        from integrations.channels.flask_integration import get_channel_integration
+        integration = get_channel_integration()
+        register_fn = getattr(integration, f'register_{channel_type}', None)
+        if register_fn:
+            register_fn(token=token)
+            return {"channel": channel_type, "activated": True}
+        else:
+            return {"channel": channel_type, "activated": False,
+                    "error": f"No register_{channel_type}() method available"}
+    except Exception as e:
+        return {"channel": channel_type, "activated": False, "error": str(e)}
 
 
 @admin_bp.route("/channels/<channel_type>/metrics", methods=["GET"])
@@ -1878,7 +1956,8 @@ def update_media_config():
     """Update media handling configuration."""
     api = get_api()
     data = request.get_json()
-    api._global_config.media = MediaConfigSchema(**data)
+    valid_fields = {f.name for f in MediaConfigSchema.__dataclass_fields__.values()}
+    api._global_config.media = MediaConfigSchema(**{k: v for k, v in data.items() if k in valid_fields})
     api._save_config()
     return api._global_config.media.to_dict()
 
@@ -1924,7 +2003,7 @@ def update_memory_config():
 @admin_bp.route("/config/embodied", methods=["GET"])
 @api_response
 def get_embodied_config():
-    """Get embodied AI / crawl4ai feed configuration."""
+    """Get embodied AI / HevolveAI feed configuration."""
     api = get_api()
     return api._global_config.embodied_ai.to_dict()
 
@@ -1932,7 +2011,7 @@ def get_embodied_config():
 @admin_bp.route("/config/embodied", methods=["PUT"])
 @api_response
 def update_embodied_config():
-    """Update embodied AI feed configuration and propagate to crawl4ai."""
+    """Update embodied AI feed configuration and propagate to HevolveAI."""
     api = get_api()
     data = request.get_json()
     if not data:
@@ -1940,7 +2019,7 @@ def update_embodied_config():
     api._global_config.embodied_ai = EmbodiedAIConfigSchema(**data)
     api._save_config()
 
-    # Propagate to crawl4ai runtime if reachable
+    # Propagate to HevolveAI runtime if reachable
     _propagate_embodied_config(api._global_config.embodied_ai)
     return api._global_config.embodied_ai.to_dict()
 
@@ -1983,16 +2062,16 @@ def toggle_embodied_feed():
 @admin_bp.route("/config/embodied/status", methods=["GET"])
 @api_response
 def get_embodied_status():
-    """Get live status of crawl4ai embodied AI system."""
+    """Get live status of HevolveAI embodied AI system."""
     import requests as req
     api = get_api()
-    url = api._global_config.embodied_ai.crawl4ai_url
+    url = api._global_config.embodied_ai.hevolveai_url
 
     try:
         resp = req.get(f"{url}/health", timeout=3)
         health = resp.json() if resp.ok else {"status": "unreachable"}
     except Exception:
-        health = {"status": "unreachable", "error": "Cannot connect to crawl4ai"}
+        health = {"status": "unreachable", "error": "Cannot connect to HevolveAI"}
 
     try:
         resp = req.get(f"{url}/v1/stats", timeout=3)
@@ -2002,18 +2081,18 @@ def get_embodied_status():
 
     return {
         "config": api._global_config.embodied_ai.to_dict(),
-        "crawl4ai_health": health,
+        "hevolve_core_health": health,
         "learning_stats": stats,
     }
 
 
 def _propagate_embodied_config(cfg: EmbodiedAIConfigSchema):
-    """Push config changes to crawl4ai runtime (best-effort)."""
+    """Push config changes to HevolveAI runtime (best-effort)."""
     import requests as req
     try:
-        # crawl4ai reads env vars at startup, but we can hit a
+        # HevolveAI reads env vars at startup, but we can hit a
         # runtime config endpoint if available, or set for next restart.
-        # For now, write to shared config file that crawl4ai watches.
+        # For now, write to shared config file that HevolveAI watches.
         config_path = os.path.join(
             os.path.dirname(__file__), '..', '..', '..',
             'agent_data', 'embodied_ai_config.json',

@@ -1,0 +1,54 @@
+{
+  "id": "high-contrast",
+  "name": "High Contrast",
+  "description": "White background with black text",
+  "category": "light",
+  "colors": {
+    "background": "ffffff",
+    "glass_bg": "rgba(255, 255, 255, 0.85)",
+    "glass_border": "rgba(0, 0, 0, 0.15)",
+    "accent": "1565c0",
+    "active": "2e7d32",
+    "text": "000000",
+    "heading": "000000",
+    "error": "b71c1c",
+    "caution": "e65100",
+    "muted": "616161",
+    "surface": "fafafa",
+    "surface_hover": "eeeeee"
+  },
+  "conky": {
+    "background": "f0f0f0",
+    "background_opacity": 240,
+    "heading": "000000",
+    "active": "2e7d32",
+    "error": "b71c1c",
+    "caution": "e65100",
+    "muted": "616161",
+    "default_text": "212121"
+  },
+  "font": {
+    "family": "Inter",
+    "size": 14,
+    "heading_size": 20,
+    "weight": 500,
+    "heading_weight": 700
+  },
+  "shell": {
+    "blur_radius": 10,
+    "saturation": 100,
+    "border_radius": 8,
+    "panel_opacity": 0.85,
+    "topbar_height": 44,
+    "icon_size": 22,
+    "panel_titlebar_height": 36,
+    "start_menu_width": 740,
+    "start_menu_columns": 4,
+    "animation_speed_ms": 150
+  },
+  "wallpaper": {
+    "type": "solid",
+    "value": "#f5f5f5"
+  },
+  "gtk_prefer_dark": false
+}

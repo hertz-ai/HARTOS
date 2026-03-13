@@ -11,8 +11,8 @@ Successfully created comprehensive runtime end-to-end tests that validate the co
 #### Main Files
 - ✅ `docker-compose.test.yml` - Orchestrates all test services
 - ✅ `Dockerfile.test` - Test environment container
-- ✅ `Dockerfile.mock-apis` - Mock external API services
-- ✅ `Dockerfile.mock-crossbar` - Mock pub/sub server
+- ✅ `tests/Dockerfile.mock-apis` - Mock external API services
+- ✅ `tests/Dockerfile.mock-crossbar` - Mock pub/sub server
 
 #### Services Architecture
 ```

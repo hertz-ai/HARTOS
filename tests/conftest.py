@@ -7,24 +7,37 @@ import shutil
 from unittest.mock import Mock, MagicMock, patch
 from datetime import datetime
 
+# ─── Windows excepthook crash guard ───
+# On Windows, sys.excepthook can crash when writing tracebacks to certain
+# consoles/pipes, killing the entire pytest process mid-run.  Installing a
+# resilient hook prevents the abort while still attempting to display the error.
+_original_excepthook = sys.excepthook
+
+def _safe_excepthook(exc_type, exc_value, exc_tb):
+    try:
+        _original_excepthook(exc_type, exc_value, exc_tb)
+    except Exception:
+        # Fallback: write to stderr directly (avoids "I/O on closed file" abort)
+        try:
+            sys.stderr.write(f"\n[conftest] Unhandled {exc_type.__name__}: {exc_value}\n")
+        except Exception:
+            pass
+
+sys.excepthook = _safe_excepthook
+
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 # ─── Exclude standalone scripts that crash pytest collection ───
 # These files have sys.exit() at module level or module-level assertions.
 # They are standalone test runners, not pytest test files.
-# Run them directly with: python tests/<filename>.py
+# Run them directly with: python tests/standalone/<filename>.py
 collect_ignore = [
-    os.path.join(os.path.dirname(__file__), 'test_nested_task_system.py'),
-    os.path.join(os.path.dirname(__file__), 'test_nested_tasks.py'),
-    os.path.join(os.path.dirname(__file__), 'test_master_suite.py'),
-    os.path.join(os.path.dirname(__file__), 'test_agent_lightning_standalone.py'),
-    os.path.join(os.path.dirname(__file__), 'run_integration_tests.py'),
-    os.path.join(os.path.dirname(__file__), 'run_manual_tests.py'),
+    os.path.join(os.path.dirname(__file__), 'standalone'),  # entire dir
 ]
 collect_ignore_glob = [
-    # runtime_tests/ need a live API server — run via scripts/run_e2e_tests.bat
-    os.path.join(os.path.dirname(__file__), 'runtime_tests', '*.py'),
+    # runtime_tests/ need a live API server - run via scripts/run_e2e_tests.bat
+    os.path.join(os.path.dirname(__file__), 'e2e', 'runtime_tests', '*.py'),
 ]
 
 from lifecycle_hooks import (
@@ -32,19 +45,37 @@ from lifecycle_hooks import (
     action_states, flow_lifecycle,
     initialize_deterministic_actions
 )
-from helper import Action
+try:
+    from helper import Action
+except ImportError:
+    Action = None  # autogen not installed — tests needing Action will skip
+
+
+def pytest_configure(config):
+    """Register custom markers for optional dependencies."""
+    config.addinivalue_line("markers", "requires_pyautogui: test needs pyautogui")
+    config.addinivalue_line("markers", "requires_telegram: test needs python-telegram-bot")
 
 
 @pytest.fixture(autouse=True)
 def reset_state_machine():
-    """Reset state machine before each test"""
-    action_states.clear()
-    flow_lifecycle.flows.clear()
-    initialize_deterministic_actions()
+    """Reset state machine before each test.
+
+    Wrapped in try/except because initialize_deterministic_actions()
+    requires Flask app context, which not all test files set up.
+    """
+    try:
+        action_states.clear()
+        flow_lifecycle.flows.clear()
+        initialize_deterministic_actions()
+    except (RuntimeError, Exception):
+        pass  # No Flask app context - test doesn't use lifecycle hooks
     yield
-    # Cleanup after test
-    action_states.clear()
-    flow_lifecycle.flows.clear()
+    try:
+        action_states.clear()
+        flow_lifecycle.flows.clear()
+    except (RuntimeError, Exception):
+        pass
 
 
 @pytest.fixture
@@ -108,17 +139,27 @@ def mock_agents():
 
 @pytest.fixture
 def temp_prompts_dir(tmp_path):
-    """Create temporary prompts directory"""
+    """Create temporary prompts directory and patch PROMPTS_DIR in all modules."""
     prompts_dir = tmp_path / "prompts"
     prompts_dir.mkdir()
 
-    # Change to temp directory
+    prompts_str = str(prompts_dir)
     original_dir = os.getcwd()
     os.chdir(tmp_path)
 
+    # Patch PROMPTS_DIR in all modules that reference it
+    patches = []
+    for mod_name in ('create_recipe', 'reuse_recipe', 'helper', 'recipe_experience'):
+        mod = sys.modules.get(mod_name)
+        if mod and hasattr(mod, 'PROMPTS_DIR'):
+            p = patch.object(mod, 'PROMPTS_DIR', prompts_str)
+            p.start()
+            patches.append(p)
+
     yield prompts_dir
 
-    # Restore original directory
+    for p in patches:
+        p.stop()
     os.chdir(original_dir)
 
 
@@ -126,6 +167,10 @@ def temp_prompts_dir(tmp_path):
 def sample_config_json(temp_prompts_dir, test_prompt_id):
     """Create sample config JSON file"""
     config = {
+        "personas": [
+            {"name": "Test Assistant"},
+            {"name": "Test Reviewer"}
+        ],
         "flows": [
             {
                 "persona": "Test Assistant",
@@ -179,13 +224,18 @@ def sample_recipe_json(temp_prompts_dir, test_prompt_id):
 
 @pytest.fixture
 def mock_flask_app():
-    """Mock Flask app context"""
-    with patch('flask.current_app') as mock_app:
-        mock_app.logger = Mock()
-        mock_app.logger.info = Mock()
-        mock_app.logger.warning = Mock()
-        mock_app.logger.error = Mock()
-        yield mock_app
+    """Provide a real Flask application context.
+
+    Using patch('flask.current_app') fails on Python 3.10+ because
+    mock introspects the werkzeug LocalProxy (calls hasattr(__func__))
+    which triggers RuntimeError outside an app context.
+    A real minimal Flask app avoids this entirely.
+    """
+    from flask import Flask
+    app = Flask(__name__)
+    app.config['TESTING'] = True
+    with app.app_context():
+        yield app
 
 
 @pytest.fixture

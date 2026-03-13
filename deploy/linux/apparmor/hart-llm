@@ -1,0 +1,19 @@
+#include <tunables/global>
+
+/opt/hart/models/** r,
+/usr/local/bin/llama-server {
+  #include <abstractions/base>
+
+  /opt/hart/models/** r,
+  /var/log/hart/** w,
+
+  # GPU
+  /dev/nvidia* rw,
+  /dev/dri/** rw,
+
+  network inet stream,
+
+  deny /etc/shadow r,
+  deny /root/** rw,
+  deny /var/lib/hart/node_private.key r,
+}

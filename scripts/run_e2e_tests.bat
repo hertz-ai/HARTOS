@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================
-REM HevolveBot LangChain Agent - End-to-End Test Runner
+REM HART OS - End-to-End Test Runner
 REM ============================================================
 REM Runs comprehensive E2E tests. Starts server if not running.
 REM Supports Docker-based and local test modes.
@@ -41,7 +41,7 @@ if errorlevel 1 (
     echo This may take a moment for model loading...
     echo.
 
-    start "HevolveBot API Server" "%PYTHON_EXE%" langchain_gpt_api.py
+    start "HART OS API Server" "%PYTHON_EXE%" langchain_gpt_api.py
 
     REM Wait for server to be ready
     echo Waiting for server to start...
@@ -77,13 +77,13 @@ set /p choice="Enter choice (1-6): "
 
 if "%choice%"=="1" (
     echo Running channel regression tests...
-    "%PYTHON_EXE%" -m pytest integrations/channels/tests/test_e2e_regression.py -v -s --tb=short
+    "%PYTHON_EXE%" -m pytest tests/integration/test_channels_e2e_regression.py -v -s --tb=short
 ) else if "%choice%"=="2" (
     echo Running master test suite...
-    "%PYTHON_EXE%" test_master_suite.py
+    "%PYTHON_EXE%" tests/standalone/test_master_suite.py
 ) else if "%choice%"=="3" (
     echo Running autonomous agent suite...
-    "%PYTHON_EXE%" test_autonomous_agent_suite.py
+    "%PYTHON_EXE%" tests/standalone/test_autonomous_agent_suite.py
 ) else if "%choice%"=="4" (
     echo Running Docker E2E tests...
     echo Checking Docker availability...
@@ -97,19 +97,20 @@ if "%choice%"=="1" (
     docker-compose -f docker-compose.test.yml up --build --abort-on-container-exit
 ) else if "%choice%"=="5" (
     echo Running ALL local tests...
-    "%PYTHON_EXE%" -m pytest tests/ integrations/channels/tests/ test_master_suite.py test_dynamic_agents.py test_complex_agent_comprehensive.py -v --tb=short --color=yes
+    "%PYTHON_EXE%" -m pytest tests/unit/ tests/integration/ tests/e2e/ -v --tb=short --color=yes
 ) else if "%choice%"=="6" (
     echo Running tests with coverage...
-    if exist htmlcov rmdir /s /q htmlcov
-    "%PYTHON_EXE%" -m pytest integrations/channels/tests/test_e2e_regression.py -v --tb=short ^
+    if not exist "test-reports\coverage" mkdir "test-reports\coverage"
+    "%PYTHON_EXE%" -m pytest tests/integration/test_channels_e2e_regression.py -v --tb=short ^
         --cov=integrations/channels ^
-        --cov-report=html:htmlcov ^
-        --cov-report=term-missing
-    if exist htmlcov\index.html (
+        --cov-report=html:test-reports/coverage ^
+        --cov-report=term-missing ^
+        --cov-config=.coveragerc
+    if exist "test-reports\coverage\index.html" (
         echo.
-        echo [SUCCESS] Coverage report generated at htmlcov\index.html
+        echo [SUCCESS] Coverage report generated at test-reports\coverage\index.html
         echo Opening in browser...
-        start htmlcov\index.html
+        start test-reports\coverage\index.html
     )
 ) else (
     echo Invalid choice
@@ -128,7 +129,7 @@ set /p stop_server="Stop API server? (y/n): "
 
 if /i "%stop_server%"=="y" (
     echo Stopping API server...
-    taskkill /FI "WindowTitle eq HevolveBot API Server*" /F > nul 2>&1
+    taskkill /FI "WindowTitle eq HART OS API Server*" /F > nul 2>&1
     echo Server stopped.
 )
 

@@ -212,7 +212,9 @@ def migrate_ledger_to_redis(
 
 
 # Singleton pattern for shared ledger instances
+import threading as _threading
 _ledger_cache = {}
+_ledger_cache_lock = _threading.Lock()
 
 
 def get_or_create_ledger(
@@ -238,14 +240,16 @@ def get_or_create_ledger(
     """
     cache_key = f"{agent_id}_{session_id}"
 
-    if use_cache and cache_key in _ledger_cache:
-        logger.info(f"[LedgerFactory] Reusing cached ledger for {cache_key}")
-        return _ledger_cache[cache_key]
+    with _ledger_cache_lock:
+        if use_cache and cache_key in _ledger_cache:
+            logger.info(f"[LedgerFactory] Reusing cached ledger for {cache_key}")
+            return _ledger_cache[cache_key]
 
     ledger = create_production_ledger(agent_id=agent_id, session_id=session_id, **kwargs)
 
     if use_cache:
-        _ledger_cache[cache_key] = ledger
+        with _ledger_cache_lock:
+            _ledger_cache[cache_key] = ledger
 
     return ledger
 
@@ -253,5 +257,6 @@ def get_or_create_ledger(
 def clear_ledger_cache():
     """Clear the global ledger cache."""
     global _ledger_cache
-    _ledger_cache = {}
+    with _ledger_cache_lock:
+        _ledger_cache = {}
     logger.info("[LedgerFactory] Cleared ledger cache")

@@ -6,6 +6,7 @@ import os
 import json
 import hashlib
 import logging
+import shutil
 from pathlib import Path
 from typing import Optional, Tuple, Dict
 
@@ -17,7 +18,16 @@ from cryptography.exceptions import InvalidSignature
 
 logger = logging.getLogger('hevolve_security')
 
-_KEY_DIR = os.environ.get('HEVOLVE_KEY_DIR', 'agent_data')
+def _resolve_key_dir():
+    explicit = os.environ.get('HEVOLVE_KEY_DIR')
+    if explicit:
+        return explicit
+    db_path = os.environ.get('HEVOLVE_DB_PATH', '')
+    if db_path and db_path != ':memory:' and os.path.isabs(db_path):
+        return os.path.dirname(db_path)
+    return 'agent_data'
+
+_KEY_DIR = _resolve_key_dir()
 _PRIVATE_KEY_FILE = 'node_private_key.pem'
 _PUBLIC_KEY_FILE = 'node_public_key.pem'
 _CODE_ROOT = os.environ.get('HEVOLVE_CODE_ROOT', os.path.dirname(
@@ -48,8 +58,14 @@ def get_or_create_keypair() -> Tuple[Ed25519PrivateKey, Ed25519PublicKey]:
 
     if priv_path.exists() and pub_path.exists():
         try:
-            priv_pem = priv_path.read_bytes()
-            _private_key = serialization.load_pem_private_key(priv_pem, password=None)
+            raw = priv_path.read_bytes()
+            # Decrypt at rest — auto-detects encrypted vs plaintext PEM
+            try:
+                from security.crypto import decrypt_data
+                raw = decrypt_data(raw)
+            except ImportError:
+                pass
+            _private_key = serialization.load_pem_private_key(raw, password=None)
             _public_key = _private_key.public_key()
             logger.info(f"Node keypair loaded from {key_dir}")
             return _private_key, _public_key
@@ -60,7 +76,7 @@ def get_or_create_keypair() -> Tuple[Ed25519PrivateKey, Ed25519PublicKey]:
     _private_key = Ed25519PrivateKey.generate()
     _public_key = _private_key.public_key()
 
-    # Persist to disk
+    # Persist to disk — encrypted at rest when HEVOLVE_DATA_KEY is set
     priv_pem = _private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.PKCS8,
@@ -70,8 +86,12 @@ def get_or_create_keypair() -> Tuple[Ed25519PrivateKey, Ed25519PublicKey]:
         encoding=serialization.Encoding.PEM,
         format=serialization.PublicFormat.SubjectPublicKeyInfo,
     )
-    priv_path.write_bytes(priv_pem)
-    pub_path.write_bytes(pub_pem)
+    try:
+        from security.crypto import encrypt_data
+        priv_path.write_bytes(encrypt_data(priv_pem))
+    except ImportError:
+        priv_path.write_bytes(priv_pem)
+    pub_path.write_bytes(pub_pem)  # Public key stays plaintext
     logger.info(f"Node keypair generated and saved to {key_dir}")
     return _private_key, _public_key
 
@@ -130,17 +150,83 @@ def verify_json_signature(public_key_hex: str, payload: dict,
 
 def compute_code_hash(code_root: str = None) -> str:
     """Compute SHA-256 manifest hash of all .py files in the project.
-    Deterministic across identical deployments."""
-    root = Path(code_root or _CODE_ROOT)
-    manifest_lines = []
 
+    Deterministic across identical deployments.
+
+    Performance modes for embedded/resource-constrained devices:
+        HEVOLVE_CODE_HASH_PRECOMPUTED: Skip computation entirely (ROM/SD card).
+            Set at build time from a known-good hash.
+        File cache (agent_data/code_hash_cache.json): Reuse cached hash if
+            no .py file has a newer mtime than the cache timestamp.
+    """
+    # Tier 1: Precomputed hash (ROM/read-only deployments)
+    precomputed = os.environ.get('HEVOLVE_CODE_HASH_PRECOMPUTED', '')
+    if precomputed:
+        logger.debug(f"Code hash: using precomputed {precomputed[:16]}...")
+        return precomputed
+
+    root = Path(code_root or _CODE_ROOT)
+
+    # Tier 2: File-based cache (skip recompute if .py files unchanged)
+    cached = _load_code_hash_cache(root)
+    if cached:
+        return cached
+
+    # Tier 3: Full computation
+    manifest_lines = []
     py_files = sorted(_collect_py_files(root, root))
     for rel_path, file_path in py_files:
         file_hash = _hash_file(file_path)
         manifest_lines.append(f"{rel_path}:{file_hash}")
 
     manifest = '\n'.join(manifest_lines)
-    return hashlib.sha256(manifest.encode('utf-8')).hexdigest()
+    result = hashlib.sha256(manifest.encode('utf-8')).hexdigest()
+
+    # Save to cache for next boot
+    _save_code_hash_cache(root, result)
+
+    return result
+
+
+def _load_code_hash_cache(root: Path) -> Optional[str]:
+    """Load cached code hash if no .py file has changed since cache was written."""
+    cache_path = root / 'agent_data' / 'code_hash_cache.json'
+    try:
+        if not cache_path.exists():
+            return None
+        with open(cache_path, 'r') as f:
+            cache = json.load(f)
+        cached_hash = cache.get('code_hash', '')
+        cached_at = cache.get('cached_at', 0)
+        if not cached_hash or not cached_at:
+            return None
+
+        # Check if any .py file is newer than the cache
+        for _, file_path in _collect_py_files(root, root):
+            try:
+                if file_path.stat().st_mtime > cached_at:
+                    logger.debug("Code hash cache stale: .py file modified")
+                    return None
+            except OSError:
+                continue
+
+        logger.debug(f"Code hash: using cache {cached_hash[:16]}...")
+        return cached_hash
+    except (json.JSONDecodeError, OSError, KeyError):
+        return None
+
+
+def _save_code_hash_cache(root: Path, code_hash: str):
+    """Save code hash to file cache for faster subsequent boots."""
+    import time
+    cache_path = root / 'agent_data' / 'code_hash_cache.json'
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_path, 'w') as f:
+            json.dump({'code_hash': code_hash, 'cached_at': time.time()}, f)
+    except (OSError, IOError) as e:
+        # Read-only FS - silently skip
+        logger.debug(f"Code hash cache write skipped: {e}")
 
 
 def compute_file_manifest(code_root: str = None) -> Dict[str, str]:
@@ -163,7 +249,7 @@ def _collect_py_files(directory: Path, root: Path):
             elif entry.is_file() and entry.suffix == '.py':
                 rel = str(entry.relative_to(root)).replace('\\', '/')
                 yield (rel, entry)
-    except PermissionError:
+    except (PermissionError, OSError):
         pass
 
 
@@ -205,3 +291,27 @@ def reset_keypair():
     global _private_key, _public_key
     _private_key = None
     _public_key = None
+
+
+def purge_pycache(code_root: str = None) -> int:
+    """Delete all __pycache__ directories and prevent bytecode regeneration.
+
+    Called at boot before the integrity manifest snapshot is taken.
+    Blocks bytecode injection attacks where malicious .pyc files
+    could be loaded by Python instead of the verified .py sources.
+
+    Returns count of __pycache__ directories removed.
+    """
+    os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
+    root = Path(code_root or _CODE_ROOT)
+    count = 0
+    try:
+        for pycache_dir in root.rglob('__pycache__'):
+            if pycache_dir.is_dir():
+                shutil.rmtree(pycache_dir, ignore_errors=True)
+                count += 1
+        if count:
+            logger.info(f"Boot integrity: purged {count} __pycache__ directories")
+    except (PermissionError, OSError) as e:
+        logger.warning(f"Boot integrity: pycache purge partial - {e}")
+    return count

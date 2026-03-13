@@ -137,6 +137,61 @@ class DistributedTaskCoordinator:
         logger.debug(f"No available tasks for agent {agent_id}")
         return None
 
+    def claim_parallel_batch(
+        self,
+        agent_id: str,
+        max_tasks: int = 4,
+        capabilities: Optional[List[str]] = None,
+    ) -> List[Task]:
+        """Atomically claim multiple parallel-ready tasks for batch execution.
+
+        Only claims tasks with execution_mode='parallel' (set by SmartLedger
+        create_sibling_tasks + parallel_dispatch). Sequential tasks are skipped.
+
+        Args:
+            agent_id: Claiming agent's ID
+            max_tasks: Maximum tasks to claim in one batch
+            capabilities: Optional capability filter
+
+        Returns:
+            List of claimed Task objects (may be empty)
+        """
+        from agent_ledger.core import ExecutionMode
+
+        claimed = []
+        for task_id in self._ledger.task_order:
+            if len(claimed) >= max_tasks:
+                break
+
+            task = self._ledger.get_task(task_id)
+            if not task or task.status != TaskStatus.PENDING:
+                continue
+
+            # Only claim parallel-mode tasks
+            if getattr(task, 'execution_mode', None) != ExecutionMode.PARALLEL:
+                continue
+
+            # Check capability match
+            if capabilities:
+                required = task.context.get("capabilities_required", [])
+                if required and not any(c in capabilities for c in required):
+                    continue
+
+            # Try atomic claim
+            if self._lock.try_claim_task(task_id, agent_id):
+                self._ledger.update_task_status(task_id, TaskStatus.IN_PROGRESS)
+                task.context["claimed_by"] = agent_id
+                task.context["claimed_at"] = datetime.now().isoformat()
+                claimed.append(task)
+
+        if claimed:
+            self._ledger.save()
+            logger.info(
+                f"{len(claimed)} parallel tasks claimed by {agent_id}: "
+                f"{[t.task_id for t in claimed]}")
+
+        return claimed
+
     def submit_result(
         self,
         task_id: str,

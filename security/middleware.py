@@ -43,7 +43,7 @@ def _apply_security_headers(app: Flask):
             response.headers['Content-Security-Policy'] = (
                 "default-src 'self'; "
                 "script-src 'self'; "
-                "style-src 'self' 'unsafe-inline'; "
+                "style-src 'self'; "
                 "img-src 'self' data:; "
                 "connect-src 'self'; "
                 "frame-ancestors 'none'"
@@ -53,13 +53,20 @@ def _apply_security_headers(app: Flask):
 
 
 def _apply_cors(app: Flask):
-    """CORS with explicit origin allowlist."""
+    """CORS with explicit origin allowlist.
 
+    If CORS_ORIGINS is not set, no origins are allowed (fail-closed).
+    Set CORS_ORIGINS=* for development only.
+    """
+    raw_origins = os.environ.get('CORS_ORIGINS', '')
     allowed_origins = set(
-        o.strip() for o in
-        os.environ.get('CORS_ORIGINS', '').split(',')
+        o.strip() for o in raw_origins.split(',')
         if o.strip()
     )
+    if not allowed_origins:
+        logger.warning(
+            "CORS_ORIGINS not configured - no cross-origin requests allowed. "
+            "Set CORS_ORIGINS env var for production (comma-separated origins).")
 
     @app.after_request
     def add_cors_headers(response):
@@ -145,6 +152,8 @@ def _apply_host_validation(app: Flask):
     def validate_host():
         if os.environ.get('HEVOLVE_ENV') == 'development':
             return
+        if os.environ.get('NUNBA_BUNDLED'):
+            return
 
         host = request.host.split(':')[0]
         if host not in allowed_hosts:
@@ -153,13 +162,39 @@ def _apply_host_validation(app: Flask):
 
 
 def _apply_api_auth(app: Flask):
-    """API key authentication for core endpoints."""
+    """Opt-in API key authentication for core endpoints.
+
+    Only active when HEVOLVE_API_KEY is explicitly configured.  When the
+    server sits behind an external gateway (KONG OAuth, etc.) that already
+    handles auth, leave HEVOLVE_API_KEY unset and this layer is a no-op.
+
+    Deployment scenarios:
+      - Behind KONG (standalone cloud): KONG handles OAuth → no API key needed
+      - Bundled desktop (NUNBA_BUNDLED):  in-process test_client → no API key
+      - Direct exposure (future):        set HEVOLVE_API_KEY to enable
+    """
 
     PROTECTED_PATHS = ('/chat', '/time_agent', '/visual_agent', '/add_history', '/prompts', '/zeroshot', '/response_ack')
     EXEMPT_PREFIXES = ('/status', '/a2a/', '/api/social/', '/.well-known/')
 
     @app.before_request
     def check_api_auth():
+        # Bundled/desktop mode: in-process test_client, always trusted.
+        if os.environ.get('NUNBA_BUNDLED'):
+            return
+
+        # Opt-in: only enforce when HEVOLVE_API_KEY is explicitly set.
+        # When behind KONG or another gateway that handles auth, leave
+        # HEVOLVE_API_KEY unset so this middleware is a no-op.
+        try:
+            from security.secrets_manager import get_secret
+            expected_key = get_secret('HEVOLVE_API_KEY')
+        except Exception:
+            expected_key = os.environ.get('HEVOLVE_API_KEY', '')
+
+        if not expected_key:
+            return  # No key configured → gateway handles auth
+
         # Only protect specific paths
         if not any(request.path == p or request.path.startswith(p + '/')
                     for p in PROTECTED_PATHS):
@@ -173,16 +208,6 @@ def _apply_api_auth(app: Flask):
         api_key = request.headers.get('X-API-Key')
         if not api_key:
             return jsonify({'error': 'X-API-Key header required'}), 401
-
-        try:
-            from security.secrets_manager import get_secret
-            expected_key = get_secret('HEVOLVE_API_KEY')
-        except Exception:
-            expected_key = os.environ.get('HEVOLVE_API_KEY', '')
-
-        if not expected_key:
-            logger.warning("HEVOLVE_API_KEY not configured - rejecting request")
-            return jsonify({'error': 'Server API key not configured'}), 500
 
         if not _constant_time_compare(api_key, expected_key):
             logger.warning(f"Invalid API key for {request.path}")

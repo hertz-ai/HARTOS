@@ -1,0 +1,54 @@
+{
+  "id": "midnight",
+  "name": "Midnight",
+  "description": "Deep purple with lavender glow",
+  "category": "dark",
+  "colors": {
+    "background": "0d0221",
+    "glass_bg": "rgba(13, 2, 33, 0.7)",
+    "glass_border": "rgba(124, 77, 255, 0.15)",
+    "accent": "7c4dff",
+    "active": "b388ff",
+    "text": "d4c4f5",
+    "heading": "b388ff",
+    "error": "ff5252",
+    "caution": "ffd740",
+    "muted": "7e57c2",
+    "surface": "150535",
+    "surface_hover": "1f0845"
+  },
+  "conky": {
+    "background": "0d0221",
+    "background_opacity": 190,
+    "heading": "b388ff",
+    "active": "b388ff",
+    "error": "ff5252",
+    "caution": "ffd740",
+    "muted": "7e57c2",
+    "default_text": "c4b0e0"
+  },
+  "font": {
+    "family": "JetBrains Mono",
+    "size": 13,
+    "heading_size": 18,
+    "weight": 400,
+    "heading_weight": 600
+  },
+  "shell": {
+    "blur_radius": 24,
+    "saturation": 200,
+    "border_radius": 18,
+    "panel_opacity": 0.7,
+    "topbar_height": 40,
+    "icon_size": 20,
+    "panel_titlebar_height": 32,
+    "start_menu_width": 720,
+    "start_menu_columns": 4,
+    "animation_speed_ms": 250
+  },
+  "wallpaper": {
+    "type": "gradient",
+    "value": "linear-gradient(135deg, #0d0221 0%, #150535 50%, #1a0a3e 100%)"
+  },
+  "gtk_prefer_dark": true
+}

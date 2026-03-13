@@ -63,7 +63,9 @@ class LightningStore:
                     host=redis_config.get('host', 'localhost'),
                     port=redis_config.get('port', 6379),
                     db=redis_config.get('db', 0),
-                    decode_responses=True
+                    decode_responses=True,
+                    socket_connect_timeout=1, socket_timeout=2,
+                    retry_on_timeout=False,
                 )
                 # Test connection
                 self._backend_client.ping()

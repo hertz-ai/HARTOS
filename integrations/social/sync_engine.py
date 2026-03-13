@@ -10,6 +10,8 @@ import logging
 import threading
 import requests
 from datetime import datetime
+
+from core.http_pool import pooled_get, pooled_post
 from typing import Dict, Optional
 
 logger = logging.getLogger('hevolve_social')
@@ -100,13 +102,25 @@ class SyncEngine:
                 'payload': item.payload_json,
             })
 
-        # Send batch
+        # Send batch — E2E encrypt if target has X25519 key
         sent = 0
         failed = 0
+        send_payload = {'items': batch, 'node_id': node_id}
         try:
-            resp = requests.post(
+            target_x25519 = SyncEngine._get_target_x25519(db, target_url)
+            if target_x25519:
+                try:
+                    from security.channel_encryption import encrypt_json_for_peer
+                    send_payload = {'encrypted': True,
+                                    'envelope': encrypt_json_for_peer(send_payload, target_x25519)}
+                except Exception:
+                    pass  # Encryption unavailable, send plaintext
+        except Exception:
+            pass
+        try:
+            resp = pooled_post(
                 f"{target_url}/api/social/hierarchy/sync",
-                json={'items': batch, 'node_id': node_id},
+                json=send_payload,
                 timeout=30,
             )
             if resp.status_code == 200:
@@ -152,6 +166,21 @@ class SyncEngine:
         return {'sent': sent, 'failed': failed, 'remaining': remaining}
 
     @staticmethod
+    def _get_target_x25519(db, target_url: str) -> str:
+        """Look up X25519 public key for a target node by URL."""
+        try:
+            from .models import PeerNode
+            peer = db.query(PeerNode).filter(
+                PeerNode.url == target_url.rstrip('/'),
+                PeerNode.status == 'active',
+            ).first()
+            if peer and getattr(peer, 'x25519_public', None):
+                return peer.x25519_public
+        except Exception:
+            pass
+        return ''
+
+    @staticmethod
     def receive_sync_batch(db, items: list) -> Dict:
         """Process incoming sync items from a child node."""
         processed = []
@@ -172,7 +201,7 @@ class SyncEngine:
 
             try:
                 if op == 'register_agent':
-                    # Agent data sync — store as metadata for now
+                    # Agent data sync - store as metadata for now
                     logger.info(f"Sync: received agent registration from child")
                 elif op == 'sync_post':
                     logger.info(f"Sync: received post sync from child")
@@ -184,6 +213,12 @@ class SyncEngine:
                     logger.info(f"Sync: received coding task assignment from parent")
                 elif op == 'coding_submission':
                     logger.info(f"Sync: received coding submission from child")
+                elif op == 'sync_user':
+                    SyncEngine._handle_sync_user(db, payload)
+                elif op == 'revoke_token':
+                    SyncEngine._handle_revoke_token(payload)
+                elif op == 'sync_blocklist':
+                    SyncEngine._handle_sync_blocklist(payload)
                 else:
                     logger.debug(f"Sync: unknown operation type: {op}")
 
@@ -194,10 +229,88 @@ class SyncEngine:
         return {'processed': processed, 'errors': errors}
 
     @staticmethod
+    def _handle_sync_user(db, payload: dict):
+        """Create or update a User record from sync data."""
+        from .models import User
+
+        user_id = payload.get('user_id')
+        username = payload.get('username', '')
+        if not user_id or not username:
+            logger.warning("sync_user: missing user_id or username")
+            return
+
+        existing = db.query(User).filter_by(id=user_id).first()
+        if existing:
+            # Update fields from sync (don't overwrite local-only fields)
+            if payload.get('handle'):
+                existing.handle = payload['handle']
+            if payload.get('display_name'):
+                existing.display_name = payload['display_name']
+            if payload.get('role'):
+                existing.role = payload['role']
+            logger.info(f"Sync: updated user {user_id} from sync")
+        else:
+            # Create new user record from sync
+            from .auth import generate_api_token
+            user = User(
+                id=user_id,
+                username=username,
+                display_name=payload.get('display_name', username),
+                handle=payload.get('handle', ''),
+                role=payload.get('role', 'flat'),
+                user_type=payload.get('user_type', 'human'),
+                api_token=generate_api_token(),
+            )
+            db.add(user)
+            logger.info(f"Sync: created user {user_id} from sync")
+
+    @staticmethod
+    def _handle_revoke_token(payload: dict):
+        """Add a JTI to the local token blocklist."""
+        jti = payload.get('jti', '')
+        if not jti:
+            logger.warning("revoke_token sync: missing jti")
+            return
+        try:
+            from security.jwt_manager import _blocklist, ACCESS_TOKEN_EXPIRY
+            expires_in = payload.get('expires_in', ACCESS_TOKEN_EXPIRY)
+            _blocklist.add(jti, expires_in)
+            logger.info(f"Sync: revoked token jti={jti}")
+        except Exception as e:
+            logger.warning(f"Sync: failed to revoke token: {e}")
+
+    @staticmethod
+    def _handle_sync_blocklist(payload: dict):
+        """Bulk sync of blocked JTIs."""
+        jtis = payload.get('jtis', [])
+        if not jtis:
+            return
+        try:
+            from security.jwt_manager import _blocklist, ACCESS_TOKEN_EXPIRY
+            expires_in = payload.get('expires_in', ACCESS_TOKEN_EXPIRY)
+            for jti in jtis:
+                _blocklist.add(jti, expires_in)
+            logger.info(f"Sync: bulk-revoked {len(jtis)} tokens")
+        except Exception as e:
+            logger.warning(f"Sync: failed to sync blocklist: {e}")
+
+    @staticmethod
+    def queue_user_sync(db, user_data: dict, direction: str = 'up'):
+        """Queue a user creation/update for sync.
+
+        Args:
+            db: Database session
+            user_data: Dict with user_id, username, handle, role, etc.
+            direction: 'up' (to central) or 'down' (from central to nodes)
+        """
+        target = 'central' if direction == 'up' else 'regional'
+        return SyncEngine.queue(db, target, 'sync_user', user_data)
+
+    @staticmethod
     def is_connected_to(target_url: str) -> bool:
         """Check if we can reach the target URL."""
         try:
-            resp = requests.get(
+            resp = pooled_get(
                 f"{target_url}/api/social/peers/health",
                 timeout=5,
             )
@@ -223,24 +336,28 @@ class SyncEngine:
         if self._thread:
             self._thread.join(timeout=10)
 
+    def _wd_heartbeat(self):
+        """Send heartbeat to watchdog between potentially blocking operations."""
+        try:
+            from security.node_watchdog import get_watchdog
+            wd = get_watchdog()
+            if wd:
+                wd.heartbeat('sync_engine')
+        except Exception:
+            pass
+
     def _sync_loop(self):
         """Background loop: periodically drain sync queue."""
         while self._running:
             time.sleep(self._interval)
             if not self._running:
                 break
-            # Heartbeat to watchdog
-            try:
-                from security.node_watchdog import get_watchdog
-                wd = get_watchdog()
-                if wd:
-                    wd.heartbeat('sync_engine')
-            except Exception:
-                pass
+            self._wd_heartbeat()
             try:
                 self._do_sync_drain()
             except Exception as e:
                 logger.debug(f"Sync drain error: {e}")
+            self._wd_heartbeat()
 
     def _do_sync_drain(self):
         """Attempt to drain queued items to target."""

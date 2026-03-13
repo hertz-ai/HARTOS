@@ -22,7 +22,7 @@ services:
   mock-crossbar:
     build:
       context: .
-      dockerfile: Dockerfile.mock-crossbar
+      dockerfile: tests/Dockerfile.mock-crossbar
     ports:
       - "8088:8088"
     healthcheck:
@@ -37,7 +37,7 @@ services:
   mock-apis:
     build:
       context: .
-      dockerfile: Dockerfile.mock-apis
+      dockerfile: tests/Dockerfile.mock-apis
     ports:
       - "9890:9890"  # autogen_response endpoint
       - "5459:5459"  # txt2img endpoint
@@ -73,9 +73,8 @@ services:
       - ACTION_API=http://mock-apis:9892/actions
       - TESTING=true
       - PYTHONUNBUFFERED=1
-    network_mode: host  # Use host network to access LLM on localhost:8000
     volumes:
-      - ./tests/runtime_tests:/app/tests/runtime_tests
+      - ./tests/e2e/runtime_tests:/app/tests/e2e/runtime_tests
       - ./prompts:/app/prompts
       - ./logs:/app/logs
       - test-data:/app/test_data
@@ -86,7 +85,7 @@ services:
         echo 'Waiting for all services to be ready...' &&
         sleep 10 &&
         echo 'Running end-to-end tests...' &&
-        pytest tests/runtime_tests/ -v --tb=short --maxfail=5 --timeout=300
+        pytest tests/e2e/runtime_tests/ -v --tb=short --maxfail=5 --timeout=300
       "
 
   # Test runner with interactive shell (for debugging)
@@ -96,7 +95,6 @@ services:
       dockerfile: Dockerfile.test
     depends_on:
       - redis
-      - mock-llm
       - mock-crossbar
       - mock-apis
     environment:
@@ -106,7 +104,7 @@ services:
       - CROSSBAR_URL=http://mock-crossbar:8088
       - TESTING=true
     volumes:
-      - ./tests/runtime_tests:/app/tests/runtime_tests
+      - ./tests/e2e/runtime_tests:/app/tests/e2e/runtime_tests
       - ./prompts:/app/prompts
       - ./logs:/app/logs
     networks:

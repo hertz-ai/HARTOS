@@ -156,7 +156,7 @@ class IPService:
         """Aggregate self-improving loop metrics from all live sources.
 
         Checks 5 flywheel components:
-        1. World model (crawl4ai) health + learning stats
+        1. World model (HevolveAI) health + learning stats
         2. Agent goal completion rates
         3. RALT skill propagation stats
         4. Recipe reuse adoption rate
@@ -472,7 +472,7 @@ class IPService:
         wm_healthy = health['world_model'].get('healthy', False)
         if wm_healthy:
             checks_passed += 1
-            evidence.append('World model (crawl4ai) is healthy and auto-learning')
+            evidence.append('World model (HevolveAI) is healthy and auto-learning')
         else:
             evidence.append('FAIL: World model not healthy or unreachable')
 
@@ -544,4 +544,201 @@ class IPService:
             },
             'evidence': evidence,
             'loopholes': loopholes,
+        }
+
+    # ─── Defensive IP (prior art proof, not patents) ───
+
+    @staticmethod
+    def create_defensive_publication(db: Session, title: str, content: str,
+                                      abstract: str = '',
+                                      git_commit: str = None,
+                                      created_by: str = None) -> Dict:
+        """Create a timestamped defensive publication (prior art proof).
+
+        NOT a patent — evidence of prior invention:
+        - SHA-256 hash of content (proves exact content existed at timestamp)
+        - Git commit hash (ties to specific codebase state)
+        - Code snapshot hash (ties to full project state)
+        - Node signature (cryptographic non-repudiation)
+        - Moat score snapshot (cumulative latent state at time)
+
+        If anyone files a patent on something we published first, THIS is prior art.
+        """
+        import hashlib
+        from integrations.social.models import DefensivePublication
+
+        content_hash = hashlib.sha256(content.encode('utf-8')).hexdigest()
+
+        # Code snapshot hash
+        code_hash = None
+        try:
+            from security.node_integrity import compute_code_hash
+            code_hash = compute_code_hash()
+        except Exception:
+            pass
+
+        # Node signature
+        node_key = None
+        sig_hex = None
+        try:
+            from security.node_integrity import get_public_key_hex, sign_message
+            node_key = get_public_key_hex()
+            sig_hex = sign_message(content_hash.encode('utf-8')).hex()
+        except Exception:
+            pass
+
+        # Snapshot moat depth
+        moat_score = 0.0
+        try:
+            moat = IPService.measure_moat_depth()
+            moat_score = moat.get('moat_score', 0.0)
+        except Exception:
+            pass
+
+        # Snapshot verification
+        verification = {}
+        try:
+            verification = IPService.verify_exponential_improvement(db)
+        except Exception:
+            pass
+
+        pub = DefensivePublication(
+            title=title,
+            abstract=abstract,
+            content_hash=content_hash,
+            git_commit_hash=git_commit,
+            code_snapshot_hash=code_hash,
+            signed_by_node_key=node_key,
+            signature_hex=sig_hex,
+            moat_score_at_publication=moat_score,
+            verification_snapshot=verification,
+            created_by=created_by,
+        )
+        db.add(pub)
+        db.flush()
+        return pub.to_dict()
+
+    @staticmethod
+    def list_defensive_publications(db: Session) -> List[Dict]:
+        """List all defensive publications in chronological order."""
+        from integrations.social.models import DefensivePublication
+        pubs = db.query(DefensivePublication).order_by(
+            DefensivePublication.publication_date.desc()).all()
+        return [p.to_dict() for p in pubs]
+
+    @staticmethod
+    def get_provenance_record(db: Session) -> Dict:
+        """Generate comprehensive provenance chain for the entire platform.
+
+        Aggregates: defensive publications, patents, moat measurements,
+        code hashes, and verification snapshots — a single cryptographic
+        chain of evidence for legal defence.
+        """
+        from integrations.social.models import DefensivePublication
+
+        pubs = db.query(DefensivePublication).order_by(
+            DefensivePublication.publication_date.asc()).all()
+
+        patents = IPService.list_patents(db)
+
+        moat = {}
+        try:
+            moat = IPService.measure_moat_depth()
+        except Exception:
+            pass
+
+        code_hash = None
+        try:
+            from security.node_integrity import compute_code_hash
+            code_hash = compute_code_hash()
+        except Exception:
+            pass
+
+        verification = {}
+        try:
+            verification = IPService.verify_exponential_improvement(db)
+        except Exception:
+            pass
+
+        return {
+            'generated_at': datetime.utcnow().isoformat(),
+            'code_snapshot_hash': code_hash,
+            'moat_depth': moat,
+            'verification': verification,
+            'defensive_publications': [p.to_dict() for p in pubs],
+            'patents': patents,
+            'total_publications': len(pubs),
+            'total_patents': len(patents),
+            'evidence_chain': [
+                {
+                    'type': 'defensive_publication',
+                    'id': p.id,
+                    'content_hash': p.content_hash,
+                    'timestamp': p.publication_date.isoformat() if p.publication_date else None,
+                    'signature': p.signature_hex,
+                }
+                for p in pubs
+            ],
+        }
+
+    @staticmethod
+    def check_intelligence_milestone(db: Session,
+                                      consecutive_days_required: int = 14,
+                                      min_catch_up: str = 'months') -> Dict:
+        """Check if critical intelligence threshold has been reached.
+
+        Auto-patent filing trigger. All 3 conditions must be met:
+        1. verify_exponential_improvement() returns verified=True
+        2. moat catch_up_estimate >= min_catch_up
+        3. At least N consecutive verified defensive publications
+
+        The philosophy: we tread carefully. No premature filing.
+        File only when the hive has proven itself over sustained time.
+        """
+        from integrations.social.models import DefensivePublication
+
+        verification = IPService.verify_exponential_improvement(db)
+
+        moat = {}
+        catch_up = 'unknown'
+        try:
+            moat = IPService.measure_moat_depth()
+            catch_up = moat.get('competitor_catch_up_estimate', 'unknown')
+        except Exception:
+            pass
+
+        # Count consecutive verified publications (most recent first)
+        pubs = db.query(DefensivePublication).order_by(
+            DefensivePublication.publication_date.desc()
+        ).limit(consecutive_days_required).all()
+
+        consecutive_verified = 0
+        for p in pubs:
+            snap = p.verification_snapshot or {}
+            if snap.get('verified', False):
+                consecutive_verified += 1
+            else:
+                break
+
+        catch_up_levels = [
+            'moat still shallow — grow network',
+            'weeks', 'months', 'years', 'practically impossible',
+        ]
+        min_idx = catch_up_levels.index(min_catch_up) if min_catch_up in catch_up_levels else 2
+        cur_idx = catch_up_levels.index(catch_up) if catch_up in catch_up_levels else 0
+
+        triggered = (
+            verification.get('verified', False)
+            and consecutive_verified >= consecutive_days_required
+            and cur_idx >= min_idx
+        )
+
+        return {
+            'triggered': triggered,
+            'consecutive_verified': consecutive_verified,
+            'consecutive_required': consecutive_days_required,
+            'moat_catch_up': catch_up,
+            'min_catch_up_required': min_catch_up,
+            'current_verification': verification,
+            'moat_score': moat.get('moat_score', 0.0),
         }

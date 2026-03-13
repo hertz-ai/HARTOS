@@ -1,0 +1,18 @@
+#!/bin/bash
+# HART OS post-installation script
+# Runs after .deb package files are installed
+
+set -e
+
+INSTALL_DIR="/opt/hart"
+
+echo "[HART OS] Running post-install setup..."
+
+# Run the main installer in post-install mode
+if [[ -f "$INSTALL_DIR/deploy/linux/install.sh" ]]; then
+    bash "$INSTALL_DIR/deploy/linux/install.sh" --from-iso
+fi
+
+echo "[HART OS] Post-install complete."
+echo "[HART OS] Edit /etc/hart/hart.env to configure API keys."
+echo "[HART OS] Run 'hart status' to check service status."

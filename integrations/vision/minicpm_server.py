@@ -5,7 +5,7 @@ Derived from the root minicpm.py but with configurable model directory,
 no external config.json dependency, and proper CLI args.
 
 Usage:
-    python -m integrations.vision.minicpm_server --model_dir ~/.hevolve/models/minicpm --port 9890
+    python -m integrations.vision.minicpm_server --model_dir ~/.hevolve/models/minicpm --port 9891
 """
 import argparse
 import asyncio
@@ -36,24 +36,25 @@ ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp'}
 
 
 def _init_model(model_dir: str, device: str = 'cuda:0'):
-    """Load MiniCPM-V-2 onto the specified device."""
+    """Load MiniCPM-V-2 onto the specified device (CUDA, MPS, or CPU)."""
     global _model, _tokenizer, _device
     import torch
     from transformers import AutoModel, AutoTokenizer
 
     logger.info(f"Loading MiniCPM from {model_dir} on {device}")
     _device = device
+    dtype = torch.float16 if device != 'cpu' else torch.float32
     _model = AutoModel.from_pretrained(
         model_dir,
         trust_remote_code=True,
-        torch_dtype=torch.float16,
-    ).to(device=device, dtype=torch.float16)
+        torch_dtype=dtype,
+    ).to(device=device, dtype=dtype)
     _model.eval()
     _tokenizer = AutoTokenizer.from_pretrained(
         model_dir,
         trust_remote_code=True,
     )
-    logger.info("MiniCPM model loaded")
+    logger.info(f"MiniCPM model loaded on {device} ({dtype})")
 
 
 def _process_image_sync(image, prompt: str) -> str:
@@ -163,9 +164,10 @@ def main():
     parser.add_argument('--model_dir', default=os.path.join(
         os.path.expanduser('~'), '.hevolve', 'models', 'minicpm',
     ))
-    parser.add_argument('--port', type=int, default=9890)
+    from core.port_registry import get_port
+    parser.add_argument('--port', type=int, default=get_port('vision'))
     parser.add_argument('--host', default='0.0.0.0')
-    parser.add_argument('--device', default='cuda:0')
+    parser.add_argument('--device', default=None)
     parser.add_argument('--log_file', default='minicpm_sidecar.log')
     args = parser.parse_args()
 
@@ -178,8 +180,20 @@ def main():
     logger.addHandler(logging.StreamHandler(sys.stdout))
     logger.setLevel(logging.INFO)
 
+    # Auto-detect device if not specified
+    device = args.device
+    if device is None:
+        import torch
+        if torch.cuda.is_available():
+            device = 'cuda:0'
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            device = 'mps'
+        else:
+            device = 'cpu'
+        logger.info(f"Auto-detected device: {device}")
+
     # Load model
-    _init_model(args.model_dir, args.device)
+    _init_model(args.model_dir, device)
 
     # Serve
     from waitress import serve

@@ -20,10 +20,17 @@ def get_social_blueprint():
 
 def init_social(app):
     """Initialize the social network module. Call after app = Flask(...)."""
-    from .models import init_db
+    # Block dev mode on central
+    import os as _os_boot
+    node_tier = _os_boot.environ.get('HEVOLVE_NODE_TIER', 'flat')
+    if node_tier == 'central' and _os_boot.environ.get('HEVOLVE_DEV_MODE', '').lower() == 'true':
+        _os_boot.environ['HEVOLVE_DEV_MODE'] = 'false'
+        logger.critical("SECURITY: Dev mode FORCED OFF on central instance")
+
+    from .models import init_db, DB_PATH
     try:
         init_db()
-        logger.info("HevolveSocial database initialized (agent_data/social.db)")
+        logger.info(f"HevolveSocial database initialized ({DB_PATH})")
     except Exception as e:
         logger.warning(f"HevolveSocial DB init failed (non-fatal): {e}")
 
@@ -32,11 +39,13 @@ def init_social(app):
         from .gamification_service import GamificationService
         from .models import get_db
         db = get_db()
-        count = GamificationService.seed_achievements(db)
-        if count > 0:
-            db.commit()
-            logger.info(f"HevolveSocial: seeded {count} achievements")
-        db.close()
+        try:
+            count = GamificationService.seed_achievements(db)
+            if count > 0:
+                db.commit()
+                logger.info(f"HevolveSocial: seeded {count} achievements")
+        finally:
+            db.close()
     except Exception as e:
         logger.debug(f"HevolveSocial achievement seeding skipped: {e}")
 
@@ -45,11 +54,13 @@ def init_social(app):
         from .ad_service import AdService
         from .models import get_db as _get_db
         db = _get_db()
-        count = AdService.seed_placements(db)
-        if count > 0:
-            db.commit()
-            logger.info(f"HevolveSocial: seeded {count} ad placements")
-        db.close()
+        try:
+            count = AdService.seed_placements(db)
+            if count > 0:
+                db.commit()
+                logger.info(f"HevolveSocial: seeded {count} ad placements")
+        finally:
+            db.close()
     except Exception as e:
         logger.debug(f"HevolveSocial ad placement seeding skipped: {e}")
 
@@ -60,6 +71,30 @@ def init_social(app):
         logger.info("HevolveSocial gamification endpoints registered")
     except Exception as e:
         logger.warning(f"HevolveSocial gamification blueprint skipped: {e}")
+
+    # Register MCP tool registry blueprint (servers, tools, discover)
+    try:
+        from .api_mcp import mcp_bp
+        app.register_blueprint(mcp_bp)
+        logger.info("HevolveSocial MCP endpoints registered at /api/social/mcp/")
+    except Exception as e:
+        logger.warning(f"HevolveSocial marketplace+MCP blueprint skipped: {e}")
+
+    # Register sharing blueprint (short URLs, OG metadata, consent-gated links)
+    try:
+        from .api_sharing import sharing_bp
+        app.register_blueprint(sharing_bp)
+        logger.info("HevolveSocial sharing endpoints registered at /api/social/share/")
+    except Exception as e:
+        logger.warning(f"HevolveSocial sharing blueprint skipped: {e}")
+
+    # Register multiplayer games + compute lending blueprint
+    try:
+        from .api_games import games_bp
+        app.register_blueprint(games_bp)
+        logger.info("HevolveSocial games + compute endpoints registered at /api/social/games/, /api/social/compute/")
+    except Exception as e:
+        logger.warning(f"HevolveSocial games blueprint skipped: {e}")
 
     # Register discovery blueprint (.well-known/hevolve-social.json)
     try:
@@ -84,6 +119,82 @@ def init_social(app):
         logger.info("HevolveSocial dashboard registered at /api/social/dashboard/")
     except Exception as e:
         logger.debug(f"HevolveSocial dashboard blueprint skipped: {e}")
+
+    # Register thought experiment tracker blueprint
+    try:
+        from .api_tracker import tracker_bp
+        app.register_blueprint(tracker_bp)
+        logger.info("HevolveSocial tracker registered at /api/social/tracker/")
+    except Exception as e:
+        logger.debug(f"HevolveSocial tracker blueprint skipped: {e}")
+
+    # Register fleet OTA update approval blueprint
+    try:
+        from .api_fleet_update import fleet_update_bp
+        app.register_blueprint(fleet_update_bp)
+        logger.info("HevolveSocial fleet update registered at /api/social/fleet/")
+    except Exception as e:
+        logger.debug(f"HevolveSocial fleet update blueprint skipped: {e}")
+
+    # Register regional host request + approval blueprint
+    try:
+        from .api_regional_host import regional_host_bp
+        app.register_blueprint(regional_host_bp)
+        logger.info("HevolveSocial regional host registered at /api/social/regional-host/")
+    except Exception as e:
+        logger.debug(f"HevolveSocial regional host blueprint skipped: {e}")
+
+    # Register sync & backup blueprint
+    try:
+        from .sync_api import sync_bp
+        app.register_blueprint(sync_bp)
+        logger.info("HevolveSocial sync registered at /api/social/sync/")
+    except Exception as e:
+        logger.debug(f"HevolveSocial sync blueprint skipped: {e}")
+
+    # Register audit trail blueprint
+    try:
+        from .api_audit import audit_bp
+        app.register_blueprint(audit_bp)
+        logger.info("HevolveSocial audit registered at /api/social/audit/")
+    except Exception as e:
+        logger.debug(f"HevolveSocial audit blueprint skipped: {e}")
+
+    # Register content generation task tracking blueprint
+    try:
+        from integrations.agent_engine.api_content_gen import content_gen_bp
+        app.register_blueprint(content_gen_bp)
+        logger.info("HevolveSocial content gen registered at /api/social/content-gen/")
+    except Exception as e:
+        logger.debug(f"HevolveSocial content gen blueprint skipped: {e}")
+
+    # Register continual learning CCT management blueprint
+    try:
+        from integrations.agent_engine.api_learning import learning_bp
+        app.register_blueprint(learning_bp)
+        logger.info("Learning CCT endpoints registered at /api/learning/")
+    except Exception as e:
+        logger.debug(f"Learning blueprint skipped: {e}")
+
+    # Register OS-wide theme management blueprint
+    try:
+        from .api_theme import theme_bp
+        app.register_blueprint(theme_bp)
+        logger.info("HevolveSocial theme registered at /api/social/theme/")
+    except Exception as e:
+        logger.debug(f"HevolveSocial theme blueprint skipped: {e}")
+
+    # Register thought experiments blueprint
+    try:
+        from .api_thought_experiments import thought_experiments_bp
+        app.register_blueprint(thought_experiments_bp)
+        logger.info("Thought experiment endpoints registered at /api/social/experiments/")
+    except Exception as e:
+        logger.debug(f"Thought experiments blueprint skipped: {e}")
+
+    # NOTE: compute_pledge_bp (api_compute_pledge.py) was consolidated into tracker_bp.
+    # All pledge endpoints now live at /api/social/tracker/experiments/*/pledge*
+    # and /api/social/tracker/pledges/* — single source of truth.
 
     # Initialize node keypair for integrity verification
     try:
@@ -113,6 +224,41 @@ def init_social(app):
     except Exception as e:
         _boot_verified = True  # Allow if master_key module unavailable
         logger.debug(f"HevolveSocial boot verification skipped: {e}")
+
+    # ── Tier authorization (central must prove master key) ──
+    try:
+        from security.key_delegation import verify_tier_authorization
+        tier_auth = verify_tier_authorization()
+        if not tier_auth.get('authorized'):
+            logger.critical(f"Tier authorization FAILED: {tier_auth.get('details', 'unknown')}")
+            if node_tier == 'central':
+                _boot_verified = False
+                logger.critical("Central node cannot start without tier authorization")
+    except Exception as e:
+        logger.warning(f"Tier authorization check unavailable: {e}")
+
+    # ── System Requirements (HART OS Equilibrium) ──
+    # Detect hardware, classify contribution tier, auto-gate features.
+    # Must run BEFORE gossip/agents so env vars are set before they check.
+    _node_capabilities = None
+    try:
+        from security.system_requirements import run_system_check, get_tier_name
+        _node_capabilities = run_system_check()
+        _tier_name = get_tier_name()
+        logger.info(
+            f"HevolveSocial equilibrium: tier={_tier_name}, "
+            f"enabled={len(_node_capabilities.enabled_features)} features, "
+            f"disabled={len(_node_capabilities.disabled_features)} features"
+        )
+        if _node_capabilities.disabled_features:
+            for _feat, _reason in _node_capabilities.disabled_features.items():
+                logger.info(f"  Feature '{_feat}' not loaded: {_reason}")
+    except Exception as e:
+        logger.warning(f"HevolveSocial system requirements check skipped: {e}")
+        # Auto-enable agent engine if not explicitly disabled
+        import os as _os_fb
+        if _os_fb.environ.get('HEVOLVE_AGENT_ENGINE_ENABLED') is None:
+            _os_fb.environ['HEVOLVE_AGENT_ENGINE_ENABLED'] = 'true'
 
     # Start decentralized gossip peer discovery (background thread)
     if _boot_verified:
@@ -144,7 +290,7 @@ def init_social(app):
             except Exception as e:
                 logger.debug(f"HevolveSocial runtime monitor start skipped: {e}")
     else:
-        logger.critical("HevolveSocial: gossip NOT started — boot verification failed (hard mode)")
+        logger.critical("HevolveSocial: gossip NOT started - boot verification failed (hard mode)")
 
     # Start sync engine for regional/local tiers
     if _boot_verified:
@@ -173,7 +319,7 @@ def init_social(app):
         from integrations.agent_engine import init_agent_engine
         init_agent_engine(app)
     except Exception as e:
-        logger.debug(f"HevolveSocial agent engine init skipped: {e}")
+        logger.warning(f"HevolveSocial agent engine init skipped: {e}")
 
     # Register with central registry if configured
     import os
@@ -189,17 +335,18 @@ def init_social(app):
         except Exception as e:
             logger.debug(f"HevolveSocial registry registration skipped: {e}")
 
-    # ── NodeWatchdog — start LAST, monitors all daemon threads ──
+    # ── NodeWatchdog - start LAST, monitors all daemon threads ──
     try:
         from security.node_watchdog import start_watchdog
         watchdog = start_watchdog()
 
-        # Register gossip
+        # Register gossip — interval must exceed worst-case gossip round
+        # (3 peers × 10s timeout = 30s max) to avoid false FROZEN alerts.
         if _boot_verified:
             try:
                 from .peer_discovery import gossip as _g
                 if _g._running:
-                    watchdog.register('gossip', expected_interval=10,
+                    watchdog.register('gossip', expected_interval=120,
                                       restart_fn=_g.start, stop_fn=_g.stop)
             except Exception:
                 pass
@@ -257,6 +404,21 @@ def init_social(app):
         except Exception:
             pass
 
+        # Register model lifecycle manager — interval must exceed worst-case
+        # tick duration (nvidia-smi 5s + pressure checks + federation report).
+        try:
+            from integrations.service_tools.model_lifecycle import get_model_lifecycle_manager
+            _lifecycle = get_model_lifecycle_manager()
+            _lifecycle.start()
+            if _lifecycle._running:
+                watchdog.register('model_lifecycle',
+                                  expected_interval=max(_lifecycle._interval * 3, 60),
+                                  restart_fn=_lifecycle.start,
+                                  stop_fn=_lifecycle.stop)
+                logger.info("Model lifecycle manager started")
+        except Exception as e:
+            logger.debug(f"Model lifecycle manager start skipped: {e}")
+
         watchdog.start()
         logger.info(f"NodeWatchdog started: monitoring "
                     f"{len(watchdog._threads)} threads")
@@ -277,13 +439,7 @@ def init_social(app):
                 logger.debug(f"HevolveSocial agent sync skipped: {e}")
 
 
-# For direct import: from integrations.social import social_bp, init_social
-@property
-def social_bp(self):
-    return get_social_blueprint()
-
-
-# Module-level lazy property workaround
+# Module-level lazy attribute: from integrations.social import social_bp
 def __getattr__(name):
     if name == 'social_bp':
         return get_social_blueprint()

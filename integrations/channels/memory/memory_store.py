@@ -269,6 +269,16 @@ class MemoryStore:
                 )
             )
 
+        # Broadcast memory addition to EventBus
+        try:
+            from core.platform.events import emit_event
+            emit_event('memory.item_added', {
+                'id': item.id, 'source': item.source,
+                'content_length': len(item.content),
+            })
+        except Exception:
+            pass
+
         return item
 
     def add_batch(
@@ -554,7 +564,16 @@ class MemoryStore:
                 "DELETE FROM memory_items WHERE id = ?",
                 (item_id,)
             )
-            return cursor.rowcount > 0
+            deleted = cursor.rowcount > 0
+
+        if deleted:
+            try:
+                from core.platform.events import emit_event
+                emit_event('memory.item_deleted', {'id': item_id})
+            except Exception:
+                pass
+
+        return deleted
 
     def delete_by_source(self, source: str) -> int:
         """

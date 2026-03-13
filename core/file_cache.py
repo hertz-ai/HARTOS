@@ -71,14 +71,39 @@ def invalidate_file_cache(filepath: str = None):
             logger.debug(f"File cache invalidated for {filepath}")
 
 
+def atomic_json_write(filepath: str, data, indent: int = 2):
+    """Write JSON atomically: write to temp file → os.replace() (atomic on POSIX and Windows).
+
+    Prevents corrupt JSON from crash/power loss during write.
+    """
+    import tempfile
+    filepath = os.path.abspath(filepath)
+    dir_path = os.path.dirname(filepath)
+    os.makedirs(dir_path, exist_ok=True)
+
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=dir_path, suffix='.tmp')
+    try:
+        with os.fdopen(tmp_fd, 'w') as f:
+            json.dump(data, f, indent=indent, default=str)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, filepath)  # Atomic
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def cached_json_save(filepath: str, data: dict, indent: int = 4):
     """
-    Save JSON data and update the cache atomically.
+    Save JSON data atomically and update the cache.
+    Uses write-to-temp + os.replace() to prevent corruption.
     """
     filepath = os.path.abspath(filepath)
 
-    with open(filepath, 'w') as f:
-        json.dump(data, f, indent=indent)
+    atomic_json_write(filepath, data, indent=indent)
 
     # Update cache with the data we just wrote
     with _cache_lock:

@@ -20,9 +20,16 @@ Core functionality is now part of SmartLedger class:
 - ledger.get_pending_subtasks() - Get pending children
 """
 
-from agent_ledger import SmartLedger, Task, TaskType, TaskStatus as LedgerTaskStatus
+try:
+    from agent_ledger import SmartLedger, Task, TaskType, TaskStatus as LedgerTaskStatus
+except ImportError:
+    SmartLedger = None
+    Task = None
+    TaskType = None
+    LedgerTaskStatus = None
 from typing import Optional, Any, Dict, List
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -439,8 +446,9 @@ def get_default_llm_client():
         def complete(self, prompt: str) -> str:
             from core.http_pool import pooled_post
             try:
+                _lp = os.environ.get('LLAMA_CPP_PORT', '8080')
                 response = pooled_post(
-                    "http://localhost:8080/v1/chat/completions",
+                    f"http://localhost:{_lp}/v1/chat/completions",
                     json={
                         "model": "Qwen3-VL-4B-Instruct",
                         "messages": [{"role": "user", "content": prompt}],

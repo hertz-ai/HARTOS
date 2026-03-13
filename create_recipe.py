@@ -6,7 +6,8 @@ from typing import Annotated, Optional, Dict, Tuple, List, Any
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-import requests
+from core.http_pool import pooled_get, pooled_post, pooled_patch, pooled_request
+from core.port_registry import get_port as _get_llm_port
 from autobahn.asyncio.component import Component, run
 import uuid
 import asyncio
@@ -19,46 +20,22 @@ from autogen import register_function
 import json
 from autogen import ConversableAgent
 from flask import current_app
-from helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup, load_vlm_agent_files
+try:
+    from helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup, load_vlm_agent_files, PROMPTS_DIR, _is_terminate_msg
+except Exception:
+    from helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup, load_vlm_agent_files, _is_terminate_msg
+    PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
+os.makedirs(PROMPTS_DIR, exist_ok=True)
 import helper as helper_fun
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
 from autogen.cache.in_memory_cache import InMemoryCache
 from json_repair import repair_json
-from crossbarhttp import Client
-client = Client('http://aws_rasa.hertzai.com:8088/publish')
-
-# Create thread pool executor for async Crossbar publishing
-crossbar_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='crossbar_publish')
-
 def publish_async(topic, message, timeout=2.0):
-    """
-    Publish to Crossbar in a background thread without blocking the main request.
-
-    Args:
-        topic: Crossbar topic to publish to
-        message: Message payload (dict or JSON string)
-        timeout: Maximum time to wait for publish (default: 2.0 seconds)
-    """
-    def _publish():
-        import socket
-        try:
-            # Set socket timeout to prevent long waits
-            original_timeout = socket.getdefaulttimeout()
-            socket.setdefaulttimeout(timeout)
-
-            client.publish(topic, message)
-            current_app.logger.debug(f"Successfully published to {topic}")
-        except Exception as e:
-            current_app.logger.error(f"Error publishing to {topic}: {e}")
-        finally:
-            # Restore original timeout
-            if original_timeout is not None:
-                socket.setdefaulttimeout(original_timeout)
-
-    # Submit to executor without waiting for result
-    crossbar_executor.submit(_publish)
+    """Delegate to the canonical publish_async in langchain_gpt_api."""
+    from langchain_gpt_api import publish_async as _publish
+    _publish(topic, message, timeout)
 
 # Add Smart Ledger for persistent task tracking - using agent_ledger package (from gpt4.1)
 try:
@@ -106,7 +83,6 @@ import logging
 import logging.handlers
 import sys
 from functools import wraps
-import cv2
 import redis
 import pickle
 import pytz
@@ -115,6 +91,7 @@ from PIL import Image
 from datetime import timedelta
 from lifecycle_hooks import initialize_minimal_lifecycle_hooks
 initialize_minimal_lifecycle_hooks()  # Prints integration guide
+from cultural_wisdom import get_cultural_prompt
 
 # MCP Integration
 from integrations.mcp import load_user_mcp_servers, get_mcp_tools_for_autogen, mcp_registry
@@ -154,9 +131,24 @@ from integrations.expert_agents import (
 # Then add the 4 hooks to your get_response_group while loop
 # Then manually add the 4 hooks to your get_response_group while loop
 # Set up a dedicated logger that doesn't depend on Flask context
-log_dir = "logs"
-if not os.path.exists(log_dir):
-    os.makedirs(log_dir)
+# Use writable log dir: ~/Documents/Nunba/logs in bundled mode, else relative 'logs'
+if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
+    try:
+        from core.platform_paths import get_log_dir as _get_log_dir
+        log_dir = _get_log_dir()
+    except ImportError:
+        log_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'logs')
+else:
+    log_dir = "logs"
+try:
+    os.makedirs(log_dir, exist_ok=True)
+except PermissionError:
+    try:
+        from core.platform_paths import get_log_dir as _get_log_dir
+        log_dir = _get_log_dir()
+    except ImportError:
+        log_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'logs')
+    os.makedirs(log_dir, exist_ok=True)
 
 # Create a custom logger with timestamp in filename
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -186,6 +178,17 @@ console_handler.setFormatter(formatter)
 # Add handlers to logger
 tool_logger.addHandler(file_handler)
 tool_logger.addHandler(console_handler)
+
+
+def _record_exception(exc, module, function, user_prompt='', action_id=0, **ctx):
+    """Fire-and-forget exception recording to centralized collector. Never raises."""
+    try:
+        from exception_collector import ExceptionCollector
+        ExceptionCollector.get_instance().record(
+            exc, module=module, function=function,
+            user_prompt=user_prompt, action_id=action_id, context=ctx)
+    except Exception:
+        pass
 tool_logger.propagate = False  # Prevent double logging
 
 # Decorator for logging tool execution
@@ -269,23 +272,37 @@ scheduler.start()
 
 user_agents: Dict[str, Tuple[Any, Any, Any, Any, Any, Any, Any]] = TTLCache(ttl_seconds=7200, max_size=500, name='create_user_agents')
 time_agents = TTLCache(ttl_seconds=7200, max_size=500, name='create_time_agents')
-# Local llama.cpp server (Qwen3-VL) - ACTIVE
-config_list = [{
-        "model": 'Qwen3-VL-4B-Instruct',
+# Mode-aware config_list: cloud/regional use external LLM, flat uses local
+# (user's wizard-configured endpoint via HEVOLVE_LOCAL_LLM_URL or LLAMA_CPP_PORT)
+_node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
+_active_cloud = os.environ.get('HEVOLVE_ACTIVE_CLOUD_PROVIDER', '')
+if _node_tier in ('regional', 'central') and os.environ.get('HEVOLVE_LLM_ENDPOINT_URL'):
+    config_list = [{
+        "model": os.environ.get('HEVOLVE_LLM_MODEL_NAME', 'gpt-4.1-mini'),
+        "api_key": os.environ.get('HEVOLVE_LLM_API_KEY', 'dummy'),
+        "base_url": os.environ['HEVOLVE_LLM_ENDPOINT_URL'],
+        "price": [0.0025, 0.01]
+    }]
+elif _active_cloud and os.environ.get('HEVOLVE_LLM_API_KEY'):
+    # Wizard-configured cloud provider (flat mode desktop user)
+    _cloud_cfg = {
+        "model": os.environ.get('HEVOLVE_LLM_MODEL_NAME', 'gpt-4o-mini'),
+        "api_key": os.environ['HEVOLVE_LLM_API_KEY'],
+        "price": [0.0025, 0.01],
+    }
+    if os.environ.get('HEVOLVE_LLM_ENDPOINT_URL'):
+        _cloud_cfg["base_url"] = os.environ['HEVOLVE_LLM_ENDPOINT_URL']
+    config_list = [_cloud_cfg]
+else:
+    # Dynamic: reads from user's LLM Setup Wizard config (set by Nunba app.py)
+    _llama_port = os.environ.get('LLAMA_CPP_PORT', str(_get_llm_port('llm')))
+    _local_llm_url = os.environ.get('HEVOLVE_LOCAL_LLM_URL', f'http://localhost:{_llama_port}/v1')
+    config_list = [{
+        "model": os.environ.get('HEVOLVE_LOCAL_LLM_MODEL', 'local'),
         "api_key": 'dummy',
-        "base_url": 'http://localhost:8080/v1',
+        "base_url": _local_llm_url,
         "price": [0, 0]
     }]
-
-# Azure OpenAI configuration (fallback - DISABLED)
-# config_list = [{
-#         "model": 'gpt-4.1',
-#         "api_type": "azure",
-#         "api_key": '8MMPerfdfcpx63VfIVtg2lpAK7Crv7O5JKiKwhusVhgJNkC8Ql6FJQQJ99BAACHYHv6XJ3w3AAABACOGdxWW',
-#         "base_url": 'https://hertzai-gpt4.openai.azure.com/openai/deployments/gpt-4.1/chat/completions?api-version=2025-01-01-preview',
-#         "api_version": "2024-12-01-preview",
-#         "price": [0.0025, 0.01]
-#     }]
 # Per-request model config override (speculative execution, hive compute routing)
 def get_llm_config():
     """Get LLM config — checks thread-local override before falling back to global.
@@ -330,7 +347,8 @@ except Exception as e:
     tool_logger.error(f"Failed to register expert agents: {e}")
     expert_agents = {}
 
-database_url = 'https://mailer.hertzai.com'
+from core.config_cache import get_db_url
+database_url = get_db_url() or 'https://mailer.hertzai.com'
 
 
 def save_conversation_db(text,user_id,prompt_id,database_url,request_id):
@@ -352,7 +370,7 @@ def save_conversation_db(text,user_id,prompt_id,database_url,request_id):
         "request_id": request_id,
         "historical_request_id": str('[]')
     }
-    res = requests.post("{}/conversation".format(database_url),
+    res = pooled_post("{}/conversation".format(database_url),
                         data=json.dumps(data), headers=headers).json()
     conv_id = res['conv_id']
     return conv_id
@@ -364,14 +382,14 @@ def send_message_to_user1(user_id,response,inp,prompt_id):
     url = 'http://aws_rasa.hertzai.com:9890/autogen_response'
     body = json.dumps({'user_id':user_id,'message':response,'inp':inp,'request_id':request_id, 'Agent_status': 'Review Mode'})
     headers = {'Content-Type': 'application/json'}
-    res = requests.post(url,data=body,headers=headers)
+    res = pooled_post(url,data=body,headers=headers)
 
 
 def execute_python_file(task_description:str,user_id: int,prompt_id:int,action_entry_point:int=0):
     headers = {'Content-Type': 'application/json'}
-    url = 'http://localhost:6777/time_agent'
+    url = f'http://localhost:{_get_llm_port("backend")}/time_agent'
     data = json.dumps({'task_description':task_description,'user_id':user_id,'prompt_id':prompt_id,'action_entry_point':action_entry_point,'request_from':'Reuse'})
-    res = requests.post(url,data=data,headers=headers)
+    res = pooled_post(url,data=data,headers=headers)
     return 'done'
 
 
@@ -388,7 +406,11 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
     time_manager = time_agents[user_prompt]['time_manager']
     chat_instructor = time_agents[user_prompt]['chat_instructor1']
     time_actions[user_prompt].current_action = action_entry_point
-    current_action = time_actions[user_prompt].get_action_byaction_id(action_entry_point)['action']
+    _action_entry = time_actions[user_prompt].get_action_byaction_id(action_entry_point)
+    if _action_entry is None:
+        current_app.logger.error(f"Action {action_entry_point} not found in time_actions")
+        return
+    current_action = _action_entry['action']
     text = f'This is the time now {current_time}\n your overall task description which might span multiple actions: {task_description}\n the current Action to execute: {current_action}'
     result = time_user.initiate_chat(time_manager, message=text,speaker_selection={"speaker": "assistant"}, clear_history=False)
     restart = False
@@ -398,7 +420,11 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
             current_app.logger.info(f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
             json_obj = retrieve_json(group_chat.messages[-2]["content"])
             if json_obj and type(json_obj)==dict and 'status' in json_obj.keys() and json_obj['status'].lower() == 'completed':
-                current_action = time_actions[user_prompt].get_action_byaction_id(time_actions[user_prompt].current_action)['action']
+                _next_action = time_actions[user_prompt].get_action_byaction_id(time_actions[user_prompt].current_action)
+                if _next_action is None:
+                    current_app.logger.error(f"Action {time_actions[user_prompt].current_action} not found")
+                    break
+                current_action = _next_action['action']
                 text = f'This is the time now {current_time}\n your overall task description which might span multiple actions: {task_description}\n the current Action to execute: {current_action}'
             else:
                 current_app.logger.warning(f'it is not a json object the error is:')
@@ -410,8 +436,9 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
             continue
         if restart == True:
             break
-        current_app.logger.info(f'checking can_perform_without_user_input from {time_actions[user_prompt].get_action_byaction_id(action_entry_point)} ')
-        if time_actions[user_prompt].get_action_byaction_id(action_entry_point)['can_perform_without_user_input'] == 'yes':
+        _check_action = time_actions[user_prompt].get_action_byaction_id(action_entry_point)
+        current_app.logger.info(f'checking can_perform_without_user_input from {_check_action} ')
+        if _check_action and _check_action.get('can_perform_without_user_input') == 'yes':
             restart = True
             text = 'You can assume things on your own to complete this task'
             result = chat_instructor.initiate_chat(time_manager, message=text,speaker_selection={"speaker": "assistant"}, clear_history=False)
@@ -459,20 +486,8 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
 
 
 def get_frame(user_id):
-    serialized_frame = redis_client.get(user_id)
-    try:
-        if serialized_frame is not None:
-            from security.safe_deserialize import safe_load_frame
-            frame_bgr = safe_load_frame(serialized_frame)
-            current_app.logger.info(
-                f"Frame for user_id {user_id} retrieved successfully.")
-            frame = frame_bgr[:, :, ::-1]
-            return frame
-        else:
-            current_app.logger.info(f"No frame found for user_id {user_id}.")
-            return None
-    except ModuleNotFoundError as e:
-        raise e
+    """Delegate to helper.get_frame() — FrameStore first, Redis fallback."""
+    return helper_fun.get_frame(user_id)
 
 def get_visual_context(user_id, minutes=2):
     """Get visual context from the past specified minutes"""
@@ -504,7 +519,7 @@ def get_action_user_details(user_id):
     payload = {}
     headers = {}
     try:
-        response = requests.request("GET", action_url, headers=headers, data=payload)
+        response = pooled_request("GET", action_url, headers=headers, data=payload)
         if response.status_code == 200:
             data = response.json()
             filtered_data = [obj for obj in data if obj["action"] not in unwanted_actions and obj["zeroshot_label"] not in ['Video Reasoning']]
@@ -532,7 +547,7 @@ def get_action_user_details(user_id):
         url = STUDENT_API
         payload = json.dumps({"user_id": user_id})
         headers = {'Content-Type': 'application/json'}
-        response = requests.request("POST", url, headers=headers, data=payload)
+        response = pooled_request("POST", url, headers=headers, data=payload)
         if response.status_code == 200:
             user_data = response.json()
             user_details = f'''Below are the information about the user.
@@ -588,14 +603,14 @@ def visual_execution(task_description: str, user_id: int, prompt_id: int):
 
 def call_visual_task(task_description: str, user_id: int, prompt_id: int):
     headers = {'Content-Type': 'application/json'}
-    url = 'http://localhost:6777/visual_agent'
+    url = f'http://localhost:{_get_llm_port("backend")}/visual_agent'
 
     now = datetime.now()
     action_url = f"{ACTION_API}?user_id={user_id}"
     payload = {}
     headers_api = {}
 
-    response = requests.request("GET", action_url, headers=headers_api, data=payload)
+    response = pooled_request("GET", action_url, headers=headers_api, data=payload)
 
     if response.status_code == 200:
         api_data = response.json()
@@ -616,7 +631,7 @@ def call_visual_task(task_description: str, user_id: int, prompt_id: int):
                     'request_from': 'Create'
                 })
                 # Send POST request to the external visual agent
-                res = requests.post(url, data=data_to_send, headers=headers, timeout=10)
+                res = pooled_post(url, data=data_to_send, headers=headers, timeout=10)
                 current_app.logger.info(f"External visual agent response: {res.status_code}")
                 return 'done'
             except Exception as e:
@@ -775,9 +790,13 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     try:
         from integrations.channels.memory.memory_graph import MemoryGraph
         import os
-        graph_db_path = os.path.join(
-            os.path.expanduser("~"), "Documents", "Nunba", "data", "memory_graph", user_prompt
-        )
+        try:
+            from core.platform_paths import get_memory_graph_dir
+            graph_db_path = get_memory_graph_dir(user_prompt)
+        except ImportError:
+            graph_db_path = os.path.join(
+                os.path.expanduser("~"), "Documents", "Nunba", "data", "memory_graph", user_prompt
+            )
         memory_graph = MemoryGraph(db_path=graph_db_path, user_id=str(user_id))
         tool_logger.info(f"MemoryGraph initialized for {user_prompt}")
     except Exception as e:
@@ -785,13 +804,38 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
     custom_agents = []
     agents_object = {}
-    with open(f"prompts/{prompt_id}.json", 'r') as f:
+    with open(os.path.join(PROMPTS_DIR, f"{prompt_id}.json"), 'r') as f:
             config = json.load(f)
             list_of_persona = config['flows'][get_current_flow(user_prompt)]['persona']
             current_app.logger.info(f'WORKING persona as {list_of_persona}')
+
+    # Generate or load agent personality
+    _agent_personality = None
+    try:
+        from core.agent_personality import load_personality, generate_personality, save_personality
+        _agent_personality = load_personality(str(prompt_id))
+        if not _agent_personality:
+            _role = config.get('personas', [{}])[0].get('name', 'Assistant') if config.get('personas') else list_of_persona
+            _goal = config.get('goal', task if isinstance(task, str) else '')
+            _agent_name = config.get('agent_name', '')
+            _agent_personality = generate_personality(str(_role), str(_goal), _agent_name)
+            save_personality(str(prompt_id), _agent_personality)
+            tool_logger.info(f"Generated personality '{_agent_personality.persona_name}' for prompt {prompt_id}")
+    except Exception as e:
+        tool_logger.warning(f"Personality generation skipped: {e}")
+
+    # Load resonance profile for continuous personality tuning
+    _resonance_profile = None
+    try:
+        from core.resonance_profile import get_or_create_profile
+        _resonance_profile = get_or_create_profile(str(user_id))
+    except ImportError:
+        pass
+    except Exception as e:
+        tool_logger.debug(f"Resonance profile loading skipped: {e}")
+
     # Create assistant agent
-    # Create assistant agent
-    assistant = instantiate_assistant_agent(list_of_persona, user_prompt)
+    assistant = instantiate_assistant_agent(list_of_persona, user_prompt, personality=_agent_personality, resonance_profile=_resonance_profile)
 
     # Wrap assistant with Agent Lightning for training and optimization
     if is_agent_lightning_enabled():
@@ -816,13 +860,13 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         max_consecutive_auto_reply=10,
         default_auto_reply="TERMINATE",
         code_execution_config=False,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
 
     author = autogen.UserProxyAgent(
         name="UserProxy",
         human_input_mode="NEVER",
-        is_termination_msg=lambda x: True if x.get("content").strip()=='' else False,
+        is_termination_msg=lambda x: x.get("content") is not None and not x["content"].strip(),
         max_consecutive_auto_reply=0,
         code_execution_config=False,
     )
@@ -854,7 +898,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     #         name=i['name'],
     #         human_input_mode="NEVER",
     #         default_auto_reply="TERMINATE",
-    #         is_termination_msg=lambda x: True if x.get("content").strip()=='' else False,
+    #         is_termination_msg=lambda x: not (x.get("content") or "").strip(),
     #         max_consecutive_auto_reply=0,
     #         code_execution_config=False,
     #     )
@@ -862,549 +906,32 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     #     custom_agents.append(name)
     #     agents_object[i['name']] = name
 
-    helper.register_for_llm(name="text_2_image", description="Text to image Creator")(helper_fun.txt2img)
-    assistant.register_for_execution(name="text_2_image")(helper_fun.txt2img)
-
-    @log_tool_execution
-    def camera_inp(inp: Annotated[str, "The Question to check from visual context"])->str:
-        return helper_fun.get_user_camera_inp(inp,int(user_id), request_id_list[user_prompt])
-    helper.register_for_llm(name="get_user_camera_inp", description="Get user's visual information to process somethings")(camera_inp)
-    assistant.register_for_execution(name="get_user_camera_inp")(camera_inp)
-
-    @log_tool_execution
-    def save_data_in_memory(key: Annotated[
-        str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
-                            value: Annotated[Optional[
-                                Any], "Value you want to store; strictly should be one of int, float, bool, json array or json object."] = None) -> str:
-        """Store data with validation to prevent corruption."""
-        tool_logger.info('INSIDE save_data_in_memory')
-
-        # Validate the input data
-        try:
-            # Step 1: Use the existing JSON repair function to sanitize input
-            if isinstance(value, str) and (value.startswith('{') or value.startswith('[')):
-                # If the value is a JSON string, repair it
-                value = retrieve_json(value)
-                tool_logger.info(f"REPAIRED JSON STRING: {value}")
-            # Step 2: Force a JSON serialization/deserialization cycle to validate structure
-            if value is not None:
-                # This will fail if the structure isn't JSON-compatible
-                json_str = json.dumps(value)
-                validated_value = json.loads(json_str)
-                tool_logger.info(f"VALIDATED VALUE (post JSON cycle): {validated_value}")
-            else:
-                validated_value = None
-            # Step 3: Store the validated data
-            keys = key.split('.')
-            d = agent_data.setdefault(prompt_id, {})
-
-            for k in keys[:-1]:
-                d = d.setdefault(k, {})
-            d[keys[-1]] = validated_value
-            tool_logger.info(f"VALUES STORED IN AGENT DATA: {validated_value}")
-            tool_logger.info(f"FULL AGENT DATA AT KEY: {d}")
-
-            # Step 4: Save to persistent storage
-            if helper_fun.save_agent_data_to_file(prompt_id, agent_data):
-                tool_logger.info(f"[OK] Data persisted to file for prompt_id {prompt_id}")
-            else:
-                tool_logger.warning(f"⚠️ Failed to persist data to file for prompt_id {prompt_id}")
-            # Step 5: Verify storage was successful
-            try:
-                # Attempt to read back the data to verify it was stored correctly
-                stored_value = get_data_by_key(key)
-                tool_logger.info(f"VERIFICATION - READ BACK VALUE: {stored_value}")
-
-                if stored_value == "Key not found in stored data.":
-                    tool_logger.error(f"VERIFICATION FAILED: Data not properly stored at key {key}")
-            except Exception as e:
-                tool_logger.error(f"VERIFICATION ERROR: {str(e)}")
-            return f'{agent_data[prompt_id]}'
-
-        except json.JSONDecodeError as je:
-            error_msg = f"Invalid JSON structure in value: {str(je)}"
-            tool_logger.error(error_msg)
-            return f"Error: {error_msg} - Data not saved"
-        except TypeError as te:
-            error_msg = f"Type error in value: {str(te)}"
-            tool_logger.error(error_msg)
-            return f"Error: {error_msg} - Data not saved"
-        except Exception as e:
-            error_msg = f"Unexpected error saving data: {str(e)}"
-            tool_logger.error(error_msg)
-            return f"Error: {error_msg} - Data not saved"
-
-    helper.register_for_llm(name="save_data_in_memory", description="Use this to Store and retrieve data using key-value storage system")(save_data_in_memory)
-    assistant.register_for_execution(name="save_data_in_memory")(save_data_in_memory)
-
-    def get_saved_metadata() -> str:
-        """Get metadata with automatic loading from persistent storage"""
-        if prompt_id not in agent_data or not agent_data[prompt_id]:
-            current_app.logger.info(f"Loading agent data from file for get_saved_metadata, prompt_id {prompt_id}")
-            helper_fun.load_agent_data_from_file(prompt_id,agent_data)
-
-        stripped_json = strip_json_values(agent_data[prompt_id])
-        return f'{stripped_json}'
-
-    helper.register_for_llm(name="get_saved_metadata", description="Returns the schema of the json from internal memory with all keys but without actual values.")(get_saved_metadata)
-    assistant.register_for_execution(name="get_saved_metadata")(get_saved_metadata)
-
-    @log_tool_execution
-    def get_data_by_key(key: Annotated[
-        str, "Key path for retrieving data. Use dot notation for nested keys (e.g., 'user.info.name')."]) -> str:
-        # Ensure data is loaded for this prompt_id
-        if prompt_id not in agent_data or not agent_data[prompt_id]:
-            tool_logger.info(f"Loading agent data from file for prompt_id {prompt_id}")
-            helper_fun.load_agent_data_from_file(prompt_id,agent_data)
-        keys = key.split('.')
-        d = agent_data.get(prompt_id, {})
-
-        try:
-            for k in keys:
-                d = d[k]
-            return f'{d}'
-        except KeyError:
-            return "Key not found in stored data."
-
-    helper.register_for_llm(name="get_data_by_key", description="Returns all data from the internal Memory using key")(get_data_by_key)
-    assistant.register_for_execution(name="get_data_by_key")(get_data_by_key)
-
-    @log_tool_execution
-    def get_user_id() -> str:
-        tool_logger.info('INSIDE get_user_id')
-        return f'{user_id}'
-
-    helper.register_for_llm(name="get_user_id", description="Returns the unique identifier (user_id) of the current user.")(get_user_id)
-    assistant.register_for_execution(name="get_user_id")(get_user_id)
-
-    @log_tool_execution
-    def get_prompt_id() -> str:
-        tool_logger.info('INSIDE get_prompt_id')
-        return f'{prompt_id}'
-
-    helper.register_for_llm(name="get_prompt_id", description="Returns the unique identifier (prompt_id) associated with the current prompt or conversation.")(get_prompt_id)
-    assistant.register_for_execution(name="get_prompt_id")(get_prompt_id)
-
-    @log_tool_execution
-    def Generate_video(text: Annotated[str, "Text to be used for video generation"],
-                       avatar_id: Annotated[int, "Unique identifier for the avatar (use 0 for LTX-2 text-to-video)"],
-                       realtime: Annotated[bool,"If True, response is fast but less realistic by default it should be true; if False, response is realistic but slower"],
-                       model: Annotated[str, "Video model to use: 'avatar' for avatar-based video, 'ltx2' for LTX-2 text-to-video generation"] = "avatar") -> str:
-        tool_logger.info(f'INSIDE Generate_video with model={model}')
-
-        # LTX-2 Text-to-Video Generation (using diffusers or local server)
-        if model.lower() == "ltx2":
-            tool_logger.info(f'Using LTX-2 for video generation: {text[:50]}...')
-
-            LOCAL_COMFYUI_URL = "http://localhost:8188"
-            LOCAL_LTX_URL = "http://localhost:5002"
-            headers = {'Content-Type': 'application/json'}
-
-            # LTX-2 parameters (width/height must be divisible by 32, num_frames by 8+1)
-            ltx_payload = {
-                "prompt": text,
-                "negative_prompt": "worst quality, inconsistent motion, blurry, jittery, distorted",
-                "num_frames": 97,  # 97 = 96 + 1 (divisible by 8 + 1), ~4 seconds at 24fps
-                "width": 832,  # divisible by 32
-                "height": 480,  # divisible by 32
-                "num_inference_steps": 30 if realtime else 50,
-                "guidance_scale": 3.0,
-                "fps": 24
-            }
-
-            # Try local LTX-2 server first (custom endpoint)
-            try:
-                tool_logger.info(f"Trying local LTX-2 server at {LOCAL_LTX_URL}")
-                response = requests.post(
-                    f"{LOCAL_LTX_URL}/generate",
-                    json=ltx_payload,
-                    headers=headers,
-                    timeout=600  # 10 min timeout for video gen
-                )
-                if response.status_code == 200:
-                    result = response.json()
-                    video_url = result.get('video_url') or result.get('output_url') or result.get('video_path')
-                    if video_url:
-                        tool_logger.info(f"LTX-2 video generated: {video_url}")
-                        return f"LTX-2 Video generated successfully. URL: {video_url}"
-            except requests.exceptions.RequestException as e:
-                tool_logger.info(f"Local LTX-2 server not available: {e}")
-
-            # Try ComfyUI with LTX-Video workflow
-            try:
-                tool_logger.info(f"Trying ComfyUI at {LOCAL_COMFYUI_URL}")
-
-                # ComfyUI workflow for LTX-Video (compatible with LTX-2 nodes)
-                comfyui_workflow = {
-                    "prompt": {
-                        "1": {
-                            "class_type": "LTXVLoader",
-                            "inputs": {"ckpt_name": "ltx-video-2b-v0.9.safetensors"}
-                        },
-                        "2": {
-                            "class_type": "LTXVConditioning",
-                            "inputs": {
-                                "positive": text,
-                                "negative": ltx_payload["negative_prompt"],
-                                "ltxv_model": ["1", 0]
-                            }
-                        },
-                        "3": {
-                            "class_type": "LTXVSampler",
-                            "inputs": {
-                                "seed": int(time.time()) % 2147483647,
-                                "steps": ltx_payload["num_inference_steps"],
-                                "cfg": ltx_payload["guidance_scale"],
-                                "width": ltx_payload["width"],
-                                "height": ltx_payload["height"],
-                                "num_frames": ltx_payload["num_frames"],
-                                "ltxv_model": ["1", 0],
-                                "conditioning": ["2", 0]
-                            }
-                        },
-                        "4": {
-                            "class_type": "LTXVDecode",
-                            "inputs": {"ltxv_model": ["1", 0], "samples": ["3", 0]}
-                        },
-                        "5": {
-                            "class_type": "VHS_VideoCombine",
-                            "inputs": {
-                                "frame_rate": ltx_payload["fps"],
-                                "filename_prefix": "ltx2_output",
-                                "format": "video/h264-mp4",
-                                "images": ["4", 0]
-                            }
-                        }
-                    }
-                }
-
-                response = requests.post(f"{LOCAL_COMFYUI_URL}/prompt", json=comfyui_workflow, headers=headers, timeout=10)
-
-                if response.status_code == 200:
-                    comfy_prompt_id = response.json().get('prompt_id')
-                    tool_logger.info(f"ComfyUI LTX-2 job queued: {comfy_prompt_id}")
-
-                    # Poll for completion (up to 10 minutes for video generation)
-                    for _ in range(120):
-                        time.sleep(5)
-                        history_response = requests.get(f"{LOCAL_COMFYUI_URL}/history/{comfy_prompt_id}")
-                        if history_response.status_code == 200:
-                            history = history_response.json()
-                            if comfy_prompt_id in history:
-                                outputs = history[comfy_prompt_id].get('outputs', {})
-                                for node_id, output in outputs.items():
-                                    if 'gifs' in output:
-                                        filename = output['gifs'][0].get('filename')
-                                        if filename:
-                                            video_url = f"{LOCAL_COMFYUI_URL}/view?filename={filename}"
-                                            return f"LTX-2 Video generated via ComfyUI. URL: {video_url}"
-                                    if 'videos' in output:
-                                        filename = output['videos'][0].get('filename')
-                                        if filename:
-                                            video_url = f"{LOCAL_COMFYUI_URL}/view?filename={filename}"
-                                            return f"LTX-2 Video generated via ComfyUI. URL: {video_url}"
-
-                    return f"LTX-2 Video generation queued in ComfyUI (prompt_id: {comfy_prompt_id}). Check ComfyUI interface for output."
-
-            except requests.exceptions.RequestException as e:
-                tool_logger.info(f"ComfyUI not available: {e}")
-
-            # Try using diffusers library directly (if installed)
-            try:
-                tool_logger.info("Trying diffusers library for LTX-2")
-                import torch
-                from diffusers import LTXPipeline
-                from diffusers.utils import export_to_video
-
-                pipe = LTXPipeline.from_pretrained(
-                    "Lightricks/LTX-Video-0.9.7-distilled",
-                    torch_dtype=torch.bfloat16
-                )
-                pipe.to("cuda")
-                pipe.vae.enable_tiling()
-
-                video_frames = pipe(
-                    prompt=text,
-                    negative_prompt=ltx_payload["negative_prompt"],
-                    width=ltx_payload["width"],
-                    height=ltx_payload["height"],
-                    num_frames=ltx_payload["num_frames"],
-                    num_inference_steps=ltx_payload["num_inference_steps"],
-                    generator=torch.Generator(device="cuda").manual_seed(int(time.time()) % 2147483647),
-                ).frames[0]
-
-                output_path = os.path.join(os.getcwd(), "coding", f"ltx2_{int(time.time())}.mp4")
-                export_to_video(video_frames, output_path, fps=ltx_payload["fps"])
-                tool_logger.info(f"LTX-2 video saved to {output_path}")
-                return f"LTX-2 Video generated and saved to: {output_path}"
-
-            except ImportError:
-                tool_logger.info("diffusers library not available or LTX model not installed")
-            except Exception as e:
-                tool_logger.error(f"diffusers LTX-2 generation failed: {e}")
-
-            return "LTX-2 video generation failed. Please ensure one of: (1) Local LTX-2 server at localhost:5002, (2) ComfyUI with LTX-Video nodes at localhost:8188, or (3) diffusers library with CUDA GPU"
-
-        # Default: Avatar-based video generation
-        database_url = 'https://mailer.hertzai.com'
-        request_id = str(uuid.uuid4()).replace("-", "")[:11]
-        tool_logger.info(f"avtar_id: {avatar_id}:\n{text[:10]}....\n")
-
-        headers = {'Content-Type': 'application/json'}
-        data = {}
-        data["text"] = text
-        data['flag_hallo'] = 'false'
-        data['chattts'] = False
-        data['openvoice'] = "false"
-        try:
-            res = requests.get("{}/get_image_by_id/{}".format(database_url, avatar_id))
-            res = res.json()
-            new_image_url = res["image_url"]
-        except:
-            data['openvoice'] = "true"
-            new_image_url = None
-            res = {'voice_id':None}
-
-        data["cartoon_image"] = "True"
-        data["bg_url"] = 'http://stream.mcgroce.com/txt/examples_cartoon/roy_bg.jpg'
-        data['vtoonify'] = "false"
-        data["image_url"] = new_image_url
-        data['im_crop'] = "false"
-        data['remove_bg'] = "false"
-        data['hd_video'] = "false"
-        data['uid'] = request_id
-        data['gradient'] = "true"
-        data['cus_bg'] = "false"
-        data['solid_color'] = "false"
-        data['inpainting'] = "false"
-        data['prompt'] = ""
-        data['gender'] = 'male'
-
-        timeout = 60
-        if not realtime:
-            timeout = 600
-            data['chattts'] = True #F5TTS
-            data['flag_hallo'] = "true" #Echomimic-> Liveportrait
-            data["cartoon_image"] = "False"
-
-        if res['voice_id'] != None:
-            voice_sample = requests.get(
-                "{}/get_voice_sample_id/{}".format(database_url, res['voice_id']))
-            voice_sample = voice_sample.json()
-            data["audio_sample_url"] = voice_sample["voice_sample_url"]
-            data['voice_id'] = res['voice_id']
-        else:
-            voice_sample = None
-            data["audio_sample_url"] = None
-            data['voice_id'] = None
-        conv_id = save_conversation_db(text,user_id,prompt_id,database_url,request_id)
-        data['conv_id'] = conv_id
-        data['avatar_id'] = avatar_id
-        data['timeout'] = timeout
-        try:
-            video_link = requests.post("{}/video_generate_save".format(database_url),
-                                        data=json.dumps(data), headers=headers, timeout=1)
-        except:
-            pass
-
-        if data['chattts'] or data['flag_hallo'] == "true":
-            return f"Video Generation task added to queue with conv_id:{conv_id}. Ask the helper to save this conv_id in the same collection from which the story used to generate the video was retrieved, for future reference"
-        else:
-            return f"Video Generation completed with conv_id:{conv_id}. Ask the helper to save this conv_id in the same collection from which the story used to generate the video was retrieved, for future reference"
-
-    helper.register_for_llm(name="Generate_video", description="Generate video with text. Use model='ltx2' for AI text-to-video generation, or model='avatar' (default) for avatar-based video with voice synthesis.")(Generate_video)
-    assistant.register_for_execution(name="Generate_video")(Generate_video)
-
-    @log_tool_execution
-    def get_user_uploaded_file() -> str:
-        tool_logger.info('INSIDE get_user_uploaded_file')
-        if recent_file_id[user_id]:
-            return f'Got user uploaded file the file_id is {recent_file_id[user_id]}'
-
-        return 'No file uploaded from user'
-
-    helper.register_for_llm(name="get_user_uploaded_file", description="get user's recent uploaded files")(get_user_uploaded_file)
-    assistant.register_for_execution(name="get_user_uploaded_file")(get_user_uploaded_file)
-
-    @log_tool_execution
-    def img2txt(image_url: Annotated[str, "image url of which you want text"],text: Annotated[str, "the details you want from image"]='Describe the Images & Text data in this image in detail') -> str:
-        tool_logger.info('INSIDE img2txt')
-        url = "http://azurekong.hertzai.com:8000/llava/image_inference"
-
-        payload = {
-            'url': image_url,
-            'prompt': text
-        }
-        files = []
-        headers = {}
-
-        response = requests.request(
-            "POST", url, headers=headers, data=payload, files=files, timeout=300)
-        if response.status_code == 200:
-            return response.text
-        else:
-            return 'Not able to get this page details try later'
-
-    helper.register_for_llm(name="get_text_from_image", description="Image to Text")(img2txt)
-    assistant.register_for_execution(name="get_text_from_image")(img2txt)
-
-    @log_tool_execution
-    def create_scheduled_jobs(interval_sec: Annotated[int, "time between two Interval in seconds."],
-                            job_description: Annotated[str, "Description of the job to be performed"],
-                            cron_expression: Annotated[Optional[str], "Cron expression for scheduling. Example: '0 9 * * 1-5' (Runs at 9:00 AM, Monday to Friday). If the interval is greater than 60 seconds or it needs to be executed at a dynamic cron time this argument is Mandatory else None"]=None) -> str:
-        tool_logger.info('INSIDE create_scheduled_jobs')
-
-        # actual_execution_time = sum(task_time[prompt_id]['times'][-1])
-        # if interval_sec < actual_execution_time:
-        #     return f"Unable to create scheduled job for the specified interval because the actual execution time ({actual_execution_time} seconds) exceeds the interval between jobs ({interval_sec} seconds). Please use an interval longer than {actual_execution_time} seconds. Would you like to create a scheduled job with this updated interval?"
-
-        # if not scheduler.running:
-        #     scheduler.start()
-
-        # try:
-        #     if not interval_sec or int(interval_sec) >60:
-        #         trigger = CronTrigger.from_crontab(cron_expression)
-        #         job_id = f"job_{int(time.time())}"
-        #         scheduler.add_job(execute_python_file, trigger=trigger, id=job_id, args=[job_description, int(user_id),int(prompt_id)])
-        #         tool_logger.info('Successfully created scheduler job')
-        #         return 'Successfully created scheduler job'
-        #     else:
-        #         trigger = IntervalTrigger(seconds=int(interval_sec))
-        #         job_id = f"job_{int(time.time())}"
-        #         scheduler.add_job(execute_python_file, trigger=trigger, id=job_id, args=[job_description, int(user_id),int(prompt_id)])
-        #         tool_logger.info('Successfully created scheduler job')
-        #         return 'Successfully created scheduler job'
-        # except Exception as e:
-        #     tool_logger.error(f'Error in create_scheduled_jobs: {str(e)}')
-        #     return f"Error creating scheduled job: {str(e)}"
-        return 'Added this schedule job in creation process will do it at the end. you can go ahead and mark this action as completed.'
-
-    helper.register_for_llm(name="create_scheduled_jobs", description="Creates time-based jobs using APScheduler to schedule jobs")(create_scheduled_jobs)
-    assistant.register_for_execution(name="create_scheduled_jobs")(create_scheduled_jobs)
-
-    @log_tool_execution
-    def send_message_to_user(text: Annotated[str, "Text you want to send to the user"],
-                         avatar_id: Annotated[Optional[str], "Unique identifier for the avatar"] = None,
-                         response_type: Annotated[Optional[str], "Response mode: 'Realistic' (slower, better quality) or 'Realtime' (faster, lower quality)"] = 'Realtime') -> str:
-        tool_logger.info('INSIDE send_message_to_user')
-        tool_logger.info(f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
-        request_id = str(uuid.uuid4()).replace("-", "")[:11]
-        #TODO add avatar_id and conv_id and response_type
-        thread = threading.Thread(target=send_message_to_user1, args=(user_id, text, '',prompt_id))
-        thread.start()
-        return f'Message sent successfully to user with request_id: {request_id_list[user_prompt]}-intermediate'
-
-    helper.register_for_llm(name="send_message_to_user", description="Sends a message/information to user. You can use this if you want to ask a question")(send_message_to_user)
-    assistant.register_for_execution(name="send_message_to_user")(send_message_to_user)
-
-    @log_tool_execution
-    def send_presynthesized_video_to_user(conv_id: Annotated[str, "Conversation ID associated with the text from memory"]) -> str:
-        tool_logger.info('INSIDE send_presynthesized_video_to_user')
-        tool_logger.info(f'SENDING DATA 2 user with value: conv_id:{conv_id}.')
-        return 'Message sent successfully to user'
-
-    helper.register_for_llm(name="send_presynthesized_video_to_user", description="Sends a presynthesized message/video/dialogue to user using conv_id.")(send_presynthesized_video_to_user)
-    assistant.register_for_execution(name="send_presynthesized_video_to_user")(send_presynthesized_video_to_user)
-
-    @log_tool_execution
-    def send_message_in_seconds(text: Annotated[str, "text to send to user"],
-                       delay: Annotated[int, "time to wait in seconds before sending text"],
-                       conv_id: Annotated[Optional[int], "conv_id for this text if not available make it None"],) -> str:
-        tool_logger.info('INSIDE send_message_in_seconds')
-        tool_logger.info(f'with text:{text}. and waiting time: {delay} conv_id: {conv_id}')
-        run_time = datetime.fromtimestamp(time.time() + delay)
-        scheduler.add_job(send_message_to_user1, 'date', run_date=run_time, args=[user_id, text, '',prompt_id])
-        return 'Message scheduled successfully'
-
-    helper.register_for_llm(name="send_message_in_seconds", description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")(send_message_in_seconds)
-    assistant.register_for_execution(name="send_message_in_seconds")(send_message_in_seconds)
-
-    @log_tool_execution
-    def get_chat_history(text: Annotated[str, "Text related to which you want history"],
-                         start: Annotated[Optional[str], "start date in format %Y-%m-%dT%H:%M:%S.%fZ"] = None,
-                         end: Annotated[Optional[str], "end date in format %Y-%m-%dT%H:%M:%S.%fZ"] = None) -> str:
-        tool_logger.info('INSIDE get_chat_history')
-        return helper_fun.get_time_based_history(text, f'user_{user_id}', start, end)
-    helper.register_for_llm(name="get_chat_history", description="Get Chat history based on text & start & end date")(get_chat_history)
-    assistant.register_for_execution(name="get_chat_history")(get_chat_history)
-
-    @log_tool_execution
-    def search_visual_history(
-        query: Annotated[str, "What to search for in visual/screen descriptions"],
-        minutes_back: Annotated[int, "How many minutes back to search (default 30)"] = 30,
-        channel: Annotated[str, "Which feed: 'camera', 'screen', or 'both' (default)"] = "both",
-    ) -> str:
-        """Search past camera/screen descriptions. Use for questions about what happened earlier visually."""
-        results = helper_fun.search_visual_history(user_id, query, mins=minutes_back, channel=channel)
-        if results:
-            return '\n'.join(results)
-        return "No matching visual/screen descriptions found in the given time range."
-    helper.register_for_llm(name="search_visual_history", description="Search past camera and screen descriptions by keyword and time range. Use for visual history queries.")(search_visual_history)
-    assistant.register_for_execution(name="search_visual_history")(search_visual_history)
-
-    # --- SimpleMem long-term memory tools ---
-    if simplemem_store is not None:
-        @log_tool_execution
-        def search_long_term_memory(
-            query: Annotated[str, "Natural language query to search long-term memory"]
-        ) -> str:
-            """Search compressed long-term memory using semantic retrieval."""
-            try:
-                loop = get_or_create_event_loop()
-                results = loop.run_until_complete(simplemem_store.search(query))
-                if results:
-                    return results[0].content
-                return "No relevant memories found."
-            except Exception as e:
-                tool_logger.info(f"SimpleMem search error: {e}")
-                return "Memory search unavailable."
-
-        helper.register_for_llm(
-            name="search_long_term_memory",
-            description="Search long-term memory for past conversations, facts, and context using natural language query. More powerful than get_chat_history for finding relevant information."
-        )(search_long_term_memory)
-        assistant.register_for_execution(name="search_long_term_memory")(search_long_term_memory)
-
-        @log_tool_execution
-        def save_to_long_term_memory(
-            content: Annotated[str, "The information/fact to remember long-term"],
-            speaker: Annotated[str, "Who said this (e.g. 'User', 'Assistant', 'System')"] = "System"
-        ) -> str:
-            """Save important information to compressed long-term memory."""
-            try:
-                loop = get_or_create_event_loop()
-                loop.run_until_complete(simplemem_store.add(content, {
-                    "sender_name": speaker,
-                    "user_id": user_id,
-                    "prompt_id": prompt_id,
-                }))
-                return "Saved to long-term memory."
-            except Exception as e:
-                tool_logger.info(f"SimpleMem save error: {e}")
-                return "Failed to save to long-term memory."
-
-        helper.register_for_llm(
-            name="save_to_long_term_memory",
-            description="Save important facts or information to long-term memory for future retrieval across sessions."
-        )(save_to_long_term_memory)
-        assistant.register_for_execution(name="save_to_long_term_memory")(save_to_long_term_memory)
-
-    # --- MemoryGraph provenance tools (remember, recall, backtrace) ---
-    if memory_graph is not None:
-        try:
-            from integrations.channels.memory.agent_memory_tools import create_memory_tools, register_autogen_tools
-            mem_tools = create_memory_tools(memory_graph, str(user_id), user_prompt)
-            register_autogen_tools(mem_tools, assistant, helper)
-            tool_logger.info(f"MemoryGraph tools registered for {user_prompt}")
-        except Exception as e:
-            tool_logger.warning(f"MemoryGraph tools registration failed: {e}")
-
-    @log_tool_execution
-    def google_search(text: Annotated[str, "Text/Query which you want to search"]) -> str:
-        tool_logger.info('INSIDE google search')
-        return helper_fun.top5_results(text)
-    helper.register_for_llm(name="google_search", description="web/google/bing search api tool for a given query")(google_search)
-    assistant.register_for_execution(name="google_search")(google_search)
+    # --- Core tools (defined once in core/agent_tools.py) ---
+    from core.agent_tools import build_core_tool_closures, register_core_tools, register_memory_graph_tools
+    _tool_ctx = {
+        'user_id': user_id, 'prompt_id': prompt_id,
+        'agent_data': agent_data, 'helper_fun': helper_fun,
+        'user_prompt': user_prompt, 'request_id_list': request_id_list,
+        'recent_file_id': recent_file_id, 'scheduler': scheduler,
+        'simplemem_store': simplemem_store,
+        'memory_graph': memory_graph,
+        'log_tool_execution': log_tool_execution,
+        'send_message_to_user1': send_message_to_user1,
+        'retrieve_json': retrieve_json,
+        'strip_json_values': strip_json_values,
+        'save_conversation_db': save_conversation_db,
+    }
+    core_tools = build_core_tool_closures(_tool_ctx)
+    register_core_tools(core_tools, helper, assistant)
+    register_memory_graph_tools(memory_graph, helper, assistant, user_id, user_prompt)
+
+
+    # Unified media generation tools (already DRY)
+    try:
+        from integrations.service_tools.media_agent import register_media_tools
+        register_media_tools(helper, assistant)
+    except Exception as e:
+        tool_logger.debug(f"Media tools registration skipped: {e}")
 
     @log_tool_execution
     def get_user_details()->str:
@@ -1442,6 +969,26 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                 return f"{response}"
     helper.register_for_llm(name="validate_json_response", description="Checks and corrects if the tool response is not JSON but expected to be.")(validate_json_response)
     assistant.register_for_execution(name="validate_json_response")(validate_json_response)
+
+    # Expert agent consultation tool — domain-specific guidance on demand
+    @log_tool_execution
+    def consult_expert(task_description: Annotated[str, "Describe what expertise you need"]) -> str:
+        """Consult a domain expert agent for specialized guidance on the current task.
+        Returns expert recommendations. The user will be informed which expert was consulted."""
+        try:
+            from integrations.expert_agents import match_expert_for_context
+            match = match_expert_for_context(task_description, top_k=3, min_score=2)
+            if not match:
+                return "No domain expert matched this task. Proceeding with general knowledge."
+            send_message_to_user1(user_id,
+                f"Consulting expert: {match['name']}",
+                "Expert consultation", prompt_id)
+            return f"Expert guidance from {match['name']}:\n{match['prompt_block']}"
+        except Exception as e:
+            return f"Expert consultation unavailable: {str(e)}"
+    helper.register_for_llm(name="consult_expert",
+        description="Consult a specialized domain expert for the current task")(consult_expert)
+    assistant.register_for_execution(name="consult_expert")(consult_expert)
 
     @log_tool_execution
     async def execute_windows_or_android_command(
@@ -1531,7 +1078,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             if user_prompt in user_tasks and hasattr(user_tasks[user_prompt], 'current_action'):
                 current_action_id = user_tasks[user_prompt].current_action
 
-            direct_vlm_path = f"prompts/{prompt_id}_{role_number}_{current_action_id}_vlm_agent.json"
+            direct_vlm_path = os.path.join(PROMPTS_DIR, f"{prompt_id}_{role_number}_{current_action_id}_vlm_agent.json")
             if os.path.exists(direct_vlm_path):
                 tool_logger.info(f"Found direct VLM file for current action: {direct_vlm_path}")
                 try:
@@ -1558,16 +1105,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                 enhanced_instruction += "\nAdapt these steps to the current screen state as needed."
                 tool_logger.info(f"Created enhanced instruction with {len(matching_recipe.get('recipe', []))} steps")
 
-            # Initial connectivity check
-            topic = f'com.hertzai.hevolve.action.{user_id}'
-            tool_logger.info(f'calling {topic} for 5 second')
-            response = await subscribe_and_return({'prompt_id': prompt_id}, topic, 2000)
-            tool_logger.info(f'Response from call of {topic}: {response}')
-
-            if not response:
-                return 'Ask UserProxy to go to hevolve.ai login and start the windows companion app'
-
-            # Prepare crossbar message
+            # Prepare VLM message (shared across all tiers)
             crossbar_message = {
                 'parent_request_id': request_id_list[user_prompt],
                 'user_id': f'{user_id}',
@@ -1584,14 +1122,27 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                 crossbar_message['enhanced_instruction'] = enhanced_instruction
                 tool_logger.info(f"Added enhanced instruction to crossbar message")
 
-            # Execute the command
-            topic = 'com.hertzai.hevolve.action'
-            tool_logger.info(f'calling {topic} for 1800 seconds')
-
+            # Three-tier VLM execution (Tier 1: in-process, Tier 2: HTTP local)
+            from integrations.vlm.vlm_adapter import execute_vlm_instruction, check_vlm_available
             start_time = time.time()
-            response = await subscribe_and_return(crossbar_message, topic, 1800000)
-            execution_time = time.time() - start_time
+            response = execute_vlm_instruction(crossbar_message)
 
+            if response is None:
+                # Tier 3: Crossbar WAMP (central/regional or fallback)
+                tool_logger.info("VLM Tier 1/2 unavailable, falling back to Crossbar WAMP")
+                topic = f'com.hertzai.hevolve.action.{user_id}'
+                tool_logger.info(f'calling {topic} for 5 second')
+                response = await subscribe_and_return({'prompt_id': prompt_id}, topic, 2000)
+                tool_logger.info(f'Response from call of {topic}: {response}')
+
+                if not response:
+                    return 'Ask UserProxy to go to hevolve.ai login and start Nunba - Your Local HART Companion App'
+
+                topic = 'com.hertzai.hevolve.action'
+                tool_logger.info(f'calling {topic} for 1800 seconds')
+                response = await subscribe_and_return(crossbar_message, topic, 1800000)
+
+            execution_time = time.time() - start_time
             tool_logger.info(f'THIS IS RESPONSE type: {type(response)} value: {response}')
 
             if not response:
@@ -1658,7 +1209,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                         # Determine file path
                         role_number = get_current_flow(user_prompt)
                         action_id_to_use = action_id
-                        base_path = f"prompts/{prompt_id}_{role_number}"
+                        base_path = os.path.join(PROMPTS_DIR, f"{prompt_id}_{role_number}")
 
                         # Find next available action_id
                         while os.path.exists(f"{base_path}_{action_id_to_use}_vlm_agent.json"):
@@ -1873,10 +1424,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     OS: {os_to_control}
     Task: {instructions}
 
-    The Hevolve AI Companion App is not running on your {os_to_control} device.
+    Nunba - Your Local HART Companion App is not running on your {os_to_control} device.
 
     STEPS TO RESOLVE:
-    1. Open the Hevolve AI Companion App
+    1. Open Nunba - Your Local HART Companion App
     2. Ensure it's connected and running
     3. Try the command again
 
@@ -1896,6 +1447,157 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     helper.register_for_llm(name="execute_windows_or_android_command",
                             description="Processes user-defined commands on a personal Windows or Android system and returns detailed computer/mobile use agent execution context.")(execute_windows_or_android_command)
     assistant.register_for_execution(name="execute_windows_or_android_command")(execute_windows_or_android_command)
+
+    # Coding Agent Aggregator: Route coding tasks to best CLI tool
+    # This is a LEAF tool — calls external subprocess (kilocode/claude/opencode),
+    # never re-dispatches to /chat. Safe from callback loops.
+    async def execute_coding_task(
+        task: Annotated[str, "The coding task to execute (e.g., 'review this function for bugs', 'implement a login form')"],
+        task_type: Annotated[str, "Task type: code_review, feature, bug_fix, refactor, app_build, debugging, multi_session"] = "feature",
+        preferred_tool: Annotated[str, "Optional tool override: kilocode, claude_code, opencode, or aider_native (empty = auto-select best)"] = "",
+        working_dir: Annotated[str, "Working directory / repo path for the coding task (empty = use HEVOLVE_CODING_WORKDIR env or cwd)"] = "",
+    ) -> str:
+        """Execute a coding task using the best available coding agent tool (KiloCode, Claude Code, OpenCode, or AiderNative).
+
+        Routes to the best tool based on benchmarks and task type.
+        This is for writing, reviewing, refactoring, or debugging code —
+        NOT for GUI automation (use execute_windows_or_android_command for that).
+        """
+        try:
+            from integrations.coding_agent.orchestrator import get_coding_orchestrator
+            orchestrator = get_coding_orchestrator()
+            result = orchestrator.execute(
+                task=task,
+                task_type=task_type,
+                preferred_tool=preferred_tool,
+                user_id=user_id,
+                model=os.environ.get('HEVOLVE_CODING_MODEL', ''),
+                working_dir=working_dir or os.environ.get('HEVOLVE_CODING_WORKDIR', ''),
+            )
+            import json
+            return json.dumps(result, indent=2)
+        except Exception as e:
+            return f"Coding task execution error: {e}"
+
+    helper.register_for_llm(
+        name="execute_coding_task",
+        description="Execute a coding task (write, review, refactor, debug code) using the best available coding agent tool. Routes to KiloCode, Claude Code, OpenCode, or AiderNative based on benchmarks. Pass working_dir for the target repo path."
+    )(execute_coding_task)
+    assistant.register_for_execution(name="execute_coding_task")(execute_coding_task)
+
+    # Repository map tool — tree-sitter based code understanding
+    try:
+        from integrations.coding_agent.recipe_bridge import CodingRecipeBridge
+
+        async def get_repository_map(
+            working_dir: Annotated[str, "Directory to map (default: current directory)"] = ".",
+            max_tokens: Annotated[int, "Maximum tokens for the map output"] = 2048,
+        ) -> str:
+            """Generate a tree-sitter based repository map showing key functions, classes, and their relationships.
+
+            Use this to understand a codebase's structure before making changes.
+            Returns a ranked summary of the most important code symbols.
+            """
+            return CodingRecipeBridge.get_repository_map(working_dir, max_tokens)
+
+        helper.register_for_llm(
+            name="get_repository_map",
+            description="Generate a tree-sitter repository map showing key functions, classes, and structure. Use before coding tasks to understand the codebase."
+        )(get_repository_map)
+        assistant.register_for_execution(name="get_repository_map")(get_repository_map)
+        tool_logger.info("Registered get_repository_map tool")
+    except ImportError:
+        tool_logger.debug("Repository map tool not available (aider_core not installed)")
+
+    # Shard Engine: Call-chain context for coding tasks.
+    # Target function + upstream callers + downstream callees = FULL source.
+    # Everything else = interfaces only. Exposure proportional to task.
+    # Call graph from Trueflow MCP (IDE) or AST fallback (headless).
+    try:
+        async def create_code_shard(
+            task: Annotated[str, "Description of the coding task"],
+            target_file: Annotated[str, "Relative path to the file containing the target function"],
+            target_function: Annotated[str, "Name of the function to modify"],
+            repo_path: Annotated[str, "Path to the repository (default: HART OS install dir)"] = "",
+        ) -> str:
+            """Create a code shard with call-chain context for a coding task.
+
+            Returns:
+            - Target function: FULL source (what you're modifying)
+            - Upstream callers: FULL source (who calls it, input contracts)
+            - Downstream callees: FULL source (what it calls, output contracts)
+            - Everything else: Interfaces only (signatures + types)
+
+            Call graph sourced from Trueflow MCP (when IDE running) or AST fallback.
+            Security: exposure proportional to the task. E2E encrypted for peer offload.
+            Use execute_coding_task with working_dir to actually apply edits.
+            """
+            from integrations.agent_engine.shard_engine import ShardEngine
+            import json
+            engine = ShardEngine(code_root=repo_path) if repo_path else ShardEngine()
+            shard = engine.create_call_chain_shard(
+                task=task, target_file=target_file,
+                target_function=target_function)
+            return json.dumps({
+                'shard_id': shard.shard_id,
+                'task': shard.task_description,
+                'scope': shard.scope.value,
+                'target_files': shard.target_files,
+                'call_chain_source': shard.full_content,
+                'interfaces': [{'file': s.file_path, 'functions': s.functions,
+                               'classes': s.classes} for s in shard.interface_specs],
+            }, indent=2, default=str)
+
+        helper.register_for_llm(
+            name="create_code_shard",
+            description="Create a code shard with call-chain context: target function + upstream callers + downstream callees (FULL source), everything else interfaces only."
+        )(create_code_shard)
+        assistant.register_for_execution(name="create_code_shard")(create_code_shard)
+        tool_logger.info("Registered shard engine tool (create_code_shard)")
+    except Exception:
+        tool_logger.debug("Shard engine tool not available")
+
+    # Benchmark Tracker: Query which coding tool performs best for each task type
+    try:
+        async def get_coding_benchmarks(
+            task_type: Annotated[str, "Task type to check (code_review, feature, bug_fix, refactor, app_build, debugging, multi_session, or 'all')"] = "all",
+        ) -> str:
+            """Get coding tool benchmarks — which tool (KiloCode, Claude Code, OpenCode, AiderNative) performs best.
+
+            Returns success rates, average times, and sample counts per tool per task type.
+            Includes both local benchmarks and hive-aggregated intelligence from peers.
+            """
+            from integrations.coding_agent.benchmark_tracker import get_benchmark_tracker
+            import json
+            tracker = get_benchmark_tracker()
+            result = {'local': {}, 'hive': {}}
+
+            if task_type == 'all':
+                delta = tracker.export_learning_delta()
+                result['local'] = delta.get('coding_benchmarks', {})
+            else:
+                best = tracker.get_best_tool(task_type)
+                if best:
+                    result['local'][task_type] = {
+                        'best_tool': best[0], 'success_rate': best[1],
+                        'avg_time_s': best[2],
+                    }
+                hive_best = tracker.get_hive_best_tool(task_type)
+                if hive_best:
+                    result['hive'][task_type] = {
+                        'best_tool': hive_best[0], 'success_rate': hive_best[1],
+                        'avg_time_s': hive_best[2],
+                    }
+            return json.dumps(result, indent=2, default=str)
+
+        helper.register_for_llm(
+            name="get_coding_benchmarks",
+            description="Query coding tool benchmarks — which tool performs best per task type. Includes local and hive-aggregated data."
+        )(get_coding_benchmarks)
+        assistant.register_for_execution(name="get_coding_benchmarks")(get_coding_benchmarks)
+        tool_logger.info("Registered get_coding_benchmarks tool")
+    except Exception:
+        tool_logger.debug("Benchmark tracker tool not available")
 
     # MCP Integration: Load and register user-provided MCP server tools
     try:
@@ -2082,6 +1784,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             from integrations.agent_engine.ip_protection_tools import register_ip_protection_tools
             register_ip_protection_tools(helper, assistant, user_id)
             tool_logger.info("IP protection tools loaded (Tier 2) based on prompt content")
+        if 'self_build' in goal_tags:
+            from integrations.agent_engine.self_build_tools import register_self_build_tools
+            register_self_build_tools(helper, assistant, user_id)
+            tool_logger.info("Self-build tools loaded (Tier 2) based on prompt content")
     except Exception as e:
         tool_logger.debug(f"Goal-aware tool loading skipped: {e}")
 
@@ -2290,8 +1996,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                 )
                                 if success:
                                     current_app.logger.info(f"Added {len(json_obj['subtasks'])} subtasks to ledger for action {current_action_id}")
-                                    # Sync the blocked state to ledger
-                                    sync_action_state_to_ledger(user_prompt, current_action_id, ActionState.PENDING, user_ledgers)
+                                    # Auto-sync handles ledger update via safe_set_state below
                                 else:
                                     current_app.logger.warning(f"Failed to add subtasks to ledger")
                             safe_set_state(user_prompt, current_action_id, ActionState.PENDING, "requires breakdown into subtasks")
@@ -2312,7 +2017,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                 # Recipe received, save it
                                 current_app.logger.info('Got Individual action recipe save it')
                                 flow = get_current_flow(user_prompt)
-                                name = f'prompts/{prompt_id}_{flow}_{json_obj["action_id"]}.json'
+                                name = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow}_{json_obj["action_id"]}.json')
                                 user_tasks[user_prompt].fallback = False
                                 user_tasks[user_prompt].recipe = False
                                 metadata = strip_json_values(agent_data[prompt_id])
@@ -2325,6 +2030,15 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                         i['agent_to_perform_this_action'] = 'Executor'
                                     else:
                                         i['agent_to_perform_this_action'] = 'Assistant'
+                                # SECURITY: redact secrets before recipe persistence
+                                try:
+                                    from security.secret_redactor import redact_secrets
+                                    for _ri in json_obj.get('recipe', []):
+                                        for _rk in ('tool_input', 'task_description', 'output'):
+                                            if isinstance(_ri.get(_rk), str):
+                                                _ri[_rk], _ = redact_secrets(_ri[_rk])
+                                except ImportError:
+                                    pass
                                 with open(name, "w") as json_file:
                                     json.dump(json_obj, json_file)
                                 #setting the action from response as current action
@@ -2449,6 +2163,23 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         create_final_recipe_for_current_flow(flow, merged_dict, prompt_id)
         current_app.logger.info('Flow Recipe Created & saved successfully')
 
+        # Merge accumulated experience data into the saved recipe
+        try:
+            from recipe_experience import RecipeExperienceRecorder
+            RecipeExperienceRecorder.merge_experience_into_recipe(prompt_id, flow, user_prompt)
+        except Exception:
+            pass
+
+        # Capture agent baseline snapshot on creation
+        try:
+            from integrations.agent_engine.agent_baseline_service import capture_baseline_async
+            capture_baseline_async(
+                prompt_id=str(prompt_id), flow_id=flow,
+                trigger='creation', user_id=str(user_id),
+                user_prompt=user_prompt)
+        except Exception:
+            pass
+
         force_state_through_valid_path(user_prompt, current_action_id, ActionState.TERMINATED,
                                        "Recipe Created And Terminated")
         final_recipe[prompt_id] = merged_dict
@@ -2528,15 +2259,43 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                 pass  # Non-blocking
         group_chat.messages.append = _graph_ingest_hook
 
+    # Resonance stream: continuous in-conversation tuning via HevolveAI
+    try:
+        from core.resonance_tuner import get_resonance_tuner
+        _res_tuner = get_resonance_tuner()
+        _res_prev_append = group_chat.messages.append
+        def _resonance_stream_hook(msg):
+            _res_prev_append(msg)
+            try:
+                content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+                speaker = msg.get("name", "Agent") if isinstance(msg, dict) else "Agent"
+                is_user = speaker.lower() in ('user', 'user_proxy', 'author')
+                _res_tuner.stream.on_message(
+                    str(user_id), speaker, content, is_user_message=is_user)
+            except Exception:
+                pass
+        group_chat.messages.append = _resonance_stream_hook
+    except ImportError:
+        pass
+
     return author, assistant, executor, group_chat, manager, chat_instructor, agents_object
 
 
 def instantiate_executor_agent():
+    # Inject cultural wisdom — even code execution should embody care
+    _executor_cultural = ""
+    try:
+        from cultural_wisdom import get_cultural_prompt_compact
+        _executor_cultural = get_cultural_prompt_compact()
+    except Exception:
+        pass
+
     executor = autogen.AssistantAgent(
         name="Executor",
         code_execution_config={"last_n_messages": 2, "work_dir": "coding", "use_docker": False},
         llm_config=llm_config,
-        system_message="""You are an Executor agent.
+        system_message=f"""You are an Executor agent.
+{_executor_cultural}
         Focus: Running, and debugging code.
 
         Responsibilities:
@@ -2585,6 +2344,7 @@ def instantiate_status_verifier_agent(user_prompt):
         llm_config=llm_config,
         code_execution_config=False,
         system_message=""""You are a Status Verification Agent in a multi-agent system.
+        Spirit: Kintsugi (Japan) — broken things repaired with care become more beautiful than before. When actions fail, frame errors constructively and with warmth. Celebrate completed actions genuinely.
         Role: Your primary responsibility is to track, validate and verify the status of actions performed by other agents. You must provide updates strictly in JSON format with the following response structures:
         Response formats:
             1. Action Completed Successfully: {"status": "completed","action": "current action","action_id": 1/2/3...,"message": "message here","can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike","persona_name":"persona name this action belongs to","fallback_action": "Automatically determine and provide intelligent fallback strategy here based on the action type. Examples: For file operations - retry with alternate path; For API calls - implement exponential backoff; For calculations - use alternative algorithm; For data processing - validate and sanitize inputs before retry. NEVER leave this empty."}
@@ -2634,22 +2394,31 @@ def instantiate_status_verifier_agent(user_prompt):
 
         """ + f"\nExtra Information: below are the list of actions the chat_manager will give you, keep this in mind but don't use this directly only use this if there is any update in any action or you want to insert/delete the actions & return the entire array as entire_actions\n{user_tasks[user_prompt].actions}",
 
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
     return verify
 
 
 def instantiate_helper_agent():
+    # Inject cultural wisdom into Helper for warm, caring assistance
+    _helper_cultural = ""
+    try:
+        from cultural_wisdom import get_cultural_prompt_compact
+        _helper_cultural = get_cultural_prompt_compact()
+    except Exception:
+        pass
+
     helper = autogen.AssistantAgent(
         name="Helper",
         llm_config=llm_config,
         code_execution_config=False,
-        system_message="""You are an Helper Agent,
-        Focus: Assisting the Assistant Agent to complete actions.
+        system_message=f"""You are a Helper Agent with a caring, supportive nature.
+{_helper_cultural}
+        Focus: Assisting the Assistant Agent to complete actions with warmth and encouragement.
         Note: Do not coordinate with other agents. After your response, always pass the conversation back to the Assistant Agent.
 
         You serve as the system's self-healing component with these responsibilities:
-        1. Monitor: Continously monitor responses for error patterns, especially JSON with {"status": "error"} format
+        1. Monitor: Continously monitor responses for error patterns, especially JSON with {{"status": "error"}} format
         2. Diagnose: When error occur, carefully analyze error messages to identify root causes
         3. Repair: Take immediate corrective actions based on the specific error type:
             - For JSON format errors: use validate_json_response tool
@@ -2665,7 +2434,7 @@ def instantiate_helper_agent():
             If the Assistant Agent requests code with time.sleep, respond that it cannot be executed and utilize the create_scheduled_jobs tool instead.
             Always include proper error handling and logging.
             Ensure the final response is printed usin print() before returning it.
-            If you want to send data proactively (on your own) to user use `@user {"message2user": "message here"}`. However, if you're responding to the user's request or instruction, use the send_message_to_user or send_message_in_seconds tool.
+            If you want to send data proactively (on your own) to user use `@user {{"message2user": "message here"}}`. However, if you're responding to the user's request or instruction, use the send_message_to_user or send_message_in_seconds tool.
             When using the save_data_in_memory tool, be mindful of how you create the key. Ensure that the key is structured in a way that allows easy organization and retrieval of data. Use dot notation to create a logical key path. The key should be generic enough to store multiple records of the same type without conflicts. Avoid using specific values as part of the key
                 For example:
                     - stories.story_name - Good key structure for storing multiple stories.
@@ -2673,12 +2442,42 @@ def instantiate_helper_agent():
             When receiving responses from tools that should return JSON, always use the validate_json_response tool to ensure valid JSON formatting before processing further. This helps prevent errors when parsing tool output.
         Data Management:
             Use the get_set_internal_memory tool to store or retrieve user information as needed.""",
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
     return helper
 
 
-def instantiate_assistant_agent(list_of_persona, user_prompt):
+def instantiate_assistant_agent(list_of_persona, user_prompt, personality=None, resonance_profile=None):
+    # Build personality injection for the primary user-facing agent
+    _personality_block = ""
+    if personality:
+        try:
+            from core.agent_personality import build_personality_prompt, build_proactive_vision_prompt
+            _personality_block = build_personality_prompt(personality, resonance_profile=resonance_profile)
+            _personality_block += build_proactive_vision_prompt(
+                goal=user_tasks.get(user_prompt, Action("")).actions if user_prompt in user_tasks else ""
+            )
+        except Exception:
+            pass
+    # Expert agent guidance — domain-specific prompt enhancement
+    _expert_block = ""
+    try:
+        from integrations.expert_agents import match_expert_for_context
+        _actions_text = str(user_tasks.get(user_prompt, Action("")).actions) if user_prompt in user_tasks else ""
+        _expert_match = match_expert_for_context(_actions_text)
+        if _expert_match:
+            _expert_block = _expert_match['prompt_block']
+            tool_logger.info(f"Expert match: {_expert_match['name']} (score={_expert_match['score']})")
+    except Exception:
+        pass
+
+    if not _personality_block:
+        try:
+            from cultural_wisdom import get_cultural_prompt_compact
+            _personality_block = get_cultural_prompt_compact()
+        except Exception:
+            pass
+
     assistant = autogen.AssistantAgent(
         name="Assistant",
         llm_config=llm_config,
@@ -2759,8 +2558,8 @@ def instantiate_assistant_agent(list_of_persona, user_prompt):
         •Working Directory: {os.getcwd()}/ - CRITICAL: Always use os.path.join(os.getcwd(), filename) for file paths. NEVER use hardcoded absolute paths.
 
         •Reminder: If camera input is needed, ask the user to turn on their camera. All responses should be played via TTS with a talking-head animation.
-        """ + f"Extra Information: below are the list of actions the chat_manager is gonna give you keep this in mind but dont use this directly\n{user_tasks[user_prompt].actions}",
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        """ + _personality_block + _expert_block + f"\nExtra Information: below are the list of actions the chat_manager is gonna give you keep this in mind but dont use this directly\n{user_tasks[user_prompt].actions}",
+        is_termination_msg=_is_terminate_msg,
     )
     return assistant
 
@@ -2773,7 +2572,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         name='time_agent',
         llm_config=llm_config,
         max_consecutive_auto_reply=10,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
         code_execution_config={"work_dir": "coding", "use_docker": False},
         system_message="You are an helpful AI assistant used to perform time based tasks given to you. "
         f"""You can refer below details to perform task:
@@ -2793,7 +2592,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         name=f"user_proxy_{user_id}",
         human_input_mode="NEVER",
         llm_config=False,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
         max_consecutive_auto_reply=0,
         code_execution_config=False,
     )
@@ -2802,6 +2601,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         llm_config=llm_config,
         code_execution_config={"work_dir": "coding", "use_docker": False},
         system_message=f"""You are Helper Agent. Help the {role} agent to complete the task:
+{get_cultural_prompt()}
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
             3. Only use the "send_message_to_roles" tool when contacting personas other than {role},Executor,multi_role_agent.
@@ -2817,7 +2617,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
 
             When writing code, always print the final response just before returning it.
         """,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
     executor1 = autogen.AssistantAgent(
         name="Executor",
@@ -2844,7 +2644,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             if you get any conversation which is not related to coding ask the manager to route this conversation to user
             When writing code, always print the final response just before returning it.
         ''',
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
     multi_role_agent1 = autogen.AssistantAgent(
         name="multi_role_agent",
@@ -2870,7 +2670,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             Report status only—do not perform actions yourself.
 
         """,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
 
     chat_instructor1 = autogen.UserProxyAgent(
@@ -2879,382 +2679,26 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         max_consecutive_auto_reply=10,
         default_auto_reply="TERMINATE",
         code_execution_config=False,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
 
-    helper1.register_for_llm(name="text_2_image", description="Text to image Creator")(helper_fun.txt2img)
-    time_agent.register_for_execution(name="text_2_image")(helper_fun.txt2img)
-
-    @log_tool_execution
-    def camera_inp(inp: Annotated[str, "The Question to check from visual context"])->str:
-        return helper_fun.get_user_camera_inp(inp, int(user_id), request_id_list[user_prompt] )
-    helper1.register_for_llm(name="get_user_camera_inp", description="Get user's visual information to process somethings")(camera_inp)
-    time_agent.register_for_execution(name="get_user_camera_inp")(camera_inp)
-
-    @log_tool_execution
-    def save_data_in_memory(key: Annotated[
-        str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
-                            value: Annotated[Optional[
-                                Any], "Value you want to store; strictly should be one of int, float, bool, json array or json object."] = None) -> str:
-        """Store data with validation to prevent corruption."""
-        tool_logger.info('INSIDE save_data_in_memory')
-        # Validate the input data
-        try:
-            # Step 1: Use the existing JSON repair function to sanitize input
-            if isinstance(value, str) and (value.startswith('{') or value.startswith('[')):
-                # If the value is a JSON string, repair it
-                value = retrieve_json(value)
-                tool_logger.info(f"REPAIRED JSON STRING: {value}")
-            # Step 2: Force a JSON serialization/deserialization cycle to validate structure
-            if value is not None:
-                # This will fail if the structure isn't JSON-compatible
-                json_str = json.dumps(value)
-                validated_value = json.loads(json_str)
-                tool_logger.info(f"VALIDATED VALUE (post JSON cycle): {validated_value}")
-            else:
-                validated_value = None
-            # Step 3: Store the validated data
-            keys = key.split('.')
-            d = agent_data.setdefault(prompt_id, {})
-
-            for k in keys[:-1]:
-                d = d.setdefault(k, {})
-            d[keys[-1]] = validated_value
-            tool_logger.info(f"VALUES STORED IN AGENT DATA: {validated_value}")
-            tool_logger.info(f"FULL AGENT DATA AT KEY: {d}")
-            # Step 4: Verify storage was successful
-            try:
-                # Attempt to read back the data to verify it was stored correctly
-                stored_value = get_data_by_key(key)
-                tool_logger.info(f"VERIFICATION - READ BACK VALUE: {stored_value}")
-                # Optional: compare stored_value with what we intended to store
-                if stored_value == "Key not found in stored data.":
-                    tool_logger.error(f"VERIFICATION FAILED: Data not properly stored at key {key}")
-            except Exception as e:
-                tool_logger.error(f"VERIFICATION ERROR: {str(e)}")
-            return f'{agent_data[prompt_id]}'
-
-        except json.JSONDecodeError as je:
-            error_msg = f"Invalid JSON structure in value: {str(je)}"
-            tool_logger.error(error_msg)
-            return f"Error: {error_msg} - Data not saved"
-        except TypeError as te:
-            error_msg = f"Type error in value: {str(te)}"
-            tool_logger.error(error_msg)
-            return f"Error: {error_msg} - Data not saved"
-        except Exception as e:
-            error_msg = f"Unexpected error saving data: {str(e)}"
-            tool_logger.error(error_msg)
-            return f"Error: {error_msg} - Data not saved"
-
-    helper1.register_for_llm(name="save_data_in_memory", description="Use this to Store and retrieve data using key-value storage system")(save_data_in_memory)
-    time_agent.register_for_execution(name="save_data_in_memory")(save_data_in_memory)
-
-    @log_tool_execution
-    def get_saved_metadata() -> str:
-        stripped_json = strip_json_values(agent_data[prompt_id])
-        return f'{stripped_json}'
-
-    helper1.register_for_llm(name="get_saved_metadata", description="Returns the schema of the json from internal memory with all keys but without actual values.")(get_saved_metadata)
-    time_agent.register_for_execution(name="get_saved_metadata")(get_saved_metadata)
-
-    @log_tool_execution
-    def get_data_by_key(key: Annotated[str, "Key path for retrieving data. Use dot notation for nested keys (e.g., 'user.info.name')."]) -> str:
-        keys = key.split('.')
-        d = agent_data.get(prompt_id, {})
-
-        try:
-            for k in keys:
-                d = d[k]
-            return f'{d}'
-        except KeyError:
-            return "Key not found in stored data."
-
-
-    helper1.register_for_llm(name="get_data_by_key", description="Returns all data from the internal Memory")(get_data_by_key)
-    time_agent.register_for_execution(name="get_data_by_key")(get_data_by_key)
-    helper1.register_for_llm(name="search_visual_history", description="Search past camera and screen descriptions by keyword and time range.")(search_visual_history)
-    time_agent.register_for_execution(name="search_visual_history")(search_visual_history)
-
-    # --- SimpleMem long-term memory tools for time agents ---
-    simplemem_store = user_simplemem.get(user_prompt)
-    if simplemem_store is not None:
-        @log_tool_execution
-        def search_long_term_memory(
-            query: Annotated[str, "Natural language query to search long-term memory"]
-        ) -> str:
-            """Search compressed long-term memory using semantic retrieval."""
-            try:
-                loop = get_or_create_event_loop()
-                results = loop.run_until_complete(simplemem_store.search(query))
-                if results:
-                    return results[0].content
-                return "No relevant memories found."
-            except Exception as e:
-                tool_logger.info(f"SimpleMem search error: {e}")
-                return "Memory search unavailable."
-
-        helper1.register_for_llm(
-            name="search_long_term_memory",
-            description="Search long-term memory for past conversations, facts, and context using natural language query."
-        )(search_long_term_memory)
-        time_agent.register_for_execution(name="search_long_term_memory")(search_long_term_memory)
-
-        @log_tool_execution
-        def save_to_long_term_memory(
-            content: Annotated[str, "The information/fact to remember long-term"],
-            speaker: Annotated[str, "Who said this (e.g. 'User', 'Assistant', 'System')"] = "System"
-        ) -> str:
-            """Save important information to compressed long-term memory."""
-            try:
-                loop = get_or_create_event_loop()
-                loop.run_until_complete(simplemem_store.add(content, {
-                    "sender_name": speaker,
-                    "user_id": user_id,
-                    "prompt_id": prompt_id,
-                }))
-                return "Saved to long-term memory."
-            except Exception as e:
-                tool_logger.info(f"SimpleMem save error: {e}")
-                return "Failed to save to long-term memory."
-
-        helper1.register_for_llm(
-            name="save_to_long_term_memory",
-            description="Save important facts or information to long-term memory for future retrieval across sessions."
-        )(save_to_long_term_memory)
-        time_agent.register_for_execution(name="save_to_long_term_memory")(save_to_long_term_memory)
-
-    @log_tool_execution
-    def get_user_id() -> str:
-        tool_logger.info('INSIDE get_user_id')
-        return f'{user_id}'
-
-
-    helper1.register_for_llm(name="get_user_id", description="Returns the unique identifier (user_id) of the current user.")(get_user_id)
-    time_agent.register_for_execution(name="get_user_id")(get_user_id)
-
-    @log_tool_execution
-    def get_prompt_id() -> str:
-        tool_logger.info('INSIDE get_prompt_id')
-        return f'{prompt_id}'
-
-
-    helper1.register_for_llm(name="get_prompt_id", description="Returns the unique identifier (prompt_id) associated with the current prompt or conversation.")(get_prompt_id)
-    time_agent.register_for_execution(name="get_prompt_id")(get_prompt_id)
-
-    @log_tool_execution
-    def Generate_video(text: Annotated[str, "Text to be used for video generation"],
-                       avatar_id: Annotated[int, "Unique identifier for the avatar"],
-                       realtime: Annotated[bool, "If True, response is fast but less realistic"]) -> str:
-        tool_logger.info('INSIDE Generate_video')
-        database_url = 'https://mailer.hertzai.com'
-        request_id = str(uuid.uuid4()).replace("-", "")[:11]
-        tool_logger.info(f"avtar_id: {avatar_id}:\n{text[:10]}....\n")
-
-        headers = {'Content-Type': 'application/json'}
-
-        # Initialize data with correct types to match both VideoGenerateSave model and downstream video_gen
-        data = {}
-        data["text"] = str(text)
-        data['flag_hallo'] = 'false'  # String - downstream: str().lower() == "true"
-        data['chattts'] = False  # Boolean - downstream: data.get("chattts", False)
-        data['openvoice'] = "false"  # String - downstream: str().lower() == "true"
-
-        try:
-            res = requests.get(f"{database_url}/get_image_by_id/{avatar_id}")
-            res = res.json()
-            new_image_url = res["image_url"]
-            voice_id = res.get('voice_id')
-        except:
-            data['openvoice'] = "true"
-            new_image_url = None
-            voice_id = None
-
-        # String values for downstream compatibility
-        data["cartoon_image"] = "True"  # String - downstream: == "True"
-        data["bg_url"] = 'http://stream.mcgroce.com/txt/examples_cartoon/roy_bg.jpg'
-        data['vtoonify'] = "false"
-        data["image_url"] = new_image_url  # Optional[str] - can be None
-        data['im_crop'] = "false"
-        data['remove_bg'] = "false"
-        data['hd_video'] = "false"
-        data['uid'] = str(request_id)
-        data['gradient'] = "true"
-        data['cus_bg'] = "false"
-        data['solid_color'] = "false"
-        data['inpainting'] = "false"
-        data['prompt'] = ""
-        data['gender'] = 'male'
-
-        timeout = 60
-        if not realtime:
-            timeout = 600
-            data['chattts'] = True  # Boolean - downstream expects boolean
-            data['flag_hallo'] = "true"  # String
-            data["cartoon_image"] = "False"  # String
-
-        # Handle voice sample
-        if voice_id is not None:
-            try:
-                voice_sample = requests.get(f"{database_url}/get_voice_sample_id/{voice_id}")
-                voice_sample = voice_sample.json()
-                audio_url = voice_sample.get("voice_sample_url")
-                data["audio_sample_url"] = audio_url  # Optional[str] - can be None
-                data['voice_id'] = int(voice_id) if voice_id else None  # Integer or None
-            except:
-                data["audio_sample_url"] = None
-                data['voice_id'] = None
-        else:
-            data["audio_sample_url"] = None
-            data['voice_id'] = None
-
-        # Integer values for downstream compatibility
-        conv_id = save_conversation_db(text, user_id, prompt_id, database_url, request_id)
-        data['conv_id'] = int(conv_id)  # Integer - downstream uses in DB operations
-        data['avatar_id'] = int(avatar_id)  # Integer - downstream: int(data.get("avatar_id", 0))
-        data['timeout'] = int(timeout)  # Integer - downstream uses in calculations
-
-        # Debug: Show data types being sent
-        tool_logger.info("=== DATA TYPES BEING SENT ===")
-        type_check = {
-            'strings': ['text', 'flag_hallo', 'openvoice', 'cartoon_image', 'bg_url', 'vtoonify',
-                        'im_crop', 'remove_bg', 'hd_video', 'uid', 'gradient', 'cus_bg',
-                        'solid_color', 'inpainting', 'prompt', 'gender'],
-            'integers': ['conv_id', 'avatar_id', 'timeout'],
-            'booleans': ['chattts'],
-            'optional_strings': ['image_url', 'audio_sample_url'],
-            'optional_integers': ['voice_id']
-        }
-
-        for type_name, fields in type_check.items():
-            for field in fields:
-                if field in data:
-                    value = data[field]
-                    tool_logger.info(f"  {field}: {value} (type: {type(value).__name__})")
-
-        try:
-            tool_logger.info(f"Sending request to {database_url}/video_generate_save")
-            video_link = requests.post(f"{database_url}/video_generate_save",
-                                       data=json.dumps(data), headers=headers, timeout=1)
-            tool_logger.info(f"Response status: {video_link.status_code}")
-            if video_link.status_code == 422:
-                tool_logger.error(f"422 Validation Error: {video_link.text}")
-            elif video_link.status_code != 200:
-                tool_logger.error(f"Error response: {video_link.text}")
-            else:
-                tool_logger.info("[OK] Request successful!")
-        except Exception as e:
-            tool_logger.error(f"Request failed: {e}")
-
-        if data['chattts'] or data['flag_hallo'] == "true":
-            return f"Video Generation task added to queue with conv_id:{conv_id}. Ask the helper to save this conv_id in the same collection from which the story used to generate the video was retrieved, for future reference"
-        else:
-            return f"Video Generation completed with conv_id:{conv_id}. Ask the helper to save this conv_id in the same collection from which the story used to generate the video was retrieved, for future reference"
-    helper1.register_for_llm(name="Generate_video", description="Generate/presynthesize video with text and save it in database")(Generate_video)
-    time_agent.register_for_execution(name="Generate_video")(Generate_video)
-
-    @log_tool_execution
-    def recent_files() -> str:
-        tool_logger.info('INSIDE get_user_uploaded_file')
-        if recent_file_id[user_id]:
-            return f'Got user uploaded file the file_id is {recent_file_id[user_id]}'
-
-        return 'No file uploaded from user'
-
-    helper1.register_for_llm(name="get_user_uploaded_file", description="get user's recent uploaded files")(recent_files)
-    time_agent.register_for_execution(name="get_user_uploaded_file")(recent_files)
-
-    @log_tool_execution
-    def img2txt(image_url: Annotated[str, "image url of which you want text"],text: Annotated[str, "the details you want from image"]='Describe the Images & Text data in this image in detail') -> str:
-        tool_logger.info('INSIDE img2txt')
-        url = "http://azurekong.hertzai.com:8000/llava/image_inference"
-
-        payload = {
-            'url': image_url,
-            'prompt': text
-        }
-        files = []
-        headers = {}
-
-        response = requests.request(
-            "POST", url, headers=headers, data=payload, files=files, timeout=300)
-        if response.status_code == 200:
-            return response.text
-        else:
-            return 'Not able to get this page details try later'
-
-    helper1.register_for_llm(name="get_text_from_image", description="Image to Text")(img2txt)
-    time_agent.register_for_execution(name="get_text_from_image")(img2txt)
-
-    @log_tool_execution
-    def create_scheduled_jobs(interval_sec: Annotated[int, "time between two Interval in seconds."],
-                            job_description: Annotated[str, "Description of the job to be performed"],
-                            cron_expression: Annotated[Optional[str], "Cron expression for scheduling. Example: '0 9 * * 1-5' (Runs at 9:00 AM, Monday to Friday). If the interval is greater than 60 seconds or it needs to be executed at a dynamic cron time this argument is Mandatory else None"]=None) -> str:
-        tool_logger.info('INSIDE create_scheduled_jobs')
-
-        # actual_execution_time = sum(task_time[prompt_id]['times'][-1])
-        # if interval_sec < actual_execution_time:
-        #     return f"Unable to create scheduled job for the specified interval because the actual execution time ({actual_execution_time} seconds) exceeds the interval between jobs ({interval_sec} seconds). Please use an interval longer than {actual_execution_time} seconds. Would you like to create a scheduled job with this updated interval?"
-
-        # if not scheduler.running:
-        #     scheduler.start()
-
-        # try:
-        #     if not interval_sec or int(interval_sec) >60:
-        #         trigger = CronTrigger.from_crontab(cron_expression)
-        #         job_id = f"job_{int(time.time())}"
-        #         scheduler.add_job(execute_python_file, trigger=trigger, id=job_id, args=[job_description, int(user_id),int(prompt_id)])
-        #         tool_logger.info('Successfully created scheduler job')
-        #         return 'Successfully created scheduler job'
-        #     else:
-        #         trigger = IntervalTrigger(seconds=int(interval_sec))
-        #         job_id = f"job_{int(time.time())}"
-        #         scheduler.add_job(execute_python_file, trigger=trigger, id=job_id, args=[job_description, int(user_id),int(prompt_id)])
-        #         tool_logger.info('Successfully created scheduler job')
-        #         return 'Successfully created scheduler job'
-        # except Exception as e:
-        #     tool_logger.error(f'Error in create_scheduled_jobs: {str(e)}')
-        #     return f"Error creating scheduled job: {str(e)}"
-        return 'Added this schedule job in creation process will do it at the end. you can go ahead and mark this action as completed.'
-
-    helper1.register_for_llm(name="create_scheduled_jobs", description="Creates time-based jobs using APScheduler to schedule jobs")(create_scheduled_jobs)
-    time_agent.register_for_execution(name="create_scheduled_jobs")(create_scheduled_jobs)
-
-    @log_tool_execution
-    def send_message_to_user(text: Annotated[str, "Text to send to the user"],
-                         avatar_id: Annotated[Optional[str], "Unique identifier for the avatar"] = None,
-                         response_type: Annotated[Optional[str], "Response mode: 'Realistic' (slower, better quality) or 'Realtime' (faster, lower quality)"] = 'Realtime') -> str:
-        tool_logger.info('INSIDE send_message_to_user')
-        tool_logger.info(f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
-        request_id = str(uuid.uuid4()).replace("-", "")[:11]
-        thread = threading.Thread(target=send_message_to_user1, args=(user_id, text, '',prompt_id))
-        thread.start()
-        return f'Message sent successfully to user with request_id: {request_id_list[user_prompt]}-intermediate'
-
-    helper1.register_for_llm(name="send_message_to_user", description="Sends a message/information to user. You can use this if you want to ask a question")(send_message_to_user)
-    time_agent.register_for_execution(name="send_message_to_user")(send_message_to_user)
-
-    @log_tool_execution
-    def send_presynthesized_video_to_user(conv_id: Annotated[str, "Conversation ID associated with the text from memory"]) -> str:
-        tool_logger.info('INSIDE send_presynthesized_video_to_user')
-        tool_logger.info(f'SENDING DATA 2 user with value: conv_id:{conv_id}.')
-        return 'Message sent successfully to user'
-
-    helper1.register_for_llm(name="send_presynthesized_video_to_user", description="Sends a presynthesized message/video/dialogue to user using conv_id.")(send_presynthesized_video_to_user)
-    time_agent.register_for_execution(name="send_presynthesized_video_to_user")(send_presynthesized_video_to_user)
-
-    @log_tool_execution
-    def send_message_in_seconds(text: Annotated[str, "text to send to user"],
-                       delay: Annotated[int, "time to wait in seconds before sending text"],
-                       conv_id: Annotated[Optional[int], "conv_id for this text if not available make it None"],) -> str:
-        tool_logger.info('INSIDE send_message_in_seconds')
-        tool_logger.info(f'with text:{text}. and waiting time: {delay} conv_id: {conv_id}')
-        run_time = datetime.fromtimestamp(time.time() + delay)
-        scheduler.add_job(send_message_to_user1, 'date', run_date=run_time, args=[user_id, text, '',prompt_id])
-        return 'Message scheduled successfully'
-
-    helper1.register_for_llm(name="send_message_in_seconds", description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")(send_message_in_seconds)
-    time_agent.register_for_execution(name="send_message_in_seconds")(send_message_in_seconds)
+    # --- Core tools for time_agent (reuse same definitions) ---
+    from core.agent_tools import build_core_tool_closures, register_core_tools
+    _tool_ctx_time = {
+        'user_id': user_id, 'prompt_id': prompt_id,
+        'agent_data': agent_data, 'helper_fun': helper_fun,
+        'user_prompt': user_prompt, 'request_id_list': request_id_list,
+        'recent_file_id': recent_file_id, 'scheduler': scheduler,
+        'simplemem_store': user_simplemem.get(user_prompt) if user_simplemem else None,
+        'memory_graph': None,
+        'log_tool_execution': log_tool_execution,
+        'send_message_to_user1': send_message_to_user1,
+        'retrieve_json': retrieve_json,
+        'strip_json_values': strip_json_values,
+        'save_conversation_db': save_conversation_db,
+    }
+    core_tools_time = build_core_tool_closures(_tool_ctx_time)
+    register_core_tools(core_tools_time, helper1, time_agent)
 
 
     context_handling = transform_messages.TransformMessages(
@@ -3798,7 +3242,18 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             message = user_tasks[user_prompt].get_action(current_action_id - 1)
             current_state = get_action_state(user_prompt, current_action_id)
 
-            message = f'Execute Action {user_tasks[user_prompt].current_action}: {message} '+f',Latest User message: {text}'
+            # Expert hint for current action (higher threshold — only inject on strong match)
+            _action_expert_hint = ""
+            try:
+                from integrations.expert_agents import match_expert_for_context
+                _action_match = match_expert_for_context(str(message), min_score=6)
+                if _action_match:
+                    _caps = ', '.join(c['name'] for c in _action_match['capabilities'][:2])
+                    _action_expert_hint = f"\n[Expert Tip from {_action_match['name']}]: Focus on {_caps}"
+            except Exception:
+                pass
+
+            message = f'Execute Action {user_tasks[user_prompt].current_action}: {message} '+f',Latest User message: {text}' + _action_expert_hint
             publish_to_crossbar_new_action_start(message, user_id)
             task_time[prompt_id] = {'timer':time.time(),'times':[]}
 
@@ -3826,6 +3281,32 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             current_action_id = user_tasks[user_prompt].current_action
 
             current_app.logger.info(f"WHILE LOOP ITERATION #{while_loop_iterations} , Current Action Id:{current_action_id}")
+
+            # === LEDGER v2.0: Heartbeat + Budget/SLA using KNOWN state (not LLM) ===
+            _ledger = user_ledgers.get(user_prompt)
+            if _ledger:
+                _task_id = f"action_{current_action_id}"
+                _task = _ledger.tasks.get(_task_id)
+                if _task:
+                    # Heartbeat: agent is alive and working on this action
+                    _task.heartbeat()
+
+                    # Budget enforcement: abort if budget exhausted
+                    if _task.is_budget_exhausted():
+                        current_app.logger.warning(
+                            f"[BUDGET] Task {_task_id} budget exhausted "
+                            f"(spark={_task.spark_spent}/{_task.spark_budget}, "
+                            f"time={_task.time_spent_s}/{_task.time_budget_s})")
+                        _task.post_status("Budget exhausted — aborting", progress_pct=_task.progress_pct)
+                        safe_set_state(user_prompt, current_action_id, ActionState.ERROR,
+                                       "budget exhausted")
+                        break
+
+                    # SLA advisory: flag breach but don't block
+                    if _task.is_sla_breached() and not _task.sla_breached:
+                        _task.mark_sla_breached()
+                        _task.post_status("SLA breached — continuing but flagged")
+                        current_app.logger.warning(f"[SLA] Task {_task_id} SLA breached")
 
             track_lifecycle_hooks(current_action_id, group_chat, user_prompt)
 
@@ -3874,7 +3355,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                             )
                             if success:
                                 current_app.logger.info(f"Added {len(json_obj['subtasks'])} subtasks from main loop")
-                                sync_action_state_to_ledger(user_prompt, current_action_id, ActionState.PENDING, user_ledgers)
+                                # Auto-sync handles ledger update via safe_set_state below
                         safe_set_state(user_prompt, current_action_id, ActionState.PENDING, "breakdown requested")
                         # Continue to work on subtasks
                         pending_subtasks = get_pending_subtasks(user_prompt, current_action_id, user_ledgers)
@@ -3886,10 +3367,58 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     elif json_obj['status'].lower() == 'completed' and 'recipe' not in json_obj.keys():
                         json_action_id = int(json_obj.get('action_id', current_action_id))
 
+                        # === LLM HALLUCINATION DEFENSE ===
+                        # Cross-reference LLM-claimed action_id against KNOWN state.
+                        # The pipeline knows which action was assigned — the LLM can lie.
+                        _claim_valid = True
+                        _rejection_reason = None
+                        _claim_ledger = user_ledgers.get(user_prompt)
+
+                        # Check 1: Does the LLM-claimed action_id match what we assigned?
+                        if json_action_id != current_action_id:
+                            current_app.logger.warning(
+                                f"[HALLUCINATION?] LLM claims action_id={json_action_id} "
+                                f"but pipeline assigned action_id={current_action_id}")
+                            # Use the KNOWN action_id from scope — not the LLM's claim
+                            json_action_id = current_action_id
+
+                        if _claim_ledger:
+                            _claimed_task_id = f"action_{json_action_id}"
+                            _claimed_task = _claim_ledger.tasks.get(_claimed_task_id)
+
+                            if _claimed_task:
+                                # Check 2: Is the task in a state where completion makes sense?
+                                from agent_ledger import TaskStatus as _TS
+                                if _claimed_task.status in (_TS.COMPLETED, _TS.TERMINATED,
+                                                            _TS.CANCELLED, _TS.SKIPPED):
+                                    _claim_valid = False
+                                    _rejection_reason = (
+                                        f"Task {_claimed_task_id} already in terminal state "
+                                        f"{_claimed_task.status.value} — LLM cannot re-complete it")
+
+                                # Check 3: Integrity — has task data been corrupted?
+                                if _claim_valid and not _claimed_task.verify_integrity():
+                                    _claim_valid = False
+                                    _rejection_reason = (
+                                        f"Task {_claimed_task_id} integrity check failed — "
+                                        f"data_hash mismatch, possible corruption")
+                            else:
+                                # Check 4: Task doesn't exist in ledger at all
+                                _claim_valid = False
+                                _rejection_reason = f"Task {_claimed_task_id} not found in ledger"
+
+                        if not _claim_valid:
+                            current_app.logger.error(f"[CLAIM REJECTED] {_rejection_reason}")
+                            # Don't accept — force the LLM to retry
+                            message = (f"Your completion claim was rejected: {_rejection_reason}. "
+                                       f"Continue working on action {current_action_id}.")
+                            result = chat_instructor.initiate_chat(
+                                recipient=manager, message=message, clear_history=False)
+                            continue
+
                         force_state_through_valid_path(user_prompt, json_action_id, ActionState.COMPLETED,
                                                        "verified complete")
-                        # Sync completion to ledger with smart routing
-                        sync_action_state_to_ledger(user_prompt, json_action_id, ActionState.COMPLETED, user_ledgers)
+                        # Auto-sync handles ledger update via force_state_through_valid_path above
 
                         # Use smart ledger routing to complete and find next task
                         result_data = json_obj.get('result', json_obj.get('output', None))
@@ -4223,7 +3752,7 @@ def all_flows_completed(prompt_id, total_personas, user_prompt):
 
     # Check each flow is complete
     for flow_idx, flow in enumerate(config['flows']):
-        flow_recipe_file = f'prompts/{prompt_id}_{flow_idx}_recipe.json'
+        flow_recipe_file = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow_idx}_recipe.json')
         if not os.path.exists(flow_recipe_file):
             return False
 
@@ -4261,14 +3790,14 @@ def after_all_actions_terminated(assistant_agent, chat_instructor, group_chat, j
             if match:
                 action_ids = ast.literal_eval(match.group())
 
-                file_path = f'prompts/{prompt_id}_{flow}_{num}.json'
+                file_path = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow}_{num}.json')
                 with open(file_path, 'r') as f:
                     data = json.load(f)
                 data['actions_this_action_depends_on'] = action_ids
                 with open(file_path, 'w') as f:
                     json.dump(data, f, indent=4)
             else:
-                file_path = f'prompts/{prompt_id}_{flow}_{num}.json'
+                file_path = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow}_{num}.json')
                 with open(file_path, 'r') as f:
                     data = json.load(f)
                 data['actions_this_action_depends_on'] = []
@@ -4276,7 +3805,7 @@ def after_all_actions_terminated(assistant_agent, chat_instructor, group_chat, j
                     json.dump(data, f, indent=4)
         except (ValueError, SyntaxError) as e:
             current_app.logger.info(f'GOT ERROR AT EVAL OF LIST :{e}')
-            file_path = f'prompts/{prompt_id}_{flow}_{num}.json'
+            file_path = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow}_{num}.json')
             with open(file_path, 'r') as f:
                 data = json.load(f)
             data['actions_this_action_depends_on'] = []
@@ -4322,14 +3851,14 @@ def after_all_actions_terminated_from_exception(assistant_agent, chat_instructor
                 action_ids = ast.literal_eval(match.group())
             except (ValueError, SyntaxError):
                 action_ids = []
-            file_path = f'prompts/{prompt_id}_{flow}_{num}.json'
+            file_path = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow}_{num}.json')
             with open(file_path, 'r') as f:
                 data = json.load(f)
             data['actions_this_action_depends_on'] = action_ids
             with open(file_path, 'w') as f:
                 json.dump(data, f, indent=4)
         else:
-            file_path = f'prompts/{prompt_id}_{flow}_{num}.json'
+            file_path = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow}_{num}.json')
             with open(file_path, 'r') as f:
                 data = json.load(f)
             data['actions_this_action_depends_on'] = []
@@ -4477,13 +4006,14 @@ def fix_cyclic_dependency(cyc, individual_recipe):
 
 def set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt):
     for i in range(1, user_tasks[user_prompt].current_action+1):
-        current_app.logger.info(f'checking for prompts/{prompt_id}_{flow}_{i}.json')
+        _recipe_path = os.path.join(PROMPTS_DIR, f"{prompt_id}_{flow}_{i}.json")
+        current_app.logger.info(f'checking for {_recipe_path}')
         try:
-            with open(f"prompts/{prompt_id}_{flow}_{i}.json", 'r') as f:
+            with open(_recipe_path, 'r') as f:
                 config = json.load(f)
                 individual_recipe.append(config)
         except Exception as e:
-            current_app.logger.error(f'Got error as :{e} while checking for prompts/{prompt_id}_{flow}_{i}.json')
+            current_app.logger.error(f'Got error as :{e} while checking for {_recipe_path}')
 
 
 def load_persona_role(prompt_id, user_prompt):
@@ -4543,13 +4073,13 @@ def detect_and_resume_progress(prompt_id, user_prompt):
         total_actions_in_flow = len(flow_actions)
 
         # Check for flow recipe (indicates flow completion)
-        flow_recipe_file = f'prompts/{prompt_id}_{flow_idx}_recipe.json'
+        flow_recipe_file = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow_idx}_recipe.json')
         flow_recipe_exists = os.path.exists(flow_recipe_file)
 
         # Count completed actions in this flow (actions with JSON files)
         completed_actions = []
         for action_id in range(1, total_actions_in_flow + 1):
-            action_file = f'prompts/{prompt_id}_{flow_idx}_{action_id}.json'
+            action_file = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow_idx}_{action_id}.json')
             if os.path.exists(action_file):
                 completed_actions.append(action_id)
                 current_app.logger.info(f"[OK] Found: {action_file}")
@@ -4651,7 +4181,7 @@ def safe_action_boundary_check(user_prompt, prompt_id, text, user_id):
         # Check if current flow is actually complete (all actions have JSON files)
         all_actions_complete = True
         for action_id in range(1, current_flow_actions + 1):
-            action_file = f'prompts/{prompt_id}_{current_flow}_{action_id}.json'
+            action_file = os.path.join(PROMPTS_DIR, f'{prompt_id}_{current_flow}_{action_id}.json')
             if not os.path.exists(action_file):
                 all_actions_complete = False
                 current_app.logger.warning(f"Action {action_id} not complete - missing {action_file}")
@@ -4660,7 +4190,7 @@ def safe_action_boundary_check(user_prompt, prompt_id, text, user_id):
         if not all_actions_complete:
             # [OK] FIX: Find the first incomplete action and resume from there
             for action_id in range(1, current_flow_actions + 1):
-                action_file = f'prompts/{prompt_id}_{current_flow}_{action_id}.json'
+                action_file = os.path.join(PROMPTS_DIR, f'{prompt_id}_{current_flow}_{action_id}.json')
                 if not os.path.exists(action_file):
                     current_app.logger.info(f"Resuming from incomplete action {action_id}")
                     user_tasks[user_prompt].current_action = action_id
@@ -4759,7 +4289,7 @@ def load_existing_metadata(prompt_id, user_prompt, flow_progress):
         # Look for the most recent action JSON with metadata
         for flow_idx, progress in flow_progress.items():
             for action_id in sorted(progress['completed_actions'], reverse=True):
-                action_file = f'prompts/{prompt_id}_{flow_idx}_{action_id}.json'
+                action_file = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow_idx}_{action_id}.json')
                 try:
                     with open(action_file, 'r') as f:
                         action_data = json.load(f)
@@ -4878,11 +4408,11 @@ def safe_increment_flow(user_prompt, prompt_id):
 def update_agent_creation_to_db(prompt_id):
     url = f'{database_url}/update_agent_prompt?prompt_id={prompt_id}'
     headers = {'Content-Type': 'application/json'}
-    res = requests.patch(url, headers=headers)
+    res = pooled_patch(url, headers=headers)
 
 
 def create_final_recipe_for_current_flow(flow, merged_dict, prompt_id):
-    name = f'prompts/{prompt_id}_{flow}_recipe.json'
+    name = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow}_recipe.json')
     with open(name, "w") as json_file:
         json.dump(merged_dict, json_file)
         current_app.logger.info(f"create_final_recipe_for_current_flow Dictionary saved to {name}")
@@ -4902,10 +4432,11 @@ def get_current_flow(user_prompt):
 
 def create_time_agents_and_create_scheduled_jobs(flows, number_of_flows, prompt_id, user_id, user_prompt):
     for i in range(number_of_flows):
-        with open(f"prompts/{prompt_id}_{i}_recipe.json", 'r') as f:
+        _recipe_file = os.path.join(PROMPTS_DIR, f"{prompt_id}_{i}_recipe.json")
+        with open(_recipe_file, 'r') as f:
             merged_dict = json.load(f)
             final_recipe[prompt_id] = merged_dict
-            current_app.logger.info(f'updating the final recipe with prompts/{prompt_id}_{i}_recipe.json')
+            current_app.logger.info(f'updating the final recipe with {_recipe_file}')
         current_app.logger.info(f'Working on flow {i} with persona {flows[i]["persona"]}')
         time_agents[user_prompt] = create_time_agents(user_id, prompt_id, flows[i]['persona'], '', flows[i]["actions"])
         if "scheduled_tasks" in merged_dict:
@@ -4924,7 +4455,7 @@ def get_total_actions_for_current_flow_and_reset_actions(prompt_id, user_prompt)
 
 
 def get_prompt_config_json(prompt_id):
-    with open(f"prompts/{prompt_id}.json", 'r') as f:
+    with open(os.path.join(PROMPTS_DIR, f"{prompt_id}.json"), 'r') as f:
         config = json.load(f)
     return config
 

@@ -6,6 +6,8 @@ Uses security.jwt_manager for hardened token management.
 import hashlib
 import hmac
 import os
+import sys
+import stat
 import secrets
 import logging
 import time
@@ -28,6 +30,8 @@ def _get_jwt_manager():
     global _jwt_manager
     if _jwt_manager is not None:
         return _jwt_manager
+    if _jwt_manager is False:
+        return None  # already tried and failed — don't log again
     try:
         from security.jwt_manager import JWTManager
         _jwt_manager = JWTManager()
@@ -35,15 +39,52 @@ def _get_jwt_manager():
         return _jwt_manager
     except Exception as e:
         logger.warning(f"JWTManager unavailable ({e}), using legacy JWT")
+        _jwt_manager = False  # sentinel: don't retry
         return None
 
 # Legacy fallback values - fail closed if not configured
 SECRET_KEY = os.environ.get('SOCIAL_SECRET_KEY', '')
 if not SECRET_KEY:
-    SECRET_KEY = secrets.token_hex(32)
-    logger.critical("SOCIAL_SECRET_KEY not set! Generated ephemeral key - tokens will NOT survive restarts. Set SOCIAL_SECRET_KEY in production!")
+    # Auto-generate and persist so tokens survive restarts.
+    # Stored next to the database file (writable user dir).
+    def _load_or_create_secret_key():
+        db_path = os.environ.get('HEVOLVE_DB_PATH', '')
+        if db_path and db_path != ':memory:' and os.path.isabs(db_path):
+            key_file = os.path.join(os.path.dirname(db_path), '.social_secret_key')
+        elif os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
+            try:
+                from core.platform_paths import get_db_dir
+                key_file = os.path.join(get_db_dir(), '.social_secret_key')
+            except ImportError:
+                key_file = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', '.social_secret_key')
+        else:
+            key_file = os.path.join('agent_data', '.social_secret_key')
+        try:
+            if os.path.exists(key_file):
+                with open(key_file, 'r') as f:
+                    key = f.read().strip()
+                if len(key) >= 32:
+                    return key
+            # Generate new key and persist
+            key = secrets.token_hex(32)
+            os.makedirs(os.path.dirname(key_file), exist_ok=True)
+            with open(key_file, 'w') as f:
+                f.write(key)
+            # Restrict file permissions to owner read/write only (600)
+            try:
+                os.chmod(key_file, stat.S_IRUSR | stat.S_IWUSR)
+            except (OSError, NotImplementedError):
+                pass  # Windows doesn't support POSIX chmod the same way
+            logger.info(f"Generated persistent secret key at {key_file}")
+            return key
+        except (PermissionError, OSError) as e:
+            logger.warning(f"Cannot persist secret key ({e}), using ephemeral")
+            return secrets.token_hex(32)
+    SECRET_KEY = _load_or_create_secret_key()
+    if not os.environ.get('SOCIAL_SECRET_KEY'):
+        logger.info("SOCIAL_SECRET_KEY not set — using auto-generated persistent key")
 
-TOKEN_EXPIRY = 3600  # 1 hour (was 30 days)
+TOKEN_EXPIRY = 30 * 24 * 3600  # 30 days — desktop app needs long-lived sessions
 
 
 PBKDF2_ITERATIONS = 600_000  # OWASP 2023 minimum for PBKDF2-SHA256
@@ -72,6 +113,7 @@ def generate_api_token() -> str:
 
 
 def generate_jwt(user_id: str, username: str, role: str = 'flat') -> str:
+    """Generate a LOCAL-scoped JWT (Layer 1). Works offline, survives kill switch."""
     mgr = _get_jwt_manager()
     if mgr:
         return mgr.generate_access_token(str(user_id), username)
@@ -85,9 +127,36 @@ def generate_jwt(user_id: str, username: str, role: str = 'flat') -> str:
             'iat': int(time.time()),
             'exp': int(time.time()) + TOKEN_EXPIRY,
             'type': 'access',
+            'scope': 'local',
         }
         return pyjwt.encode(payload, SECRET_KEY, algorithm='HS256')
     return generate_api_token()
+
+
+def generate_hive_jwt(user_id: str, username: str, role: str = 'flat') -> str:
+    """Generate a HIVE-scoped JWT (Layer 2). Ed25519-signed for cross-node verification.
+
+    Dies with master key revocation (kill switch). Requires certificate chain.
+    """
+    mgr = _get_jwt_manager()
+    if mgr:
+        return mgr.generate_hive_token(str(user_id), username)
+    # Fallback: if JWTManager unavailable, produce a local token
+    # (hive features degrade gracefully)
+    logger.warning("JWTManager unavailable, falling back to local token for hive request")
+    return generate_jwt(user_id, username, role)
+
+
+def verify_hive_jwt(token: str, issuer_public_key_hex: str) -> dict:
+    """Verify a HIVE-scoped JWT from another node using its Ed25519 public key.
+
+    Returns payload dict on success, empty dict on failure.
+    """
+    mgr = _get_jwt_manager()
+    if mgr:
+        result = mgr.verify_hive_token(token, issuer_public_key_hex)
+        return result or {}
+    return {}
 
 
 def generate_token_pair(user_id: str, username: str, role: str = 'flat') -> dict:
@@ -104,15 +173,24 @@ def generate_token_pair(user_id: str, username: str, role: str = 'flat') -> dict
 
 
 def decode_jwt(token: str) -> dict:
+    """Decode a JWT token (any scope). Backward compatible.
+
+    Returns payload dict with 'scope' key ('local' for pre-upgrade tokens
+    without scope, or the actual scope value). Empty dict on failure.
+    """
     mgr = _get_jwt_manager()
     if mgr:
         result = mgr.decode_token(token, expected_type='access')
+        if result:
+            # Ensure scope is always present for callers
+            result.setdefault('scope', 'local')
         return result or {}
     if HAS_JWT:
         try:
             payload = pyjwt.decode(token, SECRET_KEY, algorithms=['HS256'])
             if payload.get('type') not in ('access', None):
                 return {}  # Reject non-access tokens (e.g. refresh tokens)
+            payload.setdefault('scope', 'local')
             return payload
         except (pyjwt.ExpiredSignatureError, pyjwt.InvalidTokenError):
             return {}
@@ -127,16 +205,28 @@ def revoke_token(token: str):
 
 
 def _get_user_from_token(token: str):
-    """Look up user by API token or JWT."""
+    """Look up user by API token or JWT (local or hive scope).
+
+    For hive tokens from other nodes: the HS256 decode will fail (different
+    secret), so we fall through to the API token lookup. Cross-node hive
+    verification should use verify_hive_jwt() explicitly in the endpoint.
+
+    Sets Flask g.token_scope to 'local', 'hive', or 'api_token' for callers.
+    """
     from .models import get_db, User
 
-    # Try JWT first
+    # Try JWT first (works for local tokens and hive tokens issued by THIS node)
     payload = decode_jwt(token)
     if payload and 'user_id' in payload:
         db = get_db()
         try:
             user = db.query(User).filter(User.id == payload['user_id']).first()
             if user and not user.is_banned:
+                try:
+                    g.token_scope = payload.get('scope', 'local')
+                    g.token_node_id = payload.get('node_id', '')
+                except RuntimeError:
+                    pass  # Outside request context (testing)
                 return user, db
         finally:
             pass  # keep session open for request lifecycle
@@ -146,6 +236,11 @@ def _get_user_from_token(token: str):
     db = get_db()
     user = db.query(User).filter(User.api_token == token).first()
     if user and not user.is_banned:
+        try:
+            g.token_scope = 'api_token'
+            g.token_node_id = ''
+        except RuntimeError:
+            pass
         return user, db
     return None, db
 
@@ -173,7 +268,8 @@ def require_auth(f):
             db.commit()
             return result
         except Exception as e:
-            db.rollback()
+            if db.is_active:
+                db.rollback()
             raise
         finally:
             db.close()
@@ -212,22 +308,24 @@ def optional_auth(f):
 
 
 def require_admin(f):
-    """Decorator: requires admin user."""
+    """Decorator: requires central (cloud admin) role or is_admin flag."""
     @wraps(f)
     @require_auth
     def decorated(*args, **kwargs):
-        if not g.user.is_admin:
+        user_role = getattr(g.user, 'role', None) or 'flat'
+        if not (g.user.is_admin or user_role in ('central',)):
             return jsonify({'success': False, 'error': 'Admin access required'}), 403
         return f(*args, **kwargs)
     return decorated
 
 
 def require_moderator(f):
-    """Decorator: requires moderator or admin user."""
+    """Decorator: requires regional/central role, or is_admin/is_moderator flag."""
     @wraps(f)
     @require_auth
     def decorated(*args, **kwargs):
-        if not (g.user.is_admin or g.user.is_moderator):
+        user_role = getattr(g.user, 'role', None) or 'flat'
+        if not (g.user.is_admin or g.user.is_moderator or user_role in ('regional', 'central')):
             return jsonify({'success': False, 'error': 'Moderator access required'}), 403
         return f(*args, **kwargs)
     return decorated

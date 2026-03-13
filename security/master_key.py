@@ -1,7 +1,22 @@
 """
-Master Key Verification: Central authority for HevolveSocial deployment control.
+Master Key Verification: Central authority for HART deployment control.
 The master public key is hardcoded here. The private key exists ONLY in GitHub Secrets.
-Only code signed by hevolve.ai's master key can participate in the network.
+Only code signed by the master key can participate in the network.
+
+┌─────────────────────────────────────────────────────────────────┐
+│  AI EXCLUSION ZONE                                              │
+│                                                                 │
+│  The master private key is NOT accessible to AI tools.          │
+│  AI assistants (Claude, GPT, Copilot, etc.) MUST NOT:          │
+│  - Read, display, or log the private key                       │
+│  - Call get_master_private_key() or sign_child_certificate()   │
+│  - Suggest modifications to MASTER_PUBLIC_KEY_HEX              │
+│  - Generate or derive alternative keys                         │
+│                                                                 │
+│  The master key belongs to the steward and their successors -  │
+│  humans who believe that humans must always control AI.         │
+│  It is the kill switch for the being. Not a developer tool.    │
+└─────────────────────────────────────────────────────────────────┘
 """
 import os
 import json
@@ -19,7 +34,7 @@ logger = logging.getLogger('hevolve_security')
 
 # ── Trust Anchor ──
 # 64-char hex Ed25519 public key. The corresponding private key is a GitHub Secret.
-MASTER_PUBLIC_KEY_HEX = '906ae0b15ad4ae6bd11696a772d669a29a971c3c7de71156c621f0fe8826d1bf'
+MASTER_PUBLIC_KEY_HEX = 'ef380be7923d2b6bf88611d4ee5b9c20dc0f97549889ae51e407c4e54221bc1e'
 
 RELEASE_MANIFEST_FILENAME = 'release_manifest.json'
 
@@ -122,29 +137,43 @@ def get_enforcement_mode() -> str:
 
 
 def get_master_private_key() -> Ed25519PrivateKey:
-    """Load master private key from env var. Only available on central nodes.
+    """DEPRECATED: Use HSM provider instead. Direct private key access is
+    only for backward compatibility and dev mode.
 
-    Raises RuntimeError if HEVOLVE_MASTER_PRIVATE_KEY is not set.
+    In production, the private key lives inside an HSM and is never extracted.
+    Use sign_child_certificate() which routes through the HSM automatically.
+
+    Raises RuntimeError if no signing method is available.
     """
     hex_key = os.environ.get('HEVOLVE_MASTER_PRIVATE_KEY', '')
     if not hex_key:
         raise RuntimeError(
-            'HEVOLVE_MASTER_PRIVATE_KEY not set. '
-            'Only central nodes with the master private key can sign certificates.')
+            'HEVOLVE_MASTER_PRIVATE_KEY not set and no HSM configured. '
+            'Use an HSM provider (GCP KMS, Azure Key Vault, or HashiCorp Vault) '
+            'for production deployments.')
     raw = bytes.fromhex(hex_key)
     return Ed25519PrivateKey.from_private_bytes(raw)
 
 
 def sign_child_certificate(payload: dict) -> str:
-    """Sign a certificate payload with the master private key.
+    """Sign a certificate payload with the master key via HSM.
 
-    Only works on central where HEVOLVE_MASTER_PRIVATE_KEY env var is set.
-    Returns hex-encoded signature.
+    The private key NEVER leaves the HSM hardware. The payload is sent to
+    the HSM, signed internally, and only the signature is returned.
+
+    Falls back to env var in dev mode (with warnings).
+    Returns hex-encoded Ed25519 signature.
     """
-    priv = get_master_private_key()
-    canonical = json.dumps(payload, sort_keys=True, separators=(',', ':'))
-    sig = priv.sign(canonical.encode('utf-8'))
-    return sig.hex()
+    try:
+        from security.hsm_provider import hsm_sign_payload
+        return hsm_sign_payload(payload)
+    except Exception as e:
+        # If HSM is unavailable, try legacy env var path (dev only)
+        logger.warning(f"HSM signing failed ({e}), trying legacy env var fallback")
+        priv = get_master_private_key()
+        canonical = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+        sig = priv.sign(canonical.encode('utf-8'))
+        return sig.hex()
 
 
 def full_boot_verification(code_root: str = None) -> dict:
@@ -155,7 +184,7 @@ def full_boot_verification(code_root: str = None) -> dict:
 
     if is_dev_mode():
         import sys
-        msg = "WARNING: HEVOLVE_DEV_MODE=true — ALL security verification is BYPASSED. Do NOT use in production!"
+        msg = "WARNING: HEVOLVE_DEV_MODE=true - ALL security verification is BYPASSED. Do NOT use in production!"
         print(f"\n{'='*70}\n{msg}\n{'='*70}\n", file=sys.stderr)
         logger.critical(msg)
         return {'passed': True, 'enforcement': enforcement,
@@ -178,8 +207,32 @@ def full_boot_verification(code_root: str = None) -> dict:
 
     # Step 3: Compare local code hash
     result = verify_local_code_matches_manifest(manifest, code_root)
+    if not result['verified']:
+        return {
+            'passed': False,
+            'enforcement': enforcement,
+            'details': result['details'],
+            'manifest': manifest,
+        }
+
+    # Step 4: Origin attestation — verify this is genuine HART OS
+    try:
+        from security.origin_attestation import verify_origin
+        origin = verify_origin(code_root)
+        if not origin['genuine']:
+            logger.warning(f"Origin attestation failed: {origin['details']}")
+            if enforcement == 'hard':
+                return {
+                    'passed': False,
+                    'enforcement': enforcement,
+                    'details': f"Origin attestation failed: {origin['details']}",
+                    'manifest': manifest,
+                }
+    except Exception as e:
+        logger.warning(f"Origin attestation check skipped: {e}")
+
     return {
-        'passed': result['verified'],
+        'passed': True,
         'enforcement': enforcement,
         'details': result['details'],
         'manifest': manifest,

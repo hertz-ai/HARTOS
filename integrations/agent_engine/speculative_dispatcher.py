@@ -16,12 +16,15 @@ Guardrails enforced at EVERY layer:
 - HiveEthos.rewrite_prompt_for_togetherness() on EVERY prompt
 - Budget enforcement via ResonanceService.spend_spark()
 """
+import atexit
 import logging
 import os
 import time
 import uuid
 import threading
 from collections import deque
+
+from core.port_registry import get_port
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Optional
 
@@ -46,10 +49,11 @@ class SpeculativeDispatcher:
             max_workers=int(os.environ.get('HEVOLVE_EXPERT_WORKERS', '4')),
             thread_name_prefix='spec_expert',
         )
+        atexit.register(lambda: self._expert_pool.shutdown(wait=False))
         self._active: Dict[str, dict] = {}  # speculation_id → metadata
         self._lock = threading.Lock()
         self._results: Dict[str, dict] = {}  # speculation_id → expert result
-        self._results_deque: deque = deque(maxlen=1000)  # TTL cleanup
+        self._results_max = 1000  # evict oldest when exceeded
 
     # ─── Gate: should we speculate? ───
 
@@ -79,7 +83,8 @@ class SpeculativeDispatcher:
         if goal and goal.get('spark_budget', 0) > 0:
             spent = goal.get('spark_spent', 0)
             remaining = goal['spark_budget'] - spent
-            if remaining < expert.cost_per_1k_tokens:
+            # Estimate ~4k tokens per speculation (prompt + response)
+            if remaining < expert.cost_per_1k_tokens * 4:
                 return False
 
         return True
@@ -214,6 +219,7 @@ class SpeculativeDispatcher:
                             'latency_ms': round(elapsed_ms, 1),
                             'improved': True,
                         }
+                        self._evict_old_results()
                 else:
                     logger.warning(f"Expert response blocked by guardrail: {reason}")
             else:
@@ -224,6 +230,7 @@ class SpeculativeDispatcher:
                         'latency_ms': round(elapsed_ms, 1),
                         'improved': False,
                     }
+                    self._evict_old_results()
 
         except Exception as e:
             logger.debug(f"Expert background task failed for {speculation_id}: {e}")
@@ -267,7 +274,7 @@ class SpeculativeDispatcher:
                            goal_type: str, goal_id: str = None) -> str:
         """Send prompt to a specific model via /chat endpoint with config override."""
         import requests as req
-        base_url = os.environ.get('HEVOLVE_BASE_URL', 'http://localhost:6777')
+        base_url = os.environ.get('HEVOLVE_BASE_URL', f'http://localhost:{get_port("backend")}')
         try:
             resp = req.post(
                 f'{base_url}/chat',
@@ -280,7 +287,7 @@ class SpeculativeDispatcher:
                     'casual_conv': False,
                     'model_config': model.to_config_list(),
                 },
-                timeout=120,
+                timeout=30,
             )
             if resp.status_code == 200:
                 return resp.json().get('response', '')
@@ -291,18 +298,11 @@ class SpeculativeDispatcher:
     def _deliver_expert_response(self, user_id: str, prompt_id: str,
                                   speculation_id: str, response: str):
         """Dual-channel async delivery: Crossbar + Rasa HTTP."""
-        # Channel 1: Crossbar publish (WebSocket)
+        # Publish via canonical publish_async (MessageBus → Crossbar)
         try:
-            from create_recipe import publish_async
-            topic = f'com.sc.chat_agent_message.{user_id}_{prompt_id}'
+            from langchain_gpt_api import publish_async
+            topic = f'com.hertzai.hevolve.chat.{user_id}'
             publish_async(topic, response)
-        except Exception:
-            pass
-
-        # Channel 2: Rasa HTTP POST (fallback)
-        try:
-            from create_recipe import send_message_to_user1
-            send_message_to_user1(response)
         except Exception:
             pass
 
@@ -311,27 +311,19 @@ class SpeculativeDispatcher:
 
     def _check_and_reserve_budget(self, user_id: str, goal_id: str,
                                    expert_model) -> bool:
-        """Check Spark budget before expert execution."""
+        """Check Spark budget before expert execution (atomic row lock).
+
+        Delegates to shared budget_gate.check_goal_budget() to avoid duplication.
+        """
         if not goal_id:
             return True  # No goal = no budget constraint
 
         try:
-            from integrations.social.models import get_db, AgentGoal
-            db = get_db()
-            try:
-                goal = db.query(AgentGoal).filter_by(id=goal_id).first()
-                if not goal:
-                    return True
-                remaining = (goal.spark_budget or 0) - (goal.spark_spent or 0)
-                cost = expert_model.cost_per_1k_tokens
-                if remaining < cost:
-                    return False
-                goal.spark_spent = (goal.spark_spent or 0) + cost
-                db.commit()
-                return True
-            finally:
-                db.close()
-        except Exception:
+            from .budget_gate import check_goal_budget
+            cost = expert_model.cost_per_1k_tokens
+            allowed, remaining, reason = check_goal_budget(goal_id, cost)
+            return allowed
+        except ImportError:
             return True  # Allow if budget system unavailable
 
     def _record_compute_contribution(self, node_id: str, model_id: str,
@@ -355,6 +347,14 @@ class SpeculativeDispatcher:
                 db.close()
         except Exception as e:
             logger.debug(f"Compute contribution recording skipped: {e}")
+
+    def _evict_old_results(self):
+        """Evict oldest results when over capacity. Must be called under self._lock."""
+        if len(self._results) > self._results_max:
+            # Remove oldest entries (dict preserves insertion order in Python 3.7+)
+            excess = len(self._results) - self._results_max
+            for key in list(self._results.keys())[:excess]:
+                del self._results[key]
 
     # ─── Status / results ───
 

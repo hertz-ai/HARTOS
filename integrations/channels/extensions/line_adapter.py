@@ -29,7 +29,11 @@ import base64
 from typing import Optional, List, Dict, Any, Callable, Union
 from datetime import datetime
 from dataclasses import dataclass, field
-import aiohttp
+try:
+    import aiohttp
+    HAS_AIOHTTP = True
+except ImportError:
+    HAS_AIOHTTP = False
 
 try:
     from linebot import LineBotApi, WebhookHandler, WebhookParser

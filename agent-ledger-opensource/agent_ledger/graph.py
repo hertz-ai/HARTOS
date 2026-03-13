@@ -245,18 +245,56 @@ class TaskStateMachine:
     """
 
     TRANSITIONS = {
-        TaskStatus.PENDING: [TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED, TaskStatus.CANCELLED],
-        TaskStatus.IN_PROGRESS: [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.BLOCKED, TaskStatus.CANCELLED],
-        TaskStatus.COMPLETED: [],
-        TaskStatus.FAILED: [TaskStatus.PENDING, TaskStatus.CANCELLED],
-        TaskStatus.BLOCKED: [TaskStatus.PENDING, TaskStatus.CANCELLED],
-        TaskStatus.CANCELLED: []
+        TaskStatus.PENDING: [
+            TaskStatus.IN_PROGRESS, TaskStatus.PAUSED, TaskStatus.CANCELLED,
+            TaskStatus.SKIPPED, TaskStatus.NOT_APPLICABLE, TaskStatus.DEFERRED,
+            TaskStatus.DELEGATED,
+        ],
+        TaskStatus.DEFERRED: [
+            TaskStatus.PENDING, TaskStatus.IN_PROGRESS, TaskStatus.CANCELLED,
+            TaskStatus.SKIPPED, TaskStatus.NOT_APPLICABLE,
+        ],
+        TaskStatus.IN_PROGRESS: [
+            TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.PAUSED,
+            TaskStatus.USER_STOPPED, TaskStatus.BLOCKED, TaskStatus.TERMINATED,
+            TaskStatus.NOT_APPLICABLE, TaskStatus.DELEGATED,
+        ],
+        TaskStatus.DELEGATED: [
+            TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.IN_PROGRESS,
+            TaskStatus.CANCELLED, TaskStatus.BLOCKED,
+        ],
+        TaskStatus.PAUSED: [
+            TaskStatus.RESUMING, TaskStatus.CANCELLED, TaskStatus.TERMINATED,
+            TaskStatus.NOT_APPLICABLE, TaskStatus.SKIPPED, TaskStatus.DEFERRED,
+        ],
+        TaskStatus.USER_STOPPED: [
+            TaskStatus.RESUMING, TaskStatus.CANCELLED, TaskStatus.TERMINATED,
+            TaskStatus.NOT_APPLICABLE, TaskStatus.SKIPPED, TaskStatus.DEFERRED,
+        ],
+        TaskStatus.BLOCKED: [
+            TaskStatus.PENDING, TaskStatus.RESUMING, TaskStatus.FAILED,
+            TaskStatus.CANCELLED, TaskStatus.NOT_APPLICABLE, TaskStatus.DEFERRED,
+        ],
+        TaskStatus.RESUMING: [
+            TaskStatus.IN_PROGRESS, TaskStatus.PAUSED, TaskStatus.FAILED,
+        ],
+        # Terminal states — no transitions out (except COMPLETED → ROLLED_BACK)
+        TaskStatus.COMPLETED: [TaskStatus.ROLLED_BACK],
+        TaskStatus.FAILED: [],
+        TaskStatus.CANCELLED: [],
+        TaskStatus.TERMINATED: [],
+        TaskStatus.SKIPPED: [],
+        TaskStatus.NOT_APPLICABLE: [],
+        TaskStatus.ROLLED_BACK: [],
     }
 
     @classmethod
     def is_valid_transition(cls, from_status: TaskStatus, to_status: TaskStatus) -> bool:
         """
         Check if a status transition is valid.
+
+        Delegates to Task._validate_transition() logic via the TRANSITIONS dict
+        which covers all 15 TaskStatus states.
 
         Args:
             from_status: Current status

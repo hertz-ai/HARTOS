@@ -1,0 +1,54 @@
+{
+  "id": "sunset",
+  "name": "Sunset",
+  "description": "Warm amber and coral on dark",
+  "category": "dark",
+  "colors": {
+    "background": "1a0f0a",
+    "glass_bg": "rgba(26, 15, 10, 0.65)",
+    "glass_border": "rgba(255, 112, 67, 0.15)",
+    "accent": "ff7043",
+    "active": "ffd54f",
+    "text": "ffe0b2",
+    "heading": "ff8a65",
+    "error": "ff5252",
+    "caution": "ffc107",
+    "muted": "8d6e63",
+    "surface": "261a12",
+    "surface_hover": "33221a"
+  },
+  "conky": {
+    "background": "1a0f0a",
+    "background_opacity": 180,
+    "heading": "ff8a65",
+    "active": "ffd54f",
+    "error": "ff5252",
+    "caution": "ffc107",
+    "muted": "8d6e63",
+    "default_text": "d4a080"
+  },
+  "font": {
+    "family": "Inter",
+    "size": 13,
+    "heading_size": 18,
+    "weight": 400,
+    "heading_weight": 600
+  },
+  "shell": {
+    "blur_radius": 20,
+    "saturation": 180,
+    "border_radius": 16,
+    "panel_opacity": 0.65,
+    "topbar_height": 40,
+    "icon_size": 20,
+    "panel_titlebar_height": 32,
+    "start_menu_width": 720,
+    "start_menu_columns": 4,
+    "animation_speed_ms": 200
+  },
+  "wallpaper": {
+    "type": "gradient",
+    "value": "linear-gradient(135deg, #1a0f0a 0%, #2d1810 50%, #3e1c0a 100%)"
+  },
+  "gtk_prefer_dark": true
+}

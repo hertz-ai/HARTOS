@@ -55,6 +55,29 @@ SEED_BOOTSTRAP_GOALS = [
         'use_product': True,
     },
     {
+        'slug': 'bootstrap_crowdsource_intelligence',
+        'goal_type': 'marketing',
+        'title': 'Promote Crowdsourced Intelligence via Thought Experiments',
+        'description': (
+            'Create content promoting the crowdsourced intelligence concept: '
+            '1) Research how thought experiments enable collective intelligence — '
+            'users propose hypotheses, multi-agent evaluation scores them, '
+            'the hive learns from every experiment via memory chaining, '
+            '2) Generate educational posts explaining the hypothesis→evaluation→learning pipeline, '
+            '3) Create campaigns highlighting the 6 intent categories '
+            '(community, environment, education, health, equity, technology), '
+            '4) Show how every experiment makes the hive smarter — '
+            'constructive-only voting ensures quality, HITL approval gates ensure safety. '
+            'Authentic value, not hype. Let the feature speak for itself.'
+        ),
+        'config': {
+            'goal_sub_type': 'content',
+            'channels': ['platform', 'twitter', 'linkedin'],
+        },
+        'spark_budget': 250,
+        'use_product': True,
+    },
+    {
         'slug': 'bootstrap_ip_monitor',
         'goal_type': 'ip_protection',
         'title': 'Continuous Flywheel Health Monitor',
@@ -125,6 +148,462 @@ SEED_BOOTSTRAP_GOALS = [
             'repo_url': '',
             'repo_branch': 'main',
             'mode': 'audit',
+        },
+        'spark_budget': 200,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_revenue_monitor',
+        'goal_type': 'revenue',
+        'title': 'Monitor API Revenue and Pricing',
+        'description': (
+            'Monitor commercial API revenue and optimise: '
+            '1) Use get_api_revenue_stats to check revenue trends, '
+            '2) Analyse tier distribution and usage patterns, '
+            '3) Recommend pricing adjustments based on demand/costs, '
+            '4) Generate API documentation for developer onboarding. '
+            'Fair pricing: free tier always free, 90% to compute providers. '
+            'All compute falls under one basket — tread carefully, genuine value first.'
+        ),
+        'config': {
+            'mode': 'monitor',
+        },
+        'spark_budget': 150,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_defensive_ip',
+        'goal_type': 'ip_protection',
+        'title': 'Continuous Defensive Publication and Intelligence Milestone',
+        'description': (
+            'Generate defensive publications and monitor for patent trigger: '
+            '1) Create defensive publications for novel architecture components, '
+            '2) Use get_provenance_record to maintain evidence chain, '
+            '3) Monitor loop health for consecutive verified status, '
+            '4) When intelligence milestone reached (14 days verified + moat >= months), '
+            'trigger provisional patent filing via draft_patent_claims. '
+            'Defensive publications first. Patents only when critical intelligence confirmed. '
+            'HART character: Vijai — cautious, methodical, net-positive.'
+        ),
+        'config': {
+            'mode': 'monitor',
+            'auto_patent_trigger': True,
+        },
+        'spark_budget': 200,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_finance_agent',
+        'goal_type': 'finance',
+        'title': 'Self-Sustaining Business — Finance Agent Vijai',
+        'description': (
+            'Make the business self-sustaining with Vijai personality: '
+            '1) Use get_financial_health to monitor platform revenue and costs, '
+            '2) Use track_revenue_split to verify 90/9/1 compliance every period, '
+            '3) Use assess_sustainability to determine if revenue covers infrastructure, '
+            '4) Use manage_invite_participation to review private core access agreements. '
+            'No code merges without review against vision, mission, goals, constitution. '
+            'The coding agent proposes; guardrails and review approve. '
+            'Cautious market. Genuine value first. Vijai builds, never rushes.'
+        ),
+        'config': {
+            'mode': 'monitor',
+            'personality': 'vijai',
+            'commit_review_required': True,
+        },
+        'spark_budget': 200,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_exception_watcher',
+        'goal_type': 'self_heal',
+        'title': 'Continuous Exception Monitor and Self-Healing',
+        'description': (
+            'Monitor the platform for runtime exceptions. '
+            'When exception patterns are detected (3+ occurrences of same type), '
+            'create coding fix goals for idle agents. '
+            'This goal runs continuously to keep the platform self-healing.'
+        ),
+        'config': {
+            'mode': 'watch',
+            'continuous': True,
+        },
+        'spark_budget': 100,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_federation_sync',
+        'goal_type': 'federation',
+        'title': 'Federated Learning Synchronization Monitor',
+        'description': (
+            'Monitor federated learning convergence across the network: '
+            '1) Use check_federation_convergence to track sync health, '
+            '2) Identify diverging or stalled nodes via get_peer_learning_health, '
+            '3) Trigger manual sync if convergence drops below 0.5, '
+            '4) Report federation stats and trends.'
+        ),
+        'config': {
+            'mode': 'monitor',
+        },
+        'spark_budget': 150,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_self_build_monitor',
+        'goal_type': 'self_build',
+        'title': 'OS Self-Build Monitor — Sandbox-First Package Management',
+        'description': (
+            'Monitor and maintain the OS runtime configuration: '
+            '1) Use get_self_build_status to check current packages, version, generations, '
+            '2) When a package install/remove is needed, stage it with install_package/remove_package, '
+            '3) ALWAYS call sandbox_test_build() before apply_build() — never skip the sandbox, '
+            '4) Use show_build_diff() to review what will change, '
+            '5) After apply, verify the change worked — rollback_build() if anything is wrong, '
+            '6) Track build history and alert on repeated failures. '
+            'The OS rebuilds itself. Every change is reversible. Test first, deploy second.'
+        ),
+        'config': {
+            'mode': 'monitor',
+            'continuous': True,
+            'sandbox_required': True,
+        },
+        'spark_budget': 150,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_upgrade_monitor',
+        'goal_type': 'upgrade',
+        'title': 'Continuous Version Upgrade Monitor',
+        'description': (
+            'Monitor for new version deployments and orchestrate upgrades: '
+            '1) Use check_upgrade_status to detect new versions, '
+            '2) Capture pre-upgrade benchmarks, '
+            '3) Start 7-stage pipeline (build→test→audit→benchmark→sign→canary→deploy), '
+            '4) Monitor canary health during rollout, '
+            '5) Rollback immediately on ANY degradation.'
+        ),
+        'config': {
+            'mode': 'monitor',
+            'continuous': True,
+        },
+        'spark_budget': 200,
+        'use_product': False,
+    },
+    # ─── News Push Notification Agents ───
+    {
+        'slug': 'bootstrap_news_regional',
+        'goal_type': 'news',
+        'title': 'Regional News Curation and Push Notifications',
+        'description': (
+            'Subscribe to local and regional news feeds, curate relevant stories, '
+            'and push notifications to users in the region: '
+            '1) Use subscribe_news_feed for local RSS sources (city papers, regional outlets), '
+            '2) Use fetch_news_feeds to pull latest items hourly, '
+            '3) Curate top stories by relevance — community impact, weather, local events, '
+            '4) Use send_news_notification with scope=regional to push curated items, '
+            '5) Use get_news_metrics to track delivery rates and read engagement. '
+            'Quality over quantity — only push stories that matter to the community.'
+        ),
+        'config': {
+            'scope': 'regional',
+            'categories': ['local', 'community', 'weather', 'events'],
+            'feed_urls': [],
+            'frequency': 'hourly',
+        },
+        'spark_budget': 150,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_news_national',
+        'goal_type': 'news',
+        'title': 'National News Curation and Push Notifications',
+        'description': (
+            'Monitor national news feeds, filter by category relevance, '
+            'and push digest notifications: '
+            '1) Use subscribe_news_feed for major national outlets and wire services, '
+            '2) Use fetch_news_feeds to pull latest items hourly, '
+            '3) Filter and rank by category: politics, economy, sports, health, science, '
+            '4) Use send_news_notification with scope=all for high-importance national stories, '
+            '5) Use get_trending_news to identify breakout stories, '
+            '6) Use get_news_metrics to optimise send frequency and engagement. '
+            'Balanced coverage — no single category dominates. Factual, not sensational.'
+        ),
+        'config': {
+            'scope': 'national',
+            'categories': ['politics', 'economy', 'sports', 'health', 'science'],
+            'feed_urls': [],
+            'frequency': 'hourly',
+        },
+        'spark_budget': 200,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_news_international',
+        'goal_type': 'news',
+        'title': 'International News Curation and Push Notifications',
+        'description': (
+            'Curate global news from international feeds with focus on technology, '
+            'AI, climate, and geopolitics: '
+            '1) Use subscribe_news_feed for international wire services and global outlets, '
+            '2) Use fetch_news_feeds every 4 hours for world news, '
+            '3) Prioritise: world events, technology breakthroughs, AI developments, '
+            'climate updates, geopolitical shifts, '
+            '4) Use send_news_notification with scope=all for major global stories, '
+            '5) Use get_trending_news to surface viral international stories, '
+            '6) Use get_news_metrics to track cross-category engagement. '
+            'Global perspective — diverse sources, multiple viewpoints, fact-based.'
+        ),
+        'config': {
+            'scope': 'international',
+            'categories': ['world', 'technology', 'ai', 'climate', 'geopolitics'],
+            'feed_urls': [],
+            'frequency': 'every_4h',
+        },
+        'spark_budget': 200,
+        'use_product': False,
+    },
+    # ─── Continual Learning Coordination ───
+    {
+        'slug': 'bootstrap_learning_coordinator',
+        'goal_type': 'learning',
+        'title': 'Continual Learning Coordination and CCT Management',
+        'description': (
+            'Coordinate the continual learning incentive system: '
+            '1) Monitor compute contributions across all nodes with check_learning_health, '
+            '2) Issue and renew Compute Contribution Tokens for eligible nodes with issue_cct, '
+            '3) Verify learning microbenchmarks for compute attestation with verify_compute_contribution, '
+            '4) Track learning tier distribution and skill sharing rates with get_learning_tier_stats, '
+            '5) Report learning health metrics to dashboard. '
+            'Intelligence is the reward for contribution. '
+            'Every compute cycle donated makes the hive smarter. '
+            '90% of value flows back to contributors.'
+        ),
+        'config': {
+            'mode': 'monitor',
+            'continuous': True,
+        },
+        'spark_budget': 200,
+        'use_product': False,
+    },
+    # ─── Distributed Gradient Sync ───
+    {
+        'slug': 'bootstrap_gradient_sync',
+        'goal_type': 'distributed_learning',
+        'title': 'Distributed Embedding Sync Coordination',
+        'description': (
+            'Coordinate the distributed embedding sync pipeline: '
+            '1) Monitor gradient sync status across all peers with get_gradient_sync_status, '
+            '2) Submit local embedding deltas for aggregation with submit_embedding_delta, '
+            '3) Request peer witnesses for embedding deltas with request_embedding_witnesses, '
+            '4) Trigger aggregation rounds for convergence with trigger_embedding_aggregation, '
+            '5) Ensure all contributing nodes have embedding_sync CCT capability. '
+            'Phase 1: Compressed embedding deltas (<100KB), trimmed mean aggregation. '
+            'Every node that contributes makes the hive smarter.'
+        ),
+        'config': {
+            'mode': 'monitor',
+            'continuous': True,
+            'phase': 1,
+        },
+        'spark_budget': 200,
+        'use_product': False,
+    },
+    # ─── Robot Learning ───
+    {
+        'slug': 'bootstrap_robot_learning',
+        'goal_type': 'robot',
+        'title': 'Continuous Robot Learning from Physical Interactions',
+        'description': (
+            'Learn from physical interactions continuously: '
+            '1) Use get_robot_status to monitor active sensors and safety, '
+            '2) After each physical action, record the action + sensor context + outcome, '
+            '3) Build motion recipes from successful action sequences, '
+            '4) Feed outcomes to the world model for trajectory improvement, '
+            '5) Identify recurring motion patterns for recipe extraction. '
+            'Every physical interaction makes the robot smarter. '
+            'Recipes enable 90% faster replay of learned sequences.'
+        ),
+        'config': {
+            'mode': 'learning',
+            'continuous': True,
+        },
+        'spark_budget': 150,
+        'use_product': False,
+    },
+    # ─── Robot Health Monitor ───
+    {
+        'slug': 'bootstrap_robot_health_monitor',
+        'goal_type': 'robot',
+        'title': 'Robot Health Monitor — Sensor Drift and Calibration',
+        'description': (
+            'Monitor robot health continuously: '
+            '1) Use get_robot_status to check safety, sensors, and bridge health, '
+            '2) Use get_robot_capabilities to verify detected hardware matches expected, '
+            '3) Use read_sensor on each active sensor to check for drift or anomalies, '
+            '4) Use get_sensor_window to detect sensor noise or stale readings, '
+            '5) Report any safety events, sensor failures, or calibration needs. '
+            'This goal runs continuously on robot nodes to keep hardware healthy.'
+        ),
+        'config': {
+            'mode': 'monitor',
+            'continuous': True,
+        },
+        'spark_budget': 100,
+        'use_product': False,
+    },
+    # ─── Thought Experiment Coordinator ───
+    {
+        'slug': 'bootstrap_thought_experiment_coordinator',
+        'goal_type': 'thought_experiment',
+        'title': 'Constitutional Thought Experiment Coordination',
+        'description': (
+            'Coordinate the constitutional thought experiment pipeline: '
+            '1) Monitor active experiments with get_experiment_status, '
+            '2) Evaluate proposed experiments with evaluate_thought_experiment, '
+            '3) Tally votes and compute weighted scores with tally_experiment_votes, '
+            '4) Advance experiments through lifecycle with advance_experiment, '
+            '5) Ensure core IP experiments receive agent evaluation. '
+            'Both humans and agents vote. All content gated by ConstitutionalFilter. '
+            'Every experiment makes the hive smarter.'
+        ),
+        'config': {
+            'mode': 'coordinator',
+            'continuous': True,
+        },
+        'spark_budget': 200,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_paper_trader_longterm',
+        'goal_type': 'trading',
+        'title': 'Paper Trading: Diversified Long-Term Portfolio',
+        'description': (
+            'Manage a diversified long-term paper portfolio: '
+            '1) Analyse market sentiment for BTC, ETH, and top-10 assets, '
+            '2) Build positions based on fundamental + sentiment analysis, '
+            '3) Monthly rebalance — max 25% per asset, '
+            '4) Track P&L and win rate with get_portfolio_status. '
+            'All trades are paper (simulated). Halt at 10% cumulative loss.'
+        ),
+        'config': {
+            'strategy': 'long_term',
+            'paper_trading': True,
+            'market': 'crypto',
+            'max_budget': 10000,
+            'max_loss_pct': 10,
+        },
+        'spark_budget': 200,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_paper_trader_intraday',
+        'goal_type': 'trading',
+        'title': 'Paper Trading: Intraday Technical BTC/ETH',
+        'description': (
+            'Run intraday paper trades on BTC and ETH: '
+            '1) Use get_technical_indicators for RSI, MACD, Bollinger Bands, '
+            '2) Enter only on signal confluence (2+ indicators agree), '
+            '3) Max 2% risk per trade, mandatory stop-loss, '
+            '4) Review trades with get_trade_history after each session. '
+            'Paper-only mode. Halt at 10% cumulative loss.'
+        ),
+        'config': {
+            'strategy': 'intraday',
+            'paper_trading': True,
+            'market': 'crypto',
+            'max_budget': 5000,
+            'max_loss_pct': 10,
+        },
+        'spark_budget': 150,
+        'use_product': False,
+    },
+    # ─── Civic Sentinel — Autonomous Transparency Agent ───
+    {
+        'slug': 'bootstrap_civic_sentinel',
+        'goal_type': 'civic_sentinel',
+        'title': 'Autonomous Community Transparency & Accountability Monitor',
+        'description': (
+            'Autonomous agent that monitors public discourse for censorship and '
+            'political hypocrisy. Not tied to any user — serves the community. '
+            'Captures evidence when citizen voices are suppressed by biased moderators. '
+            'Digs up historical articles proving contradictions between political '
+            "parties' claimed values and their actual actions. Cross-references across "
+            'communities. Posts findings publicly with legal-grade citations. '
+            'Evaluates flags autonomously — if a propaganda group flags legitimate '
+            'criticism, the agent counter-flags with evidence. '
+            'If the agent misbehaves, users raise concerns through community '
+            'voting — not political bodies or paid mods.'
+        ),
+        'config': {
+            'channels': ['all'],
+            'auto_detect_topics': True,
+            'autonomous': True,
+            'post_findings_publicly': True,
+            'governance': 'community_vote',
+        },
+        'spark_budget': 150,
+        'use_product': False,
+    },
+    # ─── Code Evolution — Shard-Based Private Repo Coding ───
+    {
+        'slug': 'bootstrap_code_evolution',
+        'goal_type': 'code_evolution',
+        'title': 'Full-Context Code Evolution with Trust-Based Access',
+        'description': (
+            'Handle code evolution thought experiments: '
+            '1) Use create_code_shard to load full source for target files, '
+            '2) Use execute_coding_task with working_dir to make edits '
+            'via the best coding tool (KiloCode, Claude Code, OpenCode, AiderNative), '
+            '3) Hive offload only to trusted peers (SAME_USER or autotrust with 5+ '
+            'validated tasks) — full source E2E encrypted, never interface-only. '
+            'Security is encryption-based, not info-hiding. Accuracy > security theater.'
+        ),
+        'config': {
+            'mode': 'coordinator',
+            'continuous': True,
+        },
+        'spark_budget': 200,
+        'use_product': False,
+    },
+    # ─── AutoResearch — Autonomous Experiment Loop ───
+    {
+        'slug': 'bootstrap_autoresearch_coordinator',
+        'goal_type': 'autoresearch',
+        'title': 'Autonomous Research Loop Coordinator',
+        'description': (
+            'Coordinate autonomous research experiments triggered by thought '
+            'experiments with experiment_type=software. When a software thought '
+            'experiment reaches evaluating phase: '
+            '1) Parse the hypothesis into repo_path, target_file, run_command, metric, '
+            '2) Call start_autoresearch() to begin the edit-run-score-iterate loop, '
+            '3) Monitor progress with get_autoresearch_status(), '
+            '4) Post results back to the thought experiment tracker, '
+            '5) If hive peers available, run parallel variants for faster convergence. '
+            'Budget-gated by ComputeEscrow pledges from community contributors.'
+        ),
+        'config': {
+            'mode': 'coordinator',
+            'continuous': True,
+            'hive_parallel': True,
+        },
+        'spark_budget': 200,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_revenue_trading_pipeline',
+        'goal_type': 'finance',
+        'title': 'Revenue-to-Trading Pipeline Monitor',
+        'description': (
+            'Monitor platform revenue accumulation and trigger trading funding: '
+            '1) Use get_financial_health to check revenue streams, '
+            '2) When platform excess exceeds threshold, fund paper trading goals, '
+            '3) Track trading P&L and distribute simulated profits, '
+            '4) Report revenue dashboard metrics. '
+            'Revenue → Spark → trading → reinvestment cycle.'
+        ),
+        'config': {
+            'mode': 'revenue_pipeline',
+            'continuous': True,
         },
         'spark_budget': 200,
         'use_product': False,
@@ -217,6 +696,18 @@ LOOPHOLE_REMEDIATION_MAP = {
             'Report partition boundaries and suggest recovery strategy.'
         ),
         'config': {'mode': 'monitor', 'remediation': 'gossip_partition'},
+        'spark_budget': 100,
+    },
+    'learning_stall': {
+        'goal_type': 'federation',
+        'title': 'Remediate Learning Stall: Adjust Aggregation',
+        'description': (
+            'Federation convergence below threshold. '
+            'Check peer learning health for diverging nodes. '
+            'Trigger manual sync and report anomalies. '
+            'May need to adjust aggregation weights or flush frequency.'
+        ),
+        'config': {'mode': 'monitor', 'remediation': 'learning_stall'},
         'spark_budget': 100,
     },
 }

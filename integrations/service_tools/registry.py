@@ -155,9 +155,15 @@ class ServiceToolRegistry:
         api_key = tool.api_key
         api_key_header = tool.api_key_header
 
+        # If endpoint has a native handler, use it directly (no HTTP)
+        native_handler = endpoint.get("native_handler")
+
         def endpoint_executor(**kwargs) -> str:
             """Execute the service tool endpoint."""
             try:
+                if native_handler is not None:
+                    return native_handler(json.dumps(kwargs))
+
                 from core.http_pool import pooled_get, pooled_post
 
                 headers = {"Content-Type": "application/json"}

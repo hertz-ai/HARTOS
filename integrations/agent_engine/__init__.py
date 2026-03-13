@@ -25,7 +25,7 @@ def get_engine_blueprint():
 def init_agent_engine(app):
     """Initialize the unified agent goal engine."""
     if os.environ.get('HEVOLVE_AGENT_ENGINE_ENABLED', 'false').lower() != 'true':
-        logger.debug("Agent engine disabled (HEVOLVE_AGENT_ENGINE_ENABLED != true)")
+        logger.info("Agent engine disabled (HEVOLVE_AGENT_ENGINE_ENABLED != true)")
         return
 
     # Register API blueprint
@@ -37,7 +37,7 @@ def init_agent_engine(app):
         logger.warning(f"Agent engine blueprint registration failed: {e}")
         return
 
-    # Bootstrap "Hevolve Platform" product for self-marketing (idempotent)
+    # Bootstrap "HART Platform" product for self-marketing (idempotent)
     product_id = None
     try:
         from integrations.social.models import get_db, Product, User
@@ -45,9 +45,9 @@ def init_agent_engine(app):
         existing = db.query(Product).filter_by(is_platform_product=True).first()
         if not existing:
             product = Product(
-                name='Hevolve Platform',
-                description='AI-powered multi-agent platform for autonomous task execution',
-                tagline='Your AI workforce, automated',
+                name='HART Platform',
+                description='Crowdsourced agentic intelligence platform — a gift from hevolve.ai',
+                tagline='Crowdsourced intelligence, human control',
                 product_url='https://hevolve.ai',
                 category='platform',
                 target_audience='Developers, businesses, and creators who want AI-powered automation',
@@ -60,7 +60,7 @@ def init_agent_engine(app):
             db.add(product)
             db.flush()
             product_id = str(product.id)
-            logger.info("Bootstrapped Hevolve Platform product for self-marketing")
+            logger.info("Bootstrapped HART Platform product for self-marketing")
         else:
             product_id = str(existing.id)
 
@@ -69,7 +69,7 @@ def init_agent_engine(app):
         if not sys_agent:
             sys_agent = User(
                 username='hevolve_system_agent',
-                display_name='Hevolve System Agent',
+                display_name='HART System Agent',
                 user_type='agent',
                 idle_compute_opt_in=True,
                 is_admin=False,
@@ -89,6 +89,40 @@ def init_agent_engine(app):
     except Exception as e:
         logger.debug(f"Platform product bootstrap skipped: {e}")
 
+    # Register commercial API blueprint
+    try:
+        from .commercial_api import commercial_api_bp
+        app.register_blueprint(commercial_api_bp)
+        logger.info("Commercial API endpoints registered")
+    except Exception as e:
+        logger.debug(f"Commercial API blueprint skipped: {e}")
+
+    # Register build distribution blueprint
+    try:
+        from .build_distribution import build_distribution_bp
+        app.register_blueprint(build_distribution_bp)
+        logger.info("Build distribution endpoints registered")
+    except Exception as e:
+        logger.debug(f"Build distribution blueprint skipped: {e}")
+
+    # Register regional host blueprint
+    try:
+        from integrations.social.api_regional_host import regional_host_bp
+        app.register_blueprint(regional_host_bp)
+        logger.info("Regional host endpoints registered")
+    except Exception as e:
+        logger.debug(f"Regional host blueprint skipped: {e}")
+
+    # Register AgentBaselineAdapter with benchmark registry
+    try:
+        from .benchmark_registry import get_benchmark_registry
+        from .agent_baseline_service import AgentBaselineAdapter
+        registry = get_benchmark_registry()
+        registry.register_benchmark(AgentBaselineAdapter())
+        logger.info("AgentBaselineAdapter registered with benchmark registry")
+    except Exception as e:
+        logger.debug(f"AgentBaselineAdapter registration skipped: {e}")
+
     # Start background daemon
     try:
         from .agent_daemon import agent_daemon
@@ -96,3 +130,10 @@ def init_agent_engine(app):
         logger.info("Agent engine daemon started")
     except Exception as e:
         logger.debug(f"Agent engine daemon start skipped: {e}")
+
+    # Start distributed worker loop (claims tasks from shared Redis)
+    try:
+        from integrations.distributed_agent.worker_loop import worker_loop
+        worker_loop.start()
+    except Exception as e:
+        logger.debug(f"Distributed worker loop start skipped: {e}")

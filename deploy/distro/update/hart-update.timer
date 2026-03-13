@@ -1,0 +1,10 @@
+[Unit]
+Description=HART OS Daily Update Check
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=3600
+Persistent=true
+
+[Install]
+WantedBy=timers.target

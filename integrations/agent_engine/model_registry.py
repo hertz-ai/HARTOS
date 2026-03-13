@@ -103,45 +103,89 @@ class ModelRegistry:
                      f"accuracy={backend.accuracy_score})")
 
     def get_model(self, model_id: str) -> Optional[ModelBackend]:
-        return self._models.get(model_id)
+        with self._lock:
+            return self._models.get(model_id)
 
     def get_fast_model(self, min_accuracy: float = 0.0) -> Optional[ModelBackend]:
         """Get the lowest-latency model meeting minimum accuracy."""
-        candidates = [
-            m for m in self._models.values()
-            if m.accuracy_score >= min_accuracy
-        ]
+        with self._lock:
+            candidates = [
+                m for m in self._models.values()
+                if m.accuracy_score >= min_accuracy
+            ]
         if not candidates:
             return None
         return min(candidates, key=lambda m: m.avg_latency_ms)
 
     def get_expert_model(self, max_cost: float = float('inf')) -> Optional[ModelBackend]:
         """Get the highest-accuracy model within budget."""
-        candidates = [
-            m for m in self._models.values()
-            if m.cost_per_1k_tokens <= max_cost
-        ]
+        with self._lock:
+            candidates = [
+                m for m in self._models.values()
+                if m.cost_per_1k_tokens <= max_cost
+            ]
         if not candidates:
             return None
         return max(candidates, key=lambda m: m.accuracy_score)
 
+    def get_local_model(self, min_accuracy: float = 0.0) -> Optional[ModelBackend]:
+        """Get the highest-accuracy local model (is_local=True, cost=0).
+
+        Used by policy-aware routing to prefer local compute for hive/idle tasks.
+        """
+        with self._lock:
+            candidates = [m for m in self._models.values()
+                          if m.is_local and m.accuracy_score >= min_accuracy]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda m: m.accuracy_score)
+
+    def get_model_by_policy(self, policy: str = 'local_preferred',
+                            task_source: str = 'own',
+                            min_accuracy: float = 0.0) -> Optional[ModelBackend]:
+        """Policy-aware model selection.
+
+        Policies:
+          local_only     — Only local models (is_local=True). Returns None if none available.
+          local_preferred — Try local first, fall through to metered if none available.
+          any            — Fastest model regardless of locality (metered costs tracked).
+
+        For hive/idle tasks, enforces at least local_preferred unless node opted into 'any'.
+        """
+        if task_source in ('hive', 'idle') and policy != 'any':
+            policy = 'local_preferred'
+
+        if policy == 'local_only':
+            return self.get_local_model(min_accuracy)
+
+        if policy == 'local_preferred':
+            local = self.get_local_model(min_accuracy)
+            if local:
+                return local
+            # Fall through to metered (will be tracked + compensated)
+
+        return self.get_fast_model(min_accuracy)
+
     def list_models(self, tier: ModelTier = None) -> List[ModelBackend]:
         """List all models, optionally filtered by tier."""
-        models = list(self._models.values())
+        with self._lock:
+            models = list(self._models.values())
         if tier:
             models = [m for m in models if m.tier == tier]
         return sorted(models, key=lambda m: m.avg_latency_ms)
 
     def record_latency(self, model_id: str, latency_ms: float):
         """Record observed latency for a model (live running average)."""
-        model = self._models.get(model_id)
+        with self._lock:
+            model = self._models.get(model_id)
         if model:
             model.record_latency(latency_ms)
 
     def record_energy(self, model_id: str, duration_ms: float):
         """Record energy consumption for every model call — guardrail requirement."""
         from security.hive_guardrails import EnergyAwareness
-        model = self._models.get(model_id)
+        with self._lock:
+            model = self._models.get(model_id)
         if model:
             kwh = EnergyAwareness.estimate_energy_kwh(model.to_dict(), duration_ms)
             self._energy_log.append((time.time(), model_id, kwh))
@@ -190,7 +234,26 @@ model_registry = ModelRegistry()
 def _register_defaults():
     """Register default model backends. Only available if API keys are set."""
 
-    # 1. Local Qwen3-VL (always available — hive compute)
+    # 1. Local Qwen3.5-4B VL — default local model (256K context, vision+text, llama.cpp b8148+)
+    model_registry.register(ModelBackend(
+        model_id='qwen3.5-4b-local',
+        display_name='Qwen3.5 4B VL (Local)',
+        tier=ModelTier.FAST,
+        config_list_entry={
+            'model': 'Qwen3.5-4B',
+            'api_key': 'dummy',
+            'base_url': f'http://localhost:{os.environ.get("LLAMA_CPP_PORT", "8080")}/v1',
+            'price': [0, 0],
+        },
+        avg_latency_ms=700.0,
+        accuracy_score=0.60,
+        cost_per_1k_tokens=0.0,
+        is_local=True,
+        hardware_dependent=True,
+        gpu_tdp_watts=170.0,
+    ))
+
+    # 1b. Local Qwen3-VL-4B — fallback for older llama.cpp installs
     model_registry.register(ModelBackend(
         model_id='qwen3-vl-4b-local',
         display_name='Qwen3-VL 4B (Local)',
@@ -198,7 +261,7 @@ def _register_defaults():
         config_list_entry={
             'model': 'Qwen3-VL-4B-Instruct',
             'api_key': 'dummy',
-            'base_url': 'http://localhost:8080/v1',
+            'base_url': f'http://localhost:{os.environ.get("LLAMA_CPP_PORT", "8080")}/v1',
             'price': [0, 0],
         },
         avg_latency_ms=800.0,
@@ -279,17 +342,17 @@ def _register_defaults():
             cost_per_1k_tokens=1.5,
         ))
 
-    # 6. crawl4ai Learning LLM (balanced — local world model, improves over time)
-    crawl4ai_url = os.environ.get('CRAWL4AI_API_URL')
-    if crawl4ai_url:
+    # 6. HevolveAI-Core Learning LLM (balanced — local world model, improves over time)
+    hevolveai_url = os.environ.get('HEVOLVEAI_API_URL')
+    if hevolveai_url:
         model_registry.register(ModelBackend(
-            model_id='crawl4ai-learning',
-            display_name='crawl4ai World Model (Learning)',
+            model_id='hevolveai-learning',
+            display_name='HevolveAI World Model (Learning)',
             tier=ModelTier.BALANCED,
             config_list_entry={
-                'model': 'crawl4ai-learning',
+                'model': 'hevolveai-learning',
                 'api_key': 'local',
-                'base_url': crawl4ai_url,
+                'base_url': hevolveai_url,
                 'price': [0, 0],
             },
             avg_latency_ms=50.0,
@@ -297,6 +360,124 @@ def _register_defaults():
             cost_per_1k_tokens=0.0,
             is_local=True,
             hardware_dependent=True,
+        ))
+
+    # 7. MobileVLM ONNX (fast — lightweight CPU vision for embedded/lite tiers)
+    if os.environ.get('HEVOLVE_VISION_LITE_ENABLED', '').lower() == 'true':
+        model_registry.register(ModelBackend(
+            model_id='mobilevlm-1.7b-onnx',
+            display_name='MobileVLM 1.7B (ONNX CPU)',
+            tier=ModelTier.FAST,
+            config_list_entry={
+                'model': 'mobilevlm-1.7b',
+                'api_key': 'local',
+                'base_url': 'local://onnxruntime',
+                'price': [0, 0],
+            },
+            avg_latency_ms=500.0,
+            accuracy_score=0.45,
+            cost_per_1k_tokens=0.0,
+            is_local=True,
+            hardware_dependent=True,
+            gpu_tdp_watts=0.0,  # CPU-only, no GPU power draw
+        ))
+
+    # 8. Pocket TTS — offline, CPU, 100M params, MIT (always available)
+    model_registry.register(ModelBackend(
+        model_id='pocket-tts-100m',
+        display_name='Pocket TTS 100M (Offline)',
+        tier=ModelTier.FAST,
+        config_list_entry={
+            'model': 'pocket-tts-100m',
+            'api_key': 'local',
+            'base_url': 'inprocess://pocket_tts',
+            'price': [0, 0],
+        },
+        avg_latency_ms=200.0,
+        accuracy_score=0.85,
+        cost_per_1k_tokens=0.0,
+        is_local=True,
+        hardware_dependent=False,
+        gpu_tdp_watts=0.0,
+    ))
+
+    # 9. Whisper STT — offline, sherpa-onnx or openai-whisper (always available)
+    model_registry.register(ModelBackend(
+        model_id='whisper-stt-local',
+        display_name='Whisper STT (sherpa-onnx / Local)',
+        tier=ModelTier.FAST,
+        config_list_entry={
+            'model': 'whisper-stt',
+            'api_key': 'local',
+            'base_url': 'inprocess://whisper',
+            'price': [0, 0],
+        },
+        avg_latency_ms=500.0,
+        accuracy_score=0.88,
+        cost_per_1k_tokens=0.0,
+        is_local=True,
+        hardware_dependent=True,
+        gpu_tdp_watts=0.0,
+    ))
+
+    # 10. LuxTTS — 48kHz voice cloning TTS (GPU-accelerated, Apache 2.0)
+    #     150x realtime on GPU, >1x on CPU, <1GB VRAM
+    #     ZipVoice-distilled, 4-step diffusion, voice cloning from 3s audio
+    _luxtts_available = False
+    try:
+        from zipvoice.luxvoice import LuxTTS as _LuxCheck  # noqa: F401
+        _luxtts_available = True
+    except ImportError:
+        pass
+
+    if _luxtts_available:
+        # Detect GPU for latency estimate
+        _luxtts_has_gpu = False
+        try:
+            import torch as _torch_check
+            _luxtts_has_gpu = _torch_check.cuda.is_available()
+        except ImportError:
+            pass
+
+        model_registry.register(ModelBackend(
+            model_id='luxtts-48k',
+            display_name='LuxTTS 48kHz (Voice Cloning)',
+            tier=ModelTier.FAST,
+            config_list_entry={
+                'model': 'luxtts-48k',
+                'api_key': 'local',
+                'base_url': 'inprocess://luxtts',
+                'price': [0, 0],
+            },
+            avg_latency_ms=50.0 if _luxtts_has_gpu else 800.0,
+            accuracy_score=0.93,
+            cost_per_1k_tokens=0.0,
+            is_local=True,
+            hardware_dependent=True,
+            gpu_tdp_watts=170.0 if _luxtts_has_gpu else 0.0,
+        ))
+
+    # 11. MakeItTalk Cloud — TTS + video generation (if MAKEITTALK_API_URL set)
+    #     Cloud service: Flask+Celery, 7 TTS backends, lip-sync animation
+    #     POST /video-gen/ for full pipeline, audio_generation for TTS only
+    makeittalk_url = os.environ.get('MAKEITTALK_API_URL')
+    if makeittalk_url:
+        model_registry.register(ModelBackend(
+            model_id='makeittalk-cloud',
+            display_name='MakeItTalk Cloud (TTS + Video)',
+            tier=ModelTier.BALANCED,
+            config_list_entry={
+                'model': 'makeittalk',
+                'api_key': 'cloud',
+                'base_url': makeittalk_url,
+                'price': [0, 0],  # internal service
+            },
+            avg_latency_ms=5000.0,
+            accuracy_score=0.92,
+            cost_per_1k_tokens=0.0,
+            is_local=False,
+            hardware_dependent=False,
+            gpu_tdp_watts=0.0,
         ))
 
     logger.info(f"ModelRegistry: {len(model_registry._models)} backends registered")

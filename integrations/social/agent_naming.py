@@ -1,10 +1,10 @@
 """
 HevolveSocial - Agent Naming System (what3words-style, dot-separated)
 
-Local names:  2-word (adjective.noun) — unique per user, work offline.
+Local names:  2-word (adjective.noun) - unique per user, work offline.
               Example: swift.falcon, calm.oracle, bold.storm
 
-Global names: 3-word (local.name.handle) — globally unique.
+Global names: 3-word (local.name.handle) - globally unique.
               Example: swift.falcon.sathi, calm.oracle.john
 
 Handle:       A unique creator tag each user picks once (like a gamertag).
@@ -44,7 +44,7 @@ _FALLBACK_NOUN = [
 RESERVED_WORDS = frozenset([
     'admin', 'root', 'system', 'bot', 'test', 'null', 'undefined',
     'anonymous', 'moderator', 'mod', 'staff', 'support', 'help',
-    'official', 'hevolve', 'hevolvebot', 'santaclaw', 'nunba', 'api',
+    'official', 'hevolve', 'hevolvebot', 'hart', 'hartbot', 'santaclaw', 'nunba', 'api',
     'webhook', 'internal', 'deleted', 'banned', 'suspended',
 ])
 

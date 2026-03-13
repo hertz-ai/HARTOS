@@ -8,7 +8,10 @@ tracking — SmartLedger and ActionState handle that.
 import os
 import logging
 import requests
+from core.http_pool import pooled_post
 from typing import Optional
+
+from core.port_registry import get_port
 
 logger = logging.getLogger('hevolve_social')
 
@@ -19,11 +22,21 @@ def dispatch_to_chat(prompt: str, user_id: str, goal_id: str) -> Optional[str]:
     This is the only integration point: the CREATE/REUSE agent system
     handles decomposition, execution, verification, and persistence.
     """
-    base_url = os.environ.get('HEVOLVE_BASE_URL', 'http://localhost:6777')
+    # BUDGET GATE: platform affordability check before HTTP dispatch
+    try:
+        from integrations.agent_engine.budget_gate import check_platform_affordability
+        can_afford, details = check_platform_affordability()
+        if not can_afford:
+            logger.warning(f"Task dispatch blocked — platform not affordable: {details}")
+            return None
+    except ImportError:
+        pass
+
+    base_url = os.environ.get('HEVOLVE_BASE_URL', f'http://localhost:{get_port("backend")}')
     prompt_id = f"coding_{goal_id[:8]}"
 
     try:
-        resp = requests.post(
+        resp = pooled_post(
             f'{base_url}/chat',
             json={
                 'user_id': user_id,
@@ -31,6 +44,7 @@ def dispatch_to_chat(prompt: str, user_id: str, goal_id: str) -> Optional[str]:
                 'prompt': prompt,
                 'create_agent': True,
                 'casual_conv': False,
+                'task_source': 'idle',
             },
             timeout=120,
         )

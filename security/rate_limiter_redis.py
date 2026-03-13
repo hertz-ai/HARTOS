@@ -33,6 +33,41 @@ class RedisRateLimiter:
         'bot_register': (5, 300),    # 5 registrations per 5 minutes
         'discover': (10, 60),        # 10 discovery calls per 60 seconds
         'chat': (30, 60),            # 30 chat requests per 60 seconds
+        'goal_create': (10, 3600),   # 10 goals per user per hour
+        'remote_desktop': (30, 60),  # 30 connections per 60 seconds
+        'remote_desktop_auth': (5, 60),  # 5 failed auth attempts per 60 seconds
+        'shell_ops': (30, 60),          # 30 shell operations per 60 seconds
+        'shell_file_ops': (20, 60),     # 20 file operations per 60 seconds
+        'shell_terminal': (10, 60),     # 10 terminal sessions per 60 seconds
+        'shell_power': (3, 60),         # 3 power actions per 60 seconds
+        'app_install': (5, 3600),       # 5 installs per hour
+        'sharing': (20, 60),            # 20 shares per 60 seconds
+        'gamification': (30, 60),       # 30 gamification calls per 60 seconds
+        'games': (20, 60),              # 20 game operations per 60 seconds
+        'mcp': (30, 60),                # 30 MCP operations per 60 seconds
+        'tts': (10, 60),                # 10 TTS generations per 60 seconds
+        'tts_speak': (20, 60),              # 20 TTS speak requests per 60 seconds
+        'tts_clone': (5, 3600),             # 5 voice clones per hour
+        'civic_sentinel': (20, 60),      # 20 civic sentinel ops per 60 seconds
+        'autoresearch': (5, 3600),       # 5 autoresearch sessions per hour
+        'wifi': (30, 60),                # 30 wifi operations per 60 seconds
+        'vpn': (20, 60),                 # 20 vpn operations per 60 seconds
+        'trash': (30, 60),               # 30 trash operations per 60 seconds
+        'battery': (60, 60),             # 60 battery queries per 60 seconds
+        'webcam': (10, 60),              # 10 webcam operations per 60 seconds
+        'scanner': (5, 60),              # 5 scanner operations per 60 seconds
+        'video_gen': (5, 300),           # 5 video generations per 5 minutes
+        'keyboard': (20, 60),            # 20 keyboard operations per 60 seconds
+        'app_permissions': (10, 60),     # 10 permission changes per 60 seconds
+        'file_tags': (30, 60),           # 30 file tag operations per 60 seconds
+        'hotspot': (10, 60),             # 10 hotspot operations per 60 seconds
+        'weather': (10, 60),             # 10 weather queries per 60 seconds
+        'auto_update': (3, 3600),        # 3 update runs per hour
+        'dns': (5, 60),                  # 5 DNS config changes per 60 seconds
+        'sso': (5, 60),                  # 5 SSO operations per 60 seconds
+        'email': (10, 60),               # 10 email operations per 60 seconds
+        'voice_control': (30, 60),       # 30 voice operations per 60 seconds
+        'screen_rotation': (10, 60),     # 10 rotation changes per 60 seconds
     }
 
     def __init__(self):
@@ -47,7 +82,11 @@ class RedisRateLimiter:
                 'REDIS_RATE_LIMIT_URL',
                 os.environ.get('REDIS_URL', 'redis://localhost:6379/1')
             )
-            self._redis = redis.from_url(redis_url, decode_responses=True)
+            self._redis = redis.from_url(
+                redis_url, decode_responses=True,
+                socket_timeout=3, socket_connect_timeout=2,
+                socket_keepalive=True, retry_on_timeout=True,
+            )
             self._redis.ping()
             logger.info("Redis rate limiter connected")
         except Exception as e:
@@ -79,22 +118,24 @@ class RedisRateLimiter:
         """Redis sliding window counter."""
         try:
             now = time.time()
+            # Step 1: clean old entries and count current
             pipe = self._redis.pipeline()
-            # Remove old entries
             pipe.zremrangebyscore(key, 0, now - window)
-            # Count current entries
             pipe.zcard(key)
-            # Add current request
-            pipe.zadd(key, {str(now): now})
-            # Set expiry on the key
-            pipe.expire(key, window + 1)
             results = pipe.execute()
 
             current_count = results[1]
-            return current_count < max_requests
+            if current_count >= max_requests:
+                return False
+
+            # Step 2: only record if under limit
+            self._redis.zadd(key, {str(now): now})
+            self._redis.expire(key, window + 1)
+            return True
         except Exception as e:
-            logger.debug(f"Redis rate limit check failed: {e}")
-            return True  # Allow on Redis error
+            logger.warning(f"Redis rate limit check failed, falling back to memory: {e}")
+            # Fail-closed: fall back to in-memory limiter, NOT open allow
+            return self._check_memory(key, max_requests, window)
 
     def _check_memory(self, key: str, max_requests: int, window: int) -> bool:
         """In-memory sliding window (fallback)."""

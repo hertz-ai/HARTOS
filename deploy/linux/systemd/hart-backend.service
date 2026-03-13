@@ -1,0 +1,45 @@
+[Unit]
+Description=HART OS Backend (Flask/Waitress)
+Documentation=https://github.com/hevolve-ai/hart
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hart
+Group=hart
+WorkingDirectory=/opt/hart
+ExecStart=/opt/hart/venv/bin/python -m waitress --port=${HARTOS_BACKEND_PORT:-6777} --threads=50 langchain_gpt_api:app
+EnvironmentFile=/etc/hart/hart.env
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=3
+StartLimitIntervalSec=60
+WatchdogSec=120
+TimeoutStartSec=30
+TimeoutStopSec=15
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/hart /var/log/hart /var/lib/hart/agent_data
+PrivateTmp=yes
+
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+MemoryDenyWriteExecute=no
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hart-backend
+
+[Install]
+WantedBy=hart.target

@@ -17,6 +17,7 @@ Features:
 
 import json
 import os
+import threading
 from datetime import datetime
 from enum import Enum
 from typing import Dict, List, Optional, Any, Callable
@@ -167,6 +168,20 @@ class TaskStatus(str, Enum):
         return status == cls.COMPLETED
 
 
+class TaskLocality(str, Enum):
+    """Where a task is allowed to execute — controls distribution."""
+    LOCAL_ONLY = "local_only"      # Must stay on this node (confidential/sensitive)
+    REGIONAL = "regional"          # Can run within same region (shared Redis cluster)
+    GLOBAL = "global"              # Can run on any node in the hive
+
+class TaskSensitivity(str, Enum):
+    """Data sensitivity classification — controls what leaves the node."""
+    PUBLIC = "public"              # Task data can be shared freely
+    INTERNAL = "internal"          # Task data stays within the org/hive
+    CONFIDENTIAL = "confidential"  # Task data only on trusted nodes
+    SECRET = "secret"              # Task data never leaves the originating node
+
+
 class ExecutionMode(str, Enum):
     """How task should be executed"""
     PARALLEL = "parallel"      # Can run concurrently with others
@@ -205,7 +220,7 @@ class Task:
 
         # State management - track history of all state transitions
         self.state_history: List[Dict[str, Any]] = [{
-            "status": status,
+            "status": status.value if hasattr(status, 'value') else str(status),
             "timestamp": self.created_at,
             "reason": "Task created"
         }]
@@ -261,14 +276,48 @@ class Task:
         # Dependency tracking
         self.blocked_by: List[str] = []  # Task IDs blocking this task
 
+        # Ownership tracking — who owns this task
+        self.owner_node_id: Optional[str] = None      # Which machine/node owns this
+        self.owner_user_id: Optional[str] = None       # Which user owns this
+        self.owner_prompt_id: Optional[str] = None     # Which prompt/session owns this
+        self.owned_at: Optional[str] = None            # When ownership was claimed
+        self.ownership_history: List[Dict[str, Any]] = []  # Audit trail of ownership changes
+
+        # Budget and compute tracking
+        self.time_budget_s: Optional[float] = None     # Max seconds allowed
+        self.spark_budget: Optional[float] = None      # Max Spark tokens to spend
+        self.compute_requirements: Dict[str, Any] = {} # e.g. {"gpu": True, "vram_gb": 4}
+        self.timeout_s: Optional[float] = None         # Hard timeout in seconds
+        self.started_at: Optional[str] = None          # When IN_PROGRESS was entered
+        self.spark_spent: float = 0.0                  # Cumulative Spark spent
+        self.time_spent_s: float = 0.0                 # Cumulative time spent
+
+        # SLA / deadline
+        self.deadline: Optional[str] = None            # Hard deadline (ISO datetime)
+        self.sla_target_s: Optional[float] = None      # Expected completion time (seconds)
+        self.sla_breached: bool = False                # Whether SLA was breached
+
+        # Observability — agent heartbeat + progress reporting
+        self.last_heartbeat_at: Optional[str] = None   # Last time agent reported in
+        self.heartbeat_interval_s: float = 30.0        # Expected heartbeat interval
+        self.status_messages: List[Dict[str, Any]] = []  # Structured progress reports from agent
+
+        # Locality and sensitivity — controls distribution
+        self.locality: str = TaskLocality.GLOBAL.value       # Where task can execute
+        self.sensitivity: str = TaskSensitivity.PUBLIC.value  # Data classification
+
+        # Integrity — corruption detection
+        self.data_hash: Optional[str] = None           # SHA-256 of task data at last save
+        self.result_hash: Optional[str] = None         # SHA-256 of result for verification
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert task to dictionary for serialization."""
         return {
             "task_id": self.task_id,
             "description": self.description,
-            "task_type": self.task_type,
-            "execution_mode": self.execution_mode,
-            "status": self.status,
+            "task_type": self.task_type.value if hasattr(self.task_type, 'value') else str(self.task_type),
+            "execution_mode": self.execution_mode.value if hasattr(self.execution_mode, 'value') else str(self.execution_mode),
+            "status": self.status.value if hasattr(self.status, 'value') else str(self.status),
             "prerequisites": self.prerequisites,
             "context": self.context,
             "priority": self.priority,
@@ -315,7 +364,35 @@ class Task:
             # Rollback
             "rolled_back_at": self.rolled_back_at,
             "rollback_reason": self.rollback_reason,
-            "original_result": self.original_result
+            "original_result": self.original_result,
+            # Ownership
+            "owner_node_id": self.owner_node_id,
+            "owner_user_id": self.owner_user_id,
+            "owner_prompt_id": self.owner_prompt_id,
+            "owned_at": self.owned_at,
+            "ownership_history": self.ownership_history,
+            # Budget and compute
+            "time_budget_s": self.time_budget_s,
+            "spark_budget": self.spark_budget,
+            "compute_requirements": self.compute_requirements,
+            "timeout_s": self.timeout_s,
+            "started_at": self.started_at,
+            "spark_spent": self.spark_spent,
+            "time_spent_s": self.time_spent_s,
+            # SLA / deadline
+            "deadline": self.deadline,
+            "sla_target_s": self.sla_target_s,
+            "sla_breached": self.sla_breached,
+            # Observability
+            "last_heartbeat_at": self.last_heartbeat_at,
+            "heartbeat_interval_s": self.heartbeat_interval_s,
+            "status_messages": self.status_messages,
+            # Locality and sensitivity
+            "locality": self.locality,
+            "sensitivity": self.sensitivity,
+            # Integrity
+            "data_hash": self.data_hash,
+            "result_hash": self.result_hash,
         }
 
     @classmethod
@@ -375,6 +452,34 @@ class Task:
         task.rolled_back_at = data.get("rolled_back_at")
         task.rollback_reason = data.get("rollback_reason")
         task.original_result = data.get("original_result")
+        # Ownership
+        task.owner_node_id = data.get("owner_node_id")
+        task.owner_user_id = data.get("owner_user_id")
+        task.owner_prompt_id = data.get("owner_prompt_id")
+        task.owned_at = data.get("owned_at")
+        task.ownership_history = data.get("ownership_history", [])
+        # Budget and compute
+        task.time_budget_s = data.get("time_budget_s")
+        task.spark_budget = data.get("spark_budget")
+        task.compute_requirements = data.get("compute_requirements", {})
+        task.timeout_s = data.get("timeout_s")
+        task.started_at = data.get("started_at")
+        task.spark_spent = data.get("spark_spent", 0.0)
+        task.time_spent_s = data.get("time_spent_s", 0.0)
+        # SLA / deadline
+        task.deadline = data.get("deadline")
+        task.sla_target_s = data.get("sla_target_s")
+        task.sla_breached = data.get("sla_breached", False)
+        # Observability
+        task.last_heartbeat_at = data.get("last_heartbeat_at")
+        task.heartbeat_interval_s = data.get("heartbeat_interval_s", 30.0)
+        task.status_messages = data.get("status_messages", [])
+        # Locality and sensitivity
+        task.locality = data.get("locality", TaskLocality.GLOBAL.value)
+        task.sensitivity = data.get("sensitivity", TaskSensitivity.PUBLIC.value)
+        # Integrity
+        task.data_hash = data.get("data_hash")
+        task.result_hash = data.get("result_hash")
         return task
 
     def inject_vlm_context(self):
@@ -416,10 +521,10 @@ class Task:
     def _record_state_transition(self, new_status: TaskStatus, reason: str):
         """Internal method to record a state transition in history."""
         self.state_history.append({
-            "status": new_status,
+            "status": new_status.value if hasattr(new_status, 'value') else str(new_status),
             "timestamp": datetime.now().isoformat(),
             "reason": reason,
-            "previous_status": self.status
+            "previous_status": self.status.value if hasattr(self.status, 'value') else str(self.status)
         })
         self.status = new_status
         self.updated_at = datetime.now().isoformat()
@@ -482,6 +587,7 @@ class Task:
         """Start task execution (PENDING -> IN_PROGRESS)."""
         if not self._validate_transition(TaskStatus.IN_PROGRESS):
             return False
+        self.started_at = datetime.now().isoformat()
         self._record_state_transition(TaskStatus.IN_PROGRESS, reason)
         return True
 
@@ -873,6 +979,268 @@ class Task:
                 return False
         return True
 
+    # ==================== Ownership Methods ====================
+
+    def claim(self, node_id: str = None, user_id: str = None, prompt_id: str = None) -> bool:
+        """Claim ownership of this task.
+
+        Args:
+            node_id: Machine/node claiming ownership
+            user_id: User claiming ownership
+            prompt_id: Prompt/session context
+
+        Returns:
+            True if claimed (was unowned), False if already owned
+        """
+        if self.owner_node_id or self.owner_user_id:
+            logger.warning(f"Task {self.task_id} already owned by node={self.owner_node_id} user={self.owner_user_id}")
+            return False
+        self.owner_node_id = node_id
+        self.owner_user_id = user_id
+        self.owner_prompt_id = prompt_id
+        self.owned_at = datetime.now().isoformat()
+        self.ownership_history.append({
+            "action": "claimed",
+            "node_id": node_id,
+            "user_id": user_id,
+            "prompt_id": prompt_id,
+            "timestamp": self.owned_at,
+        })
+        self.updated_at = self.owned_at
+        return True
+
+    def release(self) -> bool:
+        """Release ownership of this task.
+
+        Returns:
+            True if released, False if not owned
+        """
+        if not self.owner_node_id and not self.owner_user_id:
+            return False
+        self.ownership_history.append({
+            "action": "released",
+            "node_id": self.owner_node_id,
+            "user_id": self.owner_user_id,
+            "prompt_id": self.owner_prompt_id,
+            "timestamp": datetime.now().isoformat(),
+        })
+        self.owner_node_id = None
+        self.owner_user_id = None
+        self.owner_prompt_id = None
+        self.owned_at = None
+        self.updated_at = datetime.now().isoformat()
+        return True
+
+    def transfer(self, node_id: str = None, user_id: str = None, prompt_id: str = None) -> bool:
+        """Transfer ownership to another owner (atomic release + claim).
+
+        Returns:
+            True if transferred, False if not currently owned
+        """
+        if not self.owner_node_id and not self.owner_user_id:
+            return False
+        now = datetime.now().isoformat()
+        self.ownership_history.append({
+            "action": "transferred",
+            "from_node_id": self.owner_node_id,
+            "from_user_id": self.owner_user_id,
+            "to_node_id": node_id,
+            "to_user_id": user_id,
+            "to_prompt_id": prompt_id,
+            "timestamp": now,
+        })
+        self.owner_node_id = node_id
+        self.owner_user_id = user_id
+        self.owner_prompt_id = prompt_id
+        self.owned_at = now
+        self.updated_at = now
+        return True
+
+    @property
+    def is_owned(self) -> bool:
+        """Check if this task is currently owned."""
+        return bool(self.owner_node_id or self.owner_user_id)
+
+    # ==================== Budget + Compute Methods ====================
+
+    def is_budget_exhausted(self) -> bool:
+        """Check if time or spark budget is exceeded."""
+        if self.spark_budget is not None and self.spark_spent >= self.spark_budget:
+            return True
+        if self.time_budget_s is not None and self.time_spent_s >= self.time_budget_s:
+            return True
+        # Check live elapsed time if started and has timeout
+        if self.timeout_s and self.started_at:
+            elapsed = (datetime.now() - datetime.fromisoformat(self.started_at)).total_seconds()
+            if elapsed >= self.timeout_s:
+                return True
+        return False
+
+    def is_stuck(self, threshold_s: float = 300.0) -> bool:
+        """Check if task has been in the same state too long.
+
+        Args:
+            threshold_s: Seconds before considering task stuck (default 5 min)
+        """
+        return self.get_current_state_duration() > threshold_s
+
+    def can_run_on(self, capabilities: Dict[str, Any]) -> bool:
+        """Check if compute requirements are met by given capabilities.
+
+        Args:
+            capabilities: Dict of available compute (e.g. {"gpu": True, "vram_gb": 8})
+        """
+        if not self.compute_requirements:
+            return True
+        for key, required in self.compute_requirements.items():
+            available = capabilities.get(key)
+            if available is None:
+                return False
+            if isinstance(required, bool) and required and not available:
+                return False
+            if isinstance(required, (int, float)) and isinstance(available, (int, float)):
+                if available < required:
+                    return False
+        return True
+
+    def record_spend(self, spark: float = 0.0, time_s: float = 0.0) -> None:
+        """Record resource spend on this task."""
+        self.spark_spent += spark
+        self.time_spent_s += time_s
+        self.updated_at = datetime.now().isoformat()
+
+    # ==================== Observability — Agent Heartbeat + Status ====================
+
+    def heartbeat(self, message: Optional[str] = None) -> None:
+        """Agent reports liveness while executing this task.
+
+        Lightweight — just updates a timestamp. Does NOT trigger save.
+        The agent (or ledger.save()) persists when appropriate.
+
+        Args:
+            message: Optional short status message (kept in-memory only, not appended to history)
+        """
+        self.last_heartbeat_at = datetime.now().isoformat()
+
+    def post_status(self, message: str, progress_pct: Optional[float] = None,
+                    metadata: Optional[Dict[str, Any]] = None) -> None:
+        """Agent posts a structured progress update for this task.
+
+        Appends are bounded — only last 50 messages kept to avoid unbounded growth.
+
+        Args:
+            message: Human-readable status update
+            progress_pct: Optional progress percentage update
+            metadata: Optional extra data (e.g. {"tokens_used": 1500})
+        """
+        now = datetime.now().isoformat()
+        self.last_heartbeat_at = now
+        entry = {"message": message, "timestamp": now}
+        if metadata:
+            entry["metadata"] = metadata
+        if progress_pct is not None:
+            self.progress_pct = max(0.0, min(100.0, progress_pct))
+            entry["progress_pct"] = self.progress_pct
+        self.status_messages.append(entry)
+        # Bounded — keep last 50 to prevent unbounded growth
+        if len(self.status_messages) > 50:
+            self.status_messages = self.status_messages[-50:]
+        self.updated_at = now
+
+    def is_heartbeat_stale(self, stale_threshold_s: Optional[float] = None) -> bool:
+        """Check if the agent working on this task has gone silent.
+
+        Args:
+            stale_threshold_s: Override threshold. Default: 3x heartbeat_interval_s
+        """
+        if not self.last_heartbeat_at:
+            return False  # No heartbeat expected yet
+        threshold = stale_threshold_s or (self.heartbeat_interval_s * 3)
+        elapsed = (datetime.now() - datetime.fromisoformat(self.last_heartbeat_at)).total_seconds()
+        return elapsed > threshold
+
+    def get_latest_status(self) -> Optional[Dict[str, Any]]:
+        """Get the most recent status message from the agent."""
+        return self.status_messages[-1] if self.status_messages else None
+
+    # ==================== SLA / Deadline ====================
+
+    def is_sla_breached(self) -> bool:
+        """Check if task has exceeded its SLA target or deadline.
+
+        Does NOT change task state — just reads data. Agent decides what to do.
+        """
+        now = datetime.now()
+        if self.deadline:
+            if now > datetime.fromisoformat(self.deadline):
+                return True
+        if self.sla_target_s and self.started_at:
+            elapsed = (now - datetime.fromisoformat(self.started_at)).total_seconds()
+            if elapsed > self.sla_target_s:
+                return True
+        return False
+
+    def mark_sla_breached(self) -> None:
+        """Record that SLA was breached (idempotent)."""
+        self.sla_breached = True
+        self.updated_at = datetime.now().isoformat()
+
+    # ==================== Locality + Distribution Eligibility ====================
+
+    def can_distribute(self) -> bool:
+        """Check if this task is eligible for distributed execution.
+
+        Default: True (PUBLIC + GLOBAL). Only returns False when the user
+        has explicitly set locality=LOCAL_ONLY or sensitivity=SECRET.
+        Sensitivity alone is NOT a blocker unless set to SECRET —
+        the agent decides trust boundaries for CONFIDENTIAL/INTERNAL.
+        """
+        if self.locality == TaskLocality.LOCAL_ONLY.value:
+            return False
+        if self.sensitivity == TaskSensitivity.SECRET.value:
+            return False
+        return True
+
+    def can_distribute_to_region(self) -> bool:
+        """Check if task can be distributed within a region (not globally)."""
+        if not self.can_distribute():
+            return False
+        return self.locality in (TaskLocality.REGIONAL.value, TaskLocality.GLOBAL.value)
+
+    # ==================== Integrity — Corruption Detection ====================
+
+    def compute_data_hash(self) -> str:
+        """Compute SHA-256 hash of this task's core data fields.
+
+        Used to detect corruption — compare stored hash vs recomputed hash.
+        """
+        import hashlib
+        # Hash the stable, meaningful fields (not timestamps or status_messages)
+        payload = json.dumps({
+            "task_id": self.task_id,
+            "description": self.description,
+            "task_type": self.task_type.value if hasattr(self.task_type, 'value') else str(self.task_type),
+            "prerequisites": sorted(self.prerequisites),
+            "context": self.context,
+            "priority": self.priority,
+            "parent_task_id": self.parent_task_id,
+        }, sort_keys=True)
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+    def verify_integrity(self) -> bool:
+        """Check if task data has been corrupted since last save.
+
+        Returns True if no stored hash (first check) or hash matches.
+        Returns False if stored hash doesn't match recomputed hash.
+        """
+        if self.data_hash is None:
+            return True  # No hash stored yet — nothing to verify
+        return self.compute_data_hash() == self.data_hash
+
+    def seal_integrity(self) -> None:
+        """Stamp this task with its current data hash for future verification."""
+        self.data_hash = self.compute_data_hash()
+
 
 class SmartLedger:
     """
@@ -901,11 +1269,21 @@ class SmartLedger:
         self.session_id = session_id
         self.ledger_key = f"ledger_{agent_id}_{session_id}"
         self.ledger_dir = Path(ledger_dir)
-        self.ledger_dir.mkdir(exist_ok=True)
+        try:
+            self.ledger_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # Bundled/installed mode: relative path resolves to read-only dir
+            try:
+                from core.platform_paths import get_agent_data_dir
+                self.ledger_dir = Path(get_agent_data_dir())
+            except ImportError:
+                self.ledger_dir = Path.home() / 'Documents' / 'Nunba' / 'data' / 'agent_data'
+            self.ledger_dir.mkdir(parents=True, exist_ok=True)
         self.ledger_file = self.ledger_dir / f"ledger_{agent_id}_{session_id}.json"
         self.tasks: Dict[str, Task] = {}
         self.task_order: List[str] = []  # Track order of task creation
         self.events: List[Dict[str, Any]] = []
+        self._lock = threading.RLock()  # Thread safety for self.tasks
 
         # Initialize storage backend
         if backend is None:
@@ -971,44 +1349,67 @@ class SmartLedger:
 
     def add_task(self, task: Task) -> bool:
         """Add a new task to ledger."""
-        if task.task_id in self.tasks:
-            logger.warning(f"Task {task.task_id} already exists")
-            return False
+        with self._lock:
+            if task.task_id in self.tasks:
+                logger.warning(f"Task {task.task_id} already exists")
+                return False
 
-        self.tasks[task.task_id] = task
-        if task.task_id not in self.task_order:
-            self.task_order.append(task.task_id)
-        self.save()
-        logger.info(f"Added task {task.task_id}: {task.description}")
-        return True
+            self.tasks[task.task_id] = task
+            if task.task_id not in self.task_order:
+                self.task_order.append(task.task_id)
+            self.save()
+            logger.info(f"Added task {task.task_id}: {task.description}")
+            return True
 
     def update_task_status(
         self,
         task_id: str,
         status: TaskStatus,
         error_message: Optional[str] = None,
-        result: Optional[Any] = None
+        result: Optional[Any] = None,
+        reason: Optional[str] = None
     ):
-        """Update task status with automatic dependency management."""
-        if task_id not in self.tasks:
-            logger.error(f"Task {task_id} not found")
-            return False
+        """Update task status with validation and automatic dependency management."""
+        with self._lock:
+            if task_id not in self.tasks:
+                logger.error(f"Task {task_id} not found")
+                return False
 
-        task = self.tasks[task_id]
-        task.status = status
-        task.updated_at = datetime.now().isoformat()
+            # Coerce string to TaskStatus enum for backward compatibility
+            if isinstance(status, str) and not isinstance(status, TaskStatus):
+                try:
+                    status = TaskStatus(status)
+                except ValueError:
+                    logger.error(f"Unknown status value: {status}")
+                    return False
 
-        if status == TaskStatus.COMPLETED:
-            task.completed_at = task.updated_at
-            task.result = result
-            self._handle_task_completion(task)
+            task = self.tasks[task_id]
 
-        if error_message:
-            task.error_message = error_message
+            # Validate transition (Bug #2 fix — was bypassing _validate_transition)
+            if not task._validate_transition(status):
+                logger.warning(
+                    f"Invalid transition for task {task_id}: {task.status} -> {status}"
+                )
+                return False
 
-        self.save()
-        logger.info(f"Updated task {task_id} status to {status}")
-        return True
+            # Record in state history before changing status
+            transition_reason = reason or f"Status updated to {status.value}"
+            task._record_state_transition(status, transition_reason)
+
+            if status == TaskStatus.COMPLETED:
+                task.completed_at = task.updated_at
+                task.result = result
+                self._handle_task_completion(task)
+
+            if status == TaskStatus.IN_PROGRESS and not task.started_at:
+                task.started_at = datetime.now().isoformat()
+
+            if error_message:
+                task.error_message = error_message
+
+            self.save()
+            logger.info(f"Updated task {task_id} status to {status}")
+            return True
 
     def reprioritize_task(self, task_id: str, new_priority: int):
         """Change task priority (0-100)."""
@@ -1506,8 +1907,16 @@ class SmartLedger:
         }
         task.send_message_to_dependents(completion_message)
 
+        # Collect ALL tasks that depend on the completed task:
+        # 1. Explicitly registered dependents (task.dependent_task_ids)
+        # 2. Tasks with this task in their prerequisites list
+        all_dependent_ids = set(task.dependent_task_ids)
+        for t in self.tasks.values():
+            if task.task_id in t.prerequisites:
+                all_dependent_ids.add(t.task_id)
+
         auto_resumed = []
-        for dependent_id in task.dependent_task_ids:
+        for dependent_id in all_dependent_ids:
             dependent = self.get_task(dependent_id)
             if dependent:
                 for msg in task.messages_to_dependents:
@@ -1730,7 +2139,7 @@ class SmartLedger:
             if previous_task_id:
                 task.prerequisites.append(previous_task_id)
                 task.add_blocking_task(previous_task_id)
-                task.status = TaskStatus.BLOCKED
+                task._record_state_transition(TaskStatus.BLOCKED, f"Blocked by prerequisite {previous_task_id}")
 
                 prev_task = self.get_task(previous_task_id)
                 if prev_task:
@@ -1929,7 +2338,7 @@ class SmartLedger:
         if classification.get('blocked_by'):
             task.blocked_by = classification['blocked_by']
             task.blocked_reason = classification.get('blocked_reason')
-            task.status = TaskStatus.BLOCKED
+            task._record_state_transition(TaskStatus.BLOCKED, f"Blocked by: {classification.get('blocked_reason', 'dependencies')}")
 
         # 2. Delegation
         delegation = classification.get('delegation', {})
@@ -1937,7 +2346,7 @@ class SmartLedger:
             task.delegated_to = delegation.get('delegate_to')
             task.delegated_at = datetime.now().isoformat()
             task.delegation_type = delegation.get('delegation_type')
-            task.status = TaskStatus.DELEGATED
+            task._record_state_transition(TaskStatus.DELEGATED, f"Delegated to {delegation.get('delegate_to')}")
 
         # 3. Scheduling/Deferral
         scheduling = classification.get('scheduling', {})
@@ -1945,7 +2354,7 @@ class SmartLedger:
             task.deferred_at = datetime.now().isoformat()
             task.deferred_until = scheduling.get('defer_until')
             task.deferred_reason = scheduling.get('defer_reason')
-            task.status = TaskStatus.DEFERRED
+            task._record_state_transition(TaskStatus.DEFERRED, scheduling.get('defer_reason', 'Deferred'))
         if scheduling.get('scheduled_at'):
             task.scheduled_at = scheduling.get('scheduled_at')
 
@@ -2122,26 +2531,16 @@ RELATIONSHIP TYPES:
             }
 
     def _get_default_llm_client(self) -> Any:
-        """Get default LLM client for classification."""
-        class SimpleLLMClient:
-            def complete(self, prompt: str) -> str:
-                import requests
-                try:
-                    response = requests.post(
-                        "http://localhost:8080/v1/chat/completions",
-                        json={
-                            "model": "Qwen3-VL-4B-Instruct",
-                            "messages": [{"role": "user", "content": prompt}],
-                            "max_tokens": 500,
-                            "temperature": 0.1
-                        },
-                        timeout=30
-                    )
-                    return response.json()['choices'][0]['message']['content']
-                except Exception as e:
-                    logger.error(f"LLM call failed: {e}")
-                    raise
-        return SimpleLLMClient()
+        """Get default LLM client for classification.
+
+        Raises NotImplementedError — the ledger is framework-agnostic.
+        Callers must pass their own llm_client to methods that need LLM inference.
+        """
+        raise NotImplementedError(
+            "No LLM client configured. Pass llm_client= to methods that require "
+            "language model inference. The agent-ledger package is framework-agnostic "
+            "and does not bundle a default LLM client."
+        )
 
     # ==================== TASK ORCHESTRATION ====================
 
@@ -2280,28 +2679,23 @@ RELATIONSHIP TYPES:
         task = self.tasks[task_id]
 
         if outcome == 'success':
-            task.status = TaskStatus.COMPLETED
-            task.completed_at = datetime.now().isoformat()
-            task.result = result
-            task.progress_pct = 100.0
+            task.complete(result, reason=f"Task completed: {result}" if result else "Task completed")
         else:
-            task.status = TaskStatus.FAILED
-            task.failure_reason = "execution_failed"
-            task.error_message = str(result) if result else "Task failed"
+            error_msg = str(result) if result else "Task failed"
 
             if task.retry_count < task.max_retries:
+                # Retry: don't transition to FAILED (terminal). Instead, record
+                # the retry and reset to PENDING for re-execution.
                 task.retry_count += 1
                 task.last_retry_at = datetime.now().isoformat()
-                task.retry_errors.append(task.error_message)
-                task.status = TaskStatus.PENDING
+                task.retry_errors.append(error_msg)
+                task.error_message = error_msg
+                task._record_state_transition(TaskStatus.PENDING, f"Retry {task.retry_count}/{task.max_retries}")
                 task.pending_reason = "queued"
                 logger.info(f"Task {task_id} failed, retry {task.retry_count}/{task.max_retries}")
-
-        task.state_history.append({
-            "status": task.status.value if hasattr(task.status, 'value') else str(task.status),
-            "timestamp": datetime.now().isoformat(),
-            "reason": f"Task {outcome}: {result}" if result else f"Task {outcome}"
-        })
+            else:
+                # No retries left — transition to terminal FAILED
+                task.fail(error_msg, reason=error_msg)
 
         # Send messages to dependent tasks
         for dep_id in task.dependent_task_ids:
@@ -2341,7 +2735,6 @@ RELATIONSHIP TYPES:
         )
 
         if all_complete and parent_task.status == TaskStatus.BLOCKED:
-            parent_task.status = TaskStatus.IN_PROGRESS
             parent_task._record_state_transition(TaskStatus.IN_PROGRESS, "All subtasks completed")
             logger.info(f"Unblocked parent task {parent_id} - all {len(children)} subtasks complete")
             return True
@@ -2398,7 +2791,6 @@ RELATIONSHIP TYPES:
             # Block parent task until children complete
             parent_task = self.tasks[parent_task_id]
             if parent_task.status != TaskStatus.BLOCKED:
-                parent_task.status = TaskStatus.BLOCKED
                 parent_task._record_state_transition(
                     TaskStatus.BLOCKED,
                     f"Waiting for {len(subtasks)} subtasks to complete"
@@ -3079,6 +3471,8 @@ def create_ledger_from_actions(
             priority=100 - action.get('action_id', 0)
         )
 
+        # Seal integrity hash so we can detect corruption later
+        task.seal_integrity()
         ledger.add_task(task)
 
     return ledger

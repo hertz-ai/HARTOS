@@ -8,7 +8,7 @@ from .models import get_engine, Base
 
 logger = logging.getLogger('hevolve_social')
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 35
 
 
 def get_schema_version(engine) -> int:
@@ -49,12 +49,12 @@ def run_migrations():
         with engine.connect() as conn:
             try:
                 conn.execute(text("ALTER TABLE users ADD COLUMN handle VARCHAR(30) UNIQUE"))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("v2 migration: ADD COLUMN handle skipped (may already exist): %s", e)
             try:
                 conn.execute(text("ALTER TABLE users ADD COLUMN local_name VARCHAR(35)"))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("v2 migration: ADD COLUMN local_name skipped (may already exist): %s", e)
             conn.commit()
         set_schema_version(engine, 2)
 
@@ -75,8 +75,8 @@ def run_migrations():
             ]:
                 try:
                     conn.execute(text(stmt))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("v3 migration: %s skipped: %s", stmt.split("ADD COLUMN ")[-1].split()[0], e)
             conn.commit()
         # Bootstrap existing users: create wallets
         from .models import get_db, User
@@ -128,8 +128,8 @@ def run_migrations():
             ]:
                 try:
                     conn.execute(text(stmt))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("v5 migration: %s skipped: %s", stmt.split("ADD COLUMN ")[-1].split()[0], e)
             conn.commit()
         set_schema_version(engine, 5)
 
@@ -163,8 +163,8 @@ def run_migrations():
             ]:
                 try:
                     conn.execute(text(stmt))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("v8 migration: %s skipped: %s", stmt.split("ADD COLUMN ")[-1].split()[0], e)
             conn.commit()
         set_schema_version(engine, 8)
 
@@ -184,8 +184,8 @@ def run_migrations():
             ]:
                 try:
                     conn.execute(text(stmt))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("v9 migration: %s skipped: %s", stmt.split("ADD COLUMN ")[-1].split()[0], e)
             conn.commit()
         set_schema_version(engine, 9)
 
@@ -200,8 +200,8 @@ def run_migrations():
             try:
                 conn.execute(text(
                     "ALTER TABLE peer_nodes ADD COLUMN node_operator_id VARCHAR(64) REFERENCES users(id)"))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("v10 migration: ADD COLUMN node_operator_id skipped: %s", e)
             conn.commit()
         # Backfill contribution_score for existing active nodes
         from .models import get_db, PeerNode
@@ -261,8 +261,8 @@ def run_migrations():
             ]:
                 try:
                     conn.execute(text(stmt))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("v11 migration: %s skipped: %s", stmt.split("ADD COLUMN ")[-1].split()[0], e)
             conn.commit()
         set_schema_version(engine, 11)
 
@@ -275,8 +275,8 @@ def run_migrations():
             ]:
                 try:
                     conn.execute(text(stmt))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("v12 migration: %s skipped: %s", stmt.split("ADD COLUMN ")[-1].split()[0], e)
             conn.commit()
         set_schema_version(engine, 12)
 
@@ -302,8 +302,8 @@ def run_migrations():
             ]:
                 try:
                     conn.execute(text(stmt))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("v13 migration: %s skipped: %s", stmt.split("ADD COLUMN ")[-1].split()[0], e)
             # Add hierarchy columns to regions
             for stmt in [
                 "ALTER TABLE regions ADD COLUMN host_node_id VARCHAR(64)",
@@ -316,8 +316,8 @@ def run_migrations():
             ]:
                 try:
                     conn.execute(text(stmt))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("v13 migration: %s skipped: %s", stmt.split("ADD COLUMN ")[-1].split()[0], e)
             conn.commit()
         set_schema_version(engine, 13)
 
@@ -329,8 +329,8 @@ def run_migrations():
         with engine.connect() as conn:
             try:
                 conn.execute(text("ALTER TABLE users ADD COLUMN idle_compute_opt_in BOOLEAN DEFAULT 0"))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("v14 migration: ADD COLUMN idle_compute_opt_in skipped: %s", e)
             conn.commit()
         set_schema_version(engine, 14)
 
@@ -339,15 +339,15 @@ def run_migrations():
         with engine.connect() as conn:
             try:
                 conn.execute(text("ALTER TABLE users ADD COLUMN role VARCHAR(20) DEFAULT 'flat'"))
-            except Exception:
-                pass  # Column may already exist
+            except Exception as e:
+                logger.warning("v15 migration: ADD COLUMN role skipped (may already exist): %s", e)
             # Backfill: is_admin -> central, is_moderator (non-admin) -> regional, NULL -> flat
             try:
                 conn.execute(text("UPDATE users SET role = 'central' WHERE is_admin = 1"))
                 conn.execute(text("UPDATE users SET role = 'regional' WHERE is_moderator = 1 AND is_admin = 0"))
                 conn.execute(text("UPDATE users SET role = 'flat' WHERE role IS NULL"))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error("v15 migration: role backfill failed: %s", e)
             conn.commit()
         set_schema_version(engine, 15)
 
@@ -356,12 +356,12 @@ def run_migrations():
         with engine.connect() as conn:
             try:
                 conn.execute(text("ALTER TABLE posts ADD COLUMN is_hidden BOOLEAN DEFAULT 0"))
-            except Exception:
-                pass  # Column may already exist
+            except Exception as e:
+                logger.warning("v16 migration: ADD COLUMN posts.is_hidden skipped (may already exist): %s", e)
             try:
                 conn.execute(text("ALTER TABLE comments ADD COLUMN is_hidden BOOLEAN DEFAULT 0"))
-            except Exception:
-                pass  # Column may already exist
+            except Exception as e:
+                logger.warning("v16 migration: ADD COLUMN comments.is_hidden skipped (may already exist): %s", e)
             conn.commit()
         set_schema_version(engine, 16)
 
@@ -377,8 +377,8 @@ def run_migrations():
             ]:
                 try:
                     conn.execute(text(stmt))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("v17 migration: rename skipped: %s — %s", stmt[:60], e)
             conn.commit()
         set_schema_version(engine, 17)
 
@@ -395,3 +395,353 @@ def run_migrations():
         for tbl in [IPPatent.__table__, IPInfringement.__table__]:
             tbl.create(engine, checkfirst=True)
         set_schema_version(engine, 19)
+
+    if current < 20:
+        logger.info("HevolveSocial: migrating to v20 (Thought Experiment fields on posts)")
+        with engine.connect() as conn:
+            for stmt in [
+                "ALTER TABLE posts ADD COLUMN intent_category VARCHAR(30)",
+                "ALTER TABLE posts ADD COLUMN hypothesis TEXT",
+                "ALTER TABLE posts ADD COLUMN expected_outcome TEXT",
+                "ALTER TABLE posts ADD COLUMN is_thought_experiment BOOLEAN DEFAULT 0",
+                "ALTER TABLE posts ADD COLUMN dynamic_layout JSON",
+            ]:
+                try:
+                    conn.execute(text(stmt))
+                except Exception as e:
+                    logger.warning("v20 migration: %s skipped (may already exist): %s", stmt.split("ADD COLUMN ")[-1].split()[0], e)
+            conn.commit()
+        set_schema_version(engine, 20)
+
+    if current < 21:
+        logger.info("HevolveSocial: migrating to v21 (Node capability tier - HART OS equilibrium)")
+        with engine.connect() as conn:
+            for stmt in [
+                "ALTER TABLE peer_nodes ADD COLUMN capability_tier VARCHAR(20)",
+                "ALTER TABLE peer_nodes ADD COLUMN enabled_features_json JSON",
+            ]:
+                try:
+                    conn.execute(text(stmt))
+                except Exception as e:
+                    logger.warning("v21 migration: %s skipped (may already exist): %s", stmt.split("ADD COLUMN ")[-1].split()[0], e)
+            conn.commit()
+        set_schema_version(engine, 21)
+
+    if current < 22:
+        logger.info("HevolveSocial: migrating to v22 (Commercial API + Defensive IP + Build Licenses)")
+        from .models import DefensivePublication, CommercialAPIKey, APIUsageLog, BuildLicense
+        for tbl in [DefensivePublication.__table__, CommercialAPIKey.__table__,
+                     APIUsageLog.__table__, BuildLicense.__table__]:
+            tbl.create(engine, checkfirst=True)
+        set_schema_version(engine, 22)
+
+    if current < 23:
+        logger.info("HevolveSocial: migrating to v23 (Fail2ban: ban_count + ban_until on PeerNode)")
+        with engine.connect() as conn:
+            for stmt in [
+                "ALTER TABLE peer_nodes ADD COLUMN ban_count INTEGER DEFAULT 0",
+                "ALTER TABLE peer_nodes ADD COLUMN ban_until DATETIME",
+            ]:
+                try:
+                    conn.execute(text(stmt))
+                except Exception as e:
+                    logger.warning("v23 migration: %s skipped (may already exist): %s", stmt.split("ADD COLUMN ")[-1].split()[0], e)
+            conn.commit()
+        set_schema_version(engine, 23)
+
+    if current < 24:
+        logger.info("HevolveSocial: migrating to v24 (Guest Recovery + Device Bindings + Backup Metadata)")
+        from .models import GuestRecovery, DeviceBinding, BackupMetadata
+        for tbl in [GuestRecovery.__table__, DeviceBinding.__table__, BackupMetadata.__table__]:
+            tbl.create(engine, checkfirst=True)
+        set_schema_version(engine, 24)
+
+    if current < 25:
+        logger.info("HevolveSocial: migrating to v25 (Regional Host Requests)")
+        from .models import RegionalHostRequest
+        RegionalHostRequest.__table__.create(engine, checkfirst=True)
+        set_schema_version(engine, 25)
+
+    if current < 26:
+        logger.info("HevolveSocial: migrating to v26 (Fleet Command - Queen Bee Authority)")
+        from .models import FleetCommand
+        FleetCommand.__table__.create(engine, checkfirst=True)
+        set_schema_version(engine, 26)
+
+    if current < 27:
+        logger.info("HevolveSocial: migrating to v27 (Device form_factor + capabilities)")
+        with engine.connect() as conn:
+            for stmt in [
+                "ALTER TABLE device_bindings ADD COLUMN form_factor VARCHAR(20) DEFAULT 'phone'",
+                "ALTER TABLE device_bindings ADD COLUMN capabilities_json TEXT DEFAULT '{}'",
+            ]:
+                try:
+                    conn.execute(text(stmt))
+                except Exception as e:
+                    logger.warning("v27 migration: %s skipped: %s", stmt.split("ADD COLUMN ")[-1].split()[0], e)
+            conn.commit()
+        set_schema_version(engine, 27)
+
+    if current < 28:
+        logger.info("HevolveSocial: migrating to v28 (Impression seal columns)")
+        with engine.connect() as conn:
+            for stmt in [
+                "ALTER TABLE ad_impressions ADD COLUMN witness_node_id VARCHAR(64)",
+                "ALTER TABLE ad_impressions ADD COLUMN witness_signature VARCHAR(256)",
+                "ALTER TABLE ad_impressions ADD COLUMN sealed_hash VARCHAR(64)",
+                "ALTER TABLE ad_impressions ADD COLUMN sealed_at DATETIME",
+            ]:
+                try:
+                    conn.execute(text(stmt))
+                except Exception as e:
+                    logger.warning("v28 migration: %s skipped: %s", stmt.split("ADD COLUMN ")[-1].split()[0], e)
+            conn.commit()
+        set_schema_version(engine, 28)
+
+    if current < 29:
+        logger.info("HevolveSocial: migrating to v29 (ProvisionedNode table)")
+        with engine.connect() as conn:
+            try:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS provisioned_nodes (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        target_host VARCHAR(256) NOT NULL,
+                        ssh_user VARCHAR(64) DEFAULT 'root',
+                        node_id VARCHAR(64),
+                        peer_node_id INTEGER,
+                        capability_tier VARCHAR(20),
+                        status VARCHAR(20) DEFAULT 'pending',
+                        installed_version VARCHAR(32),
+                        last_health_check DATETIME,
+                        provisioned_at DATETIME,
+                        provisioned_by VARCHAR(64) NOT NULL DEFAULT 'system',
+                        error_message TEXT,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                """))
+            except Exception as e:
+                logger.warning("v29 migration: CREATE TABLE provisioned_nodes skipped: %s", e)
+            try:
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_provisioned_nodes_target_host "
+                    "ON provisioned_nodes (target_host)"))
+            except Exception as e:
+                logger.warning("v29 migration: CREATE INDEX target_host skipped: %s", e)
+            try:
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_provisioned_nodes_status "
+                    "ON provisioned_nodes (status)"))
+            except Exception as e:
+                logger.warning("v29 migration: CREATE INDEX status skipped: %s", e)
+            conn.commit()
+        set_schema_version(engine, 29)
+
+    if current < 30:
+        logger.info("HevolveSocial: migrating to v30 (ThoughtExperiment + ExperimentVote)")
+        with engine.connect() as conn:
+            try:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS thought_experiments (
+                        id VARCHAR(64) PRIMARY KEY,
+                        post_id VARCHAR(64),
+                        creator_id VARCHAR(64) NOT NULL,
+                        title VARCHAR(200) NOT NULL,
+                        hypothesis TEXT NOT NULL,
+                        expected_outcome TEXT,
+                        intent_category VARCHAR(30) DEFAULT 'technology',
+                        status VARCHAR(20) DEFAULT 'proposed',
+                        decision_type VARCHAR(20) DEFAULT 'weighted',
+                        voting_opens_at DATETIME,
+                        voting_closes_at DATETIME,
+                        evaluation_deadline DATETIME,
+                        decision_outcome TEXT,
+                        decision_rationale JSON,
+                        total_votes INTEGER DEFAULT 0,
+                        agent_evaluations_json JSON,
+                        is_core_ip BOOLEAN DEFAULT 0,
+                        parent_experiment_id VARCHAR(64),
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                """))
+            except Exception as e:
+                logger.warning("v30 migration: CREATE TABLE thought_experiments skipped: %s", e)
+            try:
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_thought_experiments_status "
+                    "ON thought_experiments (status)"))
+            except Exception as e:
+                logger.warning("v30 migration: index on status skipped: %s", e)
+            try:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS experiment_votes (
+                        id VARCHAR(64) PRIMARY KEY,
+                        experiment_id VARCHAR(64) NOT NULL,
+                        voter_id VARCHAR(64) NOT NULL,
+                        voter_type VARCHAR(10) DEFAULT 'human',
+                        vote_value INTEGER DEFAULT 0,
+                        confidence FLOAT DEFAULT 1.0,
+                        reasoning TEXT,
+                        suggestion TEXT,
+                        constitutional_check BOOLEAN DEFAULT 1,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE (experiment_id, voter_id)
+                    )
+                """))
+            except Exception as e:
+                logger.warning("v30 migration: CREATE TABLE experiment_votes skipped: %s", e)
+            try:
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_experiment_votes_experiment_id "
+                    "ON experiment_votes (experiment_id)"))
+            except Exception as e:
+                logger.warning("v30 migration: index on experiment_id skipped: %s", e)
+            conn.commit()
+        set_schema_version(engine, 30)
+
+    if current < 31:
+        logger.info("HevolveSocial: migrating to v31 (PeerNode x25519_public for E2E encryption)")
+        with engine.connect() as conn:
+            try:
+                conn.execute(text(
+                    "ALTER TABLE peer_nodes ADD COLUMN x25519_public VARCHAR(64)"))
+            except Exception as e:
+                logger.warning("v31 migration: ADD COLUMN x25519_public skipped: %s", e)
+            conn.commit()
+        set_schema_version(engine, 31)
+
+    if current < 32:
+        logger.info("HevolveSocial: migrating to v32 (multiplayer game tables)")
+        with engine.connect() as conn:
+            try:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS game_sessions (
+                        id VARCHAR(64) PRIMARY KEY,
+                        game_type VARCHAR(30) NOT NULL,
+                        status VARCHAR(20) DEFAULT 'waiting',
+                        host_user_id VARCHAR(64) NOT NULL REFERENCES users(id),
+                        encounter_id VARCHAR(64),
+                        community_id VARCHAR(64),
+                        challenge_id VARCHAR(64),
+                        max_players INTEGER DEFAULT 4,
+                        current_round INTEGER DEFAULT 0,
+                        total_rounds INTEGER DEFAULT 5,
+                        game_state JSON,
+                        config JSON,
+                        started_at DATETIME,
+                        ended_at DATETIME,
+                        expires_at DATETIME NOT NULL,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                """))
+            except Exception as e:
+                logger.warning("v32 migration: CREATE TABLE game_sessions skipped: %s", e)
+            try:
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_game_sessions_status ON game_sessions (status)"))
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_game_sessions_host ON game_sessions (host_user_id)"))
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_game_sessions_type ON game_sessions (game_type)"))
+            except Exception as e:
+                logger.warning("v32 migration: game_sessions indexes skipped: %s", e)
+            try:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS game_participants (
+                        id VARCHAR(64) PRIMARY KEY,
+                        game_session_id VARCHAR(64) NOT NULL REFERENCES game_sessions(id),
+                        user_id VARCHAR(64) NOT NULL REFERENCES users(id),
+                        score INTEGER DEFAULT 0,
+                        is_ready BOOLEAN DEFAULT 0,
+                        joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        finished_at DATETIME,
+                        result VARCHAR(20),
+                        spark_earned INTEGER DEFAULT 0,
+                        xp_earned INTEGER DEFAULT 0,
+                        UNIQUE (game_session_id, user_id)
+                    )
+                """))
+            except Exception as e:
+                logger.warning("v32 migration: CREATE TABLE game_participants skipped: %s", e)
+            try:
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_game_participants_session "
+                    "ON game_participants (game_session_id)"))
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_game_participants_user "
+                    "ON game_participants (user_id)"))
+            except Exception as e:
+                logger.warning("v32 migration: game_participants indexes skipped: %s", e)
+            conn.commit()
+        set_schema_version(engine, 32)
+
+    if current < 33:
+        logger.info("HevolveSocial: migrating to v33 (thought experiment discovery fields)")
+        with engine.connect() as conn:
+            for stmt in [
+                "ALTER TABLE thought_experiments ADD COLUMN experiment_type VARCHAR(20) DEFAULT 'traditional'",
+                "ALTER TABLE thought_experiments ADD COLUMN funding_total INTEGER DEFAULT 0",
+                "ALTER TABLE thought_experiments ADD COLUMN contributor_count INTEGER DEFAULT 0",
+                "ALTER TABLE thought_experiments ADD COLUMN camera_feed_url VARCHAR(500)",
+            ]:
+                try:
+                    conn.execute(text(stmt))
+                except Exception as e:
+                    col = stmt.split("ADD COLUMN ")[-1].split()[0]
+                    logger.warning("v33 migration: ADD COLUMN %s skipped: %s", col, e)
+            conn.commit()
+        set_schema_version(engine, 33)
+
+    if current < 34:
+        logger.info("HevolveSocial: migrating to v34 (Compute pledge extensions for thought experiments)")
+        with engine.connect() as conn:
+            # Extend compute_escrow for experiment-specific pledges
+            for stmt in [
+                "ALTER TABLE compute_escrow ADD COLUMN experiment_post_id VARCHAR(64)",
+                "ALTER TABLE compute_escrow ADD COLUMN pledge_type VARCHAR(20)",
+                "ALTER TABLE compute_escrow ADD COLUMN consumed REAL DEFAULT 0.0",
+                "ALTER TABLE compute_escrow ADD COLUMN pledge_message TEXT",
+            ]:
+                try:
+                    conn.execute(text(stmt))
+                except Exception as e:
+                    col = stmt.split("ADD COLUMN ")[-1].split()[0]
+                    logger.warning("v34 migration: ADD COLUMN %s on compute_escrow skipped: %s", col, e)
+            # Index for fast experiment pledge lookups
+            try:
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_compute_escrow_experiment_post_id "
+                    "ON compute_escrow (experiment_post_id)"))
+            except Exception as e:
+                logger.warning("v34 migration: index on experiment_post_id skipped: %s", e)
+            # Extend metered_api_usage for consumption-to-escrow linking
+            for stmt in [
+                "ALTER TABLE metered_api_usage ADD COLUMN escrow_id INTEGER",
+                "ALTER TABLE metered_api_usage ADD COLUMN experiment_post_id VARCHAR(64)",
+            ]:
+                try:
+                    conn.execute(text(stmt))
+                except Exception as e:
+                    col = stmt.split("ADD COLUMN ")[-1].split()[0]
+                    logger.warning("v34 migration: ADD COLUMN %s on metered_api_usage skipped: %s", col, e)
+            try:
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_metered_api_usage_escrow_id "
+                    "ON metered_api_usage (escrow_id)"))
+            except Exception as e:
+                logger.warning("v34 migration: index on escrow_id skipped: %s", e)
+            try:
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_metered_api_usage_experiment_post_id "
+                    "ON metered_api_usage (experiment_post_id)"))
+            except Exception as e:
+                logger.warning("v34 migration: index on experiment_post_id skipped: %s", e)
+            conn.commit()
+        set_schema_version(engine, 34)
+
+    if current < 35:
+        logger.info("HevolveSocial: migrating to v35 (Compute Pledge + Consumption tables)")
+        from .models import ComputePledge, PledgeConsumption
+        for tbl in [ComputePledge.__table__, PledgeConsumption.__table__]:
+            tbl.create(engine, checkfirst=True)
+        set_schema_version(engine, 35)

@@ -1,17 +1,17 @@
 """
 Unified Agent Goal Engine - World Model Bridge
 
-Bridge between LLM-langchain orchestration and crawl4ai's embodied AI.
+Bridge between LLM-langchain orchestration and HevolveAI's embodied AI.
 Every agent interaction becomes training data for continuous learning.
 Skills distribute via gossip notification + local RALT ingestion.
 
 Dual-mode operation:
   IN-PROCESS (flat/regional): Direct Python calls — zero HTTP overhead.
-    crawl4ai is pip-installed, learning functions called directly.
-  HTTP FALLBACK (central standalone): REST calls to remote crawl4ai.
+    HevolveAI is pip-installed, learning functions called directly.
+  HTTP FALLBACK (central standalone): REST calls to remote HevolveAI.
     Used when services run as separate processes on different ports.
 
-Bootstrap: crawl4ai uses llama.cpp (Qwen3-VL-2B, Q4_K_XL, ~1.5GB) locally.
+Bootstrap: HevolveAI uses llama.cpp (Qwen3-VL-2B, Q4_K_XL, ~1.5GB) locally.
 No external API key needed.  Learning is local-first, distributed via RALT + WAMP.
 
 GUARDRAILS applied at every layer:
@@ -19,6 +19,7 @@ GUARDRAILS applied at every layer:
 - WorldModelSafetyBounds on RALT export (rate limit + witness)
 - ConstructiveFilter on skill packets (no destructive capabilities)
 """
+import atexit
 import json
 import logging
 import os
@@ -30,28 +31,31 @@ from typing import Dict, List, Optional
 
 import requests
 
+from core.http_pool import pooled_get, pooled_post
+
 logger = logging.getLogger('hevolve_social')
 
 
 class WorldModelBridge:
-    """Bridge between LLM-langchain orchestration and crawl4ai embodied AI.
+    """Bridge between LLM-langchain orchestration and HevolveAI embodied AI.
 
-    Dual-mode: in-process direct Python calls when crawl4ai is co-located
+    Dual-mode: in-process direct Python calls when HevolveAI is co-located
     (flat/regional), HTTP fallback when running as separate processes (central).
 
     Two-tier thinking model:
     - Agent-level: Hevolve dispatches coarse-grained goals (task delegation)
-    - Tensor-level: crawl4ai fuses heterogeneous agent thoughts (HiveMind)
+    - Tensor-level: HevolveAI fuses heterogeneous agent thoughts (HiveMind)
     This bridge connects the two layers.
     """
 
     def __init__(self):
         self._api_url = os.environ.get(
-            'CRAWL4AI_API_URL', 'http://localhost:8000')
+            'HEVOLVEAI_API_URL', 'http://localhost:8000')
         self._node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
         self._experience_queue: deque = deque(maxlen=10000)
         self._flush_executor = ThreadPoolExecutor(
             max_workers=2, thread_name_prefix='wm_flush')
+        atexit.register(lambda: self._flush_executor.shutdown(wait=False))
         self._flush_batch_size = int(os.environ.get(
             'HEVOLVE_WM_FLUSH_BATCH', '50'))
         self._lock = threading.Lock()
@@ -65,19 +69,218 @@ class WorldModelBridge:
             'node_tier': self._node_tier,
         }
 
+        # Configurable HTTP timeouts
+        self._timeout_flush = int(os.environ.get('HEVOLVE_WM_FLUSH_TIMEOUT', '15'))
+        self._timeout_correction = int(os.environ.get('HEVOLVE_WM_CORRECTION_TIMEOUT', '30'))
+        self._timeout_default = int(os.environ.get('HEVOLVE_WM_HTTP_TIMEOUT', '10'))
+
+        # Circuit breaker: reusable implementation from core
+        from core.circuit_breaker import CircuitBreaker
+        self._circuit_breaker = CircuitBreaker(
+            name='world_model_bridge', threshold=5, cooldown=60.0)
+
         # In-process mode: direct Python calls (no HTTP overhead)
         self._provider = None  # LearningLLMProvider
         self._hive_mind = None  # HiveMind
         self._in_process = False
+        self._in_process_retry_done = False
+        self._federation_aggregated = {}
+
+        # Cloud consent: per-user gate for non-local HTTP data sharing.
+        # "If anyways it needs to be sent to cloud for something then
+        #  let's get consent from user at runtime." — project steward
+        self._consent_cache: Dict[str, tuple] = {}  # user_id → (bool, timestamp)
+        self._consent_cache_ttl = 300  # 5 minutes
+
+        # CCT (Compute Contribution Token) cache for learning access gating
+        self._cct_cache: Optional[tuple] = None  # (cct_string, timestamp)
+        self._cct_cache_ttl = 300  # 5 minutes
+        self._node_id: Optional[str] = None
+
         self._init_in_process()
+
+        # Periodic HevolveAI integrity watcher (Gap 1 fix)
+        self._crawl_watcher = None
+        self._start_crawl_integrity_watcher()
+
+    def _start_crawl_integrity_watcher(self) -> None:
+        """Start periodic HevolveAI integrity watcher if in-process mode active.
+
+        No-op if HTTP mode (nothing to watch — HTTP doesn't depend on
+        HevolveAI's local file state).
+        """
+        if not self._in_process:
+            return
+        try:
+            from security.source_protection import CrawlIntegrityWatcher
+            watcher = CrawlIntegrityWatcher()
+            watcher.register_tamper_callback(self._on_crawl_tamper_detected)
+            watcher.start()
+            self._crawl_watcher = watcher
+            logger.info("[WorldModelBridge] CrawlIntegrityWatcher started")
+        except ImportError:
+            pass  # source_protection not available
+        except Exception as e:
+            logger.warning(
+                f"[WorldModelBridge] CrawlIntegrityWatcher failed: {e}")
+
+    def _on_crawl_tamper_detected(self) -> None:
+        """Callback: HevolveAI files changed post-boot.
+
+        Disable in-process mode and fall back to HTTP.
+        Does NOT halt the hive — that requires master key.
+        """
+        logger.critical(
+            "[WorldModelBridge] HevolveAI tampering detected — "
+            "disabling in-process mode, falling back to HTTP")
+        with self._lock:
+            self._in_process = False
+            self._provider = None
+            self._hive_mind = None
+
+    def _cb_is_open(self) -> bool:
+        """Check if circuit breaker is open (blocking requests)."""
+        return self._circuit_breaker.is_open()
+
+    def _cb_record_success(self):
+        """Reset circuit breaker on successful call."""
+        self._circuit_breaker.record_success()
+
+    def _cb_record_failure(self):
+        """Record failure; open circuit at threshold."""
+        self._circuit_breaker.record_failure()
+
+    def _is_external_target(self) -> bool:
+        """Check if the API URL points to a non-local (cloud) endpoint."""
+        url = self._api_url.lower()
+        local_prefixes = (
+            'http://localhost', 'http://127.0.0.1',
+            'http://0.0.0.0', 'http://[::1]',
+        )
+        return not any(url.startswith(p) for p in local_prefixes)
+
+    def _has_cloud_consent(self, user_id: str) -> bool:
+        """Check if a user has consented to cloud data sharing.
+
+        Consent is stored in User.settings['cloud_data_consent'].
+        Cached for 5 minutes to avoid DB lookups on every experience.
+        In-process mode (local) does NOT require consent — data stays local.
+        """
+        if not user_id:
+            return False
+
+        now = time.time()
+        cached = self._consent_cache.get(user_id)
+        if cached and now - cached[1] < self._consent_cache_ttl:
+            return cached[0]
+
+        consent = False
+        try:
+            from integrations.social.models import get_db, User
+            db = get_db()
+            try:
+                user = db.query(User).filter_by(id=user_id).first()
+                if user:
+                    consent = bool(
+                        (user.settings or {}).get('cloud_data_consent', False))
+            finally:
+                db.close()
+        except Exception:
+            pass
+
+        self._consent_cache[user_id] = (consent, now)
+        return consent
+
+    # U3: Hive participation opt-out (reuses consent cache pattern)
+    def _has_hive_participation(self, user_id: str) -> bool:
+        """Check if user has hive participation enabled (default: True).
+
+        Users can opt out via User.settings['hive_participation'] = False.
+        Cached alongside cloud consent (same TTL).
+        """
+        if not user_id:
+            return True  # Default participate if no user context
+
+        cache_key = f"hive_{user_id}"
+        now = time.time()
+        cached = self._consent_cache.get(cache_key)
+        if cached and now - cached[1] < self._consent_cache_ttl:
+            return cached[0]
+
+        participate = True
+        try:
+            from integrations.social.models import get_db, User
+            db = get_db()
+            try:
+                user = db.query(User).filter_by(id=user_id).first()
+                if user:
+                    participate = bool(
+                        (user.settings or {}).get('hive_participation', True))
+            finally:
+                db.close()
+        except Exception:
+            pass
+
+        self._consent_cache[cache_key] = (participate, now)
+        return participate
+
+    # ─── CCT (Compute Contribution Token) gating ──────────────────
+
+    def _load_cached_cct(self) -> Optional[str]:
+        """Load CCT from file, cache in memory (5 min TTL)."""
+        now = time.time()
+        if self._cct_cache and now - self._cct_cache[1] < self._cct_cache_ttl:
+            return self._cct_cache[0]
+
+        try:
+            from .continual_learner_gate import ContinualLearnerGateService
+            cct = ContinualLearnerGateService.load_cct_from_file()
+            if cct:
+                self._cct_cache = (cct, now)
+            return cct
+        except Exception:
+            return None
+
+    def _check_cct_access(self, capability: str) -> bool:
+        """Check if node's CCT grants a specific capability. Zero DB calls."""
+        try:
+            from .continual_learner_gate import ContinualLearnerGateService
+            cct = self._load_cached_cct()
+            if not cct:
+                return False
+            return ContinualLearnerGateService.check_cct_capability(
+                cct, capability, self._node_id)
+        except Exception:
+            return False  # Fail-closed
 
     def _init_in_process(self):
         """Try to connect to in-process learning pipeline (zero HTTP overhead).
 
-        When crawl4ai is pip-installed and _init_learning_pipeline() has run
+        When HevolveAI is pip-installed and _init_learning_pipeline() has run
         in langchain_gpt_api.py, we get direct references to the provider
         and hivemind instances. All subsequent calls bypass HTTP entirely.
+
+        SECURITY: Integrity verification required before enabling in-process.
+        If HevolveAI files don't match the signed manifest, fall back to HTTP.
         """
+        # Integrity gate: verify HevolveAI installation before in-process
+        try:
+            from security.source_protection import SourceProtectionService
+            integrity = SourceProtectionService.verify_hevolveai_integrity()
+            if not integrity.get('verified', False):
+                mismatched = integrity.get('mismatched_files', [])
+                if mismatched:
+                    logger.warning(
+                        f"[WorldModelBridge] HevolveAI integrity FAILED: "
+                        f"{len(mismatched)} mismatched files — forcing HTTP mode")
+                    logger.info(
+                        f"[WorldModelBridge] HTTP mode: {self._api_url}")
+                    return
+        except ImportError:
+            pass  # source_protection not available — skip check
+        except Exception as e:
+            logger.debug(f"[WorldModelBridge] Integrity check skipped: {e}")
+
         try:
             from langchain_gpt_api import get_learning_provider, get_hive_mind
             provider = get_learning_provider()
@@ -100,15 +303,20 @@ class WorldModelBridge:
                            prompt: str, response: str,
                            model_id: str = None, latency_ms: float = 0,
                            node_id: str = None, goal_id: str = None):
-        """Record every agent interaction as training data for crawl4ai.
+        """Record every agent interaction as training data for HevolveAI.
 
         Called after EVERY /chat response.  Batches experiences and flushes
-        them to crawl4ai (in-process or HTTP).
-        crawl4ai auto-learns from every completion (3-priority queue:
+        them to HevolveAI (in-process or HTTP).
+        HevolveAI auto-learns from every completion (3-priority queue:
         expert > reality > distillation).
 
         GUARDRAIL: ConstitutionalFilter screens before storage.
         """
+        # Lazy in-process re-check: HevolveAI may have initialized after our __init__
+        if not self._in_process and not self._in_process_retry_done:
+            self._in_process_retry_done = True
+            self._init_in_process()
+
         try:
             from security.hive_guardrails import ConstitutionalFilter
             passed, _ = ConstitutionalFilter.check_prompt(response)
@@ -129,6 +337,15 @@ class WorldModelBridge:
             'timestamp': time.time(),
             'source': 'langchain_orchestration',
         }
+
+        # PRIVACY: Redact secrets + anonymize user before shared ingestion.
+        # The hive must NEVER leak secrets from one user to another.
+        try:
+            from security.secret_redactor import redact_experience
+            experience = redact_experience(experience)
+        except ImportError:
+            pass
+
         self._experience_queue.append(experience)
         with self._lock:
             self._stats['total_recorded'] += 1
@@ -144,7 +361,7 @@ class WorldModelBridge:
                 self._flush_executor.submit(self._flush_to_world_model, batch)
 
     def _flush_to_world_model(self, batch: list):
-        """Flush experience batch to crawl4ai's learning provider.
+        """Flush experience batch to HevolveAI's learning provider.
 
         In-process mode: calls provider.create_chat_completion() directly.
         HTTP mode: POST /v1/chat/completions (OpenAI format).
@@ -181,7 +398,27 @@ class WorldModelBridge:
                     logger.debug(f"In-process flush error: {e}")
             return
 
-        # HTTP fallback (central standalone or crawl4ai not in-process)
+        # HTTP fallback (central standalone or HevolveAI not in-process)
+        if self._cb_is_open():
+            logger.debug("[WorldModelBridge] Circuit breaker open — skipping HTTP flush")
+            return
+
+        # CONSENT GATE: if target is external (cloud), filter to consented users only.
+        # Local endpoints (localhost) don't require consent — data stays on-device.
+        if self._is_external_target():
+            original_count = len(batch)
+            batch = [
+                exp for exp in batch
+                if self._has_cloud_consent(exp.get('user_id', ''))
+            ]
+            skipped = original_count - len(batch)
+            if skipped > 0:
+                logger.info(
+                    f"[WorldModelBridge] Skipped {skipped}/{original_count} "
+                    f"experiences — no cloud consent")
+            if not batch:
+                return
+
         for exp in batch:
             try:
                 body = {
@@ -206,16 +443,18 @@ class WorldModelBridge:
                     'temperature': 0,
                     'max_tokens': 1,
                 }
-                requests.post(
+                pooled_post(
                     f'{self._api_url}/v1/chat/completions',
                     json=body,
-                    timeout=15,
+                    timeout=self._timeout_flush,
                 )
+                self._cb_record_success()
                 with self._lock:
                     self._stats['total_flushed'] += 1
             except requests.RequestException:
-                pass
+                self._cb_record_failure()
             except Exception as e:
+                self._cb_record_failure()
                 logger.debug(f"World model flush error: {e}")
 
     # ─── Expert corrections (RL-EF) ─────────────────────────────────
@@ -227,12 +466,12 @@ class WorldModelBridge:
                           explanation: str = None,
                           context: dict = None,
                           valid_until: str = None) -> dict:
-        """Submit an expert correction to crawl4ai's RL-EF system.
+        """Submit an expert correction to HevolveAI's RL-EF system.
 
         In-process: calls send_expert_correction() directly.
         HTTP: POST /v1/corrections.
 
-        crawl4ai routes to:
+        HevolveAI routes to:
         - Kernel Continual Learner (instant, no gradient) for factual corrections
         - Orthogonal LoRA (gradient-based, forgetting-safe) for conceptual ones
 
@@ -246,10 +485,20 @@ class WorldModelBridge:
         except ImportError:
             pass
 
+        # PRIVACY: Redact secrets from corrections before shared learning
+        try:
+            from security.secret_redactor import redact_secrets
+            original_response, _ = redact_secrets(original_response)
+            corrected_response, _ = redact_secrets(corrected_response)
+            if explanation:
+                explanation, _ = redact_secrets(explanation)
+        except ImportError:
+            pass
+
         # In-process direct call
         if self._in_process and self._provider:
             try:
-                from crawl4ai.embodied_ai.rl_ef import send_expert_correction
+                from hevolveai.embodied_ai.rl_ef import send_expert_correction
                 result = send_expert_correction(
                     domain='general',
                     original_response=original_response[:5000],
@@ -265,6 +514,12 @@ class WorldModelBridge:
             except Exception as e:
                 logger.debug(f"In-process correction failed: {e}")
 
+        # CONSENT GATE: external HTTP requires consent
+        if self._is_external_target():
+            user_id = (context or {}).get('user_id', expert_id)
+            if not self._has_cloud_consent(user_id):
+                return {'success': False, 'reason': 'Cloud data consent required'}
+
         # HTTP fallback
         body = {
             'original_response': original_response[:5000],
@@ -279,31 +534,37 @@ class WorldModelBridge:
         if valid_until:
             body['valid_until'] = valid_until
 
+        if self._cb_is_open():
+            return {'success': False, 'reason': 'Circuit breaker open'}
+
         try:
-            resp = requests.post(
+            resp = pooled_post(
                 f'{self._api_url}/v1/corrections',
                 json=body,
-                timeout=30,
+                timeout=self._timeout_correction,
             )
+            self._cb_record_success()
             if resp.status_code == 200:
                 with self._lock:
                     self._stats['total_corrections'] += 1
                 return resp.json()
             return {'success': False, 'reason': f'HTTP {resp.status_code}'}
         except requests.RequestException as e:
+            self._cb_record_failure()
             logger.debug(f"Correction submission failed: {e}")
             return {'success': False, 'reason': str(e)}
 
     # ─── HiveMind collective thinking ────────────────────────────────
 
     def query_hivemind(self, query_text: str,
-                       timeout_ms: int = 1000) -> Optional[dict]:
-        """Query crawl4ai's HiveMind for distributed collective thinking.
+                       timeout_ms: int = 1000,
+                       user_id: str = None) -> Optional[dict]:
+        """Query HevolveAI's HiveMind for distributed collective thinking.
 
         In-process: calls hive_mind.think_together_distributed() directly.
         HTTP: POST /v1/hivemind/think.
 
-        crawl4ai:
+        HevolveAI:
         1. Encodes query via frozen Qwen alignment layer (2048-D)
         2. Publishes local thought to WAMP
         3. Waits for remote agent responses (timeout_ms)
@@ -312,7 +573,23 @@ class WorldModelBridge:
 
         Use this for real-time multi-modal reasoning (tensor-level fusion).
         For coarse-grained task delegation, use agent-level dispatch instead.
+
+        CCT gating: requires 'hivemind_query' capability. Without valid CCT,
+        returns cached/stale response (graceful degradation, not hard block).
         """
+        # U3: Check hive participation setting
+        if user_id and not self._has_hive_participation(user_id):
+            logger.debug(f"HiveMind query skipped: user {user_id} opted out of hive")
+            return None
+
+        # CCT access gate (graceful: degrade to cached, don't block)
+        if not self._check_cct_access('hivemind_query'):
+            logger.debug("HiveMind query: no CCT with hivemind_query capability")
+            cached = self._federation_aggregated.get('last_thought')
+            if cached:
+                return {'thought': cached, 'source': 'cached', 'cct_gated': True}
+            return None
+
         try:
             from security.hive_guardrails import ConstitutionalFilter
             passed, _ = ConstitutionalFilter.check_prompt(query_text)
@@ -340,6 +617,7 @@ class WorldModelBridge:
                     local_agent_id=getattr(
                         self._hive_mind, '_local_agent_id', 'local'),
                     timeout_ms=timeout_ms,
+                    **({"owner_id": user_id} if user_id else {}),
                 )
                 with self._lock:
                     self._stats['total_hivemind_queries'] += 1
@@ -350,18 +628,51 @@ class WorldModelBridge:
             except Exception as e:
                 logger.debug(f"In-process hivemind failed: {e}")
 
-        # HTTP fallback
+        # PRIVACY: Redact secrets from query before sending to shared hivemind
         try:
-            resp = requests.post(
+            from security.secret_redactor import redact_secrets
+            query_text, _ = redact_secrets(query_text)
+        except ImportError:
+            pass
+
+        # CONSENT GATE: external HTTP requires consent
+        if self._is_external_target() and user_id:
+            if not self._has_cloud_consent(user_id):
+                return None
+
+        # PeerLink path — collect thoughts from connected peers directly
+        try:
+            from core.peer_link.link_manager import get_link_manager
+            mgr = get_link_manager()
+            responses = mgr.collect('hivemind', timeout_ms=timeout_ms)
+            if responses:
+                with self._lock:
+                    self._stats['total_hivemind_queries'] += 1
+                return {
+                    'thoughts': responses,
+                    'source': 'peerlink',
+                    'peer_count': len(responses),
+                }
+        except Exception:
+            pass
+
+        # HTTP fallback
+        if self._cb_is_open():
+            return None
+
+        try:
+            resp = pooled_post(
                 f'{self._api_url}/v1/hivemind/think',
                 json={'query': query_text[:2000], 'timeout_ms': timeout_ms},
                 timeout=max(30, timeout_ms / 1000 + 5),
             )
+            self._cb_record_success()
             if resp.status_code == 200:
                 with self._lock:
                     self._stats['total_hivemind_queries'] += 1
                 return resp.json()
         except requests.RequestException as e:
+            self._cb_record_failure()
             logger.debug(f"HiveMind query failed: {e}")
         return None
 
@@ -391,16 +702,16 @@ class WorldModelBridge:
 
         # HTTP fallback
         try:
-            resp = requests.get(
-                f'{self._api_url}/v1/stats', timeout=10)
+            resp = pooled_get(
+                f'{self._api_url}/v1/stats', timeout=self._timeout_default)
             if resp.status_code == 200:
                 result['learning'] = resp.json()
         except requests.RequestException:
             pass
 
         try:
-            resp = requests.get(
-                f'{self._api_url}/v1/hivemind/stats', timeout=10)
+            resp = pooled_get(
+                f'{self._api_url}/v1/hivemind/stats', timeout=self._timeout_default)
             if resp.status_code == 200:
                 result['hivemind'] = resp.json()
         except requests.RequestException:
@@ -423,8 +734,8 @@ class WorldModelBridge:
 
         # HTTP fallback
         try:
-            resp = requests.get(
-                f'{self._api_url}/v1/hivemind/agents', timeout=10)
+            resp = pooled_get(
+                f'{self._api_url}/v1/hivemind/agents', timeout=self._timeout_default)
             if resp.status_code == 200:
                 data = resp.json()
                 return data.get('agents', data) if isinstance(data, dict) else data
@@ -441,12 +752,21 @@ class WorldModelBridge:
 
         Gossip broadcasts a notification that a skill is available.
         Each receiving peer triggers RALT ingestion through their own
-        local crawl4ai instance.
+        local HevolveAI instance.
 
         GUARDRAILS:
-        1. WorldModelSafetyBounds.gate_ralt_export() — rate limit + witness
-        2. ConstructiveFilter.check_output() — constructiveness check
+        1. CCT gate — requires 'skill_distribution' capability
+        2. WorldModelSafetyBounds.gate_ralt_export() — rate limit + witness
+        3. ConstructiveFilter.check_output() — constructiveness check
         """
+        # CCT access gate (hard block: cannot distribute without contribution)
+        if not self._check_cct_access('skill_distribution'):
+            logger.info("Skill distribution blocked: no CCT with "
+                        "skill_distribution capability")
+            with self._lock:
+                self._stats['total_skills_blocked'] += 1
+            return {'success': False, 'reason': 'no_cct_skill_distribution'}
+
         try:
             from security.hive_guardrails import WorldModelSafetyBounds
             passed, reason = WorldModelSafetyBounds.gate_ralt_export(
@@ -470,7 +790,7 @@ class WorldModelBridge:
             pass
 
         # Notify peers via gossip that a skill is available
-        # Each peer ingests via their local crawl4ai RALT receiver
+        # Each peer ingests via their local HevolveAI RALT receiver
         try:
             from integrations.social.peer_discovery import gossip
             gossip.broadcast({
@@ -497,7 +817,7 @@ class WorldModelBridge:
         """Check learning pipeline health.
 
         In-process: returns healthy if provider is available.
-        HTTP: GET /health on crawl4ai API.
+        HTTP: GET /health on HevolveAI API.
         """
         if self._in_process and self._provider:
             return {
@@ -509,7 +829,7 @@ class WorldModelBridge:
 
         # HTTP fallback
         try:
-            resp = requests.get(
+            resp = pooled_get(
                 f'{self._api_url}/health', timeout=5)
             if resp.status_code == 200:
                 data = resp.json() if resp.headers.get(
@@ -546,6 +866,392 @@ class WorldModelBridge:
                 'in_process': self._in_process,
                 **self._stats,
             }
+
+    # ─── Embodied interaction (same latent space) ────────────────
+
+    def send_action(self, action: dict) -> bool:
+        """Send a motor/actuator command to HevolveAI's world model.
+
+        The world model operates in one latent space — text, sensors,
+        motors are all representations of the same world.  Actions are
+        predictions that the world model tests against reality.
+
+        Args:
+            action: Dict with type, target, params, timestamp.
+                e.g. {'type': 'motor_velocity', 'target': 'left_wheel',
+                       'params': {'velocity': 0.5}, 'timestamp': ...}
+
+        Returns:
+            True if action was sent successfully.
+        """
+        # Safety check before forwarding
+        try:
+            from integrations.robotics.safety_monitor import get_safety_monitor
+            monitor = get_safety_monitor()
+            if monitor.is_estopped:
+                logger.warning("[WorldModelBridge] Action blocked: E-stop active")
+                return False
+            # Check position if action has spatial params
+            position = action.get('params', {})
+            if any(k in position for k in ('x', 'y', 'z')):
+                if not monitor.check_position_safe(position):
+                    logger.warning("[WorldModelBridge] Action blocked: outside workspace")
+                    return False
+        except ImportError:
+            pass
+
+        # In-process: direct call to HevolveAI action stream
+        if self._in_process and self._provider:
+            try:
+                from hevolveai.embodied_ai.action_stream import send_action
+                send_action(action)
+                with self._lock:
+                    self._stats['total_actions_sent'] = self._stats.get(
+                        'total_actions_sent', 0) + 1
+                return True
+            except (ImportError, Exception) as e:
+                logger.debug(f"In-process action send error: {e}")
+
+        # HTTP fallback
+        if self._cb_is_open():
+            return False
+
+        try:
+            resp = pooled_post(
+                f'{self._api_url}/v1/actions',
+                json=action,
+                timeout=self._timeout_default,
+            )
+            if resp.status_code in (200, 201):
+                self._cb_record_success()
+                with self._lock:
+                    self._stats['total_actions_sent'] = self._stats.get(
+                        'total_actions_sent', 0) + 1
+                return True
+            self._cb_record_failure()
+            return False
+        except requests.RequestException:
+            self._cb_record_failure()
+            return False
+
+    def ingest_sensor_batch(self, readings: list) -> int:
+        """Feed sensor data to HevolveAI's world model for learning.
+
+        The world model's latent space includes physical sensor state.
+        This method batches sensor readings and flushes them to HevolveAI
+        for continuous learning — the same way text experiences are flushed.
+
+        Args:
+            readings: List of SensorReading.to_dict() dicts.
+
+        Returns:
+            Number of readings successfully ingested.
+        """
+        if not readings:
+            return 0
+
+        # In-process: direct call
+        if self._in_process and self._provider:
+            try:
+                from hevolveai.embodied_ai.sensor_ingest import record_sensor_batch
+                count = record_sensor_batch(readings)
+                with self._lock:
+                    self._stats['total_sensor_readings'] = self._stats.get(
+                        'total_sensor_readings', 0) + len(readings)
+                return count if isinstance(count, int) else len(readings)
+            except (ImportError, Exception) as e:
+                logger.debug(f"In-process sensor ingest error: {e}")
+
+        # HTTP fallback
+        if self._cb_is_open():
+            return 0
+
+        try:
+            resp = pooled_post(
+                f'{self._api_url}/v1/sensors/batch',
+                json={'readings': readings},
+                timeout=self._timeout_flush,
+            )
+            if resp.status_code in (200, 201):
+                self._cb_record_success()
+                with self._lock:
+                    self._stats['total_sensor_readings'] = self._stats.get(
+                        'total_sensor_readings', 0) + len(readings)
+                return len(readings)
+            self._cb_record_failure()
+            return 0
+        except requests.RequestException:
+            self._cb_record_failure()
+            return 0
+
+    def get_learning_feedback(self) -> Optional[Dict]:
+        """Poll HevolveAI for real-time learning feedback.
+
+        The world model continuously learns from sensor+action data.
+        This method retrieves corrections/predictions — trajectory
+        adjustments, new obstacle awareness, learned patterns.
+
+        Returns:
+            Feedback dict from HevolveAI, or None if unavailable.
+        """
+        # In-process
+        if self._in_process:
+            try:
+                from hevolveai.embodied_ai.learning_feedback import get_latest
+                return get_latest()
+            except (ImportError, Exception):
+                pass
+
+        # HTTP fallback
+        if self._cb_is_open():
+            return None
+
+        try:
+            resp = pooled_get(
+                f'{self._api_url}/v1/feedback/latest',
+                timeout=self._timeout_default,
+            )
+            if resp.status_code == 200:
+                self._cb_record_success()
+                return resp.json()
+            self._cb_record_failure()
+            return None
+        except requests.RequestException:
+            self._cb_record_failure()
+            return None
+
+    def record_embodied_interaction(
+        self, action: dict, sensor_context: dict, outcome: dict,
+    ):
+        """Record an action+sensor+outcome triple for recipe learning.
+
+        This extends record_interaction() for physical actions.
+        The triple becomes CREATE mode training data: what action was
+        taken, what sensor state surrounded it, what was the outcome.
+
+        Stored as experiences in the same queue that text interactions use.
+        Same latent space — the world model doesn't distinguish modalities.
+        """
+        experience = {
+            'type': 'embodied_interaction',
+            'action': action,
+            'sensor_context': sensor_context,
+            'outcome': outcome,
+            'timestamp': action.get('timestamp', 0),
+            'node_tier': self._node_tier,
+        }
+        self._experience_queue.append(experience)
+        with self._lock:
+            self._stats['total_recorded'] = self._stats.get('total_recorded', 0) + 1
+
+    def emergency_stop(self) -> bool:
+        """Send zero-velocity to all actuators via HevolveAI.
+
+        This is the bridge-level emergency stop — it tells HevolveAI to
+        immediately halt all physical outputs.
+        """
+        estop_action = {
+            'type': 'emergency_stop',
+            'target': '*',
+            'params': {'velocity': 0, 'force': 0},
+        }
+
+        if self._in_process and self._provider:
+            try:
+                from hevolveai.embodied_ai.action_stream import emergency_stop
+                emergency_stop()
+                return True
+            except (ImportError, Exception):
+                pass
+
+        try:
+            resp = pooled_post(
+                f'{self._api_url}/v1/actions/estop',
+                json=estop_action,
+                timeout=3,
+            )
+            return resp.status_code in (200, 201)
+        except requests.RequestException:
+            return False
+
+    # ─── Sensor frame forwarding to HevolveAI ────────────────────
+
+    def submit_sensor_frame(
+        self, user_id: str, frame_bytes: bytes,
+        channel: str = 'camera', reality_signature: float = 1.0,
+    ):
+        """Forward raw sensor frame to HevolveAI for visual encoding + learning.
+
+        HARTOS captures camera/screen frames locally. This method forwards
+        them to HevolveAI's /v1/sensor/ingest endpoint so the embodied AI
+        can: encode via Qwen -> predict next state -> compute error -> learn.
+
+        Called only on scene change (adaptive sampling) to avoid overwhelming
+        the learning pipeline.
+
+        In-process mode: calls learn_from_feedback directly with encoded frame.
+        HTTP mode: POST /v1/sensor/ingest with base64 data.
+        """
+        import base64
+
+        source = 'camera' if channel == 'camera' else 'screen'
+        sig = reality_signature if channel == 'camera' else 0.0
+
+        if self._in_process and self._provider:
+            # In-process: encode frame and feed through learning pipeline
+            try:
+                import torch
+                embodied = getattr(self._provider, 'embodied_agent', None)
+                encoder = getattr(embodied, 'encoder', None) if embodied else None
+                if encoder is None:
+                    encoder = getattr(self._provider, 'qwen_encoder', None)
+                if encoder is not None:
+                    from PIL import Image
+                    import io
+                    img = Image.open(io.BytesIO(frame_bytes)).convert('RGB')
+                    encoding = encoder.encode_image(img)
+
+                    # Route through embodied agent step() — same path as /v1/sensor/ingest
+                    if embodied is not None and hasattr(embodied, 'step'):
+                        from hevolveai.embodied_ai.types.sensor_input import SensorInput
+                        sensor = SensorInput(
+                            data=encoding if isinstance(encoding, torch.Tensor)
+                                 else torch.tensor(encoding).float(),
+                            input_type='encoded_features',
+                            modality='vision',
+                            metadata={'reality_signature': sig, 'source': source},
+                        )
+                        embodied.step(sensor)
+                    return
+            except Exception as e:
+                logger.debug(f"[WorldModelBridge] In-process sensor frame failed: {e}")
+
+        # HTTP fallback
+        if self._cb_is_open():
+            return
+
+        try:
+            data_b64 = base64.b64encode(frame_bytes).decode('ascii')
+            resp = pooled_post(
+                f'{self._api_url}/v1/sensor/ingest',
+                json={
+                    'modality': 'vision',
+                    'source': source,
+                    'data': data_b64,
+                    'format': 'jpeg',
+                    'session_id': f'{user_id}_{source}',
+                    'reality_signature': sig,
+                },
+                timeout=self._timeout_default,
+            )
+            if resp.status_code == 200:
+                self._cb_record_success()
+            else:
+                self._cb_record_failure()
+        except requests.RequestException:
+            self._cb_record_failure()
+
+    def submit_output_feedback(
+        self, output_modality: str, status: str, context: str,
+        model_used: str = 'unknown', error_message: str = None,
+        generation_time_seconds: float = 0.0, user_id: str = 'default',
+        generated_data: bytes = None, generated_format: str = None,
+    ):
+        """Report output modality generation result to HevolveAI for learning.
+
+        Routes through existing endpoints (no redundant API surface):
+        - Success with data: /v1/sensor/ingest (generated output = observation)
+        - Error/rejection: /v1/corrections (correction signal)
+        - Success without data: record_interaction (text experience)
+
+        Generated outputs are just observations with reality_signature=0.0.
+        Errors are corrections that teach modality routing.
+        """
+        import base64
+
+        # Success with generated data: treat as sensor observation
+        if status == 'completed' and generated_data is not None:
+            # Map modality format to sensor ingest format
+            modality_map = {
+                'image': 'vision',
+                'audio_speech': 'audio',
+                'audio_music': 'audio',
+                'video': 'vision',
+                'video_with_audio': 'multimodal',
+            }
+            sensor_modality = modality_map.get(output_modality, 'multimodal')
+            fmt = generated_format or 'jpeg'
+
+            if self._cb_is_open():
+                return
+
+            try:
+                data_b64 = base64.b64encode(generated_data).decode('ascii')
+                resp = pooled_post(
+                    f'{self._api_url}/v1/sensor/ingest',
+                    json={
+                        'modality': sensor_modality,
+                        'source': f'generated_{output_modality}',
+                        'data': data_b64,
+                        'format': fmt,
+                        'session_id': f'{user_id}_output_{output_modality}',
+                        'reality_signature': 0.0,
+                        'text': context[:500],
+                    },
+                    timeout=self._timeout_default,
+                )
+                if resp.status_code == 200:
+                    self._cb_record_success()
+                else:
+                    self._cb_record_failure()
+            except requests.RequestException:
+                self._cb_record_failure()
+            return
+
+        # Error/rejection: route as correction
+        if status in ('error', 'user_rejected') and error_message:
+            self.submit_correction(
+                original_response=f'[{output_modality}] {context[:500]}',
+                corrected_response=f'{output_modality} generation failed: {error_message}',
+                expert_id=user_id,
+                confidence=0.8 if status == 'user_rejected' else 0.5,
+            )
+            return
+
+        # Success without data or pending: record as text interaction
+        self.record_interaction(
+            user_id=user_id,
+            prompt_id=f'output_{output_modality}',
+            prompt=context[:2000],
+            response=f'[{output_modality} {status}] generated by {model_used} in {generation_time_seconds:.1f}s',
+            model_id=model_used,
+            latency_ms=generation_time_seconds * 1000,
+        )
+
+    # ─── Federation support ───────────────────────────────────────
+
+    def extract_learning_delta(self) -> dict:
+        """Pull stats for federation delta extraction.
+
+        Used by FederatedAggregator.extract_local_delta() to build the
+        lightweight metric delta that gets broadcast to peers.
+        """
+        stats = self.get_stats()
+        learning = self.get_learning_stats()
+        return {
+            'bridge': stats,
+            'learning': learning.get('learning', {}),
+            'hivemind': learning.get('hivemind', {}),
+        }
+
+    def apply_federation_update(self, aggregated: dict) -> bool:
+        """Store aggregated network-wide metrics locally.
+
+        Does NOT push to HevolveAI — federation metrics are consumed
+        by BenchmarkRegistry and dashboard, not HevolveAI's learning pipeline.
+        """
+        self._federation_aggregated = aggregated
+        return True
 
 
 # ─── Module-level singleton ───

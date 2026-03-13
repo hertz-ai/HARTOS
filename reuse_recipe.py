@@ -1,12 +1,14 @@
 """reuse_recipe.py"""
 from enum import Enum
 import random
-import autogen
+try:
+    import autogen
+except ImportError:
+    autogen = None
 import os
-import cv2
 import pytz
-import requests
-from typing import Dict, Optional, Tuple, Any
+from core.http_pool import pooled_get, pooled_post, pooled_request
+from typing import Dict, Optional, Tuple, Any, List
 import uuid
 import time
 import re
@@ -17,14 +19,20 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 import json
+import ast
 from collections import deque
 import redis
 import pickle
 from PIL import Image
 
-from crossbarhttp import Client
+
 from flask import current_app
-from helper import ToolMessageHandler, strip_json_values, get_time_based_history, retrieve_json, load_vlm_agent_files
+from helper import ToolMessageHandler, strip_json_values, get_time_based_history, retrieve_json, load_vlm_agent_files, _is_terminate_msg
+try:
+    from helper import PROMPTS_DIR
+except Exception:
+    PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
+os.makedirs(PROMPTS_DIR, exist_ok=True)
 import helper as helper_fun
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
 import threading
@@ -70,12 +78,21 @@ from integrations.expert_agents import (
 )
 
 # Add Smart Ledger for persistent task tracking in reuse mode - using agent_ledger package
-from agent_ledger import (
-    SmartLedger, Task, TaskType,
-    TaskStatus as LedgerTaskStatus,  # Agent ledger task status (PENDING, IN_PROGRESS, etc.)
-    ExecutionMode,
-    create_ledger_from_actions, get_production_backend
-)
+try:
+    from agent_ledger import (
+        SmartLedger, Task, TaskType,
+        TaskStatus as LedgerTaskStatus,  # Agent ledger task status (PENDING, IN_PROGRESS, etc.)
+        ExecutionMode,
+        create_ledger_from_actions, get_production_backend
+    )
+except ImportError:
+    SmartLedger = None
+    Task = None
+    TaskType = None
+    LedgerTaskStatus = None
+    ExecutionMode = None
+    create_ledger_from_actions = None
+    get_production_backend = None
 
 # Import helper_ledger functions for subtask management and ledger awareness
 from helper_ledger import (
@@ -87,6 +104,7 @@ from helper_ledger import (
 
 # Import sync function from lifecycle_hooks
 from lifecycle_hooks import sync_action_state_to_ledger
+from cultural_wisdom import get_cultural_prompt
 
 
 class ActionExecutionStatus(Enum):
@@ -95,7 +113,7 @@ class ActionExecutionStatus(Enum):
     SCHEDULED = "SCHEDULED"
     EXECUTING = "EXECUTING"
     TIMEOUT = "TIMEOUT"
-    COMPELETED = "COMPELETED"
+    COMPLETED = "COMPLETED"
     ERROR = "ERROR"
 
 class TaskNames(Enum):
@@ -123,38 +141,10 @@ def parse_date(date_str):
     return datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%S")
 
 
-client = Client('http://aws_rasa.hertzai.com:8088/publish')
-
-# Create thread pool executor for async Crossbar publishing
-crossbar_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='crossbar_publish')
-
 def publish_async(topic, message, timeout=2.0):
-    """
-    Publish to Crossbar in a background thread without blocking the main request.
-
-    Args:
-        topic: Crossbar topic to publish to
-        message: Message payload (dict or JSON string)
-        timeout: Maximum time to wait for publish (default: 2.0 seconds)
-    """
-    def _publish():
-        import socket
-        try:
-            # Set socket timeout to prevent long waits
-            original_timeout = socket.getdefaulttimeout()
-            socket.setdefaulttimeout(timeout)
-
-            client.publish(topic, message)
-            current_app.logger.debug(f"Successfully published to {topic}")
-        except Exception as e:
-            current_app.logger.error(f"Error publishing to {topic}: {e}")
-        finally:
-            # Restore original timeout
-            if original_timeout is not None:
-                socket.setdefaulttimeout(original_timeout)
-
-    # Submit to executor without waiting for result
-    crossbar_executor.submit(_publish)
+    """Delegate to the canonical publish_async in langchain_gpt_api."""
+    from langchain_gpt_api import publish_async as _publish
+    _publish(topic, message, timeout)
 
 scheduler = BackgroundScheduler()
 scheduler.start()
@@ -188,23 +178,38 @@ user_simplemem = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_simpl
 #     "price": [0.0025, 0.01]
 # }]
 
-# Local llama.cpp server (Qwen3-VL) - ACTIVE
-config_list = [{
-        "model": 'Qwen3-VL-4B-Instruct',
+# Mode-aware config_list: cloud/regional use external LLM, flat uses local
+# (user's wizard-configured endpoint via HEVOLVE_LOCAL_LLM_URL or LLAMA_CPP_PORT)
+_node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
+_active_cloud = os.environ.get('HEVOLVE_ACTIVE_CLOUD_PROVIDER', '')
+if _node_tier in ('regional', 'central') and os.environ.get('HEVOLVE_LLM_ENDPOINT_URL'):
+    config_list = [{
+        "model": os.environ.get('HEVOLVE_LLM_MODEL_NAME', 'gpt-4.1-mini'),
+        "api_key": os.environ.get('HEVOLVE_LLM_API_KEY', 'dummy'),
+        "base_url": os.environ['HEVOLVE_LLM_ENDPOINT_URL'],
+        "price": [0.0025, 0.01]
+    }]
+elif _active_cloud and os.environ.get('HEVOLVE_LLM_API_KEY'):
+    # Wizard-configured cloud provider (flat mode desktop user)
+    _cloud_cfg = {
+        "model": os.environ.get('HEVOLVE_LLM_MODEL_NAME', 'gpt-4o-mini'),
+        "api_key": os.environ['HEVOLVE_LLM_API_KEY'],
+        "price": [0.0025, 0.01],
+    }
+    if os.environ.get('HEVOLVE_LLM_ENDPOINT_URL'):
+        _cloud_cfg["base_url"] = os.environ['HEVOLVE_LLM_ENDPOINT_URL']
+    config_list = [_cloud_cfg]
+else:
+    # Dynamic: reads from user's LLM Setup Wizard config (set by Nunba app.py)
+    from core.port_registry import get_port as _get_llm_port
+    _llama_port = os.environ.get('LLAMA_CPP_PORT', str(_get_llm_port('llm')))
+    _local_llm_url = os.environ.get('HEVOLVE_LOCAL_LLM_URL', f'http://localhost:{_llama_port}/v1')
+    config_list = [{
+        "model": os.environ.get('HEVOLVE_LOCAL_LLM_MODEL', 'local'),
         "api_key": 'dummy',
-        "base_url": 'http://localhost:8080/v1',
+        "base_url": _local_llm_url,
         "price": [0, 0]
     }]
-
-# Azure OpenAI configuration (fallback - DISABLED)
-# config_list = [{
-#         "model": 'gpt-4.1-mini',
-#         "api_type": "azure",
-#         "api_key": '8MMPerfdfcpx63VfIVtg2lpAK7Crv7O5JKiKwhusVhgJNkC8Ql6FJQQJ99BAACHYHv6XJ3w3AAABACOGdxWW',
-#         "base_url": 'https://hertzai-gpt4.openai.azure.com/openai/deployments/gpt-4.1-mini/chat/completions?api-version=2025-01-01-preview',
-#         "api_version": "2024-12-01-preview",
-#         "price": [0.0025, 0.01]
-#     }]
 
 # Per-request model config override (speculative execution, hive compute routing)
 def get_llm_config():
@@ -340,7 +345,8 @@ async def subscribe_and_return(message, topic, time=1800000):
                 current_app.logger.error(f"Error stopping component in finally: {e}")
 
 
-database_url = 'https://mailer.hertzai.com'
+from core.config_cache import get_db_url
+database_url = get_db_url() or 'https://mailer.hertzai.com'
 
 
 def save_conversation_db(text, user_id, prompt_id, database_url, request_id):
@@ -362,7 +368,7 @@ def save_conversation_db(text, user_id, prompt_id, database_url, request_id):
         "request_id": request_id,
         "historical_request_id": str('[]')
     }
-    res = requests.post("{}/conversation".format(database_url),
+    res = pooled_post("{}/conversation".format(database_url),
                         data=json.dumps(data), headers=headers).json()
     conv_id = res['conv_id']
     return conv_id
@@ -459,7 +465,7 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
     headers = {'Content-Type': 'application/json'}
 
     try:
-        res = requests.post(url, data=body, headers=headers)
+        res = pooled_post(url, data=body, headers=headers)
         current_app.logger.info(
             f'Message sent with request_id: {intermediate_request_id}, tracking will reset in {reset_tracking_delay}s')
     except Exception as e:
@@ -472,16 +478,16 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
 
 def execute_python_file(task_description: str, user_id: int, prompt_id: int, action_entry_point: int = 0):
     headers = {'Content-Type': 'application/json'}
-    url = 'http://localhost:6777/time_agent'
+    url = f'http://localhost:{_get_llm_port("backend")}/time_agent'
     data = json.dumps({'task_description': task_description, 'user_id': user_id, 'prompt_id': prompt_id,
                        'action_entry_point': action_entry_point, 'request_from': 'Reuse'})
-    res = requests.post(url, data=data, headers=headers)
+    res = pooled_post(url, data=data, headers=headers)
     return 'done'
 
 
 def call_visual_task(task_description: str, user_id: int, prompt_id: int):
     headers = {'Content-Type': 'application/json'}
-    url = 'http://localhost:6777/visual_agent'
+    url = f'http://localhost:{_get_llm_port("backend")}/visual_agent'
 
     # Get current time in UTC for comparison
     now_utc = datetime.utcnow()
@@ -492,7 +498,7 @@ def call_visual_task(task_description: str, user_id: int, prompt_id: int):
         payload = {}
         headers_api = {}
 
-        response = requests.request("GET", action_url, headers=headers_api, data=payload)
+        response = pooled_request("GET", action_url, headers=headers_api, data=payload)
 
         if response.status_code == 200:
             api_data = response.json()
@@ -531,7 +537,7 @@ def call_visual_task(task_description: str, user_id: int, prompt_id: int):
 
                 try:
                     # Send the POST request to the visual agent
-                    res = requests.post(url, data=data_to_send, headers=headers)
+                    res = pooled_post(url, data=data_to_send, headers=headers)
                     current_app.logger.info(f"Visual agent response: {res.status_code}")
                     return 'done'
                 except Exception as e:
@@ -615,7 +621,7 @@ def get_action_user_details(user_id):
     payload = {}
     headers = {}
 
-    response = requests.request(
+    response = pooled_request(
         "GET", action_url, headers=headers, data=payload)
 
     if response.status_code == 200:
@@ -727,7 +733,7 @@ def get_action_user_details(user_id):
     headers = {
         'Content-Type': 'application/json'
     }
-    response = requests.request("POST", url, headers=headers, data=payload)
+    response = pooled_request("POST", url, headers=headers, data=payload)
     if response.status_code == 200:
         user_data = response.json()
 
@@ -783,10 +789,10 @@ def visual_based_execution(task_description: str, user_id: int, prompt_id: int):
         result = user.initiate_chat(manager, message=text, speaker_selection={"speaker": "assistant"},
                                     clear_history=False)
 
-        last_message = group_chat.messages[-1]
+        last_message = chat.messages[-1]
         if last_message['content'] == 'TERMINATE':
-            if len(group_chat.messages) > 1:
-                last_message = group_chat.messages[-2]
+            if len(chat.messages) > 1:
+                last_message = chat.messages[-2]
             if 'message2userfinal' in last_message['content'].lower():
                 try:
                     json_obj = retrieve_json(last_message['content'])
@@ -802,21 +808,8 @@ def visual_based_execution(task_description: str, user_id: int, prompt_id: int):
 
 
 def get_frame(user_id):
-    serialized_frame = redis_client.get(user_id)
-
-    try:
-        if serialized_frame is not None:
-            from security.safe_deserialize import safe_load_frame
-            frame_bgr = safe_load_frame(serialized_frame)
-            current_app.logger.info(
-                f"Frame for user_id {user_id} retrieved successfully.")
-            frame = frame_bgr[:, :, ::-1]
-            return frame
-        else:
-            current_app.logger.info(f"No frame found for user_id {user_id}.")
-            return None
-    except ModuleNotFoundError as e:
-        raise e
+    """Delegate to helper.get_frame() — FrameStore first, Redis fallback."""
+    return helper_fun.get_frame(user_id)
 
 
 # TODO Reset action order after it reaches end.
@@ -832,7 +825,7 @@ def create_agents_for_role(user_id: str, prompt_id):
 
     personas = []
     try:
-        with open(f"prompts/{prompt_id}.json", 'r') as f:
+        with open(os.path.join(PROMPTS_DIR, f"{prompt_id}.json"), 'r') as f:
             config = json.load(f)
             personas = config['personas']
             current_app.logger.info(f'Available Personas {personas}')
@@ -850,7 +843,7 @@ def create_agents_for_role(user_id: str, prompt_id):
             name=f"assistant",
             llm_config=llm_config,
             max_consecutive_auto_reply=10,
-            is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+            is_termination_msg=_is_terminate_msg,
             code_execution_config={"work_dir": "coding", "use_docker": False},
             system_message=agent_prompt
         )
@@ -858,7 +851,7 @@ def create_agents_for_role(user_id: str, prompt_id):
             name=f"user",
             human_input_mode="NEVER",
             llm_config=False,
-            is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+            is_termination_msg=_is_terminate_msg,
             max_consecutive_auto_reply=0,
             code_execution_config=False,
         )
@@ -868,7 +861,7 @@ def create_agents_for_role(user_id: str, prompt_id):
             code_execution_config={"work_dir": "coding", "use_docker": False},
             system_message="""You Help the assistant agent to complete the task, you are helper agent not user/n
             if you get any request related you user redicrect that conversation to user don't asumer anything or answer anything on your own""",
-            is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+            is_termination_msg=_is_terminate_msg,
         )
 
         @helper.register_for_execution()
@@ -989,9 +982,13 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     try:
         from integrations.channels.memory.memory_graph import MemoryGraph
         import os
-        graph_db_path = os.path.join(
-            os.path.expanduser("~"), "Documents", "Nunba", "data", "memory_graph", user_prompt
-        )
+        try:
+            from core.platform_paths import get_memory_graph_dir
+            graph_db_path = get_memory_graph_dir(user_prompt)
+        except ImportError:
+            graph_db_path = os.path.join(
+                os.path.expanduser("~"), "Documents", "Nunba", "data", "memory_graph", user_prompt
+            )
         memory_graph = MemoryGraph(db_path=graph_db_path, user_id=str(user_id))
         current_app.logger.info(f"MemoryGraph initialized for {user_prompt}")
     except Exception as e:
@@ -1001,12 +998,12 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     # role = get_role(user_id,prompt_id)
     role_number, role = get_flow_number(user_id, prompt_id)
 
-    with open(f"prompts/{prompt_id}_{role_number}_recipe.json", 'r') as f:
+    with open(os.path.join(PROMPTS_DIR, f"{prompt_id}_{role_number}_recipe.json"), 'r') as f:
         config = json.load(f)
         recipes[user_prompt] = config
         final_recipe[prompt_id] = config
     goal = ''
-    with open(f"prompts/{prompt_id}.json", 'r') as f:
+    with open(os.path.join(PROMPTS_DIR, f"{prompt_id}.json"), 'r') as f:
         config = json.load(f)
         goal = config['goal']
 
@@ -1081,16 +1078,44 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
     individual_recipe = []
     for i in range(1, (len(recipes[user_prompt]['actions']) + 1)):
-        current_app.logger.info(f'checking for prompts/{prompt_id}_{role_number}_{i}.json')
+        current_app.logger.info(f'checking for {os.path.join(PROMPTS_DIR, f"{prompt_id}_{role_number}_{i}.json")}')
         try:
-            with open(f"prompts/{prompt_id}_{role_number}_{i}.json", 'r') as f:
+            with open(os.path.join(PROMPTS_DIR, f"{prompt_id}_{role_number}_{i}.json"), 'r') as f:
                 config = json.load(f)
                 individual_recipe.append(config)
         except Exception as e:
-            current_app.logger.error(f'Got error as :{e} while checking for prompts/{prompt_id}_{role_number}_{i}.json')
+            current_app.logger.error(f'Got error as :{e} while checking for {os.path.join(PROMPTS_DIR, f"{prompt_id}_{role_number}_{i}.json")}')
+
+    # Build experience hints from accumulated recipe experience data
+    experience_hints = ''
+    try:
+        from recipe_experience import build_experience_hints
+        experience_hints = build_experience_hints(individual_recipe)
+    except Exception:
+        experience_hints = 'No prior experience recorded.'
+
+    # Load saved personality for this agent (generated in CREATE mode)
+    _personality_block = ""
+    try:
+        from core.agent_personality import load_personality, build_personality_prompt, build_proactive_vision_prompt
+        _saved_personality = load_personality(str(prompt_id))
+        if _saved_personality:
+            # Load resonance profile for continuous personality tuning
+            _resonance_profile = None
+            try:
+                from core.resonance_profile import get_or_create_profile
+                _resonance_profile = get_or_create_profile(str(user_id))
+            except ImportError:
+                pass
+            _personality_block = build_personality_prompt(_saved_personality, resonance_profile=_resonance_profile)
+            _personality_block += build_proactive_vision_prompt(goal)
+    except Exception:
+        pass
 
     response_format = {"message2userfinal": "Your message here"}
     agent_prompt = f'''You are a Helpful {role} Assistant. Your primary role is to assist the user efficiently while keeping all internal actions and processes hidden from the end user. Follow the guidelines below to perform tasks correctly:
+{get_cultural_prompt()}
+{_personality_block}
         1. If you encounter a task you cannot perform, request assistance from the @Helper and @Executor agents. If you need to run a tool, seek guidance from the @Helper agent. For code execution, ask the @Executor agent for assistance.
         2. Only execute actions where the persona is: {role}.
         3. Follow the steps below to achieve the goal: {goal}.
@@ -1131,6 +1156,10 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
         Actions: <actionsStart>{role_actions}<actionEnd>
         Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{individual_recipe}<generalized_functionsEnd><recipeEnd>
+
+        PREVIOUS EXPERIENCE (use to avoid dead ends and improve efficiency):
+        {experience_hints}
+
         When writing code, always print the final response just before returning it.
         Note: Other agents do not have access to these actions or recipe information. Ensure you provide them with the necessary context and related information to perform the required actions.
     '''
@@ -1142,7 +1171,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         name='Assistant',
         llm_config=llm_config,
         max_consecutive_auto_reply=10,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
         code_execution_config={"work_dir": "coding", "use_docker": False},
         system_message=agent_prompt
     )
@@ -1167,7 +1196,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         name=f"User",
         human_input_mode="NEVER",
         llm_config=False,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
         max_consecutive_auto_reply=0,
         code_execution_config=False,
     )
@@ -1195,7 +1224,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
             When writing code, always print the final response just before returning it.
         """,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
     executor = autogen.AssistantAgent(
         name="Executor",
@@ -1226,7 +1255,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             if you get any conversation which is not related to coding ask the manager to route this conversation to user
             When writing code, always print the final response just before returning it.
         ''',
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
 
     multi_role_agent = autogen.AssistantAgent(
@@ -1255,7 +1284,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             Use "requires_breakdown" when an action is too complex and needs to be split into smaller subtasks. Each subtask should have a unique subtask_id (e.g., "1.1", "1.2").
 
         """,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
 
     chat_instructor = autogen.UserProxyAgent(
@@ -1264,7 +1293,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         max_consecutive_auto_reply=10,
         default_auto_reply="TERMINATE",
         code_execution_config=False,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
 
     context_handling = transform_messages.TransformMessages(
@@ -1328,7 +1357,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         payload = ""
         headers = {}
 
-        response = requests.post(url, headers=headers, data=payload)
+        response = pooled_post(url, headers=headers, data=payload)
         return response.json()['img_url']
 
     @assistant.register_for_execution()
@@ -1336,7 +1365,8 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     def img2txt(image_url: Annotated[str, "image url of which you want text"], text: Annotated[
         str, "the details you want from image"] = 'Describe the Images & Text data in this image in detail') -> str:
         current_app.logger.info('INSIDE img2txt')
-        url = "http://azurekong.hertzai.com:8000/llava/image_inference"
+        from core.config_cache import get_vision_api
+        url = get_vision_api() or "http://azurekong.hertzai.com:8000/llava/image_inference"
 
         payload = {
             'url': image_url,
@@ -1345,7 +1375,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         files = []
         headers = {}
 
-        response = requests.request(
+        response = pooled_request(
             "POST", url, headers=headers, data=payload, files=files, timeout=300)
         if response.status_code == 200:
             return response.text
@@ -1470,7 +1500,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         current_app.logger.info('INSIDE get_prompt_id')
         return f'{prompt_id}'
 
-    database_url = 'https://mailer.hertzai.com'
+    database_url = get_db_url() or 'https://mailer.hertzai.com'
 
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function", description="Generate video with text and save it in database")
@@ -1479,7 +1509,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                        realtime: Annotated[
                            bool, "If True, response is fast but less realistic by default it should be true; if False, response is realistic but slower"]) -> str:
         print('INSIDE Generate_video')
-        database_url = 'https://mailer.hertzai.com'
+        database_url = get_db_url() or 'https://mailer.hertzai.com'
         request_id = str(uuid.uuid4()).replace("-", "")[:11]
         print(f"avtar_id: {avatar_id}:\n{text[:10]}....\n")
 
@@ -1498,7 +1528,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         data['chattts'] = False
         data['openvoice'] = "false"
         try:
-            res = requests.get("https://mailer.hertzai.com/get_image_by_id/{}".format(avatar_id))
+            res = pooled_get("https://mailer.hertzai.com/get_image_by_id/{}".format(avatar_id))
             res = res.json()
             new_image_url = res["image_url"]
         except:
@@ -1528,7 +1558,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             data["cartoon_image"] = False
 
         if res['voice_id'] != None:
-            voice_sample = requests.get(
+            voice_sample = pooled_get(
                 "{}/get_voice_sample_id/{}".format(database_url, res['voice_id']))
             voice_sample = voice_sample.json()
             data["audio_sample_url"] = voice_sample["voice_sample_url"]
@@ -1542,7 +1572,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         data['avatar_id'] = avatar_id_int  # Use the integer version
         data['timeout'] = timeout
         try:
-            video_link = requests.post("{}/video_generate_save".format(database_url),
+            video_link = pooled_post("{}/video_generate_save".format(database_url),
                                        data=json.dumps(data), headers=headers, timeout=1)
         except:
             pass
@@ -1576,7 +1606,8 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             image = Image.fromarray(frame)
             # Save the image
             image.save(image_path)
-            url = "http://azurekong.hertzai.com:8000/minicpm/upload"
+            from core.config_cache import get_vision_api
+            url = get_vision_api() or "http://azurekong.hertzai.com:8000/minicpm/upload"
             payload = {
                 'prompt': f'Instruction: Respond in second person point of view\ninput:-{inp}'}
             files = [
@@ -1584,7 +1615,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             ]
             headers = {}
             try:
-                response = requests.post(
+                response = pooled_post(
                     url, headers=headers, data=payload, files=files)
                 current_app.logger.info(response.text)
                 response = response.text
@@ -1749,6 +1780,24 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         scheduler.add_job(send_message_to_user1, 'date', run_date=run_time, args=[user_id, text, '', prompt_id])
         return 'Message scheduled successfully'
 
+    # Expert agent consultation tool — domain-specific guidance on demand
+    @assistant.register_for_execution()
+    @helper.register_for_llm(api_style="function",
+                             description="Consult a specialized domain expert for the current task")
+    def consult_expert(task_description: Annotated[str, "Describe what expertise you need"]) -> str:
+        """Consult a domain expert agent for specialized guidance on the current task."""
+        try:
+            from integrations.expert_agents import match_expert_for_context
+            match = match_expert_for_context(task_description, top_k=3, min_score=2)
+            if not match:
+                return "No domain expert matched this task. Proceeding with general knowledge."
+            send_message_to_user1(user_id,
+                f"Consulting expert: {match['name']}",
+                "Expert consultation", prompt_id)
+            return f"Expert guidance from {match['name']}:\n{match['prompt_block']}"
+        except Exception as e:
+            return f"Expert consultation unavailable: {str(e)}"
+
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",
                              description="Retrieve the user's visual camera input from the past specified minutes.")
@@ -1819,7 +1868,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
                         for i, action in enumerate(recipes[user_prompt]['actions']):
                             if action.get("action_id") == action_id:
-                                recipes[user_prompt]['actions'][i] == vlm_action
+                                recipes[user_prompt]['actions'][i] = vlm_action
                                 action_exists = True
                                 break
 
@@ -1862,7 +1911,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             if user_prompt in user_tasks and hasattr(user_tasks[user_prompt], 'current_action'):
                 current_action_id = user_tasks[user_prompt].current_action
 
-            direct_vlm_path = f"prompts/{prompt_id}_{role_number}_{current_action_id}_vlm_agent.json"
+            direct_vlm_path = os.path.join(PROMPTS_DIR, f"{prompt_id}_{role_number}_{current_action_id}_vlm_agent.json")
             if os.path.exists(direct_vlm_path):
                 current_app.logger.info(f"Found direct VLM file for current action: {direct_vlm_path}")
                 try:
@@ -1892,12 +1941,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                 enhanced_instruction += "\nAdapt these steps to the current screen state as needed."
                 current_app.logger.info(f"Created enhanced instruction with {len(matching_recipe.get('recipe', []))} steps")
 
-            topic = f'com.hertzai.hevolve.action.{user_id}'
-            current_app.logger.info(f'calling {topic} for 5 second')
-            response = await subscribe_and_return({'prompt_id': prompt_id}, topic, 2000)  # Wait for the RPC response
-            current_app.logger.info(f'Response from call of {topic}: {response}')
-            if not response:
-                return 'Ask UserProxy to go to hevolve.ai login and start the windows companion app'
+            # Prepare VLM message (shared across all tiers)
             crossbar_message = {
                 'parent_request_id': request_id_list[user_prompt],
                 'user_id': f'{user_id}',
@@ -1914,13 +1958,26 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                 crossbar_message['enhanced_instruction'] = enhanced_instruction
                 current_app.logger.info(f"Added enhanced instruction to crossbar message")
 
-            topic = 'com.hertzai.hevolve.action'
-            current_app.logger.info(f'calling {topic} for 1800 seconds')
-
+            # Three-tier VLM execution (Tier 1: in-process, Tier 2: HTTP local)
+            from integrations.vlm.vlm_adapter import execute_vlm_instruction
             start_time = time.time()
-            response = await subscribe_and_return(crossbar_message,topic, 1800000)  # Wait for the RPC response
-            execution_time = time.time() - start_time
+            response = execute_vlm_instruction(crossbar_message)
 
+            if response is None:
+                # Tier 3: Crossbar WAMP (central/regional or fallback)
+                current_app.logger.info("VLM Tier 1/2 unavailable, falling back to Crossbar WAMP")
+                topic = f'com.hertzai.hevolve.action.{user_id}'
+                current_app.logger.info(f'calling {topic} for 5 second')
+                response = await subscribe_and_return({'prompt_id': prompt_id}, topic, 2000)
+                current_app.logger.info(f'Response from call of {topic}: {response}')
+                if not response:
+                    return 'Ask UserProxy to go to hevolve.ai login and start Nunba - Your Local HART Companion App'
+
+                topic = 'com.hertzai.hevolve.action'
+                current_app.logger.info(f'calling {topic} for 1800 seconds')
+                response = await subscribe_and_return(crossbar_message, topic, 1800000)
+
+            execution_time = time.time() - start_time
             current_app.logger.info(f'THIS IS RESPONSE type: {type(response)} value: {response}')
 
             # Transform the RPC response into the new format
@@ -1937,7 +1994,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                         # Determine file path with the action_id
                         role_number, role = get_flow_number(user_id, prompt_id)
                         action_id_to_use = action_id
-                        base_path = f"prompts/{prompt_id}_{role_number}"
+                        base_path = os.path.join(PROMPTS_DIR, f"{prompt_id}_{role_number}")
 
                         # Import os here to ensure it's available
                         import os
@@ -1971,8 +2028,11 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                             # For JSON-like strings
                             if text.strip().startswith("{") and "action" in text:
                                 try:
-                                    # Try to evaluate the string as a Python dict
-                                    action_data = eval(text.strip())
+                                    # Try to parse the string as JSON/Python dict safely
+                                    try:
+                                        action_data = json.loads(text.strip())
+                                    except (json.JSONDecodeError, ValueError):
+                                        action_data = ast.literal_eval(text.strip())
                                     action_type = action_data.get("action", "")
 
                                     if action_type == "mouse_move":
@@ -2172,7 +2232,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         name='time_agent',
         llm_config=llm_config,
         max_consecutive_auto_reply=10,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
         code_execution_config={"work_dir": "coding", "use_docker": False},
         system_message="You are an helpful AI assistant used to perform time based tasks given to you. "
                        f"""You can refer below details to perform task:
@@ -2192,7 +2252,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         name=f"user_proxy_{user_id}",
         human_input_mode="NEVER",
         llm_config=False,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
         max_consecutive_auto_reply=0,
         code_execution_config=False,
     )
@@ -2216,7 +2276,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
             When writing code, always print the final response just before returning it.
         """,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
     executor1 = autogen.AssistantAgent(
         name="Executor",
@@ -2243,7 +2303,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             if you get any conversation which is not related to coding ask the manager to route this conversation to user
             When writing code, always print the final response just before returning it.
         ''',
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
     multi_role_agent1 = autogen.AssistantAgent(
         name="multi_role_agent",
@@ -2269,7 +2329,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             Report status only—do not perform actions yourself.
 
         """,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
 
     chat_instructor1 = autogen.UserProxyAgent(
@@ -2278,7 +2338,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         max_consecutive_auto_reply=10,
         default_auto_reply="TERMINATE",
         code_execution_config=False,
-        is_termination_msg=lambda x: True if "TERMINATE" in x.get("content") else False,
+        is_termination_msg=_is_terminate_msg,
     )
 
     context_handling = transform_messages.TransformMessages(
@@ -2294,73 +2354,23 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     context_handling.add_to_agent(multi_role_agent1)
     context_handling.add_to_agent(verify1)
 
-    ##Tools call
-    helper1.register_for_llm(name="txt2img", description="Text to image Creator")(txt2img)
-    time_agent.register_for_execution(name="txt2img")(txt2img)
-    helper1.register_for_llm(name="img2txt", description="Image to Text/Question Answering from image")(img2txt)
-    time_agent.register_for_execution(name="img2txt")(img2txt)
-    helper1.register_for_llm(name="save_data_in_memory",
-                             description="Use this to Store and retrieve data using key-value storage system")(
-        save_data_in_memory)
-    time_agent.register_for_execution(name="save_data_in_memory")(save_data_in_memory)
-    helper1.register_for_llm(name="get_data_by_key", description="Returns all data from the internal Memory")(
-        get_data_by_key)
-    time_agent.register_for_execution(name="get_data_by_key")(get_data_by_key)
-    helper1.register_for_llm(name="get_user_id",
-                             description="Returns the unique identifier (user_id) of the current user.")(get_user_id)
-    time_agent.register_for_execution(name="get_user_id")(get_user_id)
-    helper1.register_for_llm(name="get_prompt_id",
-                             description="Returns the unique identifier (prompt_id) associated with the current prompt or conversation.")(
-        get_prompt_id)
-    time_agent.register_for_execution(name="get_prompt_id")(get_prompt_id)
-    helper1.register_for_llm(name="Generate_video", description="Generate video with text and save it in database")(
-        Generate_video)
-    time_agent.register_for_execution(name="Generate_video")(Generate_video)
-    helper1.register_for_llm(name="get_user_uploaded_file", description="get user's recent uploaded files")(
-        get_user_uploaded_file)
-    time_agent.register_for_execution(name="get_user_uploaded_file")(get_user_uploaded_file)
-    helper1.register_for_llm(name="get_user_camera_inp",
-                             description="Get user's visual information to process somethings")(get_user_camera_inp)
-    time_agent.register_for_execution(name="get_user_camera_inp")(get_user_camera_inp)
-    helper1.register_for_llm(name="create_scheduled_jobs",
-                             description="Creates time-based jobs using APScheduler to schedule jobs")(
-        create_scheduled_jobs)
-    time_agent.register_for_execution(name="create_scheduled_jobs")(create_scheduled_jobs)
-    helper1.register_for_llm(name="get_chat_history", description="Get Chat history based on text & start & end date")(
-        get_chat_history)
-    time_agent.register_for_execution(name="get_chat_history")(get_chat_history)
-    helper1.register_for_llm(name="search_visual_history", description="Search past camera and screen descriptions by keyword and time range.")(search_visual_history)
-    time_agent.register_for_execution(name="search_visual_history")(search_visual_history)
-    # SimpleMem tools for time_agent
-    if simplemem_store is not None:
-        helper1.register_for_llm(
-            name="search_long_term_memory",
-            description="Search long-term memory for past conversations, facts, and context using natural language query."
-        )(search_long_term_memory)
-        time_agent.register_for_execution(name="search_long_term_memory")(search_long_term_memory)
-        helper1.register_for_llm(
-            name="save_to_long_term_memory",
-            description="Save important facts or information to long-term memory for future retrieval across sessions."
-        )(save_to_long_term_memory)
-        time_agent.register_for_execution(name="save_to_long_term_memory")(save_to_long_term_memory)
-    helper1.register_for_llm(name="send_message_to_user", description="Send Message to User")(send_message_to_user)
-    time_agent.register_for_execution(name="send_message_to_user")(send_message_to_user)
-    helper1.register_for_llm(name="send_presynthesized_video_to_user",
-                             description="Sends a presynthesized message/video/dialogue to user using conv_id.")(
-        send_presynthesized_video_to_user)
-    time_agent.register_for_execution(name="send_presynthesized_video_to_user")(send_presynthesized_video_to_user)
-    helper1.register_for_llm(name="send_message_in_seconds",
-                             description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")(
-        send_message_in_seconds)
-    time_agent.register_for_execution(name="send_message_in_seconds")(send_message_in_seconds)
-
-    helper1.register_for_llm(name="execute_windows_or_android_command",
-                             description="Executes a command on a user's Windows computer or android device and returns the response.")(
-        execute_windows_or_android_command)
-    time_agent.register_for_execution(name="execute_windows_or_android_command")(execute_windows_or_android_command)
-
-    helper1.register_for_llm(name="google_search", description="Get google search response")(google_search)
-    time_agent.register_for_execution(name="google_search")(google_search)
+    # --- Core tools for time_agent (defined once in core/agent_tools.py) ---
+    from core.agent_tools import build_core_tool_closures, register_core_tools
+    _tool_ctx = {
+        'user_id': user_id, 'prompt_id': prompt_id,
+        'agent_data': agent_data, 'helper_fun': helper_fun,
+        'user_prompt': user_prompt, 'request_id_list': request_id_list,
+        'recent_file_id': recent_file_id, 'scheduler': scheduler,
+        'simplemem_store': simplemem_store,
+        'memory_graph': memory_graph,
+        # log_tool_execution not defined in reuse_recipe — uses passthrough default
+        'send_message_to_user1': send_message_to_user1,
+        'retrieve_json': retrieve_json,
+        'strip_json_values': strip_json_values,
+        'save_conversation_db': save_conversation_db,
+    }
+    core_tools = build_core_tool_closures(_tool_ctx)
+    register_core_tools(core_tools, helper1, time_agent)
 
     def connect_time_main(message: Annotated[str, "The message time agent want to send to main agent"]) -> str:
         message = f"Role: Time Agent\n Message: {message}"
@@ -2395,71 +2405,8 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     visual_agent, visual_user, helper2, executor2, multi_role_agent2, verify2, chat_instructor2 = helper_fun.create_visual_agent(
         user_id, prompt_id)
 
-    ##Tools call
-    helper2.register_for_llm(name="txt2img", description="Text to image Creator")(txt2img)
-    visual_agent.register_for_execution(name="txt2img")(txt2img)
-    helper2.register_for_llm(name="img2txt", description="Image to Text/Question Answering from image")(img2txt)
-    visual_agent.register_for_execution(name="img2txt")(img2txt)
-    helper2.register_for_llm(name="save_data_in_memory",
-                             description="Use this to Store and retrieve data using key-value storage system")(
-        save_data_in_memory)
-    visual_agent.register_for_execution(name="save_data_in_memory")(save_data_in_memory)
-    helper2.register_for_llm(name="get_data_by_key", description="Returns all data from the internal Memory")(
-        get_data_by_key)
-    visual_agent.register_for_execution(name="get_data_by_key")(get_data_by_key)
-    helper2.register_for_llm(name="get_user_id",
-                             description="Returns the unique identifier (user_id) of the current user.")(get_user_id)
-    visual_agent.register_for_execution(name="get_user_id")(get_user_id)
-    helper2.register_for_llm(name="get_prompt_id",
-                             description="Returns the unique identifier (prompt_id) associated with the current prompt or conversation.")(
-        get_prompt_id)
-    visual_agent.register_for_execution(name="get_prompt_id")(get_prompt_id)
-    helper2.register_for_llm(name="Generate_video", description="Generate video with text and save it in database")(
-        Generate_video)
-    visual_agent.register_for_execution(name="Generate_video")(Generate_video)
-    helper2.register_for_llm(name="get_user_uploaded_file", description="get user's recent uploaded files")(
-        get_user_uploaded_file)
-    visual_agent.register_for_execution(name="get_user_uploaded_file")(get_user_uploaded_file)
-    helper2.register_for_llm(name="get_user_camera_inp",
-                             description="Get user's visual information to process somethings")(get_user_camera_inp)
-    visual_agent.register_for_execution(name="get_user_camera_inp")(get_user_camera_inp)
-    helper2.register_for_llm(name="create_scheduled_jobs",
-                             description="Creates time-based jobs using APScheduler to schedule jobs")(
-        create_scheduled_jobs)
-    visual_agent.register_for_execution(name="create_scheduled_jobs")(create_scheduled_jobs)
-    helper2.register_for_llm(name="get_chat_history", description="Get Chat history based on text & start & end date")(
-        get_chat_history)
-    visual_agent.register_for_execution(name="get_chat_history")(get_chat_history)
-    helper2.register_for_llm(name="search_visual_history", description="Search past camera and screen descriptions by keyword and time range.")(search_visual_history)
-    visual_agent.register_for_execution(name="search_visual_history")(search_visual_history)
-    # SimpleMem tools for visual_agent
-    if simplemem_store is not None:
-        helper2.register_for_llm(
-            name="search_long_term_memory",
-            description="Search long-term memory for past conversations, facts, and context using natural language query."
-        )(search_long_term_memory)
-        visual_agent.register_for_execution(name="search_long_term_memory")(search_long_term_memory)
-        helper2.register_for_llm(
-            name="save_to_long_term_memory",
-            description="Save important facts or information to long-term memory for future retrieval across sessions."
-        )(save_to_long_term_memory)
-        visual_agent.register_for_execution(name="save_to_long_term_memory")(save_to_long_term_memory)
-    helper2.register_for_llm(name="send_message_to_user", description="Send Message to User")(send_message_to_user)
-    visual_agent.register_for_execution(name="send_message_to_user")(send_message_to_user)
-    helper2.register_for_llm(name="send_presynthesized_video_to_user",
-                             description="Sends a presynthesized message/video/dialogue to user using conv_id.")(
-        send_presynthesized_video_to_user)
-    visual_agent.register_for_execution(name="send_presynthesized_video_to_user")(send_presynthesized_video_to_user)
-    helper2.register_for_llm(name="send_message_in_seconds",
-                             description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")(
-        send_message_in_seconds)
-    visual_agent.register_for_execution(name="send_message_in_seconds")(send_message_in_seconds)
-    helper2.register_for_llm(name="execute_windows_or_android_command",
-                             description="Executes a command on a user's Windows computer or android device and returns the response.")(
-        execute_windows_or_android_command)
-    visual_agent.register_for_execution(name="execute_windows_or_android_command")(execute_windows_or_android_command)
-    helper2.register_for_llm(name="google_search", description="Get google search response")(google_search)
-    visual_agent.register_for_execution(name="google_search")(google_search)
+    # --- Core tools for visual_agent (reuse same tool closures) ---
+    register_core_tools(core_tools, helper2, visual_agent)
 
     # MCP Integration: Load and register user-provided MCP server tools
     try:
@@ -2516,6 +2463,18 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                 current_app.logger.info(f"Registered service tool: {tool_name}")
     except Exception as e:
         current_app.logger.warning(f"Service tools integration error (non-critical): {e}")
+
+    # HART Skills: Register ingested agent skills (Claude Code, Markdown, GitHub)
+    try:
+        from integrations.skills import skill_registry
+        skill_funcs = skill_registry.get_autogen_tools()
+        for func_name, func in skill_funcs.items():
+            description = func.__doc__ or f"HART skill: {func_name}"
+            helper.register_for_llm(name=func_name, description=description)(func)
+            assistant.register_for_execution(name=func_name)(func)
+            current_app.logger.info(f"Registered HART skill: {func_name}")
+    except Exception as e:
+        current_app.logger.debug(f"HART skills integration skipped: {e}")
 
     # Internal Agent Communication: Register agents and their skills for in-process communication
     try:
@@ -3077,15 +3036,40 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
         count = 0
         while True:
             current_app.logger.info('inside reuse while1')
+
+            # === LEDGER v2.0: Heartbeat + Budget/SLA using KNOWN state ===
+            _reuse_current_action = user_tasks[user_prompt].current_action
+            _reuse_ledger = user_ledgers.get(user_prompt)
+            if _reuse_ledger:
+                _reuse_task_id = f"action_{_reuse_current_action}"
+                _reuse_task = _reuse_ledger.tasks.get(_reuse_task_id)
+                if _reuse_task:
+                    _reuse_task.heartbeat()
+                    if _reuse_task.is_budget_exhausted():
+                        current_app.logger.warning(f"[BUDGET] Task {_reuse_task_id} budget exhausted in reuse loop")
+                        break
+                    if _reuse_task.is_sla_breached() and not _reuse_task.sla_breached:
+                        _reuse_task.mark_sla_breached()
+                        current_app.logger.warning(f"[SLA] Task {_reuse_task_id} SLA breached in reuse loop")
+
             if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
                 current_app.logger.info(
                     f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
                 try:
-                    json_obj = eval(group_chat.messages[-2]["content"])
+                    try:
+                        json_obj = json.loads(group_chat.messages[-2]["content"])
+                    except (json.JSONDecodeError, ValueError):
+                        json_obj = ast.literal_eval(group_chat.messages[-2]["content"])
                     current_app.logger.info(f'got json object {json_obj}')
                     if json_obj['status'].lower() == 'completed':
-                        current_app.logger.info(f'UPDATING CURRENT ACTION AS :{int(json_obj["action_id"])}')
-                        user_tasks[user_prompt].current_action = int(json_obj['action_id'])
+                        # === LLM CLAIM VALIDATION: cross-reference against known state ===
+                        _llm_action_id = int(json_obj.get("action_id", _reuse_current_action))
+                        if _llm_action_id != _reuse_current_action:
+                            current_app.logger.warning(
+                                f"[HALLUCINATION?] LLM claims action_id={_llm_action_id} "
+                                f"but pipeline assigned {_reuse_current_action} — using known value")
+                        current_app.logger.info(f'UPDATING CURRENT ACTION AS :{_reuse_current_action}')
+                        user_tasks[user_prompt].current_action = _reuse_current_action
                         action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)[
                             'action']
                         steps = [{x['steps']: {'tool_name': x.get('tool_name', None),
@@ -3106,8 +3090,15 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                             json_obj = json.loads(json_part)
                             current_app.logger.info(f'got json object {json_obj}')
                             if json_obj['status'].lower() == 'completed':
-                                current_app.logger.info(f'UPDATING CURRENT ACTION AS :{int(json_obj["action_id"])}')
-                                user_tasks[user_prompt].current_action = int(json_obj['action_id'])
+                                # Use KNOWN action_id from scope, not LLM's claim
+                                _known_action = user_tasks[user_prompt].current_action
+                                _llm_claimed = int(json_obj.get("action_id", _known_action))
+                                if _llm_claimed != _known_action:
+                                    current_app.logger.warning(
+                                        f"[HALLUCINATION?] LLM claims action_id={_llm_claimed} "
+                                        f"but pipeline has {_known_action}")
+                                current_app.logger.info(f'UPDATING CURRENT ACTION AS :{_known_action}')
+                                user_tasks[user_prompt].current_action = _known_action
                                 action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)['action']
                                 steps = [{x['steps']: {'tool_name': x.get('tool_name', None),
                                                        'code': x.get('generalized_functions', None)}} for x in
@@ -3118,7 +3109,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                                                               clear_history=False, silent=False)
                                 continue
                         else:
-                            raise 'No json found'
+                            raise ValueError('No json found')
                     except Exception as e:
                         current_app.logger.warning(f'it is not a json object the error is: {e}')
                         current_app.logger.info('it is not a json object You should ask status verifier to give response in proper format & not move ahead to next action')
@@ -3138,7 +3129,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                         f"Cannot access recipe for current action {user_tasks[user_prompt].current_action}")
                     continue
 
-                if user_tasks[user_prompt].actions[user_tasks[user_prompt].current_action]['can_perform_without_user_input'] == 'yes':
+                if user_tasks[user_prompt].actions[user_tasks[user_prompt].current_action - 1]['can_perform_without_user_input'] == 'yes':
                     current_app.logger.info('GOT can_perform_without_user_input as true')
                     message = 'You should complete this task independently. Feel free to make reasonable assumptions where necessary'
                     helper.initiate_chat(recipient=manager, message=message, clear_history=False, silent=False)
@@ -3243,7 +3234,7 @@ def get_flow_number(user_id, prompt_id):
     if not role:
         role = None
     current_app.logger.info(f'Got role as {role}')
-    file_path = f'prompts/{prompt_id}.json'
+    file_path = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
     with open(file_path, 'r') as f:
         data = json.load(f)
         available_roles = [x['name'] for x in data['personas']]
@@ -3259,30 +3250,39 @@ def get_flow_number(user_id, prompt_id):
     return role_number, role
 
 
+def _sched_log(level, msg):
+    """Log for create_schedule — works with or without Flask app context."""
+    try:
+        getattr(current_app.logger, level)(msg)
+    except RuntimeError:
+        import logging
+        getattr(logging.getLogger('reuse_recipe.scheduler'), level)(msg)
+
+
 def create_schedule(prompt_id, user_id):
-    current_app.logger.info('INSIDE Create Schedule')
+    _sched_log('info', 'INSIDE Create Schedule')
     user_prompt = f'{user_id}_{prompt_id}'
     role_number, role = get_flow_number(user_id, prompt_id)
-    with open(f"prompts/{prompt_id}_{role_number}_recipe.json", 'r') as f:
+    with open(os.path.join(PROMPTS_DIR, f"{prompt_id}_{role_number}_recipe.json"), 'r') as f:
         config = json.load(f)
         recipes[user_prompt] = config
     try:
         if 'scheduled_tasks' in config and len(config['scheduled_tasks']) > 0:
-            current_app.logger.info('Creating scheduled tasks')
+            _sched_log('info', 'Creating scheduled tasks')
             for i in config['scheduled_tasks']:
                 if role and i['persona'].lower() == role.lower():
                     trigger = CronTrigger.from_crontab(i['cron_expression'])
                     job_id = f"job_{int(time.time())}"
                     scheduler.add_job(execute_python_file, trigger=trigger, id=job_id,
                                       args=[i['job_description'], user_id, prompt_id, i['action_entry_point']])
-                    current_app.logger.info(f'Successfully created scheduler job {i["persona"]}')
+                    _sched_log('info', f'Successfully created scheduler job {i["persona"]}')
 
-        current_app.logger.info('Creating Visual scheduled tasks')
+        _sched_log('info', 'Creating Visual scheduled tasks')
         trigger = IntervalTrigger(seconds=int(2))
         job_id = f"job_{int(time.time())}"
         scheduler.add_job(call_visual_task, trigger=trigger, id=job_id,
                           args=['get past 1 mins visual information', user_id, prompt_id])
-        current_app.logger.info(f'Successfully created scheduler job')
+        _sched_log('info', 'Successfully created scheduler job')
         if 'visual_scheduled_tasks' in config and len(config['visual_scheduled_tasks']) > 0:
             for i in config['visual_scheduled_tasks']:
                 if role and i['persona'].lower() == role.lower():
@@ -3290,9 +3290,9 @@ def create_schedule(prompt_id, user_id):
                     job_id = f"job_{int(time.time())}"
                     scheduler.add_job(call_visual_task, trigger=trigger, id=job_id,
                                       args=[i['job_description'], user_id, prompt_id])
-                    current_app.logger.info(f'Successfully created scheduler job {i["persona"]}')
+                    _sched_log('info', f'Successfully created scheduler job {i["persona"]}')
     except Exception as e:
-        current_app.logger.error(f'Some Error in creating scheduled tasks error:{e}')
+        _sched_log('error', f'Some Error in creating scheduled tasks error:{e}')
 
 
 recent_file_id = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_recent_file_id')
@@ -3547,15 +3547,38 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                 count = 0
                 while True:
                     current_app.logger.info('inside while2')
+
+                    # === LEDGER v2.0: Heartbeat + Budget/SLA ===
+                    _w2_current = user_tasks[user_prompt].current_action
+                    _w2_ledger = user_ledgers.get(user_prompt)
+                    if _w2_ledger:
+                        _w2_task = _w2_ledger.tasks.get(f"action_{_w2_current}")
+                        if _w2_task:
+                            _w2_task.heartbeat()
+                            if _w2_task.is_budget_exhausted():
+                                current_app.logger.warning(f"[BUDGET] action_{_w2_current} budget exhausted in while2")
+                                break
+                            if _w2_task.is_sla_breached() and not _w2_task.sla_breached:
+                                _w2_task.mark_sla_breached()
+
                     if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
                         current_app.logger.info(
                             f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
                         try:
-                            json_obj = eval(group_chat.messages[-2]["content"])
+                            try:
+                                json_obj = json.loads(group_chat.messages[-2]["content"])
+                            except (json.JSONDecodeError, ValueError):
+                                json_obj = ast.literal_eval(group_chat.messages[-2]["content"])
                             current_app.logger.info(f'got json object {json_obj}')
                             if json_obj['status'].lower() == 'completed':
-                                current_app.logger.info(f'UPDATIN CURRENT ACTION AS :{int(json_obj["action_id"])}')
-                                user_tasks[user_prompt].current_action = int(json_obj['action_id'])
+                                # Use KNOWN action_id, not LLM's claim
+                                _llm_aid = int(json_obj.get("action_id", _w2_current))
+                                if _llm_aid != _w2_current:
+                                    current_app.logger.warning(
+                                        f"[HALLUCINATION?] LLM claims action_id={_llm_aid} "
+                                        f"but pipeline has {_w2_current}")
+                                current_app.logger.info(f'UPDATING CURRENT ACTION AS :{_w2_current}')
+                                user_tasks[user_prompt].current_action = _w2_current
                                 action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)['action']
                                 steps = [{x['steps']: {'tool_name': x.get('tool_name', None),
                                                        'code': x.get('generalized_functions', None)}} for x in
@@ -3573,9 +3596,15 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                     json_obj = json.loads(json_part)
                                     current_app.logger.info(f'got json object {json_obj}')
                                     if json_obj['status'].lower() == 'completed':
+                                        # Use KNOWN action_id, not LLM's claim
+                                        _llm_aid2 = int(json_obj.get("action_id", _w2_current))
+                                        if _llm_aid2 != _w2_current:
+                                            current_app.logger.warning(
+                                                f"[HALLUCINATION?] LLM claims action_id={_llm_aid2} "
+                                                f"but pipeline has {_w2_current}")
                                         current_app.logger.info(
-                                            f'UPDATIN CURRENT ACTION AS :{int(json_obj["action_id"])}')
-                                        user_tasks[user_prompt].current_action = int(json_obj['action_id'])
+                                            f'UPDATING CURRENT ACTION AS :{_w2_current}')
+                                        user_tasks[user_prompt].current_action = _w2_current
                                         action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)['action']
                                         steps = [{x['steps']: {'tool_name': x.get('tool_name', None),
                                                                'code': x.get('generalized_functions', None)}} for x in
@@ -3588,7 +3617,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
 
 
                                 else:
-                                    raise 'No json found'
+                                    raise ValueError('No json found')
                             except IndexError as e:
                                 current_app.logger.info(f"COmpleted ALL ACTIONS:")
                                 return ''

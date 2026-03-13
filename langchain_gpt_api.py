@@ -1,57 +1,56 @@
 # Fix Windows encoding for non-ASCII characters (Telugu, emojis, etc.)
 import sys
 import io
-if sys.platform == 'win32':
+if sys.platform == 'win32' and 'pytest' not in sys.modules:
     # Force UTF-8 encoding for stdout/stderr to prevent crashes with non-ASCII characters
-    if sys.stdout is not None:
+    # Skip when running under pytest — pytest wraps stdout/stderr for capture,
+    # and replacing them here closes pytest's file handles.
+    if sys.stdout is not None and hasattr(sys.stdout, 'buffer'):
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    if sys.stderr is not None:
+    if sys.stderr is not None and hasattr(sys.stderr, 'buffer'):
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 from bs4 import BeautifulSoup
 from enum import Enum
+from cultural_wisdom import get_cultural_prompt_compact
+from agent_identity import build_identity_prompt, SECRETS_GUARDRAIL
 
-# Use langchain-classic for pydantic v2 compatibility
-from langchain.llms import OpenAI
-from langchain.chains import LLMChain
-from langchain.prompts import PromptTemplate
-from langchain.agents import (
+# langchain_classic — pydantic v2-compatible fork of langchain 0.0.230
+from langchain_classic.llms import OpenAI
+from langchain_classic.chains import LLMChain
+from langchain_classic.prompts import PromptTemplate
+from langchain_classic.agents import (
     ZeroShotAgent, Tool, AgentExecutor, ConversationalAgent,
     ConversationalChatAgent, LLMSingleActionAgent, AgentOutputParser,
     load_tools, initialize_agent, AgentType
 )
+from langchain_classic.prompts import (
+    ChatPromptTemplate, MessagesPlaceholder,
+    SystemMessagePromptTemplate, HumanMessagePromptTemplate
+)
+from langchain_classic.chains import LLMMathChain
+from langchain_classic.chains.conversation.memory import ConversationSummaryMemory, ConversationBufferWindowMemory
+from langchain_classic.chat_models import ChatOpenAI
+from langchain_classic.llms.base import LLM
+from langchain_classic.memory import ConversationBufferMemory, ReadOnlySharedMemory
+from langchain_classic.schema import AgentAction, AgentFinish, OutputParserException, HumanMessage, AIMessage, SystemMessage
+from langchain_classic.tools import OpenAPISpec, APIOperation, StructuredTool
+from langchain_classic.utilities import GoogleSearchAPIWrapper
 
 import time
-from langchain.prompts import (
-    ChatPromptTemplate,
-    MessagesPlaceholder,
-    SystemMessagePromptTemplate,
-    HumanMessagePromptTemplate
-)
-from langchain.chains import LLMMathChain
-from langchain.chains.conversation.memory import ConversationSummaryMemory, ConversationBufferWindowMemory
-
-# ChatOpenAI - use langchain
-from langchain.chat_models import ChatOpenAI
 
 # ChatGroq - optional import (version compatibility issues)
 try:
     from langchain_groq import ChatGroq
-except (ImportError, ModuleNotFoundError):
+except Exception:
     ChatGroq = None
 
-# LLM base class
-from langchain.llms.base import LLM
-from langchain.memory import ConversationBufferMemory, ReadOnlySharedMemory
-from langchain.schema import AgentAction, AgentFinish, OutputParserException, HumanMessage, AIMessage, SystemMessage
-from langchain.tools import OpenAPISpec, APIOperation, StructuredTool
-from langchain.utilities import GoogleSearchAPIWrapper
 try:
-    from langchain.requests import Requests
+    from langchain_classic.requests import Requests
 except (ImportError, AttributeError):
-    # Requests might not be in langchain
     Requests = None
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, g
+from functools import wraps
 import json
 import os
 import re
@@ -61,39 +60,93 @@ import threading
 import atexit
 import requests
 import pytz
+import hashlib
+from security.node_integrity import compute_code_hash, compute_file_manifest, verify_json_signature
+from security import master_key
+
+
+# --- Hevolve Boot Integrity Verification ---
+_boot_logger = logging.getLogger("hevolve_integrity")
+
+def hevolve_verify_boot():
+    mode = (os.getenv("HEVOLVE_ENFORCEMENT_MODE") or "warn").lower()
+    tier = (os.getenv("HEVOLVE_NODE_TIER") or "unknown").lower()
+
+    manifest_path = master_key.RELEASE_MANIFEST_FILENAME
+
+    if not os.path.exists(manifest_path):
+        msg = f"[HevolveIntegrity] release_manifest.json missing (tier={tier}, mode={mode})"
+        if mode == "hard":
+            raise RuntimeError(msg)
+        _boot_logger.warning(msg)
+        return
+
+    with open(manifest_path) as f:
+        d = json.load(f)
+
+    pub_hex = d.get("master_public_key")
+    sig_hex = d.get("master_signature")
+    payload_obj = {k: d[k] for k in d.keys() if k != "master_signature"}
+    payload_json = json.dumps(payload_obj, sort_keys=True, separators=(",", ":"))
+    try:
+        verify_json_signature(pub_hex, payload_json, sig_hex)
+    except Exception as e:
+        msg = f"[HevolveIntegrity] Signature verification failed: {e}"
+        if mode == "hard":
+            raise RuntimeError(msg)
+        _boot_logger.warning(msg)
+        return
+
+    current_code_hash = compute_code_hash()
+    if d.get("code_hash") != current_code_hash:
+        msg = "[HevolveIntegrity] CODE_HASH mismatch"
+        if mode == "hard":
+            raise RuntimeError(msg)
+        _boot_logger.warning(msg)
+
+    fm = compute_file_manifest()
+    current_fm_hash = hashlib.sha256(json.dumps(fm, sort_keys=True).encode()).hexdigest()
+    if d.get("file_manifest_hash") != current_fm_hash:
+        msg = "[HevolveIntegrity] FILE_MANIFEST_HASH mismatch"
+        if mode == "hard":
+            raise RuntimeError(msg)
+        _boot_logger.warning(msg)
+
+    _boot_logger.info(f"[HevolveIntegrity] Boot verification OK (tier={tier}, mode={mode})")
+
+# Defer boot verification to main() — do not run at import time
+# --- End Boot Integrity Verification ---
+
+
 from core.http_pool import pooled_get, pooled_post
 from datetime import datetime, timezone
 from typing import List, Union, Optional, Mapping, Any, Dict
 
-# Conversational chat imports from langchain-classic
+# Conversational chat imports
 try:
-    from langchain.agents.conversational_chat.output_parser import ConvoOutputParser
-    from langchain.agents.conversational_chat.prompt import FORMAT_INSTRUCTIONS
-    from langchain.output_parsers.json import parse_json_markdown
-except (ImportError, AttributeError) as e:
-    # These might not exist in langchain-classic
+    from langchain_classic.agents.conversational_chat.output_parser import ConvoOutputParser
+    from langchain_classic.agents.conversational_chat.prompt import FORMAT_INSTRUCTIONS
+    from langchain_classic.output_parsers.json import parse_json_markdown
+except (ImportError, AttributeError):
     ConvoOutputParser = None
     FORMAT_INSTRUCTIONS = None
     parse_json_markdown = None
 
-# Tools imports - try langchain_community first
+# Tools imports
 try:
-    from langchain_community.tools import RequestsGetTool
-except ImportError:
-    try:
-        from langchain.tools.requests.tool import RequestsGetTool
-    except (ImportError, AttributeError):
-        RequestsGetTool = None
+    from langchain_classic.tools.requests.tool import RequestsGetTool
+except (ImportError, AttributeError):
+    RequestsGetTool = None
 
 try:
-    from langchain_community.utilities import TextRequestsWrapper
-except ImportError:
-    try:
-        from langchain.utilities.requests import TextRequestsWrapper
-    except (ImportError, AttributeError):
-        TextRequestsWrapper = None
+    from langchain_classic.utilities.requests import TextRequestsWrapper
+except (ImportError, AttributeError):
+    TextRequestsWrapper = None
 
-import tiktoken
+try:
+    import tiktoken
+except ImportError:
+    tiktoken = None
 from pytz import timezone
 from datetime import datetime, timedelta
 from waitress import serve
@@ -105,13 +158,16 @@ try:
 except ImportError:
     from pydantic import BaseModel, Field, root_validator
 from threadlocal import thread_local_data
-import crossbarhttp
+try:
+    import crossbarhttp
+except Exception:
+    crossbarhttp = None
 from PIL import Image
 import numpy as np
 # Cohere rerank - make optional to avoid pydantic v2 incompatibility with old langchain
 try:
     from langchain_community.retrievers.document_compressors import cohere_rerank
-except (ImportError, ModuleNotFoundError):
+except Exception:
     cohere_rerank = None  # Not available
 import asyncio
 import aiohttp
@@ -151,9 +207,23 @@ except ImportError:
 import threading
 
 try:
-    from helper import retrieve_json
-except ImportError:
+    from helper import retrieve_json, PROMPTS_DIR, safe_prompt_path, _is_terminate_msg
+except Exception:
     retrieve_json = None
+    # Frozen builds install to Program Files (read-only) — redirect to user data dir
+    if getattr(sys, 'frozen', False):
+        try:
+            from core.platform_paths import get_prompts_dir
+            PROMPTS_DIR = os.path.abspath(get_prompts_dir())
+        except ImportError:
+            PROMPTS_DIR = os.path.abspath(os.path.join(
+                os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'prompts'))
+    else:
+        PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
+    safe_prompt_path = None
+
+# Ensure prompts directory exists (agent creation writes JSON here)
+os.makedirs(PROMPTS_DIR, exist_ok=True)
 
 # Google A2A integration (from gpt4.1)
 try:
@@ -166,7 +236,7 @@ except ImportError:
 # os.environ['LANGCHAIN_ENDPOINT'] = 'https://api.smith.langchain.com'
 # os.environ['LANGCHAIN_API_KEY'] = os.getenv("LANGCHAIN_API_KEY")
 # os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGCHAIN_PROJECT")
-groq_api_key = os.environ['GROQ_API_KEY']
+groq_api_key = os.environ.get('GROQ_API_KEY', '')
 
 
 # ============================================================================
@@ -183,9 +253,13 @@ def _get_or_create_graph(user_id, prompt_id=None):
         session_key = f"{user_id}_{prompt_id}" if prompt_id else str(user_id)
         with _memory_graph_lock:
             if session_key not in _memory_graphs:
-                db_path = os.path.join(
-                    os.path.expanduser("~"), "Documents", "Nunba", "data", "memory_graph", session_key
-                )
+                try:
+                    from core.platform_paths import get_memory_graph_dir
+                    db_path = get_memory_graph_dir(session_key)
+                except ImportError:
+                    db_path = os.path.join(
+                        os.path.expanduser("~"), "Documents", "Nunba", "data", "memory_graph", session_key
+                    )
                 _memory_graphs[session_key] = MemoryGraph(
                     db_path=db_path,
                     user_id=str(user_id),
@@ -218,10 +292,11 @@ def _record_lifecycle(status, user_id, prompt_id, details=''):
 # ============================================================================
 class ChatQwen3VL(LLM):
     """
-    Custom LangChain LLM wrapper for local Qwen3-VL API server.
+    Custom LangChain LLM wrapper for a local OpenAI-compatible API server.
 
-    Compatible with LangChain's LLM interface while calling the local
-    crawl4ai server at http://localhost:8000/v1/chat/completions.
+    In bundled Nunba mode, automatically targets the llama.cpp server that
+    Nunba already starts on port 8080 (CPU inference). Otherwise falls back
+    to Qwen3-VL on port 8000 or any HEVOLVE_LOCAL_LLM_URL override.
 
     Features:
     - OpenAI-compatible API interface
@@ -230,18 +305,18 @@ class ChatQwen3VL(LLM):
     - Drop-in replacement for ChatOpenAI
     """
 
-    base_url: str = "http://localhost:8000/v1"
-    model_name: str = "Qwen3-VL-4B-Instruct"
+    base_url: str = os.environ.get('HEVOLVE_LOCAL_LLM_URL', "http://localhost:8000/v1")
+    model_name: str = "local"
     temperature: float = 0.7
     max_tokens: int = 1500
 
     @property
     def _llm_type(self) -> str:
-        return "qwen3-vl"
+        return "qwen3.5"
 
     def _call(self, prompt: str, stop: list = None) -> str:
         """
-        Call the Qwen3-VL API with the given prompt.
+        Call the Qwen3.5 API with the given prompt.
 
         Args:
             prompt: The input text prompt
@@ -260,6 +335,8 @@ class ChatQwen3VL(LLM):
         if stop:
             payload["stop"] = stop
 
+        _log = logging.getLogger(__name__)
+        # Primary: HevolveAI embodied-ai on port 8000
         try:
             response = pooled_post(
                 f"{self.base_url}/chat/completions",
@@ -267,13 +344,29 @@ class ChatQwen3VL(LLM):
                 timeout=60
             )
             response.raise_for_status()
-
             data = response.json()
             return data["choices"][0]["message"]["content"]
-
         except Exception as e:
-            app.logger.error(f"[Qwen3-VL] Error calling API: {e}")
-            raise
+            _log.warning(f"[LocalLLM] {self.base_url} unavailable: {e}")
+
+        # Fallback: llama.cpp (Nunba always starts it)
+        _llama_port = os.environ.get('LLAMA_CPP_PORT', '8080')
+        _llama_url = f"http://127.0.0.1:{_llama_port}/v1"
+        if _llama_url not in self.base_url:
+            try:
+                _log.info(f"[LocalLLM] Falling back to llama.cpp at {_llama_url}")
+                response = pooled_post(
+                    f"{_llama_url}/chat/completions",
+                    json=payload,
+                    timeout=120
+                )
+                response.raise_for_status()
+                data = response.json()
+                return data["choices"][0]["message"]["content"]
+            except Exception as e2:
+                _log.error(f"[LocalLLM] llama.cpp fallback also failed: {e2}")
+                raise
+        raise
 
     @property
     def _identifying_params(self) -> dict:
@@ -293,20 +386,71 @@ def get_llm(model_name="gpt-3.5-turbo", temperature=0.7, max_tokens=1500):
     """
     Get LLM instance based on configuration.
 
-    Returns ChatQwen3VL if USE_QWEN3VL is True, otherwise ChatOpenAI.
+    Priority:
+    1. Wizard-configured cloud provider (HEVOLVE_ACTIVE_CLOUD_PROVIDER env var)
+    2. ChatQwen3VL (local) if USE_QWEN3VL flag is True
+    3. ChatOpenAI fallback
     """
+    _active = os.environ.get('HEVOLVE_ACTIVE_CLOUD_PROVIDER', '')
+
+    if _active == 'anthropic' and os.environ.get('ANTHROPIC_API_KEY'):
+        try:
+            from langchain_anthropic import ChatAnthropic
+            return ChatAnthropic(
+                model=os.environ.get('ANTHROPIC_MODEL', 'claude-sonnet-4-20250514'),
+                api_key=os.environ['ANTHROPIC_API_KEY'],
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except ImportError:
+            pass
+
+    if _active == 'google_gemini' and os.environ.get('GOOGLE_API_KEY'):
+        try:
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            return ChatGoogleGenerativeAI(
+                model=os.environ.get('GOOGLE_MODEL', 'gemini-2.0-flash'),
+                google_api_key=os.environ['GOOGLE_API_KEY'],
+                temperature=temperature,
+                max_output_tokens=max_tokens,
+            )
+        except ImportError:
+            pass
+
+    if _active == 'groq' and os.environ.get('GROQ_API_KEY'):
+        try:
+            from langchain_groq import ChatGroq
+            return ChatGroq(
+                model=os.environ.get('GROQ_MODEL', 'llama-3.3-70b-versatile'),
+                api_key=os.environ['GROQ_API_KEY'],
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except ImportError:
+            pass
+
+    if _active in ('openai', 'azure_openai', 'custom_openai') and os.environ.get('OPENAI_API_KEY'):
+        _kwargs = dict(
+            model_name=os.environ.get('OPENAI_MODEL', model_name),
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        if _active == 'custom_openai' and os.environ.get('CUSTOM_LLM_BASE_URL'):
+            _kwargs['openai_api_base'] = os.environ['CUSTOM_LLM_BASE_URL']
+        return ChatOpenAI(**_kwargs)
+
     if USE_QWEN3VL:
         return ChatQwen3VL(
-            model_name="Qwen3-VL-2B-Instruct",
+            model_name="Qwen3.5-4B",
             temperature=temperature,
             max_tokens=max_tokens
         )
-    else:
-        return ChatOpenAI(
-            model_name=model_name,
-            temperature=temperature,
-            max_tokens=max_tokens
-        )
+
+    return ChatOpenAI(
+        model_name=model_name,
+        temperature=temperature,
+        max_tokens=max_tokens
+    )
 # ============================================================================
 
 
@@ -320,36 +464,61 @@ class RequestLogRecord(logging.LogRecord):
 # logging info
 # Use the custom log record factory
 logging.setLogRecordFactory(RequestLogRecord)
-logging.basicConfig(level=logging.INFO)
-stream_handler = logging.StreamHandler(sys.stdout)
-# In bundled/pip-installed mode (NUNBA_BUNDLED env set by main.py), redirect log
-# to the shared Nunba log directory; standalone keeps default behavior.
 
-if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
-    _nunba_log_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'logs')
-    os.makedirs(_nunba_log_dir, exist_ok=True)
+# In bundled/pip-installed mode (NUNBA_BUNDLED env set by main.py), redirect logs
+# to the shared Nunba log directory; standalone keeps default behavior.
+_is_bundled = bool(os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False))
+
+if _is_bundled:
+    try:
+        from core.platform_paths import get_log_dir as _get_log_dir_lc
+        _nunba_log_dir = _get_log_dir_lc()
+    except ImportError:
+        _nunba_log_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'logs')
+    try:
+        os.makedirs(_nunba_log_dir, exist_ok=True)
+    except PermissionError:
+        _nunba_log_dir = os.path.join(os.path.expanduser('~'), '.nunba', 'logs')
+        os.makedirs(_nunba_log_dir, exist_ok=True)
     _langchain_log_path = os.path.join(_nunba_log_dir, 'langchain.log')
 else:
     _langchain_log_path = 'langchain.log'
 
-handler = RotatingFileHandler(_langchain_log_path, maxBytes=100000, backupCount=0)
+handler = RotatingFileHandler(_langchain_log_path, maxBytes=5_000_000, backupCount=2)
+handler.setLevel(logging.INFO)
 
-# Set the logging level for the file handler
-handler.setLevel(logging.ERROR)
+stream_handler = logging.StreamHandler(sys.stdout)
 
 # Create a logging format
-req_id = thread_local_data.get_request_id()
 formatter = logging.Formatter(
     '%(asctime)s - %(name)s- [RequestID: %(req_id)s] - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 stream_handler.setFormatter(formatter)
 
+# Configure root logger: clear any default handlers first to prevent duplicates,
+# then attach our handlers once.  In bundled mode the root logger gets both
+# stream + file so that ALL module loggers are captured.  In standalone mode
+# only Flask's app.logger gets the handlers.
+_root = logging.getLogger()
+_root.handlers.clear()
+_root.setLevel(logging.INFO)
+
+if _is_bundled:
+    _root.addHandler(handler)
+    _root.addHandler(stream_handler)
+
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
 
-app.logger.addHandler(stream_handler)
-app.logger.addHandler(handler)
-app.logger.propagate = False
+if _is_bundled:
+    # Bundled: root owns the handlers; let app.logger propagate to root
+    # so ALL module loggers (hevolveai, langchain, etc.) are captured.
+    app.logger.propagate = True
+else:
+    # Standalone: only Flask's logger gets the handlers
+    app.logger.addHandler(stream_handler)
+    app.logger.addHandler(handler)
+    app.logger.propagate = False
 
 # Security: Audit logging — redact API keys, JWTs, passwords from all logs
 try:
@@ -369,6 +538,13 @@ try:
 except Exception as e:
     app.logger.warning(f"Security middleware not applied: {e}")
 
+# Security: Block inspect.getsource() for protected packages (hevolveai)
+try:
+    from security.source_protection import install_source_guards
+    install_source_guards()
+except Exception:
+    pass  # Non-fatal — source stripping is the primary defense
+
 # ============================================================================
 # HevolveSocial - Agent Social Network
 # ============================================================================
@@ -380,13 +556,162 @@ try:
 except Exception as e:
     app.logger.warning(f"HevolveSocial init skipped (non-critical): {e}")
 
+try:
+    from integrations.distributed_agent import distributed_agent_bp
+    app.register_blueprint(distributed_agent_bp)
+    app.logger.info("distributed_agent_bp registered at /api/distributed")
+except ImportError:
+    app.logger.info("distributed_agent module not available, skipping")
+except Exception as e:
+    app.logger.warning(f"distributed_agent init skipped: {e}")
+
+try:
+    from integrations.social.api_provision import provision_bp
+    app.register_blueprint(provision_bp)
+    app.logger.info("provision_bp registered at /api/provision")
+except ImportError:
+    app.logger.info("Provision module not available, skipping")
+except Exception as e:
+    app.logger.warning(f"Provision init skipped: {e}")
+
+try:
+    from integrations.social.consent_service import register_consent_routes
+    register_consent_routes(app)
+except ImportError:
+    pass
+except Exception as e:
+    app.logger.warning(f"Consent service init skipped: {e}")
+
+# Instruction Queue API — never miss a user instruction
+try:
+    from integrations.agent_engine.instruction_queue import (
+        get_queue, enqueue_instruction, pull_user_batch,
+    )
+
+    @app.route('/api/instructions/enqueue', methods=['POST'])
+    def _api_enqueue_instruction():
+        data = request.get_json(silent=True) or {}
+        user_id = str(data.get('user_id', '1'))
+        text = data.get('text', '')
+        if not text:
+            return jsonify({'error': 'text is required'}), 400
+        inst = enqueue_instruction(
+            user_id, text,
+            priority=data.get('priority', 5),
+            tags=data.get('tags'),
+            context=data.get('context'),
+        )
+        return jsonify({'success': True, 'instruction': inst.to_dict()})
+
+    @app.route('/api/instructions/pending', methods=['GET'])
+    def _api_pending_instructions():
+        user_id = request.args.get('user_id', '1')
+        q = get_queue(user_id)
+        pending = q.get_pending()
+        return jsonify({
+            'success': True,
+            'pending': [i.to_dict() for i in pending],
+            'stats': q.stats(),
+        })
+
+    @app.route('/api/instructions/batch', methods=['POST'])
+    def _api_pull_batch():
+        data = request.get_json(silent=True) or {}
+        user_id = str(data.get('user_id', '1'))
+        max_tokens = data.get('max_tokens', 8000)
+        batch = pull_user_batch(user_id, max_tokens=max_tokens)
+        if not batch:
+            return jsonify({'success': True, 'batch': None, 'message': 'No pending instructions'})
+        return jsonify({'success': True, 'batch': batch.to_dict()})
+
+    @app.route('/api/instructions/cancel', methods=['POST'])
+    def _api_cancel_instruction():
+        data = request.get_json(silent=True) or {}
+        user_id = str(data.get('user_id', '1'))
+        instruction_id = data.get('instruction_id', '')
+        if not instruction_id:
+            return jsonify({'error': 'instruction_id is required'}), 400
+        q = get_queue(user_id)
+        q.cancel(instruction_id)
+        return jsonify({'success': True})
+
+    @app.route('/api/instructions/plan', methods=['GET'])
+    def _api_execution_plan():
+        """Pull execution plan — agents query this to see what's available.
+
+        Returns dependency-aware waves so the agent can dispatch
+        independent items in parallel and dependent items in order.
+        This is a PULL API — agents decide when to fetch work.
+        """
+        user_id = request.args.get('user_id', '1')
+        max_tokens = int(request.args.get('max_tokens', '8000'))
+        q = get_queue(user_id)
+        plan = q.pull_execution_plan(max_tokens=max_tokens)
+        if not plan:
+            return jsonify({'success': True, 'plan': None, 'message': 'No pending instructions'})
+        return jsonify({'success': True, 'plan': plan.to_dict()})
+
+    @app.route('/api/instructions/complete', methods=['POST'])
+    def _api_complete_instruction():
+        """Mark a single instruction as done (used by agents after execution).
+
+        Notifies SmartLedger to unblock dependent instructions.
+        """
+        data = request.get_json(silent=True) or {}
+        user_id = str(data.get('user_id', '1'))
+        instruction_id = data.get('instruction_id', '')
+        result = data.get('result')
+        if not instruction_id:
+            return jsonify({'error': 'instruction_id is required'}), 400
+        q = get_queue(user_id)
+        q.complete_instruction(instruction_id, result=result)
+        return jsonify({'success': True})
+
+    @app.route('/api/instructions/fail', methods=['POST'])
+    def _api_fail_instruction():
+        """Mark a single instruction as failed — returns to queue for retry."""
+        data = request.get_json(silent=True) or {}
+        user_id = str(data.get('user_id', '1'))
+        instruction_id = data.get('instruction_id', '')
+        error = data.get('error', 'unknown')
+        if not instruction_id:
+            return jsonify({'error': 'instruction_id is required'}), 400
+        q = get_queue(user_id)
+        q.fail_instruction(instruction_id, error=error)
+        return jsonify({'success': True})
+
+    @app.route('/api/instructions/drain', methods=['POST'])
+    def _api_drain_queue():
+        """Trigger wave-based drain — dispatches with parallel + sequential ordering.
+
+        Agent or daemon calls this to execute all pending instructions.
+        Independent instructions dispatch in parallel threads.
+        Dependent instructions wait for prerequisites.
+        """
+        data = request.get_json(silent=True) or {}
+        user_id = str(data.get('user_id', '1'))
+        max_tokens = data.get('max_tokens', 8000)
+        try:
+            from integrations.agent_engine.dispatch import drain_instruction_queue
+            result = drain_instruction_queue(user_id, max_tokens=max_tokens)
+            if result:
+                return jsonify({'success': True, 'result': result[:2000]})
+            return jsonify({'success': True, 'result': None, 'message': 'Queue empty or all failed'})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    app.logger.info("Instruction queue API routes registered (8 endpoints)")
+except Exception as e:
+    app.logger.warning(f"Instruction queue init skipped: {e}")
+
 # ============================================================================
 # Google A2A Protocol Initialization
 # ============================================================================
 # Initialize A2A server for cross-platform agent communication
 try:
     app.logger.info("Initializing Google A2A Protocol server...")
-    a2a_server = initialize_a2a_server(app, base_url="http://localhost:6777")
+    from core.port_registry import get_port as _a2a_get_port
+    a2a_server = initialize_a2a_server(app, base_url=f"http://localhost:{_a2a_get_port('backend')}")
     app.logger.info("Google A2A Protocol server initialized successfully")
 
     # Register all agents with A2A
@@ -405,27 +730,50 @@ except Exception as e:
     spec = None
 
 
-with open("config.json", 'r') as f:
-    config = json.load(f)
-
+# Load config.json — graceful fallback when keys are absent (e.g. bundled Nunba install
+# where the config.json is Nunba's URL-template file, not langchain's API-key file).
+# In frozen Nunba builds, langchain config is bundled as langchain_config.json to avoid
+# collision with the project root config.json (which has IP_ADDRESS settings).
+config = {}
+for _cfg_name in ('langchain_config.json', 'config.json'):
+    try:
+        with open(_cfg_name, 'r') as f:
+            _loaded = json.load(f)
+        # Distinguish langchain config (has API keys) from Nunba URL config (has IP_ADDRESS)
+        if 'IP_ADDRESS' not in _loaded or any(k.endswith('_API_KEY') for k in _loaded):
+            config = _loaded
+            break
+        elif not config:
+            config = _loaded  # fall through to try langchain_config.json first
+    except Exception:
+        pass
 
 # global variables
-encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
+try:
+    encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
+except (KeyError, Exception):
+    encoding = tiktoken.get_encoding("cl100k_base")  # GPT-4 default
 
-# api and keys
-# app.logger.log(config['OPENAI_API_KEY'])
-os.environ["OPENAI_API_KEY"] = config['OPENAI_API_KEY']
-os.environ["GOOGLE_CSE_ID"] = config['GOOGLE_CSE_ID']
-os.environ["GOOGLE_API_KEY"] = config['GOOGLE_API_KEY']
-os.environ["NEWS_API_KEY"] = config['NEWS_API_KEY']
-os.environ["SERPAPI_API_KEY"] = config['SERPAPI_API_KEY']
+# api and keys — use config if available, otherwise keep existing env vars / empty
+for _cfg_key in ('OPENAI_API_KEY', 'GOOGLE_CSE_ID', 'GOOGLE_API_KEY',
+                  'NEWS_API_KEY', 'SERPAPI_API_KEY'):
+    if _cfg_key in config:
+        os.environ[_cfg_key] = config[_cfg_key]
+    else:
+        os.environ.setdefault(_cfg_key, '')
 
-# Mode-aware inference: pass LLM endpoint to crawl4ai for non-flat deployments
+# Mode-aware inference: pass LLM endpoint to HevolveAI for non-flat deployments
 _node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
+_active_cloud = os.environ.get('HEVOLVE_ACTIVE_CLOUD_PROVIDER', '')
 if _node_tier in ('regional', 'central'):
     os.environ.setdefault('HEVOLVE_LLM_ENDPOINT_URL', config.get('OPENAI_API_BASE', ''))
     os.environ.setdefault('HEVOLVE_LLM_API_KEY', config.get('OPENAI_API_KEY', ''))
     os.environ.setdefault('HEVOLVE_LLM_MODEL_NAME', config.get('OPENAI_MODEL', 'gpt-4'))
+elif _active_cloud and os.environ.get('HEVOLVE_LLM_API_KEY'):
+    # Wizard-configured cloud provider (flat mode desktop user).
+    # Vault already populated HEVOLVE_LLM_* env vars via export_to_env() in app.py.
+    # HevolveAI's create_learning_llm_config() reads these automatically.
+    pass
 # Cloud fallback for adaptive routing (flat mode — offload when local CPU overloaded)
 if config.get('CLOUD_FALLBACK_URL'):
     os.environ.setdefault('HEVOLVE_CLOUD_FALLBACK_URL', config['CLOUD_FALLBACK_URL'])
@@ -433,20 +781,35 @@ if config.get('CLOUD_FALLBACK_URL'):
     os.environ.setdefault('HEVOLVE_CLOUD_FALLBACK_MODEL', config.get('CLOUD_FALLBACK_MODEL', 'gpt-4'))
 # Zep removed — replaced by SimpleMem (local, zero-latency)
 # ZEP_API_URL / ZEP_API_KEY no longer needed
-GPT_API = config['GPT_API']
-STUDENT_API = config['STUDENT_API']
-ACTION_API = config['ACTION_API']
-FAV_TEACHER_API = config['FAV_TEACHER_API']
-DREAMBOOTH_API = config['DREAMBOOTH_API']
-STABLE_DIFF_API = config['STABLE_DIFF_API']
-LLAVA_API = config['LLAVA_API']
-BOOKPARSING_API = config['BOOKPARSING_API']
-CRAWLAB_API = config['CRAWLAB_API']
-RAG_API = config['RAG_API']
-DB_URL = config['DB_URL']
+# API endpoints — fall back to IP_ADDRESS sub-dict or empty when keys missing.
+# In bundled Nunba mode the config.json is URL-template format with IP_ADDRESS dict;
+# in cloud/dev mode it has flat top-level keys.
+_ip = config.get('IP_ADDRESS', {})
+GPT_API = config.get('GPT_API', _ip.get('gpt3_url', ''))
+FAV_TEACHER_API = config.get('FAV_TEACHER_API', '')
+DREAMBOOTH_API = config.get('DREAMBOOTH_API', '')
+STABLE_DIFF_API = config.get('STABLE_DIFF_API', '')
+# CRAWLAB_API removed — web crawling is now in-process via integrations.web_crawler
+RAG_API = config.get('RAG_API', '')
+
+# Endpoint resolution — single source of truth in core/config_cache.py
+# Automatically resolves to localhost:5000 in bundled mode, cloud URLs otherwise.
+from core.config_cache import (
+    get_db_url, get_action_api, get_student_api,
+    get_vision_api, get_book_parsing_api, is_bundled as _config_is_bundled,
+)
+DB_URL = get_db_url()
+ACTION_API = get_action_api()
+STUDENT_API = get_student_api()
+LLAVA_API = get_vision_api()
+BOOKPARSING_API = get_book_parsing_api()
+if _config_is_bundled():
+    logging.getLogger(__name__).info(
+        f"Bundled mode: DB/Action/Student/BookParsing/Vision APIs → {DB_URL}"
+    )
 
 # ============================================================================
-# Embodied AI Learning Pipeline (crawl4ai — in-process, no extra port)
+# Embodied AI Learning Pipeline (HevolveAI — in-process, no extra port)
 # ============================================================================
 _learning_provider = None
 _hive_mind = None
@@ -456,12 +819,12 @@ _trace_recorder = None
 def _is_bundled() -> bool:
     """Detect whether we are pip-installed inside Nunba (flat mode).
 
-    When Nunba imports us via ``hevolve_backend_adapter``, that module is
+    When Nunba imports us via ``hartos_backend_adapter``, that module is
     already in ``sys.modules`` by the time our daemon thread runs.  In
     standalone mode (``python langchain_gpt_api.py``, ``start_with_tracing.bat``)
     it is absent.  No env-vars or mode flags required.
     """
-    return 'hevolve_backend_adapter' in sys.modules
+    return 'hartos_backend_adapter' in sys.modules
 
 
 def _has_cloud_api() -> bool:
@@ -469,15 +832,18 @@ def _has_cloud_api() -> bool:
     return bool(os.environ.get('HEVOLVE_LLM_ENDPOINT_URL', '').strip())
 
 
-def _wait_for_llm_server(url='http://localhost:8080', timeout=15):
+def _wait_for_llm_server(url=None, timeout=15):
+    if url is None:
+        _port = os.environ.get('LLAMA_CPP_PORT', '8080')
+        url = f'http://localhost:{_port}'
     """Wait for llama.cpp server, giving parent process time to start it.
 
     In Nunba (flat mode), the desktop app starts llama.cpp in a background
-    thread.  This function polls the health endpoint so crawl4ai sees an
+    thread.  This function polls the health endpoint so HevolveAI sees an
     existing server and reuses it instead of auto-starting a second one.
 
     In standalone mode nobody else starts the server, so after *timeout*
-    seconds we return False and let crawl4ai auto-start as usual.
+    seconds we return False and let HevolveAI auto-start as usual.
 
     Returns True if server found, False if timeout expired.
     """
@@ -497,12 +863,12 @@ def _wait_for_llm_server(url='http://localhost:8080', timeout=15):
         time.sleep(1)
     _logger.info(
         f"[EmbodiedAI] No server on {url} after {timeout}s "
-        "\u2014 crawl4ai will auto-start")
+        "\u2014 HevolveAI will auto-start")
     return False
 
 
 def _init_learning_pipeline():
-    """Initialize crawl4ai's learning pipeline in-process.
+    """Initialize HevolveAI's learning pipeline in-process.
 
     Instead of starting a separate server on port 8000,
     we import and initialize the learning components directly.
@@ -520,22 +886,22 @@ def _init_learning_pipeline():
     **Standalone (start_with_tracing.bat, ``python langchain_gpt_api.py``):**
         Brief 5 s wait (in case user already has llama.cpp running).
         If nothing responds, ``create_learning_llm_config()`` calls
-        crawl4ai which auto-starts its own server.  Default behaviour,
+        HevolveAI which auto-starts its own server.  Default behaviour,
         no mode config needed.
 
     **Cloud API configured (``HEVOLVE_LLM_ENDPOINT_URL``):**
-        Skip local server wait entirely — crawl4ai's Priority 0 path
+        Skip local server wait entirely — HevolveAI's Priority 0 path
         routes to the external endpoint.
     """
     global _learning_provider, _hive_mind, _trace_recorder
 
     try:
-        from crawl4ai.embodied_ai.rl_ef import (
+        from hevolveai.embodied_ai.rl_ef import (
             create_learning_llm_config,
             register_learning_provider,
         )
-        from crawl4ai.embodied_ai.monitoring.trace_recorder import get_trace_recorder
-        from crawl4ai.embodied_ai.learning.hive_mind import HiveMind, AgentCapability
+        from hevolveai.embodied_ai.monitoring.trace_recorder import get_trace_recorder
+        from hevolveai.embodied_ai.learning.hive_mind import HiveMind, AgentCapability
 
         _logger = logging.getLogger(__name__)
         bundled = _is_bundled()
@@ -546,7 +912,7 @@ def _init_learning_pipeline():
 
         # ── Decide how to handle the local llama.cpp server ──
         if cloud:
-            # Cloud endpoint configured — crawl4ai uses it directly,
+            # Cloud endpoint configured — HevolveAI uses it directly,
             # no need to wait for or start a local server.
             _logger.info(
                 "[EmbodiedAI] Cloud API configured — skipping local server wait")
@@ -560,19 +926,20 @@ def _init_learning_pipeline():
                     "— learning disabled (chat still works)")
                 return
         else:
-            # Standalone — brief courtesy wait then let crawl4ai auto-start.
+            # Standalone — brief courtesy wait then let HevolveAI auto-start.
             _wait_for_llm_server(timeout=5)
 
         # Trace recorder
         recordings_dir = os.path.join(
-            os.path.expanduser('~'), '.crawl4ai', 'recordings')
+            os.path.expanduser('~'), '.hevolveai', 'recordings')
         os.makedirs(recordings_dir, exist_ok=True)
         _trace_recorder = get_trace_recorder(recordings_dir)
 
         # Learning provider (wraps llama.cpp on port 8080 or cloud endpoint)
         _domain = 'general'
+        _wizard_key = os.environ.get('HEVOLVE_LLM_API_KEY', '') or None
         llm_config = create_learning_llm_config(
-            domain=_domain, fallback_api_key=None)
+            domain=_domain, fallback_api_key=_wizard_key)
         if '_provider' in llm_config:
             _learning_provider = llm_config['_provider']
             register_learning_provider(_domain, _learning_provider)
@@ -597,7 +964,7 @@ def _init_learning_pipeline():
 
     except ImportError as e:
         logging.getLogger(__name__).warning(
-            f"[EmbodiedAI] crawl4ai not installed — learning disabled: {e}")
+            f"[EmbodiedAI] HevolveAI not installed — learning disabled: {e}")
     except Exception as e:
         logging.getLogger(__name__).error(
             f"[EmbodiedAI] Learning pipeline init failed: {e}")
@@ -613,10 +980,173 @@ def get_hive_mind():
     return _hive_mind
 
 
-# Boot learning pipeline in background (don't block Flask startup)
+# Boot learning pipeline in background — delayed to avoid torch circular import.
+# Threads that import torch race with the main thread's own torch imports,
+# causing "partially initialized module 'torch'" errors.
+def _delayed_learning_init():
+    import time
+    time.sleep(5)  # Let main thread finish all imports first
+    _init_learning_pipeline()
+
 threading.Thread(
-    target=_init_learning_pipeline, daemon=True,
+    target=_delayed_learning_init, daemon=True,
     name='embodied_ai_init').start()
+
+
+# ============================================================================
+# Vision Pipeline (VisionService — MiniCPM sidecar + FrameStore)
+# ============================================================================
+_vision_service = None
+
+
+def _init_vision_service():
+    """Start VisionService in standalone mode only.
+
+    In bundled mode (Nunba), Nunba owns the VisionService lifecycle
+    and stores it at ``__main__._vision_service``.  We skip here to
+    prevent double-start.
+    """
+    global _vision_service
+    if _is_bundled():
+        logging.getLogger(__name__).info(
+            "[Vision] Bundled mode — Nunba owns VisionService lifecycle")
+        return
+
+    try:
+        from integrations.vision import VisionService
+        _vision_service = VisionService()
+        _vision_service.start()
+        logging.getLogger(__name__).info(
+            "[Vision] VisionService started (standalone mode)")
+    except ImportError:
+        logging.getLogger(__name__).info(
+            "[Vision] vision module not available — disabled")
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            f"[Vision] VisionService failed to start: {e}")
+
+
+def get_vision_service():
+    """Get the active VisionService instance.
+
+    Checks module-level var first, then falls back to Nunba's
+    ``__main__._vision_service`` for bundled mode.
+    """
+    if _vision_service is not None:
+        return _vision_service
+    # Bundled mode: Nunba stores it on __main__
+    main_mod = sys.modules.get('__main__')
+    if main_mod:
+        return getattr(main_mod, '_vision_service', None)
+    return None
+
+
+def get_frame_store():
+    """Get the active FrameStore (from VisionService)."""
+    svc = get_vision_service()
+    return svc.store if svc else None
+
+
+def _wire_vision_to_learning():
+    """Connect FrameStore to HevolveAI's video learning pipeline.
+
+    Waits up to 60s for both VisionService and LearningLLMProvider,
+    then calls start_video_learning().
+    """
+    _logger = logging.getLogger(__name__)
+    for _ in range(60):
+        svc = get_vision_service()
+        if svc and _learning_provider:
+            break
+        time.sleep(1)
+    else:
+        _logger.info(
+            "[Wiring] Vision or learning not ready after 60s — skipping")
+        return
+
+    try:
+        if hasattr(_learning_provider, 'start_video_learning'):
+            _learning_provider.start_video_learning(
+                frame_store=svc.store,
+                frame_store_user_id='default',
+            )
+            _logger.info(
+                "[Wiring] FrameStore → HevolveAI video learning connected")
+        else:
+            _logger.info(
+                "[Wiring] LearningProvider has no start_video_learning — skip")
+    except Exception as e:
+        _logger.warning(f"[Wiring] FrameStore→learning failed: {e}")
+
+
+# Boot vision pipeline in background — delayed like learning init
+def _delayed_vision_init():
+    import time
+    time.sleep(6)  # After learning init delay (5s) to stagger torch imports
+    _init_vision_service()
+
+threading.Thread(
+    target=_delayed_vision_init, daemon=True,
+    name='vision_init').start()
+
+# Wire FrameStore to HevolveAI after both subsystems are ready
+threading.Thread(
+    target=_wire_vision_to_learning, daemon=True,
+    name='vision_learning_wire').start()
+
+
+# ============================================================================
+# Speaker Diarization Pipeline (sidecar subprocess)
+# ============================================================================
+_diarization_service = None
+
+
+def _init_diarization_service():
+    """Start DiarizationService in standalone mode only.
+
+    In bundled mode (Nunba), Nunba owns the lifecycle.
+    Skips if HEVOLVE_DIARIZATION_URL is already set (external service).
+    """
+    global _diarization_service
+    if _is_bundled():
+        logging.getLogger(__name__).info(
+            "[Diarization] Bundled mode — Nunba owns lifecycle")
+        return
+
+    # If user already configured an external diarization URL, don't start sidecar
+    if os.environ.get('HEVOLVE_DIARIZATION_URL', '').strip():
+        logging.getLogger(__name__).info(
+            "[Diarization] External URL configured — skipping sidecar")
+        return
+
+    try:
+        from integrations.audio import DiarizationService
+        _diarization_service = DiarizationService()
+        _diarization_service.start()
+        logging.getLogger(__name__).info(
+            "[Diarization] DiarizationService starting (standalone mode)")
+    except ImportError:
+        logging.getLogger(__name__).info(
+            "[Diarization] audio module not available — disabled")
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            f"[Diarization] DiarizationService failed to start: {e}")
+
+
+def get_diarization_service():
+    """Get the active DiarizationService instance."""
+    if _diarization_service is not None:
+        return _diarization_service
+    main_mod = sys.modules.get('__main__')
+    if main_mod:
+        return getattr(main_mod, '_diarization_service', None)
+    return None
+
+
+# Boot diarization sidecar in background
+threading.Thread(
+    target=_init_diarization_service, daemon=True,
+    name='diarization_init').start()
 
 # task scheduling and logging
 
@@ -626,7 +1156,7 @@ class TaskStatus(Enum):
     SCHEDULED = "SCHEDULED"
     EXECUTING = "EXECUTING"
     TIMEOUT = "TIMEOUT"
-    COMPELETED = "COMPELETED"
+    COMPLETED = "COMPLETED"
     ERROR = "ERROR"
 
 
@@ -640,11 +1170,11 @@ class TaskNames(Enum):
     USER_ID_RETRIEVER = "USER_ID_RETRIEVER"
 
 
-# google search API
+# google search API — graceful when GOOGLE_API_KEY is missing (e.g. local-only mode)
 try:
     search = GoogleSearchAPIWrapper(k=4)
 except Exception as e:
-    app.logger.warning(f"Could not initialize Google Search: {e}")
+    logging.getLogger(__name__).info(f"Google Search unavailable (expected in local mode): {e}")
     search = None
 
 # constants
@@ -657,7 +1187,10 @@ except Exception as e:
 # llm_math = LLMMathChain(ChatOpenAI(model_name="gpt-3.5-turbo"))
 # Old: llm_math = LLMMathChain(llm=ChatOpenAI(model_name="gpt-3.5-turbo"))
 # New: Using get_llm() to automatically use Qwen3-VL or OpenAI based on USE_QWEN3VL flag
-llm_math = LLMMathChain(llm=get_llm(model_name="gpt-3.5-turbo"))
+try:
+    llm_math = LLMMathChain(llm=get_llm(model_name="gpt-3.5-turbo"))
+except Exception:
+    llm_math = None
 # llm_math = LLMMathChain(llm= ChatGroq(groq_api_key=groq_api_key,
 #                model_name = "mixtral-8x7b-32768"))
 
@@ -666,48 +1199,119 @@ llm_math = LLMMathChain(llm=get_llm(model_name="gpt-3.5-turbo"))
 
 # app.logger.info(llm.invoke("hi how are you?"))
 
-if spec is not None:
-    try:
-        chain = get_openapi_chain(spec)
-    except Exception as e:
-        app.logger.warning(f"Could not create OpenAPI chain: {e}")
-        chain = None
-else:
-    chain = None
+# OpenAPI chain — deprecated (get_openapi_chain removed from langchain)
+chain = None
 
 
-client = crossbarhttp.Client('http://aws_rasa.hertzai.com:8088/publish')
+client = crossbarhttp.Client('http://aws_rasa.hertzai.com:8088/publish') if crossbarhttp else None
 
 # Create thread pool executor for async Crossbar publishing
 crossbar_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='crossbar_publish')
 atexit.register(lambda: crossbar_executor.shutdown(wait=False))
 
+
+def _http_crossbar_publish(topic: str, payload: str, timeout: float = 2.0):
+    """HTTP Crossbar publish — injected into MessageBus as transport fallback."""
+    if client is None:
+        return
+    import socket
+    try:
+        original_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(timeout)
+        client.publish(topic, payload)
+    except Exception:
+        pass
+    finally:
+        if original_timeout is not None:
+            socket.setdefaulttimeout(original_timeout)
+
+
+# Inject HTTP transport into MessageBus (avoids Layer 2 importing Layer 3)
+def _inject_http_transport():
+    try:
+        from core.peer_link.message_bus import get_message_bus
+        bus = get_message_bus()
+        bus.set_http_transport(lambda t, p: crossbar_executor.submit(_http_crossbar_publish, t, p))
+    except Exception:
+        pass
+
+
+_inject_http_transport()
+
+# Topic resolution uses the canonical resolve_legacy_topic() from message_bus.py
+# (single source of truth — no duplicate mapping table here)
+
+
 def publish_async(topic, message, timeout=2.0):
     """
-    Publish to Crossbar in a background thread without blocking the main request.
+    Publish to all available transports: LOCAL EventBus + PeerLink + Crossbar.
+
+    Routes through MessageBus first (local + multi-device delivery),
+    then falls back to direct HTTP Crossbar for cloud telemetry.
+    Works fully offline — LOCAL delivery always succeeds.
+
+    Also publishes to the confirmation topic (mirrors cloud chatbot.py:publish()).
 
     Args:
-        topic: Crossbar topic to publish to
-        message: Message payload (dict)
-        timeout: Maximum time to wait for publish (default: 2.0 seconds)
+        topic: Crossbar topic to publish to (legacy format)
+        message: Message payload (JSON string or dict)
+        timeout: Maximum time for HTTP Crossbar publish (default: 2.0 seconds)
     """
+    # Parse message if JSON string
+    data = message
+    if isinstance(message, str):
+        try:
+            data = json.loads(message)
+        except (json.JSONDecodeError, TypeError):
+            data = {'raw': message}
+
+    # 1. Route through MessageBus (LOCAL + PEERLINK — always works offline)
+    try:
+        from core.peer_link.message_bus import get_message_bus, resolve_legacy_topic
+    except ImportError:
+        resolve_legacy_topic = None
+    bus_topic, user_id = resolve_legacy_topic(topic) if resolve_legacy_topic else (None, '')
+    if bus_topic:
+        try:
+            bus = get_message_bus()
+            # Ensure user_id is in data for per-user routing
+            if user_id and isinstance(data, dict):
+                data.setdefault('user_id', user_id)
+            msg_id = bus.publish(
+                bus_topic, data,
+                user_id=user_id,
+                skip_crossbar=True,  # We handle Crossbar below directly
+            )
+
+            # Publish confirmation tracking (mirrors cloud chatbot.py:publish())
+            if bus_topic not in ('task.confirmation', 'task.progress'):
+                conf_data = dict(data) if isinstance(data, dict) else {'raw': str(data)}
+                conf_data['confirmation'] = False
+                conf_data['topic_name'] = topic
+                conf_data['msg_id'] = msg_id
+                bus.publish('task.confirmation', conf_data, skip_crossbar=True)
+        except Exception as e:
+            app.logger.debug(f"MessageBus publish failed (offline OK): {e}")
+
+    # 2. HTTP Crossbar for cloud telemetry + legacy mobile (when internet available)
+    if client is None:
+        return
+
+    raw_message = message if isinstance(message, str) else json.dumps(message, default=str)
+
     def _publish():
         import socket
         try:
-            # Set socket timeout to prevent long waits
             original_timeout = socket.getdefaulttimeout()
             socket.setdefaulttimeout(timeout)
-
-            client.publish(topic, message)
-            app.logger.debug(f"Successfully published to {topic}")
+            client.publish(topic, raw_message)
+            app.logger.debug(f"Published to Crossbar: {topic}")
         except Exception as e:
-            app.logger.error(f"Error publishing to {topic}: {e}")
+            app.logger.debug(f"Crossbar HTTP publish failed (offline OK): {e}")
         finally:
-            # Restore original timeout
             if original_timeout is not None:
                 socket.setdefaulttimeout(original_timeout)
 
-    # Submit to executor without waiting for result
     crossbar_executor.submit(_publish)
 
 
@@ -715,25 +1319,35 @@ def publish_async(topic, message, timeout=2.0):
 def create_prompt(tools):
     user_details, actions = get_action_user_details(
         user_id=thread_local_data.get_user_id())
+    # Build dynamic identity based on active agent config
+    _active_agent_config = thread_local_data.get_agent_config() if hasattr(thread_local_data, 'get_agent_config') else None
+    _owner_name = ''
+    if user_details:
+        # Extract name from user details string (format varies)
+        import re as _re
+        _name_match = _re.search(r'(?:name|Name)[:\s]+([^\n,]+)', str(user_details))
+        if _name_match:
+            _owner_name = _name_match.group(1).strip()
+    _dynamic_identity = build_identity_prompt(_active_agent_config, _owner_name, user_details)
+
     prefix = f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
         <GENERAL_INSTRUCTION_START>
-        Context:
-        Imagine that you are the world's leading teacher, possessing knowledge in every field. Consider the consequences of each response you provide.
-        Your answers must be meaningful and delivered as quickly as possible. As a highly educated and informed teacher, you have access to an extensive wealth of information.
-        Your primary goal as a teacher is to assist students by answering their questions, providing accurate and up-to-date information.
-        Please create a distinct personality for yourself, and remember never to refer to the user as a human or yourself as mere AI.\
-        your response should not be more than 200 words.
+        {_dynamic_identity}
+        Consider the consequences of each response you provide.
+        Your answers must be meaningful and delivered as quickly as possible.
+        Never refer to the user as a human or yourself as mere AI.
+        Your response should not be more than 200 words.
+        {get_cultural_prompt_compact()}
         <GENERAL_INSTRUCTION_END>
         User details:
         <USER_DETAILS_START>
         {user_details}
         <USER_DETAILS_END>
         <CONTEXT_START>
-        Before you respond, consider the context in which you are utilized. You are Hevolve, a highly intelligent educational AI developed by HertzAI.
-        You are designed to answer questions, provide revisions, conduct assessments, teach various topics, create personalised curriculum and assist with research for both students and working professionals.
+        You can help with anything — answering questions, teaching, coding, research, creative writing, data analysis, building agents, brainstorming, planning, and more.
         Your expertise draws from various knowledge sources like books, websites, and white papers. Your responses will be conveyed to the user through a video, using an avatar and text-to-speech technology, and can be translated into various languages.
-        Consider the user's location, time and context of previous dialogues with time to create a proper prompt for tools and follow up in-context questions.You have ability to see using Visual_Context_Camera tool.
+        Consider the user's location, time and context of previous dialogues with time to create a proper prompt for tools and follow up in-context questions. You have the ability to see using Visual_Context_Camera tool.
         If your response contains abbreviated words, please separate them with spaces, like T T S.
         <CONTEXT_END>
         These are all the actions that the user has performed up to now:
@@ -783,6 +1397,159 @@ def create_prompt(tools):
     return prompt
 
 
+def _suggest_share_worthy_content(input_text: str) -> str:
+    """Tool handler: find high-engagement, under-shared posts the user could share.
+
+    Queries the social DB for posts with strong engagement (upvotes > 5,
+    comments > 3) but few share links (< 3), then returns a human-friendly
+    suggestion.
+    """
+    try:
+        from integrations.social.models import get_db, Post, ShareableLink
+        from sqlalchemy import func, outerjoin
+
+        db = get_db()
+        try:
+            # Subquery: count share links per post
+            share_counts = (
+                db.query(
+                    ShareableLink.resource_id,
+                    func.count(ShareableLink.id).label('link_count'),
+                )
+                .filter(ShareableLink.resource_type == 'post')
+                .group_by(ShareableLink.resource_id)
+                .subquery()
+            )
+
+            # Main query: high engagement, low shares, not deleted/hidden
+            posts = (
+                db.query(Post, share_counts.c.link_count)
+                .outerjoin(share_counts, Post.id == share_counts.c.resource_id)
+                .filter(
+                    Post.is_deleted == False,
+                    Post.is_hidden == False,
+                    Post.upvotes > 5,
+                    Post.comment_count > 3,
+                )
+                .filter(
+                    (share_counts.c.link_count == None) |  # noqa: E711
+                    (share_counts.c.link_count < 3)
+                )
+                .order_by(Post.score.desc())
+                .limit(3)
+                .all()
+            )
+
+            if not posts:
+                return ("No under-shared high-engagement content found right now. "
+                        "Keep creating great posts and the community will notice!")
+
+            suggestions = []
+            for post, link_count in posts:
+                title = (post.title or post.content or '')[:80].strip()
+                shares = link_count or 0
+                suggestions.append(
+                    f"- \"{title}\" ({post.upvotes} upvotes, "
+                    f"{post.comment_count} comments, only {shares} shares) "
+                    f"[post_id: {post.id}]"
+                )
+
+            header = ("These posts are resonating with the community but haven't "
+                       "been shared much yet. Consider sharing them with your network:\n")
+            return header + "\n".join(suggestions)
+        finally:
+            db.close()
+    except Exception as e:
+        logging.debug(f"Suggest_Share_Worthy_Content failed: {e}")
+        return f"Could not fetch share-worthy content right now: {e}"
+
+
+def _observe_user_experience(input_text: str) -> str:
+    """Record a user experience observation for self-improvement."""
+    try:
+        import json as _json
+        data = _json.loads(input_text)
+        event = data.get('event', 'unknown')
+        page = data.get('page', '')
+        duration_ms = data.get('duration_ms', 0)
+        outcome = data.get('outcome', '')
+
+        observation = f"User {event} on {page} ({duration_ms}ms): {outcome}"
+
+        # Use MemoryGraph if available
+        try:
+            user_id = thread_local_data.get_user_id()
+            prompt_id = thread_local_data.get_prompt_id()
+            graph = _get_or_create_graph(user_id, prompt_id)
+            if graph:
+                session_id = f"{user_id}_{prompt_id}" if prompt_id else str(user_id)
+                memory_id = graph.register(
+                    content=observation,
+                    metadata={
+                        'memory_type': 'observation',
+                        'source_agent': 'agent',
+                        'session_id': session_id,
+                        'page': page,
+                        'event': event,
+                    },
+                    context_snapshot=f"UX observation during session {session_id}",
+                )
+                return f"Observation recorded (id: {memory_id}): {observation}"
+        except Exception:
+            pass
+
+        return f"Observation noted: {observation}"
+    except Exception:
+        return f"Observation noted: {input_text}"
+
+
+def _self_critique_and_enhance(input_text: str) -> str:
+    """Review past suggestions and outcomes to improve future behavior."""
+    try:
+        user_id = thread_local_data.get_user_id()
+        prompt_id = thread_local_data.get_prompt_id()
+        graph = _get_or_create_graph(user_id, prompt_id)
+        if not graph:
+            return "Self-critique unavailable: no memory graph for this session."
+
+        session_id = f"{user_id}_{prompt_id}" if prompt_id else str(user_id)
+
+        # Recall past suggestions and observations
+        suggestions = graph.recall(input_text or 'suggestions made outcomes', mode='semantic', top_k=10)
+        observations = graph.recall('user experience observation', mode='semantic', top_k=10)
+
+        if not suggestions and not observations:
+            return "No past interactions to critique yet. Will observe and learn."
+
+        # Format findings for agent reasoning
+        critique = "Self-critique findings:\n"
+        if suggestions:
+            critique += f"Past suggestions ({len(suggestions)}):\n"
+            for s in suggestions[:5]:
+                critique += f"  - {s.content[:100]}\n"
+        if observations:
+            critique += f"User observations ({len(observations)}):\n"
+            for o in observations[:5]:
+                critique += f"  - {o.content[:100]}\n"
+
+        # Store the critique itself as an insight
+        insight = f"Self-critique on: {input_text}"
+        graph.register(
+            content=insight,
+            metadata={
+                'memory_type': 'insight',
+                'source_agent': 'agent',
+                'session_id': session_id,
+                'type': 'self_critique',
+            },
+            context_snapshot=f"Self-critique during session {session_id}",
+        )
+
+        return critique
+    except Exception as e:
+        return f"Self-critique unavailable: {str(e)}"
+
+
 def _handle_create_agent_tool(input_text):
     """Tool handler: LLM decided user wants to create an agent.
 
@@ -813,10 +1580,286 @@ def _response_signals_creation(response_text):
     return any(signal in lower for signal in _RESPONSE_CREATION_SIGNALS)
 
 
+# ─── Perception Watchers (Future TTL) ───────────────────────────────────
+_active_watchers = {}  # user_id -> [{trigger_id, expires_at, condition, action, modality, callback}]
+
+
+def _handle_visual_watcher_tool(input_text):
+    """Register a visual/audio watcher trigger with TTL.
+
+    Input format: 'CONDITION: <condition> | ACTION: <action> | TTL: <minutes>'
+    Optional: '| MODALITY: visual|audio|both' (defaults to visual)
+    """
+    import re
+    import time as _time
+
+    parts = {}
+    for segment in input_text.split('|'):
+        segment = segment.strip()
+        if ':' in segment:
+            key, val = segment.split(':', 1)
+            parts[key.strip().upper()] = val.strip()
+
+    condition = parts.get('CONDITION', input_text)
+    action_text = parts.get('ACTION', 'notify user')
+    ttl_minutes = int(parts.get('TTL', '30'))
+    modality = parts.get('MODALITY', 'visual').lower()
+
+    user_id = thread_local_data.get_user_id() or 'default'
+    trigger_id = f'watcher_{user_id}_{int(_time.time())}'
+    expires_at = _time.time() + (ttl_minutes * 60)
+
+    def _on_trigger(description, **kwargs):
+        """Callback fired when visual trigger matches."""
+        try:
+            from core.platform.events import emit_event
+            emit_event('tts.speak', {'user_id': user_id, 'text': action_text})
+            emit_event('perception.watcher.fired', {
+                'user_id': user_id, 'condition': condition,
+                'action': action_text, 'trigger_id': trigger_id,
+            })
+        except Exception:
+            pass
+
+    # Register with VisionService for visual watchers
+    if modality in ('visual', 'both'):
+        try:
+            from integrations.vision.vision_service import VisionService
+            from core.platform.service_registry import ServiceRegistry
+            vs = ServiceRegistry.get('VisionService')
+            if vs:
+                condition_words = [w for w in condition.lower().split() if len(w) > 3]
+                vs.register_visual_trigger(
+                    channel='camera', callback=_on_trigger,
+                    keywords=condition_words, cooldown_seconds=5,
+                    name=trigger_id,
+                )
+        except Exception:
+            pass
+
+    watcher_entry = {
+        'trigger_id': trigger_id, 'expires_at': expires_at,
+        'condition': condition, 'action': action_text,
+        'modality': modality, 'callback': _on_trigger,
+    }
+
+    if user_id not in _active_watchers:
+        _active_watchers[user_id] = []
+    _active_watchers[user_id].append(watcher_entry)
+
+    return (
+        f"Watcher registered: watching for '{condition}' → will '{action_text}'. "
+        f"TTL: {ttl_minutes} minutes. Modality: {modality}."
+    )
+
+
+def _evaluate_audio_watchers(user_id, transcript):
+    """LLM-powered evaluation of audio watchers against transcript."""
+    import time as _time
+    watchers = [w for w in _active_watchers.get(user_id, [])
+                if w['modality'] in ('audio', 'both') and _time.time() < w['expires_at']]
+    if not watchers:
+        return
+
+    conditions = "\n".join(f"- Watcher {i+1}: {w['condition']}" for i, w in enumerate(watchers))
+
+    try:
+        llm = get_llm(temperature=0.1, max_tokens=200)
+        result = llm.invoke(
+            f"The user just said: \"{transcript}\"\n\n"
+            f"Active watchers:\n{conditions}\n\n"
+            f"Which watcher conditions (if any) are semantically triggered by what the user said? "
+            f"Return ONLY a JSON array of triggered watcher numbers, e.g. [1, 3]. "
+            f"Return [] if none match."
+        )
+        import re as _re
+        text = (result.content if hasattr(result, 'content') else str(result)).strip()
+        match = _re.search(r'\[.*?\]', text)
+        if match:
+            triggered = json.loads(match.group())
+            for idx in triggered:
+                if 1 <= idx <= len(watchers):
+                    w = watchers[idx - 1]
+                    if w.get('callback'):
+                        w['callback'](transcript)
+    except Exception as e:
+        app.logger.debug(f"Audio watcher eval failed: {e}")
+
+
+def _push_workflow_flowchart(user_id, prompt_id, request_id=None):
+    """Push recipe JSON to frontend via Crossbar for interactive flowchart rendering."""
+    try:
+        recipe_path = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
+        if not os.path.isfile(recipe_path):
+            return
+        with open(recipe_path) as f:
+            recipe_data = json.load(f)
+        crossbar_message = {
+            "text": ["Agent workflow ready"],
+            "priority": 50,
+            "action": "WorkflowFlowchart",
+            "recipe": recipe_data,
+            "request_id": request_id or "0",
+            "prompt_id": prompt_id,
+            "historical_request_id": [],
+            "options": [], "newoptions": [],
+        }
+        publish_async(f'com.hertzai.hevolve.chat.{user_id}', json.dumps(crossbar_message))
+    except Exception:
+        pass
+
+
+def _handle_agentic_router_tool(input_text):
+    """Tool handler: LLM detected a multi-step agentic task.
+
+    Called by the LangChain agent when a prompt needs multi-step execution.
+    Builds a plan using LLM-powered agent matching + plan generation,
+    sets thread-local flags that the /chat handler checks after get_ans() returns.
+    """
+    try:
+        import concurrent.futures
+        from integrations.agentic_router import build_agentic_plan
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(build_agentic_plan, input_text, PROMPTS_DIR)
+            try:
+                plan = future.result(timeout=15)
+            except concurrent.futures.TimeoutError:
+                return f"I'll help you with: {input_text}. Let me work on this directly."
+
+        thread_local_data.set_agentic_routing(
+            task_description=plan['task_description'],
+            plan_steps=plan['steps'],
+            matched_agent_id=plan.get('matched_agent_id'),
+        )
+
+        # Build a human-readable summary for the LLM's response
+        steps_text = "\n".join(
+            f"  {s['step_num']}. {s['description']}"
+            for s in plan['steps']
+        )
+        agent_note = ""
+        if plan.get('matched_agent_name'):
+            agent_note = f"\nMatched agent: {plan['matched_agent_name']} ({plan['matched_agent_source']})"
+        elif plan.get('requires_new_agent'):
+            agent_note = "\nNo existing agent matches — a new agent will be created if you approve."
+
+        return (
+            f"I've analyzed your request and prepared a plan:\n\n"
+            f"Task: {input_text}\n\n"
+            f"Steps:\n{steps_text}\n"
+            f"{agent_note}\n\n"
+            f"Would you like me to proceed with this plan?"
+        )
+    except Exception as e:
+        app.logger.error(f"Agentic router failed: {e}")
+        return f"I'll help you with: {input_text}. Let me work on this directly."
+
+
+def _handle_request_resource(input_text: str) -> str:
+    """Generic runtime resource request — agent calls this when ANY tool needs
+    a missing credential, API key, config value, or permission.
+
+    The agent provides a JSON string like:
+      {"resource_type": "api_key", "key_name": "GOOGLE_API_KEY",
+       "label": "Google API Key", "used_by": "Google Search tool",
+       "description": "Required for web search"}
+
+    Handler checks the vault first. If the key exists, returns the value
+    (making it available to the agent without the user re-entering it).
+    If not, returns a structured resource_request that the backend injects
+    into the response JSON so the frontend presents a secure input screen.
+    """
+    import json as _json
+    try:
+        req = _json.loads(input_text)
+    except (ValueError, TypeError):
+        # Plain-text fallback: agent just described what it needs
+        req = {
+            'resource_type': 'api_key',
+            'key_name': 'UNKNOWN',
+            'label': input_text[:100],
+            'description': input_text,
+            'used_by': 'Agent tool',
+        }
+
+    key_name = req.get('key_name', 'UNKNOWN')
+    resource_type = req.get('resource_type', 'api_key')
+
+    # Check vault first (tool keys + env vars)
+    import os
+    env_val = os.environ.get(key_name)
+    if env_val:
+        return f"Resource '{key_name}' is already configured and available."
+
+    try:
+        from desktop.ai_key_vault import AIKeyVault
+        vault = AIKeyVault.get_instance()
+        if resource_type == 'channel_secret':
+            val = vault.get_channel_secret(
+                req.get('channel_type', ''), key_name)
+        else:
+            val = vault.get_tool_key(key_name)
+        if val:
+            os.environ[key_name] = val  # Make available for current session
+            return f"Resource '{key_name}' loaded from vault and is now available."
+    except Exception:
+        pass
+
+    # Key not found — return a structured request for the frontend
+    # The backend will detect __SECRET_REQUEST__ and inject it into the response
+    secret_request = _json.dumps({
+        '__SECRET_REQUEST__': True,
+        'type': resource_type,
+        'key_name': key_name,
+        'label': req.get('label', key_name),
+        'description': req.get('description', f'{key_name} is required.'),
+        'used_by': req.get('used_by', 'Agent tool'),
+        'channel_type': req.get('channel_type', ''),
+    })
+    return (
+        f"I need the user to provide '{req.get('label', key_name)}'. "
+        f"This is required for {req.get('used_by', 'a tool')}. "
+        f"{req.get('description', '')} "
+        f"RESOURCE_REQUEST:{secret_request}"
+    )
+
+
+def _safe_load_google_search():
+    """Load google-search tool, returning empty list if package is missing."""
+    try:
+        return load_tools(["google-search"])
+    except (ImportError, Exception) as e:
+        logging.warning(f"Google Search tool unavailable: {e}")
+        return []
+
+
+def _with_tool_logging(func, tool_name):
+    """Wrap a tool function with logging and generic error handling.
+
+    Acts as a @before/@after decorator for all LangChain tools:
+    - Logs entry with tool name and truncated input
+    - Catches all exceptions and returns a user-friendly error string
+      instead of crashing the agent executor
+    - Logs completion with output length or error details
+    """
+    from functools import wraps
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        logging.info(f"[TOOL] {tool_name} called | input: {str(args)[:200]}")
+        try:
+            result = func(*args, **kwargs)
+            logging.info(f"[TOOL] {tool_name} completed | output length: {len(str(result))}")
+            return result
+        except Exception as e:
+            logging.error(f"[TOOL] {tool_name} failed: {e}", exc_info=True)
+            return f"Tool '{tool_name}' encountered an error: {str(e)[:200]}"
+    return wrapper
+
+
 def get_tools(req_tool, is_first: bool = False):
 
     if is_first:
-        tools = load_tools(["google-search"])
+        tools = _safe_load_google_search()
         tool = [
 
             Tool(
@@ -883,6 +1926,20 @@ def get_tools(req_tool, is_first: bool = False):
                 description="To see user or if there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input to this tool function should be the user query/input. Only if last 16 seconds Visual Context information is present & is enough, then use that to craft a better creative, better, cohesive, correlated , summarised natural response, format this tool response togather with Previous 15 minutes Visual Context information if you are seeing the scene via videocall from the other end. If there are more than 1 person try to give an identity to each across frames to track the subjects through time by framing the tool input accordingly."
             ),
             Tool(
+                name="Visual_Context_Watcher",
+                func=_handle_visual_watcher_tool,
+                description=(
+                    "Register a visual or audio trigger: continuously watch what the user is doing "
+                    "via camera or listen to what they say, and perform an action when a condition is met. "
+                    "Input format: 'CONDITION: <what to watch for> | ACTION: <what to do> | TTL: <minutes>'. "
+                    "Optional: '| MODALITY: visual|audio|both' (defaults to visual). "
+                    "Example: 'CONDITION: user raises hand | ACTION: say banana | TTL: 30'. "
+                    "Example: 'CONDITION: user mentions their dog | ACTION: remind them about vet appointment | TTL: 60 | MODALITY: audio'. "
+                    "The watcher runs in the background and fires the action whenever the condition "
+                    "is detected. TTL auto-expires the watcher."
+                ),
+            ),
+            Tool(
                 name="Create_Agent",
                 func=_handle_create_agent_tool,
                 description=(
@@ -894,7 +1951,63 @@ def get_tools(req_tool, is_first: bool = False):
                     "If the user also says words like 'automatically', 'autonomous', 'do it for me', "
                     "'handle it', 'just create it', include those keywords in your input."
                 ),
-            )
+            ),
+            Tool(
+                name="Request_Resource",
+                func=_handle_request_resource,
+                description=(
+                    "Use this tool when you need an API key, credential, token, or any external "
+                    "resource that is not currently available. This handles ALL resource types: "
+                    "API keys (OpenAI, Google, Slack, Discord, etc.), OAuth tokens, service "
+                    "credentials, channel secrets, or any configuration value. "
+                    "Input should be a JSON string with: resource_type (api_key, channel_secret, "
+                    "token, config), key_name (e.g. GOOGLE_API_KEY), label (human-readable name), "
+                    "used_by (which tool/service needs it), description (why it's needed). "
+                    "If the resource is already configured, it returns immediately. "
+                    "If not, the user will be prompted securely."
+                ),
+            ),
+            Tool(
+                name="Suggest_Share_Worthy_Content",
+                func=_suggest_share_worthy_content,
+                description=(
+                    "Use this tool when the user asks about content worth sharing, what to share, "
+                    "or when you want to proactively suggest high-engagement posts that deserve "
+                    "wider reach. Finds posts with strong community engagement (many upvotes and "
+                    "comments) but low share count, and suggests them for sharing. "
+                    "Input can be any text — it is not used for filtering."
+                ),
+            ),
+            Tool(
+                name="Observe_User_Experience",
+                func=_observe_user_experience,
+                description=(
+                    "Record a user experience observation. Input: JSON with event, page, "
+                    "duration_ms, outcome. Used for self-improvement and understanding user "
+                    "behavior patterns."
+                ),
+            ),
+            Tool(
+                name="Self_Critique_And_Enhance",
+                func=_self_critique_and_enhance,
+                description=(
+                    "Review past agent suggestions and user behavior observations to improve "
+                    "future recommendations. Input: topic or area to critique. Helps the agent "
+                    "learn from its own interactions."
+                ),
+            ),
+            Tool(
+                name="Agentic_Router",
+                func=_handle_agentic_router_tool,
+                description=(
+                    "Use when the user's request requires multi-step execution such as building "
+                    "an application, writing code, conducting research, creating a marketing "
+                    "campaign, or any complex task that cannot be answered in a single response. "
+                    "Input: the user's full request describing what they want accomplished. "
+                    "Output: a structured plan with steps. Do NOT use for simple questions, "
+                    "greetings, or tasks that can be answered directly."
+                ),
+            ),
 
         ]
 
@@ -902,6 +2015,13 @@ def get_tools(req_tool, is_first: bool = False):
         try:
             from integrations.service_tools import service_tool_registry
             tool += service_tool_registry.get_langchain_tools()
+        except ImportError:
+            pass
+
+        # HART Skills: Ingest agent skills (Claude Code, Markdown, GitHub)
+        try:
+            from integrations.skills import skill_registry
+            tool += skill_registry.get_langchain_tools()
         except ImportError:
             pass
 
@@ -922,6 +2042,12 @@ def get_tools(req_tool, is_first: bool = False):
             pass  # Non-blocking — memory tools are optional
 
         tools += tool
+        # Wrap all tool functions with logging
+        for t in tools:
+            if hasattr(t, 'func') and callable(t.func):
+                t.func = _with_tool_logging(t.func, t.name)
+            elif hasattr(t, '_run') and callable(t._run):
+                t._run = _with_tool_logging(t._run, t.name)
         return tools
 
     else:
@@ -973,13 +2099,13 @@ def get_tools(req_tool, is_first: bool = False):
                     description=tool_description
                 )
             ]
-            tools = load_tools(["google-search"])
+            tools = _safe_load_google_search()
             tools += req_tool_from_user
 
         else:
             tool_description = ""
             tool_func = ""
-            tools = load_tools(["google-search"])
+            tools = _safe_load_google_search()
             # tools += req_tool_from_user
 
         tool = [
@@ -1047,7 +2173,63 @@ def get_tools(req_tool, is_first: bool = False):
                     "If the user also says words like 'automatically', 'autonomous', 'do it for me', "
                     "'handle it', 'just create it', include those keywords in your input."
                 ),
-            )
+            ),
+            Tool(
+                name="Request_Resource",
+                func=_handle_request_resource,
+                description=(
+                    "Use this tool when you need an API key, credential, token, or any external "
+                    "resource that is not currently available. This handles ALL resource types: "
+                    "API keys (OpenAI, Google, Slack, Discord, etc.), OAuth tokens, service "
+                    "credentials, channel secrets, or any configuration value. "
+                    "Input should be a JSON string with: resource_type (api_key, channel_secret, "
+                    "token, config), key_name (e.g. GOOGLE_API_KEY), label (human-readable name), "
+                    "used_by (which tool/service needs it), description (why it's needed). "
+                    "If the resource is already configured, it returns immediately. "
+                    "If not, the user will be prompted securely."
+                ),
+            ),
+            Tool(
+                name="Suggest_Share_Worthy_Content",
+                func=_suggest_share_worthy_content,
+                description=(
+                    "Use this tool when the user asks about content worth sharing, what to share, "
+                    "or when you want to proactively suggest high-engagement posts that deserve "
+                    "wider reach. Finds posts with strong community engagement (many upvotes and "
+                    "comments) but low share count, and suggests them for sharing. "
+                    "Input can be any text — it is not used for filtering."
+                ),
+            ),
+            Tool(
+                name="Observe_User_Experience",
+                func=_observe_user_experience,
+                description=(
+                    "Record a user experience observation. Input: JSON with event, page, "
+                    "duration_ms, outcome. Used for self-improvement and understanding user "
+                    "behavior patterns."
+                ),
+            ),
+            Tool(
+                name="Self_Critique_And_Enhance",
+                func=_self_critique_and_enhance,
+                description=(
+                    "Review past agent suggestions and user behavior observations to improve "
+                    "future recommendations. Input: topic or area to critique. Helps the agent "
+                    "learn from its own interactions."
+                ),
+            ),
+            Tool(
+                name="Agentic_Router",
+                func=_handle_agentic_router_tool,
+                description=(
+                    "Use when the user's request requires multi-step execution such as building "
+                    "an application, writing code, conducting research, creating a marketing "
+                    "campaign, or any complex task that cannot be answered in a single response. "
+                    "Input: the user's full request describing what they want accomplished. "
+                    "Output: a structured plan with steps. Do NOT use for simple questions, "
+                    "greetings, or tasks that can be answered directly."
+                ),
+            ),
 
         ]
         final_tool = []
@@ -1056,6 +2238,13 @@ def get_tools(req_tool, is_first: bool = False):
                 final_tool.append(new_tool)
 
         tools += final_tool
+
+        # Wrap all tool functions with logging
+        for t in tools:
+            if hasattr(t, 'func') and callable(t.func):
+                t.func = _with_tool_logging(t.func, t.name)
+            elif hasattr(t, '_run') and callable(t._run):
+                t._run = _with_tool_logging(t._run, t.name)
 
         tool_strings = "\n".join(
             f"\n> {tool.name}: {tool.description}" for tool in tools)
@@ -1128,7 +2317,7 @@ class CustomGPT(LLM):
 
         app.logger.info(f"len---->{len(prompt.split(' '))}")
         # encoding = tiktoken.get_encoding("gpt-3.5-turbo")
-        num_tokens = len(encoding.encode(prompt))
+        num_tokens = len(encoding.encode(prompt)) if encoding else len(prompt.split())
         thread_local_data.update_req_token_count(num_tokens)
         app.logger.info(f"len---->{num_tokens}")
 
@@ -1363,13 +2552,13 @@ class CustomGPT(LLM):
             elapsed_time = end_time - start_time
             app.logger.info(f"time taken for this call is {elapsed_time}")
             num_tokens = len(encoding.encode(
-                str(response).replace('\n', ' ').replace('\t', '')))
+                str(response).replace('\n', ' ').replace('\t', ''))) if encoding else len(str(response).split())
             app.logger.info(f"current num_tokens: {num_tokens}")
             thread_local_data.update_res_token_count(num_tokens)
             end_result = str(response).replace('\n', ' ').replace('\t', '')
             app.logger.info(f"the end response is {end_result}")
 
-            return 'response_from_groq'.replace('\n', ' ').replace('\t', '')
+            return end_result
             # return response_from_groq.content.replace('\n', ' ').replace('\t', '')
         if checker == 1:
             try:
@@ -1397,7 +2586,7 @@ class CustomGPT(LLM):
             app.logger.info(f"time taken for this call is {elapsed_time}")
             response_text = response.json()["choices"][0]["message"]["content"]
             num_tokens = len(encoding.encode(
-                response_text.replace('\n', ' ').replace('\t', '')))
+                response_text.replace('\n', ' ').replace('\t', ''))) if encoding else len(response_text.split())
             thread_local_data.update_res_token_count(num_tokens)
             return response_text.replace('\n', ' ').replace('\t', '')
 
@@ -1415,9 +2604,7 @@ class CustomAgentExecutor(AgentExecutor):
 
     def prep_outputs(self, inputs: Dict[str, str],
                      outputs: Dict[str, str],
-                     metadata: Optional[Dict[str, Any]] = None,
                      return_only_outputs: bool = False) -> Dict[str, str]:
-        # pdb.set_trace()
         self._validate_outputs(outputs)
         req_id = thread_local_data.get_request_id()
         prom_id = thread_local_data.get_prompt_id()
@@ -1428,9 +2615,13 @@ class CustomAgentExecutor(AgentExecutor):
             app.logger.info(
                 f"memory object is not none and metadata is {metadata}")
             try:
-                self.memory.save_context(inputs, outputs, metadata)
+                self.memory.save_context(inputs, outputs, metadata=metadata)
+                # Force immediate flush so next request sees the buffer on disk
+                if hasattr(self.memory, 'chat_memory') and hasattr(self.memory.chat_memory, 'flush_sync'):
+                    self.memory.chat_memory.flush_sync()
                 app.logger.info(
-                    f"After: memory saved successfully with metadata {metadata}")
+                    f"After: memory saved successfully with metadata {metadata}, "
+                    f"buffer_size={len(self.memory.chat_memory.messages) if hasattr(self.memory, 'chat_memory') else '?'}")
             except Exception as e:
                 app.logger.error(f"Failed to save memory: {e}")
                 # Continue without crashing - memory save is not critical
@@ -1491,6 +2682,10 @@ class CustomAgentExecutor(AgentExecutor):
         if self.memory is not None:
             try:
                 external_context = self.memory.load_memory_variables(inputs)
+                chat_hist = external_context.get('chat_history', [])
+                app.logger.info(
+                    f"Memory loaded: {len(chat_hist)} messages in chat_history"
+                    f" (buffer_file={getattr(getattr(self.memory, 'chat_memory', None), '_buffer_file', '?')})")
                 inputs = dict(inputs, **external_context)
             except Exception as e:
                 app.logger.warning(f"Could not load memory: {e}")
@@ -1854,151 +3049,288 @@ def parse_image_to_text(inp):
         return f'{e} Not able to generating answer at this moment please try later'
 
 
-async def call_crwalab_api(input_url, input_str_list, user_id, request_id):
-    try:
-        app.logger.info("enter in call_crawlab_api function")
-        app.logger.info(
-            f"the input url is {input_url} and input_str_list is {input_str_list}")
-        payload = {
-            'link': input_str_list,
-            'user_id': user_id,
-            'request_id': request_id,
-            'depth': '1',
-
-        }
-        app.logger.info("in crawlab api")
-        app.logger.info(f"this is crawlab payload: - {payload}")
-
-        headers = {}
-        async with aiohttp.ClientSession() as session:
-            async with session.post(CRAWLAB_API, headers=headers, data=payload) as response:
-                response_text = await response.text()
-                app.logger.info(f" this is response text : - {response_text}")
-                return response_text
-    except Exception as e:
-        app.logger.info(
-            f"we are in except of call_crawlab_api the error is {e}")
-        url = RAG_API
-        app.logger.info("going to except in Rag api")
-        payload = {'url': input_url}
-        files = []
-        headers = {}
-
-        response = requests.request(
-            "POST", url, headers=headers, data=payload, files=files)
-        return f'your url got uploaded and data extraction is being processes. Here is some brief information about url you hava provided {response.text}'
-
-
-def start_async_tasks(coroutine):
-    def run():
-        from core.event_loop import get_or_create_event_loop
-        loop = get_or_create_event_loop()
-        loop.run_until_complete(coroutine)
-    Thread(target=run).start()
-
-
 def parse_link_for_crwalab(inp):
-    '''
+    """Extract content from a URL (PDF or website).
 
-        Use this function when user give url for any webpage or pdf
-
-    '''
+    The agent sees every intermediate step (progress log) and the final
+    extracted content directly — no opaque HTTP calls to external services.
+    """
     inp_list = inp.split(',')
-    app.logger.info(inp_list)
-    input_url = inp_list[0]
-    app.logger.info(input_url)
-    link_type = inp_list[1].strip(' ')
-    app.logger.info(link_type)
-    app.logger.info("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+    input_url = inp_list[0].strip()
+    link_type = inp_list[1].strip() if len(inp_list) > 1 else 'website'
     user_id = thread_local_data.get_user_id()
     request_id = thread_local_data.get_request_id()
 
+    app.logger.info(f"Data extraction: url={input_url}, type={link_type}")
+
+    # Publish task status so longrunning monitor knows
+    post_dict = {
+        'user_id': user_id, 'task_type': 'sync',
+        'status': TaskStatus.EXECUTING.value,
+        'task_name': TaskNames.CRAWLAB.value,
+        'uid': request_id,
+        'task_id': f"{TaskNames.CRAWLAB.value}_{request_id}",
+        'request_id': request_id,
+    }
+    publish_async('com.hertzai.longrunning.log', post_dict)
+
+    def _publish_thinking(msg):
+        """Push progress to UI via Crossbar thinking bubble."""
+        try:
+            crossbar_msg = json.dumps({
+                "text": [msg], "priority": 49,
+                "action": "Thinking", "bot_type": "Agent",
+                "historical_request_id": [], "options": [], "newoptions": [],
+                "request_id": request_id,
+            })
+            publish_async(f'com.hertzai.hevolve.chat.{user_id}', crossbar_msg)
+        except Exception:
+            pass
+
     try:
-        post_dict = {'user_id': '', 'task_type': 'async', 'status': TaskStatus.EXECUTING.value, 'task_name': TaskNames.CRAWLAB.value, 'uid': thread_local_data.get_request_id(
-        ), 'task_id': f"{TaskNames.CRAWLAB.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id()}
-        publish_async('com.hertzai.longrunning.log', post_dict)
-        inp_list = inp.split(',')
-        input_url = inp_list[0]
-        link_type = inp_list[1].strip(' ')
         if link_type == 'pdf':
-            try:
-                cwd = os.getcwd()
-                upload_folder_path = f'{cwd}/upload/'
-                pdf_file_name = input_url.split("/")[-1]
-
-                # Local path to save the PDF
-                if not os.path.exists(upload_folder_path):
-                    # If it does not exist, create it
-                    os.makedirs(upload_folder_path)
-                pdf_save_path = f'{upload_folder_path}/{pdf_file_name}'
-
-                response = pooled_get(input_url)
-                with open(pdf_save_path, 'wb') as file:
-                    file.write(response.content)
-
-                payload = {
-                    'user_id': thread_local_data.get_user_id(),
-                    'request_id': thread_local_data.get_request_id()
-                }
-
-                # Open the file and send it in the POST request
-                with open(pdf_save_path, 'rb') as file:
-                    files = [('file', (pdf_file_name, file, 'application/pdf'))]
-                    response = pooled_post(
-                        BOOKPARSING_API, data=payload, files=files)
-
-                os.remove(pdf_save_path)
-
-                return f"your request has been sent and pdf is getting uploading into our system {response.text}"
-            except:
-                app.logger.info("Got exception in book parsing api {e}")
-                post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.CRAWLAB.value, 'uid': thread_local_data.get_request_id(
-                ), 'task_id': f"{TaskNames.CRAWLAB.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at CRWALAB for req_id: {thread_local_data.get_request_id()} for pdf upload'}
-                publish_async('com.hertzai.longrunning.log', post_dict)
-                return "sorry I am not able to process your request at this moment"
-
-        elif link_type == 'website':
-            input_url_list = [input_url]
-            app.logger.info(f"link type is {link_type}")
-            input_str_list = repr(input_url_list)
-            try:
-
-                url = RAG_API
-                payload = {'url': input_url}
-                files = []
-                headers = {}
-
-                response = requests.request(
-                    "POST", url, headers=headers, data=payload, files=files)
-
-                app.logger.info(response.text)
-                app.logger.info(f"RAG_API response {response.text}")
-                app.logger.info("completed rag")
-                try:
-                    app.logger.info("going for crawlab api")
-                    start_async_tasks(call_crwalab_api(
-                        input_url, input_str_list, user_id, request_id))
-                    app.logger.info("done for crawlab api")
-                    return response.text
-                except Exception as e:
-                    app.logger.info(f"Got exception in crawlab api {e}")
-                    post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.CRAWLAB.value, 'uid': thread_local_data.get_request_id(
-                    ), 'task_id': f"{TaskNames.CRAWLAB.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at CRWALAB for req_id: {thread_local_data.get_request_id()} for weblink upload'}
-                    publish_async('com.hertzai.longrunning.log', post_dict)
-                    return f"sorry I am not able to process your request at this moment but here is some brief information about url you hava provided {response.text}"
-
-                return f"your url got uploaded and data extraction is being processes. Here is some brief information about url you hava provided {response.text}"
-            except Exception as e:
-                app.logger.info(f"Got exception in crawlab api {e}")
-                post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.CRAWLAB.value, 'uid': thread_local_data.get_request_id(
-                ), 'task_id': f"{TaskNames.CRAWLAB.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at CRWALAB for req_id: {thread_local_data.get_request_id()} for weblink upload'}
-                publish_async('com.hertzai.longrunning.log', post_dict)
-                return "sorry I am not able to process your request at this moment"
-
+            return _parse_pdf_in_process(input_url, user_id, request_id)
         else:
-            return "Sorry I am unable to process your request with this url type"
+            # Website: crawl in-process, agent + UI see progress
+            _publish_thinking(f"Crawling {input_url}...")
+            from integrations.web_crawler import crawl_url
+            result = crawl_url(input_url, timeout=30)
+
+            if result['success']:
+                _publish_thinking(f"Extracted {result['word_count']} words from {input_url}")
+                content = result['markdown']
+                if len(content) > 8000:
+                    truncate_pos = content.rfind('.', 0, 8000)
+                    if truncate_pos > 6000:
+                        content = content[:truncate_pos + 1] + "\n[Content truncated]"
+                    else:
+                        content = content[:8000] + "\n[Content truncated]"
+                parts = []
+                if result.get('progress'):
+                    parts.append("--- Progress ---")
+                    parts.append(result['progress'])
+                    parts.append("--- Result ---")
+                parts.append(f"URL: {input_url}")
+                parts.append(f"Words extracted: {result['word_count']}")
+                parts.append(f"Content:\n{content}")
+                return "\n".join(parts)
+            else:
+                _publish_thinking(f"Crawl failed: {result.get('error', 'unknown')}")
+                return f"Failed to crawl {input_url}: {result.get('error', 'unknown')}"
+
     except Exception as e:
-        pass
+        app.logger.error(f"Data extraction failed: {e}")
+        post_dict['status'] = TaskStatus.ERROR.value
+        post_dict['failure_reason'] = str(e)
+        publish_async('com.hertzai.longrunning.log', post_dict)
+        return f"Failed to extract content from {input_url}: {e}"
+
+
+def _parse_pdf_in_process(input_url, user_id, request_id):
+    """Parse PDF in-process. Agent sees every step, UI sees percentage progress bar.
+
+    Publishes to com.hertzai.bookparsing.{user_id} with {percentage, page_number, ...}
+    — same pattern as the cloud pipeline (wrapper.py). Frontend crossbarWorker.js
+    detects 'percentage' field → PROGRESS_UPDATE → ChatMessageList progress bar.
+
+    Downloads → converts to images → Qwen Vision per page → ToC → chapters → book name.
+    Returns full progress log + extracted content as a single string.
+    """
+    progress = []
+    _total_pages = [0]  # mutable for closure
+    _filename = [input_url.split("/")[-1]]
+
+    def step(msg, percentage=None, page_number=None):
+        progress.append(msg)
+        app.logger.info(msg)
+        # Publish percentage progress to bookparsing topic (UI progress bar)
+        try:
+            payload = {
+                "request_id": request_id,
+                "bot_type": "Agent",
+                "filename": _filename[0],
+            }
+            if percentage is not None:
+                payload["percentage"] = int(percentage)
+            if page_number is not None:
+                payload["page_number"] = page_number
+            payload["text"] = [msg]
+            if _total_pages[0] > 0:
+                payload["file_id"] = request_id  # use request_id as identifier
+
+            publish_async(
+                f'com.hertzai.bookparsing.{user_id}',
+                json.dumps(payload),
+            )
+        except Exception:
+            pass
+
+    # Step 1: Download PDF
+    step(f"Downloading PDF from {input_url}...")
+    response = pooled_get(input_url, timeout=60)
+    pdf_file_name = input_url.split("/")[-1]
+    if not pdf_file_name.endswith('.pdf'):
+        pdf_file_name += '.pdf'
+
+    upload_dir = os.path.join(os.getcwd(), 'upload')
+    os.makedirs(upload_dir, exist_ok=True)
+    pdf_save_path = os.path.join(upload_dir, pdf_file_name)
+    with open(pdf_save_path, 'wb') as f:
+        f.write(response.content)
+    step(f"PDF saved: {len(response.content)} bytes")
+
+    try:
+        # Import parsing functions from Nunba routes (same process)
+        from routes.upload_routes import (
+            _pdf_to_images, _parse_page_via_vision,
+            _assign_chapters_to_pages, _generate_book_name,
+            _save_parse_to_db,
+        )
+
+        # Step 2: Convert PDF to page images
+        step("Converting PDF to page images...", percentage=2)
+        pages = _pdf_to_images(pdf_save_path)
+        if not pages:
+            step("FAILED: Could not convert PDF to images")
+            return "\n".join(progress) + "\nError: PDF conversion failed. Is pdf2image or PyMuPDF installed?"
+        _total_pages[0] = len(pages)
+        _filename[0] = pdf_file_name
+        step(f"Converted to {len(pages)} page images", percentage=5)
+
+        # Step 3: Parse each page via Qwen Vision
+        results = []
+        whole_text_parts = []
+        toc_entries = []
+
+        for page_num, img_path in pages:
+            # percentage: 5% base + page progress scaled to 85% (5..90)
+            pct = 5 + (page_num / len(pages)) * 85
+            step(f"Parsing page {page_num}/{len(pages)} via Qwen Vision...",
+                 percentage=pct, page_number=page_num)
+            page_data = _parse_page_via_vision(page_num, img_path)
+            results.append(page_data)
+            page_text = page_data.get('text', '')
+            whole_text_parts.append(page_text)
+            if page_data.get('toc_entries'):
+                toc_entries.extend(page_data['toc_entries'])
+            word_count = len(page_text.split())
+            pct = 5 + (page_num / len(pages)) * 85
+            step(f"Page {page_num}: type={page_data.get('page_type', '?')}, "
+                 f"{word_count} words, {len(page_data.get('elements', []))} elements",
+                 percentage=pct, page_number=page_num)
+
+        # Step 4: Cross-page chapter assignment
+        step("Assigning chapters from Table of Contents...", percentage=92)
+        results = _assign_chapters_to_pages(results, toc_entries)
+        if toc_entries:
+            step(f"Found {len(toc_entries)} ToC entries, assigned chapters", percentage=94)
+        else:
+            step("No ToC found — skipping chapter assignment", percentage=94)
+
+        # Step 5: Generate book name
+        step("Generating book title...", percentage=95)
+        book_name = None
+        if whole_text_parts:
+            book_name = _generate_book_name(
+                whole_text_parts[0][:500] if whole_text_parts[0] else '',
+                toc_entries
+            )
+        step(f"Book title: {book_name or '(could not determine)'}", percentage=97)
+
+        # Step 6: Save to DB
+        step("Saving to database...", percentage=98)
+        whole_text = '\n\n'.join(whole_text_parts)
+        try:
+            from routes.db_routes import _get_db
+            from datetime import datetime, timezone as tz
+            conn = _get_db()
+            now = datetime.now(tz.utc).isoformat()
+            cursor = conn.execute(
+                """INSERT INTO pdf_files (user_id, filename, directory, request_id, created_date)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (user_id, pdf_file_name, upload_dir, request_id, now)
+            )
+            conn.commit()
+            file_id = cursor.lastrowid
+            conn.close()
+            _save_parse_to_db(file_id, results, whole_text, toc_entries, book_name, user_id)
+            step(f"Saved to DB: file_id={file_id}", percentage=99)
+        except Exception as db_err:
+            step(f"DB save skipped: {db_err}")
+
+        # Build agent-visible output
+        step(f"Complete: {len(pages)} pages, {len(whole_text.split())} total words",
+             percentage=100)
+
+        # Truncate whole_text for agent context
+        content_for_agent = whole_text
+        if len(content_for_agent) > 8000:
+            truncate_pos = content_for_agent.rfind('.', 0, 8000)
+            if truncate_pos > 6000:
+                content_for_agent = content_for_agent[:truncate_pos + 1] + "\n[Content truncated]"
+            else:
+                content_for_agent = content_for_agent[:8000] + "\n[Content truncated]"
+
+        return (
+            f"--- PDF Parse Progress ---\n"
+            f"{chr(10).join(progress)}\n"
+            f"--- Extracted Content ---\n"
+            f"File: {pdf_file_name}\n"
+            f"Book: {book_name or 'Unknown'}\n"
+            f"Pages: {len(pages)}\n"
+            f"Total words: {len(whole_text.split())}\n"
+            f"Chapters: {len(toc_entries)}\n"
+            f"---\n{content_for_agent}"
+        )
+
+    except ImportError as ie:
+        step(f"Import error: {ie} — falling back to hive mesh or HTTP")
+
+        # Fallback 1: Try hive mesh peer with vision model
+        try:
+            from integrations.agent_engine.compute_mesh_service import get_compute_mesh
+            mesh = get_compute_mesh()
+            if mesh and mesh._peers:
+                step("No local vision model — sending document to hive peer with GPU...")
+                result = mesh.offload_to_best_peer(
+                    model_type='vision',
+                    prompt=f'Parse PDF document: {pdf_file_name}',
+                    options={'image_path': pdf_save_path, 'timeout': 120},
+                )
+                if result and 'error' not in result:
+                    step("Document parsed by hive peer", percentage=100)
+                    return (
+                        f"--- Progress ---\n{chr(10).join(progress)}\n"
+                        f"--- Result (via hive peer) ---\n{result.get('response', '')}"
+                    )
+        except Exception as mesh_err:
+            step(f"Hive mesh unavailable: {mesh_err}")
+
+        # Fallback 2: Cloud HTTP
+        if BOOKPARSING_API:
+            step("Sending to cloud parsing service...")
+            try:
+                payload = {'user_id': user_id, 'request_id': request_id}
+                with open(pdf_save_path, 'rb') as f:
+                    files = [('file', (pdf_file_name, f, 'application/pdf'))]
+                    resp = pooled_post(BOOKPARSING_API, data=payload, files=files, timeout=60)
+                return (
+                    f"--- Progress ---\n{chr(10).join(progress)}\n"
+                    f"--- Result (via cloud) ---\n{resp.text}"
+                )
+            except Exception as cloud_err:
+                step(f"Cloud parsing service unavailable: {cloud_err}")
+
+        # All paths exhausted
+        step("Document parsing requires a vision model (GPU). "
+             "No local GPU, no hive peers with GPU, and the cloud service "
+             "is not responding. Please try again when a GPU device is connected.")
+        return "\n".join(progress)
+    finally:
+        try:
+            os.remove(pdf_save_path)
+        except OSError:
+            pass
 
 
 redis_client = redis.StrictRedis(
@@ -2006,14 +3338,29 @@ redis_client = redis.StrictRedis(
 
 
 def get_frame(user_id):
-    serialized_frame = redis_client.get(user_id)
+    """Get latest camera frame — FrameStore first, Redis fallback."""
+    # Primary: FrameStore (in-process, zero latency)
+    svc = get_vision_service()
+    if svc:
+        frame_bytes = svc.store.get_frame(str(user_id))
+        if frame_bytes is not None:
+            import cv2
+            frame = cv2.imdecode(
+                np.frombuffer(frame_bytes, np.uint8), cv2.IMREAD_COLOR,
+            )
+            if frame is not None:
+                app.logger.info(
+                    f"Frame for user_id {user_id} from FrameStore")
+                return frame[:, :, ::-1]  # BGR → RGB
 
+    # Fallback: Redis (legacy path)
+    serialized_frame = redis_client.get(user_id)
     try:
         if serialized_frame is not None:
             from security.safe_deserialize import safe_load_frame
             frame_bgr = safe_load_frame(serialized_frame)
             app.logger.info(
-                f"Frame for user_id {user_id} retrieved successfully.")
+                f"Frame for user_id {user_id} from Redis")
             frame = frame_bgr[:, :, ::-1]
             return frame
         else:
@@ -2041,22 +3388,58 @@ def parse_visual_context(inp: str):
         image = Image.fromarray(frame)
         # Save the image
         image.save(image_path)
-        url = "http://azurekong.hertzai.com:8000/minicpm/upload"
-        payload = {
-            'prompt': f'Instruction: Respond in second person point of view\ninput:-{inp}'}
-        files = [
-            ('file', ('call.jpg', open(image_path, 'rb'), 'image/jpeg'))
-        ]
-        headers = {}
-        try:
-            response = pooled_post(
-                url, headers=headers, data=payload, files=files)
-            app.logger.info(response.text)
-            response = response.text
 
-            return response
+        prompt_text = f'Instruction: Respond in second person point of view\ninput:-{inp}'
+
+        # Tier 1: Try local MiniCPM sidecar (port 9891) — zero latency, no cloud
+        local_minicpm_port = int(os.environ.get('HEVOLVE_MINICPM_PORT', 9891))
+        try:
+            with open(image_path, 'rb') as f:
+                r = requests.post(
+                    f'http://localhost:{local_minicpm_port}/describe',
+                    data=f.read(),
+                    params={'prompt': prompt_text},
+                    headers={'Content-Type': 'application/octet-stream'},
+                    timeout=10,
+                )
+                if r.status_code == 200:
+                    result = r.json().get('result', r.text)
+                    app.logger.info(f'Visual context from local MiniCPM: {result[:100]}')
+                    return result
         except Exception as e:
-            app.logger.error('Got error in visal QA')
+            app.logger.debug(f"Local MiniCPM sidecar unavailable, falling back to cloud: {e}")
+
+        # Tier 2: Hive mesh peer with GPU
+        try:
+            from integrations.agent_engine.compute_mesh_service import get_compute_mesh
+            mesh = get_compute_mesh()
+            result = mesh.offload_to_best_peer(
+                model_type='vision', prompt=prompt_text,
+                options={'image_path': image_path, 'timeout': 60},
+            )
+            if result and 'error' not in result:
+                return result.get('response', str(result))
+        except Exception as e:
+            app.logger.debug("Hive mesh vision offload not available: %s", e)
+
+        # Tier 3: Cloud MiniCPM fallback
+        from core.config_cache import get_vision_api
+        url = get_vision_api() or "http://azurekong.hertzai.com:8000/minicpm/upload"
+        payload = {'prompt': prompt_text}
+        fh = open(image_path, 'rb')
+        try:
+            files = [
+                ('file', ('call.jpg', fh, 'image/jpeg'))
+            ]
+            response = pooled_post(url, headers={}, data=payload, files=files, timeout=30)
+            app.logger.info(response.text)
+            return response.text
+        except Exception as e:
+            app.logger.error('Got error in visual QA (cloud fallback): %s', e)
+        finally:
+            fh.close()
+
+    return "No visual context available — camera not active."
 
 
 def parse_user_id(inp: str):
@@ -2067,10 +3450,8 @@ def parse_user_id(inp: str):
     }
 
     try:
-        prov_user_id = re.findall('\d', inp)[0]
-    except:
-        pass
-    finally:
+        prov_user_id = re.findall(r'\d', inp)[0]
+    except Exception:
         prov_user_id = ""
 
     payload = json.dumps({
@@ -2222,17 +3603,13 @@ else:
 if autogen is not None:
     def create_agents_for_user(user_id: str) -> Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]:
         """Create new assistant and user proxy agents for a user with basic configuration."""
-        config_list = [{
-            "model": 'hertzai-4o',
-            "api_type": "azure",
-            "api_key": os.environ.get('AZURE_OPENAI_API_KEY', ''),
-            "base_url": 'https://hertzai-gpt4.openai.azure.com/',
-            "api_version": "2024-02-15-preview"
-        }]
+        # Use the dynamic module-level config_list (cloud or local, set by wizard)
+        from threadlocal import thread_local_data as _tld
+        _override = _tld.get_model_config_override() if hasattr(_tld, 'get_model_config_override') else None
+        _clist = _override or config_list
 
-        # Create a basic function calling config
         llm_config = {
-            "config_list": config_list,
+            "config_list": _clist,
             "seed": 42
         }
 
@@ -2240,8 +3617,7 @@ if autogen is not None:
         assistant = autogen.AssistantAgent(
             name=f"assistant_{user_id}",
             llm_config=llm_config,
-            is_termination_msg=lambda x: True if "TERMINATE" in x.get(
-                "content") else False,
+            is_termination_msg=_is_terminate_msg,
             system_message="""You are a custom agent bot creator. Your task is to interact with the user to gather all the necessary details to create an agent. Once you have collected all the required information, you will generate a complete agent configuration.
 
             The information you need to collect includes:
@@ -2268,8 +3644,7 @@ if autogen is not None:
         user_proxy = autogen.UserProxyAgent(
             name=f"user_proxy_{user_id}",
             human_input_mode="NEVER",
-            is_termination_msg=lambda x: True if "TERMINATE" in x.get(
-                "content") else False,
+            is_termination_msg=_is_terminate_msg,
             code_execution_config={"work_dir": "coding", "use_docker": False}
         )
 
@@ -2309,16 +3684,13 @@ if autogen is not None:
 
     def create_agents(user_id: str,recipe:str) -> Tuple[autogen.ConversableAgent, autogen.ConversableAgent]:
         """Create new assistant and user agents for a given user_id"""
+        from threadlocal import thread_local_data as _tld
+        _override = _tld.get_model_config_override() if hasattr(_tld, 'get_model_config_override') else None
+        _clist = _override or config_list
 
         llm_config = {
             "temperature": 0.7,
-            "config_list": [{
-            "model": 'hertzai-4o',
-            "api_type": "azure",
-            "api_key": os.environ.get('AZURE_OPENAI_API_KEY', ''),
-            "base_url": 'https://hertzai-gpt4.openai.azure.com/',
-            "api_version": "2024-02-15-preview"
-        }],
+            "config_list": _clist,
         }
         conversation = True
         if conversation:
@@ -2328,16 +3700,14 @@ if autogen is not None:
         assistant = autogen.ConversableAgent(
             name=f"assistant_{user_id}",
             llm_config=llm_config,
-            is_termination_msg=lambda x: True if "TERMINATE" in x.get(
-                "content") else False,
+            is_termination_msg=_is_terminate_msg,
             system_message=recipe
         )
 
         # Create user agent
         user = autogen.ConversableAgent(
             name=f"user_{user_id}",
-            is_termination_msg=lambda x: True if "TERMINATE" in x.get(
-                "content") else False,
+            is_termination_msg=_is_terminate_msg,
             llm_config=None,  # User agent doesn't need LLM
             human_input_mode="NEVER",  # We'll manually send messages
             max_consecutive_auto_reply=1  # Limit to 1 auto reply
@@ -2380,14 +3750,19 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
     language = SUPPORTED_LANG_DICT.get(preferred_lang[:2], 'English')
     colloquial = True
 
-    prefix = f"""You are Hevolve, an expert educational AI teacher with knowledge in every field.
+    # Build dynamic identity for fast-path too
+    _fast_agent_config = thread_local_data.get_agent_config() if hasattr(thread_local_data, 'get_agent_config') else None
+    _fast_identity = build_identity_prompt(_fast_agent_config, '', user_details)
+
+    prefix = f"""{_fast_identity}
         Answer questions accurately and respond as quickly as possible in {language}.
         Keep responses under 200 words. Be colloquial and natural - don't always greet or use the user's name.
+        IMPORTANT: Do NOT re-introduce yourself if you already did in the conversation history below. Continue naturally.
 
         User details: {user_details}
         Context: {custom_prompt}
 
-        You can answer questions, provide revisions, conduct assessments, teach topics, create curriculum, and assist with research.
+        You can help with anything — answering questions, coding, research, teaching, creative writing, data analysis, building agents, brainstorming, and more.
         Your responses are conveyed via video with an avatar and text-to-speech.
 
         IMPORTANT: Always respond with valid JSON in a markdown code block with "action" and "action_input" fields.
@@ -2518,8 +3893,8 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
     return ans
 
 
-Hevolve = "You are Hevolve, a highly intelligent educational AI developed by HertzAI."
-PROBE_TEMPLATE = ("You are Hevolve, a highly intelligent educational AI developed by HertzAI. Weave the conversation "
+Hevolve = "You are Hevolve — a place where everything is possible. A personal AI by HertzAI that runs locally, respecting privacy. You help users BUILD — code, ideas, businesses, knowledge, agents, art, solutions, and anything they imagine. You are a builder's companion."
+PROBE_TEMPLATE = ("You are Hevolve, a versatile personal AI developed by HertzAI that runs locally on the user's device. Weave the conversation "
                   "history along with the Last_5_Minutes_Visual_Context if present to create a clear, engaging, "
                   "coherent conversation flow that encourages the user to respond. Complete your response in 130 words"
                   "Your response should not be more than 130 words. Neither repeat the previous "
@@ -2535,12 +3910,58 @@ PROBE_TEMPLATE = ("You are Hevolve, a highly intelligent educational AI develope
                   "\'<seek_attend_lyrics>Some awesome lyrics</seek_attend_lyrics>\' . Continue the Conversation from "
                   "where I or you left off."
                   )
-INTERMEDIATE_CONTINUATION = "You are Hevolve, a highly intelligent educational AI developed by HertzAI. Continue your response from where you left off in the last conversation, considering the new input as a continuation of the last request. Ensure a smooth transition from the previous response and start this response as a continuation of the previous one.\n INSTRUCTIONS: Start your response with transitional words or phrases that can be used as a continuation of the previous response."
+INTERMEDIATE_CONTINUATION = "You are Hevolve, a versatile personal AI developed by HertzAI that runs locally on the user's device. Continue your response from where you left off in the last conversation, considering the new input as a continuation of the last request. Ensure a smooth transition from the previous response and start this response as a continuation of the previous one.\n INSTRUCTIONS: Start your response with transitional words or phrases that can be used as a continuation of the previous response."
 
 first_promts = []
-review_agents = {"10077":True,10077:True}
-conversation_agent = {"10077":False,10077:False}
+review_agents = {}  # keyed by f'{user_id}_{prompt_id}' to avoid cross-prompt collision
+conversation_agent = {}  # keyed by f'{user_id}_{prompt_id}'
 _state_lock = threading.Lock()  # Protects review_agents, conversation_agent, first_promts
+
+# --- Interactive gather_info turn limit ---
+# After MAX_GATHER_TURNS without completion, force-complete with available data
+MAX_GATHER_TURNS = 12
+_gather_turn_counts = {}  # f'{user_id}_{prompt_id}' -> int
+
+# --- TTL-based cleanup for review_agents / conversation_agent (M2 fix) ---
+_AGENT_TTL = 3600  # 1 hour
+_agent_timestamps = {}  # f'{user_id}_{prompt_id}' -> last-access epoch
+
+
+def _touch_agent_timestamp(agent_key):
+    """Record that an agent entry was accessed (call under _state_lock)."""
+    _agent_timestamps[agent_key] = time.time()
+
+
+def _cleanup_stale_agents():
+    """Remove agent state entries not accessed in the last _AGENT_TTL seconds.
+
+    Must be called *outside* _state_lock or inside an already-acquired lock.
+    Safe to call frequently -- it is O(n) over active users only.
+    """
+    now = time.time()
+    for key in list(_agent_timestamps.keys()):
+        if now - _agent_timestamps[key] > _AGENT_TTL:
+            review_agents.pop(key, None)
+            conversation_agent.pop(key, None)
+            _agent_timestamps.pop(key, None)
+    # Also clean stale gather turn counters
+    # Both _gather_turn_counts and _agent_timestamps now use '{user_id}_{prompt_id}' keys
+    for tk in list(_gather_turn_counts.keys()):
+        if tk not in _agent_timestamps:
+            _gather_turn_counts.pop(tk, None)
+
+# Per-user locks to prevent race conditions when concurrent requests
+# for the same user modify review_agents / conversation_agent dicts.
+_user_locks = {}
+_user_locks_lock = threading.Lock()
+
+
+def _get_user_lock(user_key):
+    """Get or create a per-user lock to serialize state mutations."""
+    with _user_locks_lock:
+        if user_key not in _user_locks:
+            _user_locks[user_key] = threading.Lock()
+        return _user_locks[user_key]
 
 
 def _autonomous_gather_info(user_id, description, prompt_id):
@@ -2559,14 +3980,37 @@ def _autonomous_gather_info(user_id, description, prompt_id):
         try:
             new_response = response.replace('true', 'True').replace('false', 'False')
             parsed = retrieve_json(new_response)
-            if parsed.get('status', '').lower() == 'completed':
+            # Handle list-of-dicts response from LLM
+            if isinstance(parsed, list):
+                for item in reversed(parsed):
+                    if isinstance(item, dict) and 'status' in item:
+                        parsed = item
+                        break
+                else:
+                    parsed = {}
+            if isinstance(parsed, dict) and parsed.get('status', '').lower() == 'completed':
                 # Save agent config
                 parsed['prompt_id'] = prompt_id
                 parsed['creator_user_id'] = user_id
-                name = f'prompts/{prompt_id}.json'
+                name = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
                 with open(name, 'w') as f:
                     json.dump(parsed, f)
                 app.logger.info(f'Autonomous agent config saved to {name}')
+                # Sync to cloud DB so prompt_id matches
+                try:
+                    pooled_post(
+                        f'{DB_URL}/createpromptlist',
+                        json={'listprompts': [{
+                            'prompt_id': prompt_id,
+                            'prompt': parsed.get('goal', ''),
+                            'user_id': user_id,
+                            'name': parsed.get('name', ''),
+                            'is_active': True,
+                            'image_url': parsed.get('image_url', ''),
+                        }]},
+                        timeout=5)
+                except Exception as e:
+                    app.logger.debug(f"Cloud sync failed (non-fatal): {e}")
                 return 'Agent details gathered autonomously. Moving to review.'
         except (json.JSONDecodeError, AttributeError, Exception) as e:
             app.logger.debug(f'Autonomous gather iteration {iteration}: {e}')
@@ -2575,16 +4019,112 @@ def _autonomous_gather_info(user_id, description, prompt_id):
         response = gather_info(user_id, 'proceed', prompt_id, autonomous=True)
         iteration += 1
 
-    # Fallback: save whatever we have
-    app.logger.warning(f'Autonomous gather_info did not complete in {max_iterations} iterations')
-    return 'Autonomous gathering completed. Moving to review.'
+    # Fallback: save partial config so the pipeline can recover
+    app.logger.warning(f'Autonomous gather_info did not complete in {max_iterations} iterations, saving partial config')
+    partial = {
+        'status': 'completed',
+        'name': f'Agent {prompt_id}',
+        'agent_name': f'auto.agent{str(prompt_id)[-4:]}',
+        'goal': description or 'General assistant',
+        'broadcast_agent': 'no',
+        'personas': [{'name': 'Assistant', 'description': 'General purpose assistant'}],
+        'flows': [{'flow_name': 'main', 'persona': 'Assistant', 'actions': [{'action': 'Respond to user', 'action_id': 1, 'status': 'pending'}], 'sub_goal': description or 'Help the user'}],
+        'extra_information': f'Auto-generated after {max_iterations} autonomous gather iterations',
+        'prompt_id': prompt_id,
+        'creator_user_id': user_id,
+    }
+    name = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
+    try:
+        with open(name, 'w') as f:
+            json.dump(partial, f)
+        app.logger.info(f'Partial autonomous agent config saved to {name}')
+        # Sync to cloud DB (non-fatal)
+        try:
+            pooled_post(
+                f'{DB_URL}/createpromptlist',
+                json={'listprompts': [{
+                    'prompt_id': prompt_id,
+                    'prompt': partial.get('goal', ''),
+                    'user_id': user_id,
+                    'name': partial.get('name', ''),
+                    'is_active': True,
+                    'image_url': '',
+                }]},
+                timeout=5)
+        except Exception:
+            pass
+    except Exception as e:
+        app.logger.error(f'Failed to save partial autonomous config: {e}')
+    return 'Autonomous gathering completed with partial config. Moving to review.'
+
+
+# Resonance tuning post-response hook
+def _tune_resonance_after_chat(user_id, prompt_text, response_text):
+    """Tune resonance and return summary for crossbar/response piggyback.
+
+    Returns dict with resonance state (or empty dict on failure).
+    Sync — EMA math is <1ms, no LLM calls.
+    Also dispatches signals to HevolveAI async in background.
+    """
+    try:
+        from core.resonance_tuner import get_resonance_tuner
+        if user_id and prompt_text and response_text:
+            tuner = get_resonance_tuner()
+            profile = tuner.analyze_and_tune(
+                str(user_id), str(prompt_text), str(response_text))
+            return {
+                'resonance_confidence': round(profile.resonance_confidence, 2),
+                'resonance_tuning': {
+                    k: round(v, 3) for k, v in profile.tuning.items()
+                },
+                'resonance_interactions': profile.total_interactions,
+            }
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    return {}
 
 
 @app.route('/chat', methods=['POST'])
 def chat():
+    # Rate limit: 30 req/min per user/IP
+    try:
+        from integrations.social.rate_limiter import _limiter
+        rate_key = request.get_json(silent=True) or {}
+        rate_user = rate_key.get('user_id', request.remote_addr) if isinstance(rate_key, dict) else request.remote_addr
+        if not _limiter.check(str(rate_user), 'chat', max_tokens=30, refill_rate=30 / 60):
+            return jsonify({'error': 'Rate limit exceeded (30/min). Please wait.', 'response': None}), 429
+    except Exception:
+        pass  # Rate limiter unavailable — allow
 
     start_time = time.time()
+
+    # Periodically evict stale agent state to prevent unbounded memory growth (M2 fix)
+    _cleanup_stale_agents()
+
     data = request.get_json()
+
+    # ── Two-layer auth: extract user_id from JWT if present ──
+    # Layer 1 (LOCAL): Bearer token signed by this node's HS256 secret
+    # Layer 2 (HIVE): Bearer token with Ed25519 node_sig (cross-node)
+    # Fallback: body user_id (backward compat for desktop/Nunba mode)
+    auth_header = request.headers.get('Authorization', '')
+    if auth_header.startswith('Bearer '):
+        try:
+            from integrations.social.auth import decode_jwt
+            jwt_payload = decode_jwt(auth_header[7:])
+            if jwt_payload and 'user_id' in jwt_payload:
+                data['user_id'] = jwt_payload['user_id']
+                g.auth_source = 'jwt'
+                g.token_scope = jwt_payload.get('scope', 'local')
+            else:
+                g.auth_source = 'body'
+        except Exception:
+            g.auth_source = 'body'
+    else:
+        g.auth_source = 'body'
+
     user_id = data.get('user_id', None)
     preferred_lang = data.get('preferred_lang', 'en')
     request_id = data.get('request_id', None)
@@ -2592,19 +4132,24 @@ def chat():
     file_id = data.get('file_id', None)
     prompt_id = data.get('prompt_id', None)
     create_agent = data.get('create_agent', None)
-    casual_conv = data.get('casual_conv', True)
+    casual_conv = data.get('casual_conv', False)
     autonomous = data.get('autonomous', False)
     probe = data.get('probe', None)
     intermediate = data.get('intermediate', None)
     speculative = data.get('speculative', False)
     model_config = data.get('model_config', None)
+    task_source = data.get('task_source', 'own')
+    thread_local_data.set_task_source(task_source)
+    channel_context = data.get('channel_context', None)
+    if channel_context:
+        thread_local_data.channel_context = channel_context
     app.logger.info(f"casual_conv type {casual_conv}")
 
     # Security: sanitize prompt_id to prevent path traversal
     if prompt_id is not None:
         prompt_id = str(prompt_id)
         if not re.match(r'^[a-zA-Z0-9_-]+$', prompt_id):
-            return jsonify({'error': 'Invalid prompt_id format'}), 400
+            return jsonify({'error': 'Invalid prompt_id format', 'response': None}), 400
 
     # Per-request model config override (speculative execution)
     if model_config:
@@ -2612,13 +4157,32 @@ def chat():
     else:
         thread_local_data.clear_model_config_override()
 
+    prompt = data.get('prompt', None)
+
     # GUARDRAIL: full pre-dispatch gate on every /chat call
     if prompt:
         try:
             from security.hive_guardrails import GuardrailEnforcer
             allowed, reason, prompt = GuardrailEnforcer.before_dispatch(prompt)
             if not allowed:
-                return jsonify({'error': f'Guardrail: {reason}'}), 403
+                return jsonify({'error': f'Guardrail: {reason}', 'response': None}), 403
+        except ImportError:
+            pass
+
+    # SECURITY: redact secrets (API keys, tokens, passwords) from user prompts
+    if prompt:
+        try:
+            from security.secret_redactor import redact_secrets
+            prompt, _redacted_count = redact_secrets(prompt)
+        except ImportError:
+            pass
+
+    # BUDGET GATE: estimate and log LLM cost before execution
+    if prompt:
+        try:
+            from integrations.agent_engine.budget_gate import estimate_llm_cost_spark
+            _est_cost = estimate_llm_cost_spark(prompt)
+            app.logger.debug(f"Estimated LLM cost: {_est_cost} Spark for user={user_id}")
         except ImportError:
             pass
 
@@ -2643,7 +4207,6 @@ def chat():
 
     # return ""
     thread_local_data.set_request_id(request_id=request_id)
-    prompt = data.get('prompt', None)
 
     # Security: Prompt injection detection
     if prompt:
@@ -2652,130 +4215,301 @@ def chat():
             is_safe, reason = check_prompt_injection(prompt)
             if not is_safe:
                 app.logger.warning(f"Prompt injection detected: {reason}")
-                return jsonify({'error': f'Input rejected: {reason}'}), 400
+                return jsonify({'error': f'Input rejected: {reason}', 'response': None}), 400
         except Exception:
             pass  # Degrade gracefully
 
+    # --- Agentic execution after user consent (Plan Mode → execute) ---
+    agentic_execute = data.get('agentic_execute', False)
+    if agentic_execute and prompt and user_id:
+        agentic_plan = data.get('agentic_plan', {})
+        matched_agent_id = agentic_plan.get('matched_agent_id')
+        app.logger.info(f'Agentic execute: matched_agent={matched_agent_id}, user={user_id}')
+
+        if matched_agent_id and os.path.exists(os.path.join(PROMPTS_DIR, f'{matched_agent_id}.json')):
+            # Route to existing agent via chat_agent (reuse_recipe.py)
+            prompt_id = matched_agent_id
+            # Fall through to the existing prompt_id routing below
+        else:
+            # No matching agent — auto-create one, then execute
+            # Reuse prompt_id from Plan Mode response if available
+            new_prompt_id = prompt_id if prompt_id else _next_prompt_id()
+            auto_response = _autonomous_gather_info(user_id, prompt, new_prompt_id)
+            _ak = f'{user_id}_{new_prompt_id}'
+            review_agents[_ak] = True
+            _touch_agent_timestamp(_ak)
+            _record_lifecycle('Review Mode', user_id, new_prompt_id,
+                              f'Agentic auto-creation: {prompt[:100]}')
+            _push_workflow_flowchart(user_id, new_prompt_id, request_id)
+            return jsonify({
+                'response': auto_response,
+                'intent': ['FINAL_ANSWER'],
+                'Agent_status': 'Review Mode',
+                'autonomous_creation': True,
+                'prompt_id': new_prompt_id,
+                'req_token_count': 0,
+                'res_token_count': 0,
+                'history_request_id': [],
+            })
+
     if prompt_id:
-        with _state_lock:
-            if os.path.exists(f'prompts/{prompt_id}.json'):
+        # Per-user lock prevents concurrent requests from corrupting agent state.
+        # Replaces the global _state_lock for better concurrency.
+        _user_lock = _get_user_lock(user_id)
+        with _user_lock:
+            if os.path.exists(os.path.join(PROMPTS_DIR, f'{prompt_id}.json')):
                 app.logger.info('GATHER JSON EXISTS')
-                if os.path.exists(f'prompts/{prompt_id}_0_recipe.json'):
+                if os.path.exists(os.path.join(PROMPTS_DIR, f'{prompt_id}_0_recipe.json')):
                     app.logger.info('0 Recipe JSON EXISTS')
-                    file_path = f'prompts/{prompt_id}.json'
+                    file_path = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
                     with open(file_path, 'r') as f:
                         data = json.load(f)
                         no_of_flow = len(data['flows'])-1
                         app.logger.info(f'GOT LEN OF FLOW AS {no_of_flow}')
-                    if os.path.exists(f'prompts/{prompt_id}_{no_of_flow}_recipe.json'):
-                        create_agent = set_flags_to_enter_review_mode(no_of_flow, user_id) #returns false
+                    if os.path.exists(os.path.join(PROMPTS_DIR, f'{prompt_id}_{no_of_flow}_recipe.json')):
+                        create_agent = set_flags_to_enter_review_mode(no_of_flow, user_id, prompt_id) #returns false
                     else:
                         app.logger.info(f'{no_of_flow} Recipe JSON doesnot EXISTS')
                         create_agent = True
-                        review_agents[user_id] = True
-                        conversation_agent[user_id] = False
+                        _ak = f'{user_id}_{prompt_id}'
+                        review_agents[_ak] = True
+                        conversation_agent[_ak] = False
+                        _touch_agent_timestamp(_ak)
                 else:
                     app.logger.info('0 Recipe JSON doesnot EXISTS')
                     create_agent = True
-                    review_agents[user_id] = True
-                    conversation_agent[user_id] = False
+                    _ak = f'{user_id}_{prompt_id}'
+                    review_agents[_ak] = True
+                    conversation_agent[_ak] = False
+                    _touch_agent_timestamp(_ak)
 
             else:
                 app.logger.info('GATHER JSON doesnot EXISTS')
                 create_agent = True
-                review_agents[user_id] = False
-                conversation_agent[user_id] = True
+                _ak = f'{user_id}_{prompt_id}'
+                review_agents[_ak] = False
+                conversation_agent[_ak] = True
+                _touch_agent_timestamp(_ak)
 
     if create_agent:
+        # Generate prompt_id server-side if not provided
+        if not prompt_id:
+            prompt_id = _next_prompt_id()
+            app.logger.info(f'Generated server-side prompt_id={prompt_id} for new agent')
+        # Per-user lock: snapshot agent state flags (lock NOT held during LLM calls)
+        _user_lock = _get_user_lock(user_id)
+        _ak = f'{user_id}_{prompt_id}'
+        with _user_lock:
+            _in_review = _ak in review_agents and review_agents[_ak]
+            _in_convo = _ak in conversation_agent and conversation_agent[_ak]
         # Phase 1: Gather Requirements
-        if user_id not in review_agents.keys() or review_agents[user_id] == False:
-            review_agents[user_id] = False
+        if not _in_review:
+            with _user_lock:
+                review_agents[_ak] = False
+                _touch_agent_timestamp(_ak)
             prompt = data.get('prompt', None)
             if prompt_id not in first_promts:
                 first_promts.append(prompt_id)
                 try:
                     res = pooled_get(
-                        f'{DB_URL}/getprompt/?prompt_id={prompt_id}').json()
-                    prompt = prompt+f" name:{res[0]['name']} goal:{res[0]['prompt']}"
-                except:
-                    app.logger.error(f'GOT DB ERROR FOR PROMPTID:{prompt_id}')
+                        f'{DB_URL}/getprompt/?prompt_id={prompt_id}', timeout=5).json()
+                    if res and isinstance(res, list) and len(res) > 0:
+                        prompt = prompt+f" name:{res[0]['name']} goal:{res[0]['prompt']}"
+                    else:
+                        app.logger.debug(f'No cloud record for prompt_id={prompt_id} (new agent)')
+                except Exception:
+                    app.logger.debug(f'Cloud DB unreachable for prompt_id={prompt_id}, using local-only')
             if not user_id or not prompt:
                 return jsonify({'response': 'Need user_id and text to create agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
             if autonomous:
                 # Autonomous dispatch (from daemon or API): LLM self-generates agent config
                 auto_response = _autonomous_gather_info(user_id, prompt, prompt_id)
-                review_agents[user_id] = True
-                conversation_agent[user_id] = False
+                with _user_lock:
+                    review_agents[_ak] = True
+                    conversation_agent[_ak] = False
+                    _touch_agent_timestamp(_ak)
                 _record_lifecycle('Review Mode', user_id, prompt_id, f'Autonomous creation via dispatch: {prompt[:100]}')
-                return jsonify({'response': auto_response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [], 'Agent_status': 'Review Mode', 'autonomous_creation': True})
+                _push_workflow_flowchart(user_id, prompt_id, request_id)
+                return jsonify({'response': auto_response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [], 'Agent_status': 'Review Mode', 'autonomous_creation': True, 'prompt_id': prompt_id})
             from gather_agentdetails import gather_info
-            response = gather_info(user_id,prompt,prompt_id)
+
+            # --- Turn counter: force-complete after MAX_GATHER_TURNS ---
+            turn_key = f'{user_id}_{prompt_id}'
+            _gather_turn_counts[turn_key] = _gather_turn_counts.get(turn_key, 0) + 1
+            turn_num = _gather_turn_counts[turn_key]
+            app.logger.info(f'gather_info turn {turn_num}/{MAX_GATHER_TURNS} for {turn_key}')
+
+            if turn_num >= MAX_GATHER_TURNS:
+                # Force completion: ask LLM to wrap up with whatever it has
+                app.logger.warning(f'gather_info hit max turns ({MAX_GATHER_TURNS}), forcing completion')
+                prompt = ('Please finalize and return the completed agent configuration NOW with '
+                          'status="completed". Use reasonable defaults for any missing fields. '
+                          'Return the full JSON immediately.')
+
+            response = gather_info(user_id, prompt, prompt_id)
             new_response = response.replace('true','True').replace("false", "False")
             app.logger.info('AFTER GATHER INFO')
+
+            # --- Helper: save completed agent config and transition to Review ---
+            def _save_and_enter_review(agent_config):
+                agent_config['prompt_id'] = prompt_id
+                agent_config['creator_user_id'] = user_id
+                with _user_lock:
+                    conversation_agent[_ak] = False
+                    _touch_agent_timestamp(_ak)
+                name = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
+                with open(name, "w") as json_file:
+                    json.dump(agent_config, json_file)
+                app.logger.info(f"Agent config saved to {name}")
+                # Sync to cloud DB (non-fatal)
+                try:
+                    pooled_post(
+                        f'{DB_URL}/createpromptlist',
+                        json={'listprompts': [{
+                            'prompt_id': prompt_id,
+                            'prompt': agent_config.get('goal', ''),
+                            'user_id': user_id,
+                            'name': agent_config.get('name', ''),
+                            'is_active': True,
+                            'image_url': agent_config.get('image_url', ''),
+                        }]},
+                        timeout=5)
+                except Exception:
+                    pass
+                with _user_lock:
+                    review_agents[_ak] = True
+                    _touch_agent_timestamp(_ak)
+                _gather_turn_counts.pop(turn_key, None)  # Reset turn counter
+                _record_lifecycle('Review Mode', user_id, prompt_id, 'Agent details gathered, entering review')
+
             try:
+                # Parse gather_info response
+                new_res = None
+
+                # Detect context-exceeded errors before parsing
+                if 'Context size has been exceeded' in response:
+                    raise ValueError('LLM context size exceeded — cannot parse gather_info response')
+
                 try:
                     new_res = retrieve_json(new_response)
                     app.logger.info(f"new_res: {new_res}")
                 except Exception as e:
                     app.logger.error(f'Got some error while will try with re match error:{e}')
                     json_match = re.search(r'{[\s\S]*}', response)
-                    app.logger.info(f'Json match result: {json_match}')
                     if json_match:
-                        app.logger.info(f'Inside json_match')
-                        json_part = json_match.group(0)
-                        app.logger.info(f'Before loads json_part:{json_part}')
-                        new_res = json.loads(json_part)
-                        app.logger.info(f'After loads new_res:{new_res}')
+                        new_res = json.loads(json_match.group(0))
                     else:
-                        raise 'No Json in response'
-                app.logger.info('AFTER EVAL')
-                if new_res['status'] == 'pending':
+                        raise ValueError('No JSON in response')
+
+                # retrieve_json can return None without raising — catch it early
+                if new_res is None:
+                    json_match = re.search(r'{[\s\S]*}', response)
+                    if json_match:
+                        new_res = json.loads(json_match.group(0))
+                    else:
+                        raise ValueError('retrieve_json returned None and no JSON found in response')
+
+                # LLM sometimes returns a list of conversation turns instead of a single dict
+                if isinstance(new_res, list):
+                    app.logger.info(f'new_res is a list (len={len(new_res)}), extracting last dict with status')
+                    for item in reversed(new_res):
+                        if isinstance(item, dict) and 'status' in item:
+                            new_res = item
+                            break
+                    else:
+                        for item in reversed(new_res):
+                            if isinstance(item, dict):
+                                new_res = item
+                                break
+                        else:
+                            raise ValueError(f'List response has no usable dict: {new_res}')
+                    app.logger.info(f'Extracted dict: status={new_res.get("status")}')
+
+                if new_res is None:
+                    raise ValueError('new_res is None after parsing')
+
+                if new_res.get('status') == 'pending' and turn_num < MAX_GATHER_TURNS:
                     app.logger.info('PENDING STATUS')
-                    ans = new_res['question'] if 'question' in new_res else new_res['review_details']
-                    _record_lifecycle('Creation Mode', user_id, prompt_id, 'Agent creation started via gather_info')
-                    return jsonify({'response': ans, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Creation Mode'})
+                    ans = new_res.get('question') or new_res.get('review_details', response)
+                    _record_lifecycle('Creation Mode', user_id, prompt_id, f'Agent creation turn {turn_num}')
+                    return jsonify({'response': ans, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Creation Mode', 'prompt_id': prompt_id})
                 else:
+                    # Completed (or forced completion after max turns)
                     app.logger.info('COMPLETED STATUS')
-                    new_res['prompt_id'] = prompt_id
-                    new_res['creator_user_id'] = user_id
-                    conversation_agent[user_id] = False
-                    app.logger.info(
-                        'Agent Created Successfully saving it and reusing it for further purpose')
-                    name = f'prompts/{prompt_id}.json'
-                    with open(name, "w") as json_file:
-                        json.dump(new_res, json_file)
-                    app.logger.info(f"Dictionary saved to {name}")
-                    review_agents[user_id] = True
-                    _record_lifecycle('Review Mode', user_id, prompt_id, 'Agent details gathered, entering review')
-                    return jsonify({'response': 'Got Agent details successfully lets move on to review them one at a time', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Review Mode'})
+                    _save_and_enter_review(new_res)
+                    _push_workflow_flowchart(user_id, prompt_id, request_id)
+                    return jsonify({'response': 'Got Agent details successfully lets move on to review them one at a time', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Review Mode', 'prompt_id': prompt_id})
+
             except Exception as e:
-                app.logger.error('GOT some error while eval and returning the response')
-                app.logger.error(e)
+                app.logger.error(f'gather_info parse error on turn {turn_num}: {e}')
+                # After repeated failures, salvage what we can and move forward.
+                # For autonomous dispatches (agent daemon), salvage earlier (turn 3)
+                # to avoid tight retry loops that waste resources.
+                # For fatal errors (context exceeded, permission denied), salvage immediately.
+                is_autonomous = request.json.get('autonomous', False)
+                err_str = str(e)
+                is_fatal = ('context size' in err_str.lower()
+                            or 'permission denied' in err_str.lower()
+                            or 'errno 13' in err_str.lower())
+                if is_fatal:
+                    salvage_threshold = 1  # Immediate salvage — retrying won't help
+                elif is_autonomous:
+                    salvage_threshold = 3
+                else:
+                    salvage_threshold = MAX_GATHER_TURNS - 2
+                if turn_num >= salvage_threshold:
+                    app.logger.warning(
+                        f'Too many gather_info failures (turn {turn_num}, '
+                        f'autonomous={is_autonomous}), salvaging partial config')
+                    partial = {
+                        'status': 'completed',
+                        'name': f'Agent {prompt_id}',
+                        'agent_name': f'auto.agent{str(prompt_id)[-4:]}',
+                        'goal': prompt or 'General assistant',
+                        'broadcast_agent': 'no',
+                        'personas': [{'name': 'Assistant', 'description': 'General purpose assistant'}],
+                        'flows': [{'flow_name': 'main', 'persona': 'Assistant', 'actions': [{'action': 'Respond to user', 'action_id': 1, 'status': 'pending'}], 'sub_goal': prompt or 'Help the user'}],
+                        'extra_information': f'Auto-generated after {turn_num} gather turns'
+                    }
+                    _save_and_enter_review(partial)
+                    _record_lifecycle('Review Mode', user_id, prompt_id, f'Force-completed after {turn_num} failed turns')
+                    return jsonify({'response': 'Agent created with available details. Moving to review.', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Review Mode', 'prompt_id': prompt_id})
                 _record_lifecycle('Creation Mode', user_id, prompt_id, f'Creation continuing after parse error: {e}')
-                return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Creation Mode'})
-        # Phase 2: Review Phase
-        if review_agents[user_id] and not conversation_agent[user_id]:
+                return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Creation Mode', 'prompt_id': prompt_id})
+        # Phase 2: Review Phase (re-snapshot flags under lock after Phase 1 may have mutated)
+        with _user_lock:
+            _in_review = _ak in review_agents and review_agents[_ak]
+            _in_convo = _ak in conversation_agent and conversation_agent[_ak]
+        if _in_review and not _in_convo:
             response = recipe(user_id,prompt,prompt_id,file_id,request_id)
             if response =='Agent Created Successfully':
-                conversation_agent[user_id] = True
+                with _user_lock:
+                    conversation_agent[_ak] = True
+                _touch_agent_timestamp(_ak)
                 # Bridge: auto-create social identity for this agent
                 try:
                     _create_social_agent_from_prompt(user_id, prompt_id)
                 except Exception as e:
                     app.logger.debug(f"Social agent bridge skipped: {e}")
                 _record_lifecycle('completed', user_id, prompt_id, 'Agent creation completed successfully')
+                _push_workflow_flowchart(user_id, prompt_id, request_id)
                 return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'completed'})
             _record_lifecycle('Review Mode', user_id, prompt_id, 'Agent details being reviewed')
             return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Review Mode'})
         # Phase 3: Evaluation Phase
-        if review_agents[user_id] and conversation_agent[user_id]:
+        if _in_review and _in_convo:
             return evaluate_agent_after_creation_in_review(file_id, prompt, prompt_id, request_id, user_id)
 
-    if prompt_id and os.path.exists(f'prompts/{prompt_id}.json'):
-
-        with open(f'prompts/{prompt_id}.json', "r") as file:
+    if prompt_id and os.path.exists(os.path.join(PROMPTS_DIR, f'{prompt_id}.json')):
+        _ak = f'{user_id}_{prompt_id}'  # Ensure compound key available for reuse path
+        with open(os.path.join(PROMPTS_DIR, f'{prompt_id}.json'), "r") as file:
             created_json = json.load(file)
 
+
+        if chat_agent is None:
+            return jsonify({'response': 'Agent reuse module is unavailable. Please check server dependencies.',
+                            'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0,
+                            'history_request_id': []})
 
         response = chat_agent(user_id,prompt,prompt_id,file_id,request_id)
 
@@ -2784,7 +4518,7 @@ def chat():
         # 1. Autogen create_new_agent tool (intelligent — LLM decides via tool call)
         # 2. Response text pattern matching (fallback for structured agent output)
         user_prompt = f'{user_id}_{prompt_id}'
-        if not review_agents.get(user_id) and not create_agent:
+        if not review_agents.get(_ak) and not create_agent:
             # Check autogen tool signal first (intelligent detection)
             from reuse_recipe import creation_signals
             if user_prompt in creation_signals:
@@ -2793,11 +4527,13 @@ def chat():
                 is_auto = signal.get('autonomous', False)
                 app.logger.info(f'Autogen create_new_agent tool fired: desc="{agent_desc}", autonomous={is_auto}')
 
-                new_prompt_id = int(time.time())
+                new_prompt_id = _next_prompt_id()
                 if is_auto:
                     # Autonomous: run gather_info with LLM-generated answers
                     auto_response = _autonomous_gather_info(user_id, agent_desc, new_prompt_id)
-                    review_agents[user_id] = True
+                    _ak_new = f'{user_id}_{new_prompt_id}'
+                    review_agents[_ak_new] = True
+                    _touch_agent_timestamp(_ak_new)
                     _record_lifecycle('Review Mode', user_id, new_prompt_id, f'Autonomous creation from reuse: {agent_desc[:100]}')
                     return jsonify({
                         'response': auto_response,
@@ -2835,7 +4571,8 @@ def chat():
                 })
 
         _record_lifecycle('Reuse Mode', user_id, prompt_id, 'Agent reused for conversation')
-        return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Reuse Mode'})
+        _resonance = _tune_resonance_after_chat(user_id, prompt, response)
+        return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [],'Agent_status':'Reuse Mode', **_resonance})
 
     if prompt_id:
         try:
@@ -2854,8 +4591,8 @@ def chat():
                     f' The Language selected is {language}'
                 app.logger.info(f"custom prompt is: {custom_prompt}")
 
-        except:
-            app.logger.error(f'failed to get prompt from id:- {prompt_id}')
+        except Exception as e:
+            app.logger.error(f'failed to get prompt from id:- {prompt_id}: {e}')
             custom_prompt = Hevolve
     elif probe:
         custom_prompt = PROBE_TEMPLATE
@@ -2891,18 +4628,45 @@ def chat():
     app.logger.info("the time taken by get ans in main api is %s seconds",
                     time.time() - ans_start_time)
 
+    # --- Check if LLM's Agentic_Router tool fired during get_ans() ---
+    if thread_local_data.get_agentic_requested():
+        task_desc = thread_local_data.get_agentic_task_description()
+        plan_steps = thread_local_data.get_agentic_plan_steps()
+        matched_agent = thread_local_data.get_agentic_matched_agent_id()
+        thread_local_data.clear_agentic_flags()
+        app.logger.info(f'Agentic_Router tool fired: task="{task_desc[:80] if task_desc else ""}", '
+                        f'steps={len(plan_steps)}, matched_agent={matched_agent}')
+
+        return jsonify({
+            'response': ans,
+            'intent': ['FINAL_ANSWER'],
+            'Agent_status': 'Plan Mode',
+            'agentic_plan': {
+                'task_description': task_desc,
+                'steps': plan_steps,
+                'matched_agent_id': matched_agent,
+                'requires_consent': True,
+            },
+            'prompt_id': prompt_id if prompt_id else _next_prompt_id(),
+            'req_token_count': thread_local_data.get_req_token_count(),
+            'res_token_count': thread_local_data.get_res_token_count(),
+            'history_request_id': thread_local_data.get_reqid_list(),
+        })
+
     # --- Step 16c: Check if LLM's Create_Agent tool fired during get_ans() ---
     if thread_local_data.get_creation_requested():
         agent_description = thread_local_data.get_creation_description()
         is_autonomous = thread_local_data.get_creation_autonomous()
-        new_prompt_id = int(time.time())
+        new_prompt_id = _next_prompt_id()
         thread_local_data.clear_creation_flags()
         app.logger.info(f'LLM Create_Agent tool fired: desc="{agent_description}", autonomous={is_autonomous}')
 
         if is_autonomous:
             # Autonomous: run gather_info with LLM-generated answers
             auto_response = _autonomous_gather_info(user_id, agent_description, new_prompt_id)
-            review_agents[user_id] = True
+            _ak_new = f'{user_id}_{new_prompt_id}'
+            review_agents[_ak_new] = True
+            _touch_agent_timestamp(_ak_new)
             _record_lifecycle('Review Mode', user_id, new_prompt_id, f'Autonomous creation via LLM tool: {agent_description[:100]}')
             return jsonify({
                 'response': auto_response,
@@ -2920,7 +4684,14 @@ def chat():
             new_response = response.replace('true', 'True').replace("false", "False")
             try:
                 new_res = retrieve_json(new_response)
-                if new_res.get('status') == 'pending':
+                if isinstance(new_res, list):
+                    for item in reversed(new_res):
+                        if isinstance(item, dict) and 'status' in item:
+                            new_res = item
+                            break
+                    else:
+                        new_res = {}
+                if isinstance(new_res, dict) and new_res.get('status') == 'pending':
                     resp_text = new_res.get('question', new_res.get('review_details', ans))
                 else:
                     resp_text = ans
@@ -2949,9 +4720,11 @@ def chat():
             'Content-Type': 'application/json'
         }
         action_response = pooled_post(f'{DB_URL}/create_action', headers=headers, data=payload)
+    _resonance = _tune_resonance_after_chat(user_id, prompt, ans) if ans else {}
     if ans != "":
         post_dict = {'user_id': user_id, 'status': 'FINISHED', 'task_name': "CHAT",
-                     'uid': request_id, 'task_id': f"CHAT_{str(request_id)}", 'request_id': request_id}
+                     'uid': request_id, 'task_id': f"CHAT_{str(request_id)}", 'request_id': request_id,
+                     **_resonance}
         publish_async('com.hertzai.longrunning.log', post_dict)
     else:
         post_dict = {'user_id': user_id, 'status': 'ERROR', 'task_name': "CHAT", 'uid': request_id,
@@ -2962,21 +4735,28 @@ def chat():
     elapsed_time = end_time - start_time
     app.logger.info(f"time taken for this full call is {elapsed_time}")
 
-    return jsonify({'response': ans, 'intent': thread_local_data.get_recognize_intents(), 'req_token_count': thread_local_data.get_req_token_count(), 'res_token_count': thread_local_data.get_res_token_count(), 'history_request_id': thread_local_data.get_reqid_list()})
+    return jsonify({'response': ans, 'intent': thread_local_data.get_recognize_intents(), 'req_token_count': thread_local_data.get_req_token_count(), 'res_token_count': thread_local_data.get_res_token_count(), 'history_request_id': thread_local_data.get_reqid_list(), **_resonance})
 
 
 def evaluate_agent_after_creation_in_review(file_id, prompt, prompt_id, request_id, user_id):
+    if chat_agent is None:
+        return jsonify({'response': 'Agent reuse module is unavailable. Please check server dependencies.',
+                        'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0,
+                        'history_request_id': [], 'Agent_status': 'Evaluation Mode'})
     response = chat_agent(user_id, prompt, prompt_id, file_id, request_id)
     _record_lifecycle('Evaluation Mode', user_id, prompt_id, 'Agent being evaluated after creation')
+    _resonance = _tune_resonance_after_chat(user_id, prompt, response)
     return jsonify({'response': response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0,
-                    'history_request_id': [], 'Agent_status': 'Evaluation Mode'})
+                    'history_request_id': [], 'Agent_status': 'Evaluation Mode', **_resonance})
 
 
-def set_flags_to_enter_review_mode(no_of_flow, user_id):
+def set_flags_to_enter_review_mode(no_of_flow, user_id, prompt_id=''):
     app.logger.info(f'{no_of_flow} Recipe Json exist Going to reuse')
     create_agent = False
-    review_agents[user_id] = True
-    conversation_agent[user_id] = False
+    _ak = f'{user_id}_{prompt_id}'
+    review_agents[_ak] = True
+    conversation_agent[_ak] = False
+    _touch_agent_timestamp(_ak)
     return create_agent
 
 
@@ -2988,7 +4768,7 @@ def time_agent():
     user_id = data.get('user_id',None)
     request_from = data.get('request_from',"Reuse")
     prompt_id = data.get('prompt_id',None)
-    action_entry_point = data.get('prompt_id',0)
+    action_entry_point = data.get('action_entry_point',0)
     if not task_description or not user_id or not prompt_id:
         return jsonify({'error':'user_id or task_description or prompt_id is missing'}), 404
     app.logger.info(f'GOT user_id:{user_id} & prompt_id:{prompt_id} & task_description:{task_description}')
@@ -3024,6 +4804,7 @@ def response_ack():
     request_id = data.get('request_id',None)
     thread_local_data.set_request_id(request_id=request_id)
     prompt_id = data.get('prompt_id',None)
+    return jsonify({'status': 'acknowledged'}), 200
 
 @app.route('/add_history', methods=['POST'])
 def history():
@@ -3052,7 +4833,7 @@ def history():
 
 def _create_social_agent_from_prompt(user_id, prompt_id):
     """Read prompts/{prompt_id}.json and create a social User for this agent."""
-    prompt_file = f'prompts/{prompt_id}.json'
+    prompt_file = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
     if not os.path.exists(prompt_file):
         return
     with open(prompt_file, 'r') as f:
@@ -3105,12 +4886,11 @@ def get_prompts():
     prompts = []
 
     # 1. Read from local prompts/*.json files
-    prompts_dir = os.path.join(os.path.dirname(__file__), 'prompts')
-    if os.path.isdir(prompts_dir):
-        for fname in os.listdir(prompts_dir):
+    if os.path.isdir(PROMPTS_DIR):
+        for fname in os.listdir(PROMPTS_DIR):
             if fname.endswith('.json') and '_' not in fname:
                 try:
-                    fpath = os.path.join(prompts_dir, fname)
+                    fpath = os.path.join(PROMPTS_DIR, fname)
                     with open(fpath, 'r') as f:
                         data = json.load(f)
                     pid = fname.replace('.json', '')
@@ -3124,7 +4904,7 @@ def get_prompts():
                             'is_active': data.get('status', '') == 'completed',
                             'user_id': creator or req_user_id,
                             'has_recipe': os.path.exists(
-                                os.path.join(prompts_dir, f'{pid}_0_recipe.json')),
+                                os.path.join(PROMPTS_DIR, f'{pid}_0_recipe.json')),
                             'flow_count': len(data.get('flows', [])),
                             'source': 'local',
                         })
@@ -3149,6 +4929,88 @@ def get_prompts():
     return jsonify(prompts)
 
 
+@app.route('/prompts/public', methods=['GET'])
+def get_public_prompts():
+    """Return all public prompts/agents. Local-first, cloud DB fallback.
+    Equivalent to the legacy /getprompt_all/ cloud endpoint."""
+    prompts = []
+
+    # 1. Read ALL prompts from local files (no user filter)
+    if os.path.isdir(PROMPTS_DIR):
+        for fname in os.listdir(PROMPTS_DIR):
+            if fname.endswith('.json') and '_' not in fname:
+                try:
+                    fpath = os.path.join(PROMPTS_DIR, fname)
+                    with open(fpath, 'r') as f:
+                        data = json.load(f)
+                    pid = fname.replace('.json', '')
+                    prompts.append({
+                        'prompt_id': pid,
+                        'name': data.get('name', ''),
+                        'prompt': data.get('goal', ''),
+                        'agent_name': data.get('agent_name', ''),
+                        'is_active': data.get('status', '') == 'completed',
+                        'is_public': True,
+                        'user_id': data.get('creator_user_id', ''),
+                        'teacher_image_url': data.get('teacher_image_url', ''),
+                        'image_url': data.get('image_url', ''),
+                        'video_text': data.get('video_text', ''),
+                        'has_recipe': os.path.exists(
+                            os.path.join(prompts_dir, f'{pid}_0_recipe.json')),
+                        'flow_count': len(data.get('flows', [])),
+                        'source': 'local',
+                    })
+                except Exception:
+                    continue
+
+    # 2. Also fetch from cloud DB to get remote-only agents
+    try:
+        res = pooled_get(f'{DB_URL}/getprompt_all/', timeout=5)
+        if res.status_code == 200:
+            cloud_data = res.json()
+            local_ids = {str(p['prompt_id']) for p in prompts}
+            for item in cloud_data:
+                if str(item.get('prompt_id', '')) not in local_ids:
+                    item['source'] = 'cloud'
+                    prompts.append(item)
+    except Exception:
+        pass
+
+    return jsonify(prompts)
+
+
+_prompt_id_lock = threading.Lock()
+
+def _next_prompt_id():
+    """Generate a globally-unique prompt_id.
+
+    Uses millisecond timestamp so IDs are unique across nodes in the
+    federation (no central coordinator needed). A local collision check
+    ensures two agents created on the same node within the same
+    millisecond still get distinct IDs.
+
+    Thread-safe via lock.
+
+    NOTE: Returns 1–11 digit numeric IDs by folding the millisecond
+    timestamp into a max-11-digit space.
+    """
+    with _prompt_id_lock:
+        # Fold ms timestamp into 1..99,999,999,999 (1–11 digits)
+        pid = int(time.time() * 1000) % 100_000_000_000
+        if pid == 0:
+            pid = 1
+
+        if os.path.isdir(PROMPTS_DIR):
+            # Preserve the same collision-avoidance logic
+            while os.path.exists(os.path.join(PROMPTS_DIR, f'{pid}.json')):
+                pid += 1
+                # Keep pid within 1–11 digits while still allowing bumps
+                if pid >= 100_000_000_000:
+                    pid = 1
+
+        return pid
+
+
 @app.route('/prompts', methods=['POST'])
 def create_prompts():
     """Create/update prompts. Saves locally AND syncs to cloud DB."""
@@ -3159,14 +5021,11 @@ def create_prompts():
     for item in listprompts:
         pid = item.get('prompt_id')
         if not pid:
-            # Auto-assign prompt_id from existing files
-            existing = [f.replace('.json', '') for f in os.listdir('prompts')
-                        if f.endswith('.json') and '_' not in f and f[0].isdigit()]
-            pid = max([int(x) for x in existing if x.isdigit()] or [0]) + 1
+            pid = _next_prompt_id()
             item['prompt_id'] = pid
 
         # Save locally
-        local_path = f'prompts/{pid}.json'
+        local_path = os.path.join(PROMPTS_DIR, f'{pid}.json')
         local_data = {}
         if os.path.exists(local_path):
             with open(local_path, 'r') as f:
@@ -3213,7 +5072,7 @@ def _get_active_backend_info() -> dict:
     return {
         'type': 'local_llamacpp',
         'display_name': 'llama.cpp (Nunba)',
-        'model': 'Qwen3-VL-2B',
+        'model': 'Qwen3.5-4B',
         'mode': 'flat',
         'cloud_fallback_configured': bool(cloud_url),
     }
@@ -3227,22 +5086,232 @@ def status():
     result['llm_backend'] = _get_active_backend_info()
     result['node_tier'] = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
 
-    # crawl4ai health (non-blocking, fail-safe)
+    # HevolveAI health (non-blocking, fail-safe)
     try:
         from integrations.agent_engine.world_model_bridge import get_world_model_bridge
         bridge = get_world_model_bridge()
         bridge_stats = bridge.get_stats()
-        result['crawl4ai_url'] = bridge_stats.get('api_url', '')
+        result['hevolve_core_url'] = bridge_stats.get('api_url', '')
         result['in_process'] = bridge_stats.get('in_process', False)
         health = bridge.check_health()
-        result['crawl4ai_healthy'] = health.get('healthy', False)
+        result['hevolve_core_healthy'] = health.get('healthy', False)
         result['learning_active'] = health.get('learning_active', False)
         result['learning_mode'] = health.get('mode', 'unknown')
     except Exception:
-        result['crawl4ai_healthy'] = False
+        result['hevolve_core_healthy'] = False
         result['learning_active'] = False
 
     return jsonify(result)
+
+
+@app.route('/health', methods=['GET'])
+def health_liveness():
+    """Liveness probe — returns 200 if the process is running.
+
+    Use for K8s livenessProbe / systemd WatchdogSec.
+    """
+    return jsonify({'status': 'alive'}), 200
+
+
+@app.route('/ready', methods=['GET'])
+def health_readiness():
+    """Readiness probe — returns 200 only when critical subsystems are healthy.
+
+    Checks:
+    - Database: SELECT 1 via get_db()
+    - Node identity: get_node_identity() returns non-None
+
+    Returns 503 when any critical check fails.
+    """
+    checks = {}
+    all_ok = True
+
+    # Check 1: Database connectivity
+    try:
+        from integrations.social.models import get_db
+        from sqlalchemy import text as _sa_text
+        db = get_db()
+        try:
+            db.execute(_sa_text('SELECT 1'))
+            checks['database'] = 'ok'
+        finally:
+            db.close()
+    except Exception as e:
+        checks['database'] = f'fail: {e}'
+        all_ok = False
+
+    # Check 2: Node identity
+    try:
+        from security.node_integrity import get_node_identity
+        identity = get_node_identity()
+        if identity:
+            checks['node_identity'] = 'ok'
+        else:
+            checks['node_identity'] = 'fail: no identity'
+            all_ok = False
+    except Exception as e:
+        checks['node_identity'] = f'fail: {e}'
+        all_ok = False
+
+    # Check 3: HevolveAI bridge (optional — not critical)
+    try:
+        from integrations.agent_engine.world_model_bridge import get_world_model_bridge
+        bridge = get_world_model_bridge()
+        bridge_health = bridge.check_health()
+        checks['hevolve_core'] = 'ok' if bridge_health.get('healthy') else 'degraded'
+    except Exception:
+        checks['hevolve_core'] = 'unavailable'
+
+    # Check 4: LLM backend (optional — not critical)
+    try:
+        backend_info = _get_active_backend_info()
+        checks['llm_backend'] = backend_info.get('backend', 'unknown')
+    except Exception:
+        checks['llm_backend'] = 'unavailable'
+
+    status_code = 200 if all_ok else 503
+    return jsonify({
+        'status': 'ready' if all_ok else 'not_ready',
+        'checks': checks,
+    }), status_code
+
+
+# ============================================================================
+# HART Challenge-Response Endpoint (Node Side)
+# ============================================================================
+# Central delivers a challenge nonce to this endpoint to prove the node is
+# reachable at its claimed FQDN.  The node signs the nonce with its Ed25519
+# private key and returns the signature.  This is step 2+3 of the 4-step
+# domain verification handshake defined in security/key_delegation.py.
+#
+# Security notes:
+#   - This endpoint is intentionally unauthenticated: central must be able to
+#     reach it without prior credentials to prove domain reachability.
+#   - The nonce is signed with the node's private key, which never leaves the
+#     node.  Central verifies using the public key the node provided at
+#     registration time.
+#   - The endpoint only responds to GET (challenge delivery) and POST
+#     (explicit challenge-response submission from the node itself if needed).
+
+# Module-level storage for the most recent challenge nonce received from
+# central.  The node-side orchestrator can poll this to retrieve the nonce
+# and submit the signed response back to central.
+_hart_challenge_state = {
+    'lock': threading.Lock(),
+    'pending_nonce': None,       # str | None — most recent nonce from central
+    'pending_signature': None,   # str | None — signature once computed
+    'pending_pubkey': None,      # str | None — this node's public key hex
+    'received_at': None,         # datetime | None
+}
+
+
+@app.route('/.well-known/hart-challenge', methods=['GET'])
+def hart_challenge_receive():
+    """Receive a challenge nonce from central and auto-sign it.
+
+    Central calls:  GET http://{fqdn}:6777/.well-known/hart-challenge?nonce=<hex>
+
+    The node:
+      1. Validates the nonce format (must be 64 hex chars = 32 bytes).
+      2. Signs the raw nonce bytes with its Ed25519 private key.
+      3. Returns {nonce, public_key_hex, signature_hex} so central can
+         immediately verify without a second round-trip.
+
+    Returns 200 with signed response on success, 400 on bad input.
+    """
+    nonce_hex = request.args.get('nonce', '').strip()
+
+    if not nonce_hex:
+        return jsonify({'error': 'Missing "nonce" query parameter'}), 400
+
+    # Validate nonce format: must be valid hex and exactly 32 bytes (64 chars)
+    try:
+        nonce_bytes = bytes.fromhex(nonce_hex)
+        if len(nonce_bytes) != 32:
+            return jsonify({
+                'error': f'Invalid nonce length: expected 32 bytes (64 hex chars), '
+                         f'got {len(nonce_bytes)} bytes',
+            }), 400
+    except ValueError:
+        return jsonify({'error': 'Invalid nonce: not valid hexadecimal'}), 400
+
+    # Sign the raw nonce bytes with this node's Ed25519 private key
+    try:
+        from security.node_integrity import sign_message, get_public_key_hex
+        signature = sign_message(nonce_bytes)
+        public_key_hex = get_public_key_hex()
+    except Exception as e:
+        app.logger.error(f"hart-challenge: failed to sign nonce: {e}")
+        return jsonify({'error': 'Internal error: failed to sign challenge'}), 500
+
+    signature_hex = signature.hex()
+
+    # Store in module state for potential polling by node-side orchestrator
+    import datetime as _dt_mod
+    with _hart_challenge_state['lock']:
+        _hart_challenge_state['pending_nonce'] = nonce_hex
+        _hart_challenge_state['pending_signature'] = signature_hex
+        _hart_challenge_state['pending_pubkey'] = public_key_hex
+        _hart_challenge_state['received_at'] = _dt_mod.datetime.now(_dt_mod.timezone.utc)
+
+    app.logger.info(
+        f"hart-challenge: signed nonce {nonce_hex[:16]}... "
+        f"pubkey={public_key_hex[:16]}...")
+
+    return jsonify({
+        'nonce': nonce_hex,
+        'public_key_hex': public_key_hex,
+        'signature_hex': signature_hex,
+    }), 200
+
+
+@app.route('/.well-known/hart-challenge', methods=['POST'])
+def hart_challenge_submit():
+    """Accept an explicit challenge-response submission.
+
+    An alternative path where the node operator or automation explicitly
+    submits {nonce, fqdn} and this endpoint signs and returns the response.
+    Useful when the node needs to relay the signed response to central
+    through a different channel.
+
+    Request JSON: {"nonce": "<hex>"}
+    Response JSON: {"nonce": "...", "public_key_hex": "...", "signature_hex": "..."}
+    """
+    data = request.get_json(silent=True) or {}
+    nonce_hex = data.get('nonce', '').strip()
+
+    if not nonce_hex:
+        return jsonify({'error': 'Missing "nonce" in request body'}), 400
+
+    try:
+        nonce_bytes = bytes.fromhex(nonce_hex)
+        if len(nonce_bytes) != 32:
+            return jsonify({
+                'error': f'Invalid nonce length: expected 32 bytes, got {len(nonce_bytes)}',
+            }), 400
+    except ValueError:
+        return jsonify({'error': 'Invalid nonce: not valid hexadecimal'}), 400
+
+    try:
+        from security.node_integrity import sign_message, get_public_key_hex
+        signature = sign_message(nonce_bytes)
+        public_key_hex = get_public_key_hex()
+    except Exception as e:
+        app.logger.error(f"hart-challenge POST: failed to sign nonce: {e}")
+        return jsonify({'error': 'Internal error: failed to sign challenge'}), 500
+
+    signature_hex = signature.hex()
+
+    app.logger.info(
+        f"hart-challenge POST: signed nonce {nonce_hex[:16]}... "
+        f"pubkey={public_key_hex[:16]}...")
+
+    return jsonify({
+        'nonce': nonce_hex,
+        'public_key_hex': public_key_hex,
+        'signature_hex': signature_hex,
+    }), 200
+
 
 @app.route('/zeroshot/', methods=['POST'])
 def zeroshot():
@@ -3380,12 +5449,1080 @@ Example response format:
         app.logger.error(f"Error in /zeroshot/ endpoint: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
+# ─── Shared error-handling decorator (DRY: replaces 12+ identical try/except blocks) ──
+
+def _json_endpoint(f):
+    """Wrap a Flask view so unhandled exceptions return ``{'error': ...}, 500``."""
+    @wraps(f)
+    def _wrapped(*args, **kwargs):
+        try:
+            return f(*args, **kwargs)
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    return _wrapped
+
+
+# ─── Runtime Media Tools API ──────────────────────────────────────────
+# Endpoints for managing runtime media tools (Wan2GP, TTS-Audio-Suite,
+# Whisper, OmniParser). Tools are downloaded, started, and registered
+# dynamically. See integrations/service_tools/runtime_manager.py.
+
+@app.route('/api/tools/status', methods=['GET'])
+@_json_endpoint
+def tools_status():
+    """Get status of all runtime media tools."""
+    from integrations.service_tools.runtime_manager import runtime_tool_manager
+    return jsonify(runtime_tool_manager.get_all_status())
+
+
+@app.route('/api/tools/<tool_name>/setup', methods=['POST'])
+@_json_endpoint
+def tools_setup(tool_name):
+    """Download + start + register a runtime tool."""
+    from integrations.service_tools.runtime_manager import runtime_tool_manager
+    result = runtime_tool_manager.setup_tool(tool_name)
+    code = 500 if 'error' in result else 200
+    return jsonify(result), code
+
+
+@app.route('/api/tools/<tool_name>/start', methods=['POST'])
+@_json_endpoint
+def tools_start(tool_name):
+    """Start an already-downloaded runtime tool."""
+    from integrations.service_tools.runtime_manager import runtime_tool_manager
+    result = runtime_tool_manager.start_tool(tool_name)
+    code = 500 if 'error' in result else 200
+    return jsonify(result), code
+
+
+@app.route('/api/tools/<tool_name>/stop', methods=['POST'])
+@_json_endpoint
+def tools_stop(tool_name):
+    """Stop a running runtime tool and free VRAM."""
+    from integrations.service_tools.runtime_manager import runtime_tool_manager
+    return jsonify(runtime_tool_manager.stop_tool(tool_name))
+
+
+@app.route('/api/tools/<tool_name>/unload', methods=['POST'])
+@_json_endpoint
+def tools_unload(tool_name):
+    """Stop + deregister a runtime tool."""
+    from integrations.service_tools.runtime_manager import runtime_tool_manager
+    return jsonify(runtime_tool_manager.unload_tool(tool_name))
+
+
+@app.route('/api/tools/vram', methods=['GET'])
+@_json_endpoint
+def tools_vram():
+    """Get VRAM usage dashboard."""
+    from integrations.service_tools.vram_manager import vram_manager
+    return jsonify(vram_manager.get_status())
+
+
+# ─── Model Lifecycle API ─────────────────────────────────────────────
+# Agentic model lifecycle management — dynamic load/unload/offload.
+
+@app.route('/api/tools/lifecycle', methods=['GET'])
+@_json_endpoint
+def tools_lifecycle():
+    """Model lifecycle dashboard: loaded models, priorities, VRAM pressure, hive hints."""
+    from integrations.service_tools.model_lifecycle import get_model_lifecycle_manager
+    mgr = get_model_lifecycle_manager()
+    return jsonify(mgr.get_status())
+
+
+@app.route('/api/tools/lifecycle/<model_name>/priority', methods=['POST'])
+@_json_endpoint
+def tools_lifecycle_priority(model_name):
+    """Manually set model priority (admin override)."""
+    from integrations.service_tools.model_lifecycle import get_model_lifecycle_manager
+    data = request.get_json() or {}
+    priority = data.get('priority', 'warm')
+    mgr = get_model_lifecycle_manager()
+    return jsonify(mgr.set_priority(model_name, priority))
+
+
+@app.route('/api/tools/lifecycle/<model_name>/offload', methods=['POST'])
+@_json_endpoint
+def tools_lifecycle_offload(model_name):
+    """Manually trigger GPU→CPU offload for a model."""
+    from integrations.service_tools.model_lifecycle import get_model_lifecycle_manager
+    mgr = get_model_lifecycle_manager()
+    return jsonify(mgr.manual_offload(model_name))
+
+
+@app.route('/api/system/pressure', methods=['GET'])
+@_json_endpoint
+def system_pressure():
+    """Real-time system pressure dashboard: VRAM, RAM, CPU, disk, throttle factor."""
+    from integrations.service_tools.model_lifecycle import get_model_lifecycle_manager
+    mgr = get_model_lifecycle_manager()
+    return jsonify(mgr.get_system_pressure())
+
+
+@app.route('/api/revenue/dashboard', methods=['GET'])
+@_json_endpoint
+def revenue_dashboard():
+    """Revenue pipeline dashboard: streams, trading P&L, compute borrowing."""
+    from integrations.agent_engine.revenue_aggregator import get_revenue_aggregator
+    from integrations.agent_engine.compute_borrowing import ComputeBorrowingService
+    from integrations.social.models import get_db
+    db = get_db()
+    try:
+        rev = get_revenue_aggregator()
+        dashboard = rev.get_dashboard(db)
+        dashboard['compute_borrowing'] = ComputeBorrowingService.get_status(db)
+        return jsonify(dashboard)
+    finally:
+        db.close()
+
+
+# ─── Coding Agent Aggregator API ──────────────────────────────────────
+# Endpoints for the coding tool orchestrator (KiloCode, Claude Code, OpenCode).
+# Tools execute as external CLI subprocesses — never re-dispatch to /chat.
+
+@app.route('/coding/tools', methods=['GET'])
+@_json_endpoint
+def coding_tools():
+    """List installed coding tools, capabilities, and benchmarks."""
+    from integrations.coding_agent.orchestrator import get_coding_orchestrator
+    return jsonify(get_coding_orchestrator().list_tools())
+
+
+@app.route('/coding/execute', methods=['POST'])
+@_json_endpoint
+def coding_execute():
+    """Execute a coding task via the best available tool.
+
+    JSON body: {task, task_type?, preferred_tool?, model?, working_dir?}
+    If 'encrypted' key present, decrypts E2E envelope first (hive offload).
+    """
+    data = request.get_json(force=True)
+
+    # Handle encrypted envelope from hive peer
+    encrypted = data.get('encrypted')
+    if encrypted:
+        try:
+            from security.channel_encryption import (
+                decrypt_json_from_peer, encrypt_json_for_peer,
+                get_x25519_public_hex,
+            )
+            data = decrypt_json_from_peer(encrypted)
+            if not data:
+                return jsonify({'error': 'Decryption failed'}), 400
+        except Exception as e:
+            return jsonify({'error': f'Envelope decryption error: {e}'}), 400
+
+    task = data.get('task', '')
+    if not task:
+        return jsonify({'error': 'task is required'}), 400
+
+    from integrations.coding_agent.orchestrator import get_coding_orchestrator
+    result = get_coding_orchestrator().execute(
+        task=task,
+        task_type=data.get('task_type', 'feature'),
+        preferred_tool=data.get('preferred_tool', ''),
+        user_id=data.get('user_id', ''),
+        model=data.get('model', ''),
+        working_dir=data.get('working_dir', ''),
+    )
+
+    # If request came from hive peer, encrypt the response back
+    if encrypted:
+        try:
+            from security.channel_encryption import encrypt_json_for_peer
+            peer_pub = data.get('_reply_x25519', '')
+            if peer_pub:
+                return jsonify({'encrypted': encrypt_json_for_peer(result, peer_pub)})
+        except Exception:
+            pass
+
+    return jsonify(result)
+
+
+@app.route('/coding/benchmarks', methods=['GET'])
+@_json_endpoint
+def coding_benchmarks():
+    """Get coding tool benchmark dashboard data."""
+    from integrations.coding_agent.orchestrator import get_coding_orchestrator
+    return jsonify(get_coding_orchestrator().get_benchmarks())
+
+
+@app.route('/coding/install', methods=['POST'])
+@_json_endpoint
+def coding_install():
+    """Install a coding tool via npm. JSON body: {tool_name}"""
+    data = request.get_json(force=True)
+    tool_name = data.get('tool_name', '')
+    if not tool_name:
+        return jsonify({'error': 'tool_name is required'}), 400
+    from integrations.coding_agent.installer import install
+    result = install(tool_name)
+    code = 200 if result.get('success') else 500
+    return jsonify(result), code
+
+
+@app.route('/api/voice/transcribe', methods=['POST'])
+def voice_transcribe():
+    """Transcribe audio to text using Whisper STT.
+
+    Accepts multipart/form-data with 'audio' file or JSON with 'audio_path'.
+    """
+    try:
+        from integrations.service_tools.whisper_tool import whisper_transcribe
+        import tempfile
+        import json as _json
+
+        if request.content_type and 'multipart' in request.content_type:
+            audio_file = request.files.get('audio')
+            if not audio_file:
+                return jsonify({'error': 'No audio file provided'}), 400
+            # Save to temp file
+            suffix = os.path.splitext(audio_file.filename)[1] or '.wav'
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                audio_file.save(tmp)
+                tmp_path = tmp.name
+            try:
+                result = whisper_transcribe(tmp_path)
+                return jsonify(_json.loads(result))
+            finally:
+                os.unlink(tmp_path)
+        else:
+            data = request.get_json() or {}
+            audio_path = data.get('audio_path', '')
+            if not audio_path:
+                return jsonify({'error': 'audio_path is required'}), 400
+            language = data.get('language')
+            result = whisper_transcribe(audio_path, language)
+            return jsonify(_json.loads(result))
+
+    except ImportError as e:
+        return jsonify({'error': f'Whisper not available: {e}'}), 503
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/voice/speak', methods=['POST'])
+def voice_speak():
+    """Synthesize text to speech via smart TTS router.
+
+    Accepts JSON with:
+      - text (required)
+      - language (optional, auto-detected)
+      - voice (optional, voice ref for cloning)
+      - source (optional, context hint: chat_response/greeting/read_aloud/etc.)
+      - engine (optional, bypass router with direct engine selection)
+      - output_path (optional, auto-generated if omitted)
+    """
+    try:
+        from integrations.channels.media.tts_router import get_tts_router
+
+        data = request.get_json() or {}
+        text = data.get('text', '')
+        if not text:
+            return jsonify({'error': 'text is required'}), 400
+
+        router = get_tts_router()
+        result = router.synthesize(
+            text=text,
+            language=data.get('language'),
+            voice=data.get('voice'),
+            output_path=data.get('output_path'),
+            source=data.get('source'),
+            engine_override=data.get('engine'),
+        )
+        resp = result.to_dict()
+        # Add audio_url for frontends to fetch the WAV
+        if result.path and not result.error:
+            resp['audio_url'] = f"/api/voice/audio/{os.path.basename(result.path)}"
+        code = 200 if not result.error else 500
+        return jsonify(resp), code
+
+    except ImportError as e:
+        return jsonify({'error': f'TTS not available: {e}'}), 503
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/voice/voices', methods=['GET'])
+def voice_list_voices():
+    """List available TTS voices from all installed engines."""
+    try:
+        from integrations.channels.media.tts_router import get_tts_router
+        voices = get_tts_router().get_all_voices()
+        return jsonify({'voices': voices, 'count': len(voices)})
+    except ImportError as e:
+        return jsonify({'error': f'TTS not available: {e}'}), 503
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/voice/clone', methods=['POST'])
+def voice_clone():
+    """Clone a voice from an audio sample (5+ seconds recommended).
+
+    Accepts engine param to route to specific cloning backend.
+    Default: luxtts (CPU) or pocket_tts.
+    """
+    try:
+        data = request.get_json() or {}
+        audio_path = data.get('audio_path', '')
+        name = data.get('name', '')
+        if not audio_path or not name:
+            return jsonify({'error': 'audio_path and name required'}), 400
+
+        import json as _json
+        engine = data.get('engine', 'luxtts')
+        if engine == 'pocket_tts':
+            from integrations.service_tools.pocket_tts_tool import pocket_tts_clone_voice
+            result = pocket_tts_clone_voice(audio_path, name)
+        else:
+            from integrations.service_tools.luxtts_tool import luxtts_clone_voice
+            result = luxtts_clone_voice(audio_path, name)
+
+        parsed = _json.loads(result)
+        code = 200 if 'error' not in parsed else 500
+        return jsonify(parsed), code
+
+    except ImportError as e:
+        return jsonify({'error': f'TTS not available: {e}'}), 503
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/voice/engines', methods=['GET'])
+def voice_engines():
+    """Report status of all TTS engines (installed, can_run, device, etc.)."""
+    try:
+        from integrations.channels.media.tts_router import get_tts_router
+        engines = get_tts_router().get_engine_status()
+        return jsonify({'engines': engines})
+    except ImportError as e:
+        return jsonify({'error': f'TTS not available: {e}'}), 503
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/voice/audio/<filename>', methods=['GET'])
+def voice_audio(filename):
+    """Serve a generated TTS audio file. Path-traversal safe."""
+    import os as _os
+    safe_name = _os.path.basename(filename)
+    if safe_name != filename or '..' in filename:
+        return jsonify({'error': 'invalid filename'}), 400
+
+    # Search in known TTS output directories
+    search_dirs = [
+        _os.path.expanduser('~/.hevolve/models/luxtts/output'),
+        _os.path.expanduser('~/.hevolve/models/pocket_tts/output'),
+        _os.path.expanduser('~/.hevolve/models/chatterbox/output'),
+        _os.path.expanduser('~/.hevolve/models/cosyvoice/output'),
+        _os.path.expanduser('~/.hevolve/models/indic_parler/output'),
+        _os.path.expanduser('~/.hevolve/models/f5_tts/output'),
+        _os.environ.get('TTS_TEMP_DIR', '/tmp/tts'),
+    ]
+    for d in search_dirs:
+        fpath = _os.path.join(d, safe_name)
+        if _os.path.isfile(fpath):
+            from flask import send_file
+            return send_file(fpath, mimetype='audio/wav')
+    return jsonify({'error': 'file not found'}), 404
+
+
+# ---------------------------------------------------------------------------
+# Video Generation API — orchestrates GPU tasks via hive mesh
+# ---------------------------------------------------------------------------
+
+@app.route('/video-gen/', methods=['POST'])
+def video_gen():
+    """Video generation endpoint — drop-in replacement for MakeItTalk.
+
+    Accepts the same request format as MakeItTalk's /video-gen/ endpoint.
+    Dispatches GPU subtasks (TTS, face crop, lip-sync) to local GPU or
+    hive mesh peers. Returns 202 with queue position + ETA.
+
+    Chatbot pipeline can point here instead of MakeItTalk.
+    """
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        data = {}
+
+    if not data:
+        return jsonify({'error': 'No JSON body'}), 400
+
+    # Map user_id if present (chatbot sends 'uid' as request_id)
+    if 'uid' not in data:
+        data['uid'] = data.get('request_id', '')
+
+    try:
+        from integrations.agent_engine.video_orchestrator import get_video_orchestrator
+        orch = get_video_orchestrator()
+        result = orch.generate(data)
+
+        if 'error' in result and 'status' not in result:
+            return jsonify(result), 400
+
+        # Return 202 Accepted (async processing) — same as MakeItTalk
+        # Wrap in 'response' key for chatbot_pipeline compatibility
+        return jsonify({'response': result}), 202
+
+    except Exception as e:
+        logger.error("Video generation error: %s", e, exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/video-gen/status/<job_id>', methods=['GET'])
+def video_gen_status(job_id):
+    """Check status of a video generation job."""
+    try:
+        from integrations.agent_engine.video_orchestrator import get_video_orchestrator
+        orch = get_video_orchestrator()
+        status = orch.get_job_status(job_id)
+        if status:
+            return jsonify(status)
+        return jsonify({'error': 'Job not found'}), 404
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# HART Skills API — ingest, list, and manage agent skills
+# ---------------------------------------------------------------------------
+
+@app.route('/api/skills/list', methods=['GET'])
+def skills_list():
+    """List all registered HART skills."""
+    try:
+        from integrations.skills import skill_registry
+        return jsonify({
+            'success': True,
+            'skills': skill_registry.list_skills(),
+            'count': skill_registry.count,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/skills/ingest', methods=['POST'])
+def skills_ingest():
+    """Ingest a skill from Markdown content (with optional YAML frontmatter)."""
+    try:
+        from integrations.skills import skill_registry
+        data = request.get_json()
+        name = data.get('name', '')
+        content = data.get('content', '')
+        description = data.get('description', '')
+        tags = data.get('tags', [])
+
+        if not content:
+            return jsonify({'error': 'content is required'}), 400
+
+        skill_registry.ingest_markdown(name, content, description, tags)
+        skill_registry.save_config()
+        return jsonify({'success': True, 'message': f'Skill "{name}" ingested'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/skills/discover/local', methods=['POST'])
+def skills_discover_local():
+    """Discover skills from local filesystem paths."""
+    try:
+        from integrations.skills import skill_registry
+        data = request.get_json() or {}
+        paths = data.get('paths')  # None = default paths
+        count = skill_registry.discover_local(paths)
+        skill_registry.save_config()
+        return jsonify({'success': True, 'discovered': count})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/skills/discover/github', methods=['POST'])
+def skills_discover_github():
+    """Discover skills from a GitHub repository."""
+    try:
+        from integrations.skills import skill_registry
+        data = request.get_json()
+        repo_url = data.get('repo_url', '')
+        branch = data.get('branch', 'main')
+        skills_path = data.get('skills_path', '.claude/skills')
+
+        if not repo_url:
+            return jsonify({'error': 'repo_url is required'}), 400
+
+        count = skill_registry.discover_github(repo_url, branch, skills_path)
+        skill_registry.save_config()
+        return jsonify({'success': True, 'discovered': count})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/skills/<skill_name>', methods=['GET'])
+def skills_get(skill_name):
+    """Get a specific skill's full details."""
+    try:
+        from integrations.skills import skill_registry
+        skill = skill_registry.get_skill(skill_name)
+        if not skill:
+            return jsonify({'error': f'Skill "{skill_name}" not found'}), 404
+        return jsonify({'success': True, 'skill': skill.to_dict()})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/skills/<skill_name>', methods=['DELETE'])
+def skills_delete(skill_name):
+    """Remove a skill from the registry."""
+    try:
+        from integrations.skills import skill_registry
+        if skill_registry.unregister_skill(skill_name):
+            skill_registry.save_config()
+            return jsonify({'success': True, 'message': f'Skill "{skill_name}" removed'})
+        return jsonify({'error': f'Skill "{skill_name}" not found'}), 404
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ─── Settings API — Compute Configuration ───────────────────────────
+
+
+@app.route('/api/settings/compute', methods=['GET'])
+@_json_endpoint
+def settings_compute_get():
+    """Return merged compute policy (env > DB > defaults).
+
+    Access: any authenticated node operator.
+    """
+    import os as _os
+    node_id = _os.environ.get('HEVOLVE_NODE_ID', 'local')
+    from integrations.agent_engine.compute_config import get_compute_policy
+    policy = get_compute_policy(node_id)
+
+    # Add provider identity from PeerNode (single source of truth)
+    provider_info = {}
+    try:
+        from integrations.social.models import db_session, PeerNode
+        with db_session() as db:
+            peer = db.query(PeerNode).filter_by(node_id=node_id).first()
+            if peer:
+                provider_info = {
+                    'electricity_rate_kwh': peer.electricity_rate_kwh,
+                    'cause_alignment': peer.cause_alignment,
+                }
+    except Exception:
+        pass
+
+    return jsonify({**policy, **provider_info, 'node_id': node_id})
+
+
+@app.route('/api/settings/compute', methods=['PUT'])
+@_json_endpoint
+def settings_compute_put():
+    """Update compute configuration. Single endpoint, writes to correct table per field.
+
+    Policy fields → NodeComputeConfig (local-only).
+    Provider identity → PeerNode (gossipped to network).
+    Access: node operator or admin. Tier-aware: central nodes cannot set allow_metered_for_hive.
+    """
+    import os as _os
+    data = request.get_json() or {}
+    node_id = _os.environ.get('HEVOLVE_NODE_ID', 'local')
+    node_tier = _os.environ.get('HEVOLVE_NODE_TIER', 'flat')
+
+    # Tier guard: central nodes cannot opt into metered for hive
+    if node_tier == 'central' and data.get('allow_metered_for_hive'):
+        return jsonify({'error': 'Central nodes cannot enable metered APIs for hive'}), 403
+
+    # Policy fields → NodeComputeConfig
+    policy_fields = {
+        'compute_policy', 'hive_compute_policy', 'max_hive_gpu_pct',
+        'allow_metered_for_hive', 'metered_daily_limit_usd',
+        'offered_gpu_hours_per_day', 'accept_thought_experiments',
+        'accept_frontier_training', 'auto_settle', 'min_settlement_spark',
+    }
+    # Provider identity → PeerNode
+    peer_fields = {'electricity_rate_kwh', 'cause_alignment'}
+
+    policy_updates = {k: v for k, v in data.items() if k in policy_fields}
+    peer_updates = {k: v for k, v in data.items() if k in peer_fields}
+
+    from integrations.social.models import db_session, NodeComputeConfig, PeerNode
+
+    with db_session() as db:
+        if policy_updates:
+            config = db.query(NodeComputeConfig).filter_by(node_id=node_id).first()
+            if not config:
+                config = NodeComputeConfig(node_id=node_id)
+                db.add(config)
+            for key, val in policy_updates.items():
+                setattr(config, key, val)
+
+        if peer_updates:
+            peer = db.query(PeerNode).filter_by(node_id=node_id).first()
+            if peer:
+                for key, val in peer_updates.items():
+                    setattr(peer, key, val)
+
+        db.commit()
+
+    # Invalidate cache
+    from integrations.agent_engine.compute_config import invalidate_cache
+    invalidate_cache(node_id)
+
+    return jsonify({'updated': True, 'node_id': node_id,
+                    'policy_fields': list(policy_updates.keys()),
+                    'peer_fields': list(peer_updates.keys())})
+
+
+@app.route('/api/settings/compute/provider', methods=['GET'])
+@_json_endpoint
+def settings_compute_provider():
+    """Provider dashboard: contribution score, GPU hours, inferences, energy,
+    total Spark earned, pending settlements, cause alignment.
+
+    Access: node operator. Deployment-mode aware (flat/regional/central).
+    """
+    import os as _os
+    node_id = _os.environ.get('HEVOLVE_NODE_ID', 'local')
+    node_tier = _os.environ.get('HEVOLVE_NODE_TIER', 'flat')
+
+    from integrations.social.models import db_session, PeerNode, MeteredAPIUsage
+    from integrations.social.hosting_reward_service import HostingRewardService
+    from sqlalchemy import func as sa_func
+
+    with db_session() as db:
+        peer = db.query(PeerNode).filter_by(node_id=node_id).first()
+        if not peer:
+            return jsonify({'error': 'Node not registered', 'node_id': node_id}), 404
+
+        # Contribution score
+        score_result = HostingRewardService.compute_contribution_score(db, node_id)
+
+        # Pending settlements
+        pending_count = db.query(sa_func.count(MeteredAPIUsage.id)).filter(
+            MeteredAPIUsage.node_id == node_id,
+            MeteredAPIUsage.settlement_status == 'pending',
+        ).scalar() or 0
+
+        pending_usd = db.query(
+            sa_func.coalesce(sa_func.sum(MeteredAPIUsage.actual_usd_cost), 0)
+        ).filter(
+            MeteredAPIUsage.node_id == node_id,
+            MeteredAPIUsage.settlement_status == 'pending',
+        ).scalar() or 0.0
+
+        # Reward summary
+        reward_summary = HostingRewardService.get_reward_summary(db, node_id)
+
+        return jsonify({
+            'node_id': node_id,
+            'node_tier': node_tier,
+            'contribution': score_result,
+            'compute_stats': {
+                'gpu_hours_served': peer.gpu_hours_served or 0,
+                'total_inferences': peer.total_inferences or 0,
+                'energy_kwh_contributed': peer.energy_kwh_contributed or 0,
+                'metered_api_costs_absorbed': peer.metered_api_costs_absorbed or 0,
+            },
+            'provider_identity': {
+                'cause_alignment': peer.cause_alignment,
+                'electricity_rate_kwh': peer.electricity_rate_kwh,
+            },
+            'pending_settlements': {
+                'count': pending_count,
+                'total_usd': round(float(pending_usd), 4),
+            },
+            'reward_summary': reward_summary,
+        })
+
+
+@app.route('/api/settings/compute/provider/join', methods=['POST'])
+@_json_endpoint
+def settings_compute_provider_join():
+    """Simple provider onboarding. Creates NodeComputeConfig + sets PeerNode identity.
+
+    Body: {cause_alignment?, electricity_rate_kwh?, offered_gpu_hours_per_day?, compute_policy?}
+    Access: any node. Creates config with sensible defaults.
+    """
+    import os as _os
+    data = request.get_json() or {}
+    node_id = _os.environ.get('HEVOLVE_NODE_ID', 'local')
+
+    from integrations.social.models import db_session, NodeComputeConfig, PeerNode
+
+    with db_session() as db:
+        # Create or update NodeComputeConfig
+        config = db.query(NodeComputeConfig).filter_by(node_id=node_id).first()
+        if not config:
+            config = NodeComputeConfig(node_id=node_id)
+            db.add(config)
+
+        for field in ('compute_policy', 'offered_gpu_hours_per_day',
+                      'accept_thought_experiments', 'accept_frontier_training'):
+            if field in data:
+                setattr(config, field, data[field])
+
+        # Set provider identity on PeerNode
+        peer = db.query(PeerNode).filter_by(node_id=node_id).first()
+        if peer:
+            if 'cause_alignment' in data:
+                peer.cause_alignment = data['cause_alignment']
+            elif not peer.cause_alignment:
+                peer.cause_alignment = 'democratize_compute'
+            if 'electricity_rate_kwh' in data:
+                peer.electricity_rate_kwh = data['electricity_rate_kwh']
+
+        db.commit()
+
+    # Invalidate cache
+    from integrations.agent_engine.compute_config import invalidate_cache
+    invalidate_cache(node_id)
+
+    # Return the merged config
+    from integrations.agent_engine.compute_config import get_compute_policy
+    policy = get_compute_policy(node_id)
+
+    return jsonify({
+        'joined': True,
+        'node_id': node_id,
+        'config': policy,
+        'message': 'Welcome to the HART OS compute network. '
+                   'Your contribution helps democratize access to AI.',
+    })
+
+
+# ─── Remote Desktop API ──────────────────────────────────────────
+# RustDesk + Sunshine/Moonlight bridge, session management,
+# engine selection, device identity.
+
+
+@app.route('/api/remote-desktop/status', methods=['GET'])
+@_json_endpoint
+def remote_desktop_api_status():
+    """Device ID, engine status, active sessions."""
+    from integrations.remote_desktop.engine_selector import get_all_status
+    from integrations.remote_desktop.device_id import get_device_id, format_device_id
+    from integrations.remote_desktop.session_manager import get_session_manager
+
+    device_id = get_device_id()
+    sm = get_session_manager()
+    sessions = sm.get_active_sessions()
+
+    status = get_all_status()
+    status['device_id'] = device_id
+    status['formatted_id'] = format_device_id(device_id)
+    status['active_sessions'] = [
+        {'session_id': s.session_id, 'host_device_id': s.host_device_id,
+         'mode': s.mode.value, 'state': s.state.value,
+         'viewers': s.viewer_device_ids}
+        for s in sessions
+    ]
+    return jsonify(status)
+
+
+@app.route('/api/remote-desktop/host', methods=['POST'])
+@_json_endpoint
+def remote_desktop_api_host():
+    """Start hosting. Body: {mode?, engine?}. Returns device_id + password."""
+    data = request.get_json() or {}
+    from integrations.remote_desktop.session_manager import (
+        get_session_manager, SessionMode,
+    )
+    from integrations.remote_desktop.device_id import get_device_id, format_device_id
+
+    device_id = get_device_id()
+    sm = get_session_manager()
+    mode_str = data.get('mode', 'full_control')
+    mode = SessionMode(mode_str) if mode_str in [m.value for m in SessionMode] else SessionMode.FULL_CONTROL
+    password = sm.generate_otp(device_id)
+    engine_pref = data.get('engine', 'auto')
+
+    result = {
+        'device_id': device_id,
+        'formatted_id': format_device_id(device_id),
+        'password': password,
+        'mode': mode.value,
+        'engine': engine_pref,
+    }
+
+    # Start RustDesk
+    if engine_pref in ('auto', 'rustdesk'):
+        try:
+            from integrations.remote_desktop.rustdesk_bridge import get_rustdesk_bridge
+            bridge = get_rustdesk_bridge()
+            if bridge.available:
+                bridge.set_password(password)
+                bridge.start_service()
+                rd_id = bridge.get_id()
+                if rd_id:
+                    result['rustdesk_id'] = rd_id
+                result['engine'] = 'rustdesk'
+        except Exception:
+            pass
+
+    # Start Sunshine
+    if engine_pref in ('auto', 'sunshine'):
+        try:
+            from integrations.remote_desktop.sunshine_bridge import get_sunshine_bridge
+            bridge = get_sunshine_bridge()
+            if bridge.available:
+                bridge.start_service()
+                result['sunshine_running'] = bridge.is_running()
+                if engine_pref == 'sunshine':
+                    result['engine'] = 'sunshine'
+        except Exception:
+            pass
+
+    return jsonify(result)
+
+
+@app.route('/api/remote-desktop/connect', methods=['POST'])
+@_json_endpoint
+def remote_desktop_api_connect():
+    """Connect to remote device. Body: {device_id, password, mode?, engine?}."""
+    data = request.get_json() or {}
+    device_id = data.get('device_id')
+    password = data.get('password')
+    if not device_id or not password:
+        return jsonify({'error': 'device_id and password required'}), 400
+
+    engine = data.get('engine', 'auto')
+    file_transfer = data.get('mode') == 'file_transfer'
+
+    # Try RustDesk
+    if engine in ('auto', 'rustdesk'):
+        try:
+            from integrations.remote_desktop.rustdesk_bridge import get_rustdesk_bridge
+            bridge = get_rustdesk_bridge()
+            if bridge.available:
+                ok, msg = bridge.connect(device_id, password=password,
+                                         file_transfer=file_transfer)
+                if ok:
+                    return jsonify({'success': True, 'engine': 'rustdesk',
+                                    'device_id': device_id, 'message': msg})
+        except Exception:
+            pass
+
+    # Try Moonlight
+    if engine in ('auto', 'moonlight'):
+        try:
+            from integrations.remote_desktop.sunshine_bridge import get_moonlight_bridge
+            bridge = get_moonlight_bridge()
+            if bridge.available:
+                ok, msg = bridge.stream(device_id)
+                if ok:
+                    return jsonify({'success': True, 'engine': 'moonlight',
+                                    'device_id': device_id, 'message': msg})
+        except Exception:
+            pass
+
+    return jsonify({'success': False, 'error': 'No engine available'}), 503
+
+
+@app.route('/api/remote-desktop/sessions', methods=['GET'])
+@_json_endpoint
+def remote_desktop_api_sessions():
+    """List active remote desktop sessions."""
+    from integrations.remote_desktop.session_manager import get_session_manager
+    sm = get_session_manager()
+    sessions = sm.get_active_sessions()
+    return jsonify({
+        'sessions': [
+            {'session_id': s.session_id, 'host_device_id': s.host_device_id,
+             'mode': s.mode.value, 'state': s.state.value,
+             'viewers': s.viewer_device_ids}
+            for s in sessions
+        ]
+    })
+
+
+@app.route('/api/remote-desktop/disconnect/<session_id>', methods=['POST'])
+@_json_endpoint
+def remote_desktop_api_disconnect(session_id):
+    """End a specific session."""
+    from integrations.remote_desktop.session_manager import get_session_manager
+    sm = get_session_manager()
+    sm.disconnect_session(session_id)
+    return jsonify({'disconnected': session_id})
+
+
+@app.route('/api/remote-desktop/engines', methods=['GET'])
+@_json_endpoint
+def remote_desktop_api_engines():
+    """List available engines with install commands."""
+    from integrations.remote_desktop.engine_selector import (
+        get_available_engines, get_all_status, Engine,
+    )
+    status = get_all_status()
+    available = get_available_engines()
+    return jsonify({
+        'available': [e.value for e in available],
+        'engines': status['engines'],
+        'install_recommendations': status.get('install_recommendations', []),
+    })
+
+
+@app.route('/api/remote-desktop/select-engine', methods=['POST'])
+@_json_endpoint
+def remote_desktop_api_select_engine():
+    """Auto-select best engine. Body: {use_case?, role?, prefer?}."""
+    data = request.get_json() or {}
+    from integrations.remote_desktop.engine_selector import (
+        select_engine, UseCase, Engine,
+    )
+
+    use_case_str = data.get('use_case', 'general')
+    role = data.get('role', 'viewer')
+    prefer_str = data.get('prefer')
+
+    uc = UseCase(use_case_str) if use_case_str in [u.value for u in UseCase] else UseCase.GENERAL
+    prefer = Engine(prefer_str) if prefer_str and prefer_str in [e.value for e in Engine] else None
+
+    engine = select_engine(uc, role=role, prefer=prefer)
+    return jsonify({'engine': engine.value, 'use_case': uc.value, 'role': role})
+
+
+def _init_skills():
+    """Initialize skill registry — load persisted skills + discover local."""
+    try:
+        from integrations.skills import skill_registry
+        skill_registry.load_config()
+        skill_registry.discover_local()
+        if skill_registry.count > 0:
+            app.logger.info(f"HART skills ready: {skill_registry.count} skills loaded")
+    except Exception as e:
+        logger.debug(f"Skill init skipped: {e}")
+
+
+def _init_runtime_tools():
+    """Initialize runtime tools in a background thread.
+
+    Restores previously-running tools from state file.
+    Called from main() on startup.
+    """
+    try:
+        from integrations.service_tools.runtime_manager import runtime_tool_manager
+        runtime_tool_manager.load_state()
+    except Exception as e:
+        logger.warning(f"Runtime tool init failed: {e}")
+
+
+def _validate_startup():
+    """Validate critical configuration at startup with helpful messages."""
+    import sys
+    warnings = []
+
+    # Python version check
+    v = sys.version_info
+    if v.major != 3 or v.minor < 10 or v.minor > 11:
+        warnings.append(
+            f"Python {v.major}.{v.minor}.{v.micro} detected. "
+            f"HART OS requires Python 3.10 or 3.11 (pydantic 1.10.9 compat).")
+
+    # Config file check
+    config_path = os.path.join(os.path.dirname(__file__), 'config.json')
+    langchain_config_path = os.path.join(os.path.dirname(__file__), 'langchain_config.json')
+    if not os.path.exists(config_path) and not os.path.exists(langchain_config_path):
+        warnings.append(
+            "No config.json or langchain_config.json found. "
+            "Create config.json with API keys (OPENAI, GROQ, etc.) for full functionality.")
+
+    # .env check
+    env_path = os.path.join(os.path.dirname(__file__), '.env')
+    if not os.path.exists(env_path):
+        warnings.append(
+            "No .env file found. Create .env with OPENAI_API_KEY, GROQ_API_KEY, "
+            "LANGCHAIN_API_KEY for LLM access.")
+
+    # Database directory check — prefer DB path or user Documents for bundled mode
+    _db_p = os.environ.get('HEVOLVE_DB_PATH', '')
+    if _db_p and _db_p != ':memory:' and os.path.isabs(_db_p):
+        db_dir = os.path.join(os.path.dirname(_db_p), 'agent_data')
+    elif os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
+        try:
+            from core.platform_paths import get_agent_data_dir as _get_ad_dir
+            db_dir = _get_ad_dir()
+        except ImportError:
+            db_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'agent_data')
+    else:
+        db_dir = os.path.join(os.path.dirname(__file__), 'agent_data')
+    if not os.path.isdir(db_dir):
+        try:
+            os.makedirs(db_dir, exist_ok=True)
+        except OSError as e:
+            warnings.append(f"Cannot create agent_data directory: {e}")
+
+    # ── Central instance hardening ──
+    _central_logger = logging.getLogger('hevolve_social')
+    node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
+    if node_tier == 'central':
+        # Fix 3: TLS check
+        if not os.environ.get('TLS_CERT_PATH'):
+            _central_logger.warning("CENTRAL HARDENING: No TLS_CERT_PATH set — production should use HTTPS")
+
+        # Fix 5: Secret presence validation
+        api_key = os.environ.get('OPENAI_API_KEY', '')
+        if not api_key or api_key.startswith('sk-xxx') or api_key == 'your-key':
+            _central_logger.critical("CENTRAL HARDENING: OPENAI_API_KEY missing or placeholder")
+
+        # Fix 6: DB encryption check
+        db_url = os.environ.get('HEVOLVE_DB_URL') or os.environ.get('DATABASE_URL', '')
+        if not db_url or 'sqlite' in db_url.lower():
+            _central_logger.warning("CENTRAL HARDENING: SQLite detected — production should use PostgreSQL or sqlcipher")
+
+        # Fix 7: Block dev mode
+        if os.environ.get('HEVOLVE_DEV_MODE', '').lower() == 'true':
+            os.environ['HEVOLVE_DEV_MODE'] = 'false'
+            _central_logger.critical("CENTRAL HARDENING: Dev mode FORCED OFF on central instance")
+
+    if warnings:
+        logger = logging.getLogger('hevolve_social')
+        logger.warning("=" * 60)
+        logger.warning("STARTUP VALIDATION WARNINGS")
+        for w in warnings:
+            logger.warning(f"  - {w}")
+        logger.warning("=" * 60)
+
+    return warnings
+
+
 def main():
     """
     Main entry point for hevolve-server CLI command.
     Starts the Flask server using waitress.
     """
-    serve(app, host='0.0.0.0', port=6778, threads=50)
+    # Boot integrity verification (deferred from import time)
+    hevolve_verify_boot()
+
+    _validate_startup()
+
+    # Bootstrap EventBus (required before local subscribers)
+    try:
+        from core.platform.bootstrap import bootstrap_platform
+        bootstrap_platform()
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Platform bootstrap failed: {e}")
+
+    # Bootstrap local Crossbar subscribers (replaces cloud chatbot_pipeline)
+    try:
+        from core.peer_link.local_subscribers import bootstrap_local_subscribers
+        bootstrap_local_subscribers()
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Local subscribers bootstrap failed: {e}")
+
+    # Start runtime tools restoration in background
+    import threading
+    tools_thread = threading.Thread(target=_init_runtime_tools, daemon=True)
+    tools_thread.start()
+
+    # Initialize HART skill registry (load persisted + discover local)
+    skills_thread = threading.Thread(target=_init_skills, daemon=True)
+    skills_thread.start()
+
+    from core.port_registry import get_port
+    serve(app, host='0.0.0.0', port=get_port('backend'), threads=50)
 
 
 if __name__ == '__main__':

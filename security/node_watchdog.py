@@ -1,5 +1,5 @@
 """
-Node Watchdog — Frozen Thread Auto-Detection and Restart
+Node Watchdog - Frozen Thread Auto-Detection and Restart
 
 Monitors all background daemon threads via heartbeat protocol.
 Detects frozen/crashed threads and auto-restarts them.
@@ -20,6 +20,10 @@ from typing import Callable, Dict, List, Optional
 logger = logging.getLogger('hevolve_security')
 
 MAX_CONSECUTIVE_FAILURES = 5
+# Grace period after registration/restart before monitoring begins.
+# Prevents false FROZEN alerts during startup when daemons are still
+# initialising and haven't entered their heartbeat loop yet.
+STARTUP_GRACE_SECONDS = 60
 
 
 @dataclass
@@ -34,6 +38,8 @@ class ThreadInfo:
     restart_count: int = 0
     last_restart_at: Optional[float] = None
     consecutive_failures: int = 0
+    # Track recent restart times to detect rapid-restart loops
+    recent_restart_times: list = field(default_factory=list)
 
 
 class NodeWatchdog:
@@ -63,14 +69,20 @@ class NodeWatchdog:
 
     def register(self, name: str, expected_interval: float,
                  restart_fn: Callable, stop_fn: Callable = None) -> None:
-        """Register a daemon thread to be monitored."""
+        """Register a daemon thread to be monitored.
+
+        A grace period delays monitoring so startup initialisation doesn't
+        trigger false FROZEN alerts before the daemon enters its loop.
+        """
         with self._lock:
             self._threads[name] = ThreadInfo(
                 name=name,
                 expected_interval=expected_interval,
                 restart_fn=restart_fn,
                 stop_fn=stop_fn,
-                last_heartbeat=time.time(),
+                # Pretend the last heartbeat is in the future so the grace
+                # period must elapse before we consider the thread frozen.
+                last_heartbeat=time.time() + STARTUP_GRACE_SECONDS,
             )
         logger.info(f"Watchdog: registered thread '{name}' "
                     f"(interval={expected_interval}s)")
@@ -151,10 +163,24 @@ class NodeWatchdog:
                 if info.status == 'dead':
                     continue
                 age = now - info.last_heartbeat
+                # Negative age means we're still in the grace period
+                if age < 0:
+                    continue
                 threshold = info.expected_interval * self._frozen_multiplier
                 if age > threshold and info.status in ('healthy', 'frozen'):
+                    # Detect rapid-restart loop: 3+ restarts in last 5 minutes
+                    # means the thread keeps dying — stop restarting it
+                    recent = [t for t in info.recent_restart_times
+                              if now - t < 300]
+                    if len(recent) >= 3:
+                        info.status = 'dead'
+                        logger.warning(
+                            f"Watchdog: thread '{name}' stuck in restart loop "
+                            f"({len(recent)} restarts in 5min) — marking dormant. "
+                            f"Will not restart again until app is restarted.")
+                        continue
                     logger.critical(
-                        f"Watchdog: thread '{name}' FROZEN — no heartbeat "
+                        f"Watchdog: thread '{name}' FROZEN - no heartbeat "
                         f"for {age:.0f}s (threshold: {threshold:.0f}s)")
                     info.status = 'frozen'
                     to_restart.append(name)
@@ -193,10 +219,17 @@ class NodeWatchdog:
                 info = self._threads.get(name)
                 if info:
                     info.status = 'healthy'
-                    info.last_heartbeat = time.time()
+                    # Give the restarted thread a grace period before
+                    # monitoring resumes (same as initial registration)
+                    info.last_heartbeat = time.time() + STARTUP_GRACE_SECONDS
                     info.restart_count += 1
                     info.last_restart_at = time.time()
                     info.consecutive_failures = 0
+                    info.recent_restart_times.append(time.time())
+                    # Prune entries older than 5 minutes
+                    cutoff = time.time() - 300
+                    info.recent_restart_times = [
+                        t for t in info.recent_restart_times if t > cutoff]
                     self._restart_log.append({
                         'name': name,
                         'time': datetime.now(timezone.utc).isoformat(),

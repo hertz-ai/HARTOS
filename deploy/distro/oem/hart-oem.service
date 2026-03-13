@@ -1,0 +1,16 @@
+[Unit]
+Description=HART OS OEM First User Setup
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=!/var/lib/hart/.first-boot-done
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/hart/deploy/distro/oem/hart-oem-config.sh --user-setup
+RemainAfterExit=no
+TimeoutStartSec=300
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

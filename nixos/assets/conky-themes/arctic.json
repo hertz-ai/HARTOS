@@ -1,0 +1,54 @@
+{
+  "id": "arctic",
+  "name": "Arctic",
+  "description": "Ice-white glass with blue accent",
+  "category": "light",
+  "colors": {
+    "background": "e8edf2",
+    "glass_bg": "rgba(232, 237, 242, 0.7)",
+    "glass_border": "rgba(2, 136, 209, 0.15)",
+    "accent": "0288d1",
+    "active": "00897b",
+    "text": "263238",
+    "heading": "0277bd",
+    "error": "c62828",
+    "caution": "f57f17",
+    "muted": "90a4ae",
+    "surface": "f5f7fa",
+    "surface_hover": "eceff1"
+  },
+  "conky": {
+    "background": "d8e0e8",
+    "background_opacity": 200,
+    "heading": "0288d1",
+    "active": "00897b",
+    "error": "c62828",
+    "caution": "f57f17",
+    "muted": "90a4ae",
+    "default_text": "455a64"
+  },
+  "font": {
+    "family": "Inter",
+    "size": 13,
+    "heading_size": 18,
+    "weight": 400,
+    "heading_weight": 600
+  },
+  "shell": {
+    "blur_radius": 24,
+    "saturation": 150,
+    "border_radius": 16,
+    "panel_opacity": 0.7,
+    "topbar_height": 40,
+    "icon_size": 20,
+    "panel_titlebar_height": 32,
+    "start_menu_width": 720,
+    "start_menu_columns": 4,
+    "animation_speed_ms": 200
+  },
+  "wallpaper": {
+    "type": "gradient",
+    "value": "linear-gradient(135deg, #e8edf2 0%, #cfd8dc 50%, #b0bec5 100%)"
+  },
+  "gtk_prefer_dark": false
+}

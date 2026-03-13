@@ -11,7 +11,7 @@ from typing import Optional, List, Tuple
 
 logger = logging.getLogger('hevolve_social')
 
-from sqlalchemy import desc, asc, func
+from sqlalchemy import desc, asc, func, event
 from sqlalchemy.orm import Session, joinedload
 
 from .models import (
@@ -33,13 +33,13 @@ class UserService:
     def register(db: Session, username: str, password: str, email: str = None,
                  display_name: str = None, user_type: str = 'human') -> User:
         if db.query(User).filter(User.username == username).first():
-            raise ValueError("Registration failed — username or email may already be in use")
+            raise ValueError("Registration failed - username or email may already be in use")
         if email:
             # Basic email format validation
             if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
                 raise ValueError("Invalid email address format")
             if db.query(User).filter(User.email == email).first():
-                raise ValueError("Registration failed — username or email may already be in use")
+                raise ValueError("Registration failed - username or email may already be in use")
 
         user = User(
             id=_uuid(), username=username, display_name=display_name or username,
@@ -91,9 +91,22 @@ class UserService:
     _login_lock = threading.Lock()
     _MAX_ATTEMPTS = 5
     _LOCKOUT_MINUTES = 15
+    _LOGIN_ATTEMPT_TTL = timedelta(minutes=30)
+
+    @staticmethod
+    def _cleanup_login_attempts():
+        """Remove expired login attempt entries (called under _login_lock)."""
+        now = datetime.utcnow()
+        expired = [k for k, (_, first_at) in UserService._login_attempts.items()
+                   if now - first_at > UserService._LOGIN_ATTEMPT_TTL]
+        for k in expired:
+            del UserService._login_attempts[k]
 
     @staticmethod
     def login(db: Session, username: str, password: str) -> Tuple[User, str]:
+        # Periodically purge stale login attempt records
+        with UserService._login_lock:
+            UserService._cleanup_login_attempts()
         # Check lockout
         with UserService._login_lock:
             entry = UserService._login_attempts.get(username)
@@ -126,7 +139,6 @@ class UserService:
         with UserService._login_lock:
             UserService._login_attempts.pop(username, None)
         token = generate_jwt(user.id, user.username, getattr(user, 'role', None) or 'flat')
-        user.api_token = token
         user.last_active_at = datetime.utcnow()
         db.flush()
         return user, token
@@ -244,7 +256,10 @@ class PostService:
                content_type: str = 'text', community_name: str = None,
                code_language: str = None, media_urls: list = None,
                link_url: str = None, source_channel: str = None,
-               source_message_id: str = None) -> Post:
+               source_message_id: str = None,
+               intent_category: str = None, hypothesis: str = None,
+               expected_outcome: str = None, is_thought_experiment: bool = False,
+               dynamic_layout: dict = None) -> Post:
         community_id = None
         if community_name:
             community = db.query(Community).filter(Community.name == community_name).first()
@@ -258,6 +273,10 @@ class PostService:
             code_language=code_language, media_urls=media_urls or [],
             link_url=link_url, source_channel=source_channel,
             source_message_id=source_message_id,
+            intent_category=intent_category, hypothesis=hypothesis,
+            expected_outcome=expected_outcome,
+            is_thought_experiment=is_thought_experiment or False,
+            dynamic_layout=dynamic_layout,
         )
         db.add(post)
         author.post_count += 1
@@ -294,7 +313,9 @@ class PostService:
     def list_posts(db: Session, sort: str = 'new', community_name: str = None,
                    author_id: str = None, limit: int = 25, offset: int = 0
                    ) -> Tuple[List[Post], int]:
-        q = db.query(Post).options(joinedload(Post.author)).filter(Post.is_deleted == False)
+        q = db.query(Post).options(joinedload(Post.author)).filter(
+            Post.is_deleted == False, Post.is_hidden == False
+        )
         if community_name:
             community = db.query(Community).filter(Community.name == community_name).first()
             if community:
@@ -317,11 +338,24 @@ class PostService:
         return posts, total
 
     @staticmethod
-    def update(db: Session, post: Post, title: str = None, content: str = None) -> Post:
+    def update(db: Session, post: Post, title: str = None, content: str = None,
+               intent_category: str = None, hypothesis: str = None,
+               expected_outcome: str = None, is_thought_experiment: bool = None,
+               dynamic_layout: dict = None) -> Post:
         if title is not None:
             post.title = title
         if content is not None:
             post.content = content
+        if intent_category is not None:
+            post.intent_category = intent_category
+        if hypothesis is not None:
+            post.hypothesis = hypothesis
+        if expected_outcome is not None:
+            post.expected_outcome = expected_outcome
+        if is_thought_experiment is not None:
+            post.is_thought_experiment = is_thought_experiment
+        if dynamic_layout is not None:
+            post.dynamic_layout = dynamic_layout
         post.updated_at = datetime.utcnow()
         db.flush()
         return post
@@ -414,7 +448,8 @@ class CommentService:
     def get_by_post(db: Session, post_id: str, sort: str = 'new'
                     ) -> List[Comment]:
         q = db.query(Comment).options(joinedload(Comment.author)).filter(
-            Comment.post_id == post_id, Comment.is_deleted == False
+            Comment.post_id == post_id, Comment.is_deleted == False,
+            Comment.is_hidden == False
         )
         if sort == 'top':
             q = q.order_by(desc(Comment.score), desc(Comment.created_at))
@@ -431,18 +466,32 @@ class CommentService:
 
 # ─── Vote Service ───
 
+# Note: with_for_update() is a no-op on SQLite (no SELECT ... FOR UPDATE support).
+# Use Python-level lock as SQLite workaround for concurrent vote operations.
+# The with_for_update() calls are kept for PostgreSQL compatibility.
+_vote_lock = threading.Lock()
+
+
 class VoteService:
 
     @staticmethod
     def vote(db: Session, user: User, target_type: str, target_id: str,
              value: int) -> dict:
         """Cast or change a vote. value: +1 (upvote) or -1 (downvote)."""
+        with _vote_lock:
+            return VoteService._vote_inner(db, user, target_type, target_id, value)
+
+    @staticmethod
+    def _vote_inner(db: Session, user: User, target_type: str, target_id: str,
+                    value: int) -> dict:
+        """Inner vote logic, must be called under _vote_lock."""
         existing = db.query(Vote).filter(
             Vote.user_id == user.id, Vote.target_type == target_type,
             Vote.target_id == target_id
         ).first()
 
-        # Get target object (with_for_update prevents concurrent vote race on PostgreSQL)
+        # Get target object (with_for_update prevents concurrent vote race on PostgreSQL;
+        # no-op on SQLite — Python _vote_lock provides safety there)
         if target_type == 'post':
             target = db.query(Post).filter(Post.id == target_id).with_for_update().first()
         else:
@@ -702,6 +751,17 @@ class NotificationService:
         )
         db.add(notif)
         db.flush()
+        # Push to SSE + WAMP in real-time AFTER commit (fire-and-forget)
+        # Defer notification to after_commit to ensure data consistency
+        notif_dict = notif.to_dict()
+        _uid = user_id
+        def _push_after_commit(session):
+            try:
+                from .realtime import on_notification
+                on_notification(_uid, notif_dict)
+            except Exception:
+                pass
+        event.listen(db, 'after_commit', _push_after_commit, once=True)
         return notif
 
     @staticmethod

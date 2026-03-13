@@ -1,0 +1,23 @@
+#include <tunables/global>
+
+/opt/hart/venv/bin/python {
+  #include <abstractions/base>
+  #include <abstractions/python>
+  #include <abstractions/nameservice>
+
+  /opt/hart/** r,
+  /opt/hart/venv/bin/python ix,
+
+  /var/lib/hart/node_public.key r,
+  /var/lib/hart/node_private.key r,
+  /var/log/hart/** w,
+  /etc/hart/** r,
+
+  network inet dgram,
+  network inet stream,
+  network inet6 dgram,
+
+  deny /etc/shadow r,
+  deny /root/** rw,
+  deny /var/lib/hart/hevolve_database.db rw,
+}
