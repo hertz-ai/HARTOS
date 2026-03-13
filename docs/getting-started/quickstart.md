@@ -47,8 +47,14 @@ At minimum, one of these API keys is required. See [Configuration](configuration
 
 ## 3. Start the Server
 
+**Bare-metal:**
 ```bash
 python langchain_gpt_api.py
+```
+
+**Docker:**
+```bash
+scripts/start_docker.sh
 ```
 
 The server starts on **http://localhost:6777** using Waitress as the production WSGI server.
