@@ -115,14 +115,28 @@ jobs:
           </html>
           INDEXEOF
 
-      # ===== Deploy =====
+      # ===== Deploy (public repos only — Pages requires public or GitHub Pro) =====
+      - name: Check repo visibility
+        id: visibility
+        run: |
+          VISIBILITY=$(gh api repos/${{ github.repository }} --jq '.visibility' 2>/dev/null || echo 'private')
+          echo "is_public=$( [ "$VISIBILITY" = "public" ] && echo true || echo false )" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       - name: Setup Pages
+        if: steps.visibility.outputs.is_public == 'true'
         uses: actions/configure-pages@v4
 
       - name: Upload artifact
+        if: steps.visibility.outputs.is_public == 'true'
         uses: actions/upload-pages-artifact@v3
         with:
           path: _site
+
+      - name: Skip deploy (private repo)
+        if: steps.visibility.outputs.is_public != 'true'
+        run: echo "Skipping Pages deploy — repo is private. Enable when repo goes public."
 
   deploy:
     environment:
@@ -130,7 +144,21 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     needs: build
+    if: needs.build.result == 'success'
     steps:
+      - name: Check repo visibility
+        id: visibility
+        run: |
+          VISIBILITY=$(gh api repos/${{ github.repository }} --jq '.visibility' 2>/dev/null || echo 'private')
+          echo "is_public=$( [ "$VISIBILITY" = "public" ] && echo true || echo false )" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       - name: Deploy to GitHub Pages
+        if: steps.visibility.outputs.is_public == 'true'
         id: deployment
         uses: actions/deploy-pages@v4
+
+      - name: Skip deploy (private repo)
+        if: steps.visibility.outputs.is_public != 'true'
+        run: echo "Pages deploy skipped — repo is private."
