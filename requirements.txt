@@ -36,7 +36,7 @@ fsspec==2023.6.0
 future==1.0.0
 grpcio>=1.57.0,<2
 grpcio-status>=1.57.0,<2
-google-auth>=2.20.0
+google-auth>=2.47.0
 google-api-core>=2.11.1
 google-api-python-client==2.190.0
 google-auth-httplib2>=0.1.0
@@ -159,6 +159,12 @@ yarl==1.9.2
 
 zipp==3.15.0
 zstandard>=0.23.0
+
+# Transitive deps pinned to prevent pip resolution-too-deep in Docker
+jiter>=0.4.0,<1
+httpx-sse>=0.4.0,<1
+grpc-google-iam-v1>=0.12.4,<1
+uuid-utils>=0.9.0,<1
 #streamlit~=1.19.0
 
 # Agent Lightning - Custom implementation in integrations/agent_lightning/
