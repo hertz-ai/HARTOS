@@ -1087,7 +1087,7 @@ class TestInstallTimeDependencies:
             "Without it, HevolveAI won't be installed and the learning "
             "pipeline will silently fail on every node."
         )
-        assert 'git+ssh://git@github.com/hertz-ai/hevolveai' in content, (
+        assert 'git+ssh://git@github.com/hertz-ai/HevolveAI' in content, (
             "embodied-ai must point to the HevolveAI git repo (SSH URL)"
         )
 

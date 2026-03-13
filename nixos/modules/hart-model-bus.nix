@@ -145,7 +145,7 @@ in
     {
       systemd.services.hart-model-bus = {
         description = "HART OS Model Bus — Unified AI Access";
-        documentation = [ "https://github.com/hevolve-ai/hart" ];
+        documentation = [ "https://github.com/hertz-ai/HARTOS" ];
         after = [ "hart-backend.service" "hart.target" ];
         wants = [ "hart-backend.service" ];
         wantedBy = [ "hart.target" ];

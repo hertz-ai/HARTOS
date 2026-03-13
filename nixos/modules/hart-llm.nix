@@ -53,7 +53,7 @@ in
 
     systemd.services.hart-llm = {
       description = "HART OS Local LLM (llama.cpp)";
-      documentation = [ "https://github.com/hevolve-ai/hart" ];
+      documentation = [ "https://github.com/hertz-ai/HARTOS" ];
       after = [ "network.target" "hart-first-boot.service" ];
       partOf = [ "hart.target" ];
       wantedBy = [ "hart.target" ];

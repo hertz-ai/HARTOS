@@ -44,7 +44,7 @@ ORIGIN_IDENTITY = {
     'organization': 'Hevolve.ai',
     'master_public_key_hex': '906ae0b15ad4ae6bd11696a772d669a29a971c3c7de71156c621f0fe8826d1bf',
     'license': 'BSL-1.1',
-    'origin_url': 'https://github.com/hevolve/hartos',
+    'origin_url': 'https://github.com/hertz-ai/HARTOS',
     'guardian_principle': 'Every agent is a guardian angel for the human it serves',
     'revenue_split': '90/9/1',
     'kill_switch': 'master_key_only',
