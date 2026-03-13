@@ -5,23 +5,34 @@ ENV DOCKER_CONTAINER=true
 
 WORKDIR /app
 
-COPY . .
-
-RUN touch /app/langchain.log
-RUN pip install --upgrade pip
-# Install system dependencies for OpenCV
+# ── Layer 1: System deps (rarely changes, cached long-term) ──
 RUN apt-get update && apt-get install -y \
     libgl1 \
     libglib2.0-0 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
-RUN pip install bs4
-RUN pip install -r requirements.txt
-RUN pip install ./agent-ledger-opensource
-RUN pip install autogen-agentchat==0.2.37 apscheduler autobahn==23.1.2
-RUN pip install autobahn[serialization] autobahn[twisted]
-RUN pip install autogen-agentchat[long-context]~=0.2
-RUN pip install json-repair
+
+# ── Layer 2: Python deps (only rebuilds when requirements.txt changes) ──
+COPY requirements.txt .
+COPY agent-ledger-opensource/ ./agent-ledger-opensource/
+
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir ./agent-ledger-opensource && \
+    pip install --no-cache-dir \
+        autogen-agentchat==0.2.37 \
+        apscheduler \
+        autobahn==23.1.2 \
+        "autobahn[serialization]" \
+        "autobahn[twisted]" \
+        "autogen-agentchat[long-context]~=0.2" \
+        json-repair \
+        bs4
+
+# ── Layer 3: Application code (rebuilds on any code change — fast, no pip) ──
+COPY . .
+
+RUN touch /app/langchain.log
 
 # HevolveAI source protection: compile .py → .pyc, strip source, clean metadata
 RUN python scripts/compile_hevolveai.py --strip-source \
