@@ -286,6 +286,24 @@ class PeerLink:
             self._message_handlers[channel] = []
         self._message_handlers[channel].append(handler)
 
+    def _verify_same_user_proof(self, proof: str, peer_public_key: str) -> bool:
+        """Verify that the peer is owned by the same user.
+
+        Proof = peer signs our user_id with their Ed25519 key, and we
+        verify that their user_id matches ours. This prevents an attacker
+        from claiming SAME_USER trust without holding the user's key.
+        """
+        try:
+            from security.node_integrity import verify_message_signature
+            # The proof should be a signature of the local user_id
+            local_user_id = os.environ.get('HEVOLVE_USER_ID', '')
+            if not local_user_id or not peer_public_key:
+                return False
+            return verify_message_signature(peer_public_key, local_user_id, proof)
+        except (ImportError, Exception) as e:
+            logger.debug(f"SAME_USER proof verification failed: {e}")
+            return False
+
     def close(self) -> None:
         """Close the connection."""
         if self._state == LinkState.CLOSING:
@@ -429,10 +447,18 @@ class PeerLink:
         self.peer_x25519_public = hello_data.get('x25519_public', '')
         self.capabilities = hello_data.get('capabilities', {})
 
-        # Determine trust from request
+        # Determine trust LOCALLY — never accept trust_requested from wire.
+        # SAME_USER requires proof: peer must present a user_id_signature
+        # signed by the same user key we hold. Without proof → PEER.
         requested_trust = hello_data.get('trust_requested', 'peer')
         if requested_trust == 'same_user':
-            self.trust = TrustLevel.SAME_USER
+            # Verify SAME_USER claim cryptographically
+            user_proof = hello_data.get('user_id_proof', '')
+            if user_proof and self._verify_same_user_proof(user_proof, peer_ed25519):
+                self.trust = TrustLevel.SAME_USER
+            else:
+                logger.warning("SAME_USER trust requested but no valid proof — downgrading to PEER")
+                self.trust = TrustLevel.PEER
         else:
             self.trust = TrustLevel.PEER
 

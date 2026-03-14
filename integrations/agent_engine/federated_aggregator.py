@@ -349,8 +349,12 @@ class FederatedAggregator:
                 if not verify_json_signature(delta.get('public_key', ''),
                                              delta, sig):
                     return False, 'invalid signature'
-            except Exception:
-                pass  # Verification module unavailable — accept
+            except ImportError:
+                logger.warning('Ed25519 verification module unavailable — skipping signature check')
+            except Exception as e:
+                logger.warning(f'Ed25519 signature verification error: {e}')
+                if os.environ.get('HEVOLVE_ENFORCEMENT_MODE') == 'hard':
+                    return False, f'signature verification failed: {e}'
 
         # HMAC-SHA256 delta signing verification
         if delta.get('hmac_signature'):
