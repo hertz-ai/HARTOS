@@ -704,6 +704,49 @@ try:
 except Exception as e:
     app.logger.warning(f"Instruction queue init skipped: {e}")
 
+# ── Credential Vault API — frontend submits missing credentials ──────
+try:
+    from desktop.ai_key_vault import AIKeyVault as _VaultCls, is_local_request
+
+    @app.route('/api/credentials/submit', methods=['POST'])
+    @_json_endpoint
+    def _api_credentials_submit():
+        """Accept a credential from the frontend — LOCALHOST ONLY.
+
+        Secrets never leave the user's device. This endpoint rejects
+        any request that doesn't originate from the local machine.
+        """
+        if not is_local_request(request.remote_addr):
+            return jsonify({'error': 'Credential endpoints are localhost only. '
+                            'Secrets never leave your device.'}), 403
+        data = request.get_json(silent=True) or {}
+        key_name = (data.get('key_name') or '').strip()
+        value = (data.get('value') or '').strip()
+        if not key_name or not value:
+            return jsonify({'error': 'key_name and value are required'}), 400
+        vault = _VaultCls.get_instance()
+        resolved = vault.store_credential(
+            key_name=key_name,
+            value=value,
+            channel_type=data.get('channel_type', ''),
+        )
+        return jsonify({'success': True, 'key_name': resolved})
+
+    @app.route('/api/credentials/pending', methods=['GET'])
+    @_json_endpoint
+    def _api_credentials_pending():
+        """List pending credential requests — LOCALHOST ONLY."""
+        if not is_local_request(request.remote_addr):
+            return jsonify({'error': 'Credential endpoints are localhost only.'}), 403
+        vault = _VaultCls.get_instance()
+        return jsonify({'pending': vault.get_pending_requests()})
+
+    app.logger.info("Credential vault API routes registered (2 endpoints)")
+except ImportError:
+    pass
+except Exception as e:
+    app.logger.warning(f"Credential vault API init skipped: {e}")
+
 # ============================================================================
 # Google A2A Protocol Initialization
 # ============================================================================
@@ -1807,6 +1850,20 @@ def _handle_request_resource(input_text: str) -> str:
 
     # Key not found — return a structured request for the frontend
     # The backend will detect __SECRET_REQUEST__ and inject it into the response
+    # Track as pending so /api/credentials/pending can list it
+    try:
+        from desktop.ai_key_vault import AIKeyVault
+        AIKeyVault.get_instance().add_pending_request(
+            key_name=key_name,
+            resource_type=resource_type,
+            channel_type=req.get('channel_type', ''),
+            label=req.get('label', key_name),
+            description=req.get('description', ''),
+            used_by=req.get('used_by', 'Agent tool'),
+        )
+    except Exception:
+        pass
+
     secret_request = _json.dumps({
         '__SECRET_REQUEST__': True,
         'type': resource_type,
