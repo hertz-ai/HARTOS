@@ -113,9 +113,35 @@ jobs:
             echo "- **File**: \`$(basename $FILE)\`" >> $GITHUB_STEP_SUMMARY
             echo "- **Size**: $SIZE" >> $GITHUB_STEP_SUMMARY
             echo "- **SHA256**: \`$SHA\`" >> $GITHUB_STEP_SUMMARY
+
+            # Create .torrent with web seed pointing to GitHub Release
+            echo ""
+            echo "Creating .torrent..."
+            sudo apt-get install -y -qq mktorrent 2>/dev/null || true
+            if command -v mktorrent &>/dev/null; then
+              BASENAME=$(basename "$FILE")
+              VERSION="${GITHUB_REF_NAME#v}"
+              WEBSEED="https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/${BASENAME}"
+              mktorrent -l 22 \
+                -c "HART OS — Hevolve Hive Agentic Runtime" \
+                -w "$WEBSEED" \
+                -o "${FILE}.torrent" \
+                "$FILE"
+              echo "- **Torrent**: \`${BASENAME}.torrent\`" >> $GITHUB_STEP_SUMMARY
+              echo "- **Web Seed**: \`$WEBSEED\`" >> $GITHUB_STEP_SUMMARY
+            fi
           else
             echo "No output file found (may be a derivation-only build)"
           fi
+
+      - name: Upload artifacts
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hart-os-${{ matrix.target }}
+          path: |
+            /tmp/build-output.txt
+          retention-days: 7
 
   # ─── Summary ───────────────────────────────────────────────
   summary:
