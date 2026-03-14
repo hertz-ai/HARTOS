@@ -1123,8 +1123,8 @@ def register_shell_os_routes(app):
     def upgrades_status():
         """Get current upgrade pipeline status."""
         try:
-            from integrations.agent_engine.upgrade_orchestrator import UpgradeOrchestrator
-            orch = UpgradeOrchestrator()
+            from integrations.agent_engine.upgrade_orchestrator import get_upgrade_orchestrator
+            orch = get_upgrade_orchestrator()
             return jsonify(orch.get_status())
         except (ImportError, Exception) as e:
             return jsonify({'stage': 'idle', 'error': str(e)})
@@ -1139,8 +1139,8 @@ def register_shell_os_routes(app):
         if not version:
             return jsonify({'error': 'version required'}), 400
         try:
-            from integrations.agent_engine.upgrade_orchestrator import UpgradeOrchestrator
-            orch = UpgradeOrchestrator()
+            from integrations.agent_engine.upgrade_orchestrator import get_upgrade_orchestrator
+            orch = get_upgrade_orchestrator()
             result = orch.start_upgrade(version, sha)
             return jsonify(result)
         except Exception as e:
@@ -1150,8 +1150,8 @@ def register_shell_os_routes(app):
     def upgrades_advance():
         """Advance upgrade pipeline to next stage."""
         try:
-            from integrations.agent_engine.upgrade_orchestrator import UpgradeOrchestrator
-            orch = UpgradeOrchestrator()
+            from integrations.agent_engine.upgrade_orchestrator import get_upgrade_orchestrator
+            orch = get_upgrade_orchestrator()
             result = orch.advance_pipeline()
             return jsonify(result)
         except Exception as e:
@@ -1164,8 +1164,8 @@ def register_shell_os_routes(app):
         data = request.get_json(force=True) if request.data else {}
         reason = data.get('reason', 'manual_rollback')
         try:
-            from integrations.agent_engine.upgrade_orchestrator import UpgradeOrchestrator
-            orch = UpgradeOrchestrator()
+            from integrations.agent_engine.upgrade_orchestrator import get_upgrade_orchestrator
+            orch = get_upgrade_orchestrator()
             result = orch.rollback(reason)
             return jsonify(result)
         except Exception as e:
