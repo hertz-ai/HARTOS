@@ -257,6 +257,30 @@ def onboard(
     _log("")
 
     try:
+        # Query existing state first
+        _log("Querying existing Kong configuration...")
+        try:
+            existing_svc = session.get(f"{kong_url}/services/{SERVICE_NAME}")
+            if existing_svc.status_code == 200:
+                svc = existing_svc.json()
+                _log(f"  Found service '{SERVICE_NAME}' → {svc.get('host', '?')}:{svc.get('port', '?')}")
+            else:
+                _log(f"  No existing service '{SERVICE_NAME}' — will create")
+
+            existing_routes = session.get(f"{kong_url}/services/{SERVICE_NAME}/routes")
+            if existing_routes.status_code == 200:
+                routes = existing_routes.json().get("data", [])
+                for r in routes:
+                    _log(f"  Found route '{r.get('name', '?')}' paths={r.get('paths', [])}")
+            existing_plugins = session.get(f"{kong_url}/services/{SERVICE_NAME}/plugins")
+            if existing_plugins.status_code == 200:
+                plugins = existing_plugins.json().get("data", [])
+                for p in plugins:
+                    _log(f"  Found plugin '{p.get('name', '?')}' enabled={p.get('enabled', '?')}")
+        except requests.ConnectionError:
+            _log("  Kong not reachable — will attempt creation")
+        _log("")
+
         create_service(session, kong_url, upstream_url)
         create_route(session, kong_url)
         enable_plugins(session, kong_url)
