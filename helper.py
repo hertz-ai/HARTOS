@@ -1815,6 +1815,19 @@ llm_config = {
 }
 
 
+def get_llm_config(fallback_config_list=None):
+    """Get LLM config — checks thread-local override before falling back to given config_list.
+    This enables per-dispatch model routing for speculative execution.
+
+    Args:
+        fallback_config_list: config_list to use when no thread-local override is set.
+                              Defaults to this module's config_list.
+    """
+    from threadlocal import thread_local_data
+    override = thread_local_data.get_model_config_override()
+    return {"cache_seed": None, "config_list": override or (fallback_config_list if fallback_config_list is not None else config_list), "max_tokens": 1500}
+
+
 def create_visual_agent(user_id,prompt_id):
     visual_agent = autogen.AssistantAgent(
         name='visual_agent',
