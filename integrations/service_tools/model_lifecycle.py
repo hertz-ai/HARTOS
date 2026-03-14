@@ -1099,14 +1099,15 @@ class ModelLifecycleManager:
 
     def _guess_model_type(self, tool_name: str) -> str:
         """Map tool name to model_type for catalog sync."""
+        from integrations.service_tools.model_catalog import ModelType
         if tool_name == 'llm' or 'llama' in tool_name:
-            return 'llm'
+            return ModelType.LLM
         if 'tts' in tool_name or 'voice' in tool_name:
-            return 'tts'
+            return ModelType.TTS
         if 'whisper' in tool_name or 'stt' in tool_name:
-            return 'stt'
+            return ModelType.STT
         if 'minicpm' in tool_name or 'vlm' in tool_name or 'vision' in tool_name:
-            return 'vlm'
+            return ModelType.VLM
         return tool_name
 
     # ── Hive intelligence ─────────────────────────────────────

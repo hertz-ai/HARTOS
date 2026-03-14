@@ -25,6 +25,7 @@ import threading
 import time
 
 from core.port_registry import get_port
+from integrations.service_tools.model_catalog import ModelType
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger('hevolve.model_bus')
@@ -166,7 +167,7 @@ class ModelBusService:
             )
             if resp.status_code == 200:
                 backends['llm'] = {
-                    'type': 'llm',
+                    'type': ModelType.LLM,
                     'url': f'http://localhost:{self.llm_port}',
                     'status': 'ready',
                     'local': True,
@@ -232,7 +233,7 @@ class ModelBusService:
 
     def infer(
         self,
-        model_type: str = 'llm',
+        model_type: str = ModelType.LLM,
         prompt: str = '',
         options: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -258,17 +259,17 @@ class ModelBusService:
                 return {'error': 'Request blocked by constitutional guardrails'}
 
             # Route based on model type
-            if model_type == 'llm':
+            if model_type == ModelType.LLM:
                 result = self._route_llm(prompt, options)
             elif model_type == 'vision':
                 result = self._route_vision(prompt, options)
-            elif model_type == 'tts':
+            elif model_type == ModelType.TTS:
                 result = self._route_tts(prompt, options)
-            elif model_type == 'stt':
+            elif model_type == ModelType.STT:
                 result = self._route_stt(prompt, options)
-            elif model_type == 'video_gen':
+            elif model_type == ModelType.VIDEO_GEN:
                 result = self._route_video_gen(prompt, options)
-            elif model_type == 'image_gen':
+            elif model_type == ModelType.IMAGE_GEN:
                 result = self._route_image_gen(prompt, options)
             else:
                 result = {'error': f'Unknown model type: {model_type}'}
@@ -369,7 +370,7 @@ class ModelBusService:
                     # Compute mesh offload
                     resp = pooled_post(
                         f'{url}/mesh/infer',
-                        json={'model_type': 'llm', 'prompt': prompt},
+                        json={'model_type': ModelType.LLM, 'prompt': prompt},
                         timeout=options.get('timeout', 120),
                     )
                     if resp.status_code == 200:
@@ -671,7 +672,7 @@ class ModelBusService:
                 from integrations.agent_engine.compute_mesh_service import get_compute_mesh
                 mesh = get_compute_mesh()
                 result = mesh.offload_to_best_peer(
-                    model_type='video_gen',
+                    model_type=ModelType.VIDEO_GEN,
                     prompt=prompt,
                     options={**options, 'timeout': timeout},
                 )
@@ -758,7 +759,7 @@ class ModelBusService:
         if 'llm' in self._backends:
             models.append({
                 'id': 'local-llm',
-                'type': 'llm',
+                'type': ModelType.LLM,
                 'backend': 'llama.cpp',
                 'local': True,
                 'status': 'ready',
@@ -790,7 +791,7 @@ class ModelBusService:
             _lux_device = 'cuda' if _t.cuda.is_available() else 'cpu'
             models.append({
                 'id': 'luxtts-48k',
-                'type': 'tts',
+                'type': ModelType.TTS,
                 'backend': 'luxtts',
                 'local': True,
                 'status': 'ready',
@@ -805,7 +806,7 @@ class ModelBusService:
         if makeittalk_url:
             models.append({
                 'id': 'makeittalk-cloud',
-                'type': 'tts',
+                'type': ModelType.TTS,
                 'backend': 'makeittalk',
                 'local': False,
                 'status': 'ready',
@@ -816,7 +817,7 @@ class ModelBusService:
         # TTS — Pocket TTS (always local, CPU — fallback when cloud unavailable)
         models.append({
             'id': 'pocket-tts-100m',
-            'type': 'tts',
+            'type': ModelType.TTS,
             'backend': 'pocket_tts',
             'local': True,
             'status': 'ready',
@@ -826,7 +827,7 @@ class ModelBusService:
         # STT — Whisper (always local, sherpa-onnx or openai-whisper)
         models.append({
             'id': 'whisper-stt-local',
-            'type': 'stt',
+            'type': ModelType.STT,
             'backend': 'whisper',
             'local': True,
             'status': 'ready',
@@ -858,7 +859,7 @@ class ModelBusService:
         def chat():
             data = request.get_json(force=True)
             result = self.infer(
-                model_type='llm',
+                model_type=ModelType.LLM,
                 prompt=data.get('prompt', ''),
                 options=data,
             )
@@ -880,7 +881,7 @@ class ModelBusService:
         @app.route('/v1/tts', methods=['POST'])
         def tts():
             data = request.get_json(force=True)
-            result = self.infer('tts', data.get('text', ''), data)
+            result = self.infer(ModelType.TTS, data.get('text', ''), data)
             return jsonify(result)
 
         @app.route('/v1/stt', methods=['POST'])
@@ -890,7 +891,7 @@ class ModelBusService:
                 import tempfile
                 with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as f:
                     audio.save(f)
-                    result = self.infer('stt', '', {'audio_path': f.name})
+                    result = self.infer(ModelType.STT, '', {'audio_path': f.name})
             else:
                 result = {'error': 'No audio provided'}
             return jsonify(result)
@@ -906,7 +907,7 @@ class ModelBusService:
         @app.route('/v1/prefetch', methods=['POST'])
         def prefetch():
             data = request.get_json(force=True)
-            model_type = data.get('model_type', 'llm')
+            model_type = data.get('model_type', ModelType.LLM)
             # Prefetch is a hint — trigger backend warmup
             logger.info(f"Prefetch request for {model_type}")
             return jsonify({'status': 'prefetch_acknowledged', 'model_type': model_type})
