@@ -115,27 +115,45 @@ def get_node_tier() -> str:
     """
     tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat').lower()
 
-    # Auto-detect central: if master private key is present and valid,
-    # this node IS central regardless of HEVOLVE_NODE_TIER setting.
-    # The key is the crown — whoever holds it is king.
-    if tier != 'central':
-        priv_hex = os.environ.get('HEVOLVE_MASTER_PRIVATE_KEY', '')
-        if priv_hex and len(priv_hex) >= 64:
-            try:
-                from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-                priv = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(priv_hex))
-                pub_hex = priv.public_key().public_bytes(
-                    encoding=serialization.Encoding.Raw,
-                    format=serialization.PublicFormat.Raw,
-                ).hex()
-                from security.master_key import MASTER_PUBLIC_KEY_HEX
-                if pub_hex == MASTER_PUBLIC_KEY_HEX:
-                    os.environ['HEVOLVE_NODE_TIER'] = 'central'
-                    return 'central'
-            except Exception:
-                pass  # Invalid key — don't auto-promote
+    # Central tier requires cryptographic proof — the master private key.
+    # Setting HEVOLVE_NODE_TIER=central alone is NOT enough.
+    # The key is the crown — whoever holds it is king. No key, no crown.
+    priv_hex = os.environ.get('HEVOLVE_MASTER_PRIVATE_KEY', '')
+    if priv_hex and len(priv_hex) >= 64:
+        try:
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+            priv = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(priv_hex))
+            pub_hex = priv.public_key().public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw,
+            ).hex()
+            from security.master_key import MASTER_PUBLIC_KEY_HEX
+            if pub_hex == MASTER_PUBLIC_KEY_HEX:
+                os.environ['HEVOLVE_NODE_TIER'] = 'central'
+                return 'central'
+        except Exception:
+            pass  # Invalid key — don't promote
 
-    if tier in ('central', 'regional', 'local', 'flat'):
+    # Central claimed without proof — reject and refuse to start
+    if tier == 'central':
+        logger.critical(
+            "HEVOLVE_NODE_TIER=central set without valid HEVOLVE_MASTER_PRIVATE_KEY. "
+            "Central tier requires the master key. Refusing to start as central. "
+            "Falling back to 'flat'. If you are the steward, set the key."
+        )
+        return 'flat'
+
+    # Regional requires a valid certificate from central (checked at boot)
+    if tier == 'regional':
+        cert_path = os.environ.get('HEVOLVE_REGIONAL_CERT', '')
+        if not cert_path or not os.path.isfile(cert_path):
+            logger.warning(
+                "HEVOLVE_NODE_TIER=regional set without HEVOLVE_REGIONAL_CERT. "
+                "Falling back to 'flat'."
+            )
+            return 'flat'
+
+    if tier in ('regional', 'local', 'flat'):
         return tier
     return 'flat'
 
