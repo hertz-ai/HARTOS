@@ -324,11 +324,9 @@ in
     # Extend hart-ota CLI with self-build command
     # (hart-ota self-build delegates to hart-self-build)
 
-    # Include runtime.nix as a NixOS module
-    # This is the key: the flake evaluates this file on every rebuild
-    imports = lib.optional
-      (builtins.pathExists "/etc/hart/runtime.nix")
-      /etc/hart/runtime.nix;
+    # runtime.nix is included at the module top level (flake.nix),
+    # not inside config block. Conditional import here is invalid in
+    # NixOS module system — imports must be at top level of the module.
 
     # Filesystem watcher for auto-rebuild (optional)
     systemd.paths.hart-self-build-watch = lib.mkIf sb.autoRebuild {
