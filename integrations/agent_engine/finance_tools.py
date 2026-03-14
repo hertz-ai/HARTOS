@@ -14,6 +14,10 @@ import logging
 from datetime import datetime, timedelta
 from typing import Annotated
 
+from integrations.agent_engine.revenue_aggregator import (
+    REVENUE_SPLIT_USERS, REVENUE_SPLIT_INFRA, REVENUE_SPLIT_CENTRAL,
+)
+
 logger = logging.getLogger('hevolve_social')
 
 
@@ -56,12 +60,6 @@ def register_finance_tools(helper, assistant, user_id: str):
                 ).filter(APIUsageLog.created_at >= cutoff_7d).scalar() or 0)
 
                 # Revenue split
-                try:
-                    from integrations.agent_engine.revenue_aggregator import (
-                        REVENUE_SPLIT_USERS, REVENUE_SPLIT_INFRA, REVENUE_SPLIT_CENTRAL,
-                    )
-                except ImportError:
-                    REVENUE_SPLIT_USERS, REVENUE_SPLIT_INFRA, REVENUE_SPLIT_CENTRAL = 0.90, 0.09, 0.01
                 compute_provider_share = round(total_revenue * REVENUE_SPLIT_USERS, 4)
                 infra_share = round(total_revenue * REVENUE_SPLIT_INFRA, 4)
                 central_share = round(total_revenue * REVENUE_SPLIT_CENTRAL, 4)
@@ -124,12 +122,6 @@ def register_finance_tools(helper, assistant, user_id: str):
                 streams = query_revenue_streams(db, period_days)
                 period_revenue = streams['total_gross']
 
-                try:
-                    from integrations.agent_engine.revenue_aggregator import (
-                        REVENUE_SPLIT_USERS, REVENUE_SPLIT_INFRA, REVENUE_SPLIT_CENTRAL,
-                    )
-                except ImportError:
-                    REVENUE_SPLIT_USERS, REVENUE_SPLIT_INFRA, REVENUE_SPLIT_CENTRAL = 0.90, 0.09, 0.01
                 compute_share = round(period_revenue * REVENUE_SPLIT_USERS, 4)
                 infra_share = round(period_revenue * REVENUE_SPLIT_INFRA, 4)
                 central_share = round(period_revenue * REVENUE_SPLIT_CENTRAL, 4)
