@@ -434,13 +434,13 @@ class TestActionClassifierShellOps(unittest.TestCase):
                    return_value='safe'):
             self.assertTrue(_classify_destructive('list files'))
 
-    def test_classify_destructive_returns_true_on_import_error(self):
-        """_classify_destructive should return True (fail-open) if classifier unavailable."""
+    def test_classify_destructive_returns_false_on_import_error(self):
+        """_classify_destructive should return False (fail-closed) if classifier unavailable."""
         from integrations.agent_engine.shell_os_apis import _classify_destructive
 
         with patch('security.action_classifier.classify_action',
                    side_effect=ImportError('no module')):
-            self.assertTrue(_classify_destructive('some action'))
+            self.assertFalse(_classify_destructive('some action'))
 
     @patch('integrations.agent_engine.shell_os_apis._shell_auth_check',
            return_value=(True, None))
@@ -804,7 +804,7 @@ class TestClassifyDestructiveFix(unittest.TestCase):
         with patch('security.action_classifier.classify_action',
                    return_value='unknown'):
             result = _classify_destructive('something unclear')
-            self.assertTrue(result)
+            self.assertFalse(result)  # fail-closed: only 'safe' returns True
 
 
 # ═══════════════════════════════════════════════════════════════
