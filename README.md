@@ -31,6 +31,10 @@ If another hivemind wants to connect, it must prove - cryptographically - that i
 
 ## Try It Now
 
+**Don't want to install? Try it live: [hevolve.ai](https://hevolve.ai)**
+
+Or run it yourself:
+
 ```bash
 # 1. Clone and install
 git clone https://github.com/hertz-ai/HARTOS.git && cd HARTOS
