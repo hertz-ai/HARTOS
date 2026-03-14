@@ -215,6 +215,28 @@ Strategies tried in order (stop at first success):
 4. **Disconnected nodes self-restrict** — >24h without central → agent daemon pauses.
 5. **Relay peers can't inspect payload** — Session encryption makes traffic opaque to intermediaries.
 
+## Device Discovery
+
+PeerLink relies on three discovery mechanisms that feed peers into the connection manager.
+
+### UDP Beacon (LAN)
+
+`AutoDiscovery` in `peer_discovery.py` broadcasts a signed UDP beacon every 30 seconds on port 6780. The beacon contains a magic header (`HEVOLVE_DISCO_V1`), the node's Ed25519 public key, guardrail hash, and HTTP URL. Receivers verify the signature before accepting the peer. This is the primary mechanism for same-LAN, zero-config discovery.
+
+The `hart-discovery` NixOS service runs the beacon as a systemd unit with `CAP_NET_BROADCAST` and tight memory limits.
+
+### Gossip Propagation (WAN)
+
+`GossipProtocol` exchanges peer lists with known peers on every gossip round. Bandwidth profiles (full, constrained, minimal) adjust interval and payload size based on the node's capability tier. Embedded devices gossip every 15 minutes with a single peer using msgpack; full nodes gossip every 60 seconds with 3 peers using JSON.
+
+### Pairing (Cross-Network)
+
+When auto-discovery fails (different networks, carrier NAT), the `PairingManager` in `integrations/channels/security.py` generates a 6-character alphanumeric code. The user sends this code to the agent via any channel adapter (WhatsApp, Telegram, Discord, etc.) using the `/pair <code>` command. Codes expire after 15 minutes and are case-insensitive.
+
+For screen-equipped devices, QR code pairing encodes the node's identity (node_id, public key, OTP, WebSocket URL) for scanning with the Hevolve Droid app.
+
+See [Device Discovery & Pairing](../features/device-pairing.md) for the full user-facing guide.
+
 ## File Structure
 
 ```

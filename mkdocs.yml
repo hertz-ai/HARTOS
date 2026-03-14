@@ -60,6 +60,7 @@ nav:
     - Coding Agent (Idle Compute): features/coding-agent.md
     - Trading Agents: features/trading-agents.md
     - Channel Adapters: features/channels.md
+    - Device Discovery & Pairing: features/device-pairing.md
     - Autonomous Upgrade Pipeline: features/upgrade-pipeline.md
     - Benchmark & Baseline Tracking: features/benchmark-tracking.md
   - Provider Guide:
