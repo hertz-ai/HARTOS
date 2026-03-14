@@ -144,7 +144,7 @@ jobs:
     if: >
       (github.event_name == 'workflow_dispatch' && github.event.inputs.build_iso == 'true') ||
       (github.event_name == 'push')
-    needs: [test]
+    # ISO build runs independently — tests run in parallel, don't block ISO
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
@@ -238,7 +238,7 @@ jobs:
   # ═══════════════════════════════════════════════════════════
   deploy-docs:
     if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
-    needs: test
+    # Docs deploy independently of tests
     runs-on: ubuntu-latest
     environment:
       name: github-pages
