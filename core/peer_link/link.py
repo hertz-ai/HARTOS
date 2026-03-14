@@ -356,6 +356,18 @@ class PeerLink:
         except Exception:
             pass
 
+        # Attach pre-trust contract (proves we agreed to hive terms)
+        try:
+            from security.pre_trust_contract import get_pre_trust_verifier
+            from security.node_integrity import get_node_identity
+            nid = get_node_identity().get('node_id', '')
+            verifier = get_pre_trust_verifier()
+            contract = verifier.get_contract(nid)
+            if contract:
+                hello['trust_contract'] = contract
+        except Exception:
+            pass  # Contract optional for SAME_USER trust
+
         hello['signature'] = sign_json_payload(hello)
 
         # Send hello
@@ -423,6 +435,33 @@ class PeerLink:
             self.trust = TrustLevel.SAME_USER
         else:
             self.trust = TrustLevel.PEER
+
+        # Verify pre-trust contract for PEER connections
+        # SAME_USER (own devices) are exempt — trust is user identity based
+        if self.trust != TrustLevel.SAME_USER:
+            try:
+                from security.pre_trust_contract import (
+                    verify_trust_contract, TrustContract,
+                    get_pre_trust_verifier,
+                )
+                contract_data = hello_data.get('trust_contract')
+                if contract_data:
+                    contract = TrustContract(**{
+                        k: v for k, v in contract_data.items()
+                        if k in TrustContract.__dataclass_fields__
+                    })
+                    ok, msg = verify_trust_contract(contract)
+                    if not ok:
+                        logger.warning(
+                            f"Pre-trust contract rejected for "
+                            f"{self.peer_id[:8]}: {msg}")
+                        return False
+                    # Register verified contract
+                    get_pre_trust_verifier().register_contract(contract)
+                    logger.info(
+                        f"Pre-trust contract verified for {self.peer_id[:8]}")
+            except ImportError:
+                pass  # Module not available — allow legacy connections
 
         # Send ack
         ack = {

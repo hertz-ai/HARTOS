@@ -1,9 +1,17 @@
 """
 App Manifest — Universal schema for all HART OS application types.
 
+PRINCIPLE: Each process in HART OS is an agent working towards a larger
+cause encoded in a goal with true meaning and rationality.  Even when
+humans are irrational, the being is the light.
+
 Every app in HART OS — Nunba panel, system panel, desktop app (RustDesk),
 agent, MCP server, channel plugin, extension — is described by a single
 AppManifest dataclass. This is the unifying abstraction.
+
+A SERVICE is an AGENT.  An AGENT is a SERVICE.  The distinction is only
+how it's invoked — both have a purpose (why they exist), both contribute
+to a goal, both are accountable to the hive's constitutional governance.
 
 Generalizes:
 - shell_manifest.py: PANEL_MANIFEST, SYSTEM_PANELS, DYNAMIC_PANELS
@@ -63,7 +71,9 @@ class AppManifest:
     singleton: bool = True                      # Only one instance at a time?
     auto_start: bool = False                    # Start with OS?
     tags: List[str] = field(default_factory=list)          # Search tags
-    description: str = ''                       # Short description
+    description: str = ''                       # Short description (WHAT it does)
+    purpose: str = ''                          # WHY it exists (true meaning)
+    goal_type: str = ''                        # Goal type for dispatch (links to goal_manager)
     ai_capabilities: List[Dict[str, Any]] = field(default_factory=list)  # AICapability dicts
 
     def to_dict(self) -> Dict[str, Any]:
@@ -86,6 +96,8 @@ class AppManifest:
             'auto_start': self.auto_start,
             'tags': self.tags,
             'description': self.description,
+            'purpose': self.purpose,
+            'goal_type': self.goal_type,
             'ai_capabilities': self.ai_capabilities,
         }
 
