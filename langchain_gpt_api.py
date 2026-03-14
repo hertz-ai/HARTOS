@@ -2682,7 +2682,7 @@ class CustomGPT(LLM):
                 app.logger.info(f"text got from gpt {text}")
                 try:
                     text = text.strip('`').replace('json\n', '').strip()
-                except:
+                except Exception:
                     pass
                 intents = json.loads(text)
                 app.logger.info(f"the intents are: {intents}")
@@ -2717,7 +2717,7 @@ class CustomGPT(LLM):
                 text = str(response.json()["choices"][0]["message"]["content"])
                 try:
                     text = text.strip('`').replace('json\n', '').strip()
-                except:
+                except Exception:
                     pass
                 intents = json.loads(text)
 
@@ -3056,7 +3056,7 @@ def parsing_string(string):
         prompt, start_date, end_date = [s.strip() for s in string.split(",")]
         session_id = 'user_'+str(thread_local_data.get_user_id())
         return get_time_based_history(prompt, session_id, start_date, end_date)
-    except:
+    except Exception:
         now = datetime.utcnow()
         formatted_time = now.strftime('%Y-%m-%dT%H:%M:%S.%f') + 'Z'
         session_id = "user_"+str(thread_local_data.get_user_id())
@@ -3690,7 +3690,7 @@ class CustomConvoOutputParser(AgentOutputParser):
                     start_index = text.index('{')
                     try:
                         end_index = text.rindex('}') + 1
-                    except:
+                    except Exception:
                         text += '"}'
                         end_index = text.rindex('}') + 1
                     json_string = text[start_index:end_index]
@@ -3706,7 +3706,7 @@ class CustomConvoOutputParser(AgentOutputParser):
                     start_index = text.index('{')
                     try:
                         end_index = text.rindex('}') + 1
-                    except:
+                    except Exception:
                         text += '"}'
                         end_index = text.rindex('}') + 1
                     try:
@@ -4982,7 +4982,7 @@ def history():
     ai_msg = data['ai_msg']
     try:
         memory = get_memory(user_id=int(data['user_id']))
-    except:
+    except Exception:
         return "Invalid user ID"
     if memory:
         try:
