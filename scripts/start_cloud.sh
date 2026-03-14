@@ -72,5 +72,15 @@ echo ""
 echo "No local llama.cpp needed - intelligence from cloud APIs."
 echo ""
 
+# Onboard Mindstory SDK routes into Kong (idempotent — safe on every boot)
+echo "[KONG] Onboarding Mindstory SDK routes..."
+HARTOS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+python3 -m integrations.gateway.kong_onboard \
+    --kong-url "${KONG_ADMIN_URL:-http://localhost:8001}" \
+    --upstream "${HEVOLVE_API_URL:-http://localhost:8000}" \
+    2>/dev/null && echo "[KONG] SDK routes onboarded" \
+    || echo "[KONG] Kong not available — SDK routes will be onboarded when Kong starts"
+echo ""
+
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 "${DIR}/run.sh"

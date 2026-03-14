@@ -21,8 +21,12 @@ import requests
 # ---------------------------------------------------------------------------
 # Defaults aligned with KONG_GATEWAY.md
 # ---------------------------------------------------------------------------
-DEFAULT_KONG_ADMIN_URL = "http://localhost:8001"
-DEFAULT_UPSTREAM_URL = "http://localhost:8000"
+# Defaults: localhost for dev, cloud Kong via KONG_ADMIN_URL env var
+# Cloud Kong admin is only accessible from inside the VM (not publicly exposed)
+# Cloud proxy: https://azurekong.hertzai.com (port 443/8443)
+import os as _os
+DEFAULT_KONG_ADMIN_URL = _os.environ.get("KONG_ADMIN_URL", "http://localhost:8001")
+DEFAULT_UPSTREAM_URL = _os.environ.get("HEVOLVE_API_URL", "http://localhost:8000")
 SERVICE_NAME = "hevolve-completions"
 ROUTE_NAME = "completions-route"
 
