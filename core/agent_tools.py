@@ -23,6 +23,7 @@ import requests
 from json_repair import repair_json
 
 from core.http_pool import pooled_get, pooled_post
+from integrations.service_tools.model_catalog import ModelType
 
 tool_logger = logging.getLogger('tool_execution')
 
@@ -336,7 +337,7 @@ def build_core_tool_closures(ctx):
                     from integrations.agent_engine.compute_mesh_service import get_compute_mesh
                     mesh = get_compute_mesh()
                     result = mesh.offload_to_best_peer(
-                        model_type='video_gen',
+                        model_type=ModelType.VIDEO_GEN,
                         prompt=text,
                         options={'model': 'ltx2', 'timeout': 300},
                     )

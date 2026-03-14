@@ -184,6 +184,26 @@ class HostingRewardService:
                 f'Batch impression bonus: {batches} x 100')
 
         db.flush()
+
+        # Immutable audit trail for ad revenue distribution
+        try:
+            from security.immutable_audit_log import get_audit_log
+            get_audit_log().log_event(
+                'revenue_distribution',
+                actor_id='hosting_reward_service',
+                action=f'Ad revenue distributed to {peer.node_operator_id}',
+                detail={
+                    'node_id': node_id,
+                    'operator_id': peer.node_operator_id,
+                    'spark_amount': revenue_spark,
+                    'impressions': imp_count,
+                    'period': period,
+                },
+                target_id=node_id,
+            )
+        except Exception:
+            pass  # Audit log failure must not block distribution
+
         return reward.to_dict()
 
     @staticmethod
@@ -233,6 +253,27 @@ class HostingRewardService:
         )
         db.add(reward)
         db.flush()
+
+        # Immutable audit trail for uptime bonus distribution
+        try:
+            from security.immutable_audit_log import get_audit_log
+            get_audit_log().log_event(
+                'revenue_distribution',
+                actor_id='hosting_reward_service',
+                action=f'Uptime bonus distributed to {peer.node_operator_id}',
+                detail={
+                    'node_id': node_id,
+                    'operator_id': peer.node_operator_id,
+                    'spark_amount': 10,
+                    'pulse_amount': 5,
+                    'xp_amount': 20,
+                    'reason': 'daily_uptime_bonus',
+                },
+                target_id=node_id,
+            )
+        except Exception:
+            pass  # Audit log failure must not block distribution
+
         return reward.to_dict()
 
     @staticmethod
