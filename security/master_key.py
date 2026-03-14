@@ -61,6 +61,24 @@ def verify_master_signature(payload: dict, signature_hex: str) -> bool:
         return False
 
 
+def verify_revocation_message(message_bytes: bytes, signature_hex: str) -> bool:
+    """Verify that a revocation/halt message was signed by the master private key.
+
+    Unlike verify_master_signature (which takes a dict and canonicalises it),
+    this operates on raw bytes — suitable for the PeerLink emergency-halt path
+    and any future revocation messages.
+
+    Only the PUBLIC key is used.  The private key is never touched.
+    """
+    try:
+        pub = get_master_public_key()
+        sig = bytes.fromhex(signature_hex)
+        pub.verify(sig, message_bytes)
+        return True
+    except (InvalidSignature, ValueError, Exception):
+        return False
+
+
 def load_release_manifest(code_root: str = None) -> Optional[dict]:
     """Load release_manifest.json from code root directory."""
     root = Path(code_root or _CODE_ROOT)

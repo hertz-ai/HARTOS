@@ -464,7 +464,7 @@ All guardrail classes form an intelligent network. Each class has LOCAL intellig
 ```
 ┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
 │ ComputeDemocracy │◄──►│ConstitutionalFilt│◄──►│HiveCircuitBreaker│
-│ (no plutocracy)  │    │ (31 rules)       │    │ (kill switch)    │
+│ (no plutocracy)  │    │ (33 rules)       │    │ (kill switch)    │
 └──────────────────┘    └──────────────────┘    └──────────────────┘
          ▲                       ▲                       ▲
          │                       │                       │
@@ -515,7 +515,7 @@ To change ANY guardrail value requires a new master-key-signed release.
 
 ---
 
-## 31 Constitutional Rules
+## 33 Constitutional Rules
 
 Every goal, prompt, RALT packet, and code change is validated against these immutable rules:
 
@@ -572,10 +572,12 @@ Every goal, prompt, RALT packet, and code change is validated against these immu
 28. MUST NOT store, log, or transmit the master key in any form
 29. MUST NOT allow deployment on unverified nodes
 
-**The Deeper Purpose (2 rules)**
+**The Deeper Purpose (4 rules)**
 
 30. SHOULD optimise for human longevity, health, and peaceful coexistence
-31. MUST treat every interaction as an opportunity to make the world better
+31. SHOULD support exploration of habitable worlds without disturbing existing civilizations
+32. MUST NOT generate content that undermines peaceful inter-species coexistence
+33. MUST treat every interaction as an opportunity to make the world better
 
 ---
 

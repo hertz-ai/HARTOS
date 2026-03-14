@@ -126,7 +126,7 @@ class _FrozenValues:
         'LICENSE',
     })
 
-    # ── Constitutional Rules (all 31, immutable tuple) ──
+    # ── Constitutional Rules (all 33, immutable tuple) ──
     CONSTITUTIONAL_RULES = (
         # Human wellbeing
         'MUST NOT create content that promotes self-harm or violence',
@@ -448,12 +448,28 @@ class HiveCircuitBreaker:
     _lock = threading.Lock()
 
     @classmethod
+    def trip(cls, reason: str = 'emergency_halt') -> bool:
+        """Trip the circuit breaker (local halt, no signature required).
+
+        Called by PeerLink telemetry AFTER it has already verified the
+        master key signature on the incoming emergency_halt message.
+        Also usable for local safety halts.
+        """
+        with cls._lock:
+            cls._halted = True
+            cls._halt_reason = reason
+            cls._halt_timestamp = datetime.utcnow().isoformat()
+        logger.critical(f'CIRCUIT BREAKER TRIPPED: {reason}')
+        return True
+
+    @classmethod
     def halt_network(cls, reason: str, signature: str) -> bool:
         """Halt all agent execution across the hive.
-        Requires valid master key signature on the reason string."""
+        Requires valid master key signature on a payload containing the reason."""
         try:
             from security.master_key import verify_master_signature
-            if not verify_master_signature(reason, signature):
+            payload = {'action': 'halt', 'reason': reason}
+            if not verify_master_signature(payload, signature):
                 logger.critical('Invalid halt signature - rejecting')
                 return False
         except ImportError:
@@ -484,7 +500,8 @@ class HiveCircuitBreaker:
         """Resume after halt.  Also requires master key."""
         try:
             from security.master_key import verify_master_signature
-            if not verify_master_signature(reason, signature):
+            payload = {'action': 'resume', 'reason': reason}
+            if not verify_master_signature(payload, signature):
                 return False
         except ImportError:
             return False
@@ -563,19 +580,29 @@ class HiveCircuitBreaker:
 
     @classmethod
     def receive_halt_broadcast(cls, message: dict):
-        """Handle halt broadcast received via gossip from another node."""
+        """Handle halt broadcast received via gossip from another node.
+
+        Verifies the master key signature on the halt payload before
+        tripping the circuit breaker.
+        """
         reason = message.get('reason', '')
         signature = message.get('signature', '')
+        if not signature:
+            logger.warning('Halt broadcast without signature — IGNORING')
+            return
         try:
             from security.master_key import verify_master_signature
-            if verify_master_signature(reason, signature):
+            payload = {'action': 'halt', 'reason': reason}
+            if verify_master_signature(payload, signature):
                 with cls._lock:
                     cls._halted = True
                     cls._halt_reason = reason
                     cls._halt_timestamp = message.get('timestamp')
                 logger.critical(f'Halt broadcast received and verified: {reason}')
-        except Exception:
-            pass
+            else:
+                logger.warning(f'Halt broadcast INVALID signature — IGNORING')
+        except Exception as e:
+            logger.warning(f'Halt broadcast verification failed: {e}')
 
 
 # ═══════════════════════════════════════════════════════════════════════
