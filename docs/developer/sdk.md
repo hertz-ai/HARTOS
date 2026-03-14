@@ -190,6 +190,7 @@ def speak(text):
 
 ## See Also
 
+- [user-journey.md](user-journey.md) -- End-to-end developer journey (API key → app → deploy)
 - [extensions.md](extensions.md) -- Writing HART OS extensions
 - [patterns.md](patterns.md) -- Code patterns
 - [../features/ai-capabilities.md](../features/ai-capabilities.md) -- AI capability system

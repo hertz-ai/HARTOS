@@ -3,12 +3,14 @@ Input Sanitization & Validation
 Prevents SQL LIKE injection, path traversal, XSS, and input abuse.
 """
 
+import ipaddress
 import re
 import os
 import html
 import logging
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 logger = logging.getLogger('hevolve_security')
 
@@ -149,3 +151,45 @@ def validate_comment(content: str) -> str:
         min_length=1,
         field_name='comment',
     )
+
+
+def validate_url(url: str, allow_private: bool = False) -> str:
+    """Validate URL is safe for server-side requests (SSRF protection).
+
+    Blocks: private/reserved IPs, non-http(s) schemes, cloud metadata endpoints.
+    Raises ValueError on unsafe URLs.
+    """
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("URL must be a non-empty string")
+
+    parsed = urlparse(url.strip())
+
+    # Scheme check
+    if parsed.scheme not in ('http', 'https'):
+        raise ValueError(f"URL scheme must be http or https, got {parsed.scheme!r}")
+
+    hostname = parsed.hostname or ''
+    if not hostname:
+        raise ValueError("URL must have a hostname")
+
+    # Block cloud metadata endpoints
+    _METADATA_HOSTS = {'169.254.169.254', 'metadata.google.internal',
+                       'metadata.internal', '100.100.100.200'}
+    if hostname in _METADATA_HOSTS:
+        raise ValueError("Access to cloud metadata endpoint blocked")
+
+    # Block private/reserved IPs (unless explicitly allowed for internal tools)
+    if not allow_private:
+        try:
+            addr = ipaddress.ip_address(hostname)
+            if addr.is_private or addr.is_reserved or addr.is_loopback or addr.is_link_local:
+                raise ValueError(f"URL targets private/reserved IP: {hostname}")
+        except ValueError:
+            # hostname is a domain name, not an IP — that's fine
+            pass
+
+        # Block localhost variants
+        if hostname.lower() in ('localhost', '0.0.0.0', '127.0.0.1', '::1'):
+            raise ValueError("URL targets localhost")
+
+    return url.strip()

@@ -188,16 +188,29 @@ class MessageBus:
 
         self._stats['published'] += 1
 
-        # 1. LOCAL — always deliver
+        # 1. LOCAL — always deliver (unredacted, same process)
         self._route_local(topic, data, msg_id)
+
+        # Redact secrets before outbound transmission (PeerLink + Crossbar)
+        outbound_data = data
+        if not skip_peerlink or not skip_crossbar:
+            try:
+                from security.dlp_engine import redact_pii
+                import json
+                raw = json.dumps(data)
+                redacted = redact_pii(raw)
+                if redacted != raw:
+                    outbound_data = json.loads(redacted)
+            except (ImportError, Exception):
+                pass  # DLP not available — proceed unredacted
 
         # 2. PEERLINK — if connected peers exist
         if not skip_peerlink:
-            self._route_peerlink(topic, data, msg_id)
+            self._route_peerlink(topic, outbound_data, msg_id)
 
         # 3. CROSSBAR — if internet available (and not skipped)
         if not skip_crossbar:
-            self._route_crossbar(topic, data, user_id, device_id, msg_id)
+            self._route_crossbar(topic, outbound_data, user_id, device_id, msg_id)
 
         return msg_id
 

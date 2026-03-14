@@ -14,8 +14,22 @@ vectorstore/
 temp/
 temp_db/
 
+# Secrets — NEVER include in Docker images
+.env
+.env.*
+config.json
+*.pem
+master_private_key*
+security/*.pem
+
+# Runtime data
+agent_data/
+test-reports/
+coding_benchmarks.db
+
 # Misc
 .gitignore
+.git/
 
 
 # Individual unneccessary files

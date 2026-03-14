@@ -156,6 +156,12 @@ def safe_prompt_path(*parts, ext='.json'):
 def crawl4ai_fetch(url: str, timeout: int = 30) -> str:
     """Fetch content from URL using native in-process crawler."""
     try:
+        from security.sanitize import validate_url
+        url = validate_url(url)
+    except (ImportError, ValueError) as e:
+        current_app.logger.warning(f"URL blocked by SSRF filter: {url} — {e}")
+        return ""
+    try:
         from integrations.web_crawler import crawl_url
         result = crawl_url(url, timeout)
         if result['success']:

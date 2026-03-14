@@ -7,7 +7,7 @@ from reuse_recipe import chat_agent, crossbar_multiagent, time_based_execution
 print('Inside crossbar_server')
 
 # Crossbar/WAMP component setup        
-url = os.environ.get('CBURL', "ws://aws_rasa.hertzai.com:8088/ws")
+url = os.environ.get('CBURL', "ws://localhost:8088/ws")
 realmvalue = os.environ.get('CBREALM', 'realm1')
 
 component = Component(transports=url, realm=realmvalue)

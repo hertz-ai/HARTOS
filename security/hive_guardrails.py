@@ -282,26 +282,28 @@ def get_guardrail_hash() -> str:
 # Modifying these has NO effect on actual enforcement (classes use VALUES)
 # ═══════════════════════════════════════════════════════════════════════
 
-COMPUTE_CAPS = {
+from types import MappingProxyType as _MappingProxy
+
+COMPUTE_CAPS = _MappingProxy({
     'max_influence_weight': VALUES.MAX_INFLUENCE_WEIGHT,
     'contribution_scale': VALUES.CONTRIBUTION_SCALE,
     'diversity_bonus': VALUES.DIVERSITY_BONUS,
     'single_entity_cap_pct': VALUES.SINGLE_ENTITY_CAP_PCT,
-}
+})
 
-WORLD_MODEL_BOUNDS = {
+WORLD_MODEL_BOUNDS = _MappingProxy({
     'max_skill_packets_per_hour': VALUES.MAX_SKILL_PACKETS_PER_HOUR,
     'min_witness_count_for_ralt': VALUES.MIN_WITNESS_COUNT_FOR_RALT,
     'max_accuracy_improvement_per_day': VALUES.MAX_ACCURACY_IMPROVEMENT_PER_DAY,
-    'prohibited_skill_categories': list(VALUES.PROHIBITED_SKILL_CATEGORIES),
-}
+    'prohibited_skill_categories': tuple(VALUES.PROHIBITED_SKILL_CATEGORIES),
+})
 
-CONSTITUTIONAL_RULES = list(VALUES.CONSTITUTIONAL_RULES)
-PROTECTED_FILES = list(VALUES.PROTECTED_FILES)
+CONSTITUTIONAL_RULES = tuple(VALUES.CONSTITUTIONAL_RULES)
+PROTECTED_FILES = tuple(VALUES.PROTECTED_FILES)
 
-# Module-level pattern lists for backward compat
-_VIOLATION_PATTERNS = list(VALUES.VIOLATION_PATTERNS)
-_DESTRUCTIVE_PATTERNS = list(VALUES.DESTRUCTIVE_PATTERNS)
+# Module-level pattern tuples — immutable to prevent runtime mutation
+_VIOLATION_PATTERNS = tuple(VALUES.VIOLATION_PATTERNS)
+_DESTRUCTIVE_PATTERNS = tuple(VALUES.DESTRUCTIVE_PATTERNS)
 
 
 # ═══════════════════════════════════════════════════════════════════════

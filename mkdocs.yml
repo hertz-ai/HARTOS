@@ -79,6 +79,10 @@ nav:
     - Settings UI Spec: ui/settings-spec.md
     - Provider Dashboard UI: ui/provider-dashboard.md
   - Developer Guide:
+    - Developer Journey: developer/user-journey.md
+    - HART SDK: developer/sdk.md
+    - Widget Embed: developer/widget-embed.md
+    - Extensions: developer/extensions.md
     - Architecture: developer/architecture.md
     - Key Patterns: developer/patterns.md
     - Security Model: developer/security.md
@@ -95,6 +99,9 @@ nav:
     - Federation Protocol: architecture/federation-protocol.md
     - Nested Task System: architecture/nested-tasks.md
     - PeerLink Protocol: architecture/peer_link.md
+
+extra_javascript:
+  - assets/js/chat-widget.js
 
 extra:
   social:

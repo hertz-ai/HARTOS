@@ -509,6 +509,7 @@ if _is_bundled:
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
+app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get('HEVOLVE_MAX_PAYLOAD_BYTES', 2 * 1024 * 1024))  # 2MB default
 
 if _is_bundled:
     # Bundled: root owns the handlers; let app.logger propagate to root
@@ -4245,8 +4246,12 @@ def chat():
         rate_user = rate_key.get('user_id', request.remote_addr) if isinstance(rate_key, dict) else request.remote_addr
         if not _limiter.check(str(rate_user), 'chat', max_tokens=30, refill_rate=30 / 60):
             return jsonify({'error': 'Rate limit exceeded (30/min). Please wait.', 'response': None}), 429
-    except Exception:
-        pass  # Rate limiter unavailable — allow
+    except ImportError:
+        pass  # Rate limiter module not installed — allow (dev/flat mode)
+    except Exception as e:
+        # Rate limiter unavailable (Redis down, etc.) — fail closed on cloud
+        if os.environ.get('HEVOLVE_NODE_TIER') == 'central':
+            return jsonify({'error': 'Rate limiter unavailable — try again shortly', 'response': None}), 503
 
     start_time = time.time()
 
@@ -4765,6 +4770,20 @@ def chat():
     thread_local_data.set_recognize_intents()
     thread_local_data.set_global_intent(global_intent=req_tool)
     thread_local_data.set_prompt_id(prompt_id)
+
+    # Inject active local AI capabilities into context so the LLM
+    # naturally references what it can do (TTS, STT, music, video, etc.)
+    active_caps = data.get('active_capabilities', [])
+    if active_caps:
+        _cap_labels = {
+            'stt': 'Speech-to-text (user can speak, you will hear)',
+            'tts': 'Text-to-speech (your responses are spoken aloud)',
+            'llm': 'Local language model (full intelligence, private)',
+            'music': 'Music generation via ACE Step (compose songs/beats)',
+            'video': 'Video generation via LTX2 (create short clips)',
+        }
+        caps_str = ', '.join(_cap_labels.get(c, c) for c in active_caps)
+        custom_prompt += f'\nLocally loaded AI capabilities: {caps_str}. Mention relevant ones naturally when they would help the user.'
 
     prompt = data.get('prompt', None)
     if probe:
