@@ -32,6 +32,7 @@ RUN pip install --no-cache-dir \
         "grpc-google-iam-v1==0.14.2" \
         "proto-plus==1.22.3" \
         "protobuf==4.23.3" \
+        "google-genai==1.56.0" \
         "langchain-google-genai==4.2.1"
 
 # ── Layer 2c: LLM/AI stack (second backtracking source) ──
@@ -45,11 +46,13 @@ RUN pip install --no-cache-dir \
         "langchain-text-splitters==1.1.1" \
         "langchain-groq==1.1.2"
 
-# ── Layer 2d: Remaining requirements (deps already pinned above) ──
+# ── Layer 2d: Remaining requirements ──
+#    Use --no-deps for requirements.txt because layers 2b/2c already resolved
+#    the heavy Google/LLM transitive deps. This avoids resolution-too-deep.
 COPY requirements.txt .
 COPY agent-ledger-opensource/ ./agent-ledger-opensource/
 
-RUN pip install --no-cache-dir -r requirements.txt && \
+RUN pip install --no-cache-dir --no-deps -r requirements.txt && \
     pip install --no-cache-dir ./agent-ledger-opensource && \
     pip install --no-cache-dir \
         autogen-agentchat==0.2.37 \
