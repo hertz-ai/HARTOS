@@ -259,10 +259,10 @@ class ModelOrchestrator:
     def _load_generic(self, entry: ModelEntry, run_mode: str) -> bool:
         """Fallback: try RuntimeToolManager for sidecar-based tools."""
         try:
-            from integrations.service_tools.runtime_manager import get_runtime_tool_manager
-            rtm = get_runtime_tool_manager()
+            from integrations.service_tools.runtime_manager import runtime_tool_manager
             tool_name = entry.id.replace(f'{entry.model_type}-', '')
-            return rtm.setup_tool(tool_name)
+            result = runtime_tool_manager.setup_tool(tool_name)
+            return result.get('running', False)
         except Exception as e:
             logger.warning(f"Generic load failed for {entry.id}: {e}")
             return False

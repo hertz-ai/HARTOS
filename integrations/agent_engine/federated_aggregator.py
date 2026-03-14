@@ -372,6 +372,34 @@ class FederatedAggregator:
             except ImportError:
                 pass  # Origin module not available — accept
 
+        # Revocation check — master-key-signed network halt via federation
+        revocation = delta.get('revocation')
+        if revocation and isinstance(revocation, dict):
+            rev_sig = revocation.get('master_signature', '')
+            if rev_sig:
+                try:
+                    from security.master_key import verify_master_signature
+                    rev_payload = {k: v for k, v in revocation.items()
+                                   if k != 'master_signature'}
+                    if verify_master_signature(rev_payload, rev_sig):
+                        logger.critical(
+                            'REVOCATION received via federation delta — '
+                            'tripping circuit breaker: %s',
+                            revocation.get('reason', 'no reason'))
+                        try:
+                            from security.hive_guardrails import HiveCircuitBreaker
+                            HiveCircuitBreaker.trip(
+                                reason=revocation.get('reason', 'revocation'))
+                        except Exception as e:
+                            logger.critical(f'Circuit breaker trip failed: {e}')
+                        return True, 'revocation accepted'
+                    else:
+                        logger.warning('Revocation in delta has INVALID '
+                                       'master signature — ignoring')
+                except ImportError:
+                    logger.warning('Cannot verify revocation — '
+                                   'security modules missing')
+
         node_id = delta.get('node_id', '')
         if not node_id:
             return False, 'missing node_id'
