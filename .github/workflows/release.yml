@@ -1,5 +1,6 @@
-name: Release
+name: Release — Build, Sign, ISO, Torrent, Pages
 
+# Trigger: manual dispatch with version, or push to main (for ISO builds)
 on:
   workflow_dispatch:
     inputs:
@@ -7,19 +8,31 @@ on:
         description: 'Version to release (e.g. 1.2.3 — without "v" prefix)'
         required: true
         type: string
+      build_iso:
+        description: 'Build ISOs and torrents'
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
 
 jobs:
+  # ═══════════════════════════════════════════════════════════
+  # 1. Test Gate
+  # ═══════════════════════════════════════════════════════════
   test:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python 3.10
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
@@ -34,35 +47,40 @@ jobs:
           HEVOLVE_DB_PATH: ':memory:'
         run: |
           python -m pytest \
-            tests/test_hierarchy_system.py \
-            tests/test_integrity_system.py \
-            tests/test_ad_hosting_rewards.py \
-            tests/test_agent_network_resilience.py \
-            tests/test_master_key_system.py \
-            tests/test_coding_agent.py \
-            -v --tb=short
+            tests/unit/ \
+            tests/functional/ \
+            --noconftest -q --tb=line
 
-  tag-and-release:
+  # ═══════════════════════════════════════════════════════════
+  # 2. Tag + Sign (only on manual dispatch with version)
+  # ═══════════════════════════════════════════════════════════
+  tag-and-sign:
+    if: github.event_name == 'workflow_dispatch'
     needs: test
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Validate semver format
+      - name: Set version
+        id: version
         run: |
           VERSION="${{ github.event.inputs.version }}"
           if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "ERROR: Version must be semver (e.g. 1.2.3)"
             exit 1
           fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=v$VERSION" >> $GITHUB_OUTPUT
 
-      - name: Check tag does not already exist
+      - name: Check tag does not exist
         run: |
-          if git rev-parse "v${{ github.event.inputs.version }}" >/dev/null 2>&1; then
-            echo "ERROR: Tag v${{ github.event.inputs.version }} already exists"
+          if git rev-parse "v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+            echo "ERROR: Tag v${{ steps.version.outputs.version }} already exists"
             exit 1
           fi
 
@@ -70,26 +88,179 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "v${{ github.event.inputs.version }}" -m "Release v${{ github.event.inputs.version }}"
-          git push origin "v${{ github.event.inputs.version }}"
+          git tag -a "v${{ steps.version.outputs.version }}" \
+            -m "Release v${{ steps.version.outputs.version }}"
+          git push origin "v${{ steps.version.outputs.version }}"
+          # Tag push triggers release-sign.yml for Ed25519 manifest signing
 
-      # Tag push above triggers release-sign.yml automatically
-
-      - name: Set up Python 3.10
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: Build distribution
+      - name: Build Python distribution
         run: |
           pip install build setuptools-scm
           python -m build
 
-      - name: Upload to GitHub Release
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: "v${{ github.event.inputs.version }}"
+          tag_name: "v${{ steps.version.outputs.version }}"
+          name: "HART OS v${{ steps.version.outputs.version }}"
           files: |
             dist/*.whl
             dist/*.tar.gz
+          body: |
+            ## HART OS v${{ steps.version.outputs.version }}
+
+            Hevolve Hive Agentic Runtime — crowdsourced compute for autonomous AI training.
+
+            ### Downloads
+
+            | Format | Description |
+            |--------|-------------|
+            | `.whl` | Python wheel (pip install) |
+            | `.tar.gz` | Source distribution |
+            | `.iso` | Bootable installer (see ISO job below) |
+            | `.torrent` | P2P download (web-seeded via GitHub CDN) |
+
+            ### Verify
+
+            ```bash
+            # Check SHA-256
+            sha256sum -c hart-os-*.sha256
+
+            # Verify release signature (Ed25519)
+            python -c "from security.master_key import verify_release_manifest; \
+              import json; m = json.load(open('release_manifest.json')); \
+              print('VALID' if verify_release_manifest(m) else 'INVALID')"
+            ```
           generate_release_notes: true
+
+  # ═══════════════════════════════════════════════════════════
+  # 3. Build ISOs + Torrents (parallel matrix)
+  # ═══════════════════════════════════════════════════════════
+  build-iso:
+    if: >
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.build_iso == 'true') ||
+      (github.event_name == 'push')
+    needs: [test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [iso-server, iso-desktop, iso-edge]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@v12
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+
+      - uses: DeterminateSystems/magic-nix-cache-action@v7
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get autoremove -y && sudo apt-get clean
+          df -h /
+
+      - name: Build ${{ matrix.target }}
+        working-directory: nixos
+        run: |
+          time nix build .#${{ matrix.target }} --no-link --print-out-paths \
+            | tee /tmp/build-output.txt
+
+      - name: Checksum + Torrent
+        run: |
+          BUILD_PATH=$(cat /tmp/build-output.txt | head -1)
+
+          # Find ISO file
+          FILE=""
+          if [[ -d "$BUILD_PATH/iso" ]]; then
+            FILE=$(ls "$BUILD_PATH/iso/"*.iso 2>/dev/null | head -1)
+          elif [[ -d "$BUILD_PATH" ]]; then
+            FILE=$(find "$BUILD_PATH" -maxdepth 2 -type f \
+              \( -name "*.iso" -o -name "*.qcow2" -o -name "*.raw" \) | head -1)
+          fi
+
+          if [[ -z "${FILE:-}" ]] || [[ ! -f "$FILE" ]]; then
+            echo "No output file found"
+            exit 0
+          fi
+
+          BASENAME=$(basename "$FILE")
+          mkdir -p /tmp/release-artifacts
+
+          # Copy to artifacts dir
+          cp "$FILE" /tmp/release-artifacts/
+
+          # SHA-256 checksum
+          sha256sum "$FILE" | sed "s|.*/||" > "/tmp/release-artifacts/${BASENAME}.sha256"
+
+          # Create .torrent with web seed
+          sudo apt-get install -y -qq mktorrent
+          VERSION="${GITHUB_REF_NAME#v}"
+          WEBSEED="https://github.com/${{ github.repository }}/releases/download/v${VERSION}/${BASENAME}"
+          mktorrent -l 22 \
+            -c "HART OS — Hevolve Hive Agentic Runtime. https://github.com/${{ github.repository }}" \
+            -w "$WEBSEED" \
+            -o "/tmp/release-artifacts/${BASENAME}.torrent" \
+            "$FILE"
+
+          # Summary
+          SIZE=$(du -h "$FILE" | cut -f1)
+          SHA=$(cat "/tmp/release-artifacts/${BASENAME}.sha256" | cut -d' ' -f1)
+          echo "## ${{ matrix.target }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **File**: \`$BASENAME\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Size**: $SIZE" >> $GITHUB_STEP_SUMMARY
+          echo "- **SHA256**: \`$SHA\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Torrent**: \`${BASENAME}.torrent\` (web-seeded)" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload ISO + Torrent artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: /tmp/release-artifacts/
+          retention-days: 30
+
+      - name: Attach to GitHub Release
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v${{ github.event.inputs.version }}"
+          files: /tmp/release-artifacts/*
+
+  # ═══════════════════════════════════════════════════════════
+  # 4. Deploy Docs to GitHub Pages
+  # ═══════════════════════════════════════════════════════════
+  deploy-docs:
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install mkdocs
+        run: pip install mkdocs-material
+
+      - name: Build docs
+        run: mkdocs build --strict --site-dir _site
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
