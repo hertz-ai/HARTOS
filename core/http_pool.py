@@ -89,6 +89,11 @@ def pooled_patch(url: str, timeout=DEFAULT_TIMEOUT, **kwargs) -> requests.Respon
     return get_http_session().patch(url, timeout=timeout, **kwargs)
 
 
+def pooled_delete(url: str, timeout=DEFAULT_TIMEOUT, **kwargs) -> requests.Response:
+    """Connection-pooled DELETE request."""
+    return get_http_session().delete(url, timeout=timeout, **kwargs)
+
+
 def pooled_request(method: str, url: str, timeout=DEFAULT_TIMEOUT, **kwargs) -> requests.Response:
     """Connection-pooled generic request."""
     return get_http_session().request(method, url, timeout=timeout, **kwargs)

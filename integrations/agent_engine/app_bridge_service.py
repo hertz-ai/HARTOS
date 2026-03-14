@@ -284,12 +284,12 @@ class SemanticRouter:
 
     def _dispatch_web(self, cap: Capability, action: str, data: str) -> Dict[str, Any]:
         """Dispatch to Web/PWA via HTTP."""
-        import requests
+        from core.http_pool import pooled_post
 
         handler = cap.handler
         if handler.startswith('http'):
             try:
-                resp = requests.post(
+                resp = pooled_post(
                     handler,
                     json={'action': action, 'data': data},
                     timeout=30,
@@ -311,14 +311,14 @@ class SemanticRouter:
 
     def _ai_fallback(self, action: str, data: str, mime_type: str) -> Dict[str, Any]:
         """Fall back to AI agent when no native handler available."""
-        import requests
+        from core.http_pool import pooled_post
 
         prompt = f"Action: {action}\nData: {data}"
         if mime_type:
             prompt += f"\nMIME type: {mime_type}"
 
         try:
-            resp = requests.post(
+            resp = pooled_post(
                 f'http://localhost:{self.model_bus_port}/v1/chat',
                 json={'prompt': prompt, 'max_tokens': 512},
                 timeout=60,
@@ -462,9 +462,9 @@ class AppBridgeService:
             pass
 
         # AI (Model Bus)
-        import requests
+        from core.http_pool import pooled_get
         try:
-            resp = requests.get(
+            resp = pooled_get(
                 f'http://localhost:{self.model_bus_port}/v1/status', timeout=3,
             )
             if resp.status_code == 200:

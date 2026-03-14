@@ -20,10 +20,10 @@ This module integrates VLM feedback into the agent ledger for:
 import json
 import logging
 import os
-import requests
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 from pathlib import Path
+from core.http_pool import pooled_get, pooled_post
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +59,7 @@ class VLMAgentContext:
     def is_vlm_available(self) -> bool:
         """Check if VLM agent server is available."""
         try:
-            response = requests.get(f"{self.vlm_server_url}/health", timeout=2)
+            response = pooled_get(f"{self.vlm_server_url}/health", timeout=2)
             return response.status_code == 200
         except Exception:
             return False
@@ -67,7 +67,7 @@ class VLMAgentContext:
     def is_omniparser_available(self) -> bool:
         """Check if OmniParser server is available."""
         try:
-            response = requests.get(f"{self.omniparser_url}/probe", timeout=2)
+            response = pooled_get(f"{self.omniparser_url}/probe", timeout=2)
             return response.status_code == 200
         except Exception:
             return False
@@ -89,7 +89,7 @@ class VLMAgentContext:
                 return None
 
             # Request screen parsing from OmniParser
-            response = requests.post(
+            response = pooled_post(
                 f"{self.omniparser_url}/parse_screen",
                 json={"include_som": True},
                 timeout=10
@@ -185,7 +185,7 @@ class VLMAgentContext:
             }
 
             # Send action request to VLM agent
-            response = requests.post(
+            response = pooled_post(
                 f"{self.vlm_server_url}/execute_action",
                 json=payload,
                 timeout=30

@@ -10,7 +10,7 @@ import json
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 
-import requests
+from core.http_pool import pooled_get
 
 from .game_types import BaseGameType
 
@@ -69,7 +69,7 @@ class OpenTDBTriviaGame(BaseGameType):
             params['difficulty'] = difficulty
 
         try:
-            resp = requests.get(self.OPENTDB_URL, params=params, timeout=5)
+            resp = pooled_get(self.OPENTDB_URL, params=params, timeout=5)
             data = resp.json()
             if data.get('response_code') == 0 and data.get('results'):
                 questions = []

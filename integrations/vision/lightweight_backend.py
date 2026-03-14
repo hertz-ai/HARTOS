@@ -18,7 +18,7 @@ import os
 from abc import ABC, abstractmethod
 from typing import Optional
 
-import requests
+from core.http_pool import pooled_get, pooled_post
 
 logger = logging.getLogger('hevolve_vision')
 
@@ -100,7 +100,7 @@ class MiniCPMBackend(VisionBackend):
         import base64
         try:
             b64 = base64.b64encode(frame_bytes).decode('utf-8')
-            resp = requests.post(
+            resp = pooled_post(
                 f'http://localhost:{self._port}/describe',
                 json={
                     'image': b64,
@@ -318,7 +318,7 @@ class Qwen3VLVisionBackend(VisionBackend):
         if not base_url:
             return False
         try:
-            resp = requests.get(
+            resp = pooled_get(
                 f'{base_url.rstrip("/")}/models', timeout=3
             )
             return resp.status_code == 200
