@@ -4242,8 +4242,9 @@ def chat():
     # Rate limit: 30 req/min per user/IP
     try:
         from integrations.social.rate_limiter import _limiter
-        rate_key = request.get_json(silent=True) or {}
-        rate_user = rate_key.get('user_id', request.remote_addr) if isinstance(rate_key, dict) else request.remote_addr
+        # Rate limit by IP always (prevents user_id rotation bypass).
+        # Authenticated user_id added as secondary key for per-user tracking.
+        rate_user = request.remote_addr
         if not _limiter.check(str(rate_user), 'chat', max_tokens=30, refill_rate=30 / 60):
             return jsonify({'error': 'Rate limit exceeded (30/min). Please wait.', 'response': None}), 429
     except ImportError:
@@ -4279,6 +4280,17 @@ def chat():
             g.auth_source = 'body'
     else:
         g.auth_source = 'body'
+
+    # Reject unauthenticated requests on exposed deployments
+    # (central tier or HEVOLVE_REQUIRE_AUTH=true)
+    if g.auth_source == 'body' and (
+        os.environ.get('HEVOLVE_NODE_TIER') == 'central' or
+        os.environ.get('HEVOLVE_REQUIRE_AUTH', '').lower() == 'true'
+    ):
+        return jsonify({
+            'error': 'Authentication required. Provide Authorization: Bearer <token> header.',
+            'response': None,
+        }), 401
 
     user_id = data.get('user_id', None)
     preferred_lang = data.get('preferred_lang', 'en')
@@ -4770,20 +4782,6 @@ def chat():
     thread_local_data.set_recognize_intents()
     thread_local_data.set_global_intent(global_intent=req_tool)
     thread_local_data.set_prompt_id(prompt_id)
-
-    # Inject active local AI capabilities into context so the LLM
-    # naturally references what it can do (TTS, STT, music, video, etc.)
-    active_caps = data.get('active_capabilities', [])
-    if active_caps:
-        _cap_labels = {
-            'stt': 'Speech-to-text (user can speak, you will hear)',
-            'tts': 'Text-to-speech (your responses are spoken aloud)',
-            'llm': 'Local language model (full intelligence, private)',
-            'music': 'Music generation via ACE Step (compose songs/beats)',
-            'video': 'Video generation via LTX2 (create short clips)',
-        }
-        caps_str = ', '.join(_cap_labels.get(c, c) for c in active_caps)
-        custom_prompt += f'\nLocally loaded AI capabilities: {caps_str}. Mention relevant ones naturally when they would help the user.'
 
     prompt = data.get('prompt', None)
     if probe:

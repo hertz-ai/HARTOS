@@ -193,7 +193,17 @@ def _apply_api_auth(app: Flask):
             expected_key = os.environ.get('HEVOLVE_API_KEY', '')
 
         if not expected_key:
-            return  # No key configured → gateway handles auth
+            # No API key configured. If this is a publicly exposed deployment
+            # (central tier), require JWT Bearer token instead.
+            if os.environ.get('HEVOLVE_NODE_TIER') == 'central':
+                # Central tier without API key: require JWT Bearer on protected paths
+                if any(request.path == p or request.path.startswith(p + '/')
+                       for p in PROTECTED_PATHS):
+                    if not any(request.path.startswith(p) for p in EXEMPT_PREFIXES):
+                        auth_header = request.headers.get('Authorization', '')
+                        if not auth_header.startswith('Bearer '):
+                            return jsonify({'error': 'Authentication required (Bearer token or X-API-Key)'}), 401
+            return  # Non-central without API key → gateway or local mode handles auth
 
         # Only protect specific paths
         if not any(request.path == p or request.path.startswith(p + '/')
