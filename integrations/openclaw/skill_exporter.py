@@ -150,18 +150,70 @@ def export_recipe_as_skill(recipe_path: str,
     return str(out)
 
 
+def _broadcast_skill_via_p2p(skill_dir: str, slug: Optional[str] = None):
+    """Broadcast skill to the hive via MessageBus federation.recipe_delta.
+
+    This feeds into FederatedAggregator.receive_recipe_delta() so that
+    exported skills become discoverable by all hive nodes without ClawHub.
+    """
+    try:
+        skill_path = Path(skill_dir)
+        recipe_file = skill_path / 'hart_recipe.json'
+        skill_md_file = skill_path / 'SKILL.md'
+
+        # Extract metadata from the recipe JSON (written by export_recipe_as_skill)
+        recipe_data = {}
+        if recipe_file.exists():
+            with open(recipe_file, 'r', encoding='utf-8') as f:
+                recipe_data = json.load(f)
+
+        # Extract skill name from SKILL.md frontmatter
+        skill_name = slug or ''
+        if not skill_name and skill_md_file.exists():
+            for line in skill_md_file.read_text(encoding='utf-8').splitlines():
+                if line.startswith('name:'):
+                    skill_name = line.split(':', 1)[1].strip()
+                    break
+
+        actions = recipe_data.get('actions', recipe_data.get('steps', []))
+        skill_id = slug or skill_name or os.path.basename(skill_dir)
+
+        delta = {
+            'recipes': [{
+                'id': skill_id,
+                'name': skill_name,
+                'action_count': len(actions),
+                'success_rate': 1.0,
+                'reuse_count': 0,
+            }],
+        }
+
+        from core.peer_link.message_bus import get_message_bus
+        bus = get_message_bus()
+        bus.publish('federation.recipe_delta', delta)
+        logger.info("Broadcast skill %s via P2P federation", skill_id)
+    except Exception as e:
+        logger.debug("P2P skill broadcast skipped: %s", e)
+
+
 def publish_skill(skill_dir: str, slug: Optional[str] = None) -> bool:
     """Publish a skill to ClawHub (requires clawhub CLI).
+
+    Also broadcasts the skill via P2P MessageBus so hive nodes can
+    discover it without relying on external ClawHub infrastructure.
 
     Args:
         skill_dir: Path to the skill directory containing SKILL.md
         slug: Optional slug override
 
     Returns:
-        True if published successfully
+        True if published successfully to ClawHub
     """
     import shutil
     import subprocess
+
+    # Always broadcast via P2P regardless of ClawHub availability
+    _broadcast_skill_via_p2p(skill_dir, slug)
 
     clawhub = shutil.which('clawhub')
     if not clawhub:
