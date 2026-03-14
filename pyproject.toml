@@ -101,7 +101,9 @@ dependencies = [
     "transformers>=5.0.0,<6.0.0",
 
     # Embodied AI — learning pipeline, hivemind, distributed intelligence
-    "embodied-ai @ git+ssh://git@github.com/hertz-ai/HevolveAI.git@main",
+    # Uses HTTPS (not SSH) so pip install -e works without SSH keys.
+    # For CI/CD, set GIT_TOKEN env var or use git credential helper.
+    "embodied-ai @ git+https://github.com/hertz-ai/HevolveAI.git@main",
 
     # Security
     "cryptography>=41.0.0,<47.0.0",

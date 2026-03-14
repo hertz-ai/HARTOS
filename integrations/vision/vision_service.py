@@ -164,6 +164,14 @@ class VisionService:
         backend_name = self._vision_backend.name if self._vision_backend else 'minicpm'
         logger.info(f"VisionService started (backend={backend_name}, adaptive sampling)")
 
+        # Sync with orchestrator catalog so it knows VLM is loaded
+        try:
+            from integrations.service_tools.model_orchestrator import get_orchestrator
+            device = 'cpu' if self._vision_backend else 'gpu'
+            get_orchestrator().notify_loaded('vlm', 'MiniCPM-V-2', device=device)
+        except Exception:
+            pass
+
     def _detect_mode(self) -> str:
         """Detect vision mode from hardware tier."""
         try:
@@ -206,6 +214,13 @@ class VisionService:
             self._vision_backend.stop()
             logger.info(f"Vision backend {self._vision_backend.name} stopped")
             self._vision_backend = None
+
+        # Sync with orchestrator catalog
+        try:
+            from integrations.service_tools.model_orchestrator import get_orchestrator
+            get_orchestrator().notify_unloaded('vlm', 'MiniCPM-V-2')
+        except Exception:
+            pass
         logger.info(
             f"VisionService stopped (described={self._frames_described}, "
             f"skipped={self._frames_skipped})"
