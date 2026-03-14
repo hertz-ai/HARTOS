@@ -15,12 +15,19 @@ Architecture:
            │   RALT distribution, world model, biometric ML
            └─ Exposed via C ABI + Python ctypes/cffi wrapper
 
-Protection layers:
+Who can run HevolveAI:
+  Anyone on a legitimate deployment — Nunba, HARTOS standalone, Docker,
+  HART OS (Live OS), cloud, or pip install. Flat, regional, or central tier.
+  Users never need the master key. They download already-signed binaries.
+
+Protection (against forks weaponizing, NOT against users running):
   1. Binary is compiled (Rust/C++) — not readable Python
-  2. Binary is signed by master key — tampering = signature invalid
-  3. Binary checks origin attestation — refuses to load on forks
-  4. Symbol names are obfuscated — reverse engineering is hard
-  5. License prohibits decompilation / reverse engineering
+  2. Binary is release-signed by master key — proves authenticity (not tampered)
+  3. Binary checks origin attestation — refuses to load on unauthorized forks
+  4. Forks cannot sign modified binaries — no master key = can't distribute
+     weaponized versions that pass verification
+  5. Forks cannot join federation — origin attestation fails
+  6. License prohibits decompilation / reverse engineering
 
 Search order for native binary:
   1. HEVOLVE_NATIVE_LIB env var (explicit path)
