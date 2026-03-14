@@ -366,8 +366,8 @@ def get_compute_routing():
 
     # Check local LLM availability
     try:
-        import requests
-        resp = requests.get('http://localhost:8080/health', timeout=2)
+        from core.http_pool import pooled_get
+        resp = pooled_get('http://localhost:8080/health', timeout=2)
         routing['local_llm_available'] = resp.status_code == 200
     except Exception:
         routing['local_llm_available'] = False

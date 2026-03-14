@@ -81,12 +81,13 @@ def _parse_http(screenshot_b64: str) -> dict:
     """
     import time
     import requests
+    from core.http_pool import pooled_post
 
     omni_url = os.environ.get('OMNIPARSER_URL', 'http://localhost:8080')
     start = time.time()
 
     try:
-        resp = requests.post(
+        resp = pooled_post(
             f'{omni_url.rstrip("/")}/parse/',
             json={'base64_image': screenshot_b64},
             timeout=30

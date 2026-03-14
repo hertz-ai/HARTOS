@@ -27,7 +27,7 @@ try:
 except ImportError:
     pyperclip = None
 
-import requests
+from core.http_pool import pooled_get, pooled_post
 
 # Action types matching OmniParser computer.py Action literal
 SUPPORTED_ACTIONS = {
@@ -56,7 +56,7 @@ def take_screenshot(tier: str) -> str:
         img.save(buf, format='PNG')
         return base64.b64encode(buf.getvalue()).decode('ascii')
     else:
-        resp = requests.get('http://localhost:5001/screenshot', timeout=15)
+        resp = pooled_get('http://localhost:5001/screenshot', timeout=15)
         resp.raise_for_status()
         data = resp.json()
         return data.get('base64_image', data.get('image', ''))
@@ -220,7 +220,7 @@ def _execute_inprocess(action: dict) -> dict:
 def _execute_http(action: dict) -> dict:
     """Execute action via HTTP POST to localhost:5001/execute."""
     try:
-        resp = requests.post(
+        resp = pooled_post(
             'http://localhost:5001/execute',
             json=action,
             timeout=30

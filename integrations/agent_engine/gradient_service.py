@@ -248,7 +248,7 @@ class GradientSyncService:
             witness_ids = []
             for peer in witnesses[:WITNESS_REQUIREMENT]:
                 try:
-                    import requests
+                    from core.http_pool import pooled_post
                     url = f"{peer.url.rstrip('/')}/api/social/peers/embedding-delta"
                     witness_payload = {
                         'action': 'witness_request',
@@ -256,7 +256,7 @@ class GradientSyncService:
                         'submitter_node_id': node_id,
                         'request_id': uuid.uuid4().hex[:12],
                     }
-                    resp = requests.post(url, json=witness_payload, timeout=5)
+                    resp = pooled_post(url, json=witness_payload, timeout=5)
                     if resp.status_code == 200:
                         witness_ids.append(peer.node_id)
                 except Exception:

@@ -33,13 +33,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger('hevolve.remote_desktop')
 
-# ── Optional: requests for Sunshine REST API ────────────────────
-_requests = None
+# ── Optional: pooled HTTP for Sunshine REST API ─────────────────
+_http_pool = None
 try:
-    import requests as _requests_module
-    _requests = _requests_module
+    from core.http_pool import pooled_get as _pooled_get, pooled_post as _pooled_post
+    _http_pool = True
 except ImportError:
-    pass
+    _pooled_get = None
+    _pooled_post = None
 
 
 class SunshineBridge:
@@ -103,10 +104,10 @@ class SunshineBridge:
 
     def _api_get(self, endpoint: str) -> Optional[dict]:
         """GET request to Sunshine REST API."""
-        if not _requests:
+        if not _http_pool:
             return None
         try:
-            resp = _requests.get(
+            resp = _pooled_get(
                 f"{self._api_url}{endpoint}",
                 auth=(self._username, self._password),
                 verify=False,  # Sunshine uses self-signed cert
@@ -120,10 +121,10 @@ class SunshineBridge:
 
     def _api_post(self, endpoint: str, data: dict) -> Optional[dict]:
         """POST request to Sunshine REST API."""
-        if not _requests:
+        if not _http_pool:
             return None
         try:
-            resp = _requests.post(
+            resp = _pooled_post(
                 f"{self._api_url}{endpoint}",
                 json=data,
                 auth=(self._username, self._password),

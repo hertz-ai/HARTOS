@@ -22,6 +22,7 @@ from typing import Callable, Dict, List, Optional
 
 import numpy as np
 import requests
+from core.http_pool import pooled_get, pooled_post
 
 from .frame_store import FrameStore, compute_frame_difference, decode_jpeg
 from .minicpm_installer import MiniCPMInstaller
@@ -452,7 +453,7 @@ class VisionService:
     def _check_minicpm_health(self) -> bool:
         """Check if MiniCPM sidecar is responding."""
         try:
-            r = requests.get(
+            r = pooled_get(
                 f'http://localhost:{self._minicpm_port}/status', timeout=3,
             )
             if r.status_code == 200:
@@ -642,7 +643,7 @@ class VisionService:
 
         # MiniCPM sidecar path
         try:
-            r = requests.post(
+            r = pooled_post(
                 f'http://localhost:{self._minicpm_port}/describe',
                 data=frame_bytes,
                 params={'prompt': prompt},
@@ -666,7 +667,7 @@ class VisionService:
         if not self._callback_url:
             return
         try:
-            requests.post(
+            pooled_post(
                 f'{self._callback_url}/create_action',
                 json={
                     'user_id': user_id,

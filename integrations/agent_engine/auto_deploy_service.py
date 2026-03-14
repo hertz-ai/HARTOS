@@ -203,8 +203,8 @@ class AutoDeployService:
                     if not peer.url:
                         continue
                     try:
-                        import requests
-                        resp = requests.post(
+                        from core.http_pool import pooled_post
+                        resp = pooled_post(
                             f'{peer.url}/api/social/deploy/version-update',
                             json={
                                 'type': 'version_update',

@@ -25,6 +25,7 @@ from dataclasses import dataclass, field, asdict
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 from core.port_registry import get_port
+from core.http_pool import pooled_get, pooled_post
 
 logger = logging.getLogger('hevolve.remote_desktop')
 
@@ -193,8 +194,7 @@ class SignalingChannel:
                    message: SignalingMessage) -> bool:
         """Send signal via HTTP API endpoint."""
         try:
-            import requests
-            resp = requests.post(
+            resp = pooled_post(
                 f"{self._api_base}/api/remote-desktop/signal",
                 json={
                     'target_device_id': target_device_id,
@@ -210,8 +210,7 @@ class SignalingChannel:
     def poll_signals_http(self) -> List[SignalingMessage]:
         """Poll for incoming signals via HTTP (fallback for no WAMP)."""
         try:
-            import requests
-            resp = requests.get(
+            resp = pooled_get(
                 f"{self._api_base}/api/remote-desktop/signal/{self._device_id}",
                 timeout=5,
             )
