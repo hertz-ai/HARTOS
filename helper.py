@@ -1828,6 +1828,35 @@ def get_llm_config(fallback_config_list=None):
     return {"cache_seed": None, "config_list": override or (fallback_config_list if fallback_config_list is not None else config_list), "max_tokens": 1500}
 
 
+def save_conversation_db(text, user_id, prompt_id, database_url, request_id):
+    """Save a conversation turn to the database via the conversation API.
+
+    Canonical implementation — create_recipe.py and reuse_recipe.py delegate here.
+    """
+    headers = {'Content-Type': 'application/json'}
+    data = {
+        "request": 'VIDEO GENERATION FROM GENERATE_VIDEO',
+        "response": text.strip(),
+        "user_id": int(user_id),
+        "conv_bot_name": 'GPT-4o',
+        "topic": f'{prompt_id}',
+        "revision": False,
+        "dialogue_id": None,
+        "card_type": 'Custom GPT',
+        "qid": None,
+        "layout_id": None,
+        "layout_list": '[]',
+        "request_token": 0,
+        "response_token": 0,
+        "request_id": request_id,
+        "historical_request_id": str('[]')
+    }
+    res = pooled_post("{}/conversation".format(database_url),
+                        data=json.dumps(data), headers=headers).json()
+    conv_id = res['conv_id']
+    return conv_id
+
+
 def create_visual_agent(user_id,prompt_id):
     visual_agent = autogen.AssistantAgent(
         name='visual_agent',
