@@ -99,6 +99,7 @@ nav:
     - Federation Protocol: architecture/federation-protocol.md
     - Nested Task System: architecture/nested-tasks.md
     - PeerLink Protocol: architecture/peer_link.md
+    - Promise Scorecard: architecture/promise-scorecard.md
 
 extra_javascript:
   - assets/js/chat-widget.js

@@ -111,6 +111,29 @@ def test_external_call(mock_post):
     # Test code here
 ```
 
+## Functional Tests
+
+The `tests/functional/` suite validates core subsystems end-to-end with real
+logic (no mocks on the code under test). Total: **233 tests**, runs in ~30 s.
+
+```bash
+pytest tests/functional/ --noconftest -q
+```
+
+| File | Tests | What it covers |
+|------|------:|----------------|
+| `test_message_bus_functional.py` | 8 | Pub/sub delivery, wildcard topics, unsubscribe, thread safety |
+| `test_federation_functional.py` | 23 | 3-node convergence, HMAC sign/verify, stale-delta rejection, recipe channel, guardrail hash enforcement |
+| `test_revenue_functional.py` | 6 | 90/9/1 split math, real SQLite Spark settlements, dashboard keys, env overrides |
+| `test_vlm_loop_functional.py` | 17 | VLM control flow, action parsing, bbox handling, iteration budget, safety-gate stubs |
+| `test_pipeline_lifecycle_functional.py` | 22 | ActionState machine transitions, recipe save/load round-trip, path-traversal guards, thread-safe state changes |
+| `test_security_modules_functional.py` | 141 | Input sanitization (SQL, HTML, path), audit-log hash chain & tamper detection, action classifier (safe/destructive), DLP scan/redact (PII, credit card, IP), rate limiter, tool allowlist |
+| `test_device_control_functional.py` | 16 | Channel-to-device routing via PeerLink, SAME_USER privacy gate, fleet-command fallback, embedded handler GPIO/serial detection |
+
+These tests exercise the actual production code paths. External services (LLM
+APIs, network peers) are stubbed at the boundary, but all internal logic runs
+unmodified.
+
 ## See Also
 
 - [contributing.md](contributing.md) -- PR process
