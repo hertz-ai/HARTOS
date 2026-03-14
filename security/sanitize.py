@@ -182,11 +182,13 @@ def validate_url(url: str, allow_private: bool = False) -> str:
     if not allow_private:
         try:
             addr = ipaddress.ip_address(hostname)
-            if addr.is_private or addr.is_reserved or addr.is_loopback or addr.is_link_local:
-                raise ValueError(f"URL targets private/reserved IP: {hostname}")
         except ValueError:
             # hostname is a domain name, not an IP — that's fine
-            pass
+            addr = None
+
+        if addr is not None:
+            if addr.is_private or addr.is_reserved or addr.is_loopback or addr.is_link_local:
+                raise ValueError(f"URL targets private/reserved IP: {hostname}")
 
         # Block localhost variants
         if hostname.lower() in ('localhost', '0.0.0.0', '127.0.0.1', '::1'):
