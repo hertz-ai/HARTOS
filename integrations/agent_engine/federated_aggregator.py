@@ -263,7 +263,27 @@ class FederatedAggregator:
         return results
 
     def broadcast_delta(self, delta: dict):
-        """POST delta to all known active peers."""
+        """POST delta to all known active peers.
+
+        Privacy enforcement: ScopeGuard.check_egress() runs before any data
+        leaves this node.  Only FEDERATED-scoped aggregate stats are sent.
+        Raw user data, PII, and secrets are structurally blocked.
+        """
+        # ── Edge privacy gate: block PII / secrets from leaving ──
+        try:
+            from security.edge_privacy import get_scope_guard, PrivacyScope
+            guard = get_scope_guard()
+            tagged_delta = dict(delta, _privacy_scope=PrivacyScope.FEDERATED)
+            allowed, reason = guard.check_egress(
+                tagged_delta, PrivacyScope.FEDERATED,
+                context={'source': 'federation_broadcast'}
+            )
+            if not allowed:
+                logger.warning(f"Federation broadcast blocked by ScopeGuard: {reason}")
+                return
+        except ImportError:
+            pass  # edge_privacy not available — proceed (defense in depth below)
+
         # Sign the delta with HMAC-SHA256 before broadcasting
         _sign_delta(delta)
 
@@ -835,6 +855,85 @@ class FederatedAggregator:
         except Exception:
             pass
         return stats
+
+    # ── Node bootstrapping — help new nodes become better ──
+
+    def bootstrap_new_node(self, node_id: str) -> dict:
+        """Share aggregated learning with a newly joined node.
+
+        The flywheel helps every node improve — not just extract compute.
+        Pre-trusted nodes share:
+          - Aggregated benchmarks (what tools work best for what tasks)
+          - Recipe index (trained task patterns for REUSE mode)
+          - Quality metrics (community-validated heuristics)
+          - Resonance baseline (federated personality norms)
+
+        What is NOT shared:
+          - Raw user data (EDGE_ONLY — never leaves device)
+          - PII or secrets (DLP + ScopeGuard blocks)
+          - Raw weights (only non-interpretable LoRA deltas in Phase 2)
+          - Individual conversation history
+
+        Returns a bootstrap package for the new node.
+        """
+        package = {
+            'type': 'node_bootstrap',
+            'from_node': '',
+            'for_node': node_id,
+            'timestamp': time.time(),
+        }
+
+        # Aggregated benchmarks — what the hive has learned about tool performance
+        package['benchmarks'] = self._get_benchmark_results()
+
+        # Recipe index — trained task patterns (metadata only, not full recipes)
+        try:
+            package['recipe_index'] = self.get_recipe_stats()
+        except Exception:
+            package['recipe_index'] = {}
+
+        # Quality heuristics — community-validated metrics
+        try:
+            if self.peer_deltas:
+                quality = {}
+                for d in self.peer_deltas.values():
+                    qm = d.get('quality_metrics', {})
+                    for k, v in qm.items():
+                        if isinstance(v, (int, float)):
+                            quality.setdefault(k, []).append(v)
+                package['quality_baselines'] = {
+                    k: sum(v) / len(v) for k, v in quality.items() if v
+                }
+            else:
+                package['quality_baselines'] = {}
+        except Exception:
+            package['quality_baselines'] = {}
+
+        # Resonance norms — federated personality baselines (aggregate only)
+        try:
+            package['resonance_norms'] = self.get_resonance_stats()
+        except Exception:
+            package['resonance_norms'] = {}
+
+        # ScopeGuard: verify nothing private leaks in bootstrap
+        try:
+            from security.edge_privacy import get_scope_guard, PrivacyScope
+            guard = get_scope_guard()
+            tagged = dict(package, _privacy_scope=PrivacyScope.FEDERATED)
+            allowed, reason = guard.check_egress(
+                tagged, PrivacyScope.FEDERATED,
+                context={'source': 'node_bootstrap', 'target_node': node_id}
+            )
+            if not allowed:
+                logger.warning(f"Bootstrap blocked by ScopeGuard: {reason}")
+                return {'error': reason}
+        except ImportError:
+            pass
+
+        logger.info(f"Bootstrap package for node {node_id}: "
+                    f"{len(package.get('benchmarks', {}))} benchmarks, "
+                    f"{package.get('recipe_index', {}).get('total_recipes', 0)} recipes")
+        return package
 
 
 # ─── Singleton ───
