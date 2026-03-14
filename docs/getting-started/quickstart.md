@@ -122,3 +122,4 @@ curl -X POST http://localhost:6777/chat \
 - [Deployment Modes](deployment-modes.md) -- flat, regional, central
 - [Configuration Reference](configuration.md) -- all environment variables
 - [Features Overview](../features/overview.md) -- what HART OS can do
+- [Device Discovery & Pairing](../features/device-pairing.md) -- connect phones, IoT devices, and headless nodes to your mesh
