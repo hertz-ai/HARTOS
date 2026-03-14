@@ -1519,7 +1519,7 @@ class TestLocalComputerTool:
         assert 'error' in result
         assert 'Unknown action' in result['error']
 
-    @patch('integrations.vlm.local_computer_tool.requests.get')
+    @patch('integrations.vlm.local_computer_tool.pooled_get')
     def test_take_screenshot_http(self, mock_get):
         """HTTP tier screenshot fetches from localhost:5001."""
         mock_resp = MagicMock()
@@ -1532,7 +1532,7 @@ class TestLocalComputerTool:
         result = take_screenshot('http')
         assert result == "abc123"
 
-    @patch('integrations.vlm.local_computer_tool.requests.post')
+    @patch('integrations.vlm.local_computer_tool.pooled_post')
     def test_execute_action_http(self, mock_post):
         """HTTP tier execute sends POST to localhost:5001/execute."""
         mock_resp = MagicMock()
@@ -1566,8 +1566,8 @@ class TestLocalOmniParser:
             "som_image_base64": "labeled_image",
         }
 
-        # requests is imported inside _parse_http, so patch at the top-level module
-        with patch('requests.post', return_value=mock_resp):
+        # pooled_post is lazy-imported inside _parse_http, mock at source
+        with patch('core.http_pool.pooled_post', return_value=mock_resp):
             from integrations.vlm.local_omniparser import _parse_http
             result = _parse_http("dummyb64")
 
