@@ -1610,7 +1610,7 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
         current_app.logger.info(f"Exception {e}")
         try:
             messages = memory.chat_memory.search(prompt)
-        except:
+        except Exception:
            current_app.logger.info(f'Error: {e}')
 
         # current_app.logger.info(f"final messages in except-->{messages}")
@@ -1772,7 +1772,7 @@ def get_memory(user_id: int):
 def history(user_id,prompt_id,role,message):
     try:
         memory = get_memory(user_id=int(user_id))
-    except:
+    except Exception:
         return "Invalid user ID"
     if memory:
         if role == 'user':
@@ -2198,7 +2198,7 @@ def get_agent_data_info(prompt_id: int) -> Dict[str, Any]:
                 data = json.load(f)
             saved_at = data.get('saved_at', 'unknown')
             data_keys = list(data.get('data', {}).keys()) if 'data' in data else list(data.keys())
-        except:
+        except Exception:
             saved_at = 'unknown'
             data_keys = []
 
@@ -2321,7 +2321,7 @@ def force_apply_autogen_json_fix():
         try:
             from autogen.io.base import IOStream
             iostream = IOStream.get_default()
-        except:
+        except Exception:
             class MockIOStream:
                 def print(self, *args, **kwargs):
                     print(*args)
@@ -2390,7 +2390,7 @@ def force_apply_autogen_json_fix():
         try:
             from autogen.io.base import IOStream
             iostream = IOStream.get_default()
-        except:
+        except Exception:
             class MockIOStream:
                 def print(self, *args, **kwargs):
                     print(*args)

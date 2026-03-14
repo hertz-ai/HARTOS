@@ -514,7 +514,7 @@ def get_action_user_details(user_id):
     time_zone = "Asia/Kolkata"
     try:
         india_tz = pytz.timezone(time_zone)
-    except:
+    except Exception:
         india_tz = None
     payload = {}
     headers = {}
@@ -533,7 +533,7 @@ def get_action_user_details(user_id):
                     else:
                         first_action_text = f"{action} on {date.strftime('%Y-%m-%dT%H:%M:%S')}"
                     action_texts.append(first_action_text)
-                except:
+                except Exception:
                     action_texts.append(f"{action}")
                 if len(action_texts) == 0:
                     action_texts = ['user has not performed any actions yet.']
@@ -769,7 +769,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         tool_logger.info("[INIT] Trying to initialise...")
 
         apply_autogen_fix_on_startup()
-    except:
+    except Exception:
         tool_logger.info("[INFO] Autogen JSON enhancement ready - will be applied when Flask starts")
 
     # Initialize SimpleMem for this session (from gpt4.1)
@@ -1250,7 +1250,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                         return "Perform drag action"
                                     else:
                                         return f"Perform {action_type} action"
-                                except:
+                                except Exception:
                                     action_match = re.search(r"'action':\s*'([^']+)'", text)
                                     text_match = re.search(r"'text':\s*'([^']+)'", text)
 
@@ -1884,7 +1884,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                             # Add the error context as a new message to maintain the original error message
                             if last_speaker.name != "Helper":
                                 return helper
-                    except:
+                    except Exception:
                         pass
         except Exception as e:
             current_app.logger.error(f"Error in error detection logic: {e}")
@@ -2749,7 +2749,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
                     current_app.logger.info('GOT COMPLETED FOR ACTION')
                     try:
                         time_actions[user_prompt].current_action += 1
-                    except:
+                    except Exception:
                         current_app.logger.error('GOT ERROR WHILE UPDATING CURRENT ACTION')
                         time_actions[user_prompt].current_action += 1
                     return chat_instructor1
@@ -2782,7 +2782,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
                     current_app.logger.info('Sending user the message')
                     json_obj = json.loads(json_part)
                     send_message_to_user1(user_id,json_obj['message2user'],'',prompt_id)
-                except:
+                except Exception:
                     pass
                 return "auto"
 
@@ -3006,7 +3006,7 @@ def get_ledger_status_for_logging(user_prompt: str) -> str:
     try:
         summary = ledger.get_execution_summary()
         return f"Ledger: {summary['total']} tasks ({len(summary['completed'])} done, {len(summary['in_progress'])} running, {len(summary['pending'])} pending)"
-    except:
+    except Exception:
         return "Ledger: status unavailable"
 
 
@@ -3201,7 +3201,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             try:
                 message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)
                 text = f'Properly Execute Action {user_tasks[user_prompt].current_action}: {message} '
-            except:
+            except Exception:
                 message = ""
                 text = f'Properly Execute Action {user_tasks[user_prompt].current_action}: {message} '
     # Initiate or resume chat
@@ -3525,7 +3525,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     user_tasks[user_prompt].new_json.append(json_obj)
                     try:
                         message = user_tasks[user_prompt].get_action(current_action_id - 1)
-                    except:
+                    except Exception:
                         flow, json_response = after_all_actions_terminated_from_exception(assistant_agent, chat_instructor, flow,
                                                                                           group_chat, manager, prompt_id, user_prompt)
                         if all_flows_completed(prompt_id, get_total_flows(user_prompt), user_prompt):
@@ -3618,7 +3618,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     if json_obj:
                         try:
                             last_message['content'] = json_obj['message2user']
-                        except:
+                        except Exception:
                             pass
                     return last_message['content']
                 elif f'message2'.lower() in last_message['content'].lower():
@@ -3665,7 +3665,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         try:
                             last_message['content'] = json_obj['message2user']
                             return last_message['content']
-                        except:
+                        except Exception:
                             pass
                 elif f'message2'.lower() in last_message['content'].lower():
                     try:
@@ -3717,7 +3717,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             if json_obj:
                 try:
                     last_message['content'] = json_obj['message2user']
-                except:
+                except Exception:
                     pass
         elif f'message2'.lower() in last_message['content'].lower():
             try:
@@ -4368,7 +4368,7 @@ def recipe(user_id, text, prompt_id, file_id, request_id):
                 return 'Agent Created Successfully'
             else:
                 return json_response['message']
-    except:
+    except Exception:
         pass
 
     return last_response

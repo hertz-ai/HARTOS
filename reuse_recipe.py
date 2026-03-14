@@ -244,7 +244,7 @@ class Action:
     def get_action(self, current_action):
         try:
             return self.actions[current_action]
-        except:
+        except Exception:
             raise IndexError("Custom message: Index is out of range!")
 
     def set_ledger(self, ledger):
@@ -1531,7 +1531,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             res = pooled_get("https://mailer.hertzai.com/get_image_by_id/{}".format(avatar_id))
             res = res.json()
             new_image_url = res["image_url"]
-        except:
+        except Exception:
             data['openvoice'] = "true"
             new_image_url = None
             res = {'voice_id': None}
@@ -1574,7 +1574,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         try:
             video_link = pooled_post("{}/video_generate_save".format(database_url),
                                        data=json.dumps(data), headers=headers, timeout=1)
-        except:
+        except Exception:
             pass
         if data['chattts'] or data['flag_hallo'] == "true":
             return f"Video Generation task added to queue with conv_id:{conv_id}. Ask the helper to save this conv_id in the same collection from which the story used to generate the video was retrieved, for future reference"
@@ -2049,7 +2049,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                                         return "Perform drag action"
                                     else:
                                         return f"Perform {action_type} action"
-                                except:
+                                except Exception:
                                     # If eval fails, try regex
                                     action_match = re.search(r"'action':\s*'([^']+)'", text)
                                     text_match = re.search(r"'text':\s*'([^']+)'", text)
@@ -2796,7 +2796,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                     current_app.logger.info('GOT COMPLETED FOR ACTION')
                     try:
                         time_actions[user_prompt].current_action += 1
-                    except:
+                    except Exception:
                         current_app.logger.error('GOT ERROR WHILE UPDATING CURRENT ACTION')
                         time_actions[user_prompt].current_action += 1
                     return chat_instructor1
@@ -2830,7 +2830,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                     current_app.logger.info('Sending user the message')
                     json_obj = json.loads(json_part)
                     send_message_to_user1(user_id, json_obj['message2userfinal'], '', prompt_id)
-                except:
+                except Exception:
                     pass
                 return "auto"
 
@@ -2873,7 +2873,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                     current_app.logger.info('Sending user the message')
                     json_obj = json.loads(json_part)
                     send_message_to_user1(user_id, json_obj['message2userfinal'], '', prompt_id)
-                except:
+                except Exception:
                     pass
 
         pattern3 = r"@statusverifier"
@@ -3082,7 +3082,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                 except IndexError as e:
                     current_app.logger.info(f"COmpleted ALL ACTIONS:")
                     return ''
-                except:
+                except Exception:
                     try:
                         json_match = re.search(r'{[\s\S]*}', group_chat.messages[-2]["content"])
                         if json_match:
@@ -3482,7 +3482,7 @@ def get_ledger_status_for_logging(user_prompt: str) -> str:
     try:
         summary = ledger.get_execution_summary()
         return f"Ledger: {summary['total']} tasks ({len(summary['completed'])} done, {len(summary['in_progress'])} running, {len(summary['pending'])} pending)"
-    except:
+    except Exception:
         return "Ledger: status unavailable"
 
 
@@ -3588,7 +3588,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                 chat_instructor.initiate_chat(recipient=manager, message=user_message,
                                                               clear_history=False, silent=False)
                                 continue
-                        except:
+                        except Exception:
                             try:
                                 json_match = re.search(r'{[\s\S]*}', group_chat.messages[-2]["content"])
                                 if json_match:
@@ -3654,7 +3654,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                     if json_obj:
                         try:
                             last_message['content'] = json_obj['message2userfinal']
-                        except:
+                        except Exception:
                             pass
 
                 elif f'message2'.lower() in last_message['content'].lower():
@@ -3662,7 +3662,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                     if json_obj:
                         try:
                             last_message['content'] = json_obj['message2']
-                        except:
+                        except Exception:
                             pass
 
                 return last_message['content']
