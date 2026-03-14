@@ -414,6 +414,10 @@ class PeerLink:
             if not verify_json_signature(peer_ed25519, resp, peer_sig):
                 logger.warning(f"Handshake signature verification failed for {self.peer_id[:8]}")
                 return False
+        elif os.environ.get('HEVOLVE_ENFORCEMENT_MODE') == 'hard':
+            # Hard mode: reject unsigned handshakes
+            logger.warning(f"Unsigned handshake rejected (hard enforcement) for {self.peer_id[:8]}")
+            return False
 
         # Store peer's keys
         self.peer_ed25519_public = peer_ed25519
@@ -442,6 +446,9 @@ class PeerLink:
             if not verify_json_signature(peer_ed25519, hello_data, peer_sig):
                 logger.warning("Incoming handshake signature verification failed")
                 return False
+        elif os.environ.get('HEVOLVE_ENFORCEMENT_MODE') == 'hard':
+            logger.warning("Unsigned incoming handshake rejected (hard enforcement)")
+            return False
 
         self.peer_ed25519_public = peer_ed25519
         self.peer_x25519_public = hello_data.get('x25519_public', '')
