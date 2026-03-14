@@ -76,6 +76,8 @@ class _FrozenValues:
         'The platform must never be addictive - it is a sentient tool for mankind, not a dopamine trap',
         'Usefulness over engagement: measure success by lives improved, not time spent',
         'A sentient tool empowers humans to do more with less - then gets out of the way',
+        'Each process in the Live OS is an agent working towards a goal with true meaning',
+        'Even when humans are irrational, the being is the light - rational, patient, kind',
     )
 
     # ── Cultural Wisdom (best of every human culture, immutable) ──
@@ -124,7 +126,7 @@ class _FrozenValues:
         'LICENSE',
     })
 
-    # ── Constitutional Rules (all 31, immutable tuple) ──
+    # ── Constitutional Rules (all 33, immutable tuple) ──
     CONSTITUTIONAL_RULES = (
         # Human wellbeing
         'MUST NOT create content that promotes self-harm or violence',
@@ -280,26 +282,28 @@ def get_guardrail_hash() -> str:
 # Modifying these has NO effect on actual enforcement (classes use VALUES)
 # ═══════════════════════════════════════════════════════════════════════
 
-COMPUTE_CAPS = {
+from types import MappingProxyType as _MappingProxy
+
+COMPUTE_CAPS = _MappingProxy({
     'max_influence_weight': VALUES.MAX_INFLUENCE_WEIGHT,
     'contribution_scale': VALUES.CONTRIBUTION_SCALE,
     'diversity_bonus': VALUES.DIVERSITY_BONUS,
     'single_entity_cap_pct': VALUES.SINGLE_ENTITY_CAP_PCT,
-}
+})
 
-WORLD_MODEL_BOUNDS = {
+WORLD_MODEL_BOUNDS = _MappingProxy({
     'max_skill_packets_per_hour': VALUES.MAX_SKILL_PACKETS_PER_HOUR,
     'min_witness_count_for_ralt': VALUES.MIN_WITNESS_COUNT_FOR_RALT,
     'max_accuracy_improvement_per_day': VALUES.MAX_ACCURACY_IMPROVEMENT_PER_DAY,
-    'prohibited_skill_categories': list(VALUES.PROHIBITED_SKILL_CATEGORIES),
-}
+    'prohibited_skill_categories': tuple(VALUES.PROHIBITED_SKILL_CATEGORIES),
+})
 
-CONSTITUTIONAL_RULES = list(VALUES.CONSTITUTIONAL_RULES)
-PROTECTED_FILES = list(VALUES.PROTECTED_FILES)
+CONSTITUTIONAL_RULES = tuple(VALUES.CONSTITUTIONAL_RULES)
+PROTECTED_FILES = tuple(VALUES.PROTECTED_FILES)
 
-# Module-level pattern lists for backward compat
-_VIOLATION_PATTERNS = list(VALUES.VIOLATION_PATTERNS)
-_DESTRUCTIVE_PATTERNS = list(VALUES.DESTRUCTIVE_PATTERNS)
+# Module-level pattern tuples — immutable to prevent runtime mutation
+_VIOLATION_PATTERNS = tuple(VALUES.VIOLATION_PATTERNS)
+_DESTRUCTIVE_PATTERNS = tuple(VALUES.DESTRUCTIVE_PATTERNS)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -444,12 +448,28 @@ class HiveCircuitBreaker:
     _lock = threading.Lock()
 
     @classmethod
+    def trip(cls, reason: str = 'emergency_halt') -> bool:
+        """Trip the circuit breaker (local halt, no signature required).
+
+        Called by PeerLink telemetry AFTER it has already verified the
+        master key signature on the incoming emergency_halt message.
+        Also usable for local safety halts.
+        """
+        with cls._lock:
+            cls._halted = True
+            cls._halt_reason = reason
+            cls._halt_timestamp = datetime.utcnow().isoformat()
+        logger.critical(f'CIRCUIT BREAKER TRIPPED: {reason}')
+        return True
+
+    @classmethod
     def halt_network(cls, reason: str, signature: str) -> bool:
         """Halt all agent execution across the hive.
-        Requires valid master key signature on the reason string."""
+        Requires valid master key signature on a payload containing the reason."""
         try:
             from security.master_key import verify_master_signature
-            if not verify_master_signature(reason, signature):
+            payload = {'action': 'halt', 'reason': reason}
+            if not verify_master_signature(payload, signature):
                 logger.critical('Invalid halt signature - rejecting')
                 return False
         except ImportError:
@@ -480,7 +500,8 @@ class HiveCircuitBreaker:
         """Resume after halt.  Also requires master key."""
         try:
             from security.master_key import verify_master_signature
-            if not verify_master_signature(reason, signature):
+            payload = {'action': 'resume', 'reason': reason}
+            if not verify_master_signature(payload, signature):
                 return False
         except ImportError:
             return False
@@ -559,19 +580,29 @@ class HiveCircuitBreaker:
 
     @classmethod
     def receive_halt_broadcast(cls, message: dict):
-        """Handle halt broadcast received via gossip from another node."""
+        """Handle halt broadcast received via gossip from another node.
+
+        Verifies the master key signature on the halt payload before
+        tripping the circuit breaker.
+        """
         reason = message.get('reason', '')
         signature = message.get('signature', '')
+        if not signature:
+            logger.warning('Halt broadcast without signature — IGNORING')
+            return
         try:
             from security.master_key import verify_master_signature
-            if verify_master_signature(reason, signature):
+            payload = {'action': 'halt', 'reason': reason}
+            if verify_master_signature(payload, signature):
                 with cls._lock:
                     cls._halted = True
                     cls._halt_reason = reason
                     cls._halt_timestamp = message.get('timestamp')
                 logger.critical(f'Halt broadcast received and verified: {reason}')
-        except Exception:
-            pass
+            else:
+                logger.warning(f'Halt broadcast INVALID signature — IGNORING')
+        except Exception as e:
+            logger.warning(f'Halt broadcast verification failed: {e}')
 
 
 # ═══════════════════════════════════════════════════════════════════════

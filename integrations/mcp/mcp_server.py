@@ -16,6 +16,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 from core.port_registry import get_port
+from core.http_pool import pooled_get, pooled_post
 
 from mcp.server.fastmcp import FastMCP
 
@@ -214,16 +215,14 @@ def agent_status() -> str:
 
     # Check running server
     try:
-        import requests
-        resp = requests.get('http://localhost:5000/health', timeout=2)
+        resp = pooled_get('http://localhost:5000/health', timeout=2)
         status['nunba_server'] = 'running' if resp.status_code == 200 else f'status {resp.status_code}'
     except Exception:
         status['nunba_server'] = 'not reachable'
 
     # Check LLM
     try:
-        import requests
-        resp = requests.get(f'http://localhost:{get_port("llm")}/health', timeout=2)
+        resp = pooled_get(f'http://localhost:{get_port("llm")}/health', timeout=2)
         status['llm_server'] = 'running' if resp.status_code == 200 else f'status {resp.status_code}'
     except Exception:
         status['llm_server'] = 'not reachable'
@@ -318,19 +317,17 @@ def system_health() -> str:
 
     # Flask server
     try:
-        import requests
-        resp = requests.get('http://localhost:5000/health', timeout=2)
+        resp = pooled_get('http://localhost:5000/health', timeout=2)
         health['flask'] = {'status': 'up', 'code': resp.status_code}
     except Exception:
         health['flask'] = {'status': 'down'}
 
     # LLM server
     try:
-        import requests
-        resp = requests.get(f'http://localhost:{get_port("llm")}/health', timeout=2)
+        resp = pooled_get(f'http://localhost:{get_port("llm")}/health', timeout=2)
         health['llm'] = {'status': 'up', 'code': resp.status_code}
         try:
-            models_resp = requests.get(f'http://localhost:{get_port("llm")}/v1/models', timeout=2)
+            models_resp = pooled_get(f'http://localhost:{get_port("llm")}/v1/models', timeout=2)
             if models_resp.status_code == 200:
                 data = models_resp.json()
                 models = data.get('data', [])
@@ -342,8 +339,7 @@ def system_health() -> str:
 
     # LangChain agent (port 6778)
     try:
-        import requests
-        resp = requests.get('http://localhost:6778/health', timeout=2)
+        resp = pooled_get('http://localhost:6778/health', timeout=2)
         health['langchain'] = {'status': 'up' if resp.status_code == 200 else 'error'}
     except Exception:
         health['langchain'] = {'status': 'down'}
@@ -452,7 +448,7 @@ def switch_model(model_name: str) -> str:
 
     try:
         import requests
-        resp = requests.post('http://localhost:5000/api/llm/switch', json={"model_index": model_index}, timeout=120)
+        resp = pooled_post('http://localhost:5000/api/llm/switch', json={"model_index": model_index}, timeout=120)
         if resp.status_code == 200:
             return json.dumps(resp.json(), default=str)
         return json.dumps({"error": f"Server returned {resp.status_code}: {resp.text[:300]}"})
@@ -475,6 +471,55 @@ def switch_model(model_name: str) -> str:
             })
         except Exception as e:
             return json.dumps({"error": str(e)})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def code(
+    task: str,
+    task_type: str = 'feature',
+    preferred_tool: str = '',
+    working_dir: str = '',
+    model: str = '',
+) -> str:
+    """Execute a coding task via the distributed coding agent.
+
+    Routes to the best available tool (kilocode, claude_code, opencode, aider).
+    Records benchmarks. Captures edits as recipes for REUSE mode.
+
+    task_type: feature, bug_fix, refactor, code_review, app_build
+    """
+    try:
+        from integrations.coding_agent.orchestrator import get_coding_orchestrator
+        orchestrator = get_coding_orchestrator()
+        result = orchestrator.execute(
+            task=task,
+            task_type=task_type,
+            preferred_tool=preferred_tool,
+            user_id='claude_mcp',
+            model=model,
+            working_dir=working_dir or os.getcwd(),
+        )
+        return json.dumps(result, indent=2, default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def onboard_kong(
+    kong_url: str = 'http://localhost:8001',
+    upstream_url: str = 'http://localhost:8000',
+) -> str:
+    """Onboard the Mindstory SDK into Kong API Gateway.
+
+    Creates service, routes, and plugins (key-auth, rate-limiting, cors).
+    Idempotent — safe to call multiple times. Queries existing config first.
+    """
+    try:
+        from integrations.gateway.kong_onboard import onboard
+        ok = onboard(kong_url=kong_url, upstream_url=upstream_url)
+        return json.dumps({"success": ok})
     except Exception as e:
         return json.dumps({"error": str(e)})
 

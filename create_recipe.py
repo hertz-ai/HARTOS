@@ -304,12 +304,9 @@ else:
         "price": [0, 0]
     }]
 # Per-request model config override (speculative execution, hive compute routing)
+# Canonical implementation lives in helper.py — thin wrapper passes local config_list.
 def get_llm_config():
-    """Get LLM config — checks thread-local override before falling back to global.
-    This enables per-dispatch model routing for speculative execution."""
-    from threadlocal import thread_local_data
-    override = thread_local_data.get_model_config_override()
-    return {"cache_seed": None, "config_list": override or config_list, "max_tokens": 1500}
+    return helper_fun.get_llm_config(config_list)
 
 # Performance: cached config loading (shared with helper.py, reuse_recipe.py)
 from core.config_cache import get_config as _get_config
@@ -351,29 +348,9 @@ from core.config_cache import get_db_url
 database_url = get_db_url() or 'https://mailer.hertzai.com'
 
 
-def save_conversation_db(text,user_id,prompt_id,database_url,request_id):
-    headers = {'Content-Type': 'application/json'}
-    data = {
-        "request": 'VIDEO GENERATION FROM GENERATE_VIDEO',
-        "response": text.strip(),
-        "user_id": int(user_id),
-        "conv_bot_name": 'GPT-4o',
-        "topic": f'{prompt_id}',
-        "revision": False,
-        "dialogue_id": None,
-        "card_type": 'Custom GPT',
-        "qid": None,
-        "layout_id": None,
-        "layout_list": '[]',
-        "request_token": 0,
-        "response_token": 0,
-        "request_id": request_id,
-        "historical_request_id": str('[]')
-    }
-    res = pooled_post("{}/conversation".format(database_url),
-                        data=json.dumps(data), headers=headers).json()
-    conv_id = res['conv_id']
-    return conv_id
+def save_conversation_db(text, user_id, prompt_id, database_url, request_id):
+    """Delegate to canonical implementation in helper.py."""
+    return helper_fun.save_conversation_db(text, user_id, prompt_id, database_url, request_id)
 
 
 def send_message_to_user1(user_id,response,inp,prompt_id):
@@ -514,7 +491,7 @@ def get_action_user_details(user_id):
     time_zone = "Asia/Kolkata"
     try:
         india_tz = pytz.timezone(time_zone)
-    except:
+    except Exception:
         india_tz = None
     payload = {}
     headers = {}
@@ -533,7 +510,7 @@ def get_action_user_details(user_id):
                     else:
                         first_action_text = f"{action} on {date.strftime('%Y-%m-%dT%H:%M:%S')}"
                     action_texts.append(first_action_text)
-                except:
+                except Exception:
                     action_texts.append(f"{action}")
                 if len(action_texts) == 0:
                     action_texts = ['user has not performed any actions yet.']
@@ -769,7 +746,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         tool_logger.info("[INIT] Trying to initialise...")
 
         apply_autogen_fix_on_startup()
-    except:
+    except Exception:
         tool_logger.info("[INFO] Autogen JSON enhancement ready - will be applied when Flask starts")
 
     # Initialize SimpleMem for this session (from gpt4.1)
@@ -1231,44 +1208,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                             return '\n'.join(cleaned_lines)
 
                         def format_action_text(text):
-                            if text.strip().startswith("{") and "action" in text:
-                                try:
-                                    action_data = ast.literal_eval(text.strip())
-                                    action_type = action_data.get("action", "")
-
-                                    if action_type == "mouse_move":
-                                        return "Move mouse"
-                                    elif action_type == "left_click":
-                                        return "Perform left click"
-                                    elif action_type == "right_click":
-                                        return "Perform right click"
-                                    elif action_type == "double_click":
-                                        return "Perform double click"
-                                    elif action_type == "type" and "text" in action_data:
-                                        return f"Type '{action_data['text']}'"
-                                    elif action_type == "drag":
-                                        return "Perform drag action"
-                                    else:
-                                        return f"Perform {action_type} action"
-                                except:
-                                    action_match = re.search(r"'action':\s*'([^']+)'", text)
-                                    text_match = re.search(r"'text':\s*'([^']+)'", text)
-
-                                    if action_match:
-                                        action_type = action_match.group(1)
-                                        if action_type == "type" and text_match:
-                                            return f"Type '{text_match.group(1)}'"
-                                        elif action_type == "mouse_move":
-                                            return "Move mouse"
-                                        elif action_type == "left_click":
-                                            return "Perform left click"
-                                        elif action_type == "right_click":
-                                            return "Perform right click"
-                                        elif action_type == "double_click":
-                                            return "Perform double click"
-                                        else:
-                                            return f"Perform {action_type} action"
-                            return text
+                            return helper_fun.format_action_text(text)
 
                         # Process extracted responses into recipe steps
                         recipe_steps = []
@@ -1884,7 +1824,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                             # Add the error context as a new message to maintain the original error message
                             if last_speaker.name != "Helper":
                                 return helper
-                    except:
+                    except Exception:
                         pass
         except Exception as e:
             current_app.logger.error(f"Error in error detection logic: {e}")
@@ -2749,7 +2689,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
                     current_app.logger.info('GOT COMPLETED FOR ACTION')
                     try:
                         time_actions[user_prompt].current_action += 1
-                    except:
+                    except Exception:
                         current_app.logger.error('GOT ERROR WHILE UPDATING CURRENT ACTION')
                         time_actions[user_prompt].current_action += 1
                     return chat_instructor1
@@ -2782,7 +2722,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
                     current_app.logger.info('Sending user the message')
                     json_obj = json.loads(json_part)
                     send_message_to_user1(user_id,json_obj['message2user'],'',prompt_id)
-                except:
+                except Exception:
                     pass
                 return "auto"
 
@@ -3006,7 +2946,7 @@ def get_ledger_status_for_logging(user_prompt: str) -> str:
     try:
         summary = ledger.get_execution_summary()
         return f"Ledger: {summary['total']} tasks ({len(summary['completed'])} done, {len(summary['in_progress'])} running, {len(summary['pending'])} pending)"
-    except:
+    except Exception:
         return "Ledger: status unavailable"
 
 
@@ -3201,7 +3141,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             try:
                 message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)
                 text = f'Properly Execute Action {user_tasks[user_prompt].current_action}: {message} '
-            except:
+            except Exception:
                 message = ""
                 text = f'Properly Execute Action {user_tasks[user_prompt].current_action}: {message} '
     # Initiate or resume chat
@@ -3525,7 +3465,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     user_tasks[user_prompt].new_json.append(json_obj)
                     try:
                         message = user_tasks[user_prompt].get_action(current_action_id - 1)
-                    except:
+                    except Exception:
                         flow, json_response = after_all_actions_terminated_from_exception(assistant_agent, chat_instructor, flow,
                                                                                           group_chat, manager, prompt_id, user_prompt)
                         if all_flows_completed(prompt_id, get_total_flows(user_prompt), user_prompt):
@@ -3618,7 +3558,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     if json_obj:
                         try:
                             last_message['content'] = json_obj['message2user']
-                        except:
+                        except Exception:
                             pass
                     return last_message['content']
                 elif f'message2'.lower() in last_message['content'].lower():
@@ -3665,7 +3605,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         try:
                             last_message['content'] = json_obj['message2user']
                             return last_message['content']
-                        except:
+                        except Exception:
                             pass
                 elif f'message2'.lower() in last_message['content'].lower():
                     try:
@@ -3717,7 +3657,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             if json_obj:
                 try:
                     last_message['content'] = json_obj['message2user']
-                except:
+                except Exception:
                     pass
         elif f'message2'.lower() in last_message['content'].lower():
             try:
@@ -4368,7 +4308,7 @@ def recipe(user_id, text, prompt_id, file_id, request_id):
                 return 'Agent Created Successfully'
             else:
                 return json_response['message']
-    except:
+    except Exception:
         pass
 
     return last_response

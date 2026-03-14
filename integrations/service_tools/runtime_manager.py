@@ -28,22 +28,27 @@ logger = logging.getLogger(__name__)
 STATE_FILE = Path.home() / '.hevolve' / 'tool_state.json'
 SERVERS_DIR = os.path.join(os.path.dirname(__file__), 'servers')
 
-# Tool configuration: name → {repo_url, server_script, hf_repo_id, is_inprocess}
+# Tool configuration: name → {repo_url, server_script, hf_repo_id, is_inprocess, catalog_id}
+# catalog_id links RTM tools to ModelCatalog entries so the orchestrator stays in sync.
+# None = no catalog entry (tool is a wrapper or resolved dynamically).
 TOOL_CONFIGS = {
     'wan2gp': {
         'repo_url': 'https://github.com/deepbeepmeep/Wan2GP',
         'server_script': os.path.join(SERVERS_DIR, 'wan2gp_server.py'),
         'download_type': 'git',
+        'catalog_id': 'video_gen-ltx2',
     },
     'tts_audio_suite': {
         'repo_url': 'https://github.com/diodiogod/TTS-Audio-Suite',
         'server_script': os.path.join(SERVERS_DIR, 'tts_audio_suite_server.py'),
         'download_type': 'git',
+        'catalog_id': None,  # wrapper — individual engines have their own entries
     },
     'whisper': {
         'hf_repo_id': 'openai/whisper-base',
         'download_type': 'hf',
         'is_inprocess': True,
+        'catalog_id': None,  # resolved dynamically from select_whisper_model()
     },
 }
 
@@ -147,11 +152,13 @@ class RuntimeToolManager:
         config = TOOL_CONFIGS.get(tool_name)
         if config and config.get('is_inprocess'):
             result = self._stop_inprocess(tool_name)
+            self._unsync_catalog(tool_name)
             self._notify_hooks('on_tool_stopped', tool_name)
             return result
 
         self._kill_server(tool_name)
         self.vram.release(tool_name)
+        self._unsync_catalog(tool_name)
         self._notify_hooks('on_tool_stopped', tool_name)
         self.save_state()
         return {'tool': tool_name, 'status': 'stopped'}
@@ -214,6 +221,46 @@ class RuntimeToolManager:
                 self._stop_inprocess(name)
         self.save_state()
         logger.info("All runtime tools stopped")
+
+    # ── Catalog sync — single authority for model state ─────────
+    # RTM is a process manager; the orchestrator's catalog is the
+    # authority on "what is loaded." These methods bridge the gap.
+
+    def _sync_catalog(self, tool_name: str, device: str = 'gpu',
+                      catalog_id: str = None) -> None:
+        """Notify orchestrator catalog that a model is now loaded."""
+        cid = catalog_id or TOOL_CONFIGS.get(tool_name, {}).get('catalog_id')
+        if not cid:
+            return
+        try:
+            from .model_orchestrator import get_orchestrator
+            orch = get_orchestrator()
+            entry = orch._catalog.get(cid)
+            if entry and not entry.loaded:
+                orch._catalog.mark_loaded(cid, device=device)
+                orch._register_vram(entry, device)
+                orch._register_lifecycle(entry)
+                orch._register_service_tool(entry)
+                logger.info(f"Catalog synced: {cid} loaded via RTM")
+        except Exception as e:
+            logger.debug(f"Catalog sync skipped for {tool_name}: {e}")
+
+    def _unsync_catalog(self, tool_name: str) -> None:
+        """Notify orchestrator catalog that a model was unloaded."""
+        cid = TOOL_CONFIGS.get(tool_name, {}).get('catalog_id')
+        if not cid:
+            return
+        try:
+            from .model_orchestrator import get_orchestrator
+            orch = get_orchestrator()
+            entry = orch._catalog.get(cid)
+            if entry and entry.loaded:
+                orch._release_vram(entry)
+                orch._deregister_service_tool(entry)
+                orch._catalog.mark_unloaded(cid)
+                logger.info(f"Catalog synced: {cid} unloaded via RTM")
+        except Exception as e:
+            logger.debug(f"Catalog unsync skipped for {tool_name}: {e}")
 
     # ── State persistence ────────────────────────────────────────
 
@@ -318,6 +365,7 @@ class RuntimeToolManager:
             self._register_tool_at_port(tool_name, port)
 
             logger.info(f"Started {tool_name} on port {port} (PID {proc.pid})")
+            self._sync_catalog(tool_name, device='gpu')
             self._notify_hooks('on_tool_started', tool_name,
                                device='gpu', offload_mode=offload_mode)
             return {'running': True, 'port': port, 'pid': proc.pid}
@@ -335,6 +383,9 @@ class RuntimeToolManager:
                 WhisperTool.register_functions()
                 self.vram.allocate(tool_name)
                 logger.info(f"Whisper registered in-process (model: {model_name})")
+                # Resolve catalog_id dynamically from selected model size
+                self._sync_catalog(tool_name, device='cpu',
+                                   catalog_id=f'stt-whisper-{model_name}')
                 self._notify_hooks('on_tool_started', tool_name,
                                    device='gpu', inprocess=True)
                 return {'running': True, 'inprocess': True, 'model': model_name}

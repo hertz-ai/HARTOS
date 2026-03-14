@@ -6,11 +6,26 @@ from reuse_recipe import chat_agent, crossbar_multiagent, time_based_execution
 
 print('Inside crossbar_server')
 
-# Crossbar/WAMP component setup        
-url = os.environ.get('CBURL', "ws://aws_rasa.hertzai.com:8088/ws")
+# Crossbar/WAMP component setup
+url = os.environ.get('CBURL', "ws://localhost:8088/ws")
 realmvalue = os.environ.get('CBREALM', 'realm1')
 
-component = Component(transports=url, realm=realmvalue)
+# Prefer WSS (TLS) for production — warn if using plaintext ws://
+if url.startswith('ws://') and os.environ.get('HEVOLVE_NODE_TIER') == 'central':
+    print("WARNING: Using plaintext ws:// on central tier — set CBURL to wss:// for production")
+
+# Build transport config with optional ticket auth
+_transport_config = {'url': url, 'max_retry_delay': 30}
+_wamp_ticket = os.environ.get('HEVOLVE_WAMP_TICKET', '')
+
+if _wamp_ticket:
+    component = Component(
+        transports=[_transport_config],
+        realm=realmvalue,
+        authentication={'ticket': {'ticket': _wamp_ticket, 'authid': os.environ.get('HEVOLVE_NODE_ID', 'anon')}},
+    )
+else:
+    component = Component(transports=url, realm=realmvalue)
 wamp_session = None  # Global variable to store session
 response_event = asyncio.Event()
 response_message = None  # To store the response

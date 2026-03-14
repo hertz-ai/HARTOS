@@ -34,7 +34,7 @@ logger = logging.getLogger('hevolve_security')
 
 # ── Trust Anchor ──
 # 64-char hex Ed25519 public key. The corresponding private key is a GitHub Secret.
-MASTER_PUBLIC_KEY_HEX = 'ef380be7923d2b6bf88611d4ee5b9c20dc0f97549889ae51e407c4e54221bc1e'
+MASTER_PUBLIC_KEY_HEX = "4662e30d86c2f58416c5ac3f806c2a6af8186e1d96fdbbcad3189847cf888a01"
 
 RELEASE_MANIFEST_FILENAME = 'release_manifest.json'
 
@@ -61,6 +61,24 @@ def verify_master_signature(payload: dict, signature_hex: str) -> bool:
         return False
 
 
+def verify_revocation_message(message_bytes: bytes, signature_hex: str) -> bool:
+    """Verify that a revocation/halt message was signed by the master private key.
+
+    Unlike verify_master_signature (which takes a dict and canonicalises it),
+    this operates on raw bytes — suitable for the PeerLink emergency-halt path
+    and any future revocation messages.
+
+    Only the PUBLIC key is used.  The private key is never touched.
+    """
+    try:
+        pub = get_master_public_key()
+        sig = bytes.fromhex(signature_hex)
+        pub.verify(sig, message_bytes)
+        return True
+    except (InvalidSignature, ValueError, Exception):
+        return False
+
+
 def load_release_manifest(code_root: str = None) -> Optional[dict]:
     """Load release_manifest.json from code root directory."""
     root = Path(code_root or _CODE_ROOT)
@@ -71,7 +89,7 @@ def load_release_manifest(code_root: str = None) -> Optional[dict]:
         with open(manifest_path, 'r', encoding='utf-8') as f:
             return json.load(f)
     except (json.JSONDecodeError, IOError) as e:
-        logger.warning(f"Failed to load release manifest: {e}")
+        logger.warning("Failed to load release manifest: %s" % e)
         return None
 
 

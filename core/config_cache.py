@@ -162,5 +162,5 @@ def get_book_parsing_api() -> str:
 
 def get_visual_context_api(user_id, mins=5) -> str:
     """Visual context query URL (recent actions by time window)."""
-    base = _local_base() if is_bundled() else 'https://mailer.hertzai.com'
+    base = _local_base() if is_bundled() else os.environ.get('HEVOLVE_MAILER_URL', _local_base())
     return f'{base}/get_visual_bymins?user_id={user_id}&mins={mins}'

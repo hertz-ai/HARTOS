@@ -370,9 +370,9 @@ class ThemeService:
     def _notify_liquid_ui(theme: dict):
         """Push theme update to LiquidUI Flask server."""
         try:
-            import requests
+            from core.http_pool import pooled_post
             port = os.environ.get('HART_LIQUID_UI_PORT', '6800')
-            requests.post(
+            pooled_post(
                 f'http://localhost:{port}/api/theme',
                 json={'theme': theme},
                 timeout=2,

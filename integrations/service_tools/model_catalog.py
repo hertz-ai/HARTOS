@@ -19,22 +19,59 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field, asdict
+from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger('ModelCatalog')
 
-# ── Model type constants ──────────────────────────────────────────
-MODEL_TYPES = {
-    'llm':       'Large Language Model',
-    'tts':       'Text-to-Speech',
-    'stt':       'Speech-to-Text',
-    'vlm':       'Vision-Language Model',
-    'image_gen': 'Image Generation',
-    'video_gen': 'Video Generation',
-    'audio_gen': 'Audio/Music Generation',
-    'embedding': 'Embedding Model',
+
+# ── Model type enum — single source of truth ─────────────────────
+# Use ModelType.LLM (not 'llm') everywhere. The .value IS the string
+# so JSON serialization and dict key usage work unchanged.
+#
+# Usage:
+#   ModelType.LLM          → <ModelType.LLM: 'llm'>
+#   ModelType.LLM.value    → 'llm'
+#   ModelType.LLM.label    → 'Large Language Model'
+#   ModelType('llm')       → ModelType.LLM  (lookup from string)
+#   str(ModelType.LLM)     → 'llm'          (clean string for JSON/logs)
+
+class ModelType(str, Enum):
+    """Canonical model type identifiers. Inherits from str so
+    ModelType.LLM == 'llm' is True — backwards compatible with
+    all existing string comparisons, dict keys, and JSON."""
+
+    LLM       = 'llm'
+    TTS       = 'tts'
+    STT       = 'stt'
+    VLM       = 'vlm'
+    IMAGE_GEN = 'image_gen'
+    VIDEO_GEN = 'video_gen'
+    AUDIO_GEN = 'audio_gen'
+    EMBEDDING = 'embedding'
+
+    @property
+    def label(self) -> str:
+        return _MODEL_TYPE_LABELS[self]
+
+    def __str__(self) -> str:
+        return self.value
+
+
+_MODEL_TYPE_LABELS = {
+    ModelType.LLM:       'Large Language Model',
+    ModelType.TTS:       'Text-to-Speech',
+    ModelType.STT:       'Speech-to-Text',
+    ModelType.VLM:       'Vision-Language Model',
+    ModelType.IMAGE_GEN: 'Image Generation',
+    ModelType.VIDEO_GEN: 'Video Generation',
+    ModelType.AUDIO_GEN: 'Audio/Music Generation',
+    ModelType.EMBEDDING: 'Embedding Model',
 }
+
+# Backwards-compatible dict for code that iterates MODEL_TYPES
+MODEL_TYPES = {mt.value: mt.label for mt in ModelType}
 
 # Backend runtimes
 BACKENDS = {
@@ -371,7 +408,7 @@ class ModelCatalog:
             if mid in self._entries:
                 continue
             entry = ModelEntry(
-                id=mid, name=name, model_type='stt',
+                id=mid, name=name, model_type=ModelType.STT,
                 source='huggingface',
                 vram_gb=vram, ram_gb=ram,
                 backend='torch', supports_gpu=vram > 0, supports_cpu=True,
@@ -391,7 +428,7 @@ class ModelCatalog:
         if 'vlm-minicpm-v2' not in self._entries:
             entry = ModelEntry(
                 id='vlm-minicpm-v2', name='MiniCPM-V-2',
-                model_type='vlm', source='huggingface',
+                model_type=ModelType.VLM, source='huggingface',
                 repo_id='openbmb/MiniCPM-V-2',
                 vram_gb=4.0, ram_gb=4.0, disk_gb=4.0,
                 min_capability_tier='full',

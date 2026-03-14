@@ -1,8 +1,8 @@
 site_name: HART OS Documentation
 site_url: https://docs.hevolve.ai
 site_description: Hevolve Hive Agentic Runtime -Crowdsourced compute infrastructure for autonomous Hive AI Training, distributed agents, self-sustaining economy. No entity monopolizes AI.
-repo_url: https://github.com/hevolve/hart
-repo_name: hevolve/hart
+repo_url: https://github.com/hertz-ai/HARTOS
+repo_name: hertz-ai/HARTOS
 
 theme:
   name: material
@@ -60,6 +60,7 @@ nav:
     - Coding Agent (Idle Compute): features/coding-agent.md
     - Trading Agents: features/trading-agents.md
     - Channel Adapters: features/channels.md
+    - Device Discovery & Pairing: features/device-pairing.md
     - Autonomous Upgrade Pipeline: features/upgrade-pipeline.md
     - Benchmark & Baseline Tracking: features/benchmark-tracking.md
   - Provider Guide:
@@ -79,6 +80,10 @@ nav:
     - Settings UI Spec: ui/settings-spec.md
     - Provider Dashboard UI: ui/provider-dashboard.md
   - Developer Guide:
+    - Developer Journey: developer/user-journey.md
+    - HART SDK: developer/sdk.md
+    - Widget Embed: developer/widget-embed.md
+    - Extensions: developer/extensions.md
     - Architecture: developer/architecture.md
     - Key Patterns: developer/patterns.md
     - Security Model: developer/security.md
@@ -95,6 +100,10 @@ nav:
     - Federation Protocol: architecture/federation-protocol.md
     - Nested Task System: architecture/nested-tasks.md
     - PeerLink Protocol: architecture/peer_link.md
+    - Promise Scorecard: architecture/promise-scorecard.md
+
+extra_javascript:
+  - assets/js/chat-widget.js
 
 extra:
   social:

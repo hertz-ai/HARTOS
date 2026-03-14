@@ -740,8 +740,8 @@ class DomainChallengeVerifier:
         # Deliver challenge to the node via HTTP GET
         callback_url = f'http://{fqdn}:{challenge_port}/.well-known/hart-challenge'
         try:
-            import requests as http_requests
-            resp = http_requests.get(
+            from core.http_pool import pooled_get
+            resp = pooled_get(
                 callback_url,
                 params={'nonce': nonce_hex},
                 timeout=10,

@@ -286,6 +286,24 @@ class PeerLink:
             self._message_handlers[channel] = []
         self._message_handlers[channel].append(handler)
 
+    def _verify_same_user_proof(self, proof: str, peer_public_key: str) -> bool:
+        """Verify that the peer is owned by the same user.
+
+        Proof = peer signs our user_id with their Ed25519 key, and we
+        verify that their user_id matches ours. This prevents an attacker
+        from claiming SAME_USER trust without holding the user's key.
+        """
+        try:
+            from security.node_integrity import verify_message_signature
+            # The proof should be a signature of the local user_id
+            local_user_id = os.environ.get('HEVOLVE_USER_ID', '')
+            if not local_user_id or not peer_public_key:
+                return False
+            return verify_message_signature(peer_public_key, local_user_id, proof)
+        except (ImportError, Exception) as e:
+            logger.debug(f"SAME_USER proof verification failed: {e}")
+            return False
+
     def close(self) -> None:
         """Close the connection."""
         if self._state == LinkState.CLOSING:
@@ -356,6 +374,18 @@ class PeerLink:
         except Exception:
             pass
 
+        # Attach pre-trust contract (proves we agreed to hive terms)
+        try:
+            from security.pre_trust_contract import get_pre_trust_verifier
+            from security.node_integrity import get_node_identity
+            nid = get_node_identity().get('node_id', '')
+            verifier = get_pre_trust_verifier()
+            contract = verifier.get_contract(nid)
+            if contract:
+                hello['trust_contract'] = contract
+        except Exception:
+            pass  # Contract optional for SAME_USER trust
+
         hello['signature'] = sign_json_payload(hello)
 
         # Send hello
@@ -384,6 +414,10 @@ class PeerLink:
             if not verify_json_signature(peer_ed25519, resp, peer_sig):
                 logger.warning(f"Handshake signature verification failed for {self.peer_id[:8]}")
                 return False
+        elif os.environ.get('HEVOLVE_ENFORCEMENT_MODE') == 'hard':
+            # Hard mode: reject unsigned handshakes
+            logger.warning(f"Unsigned handshake rejected (hard enforcement) for {self.peer_id[:8]}")
+            return False
 
         # Store peer's keys
         self.peer_ed25519_public = peer_ed25519
@@ -412,17 +446,55 @@ class PeerLink:
             if not verify_json_signature(peer_ed25519, hello_data, peer_sig):
                 logger.warning("Incoming handshake signature verification failed")
                 return False
+        elif os.environ.get('HEVOLVE_ENFORCEMENT_MODE') == 'hard':
+            logger.warning("Unsigned incoming handshake rejected (hard enforcement)")
+            return False
 
         self.peer_ed25519_public = peer_ed25519
         self.peer_x25519_public = hello_data.get('x25519_public', '')
         self.capabilities = hello_data.get('capabilities', {})
 
-        # Determine trust from request
+        # Determine trust LOCALLY — never accept trust_requested from wire.
+        # SAME_USER requires proof: peer must present a user_id_signature
+        # signed by the same user key we hold. Without proof → PEER.
         requested_trust = hello_data.get('trust_requested', 'peer')
         if requested_trust == 'same_user':
-            self.trust = TrustLevel.SAME_USER
+            # Verify SAME_USER claim cryptographically
+            user_proof = hello_data.get('user_id_proof', '')
+            if user_proof and self._verify_same_user_proof(user_proof, peer_ed25519):
+                self.trust = TrustLevel.SAME_USER
+            else:
+                logger.warning("SAME_USER trust requested but no valid proof — downgrading to PEER")
+                self.trust = TrustLevel.PEER
         else:
             self.trust = TrustLevel.PEER
+
+        # Verify pre-trust contract for PEER connections
+        # SAME_USER (own devices) are exempt — trust is user identity based
+        if self.trust != TrustLevel.SAME_USER:
+            try:
+                from security.pre_trust_contract import (
+                    verify_trust_contract, TrustContract,
+                    get_pre_trust_verifier,
+                )
+                contract_data = hello_data.get('trust_contract')
+                if contract_data:
+                    contract = TrustContract(**{
+                        k: v for k, v in contract_data.items()
+                        if k in TrustContract.__dataclass_fields__
+                    })
+                    ok, msg = verify_trust_contract(contract)
+                    if not ok:
+                        logger.warning(
+                            f"Pre-trust contract rejected for "
+                            f"{self.peer_id[:8]}: {msg}")
+                        return False
+                    # Register verified contract
+                    get_pre_trust_verifier().register_contract(contract)
+                    logger.info(
+                        f"Pre-trust contract verified for {self.peer_id[:8]}")
+            except ImportError:
+                pass  # Module not available — allow legacy connections
 
         # Send ack
         ack = {

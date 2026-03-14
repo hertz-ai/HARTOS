@@ -15,12 +15,19 @@ Architecture:
            │   RALT distribution, world model, biometric ML
            └─ Exposed via C ABI + Python ctypes/cffi wrapper
 
-Protection layers:
+Who can run HevolveAI:
+  Anyone on a legitimate deployment — Nunba, HARTOS standalone, Docker,
+  HART OS (Live OS), cloud, or pip install. Flat, regional, or central tier.
+  Users never need the master key. They download already-signed binaries.
+
+Protection (against forks weaponizing, NOT against users running):
   1. Binary is compiled (Rust/C++) — not readable Python
-  2. Binary is signed by master key — tampering = signature invalid
-  3. Binary checks origin attestation — refuses to load on forks
-  4. Symbol names are obfuscated — reverse engineering is hard
-  5. License prohibits decompilation / reverse engineering
+  2. Binary is release-signed by master key — proves authenticity (not tampered)
+  3. Binary checks origin attestation — refuses to load on unauthorized forks
+  4. Forks cannot sign modified binaries — no master key = can't distribute
+     weaponized versions that pass verification
+  5. Forks cannot join federation — origin attestation fails
+  6. License prohibits decompilation / reverse engineering
 
 Search order for native binary:
   1. HEVOLVE_NATIVE_LIB env var (explicit path)
@@ -181,11 +188,106 @@ def _verify_binary_origin_check(lib: ctypes.CDLL) -> Tuple[bool, str]:
 # ═══════════════════════════════════════════════════════════════════════
 
 def _find_native_binary() -> Optional[str]:
-    """Search for the native binary in known locations."""
+    """Search for the native binary in known locations.
+
+    Checks for both plaintext (.so/.dll) and encrypted (.so.enc) variants.
+    Encrypted binaries are decrypted to tmpfs (RAM) at load time.
+    """
     for path in _SEARCH_PATHS:
         if path and os.path.isfile(path):
             return path
+        # Check for encrypted variant
+        enc_path = path + '.enc' if path else ''
+        if enc_path and os.path.isfile(enc_path):
+            decrypted = _decrypt_binary_to_tmpfs(enc_path)
+            if decrypted:
+                return decrypted
     return None
+
+
+def _decrypt_binary_to_tmpfs(enc_path: str) -> Optional[str]:
+    """Decrypt an encrypted HevolveAI binary to RAM-only filesystem.
+
+    The binary is AES-256-GCM encrypted. The decryption key is derived via
+    ECDH between this node's Ed25519 key and the master public key, ensuring
+    only legitimate HART OS nodes (with valid first-boot keypairs) can decrypt.
+
+    File format: [12-byte nonce][ciphertext][16-byte GCM tag]
+
+    The decrypted binary lives ONLY in tmpfs (RAM) — never touches disk.
+    Docker: --read-only --tmpfs /run/hevolve ensures this.
+    """
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    except ImportError:
+        logger.warning("cryptography package not available — cannot decrypt binary")
+        return None
+
+    try:
+        # Derive decryption key: HKDF(node_private_key_seed || master_public_key)
+        # This ensures only nodes with valid Ed25519 keys from first-boot can decrypt
+        node_key_path = os.path.expanduser('~/.hevolve/keys/node_private.key')
+        if not os.path.isfile(node_key_path):
+            node_key_path = '/var/lib/hevolve/node_private.key'
+        if not os.path.isfile(node_key_path):
+            logger.debug("No node private key — cannot decrypt binary")
+            return None
+
+        with open(node_key_path, 'rb') as f:
+            node_seed = f.read(32)
+
+        from security.master_key import MASTER_PUBLIC_KEY_HEX
+        master_pub_bytes = bytes.fromhex(MASTER_PUBLIC_KEY_HEX)
+
+        # HKDF: derive AES-256 key from node_seed + master_public_key
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+        from cryptography.hazmat.primitives import hashes
+        hkdf = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=master_pub_bytes,
+            info=b'hevolve-native-binary-v1',
+        )
+        aes_key = hkdf.derive(node_seed)
+
+        # Read encrypted binary
+        with open(enc_path, 'rb') as f:
+            data = f.read()
+
+        if len(data) < 28:  # 12 nonce + 16 tag minimum
+            logger.warning(f"Encrypted binary too small: {enc_path}")
+            return None
+
+        nonce = data[:12]
+        ciphertext_with_tag = data[12:]
+
+        # Decrypt
+        aesgcm = AESGCM(aes_key)
+        plaintext = aesgcm.decrypt(nonce, ciphertext_with_tag, None)
+
+        # Write to tmpfs (RAM only — never persists to disk)
+        tmpfs_dir = os.environ.get('HEVOLVE_TMPFS', '/run/hevolve')
+        if not os.path.isdir(tmpfs_dir):
+            # Fallback: /dev/shm (Linux shared memory) or system temp
+            for candidate in ['/dev/shm/hevolve', '/tmp/.hevolve_runtime']:
+                try:
+                    os.makedirs(candidate, mode=0o700, exist_ok=True)
+                    tmpfs_dir = candidate
+                    break
+                except OSError:
+                    continue
+
+        decrypted_path = os.path.join(tmpfs_dir, _LIB_NAME)
+        with open(decrypted_path, 'wb') as f:
+            f.write(plaintext)
+        os.chmod(decrypted_path, 0o500)  # read+execute only
+
+        logger.info(f"Decrypted HevolveAI binary to tmpfs: {decrypted_path}")
+        return decrypted_path
+
+    except Exception as e:
+        logger.warning(f"Failed to decrypt binary {enc_path}: {e}")
+        return None
 
 
 def load_native_lib(force_reload: bool = False) -> Tuple[bool, str]:

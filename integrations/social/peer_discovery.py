@@ -708,6 +708,23 @@ class GossipProtocol:
         if not node_id or not url or node_id == self.node_id:
             return False
 
+        # Sybil protection: max 5 nodes per IP/hostname
+        try:
+            from urllib.parse import urlparse
+            host = urlparse(url).hostname or ''
+            if host:
+                from .models import PeerNode
+                same_host_count = db.query(PeerNode).filter(
+                    PeerNode.url.contains(host),
+                    PeerNode.integrity_status != 'banned',
+                ).count()
+                max_per_ip = int(os.environ.get('HEVOLVE_MAX_PEERS_PER_IP', '5'))
+                if same_host_count >= max_per_ip:
+                    logger.warning(f"Sybil limit: {same_host_count} nodes from {host}, rejecting {node_id[:8]}")
+                    return False
+        except Exception:
+            pass  # URL parsing failed — proceed with other checks
+
         # Reject banned nodes
         existing = db.query(PeerNode).filter(PeerNode.node_id == node_id).first()
         if existing and existing.integrity_status == 'banned':

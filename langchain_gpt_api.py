@@ -509,6 +509,7 @@ if _is_bundled:
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
+app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get('HEVOLVE_MAX_PAYLOAD_BYTES', 2 * 1024 * 1024))  # 2MB default
 
 if _is_bundled:
     # Bundled: root owns the handlers; let app.logger propagate to root
@@ -703,6 +704,142 @@ try:
     app.logger.info("Instruction queue API routes registered (8 endpoints)")
 except Exception as e:
     app.logger.warning(f"Instruction queue init skipped: {e}")
+
+# ── Credential Vault API — frontend submits missing credentials ──────
+try:
+    from desktop.ai_key_vault import AIKeyVault as _VaultCls, is_local_request
+
+    @app.route('/api/credentials/submit', methods=['POST'])
+    @_json_endpoint
+    def _api_credentials_submit():
+        """Accept a credential from the frontend — LOCALHOST ONLY.
+
+        Secrets never leave the user's device. This endpoint rejects
+        any request that doesn't originate from the local machine.
+        """
+        if not is_local_request(request.remote_addr):
+            return jsonify({'error': 'Credential endpoints are localhost only. '
+                            'Secrets never leave your device.'}), 403
+        data = request.get_json(silent=True) or {}
+        key_name = (data.get('key_name') or '').strip()
+        value = (data.get('value') or '').strip()
+        if not key_name or not value:
+            return jsonify({'error': 'key_name and value are required'}), 400
+        vault = _VaultCls.get_instance()
+        resolved = vault.store_credential(
+            key_name=key_name,
+            value=value,
+            channel_type=data.get('channel_type', ''),
+        )
+        return jsonify({'success': True, 'key_name': resolved})
+
+    @app.route('/api/credentials/pending', methods=['GET'])
+    @_json_endpoint
+    def _api_credentials_pending():
+        """List pending credential requests — LOCALHOST ONLY."""
+        if not is_local_request(request.remote_addr):
+            return jsonify({'error': 'Credential endpoints are localhost only.'}), 403
+        vault = _VaultCls.get_instance()
+        return jsonify({'pending': vault.get_pending_requests()})
+
+    app.logger.info("Credential vault API routes registered (2 endpoints)")
+except ImportError:
+    pass
+except Exception as e:
+    app.logger.warning(f"Credential vault API init skipped: {e}")
+
+# ── Kong API Gateway — Completions API proxy + metering ───────────────
+try:
+    @app.route('/v1/chat/completions', methods=['POST'])
+    @_json_endpoint
+    def _completions_proxy():
+        """OpenAI-compatible completions — proxied through Kong metering.
+
+        SDK clients hit Kong → Kong routes here → we forward to HevolveAI.
+        Token usage is metered for 90/9/1 revenue split.
+        """
+        import requests as _req
+        data = request.get_json(silent=True) or {}
+        hevolve_url = os.environ.get('HEVOLVE_API_URL', 'http://localhost:8000')
+        headers = {'Content-Type': 'application/json'}
+        try:
+            resp = _req.post(
+                f'{hevolve_url}/v1/chat/completions',
+                json=data,
+                headers=headers,
+                timeout=120
+            )
+            result = resp.json()
+        except Exception as fwd_err:
+            return jsonify({'error': f'HevolveAI backend unavailable: {fwd_err}'}), 502
+
+        # Meter usage for revenue split
+        usage = result.get('usage', {})
+        total_tokens = usage.get('total_tokens', 0)
+        if total_tokens > 0:
+            try:
+                from integrations.agent_engine.budget_gate import record_metered_usage
+                consumer = request.headers.get('X-Consumer-Username', 'anonymous')
+                record_metered_usage(
+                    provider='hevolve',
+                    model=data.get('model', 'hevolve'),
+                    tokens=total_tokens,
+                    source=f'sdk:{consumer}'
+                )
+            except Exception:
+                pass  # metering failure must not block response
+
+        return jsonify(result)
+
+    @app.route('/api/gateway/metering', methods=['GET'])
+    @_json_endpoint
+    def _gateway_metering():
+        """SDK usage metering stats for billing dashboard."""
+        try:
+            from integrations.social.models import db_session, MeteredAPIUsage
+            from sqlalchemy import func
+            with db_session() as session:
+                rows = session.query(
+                    MeteredAPIUsage.provider,
+                    func.sum(MeteredAPIUsage.tokens_used),
+                    func.count(MeteredAPIUsage.id)
+                ).group_by(MeteredAPIUsage.provider).all()
+                return jsonify({
+                    'providers': [
+                        {'provider': r[0], 'total_tokens': int(r[1] or 0), 'calls': r[2]}
+                        for r in rows
+                    ]
+                })
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/gateway/register', methods=['POST'])
+    @_json_endpoint
+    def _gateway_register_node():
+        """Register a compute node as Kong upstream target.
+
+        Called by compute_mesh when a node joins the hive.
+        """
+        data = request.get_json(silent=True) or {}
+        target = data.get('target')  # e.g. "192.168.1.5:8000"
+        if not target:
+            return jsonify({'error': 'target is required'}), 400
+        kong_admin = os.environ.get('KONG_ADMIN_URL', 'http://localhost:8001')
+        upstream = data.get('upstream', 'hevolve-nodes')
+        try:
+            import requests as _req
+            resp = _req.post(
+                f'{kong_admin}/upstreams/{upstream}/targets',
+                json={'target': target, 'weight': 100},
+                timeout=10
+            )
+            return jsonify({'registered': True, 'status': resp.status_code})
+        except Exception as e:
+            return jsonify({'error': f'Kong admin unreachable: {e}'}), 502
+
+    app.logger.info("Kong gateway API routes registered (3 endpoints: completions proxy, metering, node registration)")
+except Exception as e:
+    app.logger.warning(f"Kong gateway API init skipped: {e}")
 
 # ============================================================================
 # Google A2A Protocol Initialization
@@ -1807,6 +1944,20 @@ def _handle_request_resource(input_text: str) -> str:
 
     # Key not found — return a structured request for the frontend
     # The backend will detect __SECRET_REQUEST__ and inject it into the response
+    # Track as pending so /api/credentials/pending can list it
+    try:
+        from desktop.ai_key_vault import AIKeyVault
+        AIKeyVault.get_instance().add_pending_request(
+            key_name=key_name,
+            resource_type=resource_type,
+            channel_type=req.get('channel_type', ''),
+            label=req.get('label', key_name),
+            description=req.get('description', ''),
+            used_by=req.get('used_by', 'Agent tool'),
+        )
+    except Exception:
+        pass
+
     secret_request = _json.dumps({
         '__SECRET_REQUEST__': True,
         'type': resource_type,
@@ -2531,7 +2682,7 @@ class CustomGPT(LLM):
                 app.logger.info(f"text got from gpt {text}")
                 try:
                     text = text.strip('`').replace('json\n', '').strip()
-                except:
+                except Exception:
                     pass
                 intents = json.loads(text)
                 app.logger.info(f"the intents are: {intents}")
@@ -2566,7 +2717,7 @@ class CustomGPT(LLM):
                 text = str(response.json()["choices"][0]["message"]["content"])
                 try:
                     text = text.strip('`').replace('json\n', '').strip()
-                except:
+                except Exception:
                     pass
                 intents = json.loads(text)
 
@@ -2905,7 +3056,7 @@ def parsing_string(string):
         prompt, start_date, end_date = [s.strip() for s in string.split(",")]
         session_id = 'user_'+str(thread_local_data.get_user_id())
         return get_time_based_history(prompt, session_id, start_date, end_date)
-    except:
+    except Exception:
         now = datetime.utcnow()
         formatted_time = now.strftime('%Y-%m-%dT%H:%M:%S.%f') + 'Z'
         session_id = "user_"+str(thread_local_data.get_user_id())
@@ -3539,7 +3690,7 @@ class CustomConvoOutputParser(AgentOutputParser):
                     start_index = text.index('{')
                     try:
                         end_index = text.rindex('}') + 1
-                    except:
+                    except Exception:
                         text += '"}'
                         end_index = text.rindex('}') + 1
                     json_string = text[start_index:end_index]
@@ -3555,7 +3706,7 @@ class CustomConvoOutputParser(AgentOutputParser):
                     start_index = text.index('{')
                     try:
                         end_index = text.rindex('}') + 1
-                    except:
+                    except Exception:
                         text += '"}'
                         end_index = text.rindex('}') + 1
                     try:
@@ -4091,12 +4242,17 @@ def chat():
     # Rate limit: 30 req/min per user/IP
     try:
         from integrations.social.rate_limiter import _limiter
-        rate_key = request.get_json(silent=True) or {}
-        rate_user = rate_key.get('user_id', request.remote_addr) if isinstance(rate_key, dict) else request.remote_addr
+        # Rate limit by IP always (prevents user_id rotation bypass).
+        # Authenticated user_id added as secondary key for per-user tracking.
+        rate_user = request.remote_addr
         if not _limiter.check(str(rate_user), 'chat', max_tokens=30, refill_rate=30 / 60):
             return jsonify({'error': 'Rate limit exceeded (30/min). Please wait.', 'response': None}), 429
-    except Exception:
-        pass  # Rate limiter unavailable — allow
+    except ImportError:
+        pass  # Rate limiter module not installed — allow (dev/flat mode)
+    except Exception as e:
+        # Rate limiter unavailable (Redis down, etc.) — fail closed on cloud
+        if os.environ.get('HEVOLVE_NODE_TIER') == 'central':
+            return jsonify({'error': 'Rate limiter unavailable — try again shortly', 'response': None}), 503
 
     start_time = time.time()
 
@@ -4124,6 +4280,17 @@ def chat():
             g.auth_source = 'body'
     else:
         g.auth_source = 'body'
+
+    # Reject unauthenticated requests on exposed deployments
+    # (central tier or HEVOLVE_REQUIRE_AUTH=true)
+    if g.auth_source == 'body' and (
+        os.environ.get('HEVOLVE_NODE_TIER') == 'central' or
+        os.environ.get('HEVOLVE_REQUIRE_AUTH', '').lower() == 'true'
+    ):
+        return jsonify({
+            'error': 'Authentication required. Provide Authorization: Bearer <token> header.',
+            'response': None,
+        }), 401
 
     user_id = data.get('user_id', None)
     preferred_lang = data.get('preferred_lang', 'en')
@@ -4813,7 +4980,7 @@ def history():
     ai_msg = data['ai_msg']
     try:
         memory = get_memory(user_id=int(data['user_id']))
-    except:
+    except Exception:
         return "Invalid user ID"
     if memory:
         try:

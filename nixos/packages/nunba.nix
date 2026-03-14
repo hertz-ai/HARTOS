@@ -31,7 +31,7 @@ pkgs.stdenv.mkDerivation rec {
   src = if hartSrc != null
     then "${hartSrc}/../Nunba"
     else pkgs.fetchgit {
-      url = "https://github.com/hevolve-ai/nunba.git";
+      url = "https://github.com/hertz-ai/nunba.git";
       rev = "HEAD";
       sha256 = lib.fakeSha256;  # Replace with actual hash on first build
     };

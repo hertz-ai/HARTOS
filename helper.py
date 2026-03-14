@@ -156,6 +156,12 @@ def safe_prompt_path(*parts, ext='.json'):
 def crawl4ai_fetch(url: str, timeout: int = 30) -> str:
     """Fetch content from URL using native in-process crawler."""
     try:
+        from security.sanitize import validate_url
+        url = validate_url(url)
+    except (ImportError, ValueError) as e:
+        current_app.logger.warning(f"URL blocked by SSRF filter: {url} — {e}")
+        return ""
+    try:
         from integrations.web_crawler import crawl_url
         result = crawl_url(url, timeout)
         if result['success']:
@@ -1604,7 +1610,7 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
         current_app.logger.info(f"Exception {e}")
         try:
             messages = memory.chat_memory.search(prompt)
-        except:
+        except Exception:
            current_app.logger.info(f'Error: {e}')
 
         # current_app.logger.info(f"final messages in except-->{messages}")
@@ -1766,7 +1772,7 @@ def get_memory(user_id: int):
 def history(user_id,prompt_id,role,message):
     try:
         memory = get_memory(user_id=int(user_id))
-    except:
+    except Exception:
         return "Invalid user ID"
     if memory:
         if role == 'user':
@@ -1807,6 +1813,100 @@ llm_config = {
     "config_list": config_list,
     "cache_seed": None
 }
+
+
+def get_llm_config(fallback_config_list=None):
+    """Get LLM config — checks thread-local override before falling back to given config_list.
+    This enables per-dispatch model routing for speculative execution.
+
+    Args:
+        fallback_config_list: config_list to use when no thread-local override is set.
+                              Defaults to this module's config_list.
+    """
+    from threadlocal import thread_local_data
+    override = thread_local_data.get_model_config_override()
+    return {"cache_seed": None, "config_list": override or (fallback_config_list if fallback_config_list is not None else config_list), "max_tokens": 1500}
+
+
+def format_action_text(text):
+    """Format VLM action JSON into human-readable step description.
+
+    Canonical implementation — create_recipe.py and reuse_recipe.py delegate here.
+    Handles JSON dict, ast.literal_eval fallback, regex fallback.
+    """
+    if text.strip().startswith("{") and "action" in text:
+        try:
+            try:
+                action_data = json.loads(text.strip())
+            except (json.JSONDecodeError, ValueError):
+                action_data = ast.literal_eval(text.strip())
+            action_type = action_data.get("action", "")
+
+            if action_type == "mouse_move":
+                return "Move mouse"
+            elif action_type == "left_click":
+                return "Perform left click"
+            elif action_type == "right_click":
+                return "Perform right click"
+            elif action_type == "double_click":
+                return "Perform double click"
+            elif action_type == "type" and "text" in action_data:
+                return f"Type '{action_data['text']}'"
+            elif action_type == "drag":
+                return "Perform drag action"
+            else:
+                return f"Perform {action_type} action"
+        except Exception:
+            action_match = re.search(r"'action':\s*'([^']+)'", text)
+            text_match = re.search(r"'text':\s*'([^']+)'", text)
+            if action_match:
+                action_type = action_match.group(1)
+                if action_type == "type" and text_match:
+                    return f"Type '{text_match.group(1)}'"
+                elif action_type == "mouse_move":
+                    return "Move mouse"
+                elif action_type == "left_click":
+                    return "Perform left click"
+                elif action_type == "right_click":
+                    return "Perform right click"
+                elif action_type == "double_click":
+                    return "Perform double click"
+                else:
+                    return f"Perform {action_type} action"
+            else:
+                return "Perform action"
+    elif "Perform" in text and "action" in text:
+        return text
+    return text
+
+
+def save_conversation_db(text, user_id, prompt_id, database_url, request_id):
+    """Save a conversation turn to the database via the conversation API.
+
+    Canonical implementation — create_recipe.py and reuse_recipe.py delegate here.
+    """
+    headers = {'Content-Type': 'application/json'}
+    data = {
+        "request": 'VIDEO GENERATION FROM GENERATE_VIDEO',
+        "response": text.strip(),
+        "user_id": int(user_id),
+        "conv_bot_name": 'GPT-4o',
+        "topic": f'{prompt_id}',
+        "revision": False,
+        "dialogue_id": None,
+        "card_type": 'Custom GPT',
+        "qid": None,
+        "layout_id": None,
+        "layout_list": '[]',
+        "request_token": 0,
+        "response_token": 0,
+        "request_id": request_id,
+        "historical_request_id": str('[]')
+    }
+    res = pooled_post("{}/conversation".format(database_url),
+                        data=json.dumps(data), headers=headers).json()
+    conv_id = res['conv_id']
+    return conv_id
 
 
 def create_visual_agent(user_id,prompt_id):
@@ -2192,7 +2292,7 @@ def get_agent_data_info(prompt_id: int) -> Dict[str, Any]:
                 data = json.load(f)
             saved_at = data.get('saved_at', 'unknown')
             data_keys = list(data.get('data', {}).keys()) if 'data' in data else list(data.keys())
-        except:
+        except Exception:
             saved_at = 'unknown'
             data_keys = []
 
@@ -2315,7 +2415,7 @@ def force_apply_autogen_json_fix():
         try:
             from autogen.io.base import IOStream
             iostream = IOStream.get_default()
-        except:
+        except Exception:
             class MockIOStream:
                 def print(self, *args, **kwargs):
                     print(*args)
@@ -2384,7 +2484,7 @@ def force_apply_autogen_json_fix():
         try:
             from autogen.io.base import IOStream
             iostream = IOStream.get_default()
-        except:
+        except Exception:
             class MockIOStream:
                 def print(self, *args, **kwargs):
                     print(*args)

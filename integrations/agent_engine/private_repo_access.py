@@ -156,8 +156,8 @@ class PrivateRepoAccessService:
                     'error': 'No HEVOLVE_GITHUB_TOKEN configured'}
 
         try:
-            import requests
-            resp = requests.put(
+            from core.http_pool import pooled_put
+            resp = pooled_put(
                 f'https://api.github.com/repos/{owner}/{repo}'
                 f'/collaborators/{github_username}',
                 headers={
@@ -220,8 +220,8 @@ class PrivateRepoAccessService:
                     'error': 'No HEVOLVE_GITHUB_TOKEN configured'}
 
         try:
-            import requests
-            resp = requests.delete(
+            from core.http_pool import pooled_delete
+            resp = pooled_delete(
                 f'https://api.github.com/repos/{owner}/{repo}'
                 f'/collaborators/{github_username}',
                 headers={

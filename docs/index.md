@@ -20,6 +20,7 @@ HART OS is a multi-agent platform built on AutoGen that creates, trains, and reu
 | [Features](features/overview.md) | Full feature overview |
 | [Provider Guide](provider/joining.md) | Join the network as a compute provider |
 | [API Reference](api/core.md) | Core endpoint documentation |
+| [Developer Journey](developer/user-journey.md) | Zero to shipping: API key → first call → build app → deploy |
 | [Developer Guide](developer/architecture.md) | Architecture and contribution guide |
 
 ---

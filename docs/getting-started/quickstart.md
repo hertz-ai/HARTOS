@@ -14,8 +14,8 @@ Get HART OS running in 5 minutes.
 ## 1. Clone and Set Up
 
 ```bash
-git clone https://github.com/hevolve/hart.git
-cd hart
+git clone https://github.com/hertz-ai/HARTOS.git
+cd HARTOS
 
 # Create virtual environment with Python 3.10
 python3.10 -m venv venv310
@@ -122,3 +122,4 @@ curl -X POST http://localhost:6777/chat \
 - [Deployment Modes](deployment-modes.md) -- flat, regional, central
 - [Configuration Reference](configuration.md) -- all environment variables
 - [Features Overview](../features/overview.md) -- what HART OS can do
+- [Device Discovery & Pairing](../features/device-pairing.md) -- connect phones, IoT devices, and headless nodes to your mesh

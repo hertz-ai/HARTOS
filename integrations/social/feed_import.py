@@ -15,6 +15,7 @@ Usage:
 import logging
 import hashlib
 import requests
+from core.http_pool import pooled_get
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
@@ -302,7 +303,7 @@ class FeedImporter:
             headers['If-Modified-Since'] = last_modified
 
         try:
-            response = requests.get(url, headers=headers, timeout=self.timeout)
+            response = pooled_get(url, headers=headers, timeout=self.timeout)
 
             # Handle 304 Not Modified
             if response.status_code == 304:

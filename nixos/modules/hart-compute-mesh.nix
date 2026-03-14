@@ -202,7 +202,7 @@ in
     {
       systemd.services.hart-compute-mesh = {
         description = "HART OS Compute Mesh Daemon";
-        documentation = [ "https://github.com/hevolve-ai/hart" ];
+        documentation = [ "https://github.com/hertz-ai/HARTOS" ];
         after = [
           "hart.target"
           "hart-mesh-keygen.service"

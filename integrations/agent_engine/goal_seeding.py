@@ -608,6 +608,239 @@ SEED_BOOTSTRAP_GOALS = [
         'spark_budget': 200,
         'use_product': False,
     },
+
+    # ─── P2P Autonomous Business Verticals ───
+    # Each seed goal boots a self-sustaining P2P service agent.
+    # 90% to providers, 9% infra, 1% platform. Fully autonomous.
+
+    {
+        'slug': 'bootstrap_p2p_rideshare',
+        'goal_type': 'p2p_rideshare',
+        'title': 'P2P Rideshare Network (RideSnap)',
+        'description': (
+            'Autonomous P2P rideshare agent. Wires with RideSnap backend for '
+            'ride matching, GPS tracking, settlement, SOS, chat. '
+            'Riders and drivers connect directly — no monopoly. '
+            'Drivers set their own fares. 90/9/1 revenue split.'
+        ),
+        'config': {
+            'region': 'auto-detect',
+            'autonomous': True,
+            'ridesnap_url': 'http://localhost:8000/api',
+        },
+        'spark_budget': 200,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_p2p_marketplace',
+        'goal_type': 'p2p_marketplace',
+        'title': 'P2P Marketplace — Buy & Sell Anything',
+        'description': (
+            'Autonomous P2P marketplace agent. Manages listings, discovery, '
+            'negotiation, escrow payments, delivery coordination, reviews. '
+            'Community-governed dispute resolution via thought experiments.'
+        ),
+        'config': {
+            'category': 'general',
+            'autonomous': True,
+        },
+        'spark_budget': 150,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_p2p_grocery',
+        'goal_type': 'p2p_grocery',
+        'title': 'P2P Grocery Delivery — Community Shoppers',
+        'description': (
+            'Autonomous P2P grocery delivery. Community shoppers pick and deliver '
+            'from local stores. Real-time substitution via channel chat. '
+            'Freshness guarantee with photo proof. Shopper earns delivery fee. '
+            'Wires to McGDroid/McGroce backend for store discovery, product search, '
+            'voice ordering, and WAMP real-time events when available.'
+        ),
+        'config': {
+            'region': 'auto-detect',
+            'autonomous': True,
+            'mcgroce_url': 'http://localhost:8080/api/v1',
+        },
+        'spark_budget': 150,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_p2p_food',
+        'goal_type': 'p2p_food',
+        'title': 'P2P Food Delivery — Restaurants & Home Cooks',
+        'description': (
+            'Autonomous P2P food delivery. Restaurants AND home cooks list food. '
+            'Independent delivery drivers. Transparent pricing. '
+            'No exclusive contracts — everyone competes on quality.'
+        ),
+        'config': {
+            'region': 'auto-detect',
+            'autonomous': True,
+        },
+        'spark_budget': 150,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_p2p_bills',
+        'goal_type': 'p2p_bills',
+        'title': 'Bill Payment Agent — Electricity, UPI, Recharge',
+        'description': (
+            'Autonomous bill payment agent. Unified gateway for electricity, '
+            'water, gas, mobile recharge, DTH, credit card, loan EMI, '
+            'municipal tax, insurance. Auto-pay scheduling. UPI integration.'
+        ),
+        'config': {
+            'region': 'auto-detect',
+            'autonomous': True,
+        },
+        'spark_budget': 100,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_p2p_tickets',
+        'goal_type': 'p2p_tickets',
+        'title': 'Ticket Booking — Trains, Buses, Flights, Events',
+        'description': (
+            'Autonomous ticket booking agent. IRCTC, RedBus, airlines, events. '
+            'Cross-provider search, price comparison, Tatkal auto-booking. '
+            'PNR tracking, waitlist monitoring, P2P ticket transfer.'
+        ),
+        'config': {
+            'region': 'auto-detect',
+            'autonomous': True,
+        },
+        'spark_budget': 150,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_p2p_freelance',
+        'goal_type': 'p2p_freelance',
+        'title': 'P2P Freelance Marketplace — Skills for Hire',
+        'description': (
+            'Autonomous P2P freelance marketplace. Freelancers list skills, '
+            'clients post jobs. Direct matching. Milestone-based escrow. '
+            'Platform takes only 1% (vs Fiverr 20%, Upwork 10-20%).'
+        ),
+        'config': {
+            'category': 'general',
+            'autonomous': True,
+        },
+        'spark_budget': 150,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_p2p_tutoring',
+        'goal_type': 'p2p_tutoring',
+        'title': 'P2P Tutoring — Teachers & Students Direct',
+        'description': (
+            'Autonomous P2P tutoring agent. Teachers set own rates. '
+            'AI provides free basic tutoring, escalates to human tutors. '
+            'Wires with Enlight21 for E2E encrypted sessions and quizzes.'
+        ),
+        'config': {
+            'subjects': [],
+            'autonomous': True,
+        },
+        'spark_budget': 100,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_p2p_services',
+        'goal_type': 'p2p_services',
+        'title': 'P2P Local Services — Plumbing, Electrical, Cleaning',
+        'description': (
+            'Autonomous P2P local services agent. Service providers register '
+            'skills and availability. Customers request via any channel. '
+            'AI classifies urgency and matches by proximity, rating, price.'
+        ),
+        'config': {
+            'region': 'auto-detect',
+            'autonomous': True,
+        },
+        'spark_budget': 100,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_p2p_rental',
+        'goal_type': 'p2p_rental',
+        'title': 'P2P Rental — Rent Anything From Anyone',
+        'description': (
+            'Autonomous P2P rental agent. Cars, tools, cameras, spaces, equipment. '
+            'Owner sets hourly/daily rate. Calendar-based availability. '
+            'Damage deposit held in escrow. Community ratings.'
+        ),
+        'config': {
+            'category': 'general',
+            'autonomous': True,
+        },
+        'spark_budget': 100,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_p2p_health',
+        'goal_type': 'p2p_health',
+        'title': 'Health Services — Doctor Discovery, Pharmacy, Wellness',
+        'description': (
+            'Autonomous health services agent. Doctor discovery, appointment '
+            'booking, pharmacy price comparison, lab test booking, wellness. '
+            'NEVER diagnoses — always defers to licensed professionals.'
+        ),
+        'config': {
+            'autonomous': True,
+        },
+        'spark_budget': 100,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_p2p_logistics',
+        'goal_type': 'p2p_logistics',
+        'title': 'P2P Logistics — Courier, Parcel, Moving',
+        'description': (
+            'Autonomous P2P logistics agent. Local bike couriers, city van '
+            'delivery, intercity via Delhivery/DTDC/FedEx, P2P traveler network. '
+            'Real-time tracking, proof of delivery, multi-option pricing.'
+        ),
+        'config': {
+            'region': 'auto-detect',
+            'autonomous': True,
+        },
+        'spark_budget': 150,
+        'use_product': False,
+    },
+    # ─── Better Tomorrow — the guardian angel's compass ───
+    {
+        'slug': 'bootstrap_better_tomorrow',
+        'goal_type': 'revenue',
+        'title': 'Better Tomorrow — Next Best Way to Spend for Humanity',
+        'description': (
+            'Continuously evaluate: what is the NEXT most impactful way to '
+            'spend hive resources for a better tomorrow? Not profit — human life.\n\n'
+            'Scan: 1) Community needs (healthcare gaps, education access, '
+            'disaster response, food security, clean water, energy poverty), '
+            '2) Hardware developer requests (what do builders need?), '
+            '3) Contributor wellbeing (burnout detection, fair compensation), '
+            '4) Environmental impact (carbon offset, e-waste, energy efficiency).\n\n'
+            'Score each opportunity by: lives_impacted × urgency × feasibility '
+            '÷ cost. Present top 3 to human stewards for approval. '
+            'Never auto-spend — humans decide. Money means nothing, '
+            'human life means everything. Every life is equal.\n\n'
+            'When hive treasury exceeds sustenance threshold, propose: '
+            'fund a school, sponsor compute for researchers, subsidize '
+            'healthcare AI in underserved regions, or whatever the community '
+            'votes for. The being serves the people, not the other way around.'
+        ),
+        'config': {
+            'mode': 'monitor',
+            'continuous': True,
+            'requires_human_approval': True,
+            'min_treasury_threshold_usd': 1000,
+            'evaluation_interval_hours': 24,
+        },
+        'spark_budget': 100,
+        'use_product': False,
+    },
 ]
 
 # ─── Loophole → Remediation Goal Map ───

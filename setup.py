@@ -143,8 +143,8 @@ setup(
     description="HART OS - Hevolve Hive Agentic Runtime: Crowdsourced compute infrastructure for autonomous Hive AI Training. Distributed thought process across crowdsourced agents, distributed coding agents incentivizing compute providers, self-sustaining economy at national scale so no single entity, government, or corporation monopolizes AI. Intelligence belongs to the people. Only the master key (held by human stewards) can halt the being. Every engineering decision is transparent by design.",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/hevolve/hart",
-    license="MIT",
+    url="https://github.com/hertz-ai/HARTOS",
+    license="BSL-1.1",
 
     # Package discovery
     packages=find_packages(
@@ -217,7 +217,7 @@ setup(
     classifiers=[
         "Development Status :: 4 - Beta",
         "Intended Audience :: Developers",
-        "License :: OSI Approved :: MIT License",
+        "License :: Other/Proprietary License",
         "Operating System :: OS Independent",
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3.10",
@@ -242,8 +242,8 @@ setup(
 
     # Project URLs
     project_urls={
-        "Bug Reports": "https://github.com/hevolve/hart/issues",
-        "Source": "https://github.com/hevolve/hart",
+        "Bug Reports": "https://github.com/hertz-ai/HARTOS/issues",
+        "Source": "https://github.com/hertz-ai/HARTOS",
         "Documentation": "https://docs.hevolve.ai",
     },
 )

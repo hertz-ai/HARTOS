@@ -109,7 +109,7 @@ Central (hevolve.ai)
 
 ## Get It
 
-- **GitHub**: [github.com/hevolve/hart-os](https://github.com/hevolve) — open source (framework, agents, social, desktop, mobile)
+- **GitHub**: [github.com/hertz-ai/HARTOS](https://github.com/hertz-ai/HARTOS) — open source (framework, agents, social, desktop, mobile)
 - **Hevolve Core** (self-evolving intelligence engine): Private repo. Regional hosts who contribute compute get access.
 - **hevolve.ai**: [hevolve.ai](https://hevolve.ai) — web platform, agent creation, pricing, demos
 - **Nunba Desktop**: Windows/Mac/Linux — companion app that turns your computer into a hive node (Python + cx_Freeze)

@@ -14,6 +14,7 @@ import logging
 import threading
 import requests
 from typing import Optional
+from core.http_pool import pooled_post
 
 from core.port_registry import get_port
 
@@ -179,7 +180,7 @@ class DistributedWorkerLoop:
         }
 
         try:
-            resp = requests.post(f'{base_url}/chat', json=body, timeout=120)
+            resp = pooled_post(f'{base_url}/chat', json=body, timeout=120)
             if resp.status_code == 200:
                 result = resp.json()
                 response = result.get('response', '')

@@ -212,11 +212,9 @@ else:
     }]
 
 # Per-request model config override (speculative execution, hive compute routing)
+# Canonical implementation lives in helper.py — thin wrapper passes local config_list.
 def get_llm_config():
-    """Get LLM config — checks thread-local override before falling back to global."""
-    from threadlocal import thread_local_data
-    override = thread_local_data.get_model_config_override()
-    return {"cache_seed": None, "config_list": override or config_list, "max_tokens": 1500}
+    return helper_fun.get_llm_config(config_list)
 
 message_tracking_lock = threading.Lock()
 
@@ -244,7 +242,7 @@ class Action:
     def get_action(self, current_action):
         try:
             return self.actions[current_action]
-        except:
+        except Exception:
             raise IndexError("Custom message: Index is out of range!")
 
     def set_ledger(self, ledger):
@@ -350,28 +348,8 @@ database_url = get_db_url() or 'https://mailer.hertzai.com'
 
 
 def save_conversation_db(text, user_id, prompt_id, database_url, request_id):
-    headers = {'Content-Type': 'application/json'}
-    data = {
-        "request": 'VIDEO GENERATION FROM GENERATE_VIDEO',
-        "response": text.strip(),
-        "user_id": int(user_id),
-        "conv_bot_name": 'GPT-4o',
-        "topic": f'{prompt_id}',
-        "revision": False,
-        "dialogue_id": None,
-        "card_type": 'Custom GPT',
-        "qid": None,
-        "layout_id": None,
-        "layout_list": '[]',
-        "request_token": 0,
-        "response_token": 0,
-        "request_id": request_id,
-        "historical_request_id": str('[]')
-    }
-    res = pooled_post("{}/conversation".format(database_url),
-                        data=json.dumps(data), headers=headers).json()
-    conv_id = res['conv_id']
-    return conv_id
+    """Delegate to canonical implementation in helper.py."""
+    return helper_fun.save_conversation_db(text, user_id, prompt_id, database_url, request_id)
 
 
 def get_role(user_id, prompt_id):
@@ -1531,7 +1509,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             res = pooled_get("https://mailer.hertzai.com/get_image_by_id/{}".format(avatar_id))
             res = res.json()
             new_image_url = res["image_url"]
-        except:
+        except Exception:
             data['openvoice'] = "true"
             new_image_url = None
             res = {'voice_id': None}
@@ -1574,7 +1552,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         try:
             video_link = pooled_post("{}/video_generate_save".format(database_url),
                                        data=json.dumps(data), headers=headers, timeout=1)
-        except:
+        except Exception:
             pass
         if data['chattts'] or data['flag_hallo'] == "true":
             return f"Video Generation task added to queue with conv_id:{conv_id}. Ask the helper to save this conv_id in the same collection from which the story used to generate the video was retrieved, for future reference"
@@ -2023,59 +2001,8 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                                     cleaned_lines.append(line)
                             return '\n'.join(cleaned_lines)
 
-                        # Function to format action text consistently
                         def format_action_text(text):
-                            # For JSON-like strings
-                            if text.strip().startswith("{") and "action" in text:
-                                try:
-                                    # Try to parse the string as JSON/Python dict safely
-                                    try:
-                                        action_data = json.loads(text.strip())
-                                    except (json.JSONDecodeError, ValueError):
-                                        action_data = ast.literal_eval(text.strip())
-                                    action_type = action_data.get("action", "")
-
-                                    if action_type == "mouse_move":
-                                        return "Move mouse"
-                                    elif action_type == "left_click":
-                                        return "Perform left click"
-                                    elif action_type == "right_click":
-                                        return "Perform right click"
-                                    elif action_type == "double_click":
-                                        return "Perform double click"
-                                    elif action_type == "type" and "text" in action_data:
-                                        return f"Type '{action_data['text']}'"
-                                    elif action_type == "drag":
-                                        return "Perform drag action"
-                                    else:
-                                        return f"Perform {action_type} action"
-                                except:
-                                    # If eval fails, try regex
-                                    action_match = re.search(r"'action':\s*'([^']+)'", text)
-                                    text_match = re.search(r"'text':\s*'([^']+)'", text)
-
-                                    if action_match:
-                                        action_type = action_match.group(1)
-                                        if action_type == "type" and text_match:
-                                            return f"Type '{text_match.group(1)}'"
-                                        elif action_type == "mouse_move":
-                                            return "Move mouse"
-                                        elif action_type == "left_click":
-                                            return "Perform left click"
-                                        elif action_type == "right_click":
-                                            return "Perform right click"
-                                        elif action_type == "double_click":
-                                            return "Perform double click"
-                                        else:
-                                            return f"Perform {action_type} action"
-                                    else:
-                                        return "Perform action"
-
-                            # For text descriptions containing "Perform"
-                            elif "Perform" in text and "action" in text:
-                                return text  # Already in desired format
-
-                            return text
+                            return helper_fun.format_action_text(text)
 
                         # Handle different response format
                         if 'extracted_responses' in response:
@@ -2796,7 +2723,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                     current_app.logger.info('GOT COMPLETED FOR ACTION')
                     try:
                         time_actions[user_prompt].current_action += 1
-                    except:
+                    except Exception:
                         current_app.logger.error('GOT ERROR WHILE UPDATING CURRENT ACTION')
                         time_actions[user_prompt].current_action += 1
                     return chat_instructor1
@@ -2830,7 +2757,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                     current_app.logger.info('Sending user the message')
                     json_obj = json.loads(json_part)
                     send_message_to_user1(user_id, json_obj['message2userfinal'], '', prompt_id)
-                except:
+                except Exception:
                     pass
                 return "auto"
 
@@ -2873,7 +2800,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                     current_app.logger.info('Sending user the message')
                     json_obj = json.loads(json_part)
                     send_message_to_user1(user_id, json_obj['message2userfinal'], '', prompt_id)
-                except:
+                except Exception:
                     pass
 
         pattern3 = r"@statusverifier"
@@ -3082,7 +3009,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                 except IndexError as e:
                     current_app.logger.info(f"COmpleted ALL ACTIONS:")
                     return ''
-                except:
+                except Exception:
                     try:
                         json_match = re.search(r'{[\s\S]*}', group_chat.messages[-2]["content"])
                         if json_match:
@@ -3482,7 +3409,7 @@ def get_ledger_status_for_logging(user_prompt: str) -> str:
     try:
         summary = ledger.get_execution_summary()
         return f"Ledger: {summary['total']} tasks ({len(summary['completed'])} done, {len(summary['in_progress'])} running, {len(summary['pending'])} pending)"
-    except:
+    except Exception:
         return "Ledger: status unavailable"
 
 
@@ -3588,7 +3515,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                 chat_instructor.initiate_chat(recipient=manager, message=user_message,
                                                               clear_history=False, silent=False)
                                 continue
-                        except:
+                        except Exception:
                             try:
                                 json_match = re.search(r'{[\s\S]*}', group_chat.messages[-2]["content"])
                                 if json_match:
@@ -3654,7 +3581,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                     if json_obj:
                         try:
                             last_message['content'] = json_obj['message2userfinal']
-                        except:
+                        except Exception:
                             pass
 
                 elif f'message2'.lower() in last_message['content'].lower():
@@ -3662,7 +3589,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                     if json_obj:
                         try:
                             last_message['content'] = json_obj['message2']
-                        except:
+                        except Exception:
                             pass
 
                 return last_message['content']

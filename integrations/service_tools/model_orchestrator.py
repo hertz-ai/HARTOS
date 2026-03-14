@@ -186,6 +186,7 @@ class ModelOrchestrator:
                 self._catalog.mark_loaded(model_id, device=fit)
                 self._register_vram(entry, fit)
                 self._register_lifecycle(entry)
+                self._register_service_tool(entry)
                 logger.info(f"Loaded {model_id} on {fit}")
                 return entry
             else:
@@ -208,6 +209,7 @@ class ModelOrchestrator:
             logger.warning(f"Unload dispatch failed for {model_id}: {e}")
 
         self._release_vram(entry)
+        self._deregister_service_tool(entry)
         self._catalog.mark_unloaded(model_id)
         logger.info(f"Unloaded {model_id}")
         return True
@@ -257,10 +259,10 @@ class ModelOrchestrator:
     def _load_generic(self, entry: ModelEntry, run_mode: str) -> bool:
         """Fallback: try RuntimeToolManager for sidecar-based tools."""
         try:
-            from integrations.service_tools.runtime_manager import get_runtime_tool_manager
-            rtm = get_runtime_tool_manager()
+            from integrations.service_tools.runtime_manager import runtime_tool_manager
             tool_name = entry.id.replace(f'{entry.model_type}-', '')
-            return rtm.setup_tool(tool_name)
+            result = runtime_tool_manager.setup_tool(tool_name)
+            return result.get('running', False)
         except Exception as e:
             logger.warning(f"Generic load failed for {entry.id}: {e}")
             return False
@@ -337,6 +339,55 @@ class ModelOrchestrator:
                 mlm.notify_access(entry.id)
         except ImportError:
             pass
+
+    # ── Service tool registration ────────────────────────────────────
+    # When a model loads, register its corresponding service tool so
+    # the LLM sees the capability via get_tools() → {{tools}}.
+    # Each tool class (AceStepTool, CosyVoiceTool, etc.) self-registers
+    # with service_tool_registry — we just trigger the registration.
+
+    # Maps catalog model_type or id-prefix to the tool module + class
+    _SERVICE_TOOL_MAP = {
+        'audio_gen-acestep': ('integrations.service_tools.acestep_tool', 'AceStepTool'),
+        'stt-whisper': ('integrations.service_tools.whisper_tool', 'WhisperTool'),
+        'tts-cosyvoice3': ('integrations.service_tools.cosyvoice_tool', 'CosyVoiceTool'),
+        'tts-f5': ('integrations.service_tools.f5_tts_tool', 'F5TTSTool'),
+        'tts-indic-parler': ('integrations.service_tools.indic_parler_tool', 'IndicParlerTool'),
+        'tts-pocket': ('integrations.service_tools.pocket_tts_tool', 'PocketTTSTool'),
+    }
+
+    def _register_service_tool(self, entry: ModelEntry) -> None:
+        """Register loaded model with service_tool_registry."""
+        for prefix, (mod_path, cls_name) in self._SERVICE_TOOL_MAP.items():
+            if entry.id.startswith(prefix):
+                try:
+                    import importlib
+                    mod = importlib.import_module(mod_path)
+                    tool_cls = getattr(mod, cls_name, None)
+                    if tool_cls:
+                        reg = getattr(tool_cls, 'register', None) or \
+                              getattr(tool_cls, 'register_functions', None)
+                        if reg:
+                            reg()
+                            logger.info(f"Service tool registered: {cls_name}")
+                except Exception as e:
+                    logger.debug(f"Service tool registration skipped for {entry.id}: {e}")
+                return
+
+    def _deregister_service_tool(self, entry: ModelEntry) -> None:
+        """Remove tool from service_tool_registry on unload."""
+        for prefix, (mod_path, cls_name) in self._SERVICE_TOOL_MAP.items():
+            if entry.id.startswith(prefix):
+                try:
+                    from integrations.service_tools.registry import service_tool_registry
+                    # Extract tool name from class convention (AceStepTool → acestep)
+                    tool_name = prefix.split('-', 1)[-1] if '-' in prefix else prefix
+                    if tool_name in service_tool_registry._tools:
+                        service_tool_registry._tools[tool_name].is_healthy = False
+                        logger.info(f"Service tool deregistered: {tool_name}")
+                except Exception:
+                    pass
+                return
 
     # ── Model swapping ──────────────────────────────────────────────
 

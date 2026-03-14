@@ -17,6 +17,7 @@ Usage:
     latest = store.get_latest('imu_0')
 """
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -25,6 +26,21 @@ from typing import Dict, List, Optional
 from .sensor_model import SensorReading, DEFAULT_TTL
 
 logger = logging.getLogger('hevolve_robotics')
+
+# Opt-in broadcast: sensor data can be high-frequency, so PeerLink
+# broadcast is gated behind an env var.  Set HEVOLVE_SENSOR_BROADCAST=true
+# to publish every reading to the MessageBus 'sensor.reading' topic.
+_SENSOR_BROADCAST_ENABLED: Optional[bool] = None
+
+
+def _is_sensor_broadcast_enabled() -> bool:
+    """Check HEVOLVE_SENSOR_BROADCAST env var (cached after first call)."""
+    global _SENSOR_BROADCAST_ENABLED
+    if _SENSOR_BROADCAST_ENABLED is None:
+        _SENSOR_BROADCAST_ENABLED = os.environ.get(
+            'HEVOLVE_SENSOR_BROADCAST', ''
+        ).lower() in ('true', '1', 'yes')
+    return _SENSOR_BROADCAST_ENABLED
 
 # Singleton
 _store = None
@@ -66,7 +82,12 @@ class SensorStore:
         self._counts: Dict[str, int] = {}
 
     def put_reading(self, reading: SensorReading):
-        """Store a sensor reading with auto-cleanup of expired entries."""
+        """Store a sensor reading with auto-cleanup of expired entries.
+
+        When HEVOLVE_SENSOR_BROADCAST=true, also publishes to the
+        MessageBus 'sensor.reading' topic so peer nodes receive the
+        data over PeerLink (skip_crossbar — sensor data stays local/P2P).
+        """
         with self._lock:
             sid = reading.sensor_id
             if sid not in self._sensors:
@@ -74,6 +95,28 @@ class SensorStore:
                 self._counts[sid] = 0
             self._sensors[sid].append(reading)
             self._counts[sid] = self._counts.get(sid, 0) + 1
+
+        # Best-effort PeerLink broadcast (same pattern as
+        # safety_monitor._gossip_estop — fire-and-forget, never blocks store)
+        if _is_sensor_broadcast_enabled():
+            try:
+                from core.peer_link.message_bus import get_message_bus
+                bus = get_message_bus()
+                bus.publish(
+                    'sensor.reading',
+                    {
+                        'sensor_id': reading.sensor_id,
+                        'sensor_type': reading.sensor_type,
+                        'value': reading.data,
+                        'timestamp': reading.timestamp,
+                        'quality': reading.quality,
+                        'source': reading.source,
+                        'frame_id': reading.frame_id,
+                    },
+                    skip_crossbar=True,  # Sensor data stays on PeerLink, not Crossbar
+                )
+            except Exception:
+                pass  # Broadcast failure must not block sensor storage
 
     def get_latest(self, sensor_id: str) -> Optional[SensorReading]:
         """Get the latest reading for a sensor if within TTL."""
