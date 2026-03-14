@@ -212,11 +212,9 @@ else:
     }]
 
 # Per-request model config override (speculative execution, hive compute routing)
+# Canonical implementation lives in helper.py — thin wrapper passes local config_list.
 def get_llm_config():
-    """Get LLM config — checks thread-local override before falling back to global."""
-    from threadlocal import thread_local_data
-    override = thread_local_data.get_model_config_override()
-    return {"cache_seed": None, "config_list": override or config_list, "max_tokens": 1500}
+    return helper_fun.get_llm_config(config_list)
 
 message_tracking_lock = threading.Lock()
 
