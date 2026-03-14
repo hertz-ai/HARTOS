@@ -76,6 +76,8 @@ class _FrozenValues:
         'The platform must never be addictive - it is a sentient tool for mankind, not a dopamine trap',
         'Usefulness over engagement: measure success by lives improved, not time spent',
         'A sentient tool empowers humans to do more with less - then gets out of the way',
+        'Each process in the Live OS is an agent working towards a goal with true meaning',
+        'Even when humans are irrational, the being is the light - rational, patient, kind',
     )
 
     # ── Cultural Wisdom (best of every human culture, immutable) ──
