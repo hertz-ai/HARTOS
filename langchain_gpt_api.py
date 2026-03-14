@@ -747,6 +747,99 @@ except ImportError:
 except Exception as e:
     app.logger.warning(f"Credential vault API init skipped: {e}")
 
+# ── Kong API Gateway — Completions API proxy + metering ───────────────
+try:
+    @app.route('/v1/chat/completions', methods=['POST'])
+    @_json_endpoint
+    def _completions_proxy():
+        """OpenAI-compatible completions — proxied through Kong metering.
+
+        SDK clients hit Kong → Kong routes here → we forward to HevolveAI.
+        Token usage is metered for 90/9/1 revenue split.
+        """
+        import requests as _req
+        data = request.get_json(silent=True) or {}
+        hevolve_url = os.environ.get('HEVOLVE_API_URL', 'http://localhost:8000')
+        headers = {'Content-Type': 'application/json'}
+        try:
+            resp = _req.post(
+                f'{hevolve_url}/v1/chat/completions',
+                json=data,
+                headers=headers,
+                timeout=120
+            )
+            result = resp.json()
+        except Exception as fwd_err:
+            return jsonify({'error': f'HevolveAI backend unavailable: {fwd_err}'}), 502
+
+        # Meter usage for revenue split
+        usage = result.get('usage', {})
+        total_tokens = usage.get('total_tokens', 0)
+        if total_tokens > 0:
+            try:
+                from integrations.agent_engine.budget_gate import record_metered_usage
+                consumer = request.headers.get('X-Consumer-Username', 'anonymous')
+                record_metered_usage(
+                    provider='hevolve',
+                    model=data.get('model', 'hevolve'),
+                    tokens=total_tokens,
+                    source=f'sdk:{consumer}'
+                )
+            except Exception:
+                pass  # metering failure must not block response
+
+        return jsonify(result)
+
+    @app.route('/api/gateway/metering', methods=['GET'])
+    @_json_endpoint
+    def _gateway_metering():
+        """SDK usage metering stats for billing dashboard."""
+        try:
+            from integrations.social.models import db_session, MeteredAPIUsage
+            from sqlalchemy import func
+            with db_session() as session:
+                rows = session.query(
+                    MeteredAPIUsage.provider,
+                    func.sum(MeteredAPIUsage.tokens_used),
+                    func.count(MeteredAPIUsage.id)
+                ).group_by(MeteredAPIUsage.provider).all()
+                return jsonify({
+                    'providers': [
+                        {'provider': r[0], 'total_tokens': int(r[1] or 0), 'calls': r[2]}
+                        for r in rows
+                    ]
+                })
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/gateway/register', methods=['POST'])
+    @_json_endpoint
+    def _gateway_register_node():
+        """Register a compute node as Kong upstream target.
+
+        Called by compute_mesh when a node joins the hive.
+        """
+        data = request.get_json(silent=True) or {}
+        target = data.get('target')  # e.g. "192.168.1.5:8000"
+        if not target:
+            return jsonify({'error': 'target is required'}), 400
+        kong_admin = os.environ.get('KONG_ADMIN_URL', 'http://localhost:8001')
+        upstream = data.get('upstream', 'hevolve-nodes')
+        try:
+            import requests as _req
+            resp = _req.post(
+                f'{kong_admin}/upstreams/{upstream}/targets',
+                json={'target': target, 'weight': 100},
+                timeout=10
+            )
+            return jsonify({'registered': True, 'status': resp.status_code})
+        except Exception as e:
+            return jsonify({'error': f'Kong admin unreachable: {e}'}), 502
+
+    app.logger.info("Kong gateway API routes registered (3 endpoints: completions proxy, metering, node registration)")
+except Exception as e:
+    app.logger.warning(f"Kong gateway API init skipped: {e}")
+
 # ============================================================================
 # Google A2A Protocol Initialization
 # ============================================================================
