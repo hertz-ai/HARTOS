@@ -1,0 +1,32 @@
+name: Feature Request
+description: Suggest an idea
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      placeholder: I want to be able to...
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      placeholder: How would you like it to work?
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Agent Engine
+        - Channels (Discord, Telegram, WhatsApp, etc.)
+        - PeerLink / P2P
+        - Security
+        - Vision / VLM
+        - TTS / STT
+        - CLI (hart command)
+        - SDK
+        - NixOS / ISO
+        - Documentation
+        - Other
