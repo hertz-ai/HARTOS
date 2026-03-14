@@ -229,6 +229,59 @@ def _subscribe_fleet_commands(node_id: str):
         logger.warning(f"Fleet: MessageBus subscription failed: {e}")
 
 
+def _register_device_control_handler():
+    """Register handler for device_control messages on PeerLink dispatch channel.
+
+    When another node (same user) sends a device_control message via PeerLink,
+    this handler executes the action locally and returns the result.
+    Only processes requests from SAME_USER trust links (privacy-first).
+    """
+    try:
+        from core.peer_link.link_manager import get_link_manager
+        mgr = get_link_manager()
+
+        def _handle_device_control(data, sender_peer_id):
+            """Handle incoming device_control on the 'dispatch' channel."""
+            if not isinstance(data, dict):
+                return None
+            if data.get('type') != 'device_control':
+                return None  # Not a device_control message, let other handlers process
+
+            action = data.get('action', '')
+            if not action:
+                return {'success': False, 'message': 'No action provided'}
+
+            # Verify sender is SAME_USER trust (privacy enforcement)
+            link = mgr.get_link(sender_peer_id)
+            if not link:
+                return {'success': False, 'message': 'Unknown sender'}
+
+            from core.peer_link.link import TrustLevel
+            if link.trust != TrustLevel.SAME_USER:
+                logger.warning(
+                    f"Device control rejected from non-SAME_USER peer "
+                    f"{sender_peer_id[:8]}")
+                return {'success': False, 'message': 'Only SAME_USER devices can send control commands'}
+
+            # Execute via FleetCommandService (reuses all existing executors)
+            from integrations.social.fleet_command import FleetCommandService
+            result = FleetCommandService.execute_command('device_control', {
+                'action': action,
+                'category': data.get('category', ''),
+                'pin': data.get('pin'),
+                'value': data.get('value', ''),
+                'port': data.get('port', ''),
+            })
+            logger.info(f"Device control from {sender_peer_id[:8]}: "
+                       f"{action[:50]} -> {result.get('success')}")
+            return result
+
+        mgr.register_channel_handler('dispatch', _handle_device_control)
+        logger.info("Device control handler registered on dispatch channel")
+    except Exception as e:
+        logger.debug(f"Device control handler registration failed: {e}")
+
+
 def _check_halt():
     """Check if halt has been requested (by fleet command or circuit breaker)."""
     if os.environ.get('HEVOLVE_HALTED', '').lower() == 'true':
@@ -260,6 +313,9 @@ def _main_loop(node_id: str, gossip_interval: int = 60):
 
     # Subscribe to MessageBus for instant fleet command delivery
     _subscribe_fleet_commands(node_id)
+
+    # Register PeerLink dispatch handler for device_control messages
+    _register_device_control_handler()
 
     tick = 0
     logger.info(f"Main loop started (interval={gossip_interval}s)")

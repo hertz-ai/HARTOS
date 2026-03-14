@@ -857,6 +857,111 @@ def build_core_tool_closures(ctx):
         self_critique_and_enhance,
     ))
 
+    # ------------------------------------------------------------------
+    # device_control — Cross-device control via PeerLink (SAME_USER only)
+    # ------------------------------------------------------------------
+    @log_tool_execution
+    def device_control(
+        action: Annotated[str, "What to do: 'turn on light', 'check temperature', 'list files', 'run command ls -la'"],
+        device_hint: Annotated[str, "Which device: 'phone', 'desktop', 'iot hub', or empty for default"] = '',
+    ) -> str:
+        """Control a device on the user's private network via PeerLink.
+
+        Privacy-first: only targets the user's own devices (SAME_USER trust).
+        Uses PeerLink dispatch channel with FleetCommandService fallback.
+        """
+        try:
+            # Step 1: Find the target device via DeviceRoutingService
+            target_device = None
+            try:
+                from integrations.social.models import db_session
+                from integrations.social.device_routing_service import DeviceRoutingService
+                with db_session(commit=False) as db:
+                    if device_hint:
+                        # Map hint to capability or form factor
+                        capability = 'general'
+                        if device_hint.lower() in ('phone', 'desktop', 'tablet', 'tv', 'embedded', 'robot'):
+                            # Filter by form factor
+                            devices = DeviceRoutingService.get_user_device_map(db, str(user_id))
+                            for d in devices:
+                                if d.get('form_factor', '') == device_hint.lower():
+                                    target_device = d
+                                    break
+                        if not target_device:
+                            target_device = DeviceRoutingService.pick_device(
+                                db, str(user_id), required_capability=capability)
+                    else:
+                        target_device = DeviceRoutingService.pick_device(
+                            db, str(user_id), required_capability='general')
+            except Exception as e:
+                tool_logger.debug(f"Device routing lookup failed: {e}")
+
+            target_node_id = (target_device or {}).get('device_id', '')
+
+            # Step 2: Try PeerLink dispatch channel (SAME_USER trust only)
+            peerlink_sent = False
+            if target_node_id:
+                try:
+                    from core.peer_link.link_manager import get_link_manager
+                    from core.peer_link.link import TrustLevel
+                    mgr = get_link_manager()
+                    link = mgr.get_link(target_node_id)
+                    if link and link.trust == TrustLevel.SAME_USER:
+                        result = mgr.send(
+                            target_node_id, 'dispatch',
+                            {'type': 'device_control', 'action': action,
+                             'user_id': str(user_id)},
+                            wait_response=True, timeout=30.0,
+                        )
+                        if result is not None:
+                            peerlink_sent = True
+                            msg = result.get('message', str(result))
+                            return f"Device control result: {msg}"
+                    elif link and link.trust != TrustLevel.SAME_USER:
+                        return ("Device control blocked: target device is not a SAME_USER "
+                                "trusted device. Only your own devices can be controlled.")
+                except Exception as e:
+                    tool_logger.debug(f"PeerLink dispatch failed: {e}")
+
+            # Step 3: Fallback to FleetCommandService
+            if not peerlink_sent:
+                try:
+                    from integrations.social.models import db_session
+                    from integrations.social.fleet_command import FleetCommandService
+                    with db_session() as db:
+                        cmd = FleetCommandService.push_command(
+                            db, target_node_id or 'self',
+                            'device_control',
+                            {'action': action, 'device_hint': device_hint},
+                        )
+                        if cmd:
+                            return f"Device control command queued (id={cmd.get('id', '?')}): {action}"
+                        return "Device control: failed to queue command"
+                except Exception as e:
+                    tool_logger.debug(f"Fleet command fallback failed: {e}")
+
+            # Step 4: Local execution as last resort (this IS the target device)
+            try:
+                from integrations.social.fleet_command import FleetCommandService
+                result = FleetCommandService.execute_command(
+                    'device_control', {'action': action})
+                if result.get('success'):
+                    return f"Device control (local): {result.get('message', 'OK')}"
+                return f"Device control failed: {result.get('message', 'Unknown error')}"
+            except Exception as e:
+                return f"Device control unavailable: {e}"
+
+        except Exception as e:
+            tool_logger.warning(f"device_control failed: {e}")
+            return f"Device control error: {e}"
+
+    tools.append((
+        "device_control",
+        "Control a device on the user's private network. Actions: turn on/off lights, "
+        "check temperature, list files, run commands. Privacy-first: only your own devices.",
+        device_control,
+    ))
+
     return tools
 
 

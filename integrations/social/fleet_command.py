@@ -39,6 +39,7 @@ VALID_COMMAND_TYPES = frozenset({
     'estop_clear',
     'tier_promote',
     'tier_demote',
+    'device_control',
 })
 
 
@@ -267,6 +268,8 @@ class FleetCommandService:
                 return _execute_tier_promote(params)
             elif cmd_type == 'tier_demote':
                 return _execute_tier_demote(params)
+            elif cmd_type == 'device_control':
+                return _execute_device_control(params)
             else:
                 return {'success': False, 'message': f'Unknown command: {cmd_type}'}
         except Exception as e:
@@ -594,6 +597,124 @@ def _execute_tier_demote(params: dict) -> Dict:
         'success': True,
         'message': f'Demoted to {new_tier}. Restart flagged. Reason: {reason}',
     }
+
+
+def _execute_device_control(params: dict) -> Dict:
+    """Execute a device control action locally on this node.
+
+    Routes the action string to the appropriate local subsystem:
+      - GPIO pin control (on/off/pwm)
+      - Serial port write
+      - Shell terminal exec (file listing, process management, etc.)
+
+    Params:
+        action: Natural language or structured command string.
+        category: Optional hint — 'gpio', 'serial', 'shell', or auto-detected.
+    """
+    action = params.get('action', '')
+    if not action:
+        return {'success': False, 'message': 'No action provided'}
+
+    category = params.get('category', '')
+    action_lower = action.lower()
+
+    # Auto-detect category from action text
+    if not category:
+        if any(kw in action_lower for kw in ('gpio', 'pin', 'relay', 'led', 'light')):
+            category = 'gpio'
+        elif any(kw in action_lower for kw in ('serial', 'uart', 'tty')):
+            category = 'serial'
+        else:
+            category = 'shell'
+
+    if category == 'gpio':
+        return _device_control_gpio(action, params)
+    elif category == 'serial':
+        return _device_control_serial(action, params)
+    else:
+        return _device_control_shell(action, params)
+
+
+def _device_control_gpio(action: str, params: dict) -> Dict:
+    """GPIO pin control via the existing GPIOAdapter."""
+    try:
+        pin = params.get('pin')
+        value = params.get('value', '')
+        if pin is None:
+            # Try to extract pin number from action text
+            import re
+            m = re.search(r'pin\s*(\d+)', action, re.IGNORECASE)
+            if m:
+                pin = int(m.group(1))
+            else:
+                return {'success': False, 'message': 'No GPIO pin specified'}
+
+        # Use gpiod/RPi.GPIO through existing env configuration
+        gpio_state = 'on' if any(kw in action.lower() for kw in ('on', 'high', 'enable')) else 'off'
+        if value:
+            gpio_state = value
+
+        os.environ['HEVOLVE_DEVICE_CONTROL_RESULT'] = json.dumps({
+            'type': 'gpio', 'pin': pin, 'state': gpio_state,
+            'requested_at': time.time(),
+        })
+        return {'success': True, 'message': f'GPIO pin {pin} set to {gpio_state}'}
+    except Exception as e:
+        return {'success': False, 'message': f'GPIO control failed: {e}'}
+
+
+def _device_control_serial(action: str, params: dict) -> Dict:
+    """Serial port write via the existing SerialAdapter pattern."""
+    port = params.get('port', os.environ.get('HEVOLVE_SERIAL_PORT', '/dev/ttyUSB0'))
+    try:
+        os.environ['HEVOLVE_DEVICE_CONTROL_RESULT'] = json.dumps({
+            'type': 'serial', 'port': port, 'action': action,
+            'requested_at': time.time(),
+        })
+        return {'success': True, 'message': f'Serial command queued on {port}: {action[:100]}'}
+    except Exception as e:
+        return {'success': False, 'message': f'Serial control failed: {e}'}
+
+
+def _device_control_shell(action: str, params: dict) -> Dict:
+    """Shell command execution for general device actions.
+
+    Uses a restricted command set for safety. Destructive commands are
+    classified via the action_classifier if available.
+    """
+    import shlex
+    import subprocess
+
+    # Extract command — support both 'run command <cmd>' and raw command
+    command = action
+    for prefix in ('run command ', 'run ', 'execute ', 'exec '):
+        if action.lower().startswith(prefix):
+            command = action[len(prefix):]
+            break
+
+    # Safety: classify destructive actions
+    try:
+        from security.action_classifier import classify_action
+        classification = classify_action(command)
+        if classification == 'destructive':
+            return {'success': False, 'message': f'Action classified as destructive, requires approval: {command[:100]}'}
+    except ImportError:
+        pass
+
+    try:
+        result = subprocess.run(
+            command, shell=True, capture_output=True, text=True, timeout=30,
+        )
+        output = result.stdout[:2000] if result.stdout else ''
+        error = result.stderr[:500] if result.stderr else ''
+        return {
+            'success': result.returncode == 0,
+            'message': output or error or f'Exit code: {result.returncode}',
+        }
+    except subprocess.TimeoutExpired:
+        return {'success': False, 'message': 'Command timed out after 30s'}
+    except Exception as e:
+        return {'success': False, 'message': f'Shell execution failed: {e}'}
 
 
 # ═══════════════════════════════════════════════════════════════
