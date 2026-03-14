@@ -1,0 +1,40 @@
+# HART OS Code Owners — every change requires explicit approval.
+# Nobody writes anything without being approved.
+#
+# Format: <pattern> <owner>
+# The LAST matching pattern takes precedence.
+
+# Default: everything requires steward approval
+*                           @hertz-ai/stewards
+
+# Security — requires steward + security reviewer
+/security/                  @hertz-ai/stewards
+/security/hive_guardrails.py @hertz-ai/stewards
+/security/master_key.py     @hertz-ai/stewards
+/security/native_hive_loader.py @hertz-ai/stewards
+/security/origin_attestation.py @hertz-ai/stewards
+
+# Core — requires steward approval
+/core/                      @hertz-ai/stewards
+/core/peer_link/            @hertz-ai/stewards
+/core/platform/             @hertz-ai/stewards
+
+# License and identity — ONLY steward
+LICENSE                     @hertz-ai/stewards
+CLAUDE.md                   @hertz-ai/stewards
+README.md                   @hertz-ai/stewards
+
+# CI/CD — steward only (controls what gets built and released)
+/.github/                   @hertz-ai/stewards
+/deploy/                    @hertz-ai/stewards
+/nixos/                     @hertz-ai/stewards
+/scripts/                   @hertz-ai/stewards
+
+# Agent engine — steward approval
+/integrations/agent_engine/ @hertz-ai/stewards
+
+# Root files — steward only
+/*.py                       @hertz-ai/stewards
+/pyproject.toml             @hertz-ai/stewards
+/setup.py                   @hertz-ai/stewards
+/requirements.txt           @hertz-ai/stewards
