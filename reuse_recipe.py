@@ -348,28 +348,8 @@ database_url = get_db_url() or 'https://mailer.hertzai.com'
 
 
 def save_conversation_db(text, user_id, prompt_id, database_url, request_id):
-    headers = {'Content-Type': 'application/json'}
-    data = {
-        "request": 'VIDEO GENERATION FROM GENERATE_VIDEO',
-        "response": text.strip(),
-        "user_id": int(user_id),
-        "conv_bot_name": 'GPT-4o',
-        "topic": f'{prompt_id}',
-        "revision": False,
-        "dialogue_id": None,
-        "card_type": 'Custom GPT',
-        "qid": None,
-        "layout_id": None,
-        "layout_list": '[]',
-        "request_token": 0,
-        "response_token": 0,
-        "request_id": request_id,
-        "historical_request_id": str('[]')
-    }
-    res = pooled_post("{}/conversation".format(database_url),
-                        data=json.dumps(data), headers=headers).json()
-    conv_id = res['conv_id']
-    return conv_id
+    """Delegate to canonical implementation in helper.py."""
+    return helper_fun.save_conversation_db(text, user_id, prompt_id, database_url, request_id)
 
 
 def get_role(user_id, prompt_id):
