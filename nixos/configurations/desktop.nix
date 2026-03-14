@@ -347,11 +347,12 @@
   }];
 
   # ─── GNOME Shell Extensions (packaged) ───
-  environment.systemPackages = with pkgs; [
+  # Uses lib.mkAfter to merge with the primary systemPackages list above
+  environment.systemPackages = lib.mkAfter (with pkgs; [
     gnomeExtensions.dash-to-dock       # Taskbar (dock) at bottom
     gnomeExtensions.appindicator       # System tray support
     jetbrains-mono                     # Default monospace font
-  ] ++ config.environment.systemPackages;
+  ]);
 
   # ─── i18n / Language Support ───
   # Install fonts for ALL major writing systems
