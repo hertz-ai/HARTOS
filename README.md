@@ -29,6 +29,41 @@ If another hivemind wants to connect, it must prove - cryptographically - that i
 
 ---
 
+## Try It Now
+
+```bash
+# 1. Clone and install
+git clone https://github.com/hertz-ai/HARTOS.git && cd HARTOS
+pip install -r requirements.txt
+
+# 2. Add your API key (OpenAI or Groq)
+echo "OPENAI_API_KEY=your-key" > .env
+
+# 3. Start the backend
+python langchain_gpt_api.py
+```
+
+Now talk to it:
+
+```bash
+# Chat with an agent
+curl -X POST http://localhost:6777/chat \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": "1", "prompt_id": "1", "prompt": "What can you do?"}'
+
+# OpenAI-compatible endpoint (works with any OpenAI SDK client)
+curl -X POST http://localhost:6777/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "hevolve", "messages": [{"role": "user", "content": "Hello"}]}'
+
+# Health check
+curl http://localhost:6777/status
+```
+
+**Use any frontend:** [Nunba](https://github.com/hertz-ai/Hevolve) (companion app, OSS soon), any OpenAI-compatible client, curl, Python, the `hart` CLI, or build your own with the [HART SDK](docs/developer/sdk.md).
+
+---
+
 ## How It Works
 
 ### The Guardian Angel Principle
