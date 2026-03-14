@@ -198,11 +198,13 @@ Task relationships classified by LLM: child, sibling, sequential, conditional, i
 
 Goal-driven autonomous agent runtime.
 
-### Core Files (`integrations/agent_engine/`)
+### Core Files (`integrations/agent_engine/`) — 67 files
 
 | File | Purpose |
 |------|---------|
+| `__init__.py` | Package init, tier authorization at boot |
 | `agent_daemon.py` | Tick-based daemon (30s), processes goals from queue |
+| `agent_baseline_service.py` | Per-agent benchmark snapshots, regression detection |
 | `goal_manager.py` | 17+ goal types, prompt builders, tool tag routing |
 | `goal_seeding.py` | 30+ bootstrap goals on first start |
 | `dispatch.py` | Goal decomposition, LLM dispatch, budget gating |
@@ -232,7 +234,41 @@ Goal-driven autonomous agent runtime.
 | `network_provisioner.py` | Node provisioning, deployment automation |
 | `liquid_ui_service.py` | LiquidUI Glass Shell (3244 lines), 55 panels, MD3 design |
 | `shell_manifest.py` | Panel manifest migration, system panel definitions |
+| `shell_os_apis.py` | 57 shell OS endpoints (files, power, WiFi, VPN, backup, etc.) |
+| `shell_desktop_apis.py` | 46 desktop endpoints (fonts, sound, clipboard, wallpaper, etc.) |
+| `shell_system_apis.py` | 28 system endpoints (processes, storage, Bluetooth, CUPS, etc.) |
 | `theme_service.py` | CSS design tokens, custom themes, EventBus emission |
+| `api.py` | Unified product + goal endpoints (10 endpoints) |
+| `api_content_gen.py` | Content generation task API (6 endpoints) |
+| `api_learning.py` | CCT management and learning tier endpoints (9 endpoints) |
+| `app_installer.py` | Cross-platform package installer (Nix, Flatpak, AppImage, Wine, Android) |
+| `auto_deploy_service.py` | Build, sign, and deploy on PR merge |
+| `auto_evolve.py` | Democratic thought experiment to autonomous iteration loop |
+| `benchmark_registry.py` | Dynamic benchmark registry, 7 built-in adapters |
+| `content_gen_tools.py` | 4 AutoGen tools for content_gen goal type |
+| `federated_gradient_protocol.py` | Phase 2 stubs for LoRA gradient sync |
+| `federation_tools.py` | 4 AutoGen tools for federation goal type |
+| `finance_tools.py` | Revenue split tracking (90/9/1), expense monitoring, financial health |
+| `gradient_tools.py` | 4+2 AutoGen tools for distributed embedding sync |
+| `ip_protection_tools.py` | AutoGen tools for IP protection goals |
+| `ip_service.py` | Patent CRUD + moat verification service |
+| `learning_tools.py` | AutoGen tools for CCT issuance, learning coordination |
+| `marketing_tools.py` | AutoGen tools for marketing goals (campaigns, ads, channels) |
+| `native_onboarding.py` | GTK4/libadwaita native "Light Your HART" onboarding app |
+| `news_tools.py` | AutoGen tools for news curation and push notifications |
+| `onboarding_routes.py` | REST endpoints for onboarding state machine |
+| `pr_review_service.py` | Coding agent PR review, auto-approve/flag for steward |
+| `private_repo_access.py` | GitHub invite/revoke + access control for private repos |
+| `provision_tools.py` | 5 AutoGen tools for network provisioning |
+| `revenue_tools.py` | AutoGen tools for API revenue monitoring |
+| `rl_ef_endpoints.py` | RL-EF API endpoints for expert corrections and learning stats |
+| `self_build_tools.py` | AutoGen tools for NixOS self-build (stage/dry-run/apply) |
+| `thought_experiment_tools.py` | 8 AutoGen tools for thought experiment coordination |
+| `tool_allowlist.py` | Tool restrictions by model tier: FAST=read-only, BALANCED=read-write, EXPERT=unrestricted |
+| `trading_tools.py` | AutoGen tools for paper/live trading agents |
+| `upgrade_orchestrator.py` | 7-stage upgrade pipeline (BUILD→TEST→AUDIT→BENCHMARK→SIGN→CANARY→DEPLOY) |
+| `upgrade_tools.py` | 10 AutoGen tools for upgrade goal type |
+| `video_orchestrator.py` | Video generation orchestration, asset caching, text chunking, queue ETA |
 
 ### Goal Types (17+)
 
@@ -412,10 +448,11 @@ Master Key (Ed25519, human-held, AI exclusion zone)
 4. NEVER modify `HiveCircuitBreaker` or `_FrozenValues`
 5. The master key is a kill switch for distributed intelligence. It belongs to human stewards only.
 
-### Files (`security/`)
+### Files (`security/`) — 33 files
 
 | File | Purpose |
 |------|---------|
+| `__init__.py` | Package init, full boot verification orchestration. |
 | `master_key.py` | Ed25519 trust anchor. Public key hardcoded. Private key in HSM/GitHub Secrets. |
 | `hive_guardrails.py` | 10 structurally immutable guardrail classes. `_FrozenValues` + `__setattr__` guard + SHA-256 hash chain. |
 | `key_delegation.py` | 3-tier certificate chain. `DomainChallengeVerifier` for provisional nodes. |
@@ -437,6 +474,17 @@ Master Key (Ed25519, human-held, AI exclusion zone)
 | `safe_deserialize.py` | Replace pickle with safe format (HVSF). |
 | `secrets_manager.py` | Fernet-encrypted secrets vault (PBKDF2 key derivation). |
 | `hsm_provider.py` | HSM backends: GCP KMS, Azure Key Vault, HashiCorp Vault. |
+| `ai_governance.py` | Constitutional scoring framework. Weighted multi-signal scoring (score starts at 1.0, violations reduce). |
+| `audit_log.py` | Security audit logging. Filters sensitive data (API keys, JWTs, credentials) from log output. |
+| `edge_privacy.py` | Scope-based data protection at the edge. PrivacyScope enum, ScopeGuard egress checks. |
+| `hsm_trust.py` | HSM trust network. Certificate pinning, mTLS client certs, request signing, health monitoring. |
+| `mcp_sandbox.py` | MCP tool sandboxing. Defends against CVE-2025-6514 (command injection), path traversal, shell metachar blocking. |
+| `middleware.py` | Flask security middleware. Security headers, CORS, CSRF protection, host validation, API auth. |
+| `pre_trust_contract.py` | Automated hive trust establishment. Cryptographic contract signing, 80% compute audit commitment. |
+| `release_hash_registry.py` | Multi-version code hash allowlist. Accepts peers running any valid GA release during rolling upgrades. |
+| `sanitize.py` | Input sanitization. SQL LIKE injection, path traversal, XSS prevention, input validation. |
+| `system_requirements.py` | Hardware detection, 6-tier classification (EMBEDDED through COMPUTE_HOST), adaptive feature gating. |
+| `tls_config.py` | TLS enforcement for outbound HTTP. Secure request sessions, MITM defense. |
 
 ### Guardrail Network (Constitutional Rules)
 
@@ -999,6 +1047,18 @@ Accepts task description + user_id. Delegates to action execution pipeline (CREA
 
 LTX-2 server (`integrations/vision/ltx2_server.py`): text-to-video generation, long video generation, model lifecycle.
 
+### VLM Files (`integrations/vlm/`) — 7 files
+
+| File | Purpose |
+|------|---------|
+| `__init__.py` | Package init |
+| `local_loop.py` | Local agentic VLM loop (in-process and HTTP tiers) |
+| `local_computer_tool.py` | Local computer use tool (pyautogui, screenshot) |
+| `local_omniparser.py` | Local OmniParser integration for screen parsing |
+| `qwen3vl_backend.py` | Qwen3-VL unified VLM backend |
+| `vlm_adapter.py` | Three-tier VLM execution adapter (in-process / HTTP local / Crossbar WAMP). Circuit breaker with 2-failure threshold. |
+| `vlm_agent_integration.py` | VLMAgentContext — bridges VLM visual capabilities with agent ledger. Screen context injection, GUI action dispatch, Windows command execution. Singleton via `get_vlm_context()`. |
+
 ---
 
 ## 18. Remote Desktop
@@ -1245,7 +1305,113 @@ Headless mode: `hart -p "task"` dispatches to `/chat` endpoint.
 
 ---
 
-## 28. NixOS Modules (48)
+## 28. Robotics (`integrations/robotics/`)
+
+Embodiment orchestration layer that bridges the LLM-langchain agentic side with HevolveAI's native embodiment intelligence. HARTOS owns safety, sensor routing, capability advertisement, and the learning feedback loop. HevolveAI owns the hard real-time control: PID, Kalman filtering, SLAM, navigation, and kinematics. Everything is optional — no GPIO means no GPIO bridge, no HevolveAI means HTTP fallback. A Raspberry Pi Zero running gossip and fleet commands is still a valid node.
+
+The safety subsystem is local-first: a GPIO pin going LOW triggers an E-stop within 50ms without waiting for network or agent approval. Only human operators can clear an E-stop — agents are explicitly rejected. The recipe adapter bridges the CREATE/REUSE pipeline with physical actions so robot motion sequences can be learned once and replayed with real-time adaptation by HevolveAI.
+
+### Files — 14 files
+
+| File | Purpose |
+|------|---------|
+| `__init__.py` | Package init. Bridges LLM orchestration to HevolveAI native embodiment. |
+| `action_model.py` | `RobotAction` dataclass — universal format for motor commands (motor_velocity, servo_position, gpio_output, gripper, navigate_to, emergency_stop). |
+| `sensor_model.py` | `SensorReading` dataclass — unified format for all sensor types (11 schemas: imu, gps, encoder, force_torque, proximity, temperature, camera, depth, lidar, contact, battery). Per-type TTL defaults. |
+| `sensor_store.py` | Thread-safe multi-modal sensor data store. Per-sensor bounded deques with TTL. Singleton via `get_sensor_store()`. |
+| `sensor_adapters.py` | 4 hardware bridges: `SerialSensorBridge` (regex line parsing), `GPIOSensorBridge` (pin state to proximity/contact), `ROSSensorBridge` (ROS 2 sensor_msgs), `WAMPSensorBridge` (IoT topics). |
+| `safety_monitor.py` | E-stop + operational domain enforcement. 20Hz GPIO/serial polling, workspace limit validation, joint limit checks. Human-only clear. Singleton via `get_safety_monitor()`. |
+| `safety_tools.py` | 4 AutoGen tools: `configure_workspace_limits`, `get_safety_status`, `test_estop`, `configure_estop_sources`. |
+| `control_loop.py` | `ControlLoopBridge` — timing bridge between agentic and native layers. Drift-compensated per-callback threads at configurable Hz. |
+| `robot_boot.py` | `boot_robotics()` — initializes all subsystems (safety, sensor store, adapters, control loop, capability advertiser). Called from `embedded_main.py` when `HEVOLVE_ROBOT_ENABLED=true`. |
+| `capability_advertiser.py` | Discovers robot capabilities from 4 sources (hardware profile, sensor store, robot_config.json, HevolveAI query). `matches_task_requirements()` scores task-robot fit. Singleton via `get_capability_advertiser()`. |
+| `hevolveai_access_gate.py` | Feature-level access control. Gates HevolveAI features by certificate tier, CCT capability, and installation integrity. 6 feature rules (in_process, sensor_fusion, navigation, manipulation, learning, hivemind). |
+| `robot_prompt_builder.py` | `build_robot_prompt()` — injects capabilities, safety status, active sensors, and available tools into the agent's system prompt for robot goals. |
+| `robot_tools.py` | 8 AutoGen tools: `get_robot_capabilities`, `read_sensor`, `get_sensor_window`, `get_robot_status`, `navigate_to`, `move_joint`, `execute_motion_sequence`, `configure_sensor`. All route through WorldModelBridge. |
+| `recipe_adapter.py` | `RobotRecipeAdapter` — converts physical actions + sensor context into recipe steps (CREATE mode) and extracts action sequences for replay (REUSE mode). |
+
+---
+
+## 29. Agent Lightning (`integrations/agent_lightning/`)
+
+Integrates continuous agent training and optimization via automatic tracing and reinforcement learning. Provides minimal-change wrappers for existing AutoGen agents — the wrapper is transparent and has zero impact on agent behavior. When enabled (`AGENT_LIGHTNING_ENABLED=true`), it instruments `generate_reply` and tool execution methods to capture prompts, responses, tool calls, and rewards.
+
+The reward calculator supports 7 reward types (task_completion, task_failure, tool_use_efficiency, response_quality, execution_time, user_feedback, custom) with context-based modifiers. Training data is accumulated from completed spans and can be extracted for prompt optimization (SFT or PPO). The store supports 3 backends (Redis for production, JSON for development, in-memory for testing).
+
+### Files — 6 files
+
+| File | Purpose |
+|------|---------|
+| `__init__.py` | Package init, exports all public classes and functions. |
+| `config.py` | `AGENT_LIGHTNING_CONFIG` — global config dict (training, rewards, per-agent settings, monitoring, performance). `is_enabled()`, `get_agent_config()`, `get_reward_value()`. |
+| `tracer.py` | `LightningTracer` — automatic tracing. `Span` class with events (prompt, response, tool_call, reward). Global auto-tracing toggle. |
+| `rewards.py` | `RewardCalculator` — 7 `RewardType` enum values, context-based reward modifiers, statistics tracking, reward history (last 1000). |
+| `store.py` | `LightningStore` — persistence for spans and training data. Redis/JSON/memory backends. `get_training_data()` with reward filtering. |
+| `wrapper.py` | `AgentLightningWrapper` — wraps AutoGen agents. Instruments `generate_reply` and `_execute_function`. `instrument_autogen_agent()` convenience function (returns unwrapped agent when disabled). |
+
+---
+
+## 30. Marketing (`integrations/marketing/`)
+
+Tamil-rooted, globally adaptive marketing intelligence. Named "Nunban" ("one of Nunba" in Tamil), the marketing agent is grounded in Thirukkural couplets (2000+ years of Tamil ethical wisdom) and cultural_wisdom.py traits for geographic adaptation. Core values: Mei (truth), Aram (righteousness), Anbu (love), Virunthombal (hospitality). No dark patterns, no manipulation, no hype — just truth. The 10 marketing rules include honest claims, no FOMO manipulation, healthy disengagement, and measuring success by trust earned rather than clicks.
+
+Geographic adaptation covers 12 regions (tamil_nadu, south_asia, east_asia, southeast_asia, middle_east, africa, northern_europe, southern_europe, north_america, latin_america, oceania) with region-specific tone, values, cultural traits, and explicit "things to avoid" guidance. Tamil Nadu is the default voice; all other styles adapt from it.
+
+### Files — 2 files
+
+| File | Purpose |
+|------|---------|
+| `__init__.py` | Package init. |
+| `marketing_nunban.py` | 9 Thirukkural couplets + 6 Tamil proverbs for marketing contexts. 12 `GEOGRAPHIC_STYLES` with per-region tone/values/avoid guidance. `get_marketing_system_prompt(geography)`, `detect_geography(user_data)`, `get_kural_for_context()`, `get_proverb_for_context()`. |
+
+---
+
+## 31. Skills (`integrations/skills/`)
+
+Skill ingestion registry that converts any agent skill definition (Claude Code SKILL.md, plain Markdown, JSON) into HART tools available to every agent. Follows the ServiceToolRegistry / MCPToolRegistry pattern with a global singleton `skill_registry`. Skills are discovered from local filesystem (`~/.claude/skills/*/SKILL.md`), GitHub repositories, or API uploads.
+
+Each `SkillInfo` carries metadata (name, description, tags, allowed tools, version, author) plus the Markdown instructions body. The registry generates LangChain `Tool` objects and AutoGen function descriptions, plugging into the existing `get_tools()` pipeline. Skills persist to `skills.json` for startup reload.
+
+### Files — 2 files
+
+| File | Purpose |
+|------|---------|
+| `__init__.py` | Package init, exports `skill_registry` singleton and `SkillInfo`. |
+| `registry.py` | `SkillInfo` dataclass (YAML frontmatter parser, `from_skill_md()`). `SkillRegistry` — register/unregister, `discover_local()`, `discover_github()`, `ingest_markdown()`, `get_langchain_tools()`, `get_autogen_tools()`, JSON persistence. |
+
+---
+
+## 32. Service Tools (`integrations/service_tools/`) — 21 files
+
+Model lifecycle management, TTS engines, media agent, and AI tool backends.
+
+| File | Purpose |
+|------|---------|
+| `__init__.py` | Package init |
+| `registry.py` | ServiceToolRegistry — tool registration, discovery, LangChain integration |
+| `model_catalog.py` | Model catalog with metadata, capabilities, and requirements |
+| `model_lifecycle.py` | Model download, load, unload, health check lifecycle |
+| `model_orchestrator.py` | Multi-model orchestration, routing, fallback chains |
+| `model_storage.py` | Model file storage, cache management, disk cleanup |
+| `runtime_manager.py` | Runtime process management for model servers |
+| `vram_manager.py` | Single source of truth for GPU detection and VRAM management |
+| `media_agent.py` | Media processing agent (image, video, audio) |
+| `luxtts_tool.py` | LuxTTS — sherpa-onnx ZipVoice-Distill INT8, zero-shot voice cloning, 24kHz |
+| `pocket_tts_tool.py` | Pocket TTS — 8 built-in voices, voice cloning via HF gated model |
+| `chatterbox_tool.py` | Chatterbox TTS stub (en, 23-lang ML variant) |
+| `cosyvoice_tool.py` | CosyVoice 3 TTS stub (9 languages, voice cloning) |
+| `f5_tts_tool.py` | F5-TTS stub (en/zh, voice cloning) |
+| `indic_parler_tool.py` | Indic Parler TTS stub (22 Indian languages) |
+| `tts_audio_suite_tool.py` | TTS audio post-processing suite |
+| `whisper_tool.py` | Whisper STT tool (faster-whisper, sherpa-onnx, openai-whisper) |
+| `omniparser_tool.py` | OmniParser screen parsing tool |
+| `acestep_tool.py` | ACEStep AI tool |
+| `crawl4ai_tool.py` | Crawl4AI web scraping tool |
+| `wan2gp_tool.py` | Wan2GP video generation tool |
+
+---
+
+## 33. NixOS Modules (48)
 
 ### Base & Boot
 
@@ -1342,7 +1508,7 @@ Headless mode: `hart -p "task"` dispatches to `/chat` endpoint.
 
 ---
 
-## 29. Port Registry
+## 34. Port Registry
 
 Single source of truth: `core/port_registry.py`
 
@@ -1363,7 +1529,7 @@ Mode detection: `HART_OS_MODE=true` env var OR `/etc/os-release ID=hart-os`.
 
 ---
 
-## 30. Core Infrastructure
+## 35. Core Infrastructure
 
 ### Singletons (25+)
 
@@ -1403,7 +1569,7 @@ Mode detection: `HART_OS_MODE=true` env var OR `/etc/os-release ID=hart-os`.
 
 ---
 
-## 31. Design Patterns
+## 36. Design Patterns
 
 ### Singleton Pattern
 Module-level `_instance = None` + `get_*()` factory. 25+ instances.
@@ -1443,7 +1609,7 @@ Exception collection, recipe experience recording, notifications — never block
 
 ---
 
-## 32. Environment Variables
+## 37. Environment Variables
 
 ### Core
 
@@ -1486,7 +1652,7 @@ Exception collection, recipe experience recording, notifications — never block
 
 ---
 
-## 33. API Endpoints (430+)
+## 38. API Endpoints (430+)
 
 ### Main Application (`langchain_gpt_api.py`) — 47 endpoints
 
@@ -1528,7 +1694,7 @@ Coding Agent (7), Distributed Agent (11), OpenClaw (9), Onboarding (4), Flask In
 
 ---
 
-## 34. Test Architecture
+## 39. Test Architecture
 
 ### Patterns
 
@@ -1553,7 +1719,7 @@ Coding Agent (7), Distributed Agent (11), OpenClaw (9), Onboarding (4), Flask In
 
 ---
 
-## 35. Dependencies
+## 40. Dependencies
 
 ### Critical Pinned
 
@@ -1576,7 +1742,7 @@ All imports use `from langchain.X` (NOT langchain_classic, langchain_community).
 
 ---
 
-## 36. File Tree Summary
+## 41. File Tree Summary
 
 ```
 HARTOS/
@@ -1612,17 +1778,21 @@ HARTOS/
 │   ├── file_cache.py            # mtime-based JSON cache
 │   └── config_cache.py          # Cached config reader
 │
-├── security/                    # 20 files (see Section 7)
+├── security/                    # 33 files (see Section 7)
 │
 ├── integrations/
-│   ├── agent_engine/            # 35+ files (see Section 5)
+│   ├── agent_engine/            # 67 files (see Section 5)
 │   ├── social/                  # 50+ files (see Section 14)
-│   ├── channels/                # 80+ files (see Section 15)
+│   ├── channels/                # 14 core + 60+ extended (see Section 15)
 │   ├── coding_agent/            # 8 files (see Section 19)
 │   ├── distributed_agent/       # 5 files (see Section 20)
 │   ├── remote_desktop/          # 15 files (see Section 18)
-│   ├── service_tools/           # 18+ files (see Section 16)
-│   ├── vision/                  # 5 files (see Section 17)
+│   ├── service_tools/           # 21 files (see Section 32)
+│   ├── vision/                  # 7 files (see Section 17)
+│   ├── robotics/                # 14 files (see Section 28)
+│   ├── agent_lightning/         # 6 files (see Section 29)
+│   ├── marketing/               # 2 files (see Section 30)
+│   ├── skills/                  # 2 files (see Section 31)
 │   ├── audio/                   # Diarization server + service
 │   ├── mcp/                     # MCP server + integration
 │   ├── ap2/                     # Agent Protocol 2 (payments)
@@ -1631,14 +1801,14 @@ HARTOS/
 │   ├── openclaw/                # OpenClaw integration (see Section 26)
 │   └── google_a2a/              # Dynamic agent registry
 │
-├── nixos/                       # 48 NixOS modules (see Section 28)
+├── nixos/                       # 48 NixOS modules (see Section 33)
 ├── tests/                       # Unit + integration tests
 └── docs/                        # Documentation
 ```
 
 ---
 
-## 37. Review Notes for Open-Sourcing
+## 42. Review Notes for Open-Sourcing
 
 ### Items to Verify Before Release
 
