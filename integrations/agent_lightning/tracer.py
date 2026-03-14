@@ -158,6 +158,22 @@ class LightningTracer:
 
         logger.debug(f"Ended span: {span_id} (status: {status})")
 
+        # Emit to EventBus so FederatedAggregator and WorldModelBridge
+        # can consume Agent Lightning traces (closes gap #337)
+        try:
+            from core.platform.events import emit_event
+            emit_event('inference.completed', {
+                'source': 'agent_lightning',
+                'span_id': span.span_id,
+                'agent_id': span.agent_id,
+                'span_type': span.span_type,
+                'duration_ms': (span.end_time - span.start_time) * 1000,
+                'status': status,
+                'success': status == 'success',
+            })
+        except Exception:
+            pass  # Best-effort — never break tracing for event emission
+
         # Save span if configured
         if AGENT_LIGHTNING_CONFIG['monitoring']['save_traces']:
             self._save_span(span)
