@@ -232,6 +232,11 @@
     ripgrep fd bat              # Modern CLI tools (better grep/find/cat)
     tree jq                     # Directory tree / JSON processor
     mpv                         # Media backend (used by celluloid, also standalone)
+
+    # ── GNOME Shell Extensions ──
+    gnomeExtensions.dash-to-dock       # Taskbar (dock) at bottom
+    gnomeExtensions.appindicator       # System tray support
+    jetbrains-mono                     # Default monospace font
   ];
 
   # ─── ISO Branding ───
@@ -346,13 +351,7 @@
     };
   }];
 
-  # ─── GNOME Shell Extensions (packaged) ───
-  # Uses lib.mkAfter to merge with the primary systemPackages list above
-  environment.systemPackages = lib.mkAfter (with pkgs; [
-    gnomeExtensions.dash-to-dock       # Taskbar (dock) at bottom
-    gnomeExtensions.appindicator       # System tray support
-    jetbrains-mono                     # Default monospace font
-  ]);
+  # GNOME Shell Extensions merged into main systemPackages list above
 
   # ─── i18n / Language Support ───
   # Install fonts for ALL major writing systems
