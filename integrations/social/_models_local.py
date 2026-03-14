@@ -10,6 +10,8 @@ the time this module is reached (no circular import issue).
 # noqa: E501
 # ruff: noqa
 
+from datetime import datetime
+
 from sqlalchemy import (
     Column, String, Text, Integer, Float, Boolean,
     DateTime, JSON, ForeignKey, UniqueConstraint, Index, func
