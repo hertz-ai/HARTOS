@@ -170,7 +170,7 @@ jobs:
       - name: Build ${{ matrix.target }}
         working-directory: nixos
         run: |
-          time nix build .#${{ matrix.target }} --no-link --print-out-paths \
+          time nix build .#${{ matrix.target }} --no-link --print-out-paths --show-trace \
             | tee /tmp/build-output.txt
 
       - name: Checksum + Torrent
