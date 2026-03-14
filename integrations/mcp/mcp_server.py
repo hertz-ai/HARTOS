@@ -479,6 +479,55 @@ def switch_model(model_name: str) -> str:
         return json.dumps({"error": str(e)})
 
 
+@mcp.tool()
+def code(
+    task: str,
+    task_type: str = 'feature',
+    preferred_tool: str = '',
+    working_dir: str = '',
+    model: str = '',
+) -> str:
+    """Execute a coding task via the distributed coding agent.
+
+    Routes to the best available tool (kilocode, claude_code, opencode, aider).
+    Records benchmarks. Captures edits as recipes for REUSE mode.
+
+    task_type: feature, bug_fix, refactor, code_review, app_build
+    """
+    try:
+        from integrations.coding_agent.orchestrator import get_coding_orchestrator
+        orchestrator = get_coding_orchestrator()
+        result = orchestrator.execute(
+            task=task,
+            task_type=task_type,
+            preferred_tool=preferred_tool,
+            user_id='claude_mcp',
+            model=model,
+            working_dir=working_dir or os.getcwd(),
+        )
+        return json.dumps(result, indent=2, default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def onboard_kong(
+    kong_url: str = 'http://localhost:8001',
+    upstream_url: str = 'http://localhost:8000',
+) -> str:
+    """Onboard the Mindstory SDK into Kong API Gateway.
+
+    Creates service, routes, and plugins (key-auth, rate-limiting, cors).
+    Idempotent — safe to call multiple times. Queries existing config first.
+    """
+    try:
+        from integrations.gateway.kong_onboard import onboard
+        ok = onboard(kong_url=kong_url, upstream_url=upstream_url)
+        return json.dumps({"success": ok})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
 # ─── Entry point ───
 
 if __name__ == "__main__":
