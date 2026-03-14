@@ -307,6 +307,24 @@ def settle_metered_api_costs(db, period_hours: int = 24) -> Dict:
         logger.info(f"Metered API settlement: {settled_count} records, "
                      f"{total_spark} Spark, ${total_usd:.2f} USD")
 
+        # Immutable audit trail for revenue settlements
+        try:
+            from security.immutable_audit_log import get_audit_log
+            get_audit_log().log_event(
+                'revenue_settlement',
+                actor_id='revenue_aggregator',
+                action=f'Settled {settled_count} metered API records',
+                detail={
+                    'settled_count': settled_count,
+                    'total_spark_awarded': total_spark,
+                    'total_usd_settled': round(total_usd, 4),
+                    'period_hours': period_hours,
+                    'spark_per_usd': SPARK_PER_USD,
+                },
+            )
+        except Exception:
+            pass  # Audit log failure must not block settlement
+
     return {
         'settled_count': settled_count,
         'total_spark_awarded': total_spark,
