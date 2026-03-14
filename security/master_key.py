@@ -34,7 +34,7 @@ logger = logging.getLogger('hevolve_security')
 
 # ── Trust Anchor ──
 # 64-char hex Ed25519 public key. The corresponding private key is a GitHub Secret.
-MASTER_PUBLIC_KEY_HEX = 'ef380be7923d2b6bf88611d4ee5b9c20dc0f97549889ae51e407c4e54221bc1e'
+MASTER_PUBLIC_KEY_HEX = "4662e30d86c2f58416c5ac3f806c2a6af8186e1d96fdbbcad3189847cf888a01"
 
 RELEASE_MANIFEST_FILENAME = 'release_manifest.json'
 
@@ -71,7 +71,7 @@ def load_release_manifest(code_root: str = None) -> Optional[dict]:
         with open(manifest_path, 'r', encoding='utf-8') as f:
             return json.load(f)
     except (json.JSONDecodeError, IOError) as e:
-        logger.warning(f"Failed to load release manifest: {e}")
+        logger.warning("Failed to load release manifest: %s" % e)
         return None
 
 
