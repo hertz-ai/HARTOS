@@ -1208,44 +1208,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                             return '\n'.join(cleaned_lines)
 
                         def format_action_text(text):
-                            if text.strip().startswith("{") and "action" in text:
-                                try:
-                                    action_data = ast.literal_eval(text.strip())
-                                    action_type = action_data.get("action", "")
-
-                                    if action_type == "mouse_move":
-                                        return "Move mouse"
-                                    elif action_type == "left_click":
-                                        return "Perform left click"
-                                    elif action_type == "right_click":
-                                        return "Perform right click"
-                                    elif action_type == "double_click":
-                                        return "Perform double click"
-                                    elif action_type == "type" and "text" in action_data:
-                                        return f"Type '{action_data['text']}'"
-                                    elif action_type == "drag":
-                                        return "Perform drag action"
-                                    else:
-                                        return f"Perform {action_type} action"
-                                except Exception:
-                                    action_match = re.search(r"'action':\s*'([^']+)'", text)
-                                    text_match = re.search(r"'text':\s*'([^']+)'", text)
-
-                                    if action_match:
-                                        action_type = action_match.group(1)
-                                        if action_type == "type" and text_match:
-                                            return f"Type '{text_match.group(1)}'"
-                                        elif action_type == "mouse_move":
-                                            return "Move mouse"
-                                        elif action_type == "left_click":
-                                            return "Perform left click"
-                                        elif action_type == "right_click":
-                                            return "Perform right click"
-                                        elif action_type == "double_click":
-                                            return "Perform double click"
-                                        else:
-                                            return f"Perform {action_type} action"
-                            return text
+                            return helper_fun.format_action_text(text)
 
                         # Process extracted responses into recipe steps
                         recipe_steps = []

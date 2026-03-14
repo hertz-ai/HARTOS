@@ -1828,6 +1828,58 @@ def get_llm_config(fallback_config_list=None):
     return {"cache_seed": None, "config_list": override or (fallback_config_list if fallback_config_list is not None else config_list), "max_tokens": 1500}
 
 
+def format_action_text(text):
+    """Format VLM action JSON into human-readable step description.
+
+    Canonical implementation — create_recipe.py and reuse_recipe.py delegate here.
+    Handles JSON dict, ast.literal_eval fallback, regex fallback.
+    """
+    if text.strip().startswith("{") and "action" in text:
+        try:
+            try:
+                action_data = json.loads(text.strip())
+            except (json.JSONDecodeError, ValueError):
+                action_data = ast.literal_eval(text.strip())
+            action_type = action_data.get("action", "")
+
+            if action_type == "mouse_move":
+                return "Move mouse"
+            elif action_type == "left_click":
+                return "Perform left click"
+            elif action_type == "right_click":
+                return "Perform right click"
+            elif action_type == "double_click":
+                return "Perform double click"
+            elif action_type == "type" and "text" in action_data:
+                return f"Type '{action_data['text']}'"
+            elif action_type == "drag":
+                return "Perform drag action"
+            else:
+                return f"Perform {action_type} action"
+        except Exception:
+            action_match = re.search(r"'action':\s*'([^']+)'", text)
+            text_match = re.search(r"'text':\s*'([^']+)'", text)
+            if action_match:
+                action_type = action_match.group(1)
+                if action_type == "type" and text_match:
+                    return f"Type '{text_match.group(1)}'"
+                elif action_type == "mouse_move":
+                    return "Move mouse"
+                elif action_type == "left_click":
+                    return "Perform left click"
+                elif action_type == "right_click":
+                    return "Perform right click"
+                elif action_type == "double_click":
+                    return "Perform double click"
+                else:
+                    return f"Perform {action_type} action"
+            else:
+                return "Perform action"
+    elif "Perform" in text and "action" in text:
+        return text
+    return text
+
+
 def save_conversation_db(text, user_id, prompt_id, database_url, request_id):
     """Save a conversation turn to the database via the conversation API.
 

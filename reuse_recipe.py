@@ -2001,59 +2001,8 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                                     cleaned_lines.append(line)
                             return '\n'.join(cleaned_lines)
 
-                        # Function to format action text consistently
                         def format_action_text(text):
-                            # For JSON-like strings
-                            if text.strip().startswith("{") and "action" in text:
-                                try:
-                                    # Try to parse the string as JSON/Python dict safely
-                                    try:
-                                        action_data = json.loads(text.strip())
-                                    except (json.JSONDecodeError, ValueError):
-                                        action_data = ast.literal_eval(text.strip())
-                                    action_type = action_data.get("action", "")
-
-                                    if action_type == "mouse_move":
-                                        return "Move mouse"
-                                    elif action_type == "left_click":
-                                        return "Perform left click"
-                                    elif action_type == "right_click":
-                                        return "Perform right click"
-                                    elif action_type == "double_click":
-                                        return "Perform double click"
-                                    elif action_type == "type" and "text" in action_data:
-                                        return f"Type '{action_data['text']}'"
-                                    elif action_type == "drag":
-                                        return "Perform drag action"
-                                    else:
-                                        return f"Perform {action_type} action"
-                                except Exception:
-                                    # If eval fails, try regex
-                                    action_match = re.search(r"'action':\s*'([^']+)'", text)
-                                    text_match = re.search(r"'text':\s*'([^']+)'", text)
-
-                                    if action_match:
-                                        action_type = action_match.group(1)
-                                        if action_type == "type" and text_match:
-                                            return f"Type '{text_match.group(1)}'"
-                                        elif action_type == "mouse_move":
-                                            return "Move mouse"
-                                        elif action_type == "left_click":
-                                            return "Perform left click"
-                                        elif action_type == "right_click":
-                                            return "Perform right click"
-                                        elif action_type == "double_click":
-                                            return "Perform double click"
-                                        else:
-                                            return f"Perform {action_type} action"
-                                    else:
-                                        return "Perform action"
-
-                            # For text descriptions containing "Perform"
-                            elif "Perform" in text and "action" in text:
-                                return text  # Already in desired format
-
-                            return text
+                            return helper_fun.format_action_text(text)
 
                         # Handle different response format
                         if 'extracted_responses' in response:
