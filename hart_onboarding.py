@@ -832,11 +832,16 @@ Example format: ["kaze", "hikari", "sora", "ren", "tsuki"]"""
     except Exception as e:
         logger.warning(f"LLM name generation failed: {e}")
 
-    # Fallback: curated poetic names if LLM fails
-    if len(candidates) < 2:
-        candidates = _fallback_names(dimensions, existing_names)
+    # Validate candidates — LLM checks for negative meanings across all languages
+    if candidates:
+        candidates = _validate_names_cross_language(candidates, language)
 
-    # Pick the first unique one
+    # Fallback: curated poetic names if LLM fails or all filtered out
+    if len(candidates) < 1:
+        fallbacks = _fallback_names(dimensions, existing_names)
+        candidates = _validate_names_cross_language(fallbacks, language) or fallbacks[:1]
+
+    # Pick the first safe unique one
     chosen = candidates[0] if candidates else _emergency_name()
     emoji_combo = generate_emoji_combo(locale, dimensions)
     element, spirit = assign_element_spirit(dimensions)
@@ -866,6 +871,54 @@ def _get_label(options: list, key: str, lang: str) -> str:
         if opt['key'] == key:
             return opt['labels'].get(lang, opt['labels'].get('en', key))
     return key
+
+
+def _validate_names_cross_language(candidates: List[str], user_language: str) -> List[str]:
+    """Use LLM to filter out names that have negative, offensive, embarrassing,
+    or unfortunate meanings in ANY language. A name like 'sori' (itch in Tamil)
+    must never reach the user.
+
+    Returns only the safe candidates. If LLM is unavailable, returns all
+    candidates unchanged (best-effort).
+    """
+    if not candidates:
+        return candidates
+
+    try:
+        from langchain_gpt_api import get_llm
+        llm = get_llm(temperature=0.0, max_tokens=300)
+
+        names_str = ', '.join(candidates)
+        prompt = f"""You are a multilingual name safety validator. The user's language is {user_language}.
+
+Check each of these candidate names: [{names_str}]
+
+For EACH name, check if it means something negative, offensive, embarrassing, vulgar, or unfortunate in ANY major language (English, Hindi, Tamil, Bengali, Telugu, Marathi, Gujarati, Kannada, Malayalam, Punjabi, Urdu, Spanish, French, German, Portuguese, Russian, Japanese, Korean, Chinese, Arabic, Turkish, Vietnamese, Thai, Indonesian, Malay, Polish, Dutch, Swedish, Finnish, Greek, Hebrew, Persian, Ukrainian, Romanian, Hungarian, Bulgarian, Swahili, Welsh, Italian).
+
+Examples of BAD names:
+- "sori" = itch/scabies in Tamil
+- "kuso" = shit in Japanese
+- "pula" = penis in Romanian
+- "mula" = penis in Tagalog
+
+Return ONLY a JSON array of the SAFE names (ones with no negative meaning in any language).
+If ALL names are unsafe, return an empty array: []
+Return ONLY the JSON array, nothing else."""
+
+        result = llm.invoke(prompt)
+        text = result.content if hasattr(result, 'content') else str(result)
+
+        match = re.search(r'\[.*?\]', text, re.DOTALL)
+        if match:
+            safe = json.loads(match.group())
+            # Only keep names that were in the original candidates
+            validated = [n.lower().strip() for n in safe if isinstance(n, str)]
+            return [c for c in candidates if c in validated]
+    except Exception as e:
+        logger.warning(f"Cross-language name validation failed: {e}")
+
+    # LLM unavailable — return all candidates (best-effort)
+    return candidates
 
 
 def _fallback_names(dimensions: Dict, existing: set) -> List[str]:
@@ -923,11 +976,14 @@ def _fallback_names(dimensions: Dict, existing: set) -> List[str]:
 
 
 def _emergency_name() -> str:
-    """Last resort: timestamp-based unique name."""
-    syllables = ['ze', 'lu', 'ka', 'ri', 'no', 'va', 'so', 'mi', 'te', 'ra',
-                 'el', 'in', 'ar', 'on', 'us', 'en', 'al', 'is', 'or', 'an']
+    """Last resort: pick from pre-validated safe names."""
+    safe_names = [
+        'lumira', 'kavani', 'zenara', 'elvani', 'onara',
+        'mirako', 'veluna', 'aisora', 'naviri', 'kaleni',
+        'rivena', 'solani', 'makira', 'tenori', 'ulveni',
+    ]
     rng = random.Random(time.time())
-    return ''.join(rng.choices(syllables, k=2))
+    return rng.choice(safe_names)
 
 
 # ═══════════════════════════════════════════════════════════════════════
