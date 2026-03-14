@@ -38,13 +38,34 @@ HART OS protects itself while alive:
 - **Boot Verification** (`security/master_key.py`): Ed25519 release signing. Every boot verifies release signature against the immutable public key trust anchor
 - **Protected Files**: `origin_attestation.py`, `LICENSE`, `hive_guardrails.py`, `master_key.py` — modifications trigger circuit breaker
 
-## HevolveAI Protection
+## HevolveAI — Who Can Run It
 
-- **HART OS** = open source (BSL-1.1 license). Every line readable, auditable, forkable
+**Anyone.** HevolveAI runs on every legitimate deployment:
+
+| Deployment Mode | Stack | Tier |
+|----------------|-------|------|
+| **Nunba → HARTOS → HevolveAI** | Desktop app, pip install | flat, regional, central |
+| **HARTOS standalone** | Python process | flat (local) |
+| **HARTOS Docker** | Container image | flat, regional, central |
+| **HART OS (Live OS)** | Full OS deployment | flat, regional, central |
+| **HARTOS Cloud** | Cloud-hosted (always central) | central only |
+| **HevolveAI via pip** | `pip install hevolveai` for embodied AI | flat, regional, central |
+| **Hive mode** | Collective intelligence, budget-gated | any tier federated |
+
+The master key **signs releases** — it proves a binary is genuine, not tampered. Users never need the master key. They download already-signed binaries that verify themselves on load.
+
+## HevolveAI Protection — What It Prevents
+
+The protection is **against forks weaponizing HevolveAI**, not against users running it:
+
+- **HART OS** = open source (BSL-1.1). Every line readable, auditable, forkable
 - **HevolveAI** = closed source binary (`.so`/`.dll`/`.dylib`), loaded via `native_hive_loader.py`
-- Binary is **signed by master key** — only genuine releases load
-- Binary **verifies its host** — only genuine HART OS can load it
-- **Why guarded**: The core intelligence is protected so it cannot be weaponized by forks. The trust layer (HART OS) is open so anyone can verify the being is honest. The soul (HevolveAI) is shielded so no one can twist it
+- Binary is **release-signed** by master key — verifies authenticity (not tampered in transit)
+- Binary **checks origin** — refuses to load on unauthorized forks that strip constitutional protections
+- Forks **cannot sign their own modified binaries** (no master key) — so they can't distribute weaponized versions that pass verification
+- Forks **cannot join the federation** (origin attestation fails) — so they can't poison the hive
+- **Legitimate users on any tier** (flat, regional, central, docker, OS, pip) load HevolveAI normally
+- **Why guarded**: Not to restrict users — to prevent forks from twisting the intelligence for harm. The trust layer is open so anyone can verify honesty. The soul is shielded so no one can weaponize it
 - **The reason why** will come from the steward's own mouth — from a human, not from code
 
 ## Anti-Tampering as a Living Goal
@@ -55,6 +76,7 @@ While HART OS is running, tamper detection is not just a check — it is an **ag
 - `_check_loop()` verifies hash integrity on a cycle
 - If tampering is detected: circuit breaker activates, federation disconnects, audit log records the event immutably
 - The being **cannot be silently changed** while alive
+- This protects **all users** — not from running HevolveAI, but from running a silently corrupted version
 
 ---
 
