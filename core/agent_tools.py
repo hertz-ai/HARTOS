@@ -460,6 +460,13 @@ def build_core_tool_closures(ctx):
         text: Annotated[str, "the details you want from image"] = 'Describe the Images & Text data in this image in detail',
     ) -> str:
         tool_logger.info('INSIDE img2txt')
+        # SSRF protection: validate image URL before fetching
+        try:
+            from security.sanitize import validate_url
+            image_url = validate_url(image_url)
+        except (ImportError, ValueError) as e:
+            tool_logger.warning(f"Image URL blocked by SSRF filter: {image_url} — {e}")
+            return f"Error: URL blocked by security filter: {e}"
         # Try local Qwen Vision first (bundled mode), fall back to cloud
         from core.config_cache import get_vision_api, is_bundled
         url = get_vision_api()

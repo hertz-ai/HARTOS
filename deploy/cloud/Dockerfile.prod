@@ -70,7 +70,8 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 # Copy application code
 COPY langchain_gpt_api.py .
-COPY config.json .
+# config.json deliberately excluded — use env vars or Docker secrets for API keys
+# COPY config.json .  # SECURITY: never bake credentials into image layers
 COPY helper.py .
 COPY threadlocal.py .
 COPY reuse_recipe.py .

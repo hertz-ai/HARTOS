@@ -27,6 +27,7 @@ Security:
 import json
 import logging
 import os
+import shlex
 import shutil
 import subprocess
 import time
@@ -118,18 +119,19 @@ def _audit_shell_op(action, detail=None):
 
 
 def _classify_destructive(action_desc):
-    """Check if an action is destructive via action_classifier (best-effort).
+    """Check if an action is destructive via action_classifier.
 
-    Returns True if action is safe or classifier unavailable.
-    Returns False if action is classified as destructive.
+    Returns True if action is safe.
+    Returns False if action is destructive OR classifier unavailable (fail-closed).
     """
     try:
         from security.action_classifier import classify_action
         result = classify_action(action_desc)
         # classify_action returns a string literal: 'safe', 'destructive', or 'unknown'
-        return result != 'destructive'
+        return result == 'safe'
     except Exception:
-        return True  # fail-open if classifier unavailable
+        logger.warning("Action classifier unavailable — blocking action (fail-closed)")
+        return False  # fail-closed: deny if classifier unavailable
 
 
 def register_shell_os_routes(app):
@@ -474,8 +476,10 @@ def register_shell_os_routes(app):
         _audit_shell_op('terminal_exec', {'command': command[:200]})
 
         try:
+            # shell=False prevents command injection; shlex.split tokenizes safely
+            cmd_list = shlex.split(command)
             result = subprocess.run(
-                command, shell=True, capture_output=True,
+                cmd_list, shell=False, capture_output=True,
                 text=True, timeout=timeout, cwd=cwd)
             return jsonify({
                 'stdout': result.stdout[-10000:],  # Cap output

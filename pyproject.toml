@@ -7,7 +7,7 @@ name = "hart-backend"
 dynamic = ["version"]
 description = "HART OS - Hevolve Hive Agentic Runtime: Crowdsourced compute infrastructure for autonomous Hive AI Training. Distributed thought process across crowdsourced agents, distributed coding agents incentivizing compute providers, self-sustaining economy at national scale so no single entity, government, or corporation monopolizes AI. Intelligence belongs to the people. Only the master key (held by human stewards) can halt the being. Every engineering decision is transparent by design."
 readme = "README.md"
-license = {text = "MIT"}
+license = {text = "BSL-1.1"}
 requires-python = ">=3.9"
 authors = [
     {name = "HART Team", email = "contact@hevolve.ai"}
@@ -27,7 +27,7 @@ keywords = [
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
+    "License :: Other/Proprietary License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
@@ -55,17 +55,17 @@ dependencies = [
     "crossbarhttp3>=1.1,<2.0",
     "websockets>=11.0.0,<17.0",
 
-    # Web framework
-    "Flask>=3.0.0,<4.0.0",
-    "waitress>=3.0.0,<4.0.0",
+    # Web framework (aligned with requirements.txt)
+    "Flask>=2.3.0,<4.0.0",
+    "waitress>=2.1.0,<4.0.0",
     "fastapi>=0.100.0,<1.0.0",
-    "uvicorn>=0.30.0,<1.0.0",
+    "uvicorn>=0.22.0,<1.0.0",
     "starlette>=0.40.0,<1.0.0",
 
     # Database — hevolve-database is the single source of truth for all models
     "hevolve-database @ git+https://github.com/hertz-ai/Hevolve_Database.git@realistic_intro_video",
     "SQLAlchemy>=2.0.0,<3.0.0",
-    "redis>=7.0.0,<8.0.0",
+    "redis>=4.6.0,<8.0.0",
 
     # LangChain ecosystem — pinned to avoid pip backtracking (40+ version checks)
     "langchain-classic>=1.0.0,<2.0.0",
@@ -74,7 +74,7 @@ dependencies = [
     "langsmith>=0.3.0,<1.0.0",
 
     # LLM providers
-    "openai>=2.0.0,<3.0.0",
+    "openai>=1.0.0,<3.0.0",
     "groq>=0.5.0,<1.0.0",
 
     # ML/Vector stores (optional heavy deps — install separately if needed)

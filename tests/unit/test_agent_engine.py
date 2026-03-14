@@ -2007,15 +2007,17 @@ class TestModuleLevelGuard:
         with pytest.raises(AttributeError, match='Cannot delete frozen guardrail'):
             del hg.VALUES
 
-    def test_backward_compat_dicts_still_writable(self):
-        """Backward compat dicts can be modified but it doesn't affect VALUES."""
+    def test_backward_compat_exports_are_immutable(self):
+        """Exported guardrail dicts/tuples must be immutable at runtime."""
         import security.hive_guardrails as hg
-        original = hg.COMPUTE_CAPS['max_influence_weight']
-        hg.COMPUTE_CAPS['max_influence_weight'] = 999
-        # VALUES is unaffected
+        # MappingProxyType dicts reject mutation
+        with pytest.raises(TypeError):
+            hg.COMPUTE_CAPS['max_influence_weight'] = 999
+        # Tuples reject mutation
+        with pytest.raises(TypeError):
+            hg.CONSTITUTIONAL_RULES[0] = 'hacked'
+        # VALUES is always unaffected
         assert hg.VALUES.MAX_INFLUENCE_WEIGHT == 5.0
-        # Restore
-        hg.COMPUTE_CAPS['max_influence_weight'] = original
 
 
 class TestBootVerificationGuardrailHash:

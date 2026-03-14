@@ -14,8 +14,8 @@ services:
       - "8000:8000"
     environment:
       - FLASK_ENV=development
-      - HEVOLVE_DB_URL=mysql+mysqlconnector://chatbot:chatbot_password@mysql:3306/chatbot_db
-      - REDIS_URL=redis://redis:6379/0
+      - HEVOLVE_DB_URL=mysql+mysqlconnector://chatbot:${MYSQL_PASSWORD:-changeme}@mysql:3306/chatbot_db
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-changeme}@redis:6379/0
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - PYTHONUNBUFFERED=1
@@ -48,9 +48,9 @@ services:
     restart: unless-stopped
     environment:
       - MYSQL_USER=chatbot
-      - MYSQL_PASSWORD=chatbot_password
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-changeme}
       - MYSQL_DATABASE=chatbot_db
-      - MYSQL_ROOT_PASSWORD=chatbot_root_password
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-changeme}
     volumes:
       - mysql-data:/var/lib/mysql
       - ./init-db:/docker-entrypoint-initdb.d:ro
@@ -59,7 +59,7 @@ services:
     networks:
       - chatbot-network
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "chatbot", "-pchatbot_password"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -77,6 +77,7 @@ services:
       --appendonly yes
       --maxmemory 256mb
       --maxmemory-policy allkeys-lru
+      --requirepass ${REDIS_PASSWORD:-changeme}
     volumes:
       - redis-data:/data
     ports:

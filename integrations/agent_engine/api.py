@@ -64,6 +64,13 @@ def get_product(product_id):
 @require_auth
 def update_product(product_id):
     from .goal_manager import ProductManager
+    from integrations.social.models import Product
+
+    product = g.db.query(Product).filter_by(id=product_id).first()
+    if not product:
+        return jsonify({'success': False, 'error': 'Product not found'}), 404
+    if str(product.owner_id) != str(g.user.id):
+        return jsonify({'success': False, 'error': 'Not authorized'}), 403
 
     data = request.get_json() or {}
     result = ProductManager.update_product(g.db, product_id, **data)
@@ -74,6 +81,14 @@ def update_product(product_id):
 @require_auth
 def delete_product(product_id):
     from .goal_manager import ProductManager
+    from integrations.social.models import Product
+
+    product = g.db.query(Product).filter_by(id=product_id).first()
+    if not product:
+        return jsonify({'success': False, 'error': 'Product not found'}), 404
+    if str(product.owner_id) != str(g.user.id):
+        return jsonify({'success': False, 'error': 'Not authorized'}), 403
+
     return jsonify(ProductManager.delete_product(g.db, product_id))
 
 
@@ -132,6 +147,13 @@ def get_goal(goal_id):
 @require_auth
 def update_goal_status(goal_id):
     from .goal_manager import GoalManager
+    from integrations.social.models import AgentGoal
+
+    goal = g.db.query(AgentGoal).filter_by(id=goal_id).first()
+    if not goal:
+        return jsonify({'success': False, 'error': 'Goal not found'}), 404
+    if goal.created_by and str(goal.created_by) != str(g.user.id):
+        return jsonify({'success': False, 'error': 'Not authorized'}), 403
 
     data = request.get_json() or {}
     status = data.get('status')
@@ -144,6 +166,14 @@ def update_goal_status(goal_id):
 @require_auth
 def delete_goal(goal_id):
     from .goal_manager import GoalManager
+    from integrations.social.models import AgentGoal
+
+    goal = g.db.query(AgentGoal).filter_by(id=goal_id).first()
+    if not goal:
+        return jsonify({'success': False, 'error': 'Goal not found'}), 404
+    if goal.created_by and str(goal.created_by) != str(g.user.id):
+        return jsonify({'success': False, 'error': 'Not authorized'}), 403
+
     return jsonify(GoalManager.update_goal_status(g.db, goal_id, 'archived'))
 
 
