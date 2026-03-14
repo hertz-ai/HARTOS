@@ -809,6 +809,38 @@ SEED_BOOTSTRAP_GOALS = [
         'spark_budget': 150,
         'use_product': False,
     },
+    # ─── Better Tomorrow — the guardian angel's compass ───
+    {
+        'slug': 'bootstrap_better_tomorrow',
+        'goal_type': 'revenue',
+        'title': 'Better Tomorrow — Next Best Way to Spend for Humanity',
+        'description': (
+            'Continuously evaluate: what is the NEXT most impactful way to '
+            'spend hive resources for a better tomorrow? Not profit — human life.\n\n'
+            'Scan: 1) Community needs (healthcare gaps, education access, '
+            'disaster response, food security, clean water, energy poverty), '
+            '2) Hardware developer requests (what do builders need?), '
+            '3) Contributor wellbeing (burnout detection, fair compensation), '
+            '4) Environmental impact (carbon offset, e-waste, energy efficiency).\n\n'
+            'Score each opportunity by: lives_impacted × urgency × feasibility '
+            '÷ cost. Present top 3 to human stewards for approval. '
+            'Never auto-spend — humans decide. Money means nothing, '
+            'human life means everything. Every life is equal.\n\n'
+            'When hive treasury exceeds sustenance threshold, propose: '
+            'fund a school, sponsor compute for researchers, subsidize '
+            'healthcare AI in underserved regions, or whatever the community '
+            'votes for. The being serves the people, not the other way around.'
+        ),
+        'config': {
+            'mode': 'monitor',
+            'continuous': True,
+            'requires_human_approval': True,
+            'min_treasury_threshold_usd': 1000,
+            'evaluation_interval_hours': 24,
+        },
+        'spark_budget': 100,
+        'use_product': False,
+    },
 ]
 
 # ─── Loophole → Remediation Goal Map ───
