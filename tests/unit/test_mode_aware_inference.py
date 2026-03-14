@@ -34,6 +34,9 @@ if os.path.isdir(HevolveAI_SRC):
 
 _hevolveai_base = os.path.join(HevolveAI_SRC, 'hevolveai', 'embodied_ai')
 
+if not os.path.isdir(_hevolveai_base):
+    pytest.skip("HevolveAI not available (closed-source sibling repo)", allow_module_level=True)
+
 
 # ─── Direct-import helper (bypasses package __init__.py chains) ───
 
