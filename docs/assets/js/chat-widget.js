@@ -59,7 +59,7 @@
     '#hevolve-chat-pill{',
     '  position:fixed;bottom:24px;right:24px;z-index:9999;',
     '  display:flex;align-items:center;gap:8px;',
-    '  background:#111111;color:#fff;border:none;border-radius:28px;',
+    '  background:#7c3aed;color:#fff;border:none;border-radius:28px;',
     '  padding:10px 18px 10px 14px;cursor:pointer;',
     '  font:500 14px/1.4 system-ui,sans-serif;',
     '  box-shadow:0 4px 16px rgba(124,58,237,.35);',
