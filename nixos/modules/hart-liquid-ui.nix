@@ -1,4 +1,4 @@
-{ config, lib, pkgs, ... }:
+{ config, lib, pkgs, hartSrc ? /etc/hart, ... }:
 
 # ═══════════════════════════════════════════════════════════════
 # HART OS LiquidUI — AI Generates the Interface
@@ -174,7 +174,7 @@ in
           HART_THEME_DIR = "/run/current-system/sw/share/hart/conky-themes";
           HART_LIQUID_UI_PORT = toString ui.port;
           NUNBA_STATIC_DIR = lib.mkIf ui.embedNunba
-            "${pkgs.callPackage ../packages/nunba.nix { inherit (config) hartSrc; }}/lib/nunba/static";
+            "${pkgs.callPackage ../packages/nunba.nix { inherit hartSrc; }}/lib/nunba/static";
           PYTHONDONTWRITEBYTECODE = "1";
           PYTHONUNBUFFERED = "1";
         };

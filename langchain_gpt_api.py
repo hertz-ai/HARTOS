@@ -1191,6 +1191,13 @@ def _wire_vision_to_learning():
     then calls start_video_learning().
     """
     _logger = logging.getLogger(__name__)
+
+    # Fast-fail: if hevolveai isn't installed, learning is impossible — don't wait 60s
+    import importlib.util
+    if not importlib.util.find_spec('hevolveai'):
+        _logger.info("[Wiring] hevolveai not installed — skipping vision-learning wire")
+        return
+
     for _ in range(60):
         svc = get_vision_service()
         if svc and _learning_provider:

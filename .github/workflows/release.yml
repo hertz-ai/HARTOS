@@ -150,8 +150,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Server ISO first (headless, minimal deps). Desktop/edge need package fixes.
-        target: [iso-server]
+        target: [iso-server, iso-desktop, iso-edge]
     steps:
       - uses: actions/checkout@v4
 

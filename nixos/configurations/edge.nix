@@ -76,7 +76,7 @@
   # Minimal footprint
   boot.kernel.sysctl."vm.swappiness" = lib.mkForce 60;
 
-  environment.noXlibs = true;
+  # environment.noXlibs removed in nixpkgs — headless by not including X/GNOME
   documentation.enable = false;
   documentation.man.enable = false;
   documentation.nixos.enable = false;
