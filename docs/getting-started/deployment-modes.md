@@ -21,7 +21,7 @@ The simplest deployment. A single HART OS node operates independently with no fe
 **Bare-metal:**
 ```bash
 # No special configuration needed -- flat is the default
-python langchain_gpt_api.py
+python hart_intelligence_entry.py
 ```
 
 **Docker:**
@@ -206,7 +206,7 @@ Nunba is the end-user distribution of HART OS. When bundled mode is active, the 
 ```bash
 export NUNBA_BUNDLED=true
 
-python langchain_gpt_api.py
+python hart_intelligence_entry.py
 ```
 
 **Characteristics:**

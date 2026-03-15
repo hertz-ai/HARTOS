@@ -263,18 +263,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 
 # If running from install bundle (tar.gz extracted), source is parent
-if [[ -f "$SOURCE_DIR/langchain_gpt_api.py" ]]; then
+if [[ -f "$SOURCE_DIR/hart_intelligence_entry.py" ]]; then
     rsync -a --exclude='.git' --exclude='__pycache__' --exclude='venv*' \
           --exclude='*.pyc' --exclude='tests/' --exclude='agent_data/*.db' \
           --exclude='.env' --exclude='*.egg-info' \
           "$SOURCE_DIR/" "$INSTALL_DIR/"
-elif [[ -f "$SCRIPT_DIR/../../langchain_gpt_api.py" ]]; then
+elif [[ -f "$SCRIPT_DIR/../../hart_intelligence_entry.py" ]]; then
     rsync -a --exclude='.git' --exclude='__pycache__' --exclude='venv*' \
           --exclude='*.pyc' --exclude='tests/' --exclude='agent_data/*.db' \
           --exclude='.env' --exclude='*.egg-info' \
           "$SCRIPT_DIR/../../" "$INSTALL_DIR/"
 else
-    log_error "Cannot find application source. Expected langchain_gpt_api.py in parent directory."
+    log_error "Cannot find application source. Expected hart_intelligence_entry.py in parent directory."
     exit 1
 fi
 

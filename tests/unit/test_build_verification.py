@@ -67,15 +67,15 @@ class TestIntegrationModulesImportable(unittest.TestCase):
 
 
 class TestFlaskAppImportable(unittest.TestCase):
-    """langchain_gpt_api.py must import and create Flask app."""
+    """hart_intelligence_entry.py must import and create Flask app."""
 
-    def test_langchain_gpt_api_imports(self):
-        import langchain_gpt_api
-        self.assertTrue(hasattr(langchain_gpt_api, 'app'))
+    def test_hart_intelligence_entry_imports(self):
+        import hart_intelligence_entry
+        self.assertTrue(hasattr(hart_intelligence_entry, 'app'))
 
     def test_flask_app_has_routes(self):
-        import langchain_gpt_api
-        rules = [r.rule for r in langchain_gpt_api.app.url_map.iter_rules()]
+        import hart_intelligence_entry
+        rules = [r.rule for r in hart_intelligence_entry.app.url_map.iter_rules()]
         # Must have at least /chat and /status
         self.assertIn('/chat', rules)
         self.assertIn('/status', rules)
@@ -125,8 +125,8 @@ class TestNoCircularImports(unittest.TestCase):
         if mod_name in sys.modules:
             del sys.modules[mod_name]
         importlib.import_module(mod_name)
-        # Should NOT have loaded langchain_gpt_api
-        self.assertNotIn('langchain_gpt_api', sys.modules.get(mod_name, {}).__dict__)
+        # Should NOT have loaded hart_intelligence_entry
+        self.assertNotIn('hart_intelligence_entry', sys.modules.get(mod_name, {}).__dict__)
 
     def test_model_registry_independent(self):
         """model_registry.py must import without pulling Flask."""

@@ -173,7 +173,8 @@ setup(
     # Include main modules at root level
     py_modules=[
         "hart_version",
-        "langchain_gpt_api",
+        "hart_intelligence",
+        "hart_intelligence_entry",
         "helper",
         "helper_ledger",
         "threadlocal",
@@ -208,7 +209,7 @@ setup(
     entry_points={
         "console_scripts": [
             "hart=hart_cli:hart",
-            "hart-server=langchain_gpt_api:main",
+            "hart-server=hart_intelligence:main",
             "hart-crossbar=crossbar_server:main",
         ],
     },

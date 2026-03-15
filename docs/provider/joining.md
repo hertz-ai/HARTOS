@@ -4,7 +4,7 @@ How to join the HART OS compute network as a regional compute provider.
 
 ## Prerequisites
 
-- A running HART OS instance (`python langchain_gpt_api.py` on port 6777)
+- A running HART OS instance (`python hart_intelligence_entry.py` on port 6777)
 - At least one GPU (recommended) or CPU-only node
 - Network connectivity to at least one seed peer
 

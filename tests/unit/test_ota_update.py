@@ -72,7 +72,7 @@ def fake_bundle(tmp_path):
     bundle_dir = tmp_path / 'hart-os-2.0.0'
     bundle_dir.mkdir()
     (bundle_dir / 'VERSION').write_text('2.0.0')
-    (bundle_dir / 'langchain_gpt_api.py').write_text('# updated')
+    (bundle_dir / 'hart_intelligence_entry.py').write_text('# updated')
 
     bundle_path = str(tmp_path / 'update.tar.gz')
     with tarfile.open(bundle_path, 'w:gz') as tar:

@@ -40,7 +40,7 @@ Architecture:
             └─ complete_batch() → ledger.complete_task_and_route()
 
 Integration points:
-  - hart_intelligence (langchain_gpt_api.py) /chat endpoint: auto-enqueue if compute busy
+  - hart_intelligence /chat endpoint: auto-enqueue if compute busy
   - hart_cli.py: `hart -p "task"` enqueues if server busy
   - dispatch.py: pull_batch when idle compute detected
   - agent_daemon.py: periodic batch check on tick

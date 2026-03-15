@@ -35,4 +35,4 @@ GPU detection and VRAM allocation are handled by `vram_manager.detect_gpu()` and
 
 - `integrations/vision/` (vision sidecar implementation)
 - `integrations/service_tools/vram_manager.py`
-- `langchain_gpt_api.py` (`/visual_agent` route)
+- `hart_intelligence_entry.py` (`/visual_agent` route)

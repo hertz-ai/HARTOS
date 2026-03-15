@@ -49,7 +49,7 @@ At minimum, one of these API keys is required. See [Configuration](configuration
 
 **Bare-metal:**
 ```bash
-python langchain_gpt_api.py
+python hart_intelligence_entry.py
 ```
 
 **Docker:**

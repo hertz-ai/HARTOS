@@ -13,7 +13,7 @@ os.environ.setdefault('SOCIAL_DB_PATH', ':memory:')
 @pytest.fixture
 def client():
     """Create Flask test client for health endpoints."""
-    from langchain_gpt_api import app
+    from hart_intelligence_entry import app
     app.config['TESTING'] = True
     with app.test_client() as c:
         yield c

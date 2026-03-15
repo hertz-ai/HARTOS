@@ -16,7 +16,7 @@ import sys
 import unittest
 from unittest.mock import patch, MagicMock
 
-# Pre-load a mock for langchain_gpt_api to prevent slow import
+# Pre-load a mock for hart_intelligence_entry to prevent slow import
 # during tests that trigger generate_hart_name -> get_llm
 _mock_lgapi = MagicMock()
 _mock_lgapi.get_llm.side_effect = Exception("mocked — no LLM in tests")
@@ -143,7 +143,7 @@ class TestNameGeneration(unittest.TestCase):
         self.assertTrue(len(name) >= 4)
         self.assertTrue(name.isalpha())
 
-    @patch.dict(sys.modules, {'langchain_gpt_api': _mock_lgapi})
+    @patch.dict(sys.modules, {'hart_intelligence_entry': _mock_lgapi})
     def test_generate_without_llm(self):
         result = generate_hart_name('en', 'music_art', 'quiet_alone')
         self.assertIn('name', result)
@@ -152,7 +152,7 @@ class TestNameGeneration(unittest.TestCase):
         self.assertIn('hart_tag', result)
         self.assertTrue(result['hart_tag'].startswith('@'))
 
-    @patch.dict(sys.modules, {'langchain_gpt_api': _mock_lgapi})
+    @patch.dict(sys.modules, {'hart_intelligence_entry': _mock_lgapi})
     def test_generate_includes_element_spirit(self):
         result = generate_hart_name('en', 'building_coding', 'ideas_possibilities')
         self.assertIn('element', result)
@@ -248,7 +248,7 @@ class TestOnboardingSession(unittest.TestCase):
         self.assertEqual(self.session.phase, 'ack_passion')
         self.assertEqual(self.session.passion_key, 'music_art')
 
-    @patch.dict(sys.modules, {'langchain_gpt_api': _mock_lgapi})
+    @patch.dict(sys.modules, {'hart_intelligence_entry': _mock_lgapi})
     @patch.object(HARTNameRegistry, 'get_all_names', return_value=set())
     def test_full_flow_to_reveal(self, _mock_names):
         s = self.session
@@ -265,7 +265,7 @@ class TestOnboardingSession(unittest.TestCase):
         self.assertIn('element', result)
         self.assertIn('spirit', result)
 
-    @patch.dict(sys.modules, {'langchain_gpt_api': _mock_lgapi})
+    @patch.dict(sys.modules, {'hart_intelligence_entry': _mock_lgapi})
     @patch.object(HARTNameRegistry, 'get_all_names', return_value=set())
     def test_reveal_includes_hart_tag(self, _mock_names):
         s = self.session
@@ -460,7 +460,7 @@ class TestIdentityUnification(unittest.TestCase):
         # Both could be top, depends on dict ordering
         self.assertIn(e, ['stone', 'wind'])
 
-    @patch.dict(sys.modules, {'langchain_gpt_api': _mock_lgapi})
+    @patch.dict(sys.modules, {'hart_intelligence_entry': _mock_lgapi})
     def test_full_generate_has_tag(self):
         result = generate_hart_name('en', 'games_strategy', 'building_something')
         tag = result['hart_tag']

@@ -43,7 +43,7 @@ pip install -r requirements.txt
 
 ### Running the Application
 ```bash
-python langchain_gpt_api.py    # Flask server on port 6777
+python hart_intelligence_entry.py    # Flask server on port 6777
 ```
 
 ### Running Tests
@@ -80,7 +80,7 @@ REUSE Mode:  User Input → Load Recipe → Execute Steps → Output (90% faster
 ### Key Files
 | File | Purpose |
 |------|---------|
-| `langchain_gpt_api.py` | Flask entry point (port 6777, Waitress server) |
+| `hart_intelligence_entry.py` | Flask entry point (port 6777, Waitress server) |
 | `create_recipe.py` | Agent creation, action execution, recipe generation |
 | `reuse_recipe.py` | Recipe reuse, trained agent execution |
 | `helper.py` | Action class, JSON utilities, tool handlers |

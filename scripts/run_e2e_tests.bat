@@ -41,7 +41,7 @@ if errorlevel 1 (
     echo This may take a moment for model loading...
     echo.
 
-    start "HART OS API Server" "%PYTHON_EXE%" langchain_gpt_api.py
+    start "HART OS API Server" "%PYTHON_EXE%" hart_intelligence_entry.py
 
     REM Wait for server to be ready
     echo Waiting for server to start...

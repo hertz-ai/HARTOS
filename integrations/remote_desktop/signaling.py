@@ -14,7 +14,7 @@ Channels:
 Reuses:
   - crossbar_server.py WAMP publish/subscribe
   - security/channel_encryption.py encrypt_event() for encrypted signals
-  - /api/remote-desktop/signal endpoints (already wired in langchain_gpt_api.py)
+  - /api/remote-desktop/signal endpoints (already wired in hart_intelligence)
 """
 
 import json

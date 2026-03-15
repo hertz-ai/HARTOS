@@ -359,11 +359,11 @@ class TestRegressionExistingFunctionality:
         """Test that Flask app can still be imported."""
         try:
             # This should not raise any import errors
-            import langchain_gpt_api
-            assert hasattr(langchain_gpt_api, 'app')
+            import hart_intelligence_entry
+            assert hasattr(hart_intelligence_entry, 'app')
         except ImportError:
             # If there are missing dependencies, that's a separate issue
-            pytest.skip("langchain_gpt_api has missing dependencies")
+            pytest.skip("hart_intelligence_entry has missing dependencies")
 
     def test_helper_functions_available(self):
         """Test that helper functions are still available."""

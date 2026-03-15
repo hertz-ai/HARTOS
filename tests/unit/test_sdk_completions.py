@@ -1,6 +1,6 @@
 """
 Tests for Kong API Gateway — /v1/chat/completions proxy, metering, and
-node registration endpoints defined in langchain_gpt_api.py.
+node registration endpoints defined in hart_intelligence_entry.py.
 
 Uses source inspection for route registration checks, plus a lightweight
 Flask test app that replays the proxy logic with mocked backends.
@@ -22,7 +22,7 @@ from flask import Flask, request, jsonify
 # ─── Helper: build a minimal Flask app mirroring the gateway routes ────
 
 def _json_endpoint(f):
-    """Replica of the decorator from langchain_gpt_api.py."""
+    """Replica of the decorator from hart_intelligence_entry.py."""
     @wraps(f)
     def _wrapped(*args, **kwargs):
         try:
@@ -36,7 +36,7 @@ def _build_gateway_app(*, requests_post_mock=None, record_metered_mock=None,
                        db_session_mock=None):
     """Build a Flask app with the three gateway routes.
 
-    The route bodies are faithful copies of langchain_gpt_api.py lines 752-838
+    The route bodies are faithful copies of hart_intelligence_entry.py lines 752-838
     but with injected mocks so we don't need real backends.
     """
     app = Flask(__name__)
@@ -121,13 +121,13 @@ def _build_gateway_app(*, requests_post_mock=None, record_metered_mock=None,
 # ═════════════════════════════════════════════════════════════════════
 
 class TestGatewayRouteRegistration(unittest.TestCase):
-    """Verify gateway routes exist in langchain_gpt_api.py source."""
+    """Verify gateway routes exist in hart_intelligence_entry.py source."""
 
     @classmethod
     def setUpClass(cls):
         src = os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-            'langchain_gpt_api.py')
+            'hart_intelligence_entry.py')
         with open(src, 'r', encoding='utf-8') as f:
             cls.source = f.read()
 

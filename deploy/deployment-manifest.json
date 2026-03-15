@@ -3,7 +3,7 @@
   "modes": {
     "standalone": {
       "description": "Developer machine running Flask directly",
-      "entry_point": "langchain_gpt_api.py",
+      "entry_point": "hart_intelligence_entry.py",
       "database": "sqlite",
       "certificate_tier": "flat",
       "config_file": "config.json",
@@ -31,7 +31,7 @@
     },
     "regional": {
       "description": "HART OS regional host (systemd services)",
-      "entry_point": "/opt/hart/venv/bin/python langchain_gpt_api.py",
+      "entry_point": "/opt/hart/venv/bin/python hart_intelligence_entry.py",
       "database": "mysql",
       "certificate_tier": "regional",
       "config_file": "/etc/hart/hart.env",
@@ -40,7 +40,7 @@
     },
     "central": {
       "description": "Central authority node",
-      "entry_point": "/opt/hart/venv/bin/python langchain_gpt_api.py",
+      "entry_point": "/opt/hart/venv/bin/python hart_intelligence_entry.py",
       "database": "mysql",
       "certificate_tier": "central",
       "config_file": "/etc/hart/hart.env",

@@ -204,7 +204,7 @@ Total: 2 tests | Passed: 2 | Failed: 0 | Skipped: 0
 
 ## Integration into Main System
 
-### langchain_gpt_api.py
+### hart_intelligence_entry.py
 
 ```python
 from integrations.google_a2a import initialize_a2a_server, register_all_agents

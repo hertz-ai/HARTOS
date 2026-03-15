@@ -46,7 +46,7 @@ if [ $? -ne 0 ]; then
     echo "This may take a moment for model loading..."
     echo ""
 
-    $PYTHON_EXE langchain_gpt_api.py &
+    $PYTHON_EXE hart_intelligence_entry.py &
     SERVER_PID=$!
 
     echo "Waiting for server to start (PID: $SERVER_PID)..."

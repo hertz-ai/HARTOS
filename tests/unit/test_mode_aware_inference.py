@@ -460,7 +460,7 @@ class TestWorldModelBridgeTier:
 # ═══════════════════════════════════════════════════════════════════
 
 class TestEnvVarPassthrough:
-    """Test that langchain_gpt_api sets HEVOLVE_LLM_* env vars for non-flat modes."""
+    """Test that hart_intelligence_entry sets HEVOLVE_LLM_* env vars for non-flat modes."""
 
     def test_flat_mode_no_passthrough(self):
         """Flat mode should not set HEVOLVE_LLM_* env vars."""
@@ -801,11 +801,11 @@ class TestDeploymentConfigCloudFallback:
 # ═══════════════════════════════════════════════════════════════════
 
 class TestStatusEndpoint:
-    """Test the enriched /status endpoint in langchain_gpt_api."""
+    """Test the enriched /status endpoint in hart_intelligence_entry."""
 
     def test_get_active_backend_info_flat(self):
         """_get_active_backend_info should return local_llamacpp in flat mode."""
-        from langchain_gpt_api import _get_active_backend_info
+        from hart_intelligence_entry import _get_active_backend_info
         with patch.dict(os.environ, {'HEVOLVE_NODE_TIER': 'flat'}, clear=False):
             os.environ.pop('HEVOLVE_CLOUD_FALLBACK_URL', None)
             info = _get_active_backend_info()
@@ -815,7 +815,7 @@ class TestStatusEndpoint:
 
     def test_get_active_backend_info_central(self):
         """_get_active_backend_info should return external in central mode."""
-        from langchain_gpt_api import _get_active_backend_info
+        from hart_intelligence_entry import _get_active_backend_info
         env = {
             'HEVOLVE_NODE_TIER': 'central',
             'HEVOLVE_LLM_MODEL_NAME': 'gpt-4',
@@ -829,7 +829,7 @@ class TestStatusEndpoint:
 
     def test_get_active_backend_info_flat_with_cloud_fallback(self):
         """_get_active_backend_info should indicate cloud_fallback_configured in flat mode."""
-        from langchain_gpt_api import _get_active_backend_info
+        from hart_intelligence_entry import _get_active_backend_info
         env = {
             'HEVOLVE_NODE_TIER': 'flat',
             'HEVOLVE_CLOUD_FALLBACK_URL': 'https://api.openai.com',
@@ -925,7 +925,7 @@ class TestEmbodiedInProcess:
             ),
         }):
             # Import and run the init function
-            import langchain_gpt_api as lgapi
+            import hart_intelligence_entry as lgapi
 
             # Save originals
             orig_provider = lgapi._learning_provider
@@ -944,7 +944,7 @@ class TestEmbodiedInProcess:
 
     def test_init_learning_pipeline_import_error(self):
         """Mock ImportError → verify graceful degradation, no crash."""
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
 
         orig_provider = lgapi._learning_provider
         orig_hive = lgapi._hive_mind
@@ -1099,7 +1099,7 @@ class TestInstallTimeDependencies:
 
         Without this, pip install creates 'src.hevolveai' import paths instead
         of 'hevolveai', breaking all in-process imports from world_model_bridge
-        and langchain_gpt_api.
+        and hart_intelligence_entry.
         """
         setup_path = os.path.normpath(os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
@@ -1161,28 +1161,28 @@ class TestInstallTimeDependencies:
             "\n".join(bad_files[:10])
         )
 
-    def test_langchain_gpt_api_exports_learning_getters(self):
-        """langchain_gpt_api must export get_learning_provider/get_hive_mind.
+    def test_hart_intelligence_entry_exports_learning_getters(self):
+        """hart_intelligence_entry must export get_learning_provider/get_hive_mind.
 
         world_model_bridge._init_in_process() imports these to connect
         to the in-process learning pipeline. If they're removed, all nodes
         fall back to HTTP mode (port 8000 which doesn't exist).
         """
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         assert hasattr(lgapi, 'get_learning_provider'), (
-            "langchain_gpt_api must export get_learning_provider()"
+            "hart_intelligence_entry must export get_learning_provider()"
         )
         assert hasattr(lgapi, 'get_hive_mind'), (
-            "langchain_gpt_api must export get_hive_mind()"
+            "hart_intelligence_entry must export get_hive_mind()"
         )
         assert callable(lgapi.get_learning_provider)
         assert callable(lgapi.get_hive_mind)
 
-    def test_langchain_gpt_api_has_init_learning_pipeline(self):
+    def test_hart_intelligence_entry_has_init_learning_pipeline(self):
         """_init_learning_pipeline must exist and be a callable function."""
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         assert hasattr(lgapi, '_init_learning_pipeline'), (
-            "langchain_gpt_api must have _init_learning_pipeline() for "
+            "hart_intelligence_entry must have _init_learning_pipeline() for "
             "in-process HevolveAI initialization"
         )
         assert callable(lgapi._init_learning_pipeline)
@@ -1737,7 +1737,7 @@ class TestStatusEndpointLearning:
 
     def test_status_includes_learning_active_field(self):
         """GET /status must include learning_active in response."""
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         with lgapi.app.test_client() as client:
             with patch(
                 'integrations.agent_engine.world_model_bridge'
@@ -1761,7 +1761,7 @@ class TestStatusEndpointLearning:
 
     def test_status_includes_learning_mode(self):
         """GET /status must include learning_mode (in_process or http)."""
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         with lgapi.app.test_client() as client:
             with patch(
                 'integrations.agent_engine.world_model_bridge'
@@ -1783,7 +1783,7 @@ class TestStatusEndpointLearning:
 
     def test_status_learning_false_on_bridge_error(self):
         """GET /status must report learning_active=False if bridge fails."""
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         with lgapi.app.test_client() as client:
             with patch(
                 'integrations.agent_engine.world_model_bridge'
@@ -1823,7 +1823,7 @@ class TestNoExtraPortsInProcessMode:
         the server module must never be loaded.
         """
         import inspect
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         source = inspect.getsource(lgapi._init_learning_pipeline)
 
         # Strip docstring - only check executable code, not comments
@@ -1860,7 +1860,7 @@ class TestNoExtraPortsInProcessMode:
         of in-process mode.
         """
         import inspect
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         source = inspect.getsource(lgapi._init_learning_pipeline)
 
         port_binding_patterns = [
@@ -2045,7 +2045,7 @@ class TestNoExtraPortsInProcessMode:
         proof monitor and creates a FastAPI app - opening port 8000.
         """
         import inspect
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         source = inspect.getsource(lgapi._init_learning_pipeline)
 
         # Must import learning functions
@@ -2119,7 +2119,7 @@ class TestNoExtraPortsInProcessMode:
 # ════════════════════════════════════════════════════════════════════
 
 class TestBootPhase:
-    """Verify boot-time behavior when langchain_gpt_api module loads.
+    """Verify boot-time behavior when hart_intelligence_entry module loads.
 
     On module import, _init_learning_pipeline is started in a daemon
     thread. This must not block Flask startup, must not crash on
@@ -2131,7 +2131,7 @@ class TestBootPhase:
 
         If non-daemon, it would prevent process exit when Flask stops.
         """
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
 
         # Check that a daemon thread with the right name was started
         # (it already ran on module import, but verify the pattern)
@@ -2148,7 +2148,7 @@ class TestBootPhase:
         )
 
     def test_boot_does_not_block_module_import(self):
-        """Importing langchain_gpt_api must return immediately.
+        """Importing hart_intelligence_entry must return immediately.
 
         _init_learning_pipeline runs in a background thread, so import
         must not hang even if HevolveAI takes time to initialize.
@@ -2156,7 +2156,7 @@ class TestBootPhase:
         import time
         start = time.time()
         # Module is already imported, but verify the pattern
-        import langchain_gpt_api  # noqa: already imported
+        import hart_intelligence_entry  # noqa: already imported
         elapsed = time.time() - start
 
         # Module import should be near-instant (< 5s)
@@ -2172,7 +2172,7 @@ class TestBootPhase:
         get_learning_provider() and get_hive_mind() must be safe to call
         even before _init_learning_pipeline completes (return None).
         """
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
 
         # These must exist as module-level globals
         assert hasattr(lgapi, '_learning_provider')
@@ -2191,7 +2191,7 @@ class TestInitPhase:
 
     def test_init_sets_provider_on_success(self):
         """On success, _learning_provider must be set to the provider."""
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         mock_provider = MagicMock()
         mock_hive = MagicMock()
 
@@ -2231,7 +2231,7 @@ class TestInitPhase:
 
     def test_init_leaves_none_on_import_error(self):
         """On ImportError (HevolveAI not installed), globals stay None."""
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         orig_p, orig_h = lgapi._learning_provider, lgapi._hive_mind
         try:
             lgapi._learning_provider = None
@@ -2252,7 +2252,7 @@ class TestInitPhase:
 
     def test_init_leaves_none_on_runtime_error(self):
         """On runtime error during init, globals stay None."""
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         orig_p, orig_h = lgapi._learning_provider, lgapi._hive_mind
         try:
             lgapi._learning_provider = None
@@ -2287,7 +2287,7 @@ class TestRuntimePhaseTransitions:
     def test_bridge_connects_when_provider_becomes_available(self):
         """If provider is None at bridge init but appears later,
         a fresh bridge instance should pick it up."""
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         orig_p = lgapi._learning_provider
         try:
             # Initially no provider
@@ -2352,36 +2352,36 @@ class TestContextDetection:
 
     def test_is_bundled_true_when_adapter_imported(self):
         """Inside Nunba, hartos_backend_adapter is in sys.modules."""
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         fake = MagicMock()
         with patch.dict('sys.modules', {'hartos_backend_adapter': fake}):
             assert lgapi._is_bundled() is True
 
     def test_is_bundled_false_standalone(self):
         """Running standalone, hartos_backend_adapter is absent."""
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         mods = dict(sys.modules)
         mods.pop('hartos_backend_adapter', None)
         with patch.dict('sys.modules', mods, clear=True):
             assert lgapi._is_bundled() is False
 
     def test_has_cloud_api_true_when_set(self):
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         with patch.dict(os.environ, {'HEVOLVE_LLM_ENDPOINT_URL': 'https://api.openai.com/v1'}):
             assert lgapi._has_cloud_api() is True
 
     def test_has_cloud_api_false_when_empty(self):
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         with patch.dict(os.environ, {'HEVOLVE_LLM_ENDPOINT_URL': ''}):
             assert lgapi._has_cloud_api() is False
 
     def test_has_cloud_api_false_when_whitespace(self):
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         with patch.dict(os.environ, {'HEVOLVE_LLM_ENDPOINT_URL': '   '}):
             assert lgapi._has_cloud_api() is False
 
     def test_has_cloud_api_false_when_absent(self):
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         env = dict(os.environ)
         env.pop('HEVOLVE_LLM_ENDPOINT_URL', None)
         with patch.dict(os.environ, env, clear=True):
@@ -2392,14 +2392,14 @@ class TestWaitForLlmServer:
     """Low-level _wait_for_llm_server() behaviour."""
 
     def test_finds_running_server_immediately(self):
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         mock_resp = MagicMock(status=200)
         with patch('urllib.request.urlopen', return_value=mock_resp):
             assert lgapi._wait_for_llm_server(timeout=5) is True
 
     def test_timeout_when_nothing_running(self):
         import urllib.error
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         with patch('urllib.request.urlopen',
                    side_effect=urllib.error.URLError('refused')), \
              patch('time.sleep'):
@@ -2407,7 +2407,7 @@ class TestWaitForLlmServer:
 
     def test_detects_delayed_start(self):
         import urllib.error
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         mock_resp = MagicMock(status=200)
         effects = [urllib.error.URLError('refused')] * 3 + [mock_resp]
         with patch('urllib.request.urlopen', side_effect=effects), \
@@ -2415,13 +2415,13 @@ class TestWaitForLlmServer:
             assert lgapi._wait_for_llm_server(timeout=10) is True
 
     def test_oserror_treated_as_not_ready(self):
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         with patch('urllib.request.urlopen', side_effect=OSError('network')), \
              patch('time.sleep'):
             assert lgapi._wait_for_llm_server(timeout=2) is False
 
     def test_non_200_treated_as_not_ready(self):
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         mock_resp = MagicMock(status=503)
         # status != 200 means server is loading - keep polling
         effects = [mock_resp, mock_resp, MagicMock(status=200)]
@@ -2440,7 +2440,7 @@ class TestBundledFlatCloudApiWorking:
 
     def test_skips_local_server_wait(self):
         """Cloud API configured → no local server poll at all."""
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
 
         with patch.dict(os.environ, {'HEVOLVE_LLM_ENDPOINT_URL': 'https://api.openai.com/v1'}), \
              patch.dict('sys.modules', {'hartos_backend_adapter': MagicMock()}), \
@@ -2464,7 +2464,7 @@ class TestBundledFlatCloudApiWorking:
 
     def test_no_local_port_used(self):
         """With cloud API, no connection to localhost:8080."""
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
 
         with patch.dict(os.environ, {'HEVOLVE_LLM_ENDPOINT_URL': 'https://api.openai.com/v1'}), \
              patch.dict('sys.modules', {'hartos_backend_adapter': MagicMock()}), \
@@ -2479,7 +2479,7 @@ class TestBundledFlatCloudApiBroken:
 
     def test_falls_back_to_waiting_for_nunba_server(self):
         """Cloud broken → should NOT be detected as cloud (empty env → no cloud)."""
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         # If HEVOLVE_LLM_ENDPOINT_URL is empty, _has_cloud_api() is False
         # so the bundled path runs (wait for Nunba's server)
         with patch.dict(os.environ, {'HEVOLVE_LLM_ENDPOINT_URL': ''}), \
@@ -2494,7 +2494,7 @@ class TestBundledFlatNunbaLlamaCppRunning:
 
     def test_reuses_nunba_server(self):
         """Wait detects Nunba's server → proceeds to create_learning_llm_config."""
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
 
         with patch.dict(os.environ, {'HEVOLVE_LLM_ENDPOINT_URL': ''}), \
              patch.dict('sys.modules', {'hartos_backend_adapter': MagicMock()}), \
@@ -2520,7 +2520,7 @@ class TestBundledFlatNunbaLlamaCppRunning:
 
     def test_no_second_server_started(self):
         """Bundled mode never triggers HevolveAI's auto-start path."""
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
 
         with patch.dict(os.environ, {'HEVOLVE_LLM_ENDPOINT_URL': ''}), \
              patch.dict('sys.modules', {'hartos_backend_adapter': MagicMock()}), \
@@ -2551,7 +2551,7 @@ class TestBundledFlatExternalLlamaCppRunning:
 
     def test_reuses_users_server(self):
         """Same as Nunba server - wait detects it, reuses it."""
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         mock_resp = MagicMock(status=200)
         with patch.dict(os.environ, {'HEVOLVE_LLM_ENDPOINT_URL': ''}), \
              patch.dict('sys.modules', {'hartos_backend_adapter': MagicMock()}), \
@@ -2565,7 +2565,7 @@ class TestBundledFlatNothingAvailable:
 
     def test_disables_learning_no_auto_start(self):
         """Bundled + no server → learning disabled, never auto-starts."""
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
 
         with patch.dict(os.environ, {'HEVOLVE_LLM_ENDPOINT_URL': ''}), \
              patch.dict('sys.modules', {'hartos_backend_adapter': MagicMock()}), \
@@ -2591,7 +2591,7 @@ class TestBundledFlatNothingAvailable:
 
     def test_chat_still_works_without_learning(self):
         """Learning disabled ≠ chat disabled - provider is None, bridge gracefully degrades."""
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         assert lgapi._learning_provider is None or True  # None is fine
         # WorldModelBridge._in_process would be False → HTTP fallback or no-op
 
@@ -2601,7 +2601,7 @@ class TestBundledFlatLlamaCppUninstalled:
 
     def test_same_as_nothing_available(self):
         """No binary = no server = learning disabled in bundled mode."""
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         import urllib.error
 
         with patch.dict(os.environ, {'HEVOLVE_LLM_ENDPOINT_URL': ''}), \
@@ -2624,7 +2624,7 @@ class TestBundledFlatCloudApiStoppedWorking:
         and fall through to local (or fail gracefully).  We don't
         auto-start a server - the user needs to fix their API key.
         """
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         with patch.dict(os.environ, {
             'HEVOLVE_LLM_ENDPOINT_URL': 'https://api.openai.com/v1',
         }):
@@ -2636,7 +2636,7 @@ class TestStandaloneCloudApiWorking:
     """Standalone (start_with_tracing.bat) + cloud API configured."""
 
     def test_uses_cloud_api_skips_wait(self):
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         mods = dict(sys.modules)
         mods.pop('hartos_backend_adapter', None)
         with patch.dict('sys.modules', mods, clear=True), \
@@ -2649,7 +2649,7 @@ class TestStandaloneLlamaCppRunning:
     """Standalone + user already has llama.cpp running on 8080."""
 
     def test_reuses_existing_server(self):
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         mock_resp = MagicMock(status=200)
         mods = dict(sys.modules)
         mods.pop('hartos_backend_adapter', None)
@@ -2665,7 +2665,7 @@ class TestStandaloneNothingAvailable:
 
     def test_short_wait_then_hevolveai_auto_starts(self):
         """5 s timeout, then create_learning_llm_config proceeds (auto_setup=True)."""
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
 
         mods = dict(sys.modules)
         mods.pop('hartos_backend_adapter', None)
@@ -2695,7 +2695,7 @@ class TestStandaloneNothingAvailable:
 
     def test_provider_set_after_auto_start(self):
         """After HevolveAI auto-starts, _learning_provider is populated."""
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
 
         mock_provider = MagicMock()
         mods = dict(sys.modules)
@@ -2727,7 +2727,7 @@ class TestStandaloneLlamaCppUninstalled:
 
     def test_create_learning_config_still_called(self):
         """HevolveAI handles missing llama.cpp by falling back to transformers."""
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
 
         mods = dict(sys.modules)
         mods.pop('hartos_backend_adapter', None)
@@ -2759,7 +2759,7 @@ class TestStandaloneCloudApiBroken:
 
     def test_cloud_url_present_skips_local_wait(self):
         """HEVOLVE_LLM_ENDPOINT_URL non-empty → still treated as cloud path."""
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         with patch.dict(os.environ, {
             'HEVOLVE_LLM_ENDPOINT_URL': 'https://broken.example.com/v1',
         }):
@@ -2812,7 +2812,7 @@ class TestTimeoutContracts:
     """Bundled mode waits 30 s, standalone waits 5 s, cloud skips entirely."""
 
     def test_bundled_waits_30_seconds(self):
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
 
         with patch.dict(os.environ, {'HEVOLVE_LLM_ENDPOINT_URL': ''}), \
              patch.dict('sys.modules', {'hartos_backend_adapter': MagicMock()}), \
@@ -2833,7 +2833,7 @@ class TestTimeoutContracts:
             m.assert_called_once_with(timeout=30)
 
     def test_standalone_waits_5_seconds(self):
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
 
         mods = dict(sys.modules)
         mods.pop('hartos_backend_adapter', None)
@@ -2858,7 +2858,7 @@ class TestTimeoutContracts:
             m.assert_called_once_with(timeout=5)
 
     def test_cloud_api_skips_wait_entirely(self):
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
 
         with patch.dict(os.environ, {'HEVOLVE_LLM_ENDPOINT_URL': 'https://api.example.com'}), \
              patch.dict('sys.modules', {'hartos_backend_adapter': MagicMock()}), \
@@ -2890,7 +2890,7 @@ class TestInitStructure:
 
     def test_wait_called_before_create_learning_config(self):
         import inspect, re
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         source = inspect.getsource(lgapi._init_learning_pipeline)
         # Strip docstring and comments to avoid false positives
         body = re.sub(r'"""[\s\S]*?"""', '', source, count=1)
@@ -2903,14 +2903,14 @@ class TestInitStructure:
 
     def test_is_bundled_checks_sys_modules(self):
         import inspect
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         source = inspect.getsource(lgapi._is_bundled)
         assert 'sys.modules' in source
         assert 'hartos_backend_adapter' in source
 
     def test_has_cloud_api_checks_env(self):
         import inspect
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         source = inspect.getsource(lgapi._has_cloud_api)
         assert 'HEVOLVE_LLM_ENDPOINT_URL' in source
 
@@ -2918,7 +2918,7 @@ class TestInitStructure:
         """In bundled mode, if server not found, function returns before
         create_learning_llm_config - verified by source inspection."""
         import inspect
-        import langchain_gpt_api as lgapi
+        import hart_intelligence_entry as lgapi
         source = inspect.getsource(lgapi._init_learning_pipeline)
         # The bundled branch has 'return' between wait and create_learning
         bundled_section_start = source.find('elif bundled:')

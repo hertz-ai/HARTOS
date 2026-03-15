@@ -126,7 +126,7 @@ class TestRemoteDesktopAPI(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         # Import Flask app
-        from langchain_gpt_api import app
+        from hart_intelligence_entry import app
         app.config['TESTING'] = True
         cls.app = app
         cls.client = app.test_client()

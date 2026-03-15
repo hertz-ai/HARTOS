@@ -1,4 +1,4 @@
-"""Tests for /api/voice/* endpoints in langchain_gpt_api.py.
+"""Tests for /api/voice/* endpoints in hart_intelligence_entry.py.
 
 These test the Flask routes after rewiring to TTSRouter.
 """

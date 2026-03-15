@@ -359,7 +359,7 @@ def get_compute_routing():
     # Detect LLM backend
     hevolve_url = os.environ.get('HEVOLVE_BACKEND_URL', '')
     if hevolve_url:
-        routing['llm_backend'] = 'langchain_gpt_api'
+        routing['llm_backend'] = 'hart_intelligence'
         routing['llm_url'] = hevolve_url
     else:
         routing['llm_backend'] = 'direct_llama'

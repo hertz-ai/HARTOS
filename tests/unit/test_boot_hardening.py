@@ -43,7 +43,7 @@ class TestDevModeEnforcement:
             'HEVOLVE_NODE_TIER': 'central',
             'HEVOLVE_DEV_MODE': 'true',
         }):
-            # Simulate the check from langchain_gpt_api.py _validate_startup
+            # Simulate the check from hart_intelligence_entry.py _validate_startup
             node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
             if node_tier == 'central':
                 if os.environ.get('HEVOLVE_DEV_MODE', '').lower() == 'true':

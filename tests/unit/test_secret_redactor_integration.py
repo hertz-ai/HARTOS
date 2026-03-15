@@ -53,9 +53,9 @@ class TestChatRedaction:
     """Test that /chat handler redacts secrets from prompts."""
 
     def test_chat_imports_redact_secrets(self):
-        """Verify the redaction code exists in langchain_gpt_api.py."""
-        import langchain_gpt_api
-        source_file = langchain_gpt_api.__file__
+        """Verify the redaction code exists in hart_intelligence_entry.py."""
+        import hart_intelligence_entry
+        source_file = hart_intelligence_entry.__file__
         with open(source_file, 'r', encoding='utf-8') as f:
             source = f.read()
         assert 'from security.secret_redactor import redact_secrets' in source

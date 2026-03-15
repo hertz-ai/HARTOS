@@ -221,7 +221,7 @@ A machine-readable manifest declaring all 5 deployment modes with their properti
 ```json
 {
   "modes": {
-    "standalone": {"entry": "langchain_gpt_api.py", "db": "sqlite", "cert": "flat", ...},
+    "standalone": {"entry": "hart_intelligence_entry.py", "db": "sqlite", "cert": "flat", ...},
     "bundled":    {"entry": "Nunba.exe", "db": "sqlite", "cert": "flat", ...},
     "headless":   {"entry": "embedded_main.py", "db": "sqlite", "cert": "flat", ...},
     "regional":   {"entry": "install.sh", "db": "sqlite|postgres", "cert": "regional", ...},
@@ -253,7 +253,7 @@ desktop = ["pystray>=0.19", "dbus-python"]  # For Linux desktop
 
 ### C4. Tier Detection Unification
 **File**: `security/system_requirements.py` — ensure `run_system_check()` works identically in:
-- Standalone Python (`python langchain_gpt_api.py`)
+- Standalone Python (`python hart_intelligence_entry.py`)
 - Bundled Nunba (`sys.frozen=True`)
 - HART OS systemd (`/opt/hart/venv/bin/python`)
 - Headless embedded (`embedded_main.py`)

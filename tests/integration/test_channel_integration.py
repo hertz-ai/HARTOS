@@ -367,8 +367,8 @@ class TestRegressionExistingFunctionality:
     def test_flask_app_importable(self):
         """Test Flask app can be imported."""
         try:
-            import langchain_gpt_api
-            assert hasattr(langchain_gpt_api, 'app')
+            import hart_intelligence_entry
+            assert hasattr(hart_intelligence_entry, 'app')
         except ImportError:
             pytest.skip("Flask app has missing dependencies")
 

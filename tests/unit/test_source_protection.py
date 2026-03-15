@@ -321,7 +321,7 @@ class TestBridgeIntegrityGate:
         mock_integrity = {'verified': True, 'mismatched_files': []}
         with patch('security.source_protection.SourceProtectionService.verify_hevolveai_integrity',
                    return_value=mock_integrity):
-            # Still won't be in-process because langchain_gpt_api
+            # Still won't be in-process because hart_intelligence_entry
             # providers won't be available, but it shouldn't block
             bridge._init_in_process()
         # Just verify it didn't raise — in-process depends on provider

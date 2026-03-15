@@ -958,7 +958,7 @@ def _is_bundled() -> bool:
 
     When Nunba imports us via ``hartos_backend_adapter``, that module is
     already in ``sys.modules`` by the time our daemon thread runs.  In
-    standalone mode (``python langchain_gpt_api.py``, ``start_with_tracing.bat``)
+    standalone mode (``python hart_intelligence_entry.py``, ``start_with_tracing.bat``)
     it is absent.  No env-vars or mode flags required.
     """
     return 'hartos_backend_adapter' in sys.modules
@@ -1020,7 +1020,7 @@ def _init_learning_pipeline():
         works, only RL-EF / hivemind is disabled.  We NEVER auto-start
         a second server on the user's machine.
 
-    **Standalone (start_with_tracing.bat, ``python langchain_gpt_api.py``):**
+    **Standalone (start_with_tracing.bat, ``python hart_intelligence_entry.py``):**
         Brief 5 s wait (in case user already has llama.cpp running).
         If nothing responds, ``create_learning_llm_config()`` calls
         HevolveAI which auto-starts its own server.  Default behaviour,

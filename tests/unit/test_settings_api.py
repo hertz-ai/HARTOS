@@ -1,6 +1,6 @@
 """
 Tests for Settings API endpoints — verified via source code inspection
-to avoid langchain_gpt_api import issues on Python 3.11.
+to avoid hart_intelligence_entry import issues on Python 3.11.
 
 Run with: pytest tests/unit/test_settings_api.py -v --noconftest
 """
@@ -17,10 +17,10 @@ class TestSettingsAPIRouteRegistration(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        """Read langchain_gpt_api.py source once."""
+        """Read hart_intelligence_entry.py source once."""
         src_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-            'langchain_gpt_api.py')
+            'hart_intelligence_entry.py')
         with open(src_path, 'r', encoding='utf-8') as f:
             cls.source = f.read()
 
@@ -65,7 +65,7 @@ class TestSettingsComputeGetLogic(unittest.TestCase):
     def setUpClass(cls):
         src_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-            'langchain_gpt_api.py')
+            'hart_intelligence_entry.py')
         with open(src_path, 'r', encoding='utf-8') as f:
             cls.source = f.read()
 
@@ -94,7 +94,7 @@ class TestSettingsComputePutLogic(unittest.TestCase):
     def setUpClass(cls):
         src_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-            'langchain_gpt_api.py')
+            'hart_intelligence_entry.py')
         with open(src_path, 'r', encoding='utf-8') as f:
             cls.source = f.read()
 
@@ -146,7 +146,7 @@ class TestSettingsProviderLogic(unittest.TestCase):
     def setUpClass(cls):
         src_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-            'langchain_gpt_api.py')
+            'hart_intelligence_entry.py')
         with open(src_path, 'r', encoding='utf-8') as f:
             cls.source = f.read()
 

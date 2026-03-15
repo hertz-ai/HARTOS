@@ -257,7 +257,7 @@ class WorldModelBridge:
         """Try to connect to in-process learning pipeline (zero HTTP overhead).
 
         When HevolveAI is pip-installed and _init_learning_pipeline() has run
-        in hart_intelligence (langchain_gpt_api.py), we get direct references to the provider
+        in hart_intelligence, we get direct references to the provider
         and hivemind instances. All subsequent calls bypass HTTP entirely.
 
         SECURITY: Integrity verification required before enabling in-process.

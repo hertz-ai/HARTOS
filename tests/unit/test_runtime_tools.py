@@ -471,7 +471,7 @@ class TestVoiceTranscription:
     @pytest.fixture
     def client(self):
         """Flask test client."""
-        from langchain_gpt_api import app
+        from hart_intelligence_entry import app
         app.config['TESTING'] = True
         with app.test_client() as c:
             yield c
@@ -505,7 +505,7 @@ class TestToolsAPIEndpoints:
 
     @pytest.fixture
     def client(self):
-        from langchain_gpt_api import app
+        from hart_intelligence_entry import app
         app.config['TESTING'] = True
         with app.test_client() as c:
             yield c

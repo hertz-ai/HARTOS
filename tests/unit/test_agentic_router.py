@@ -133,7 +133,7 @@ class TestBuildAgentCatalog:
 class TestFindMatchingAgent:
     """Tests for find_matching_agent — LLM semantic matching."""
 
-    @patch('langchain_gpt_api.get_llm')
+    @patch('hart_intelligence_entry.get_llm')
     def test_returns_matched_agent_when_llm_selects(self, mock_get_llm):
         """When LLM returns an agent ID, should return the match dict."""
         from integrations.agentic_router import find_matching_agent
@@ -154,7 +154,7 @@ class TestFindMatchingAgent:
             assert result['source'] == 'recipe'
             assert result['score'] == 15  # LLM-selected = high confidence
 
-    @patch('langchain_gpt_api.get_llm')
+    @patch('hart_intelligence_entry.get_llm')
     def test_returns_none_when_llm_says_none(self, mock_get_llm):
         """When LLM says NONE, should return None."""
         from integrations.agentic_router import find_matching_agent
@@ -166,7 +166,7 @@ class TestFindMatchingAgent:
         result = find_matching_agent('hello how are you', '/tmp/empty')
         assert result is None
 
-    @patch('langchain_gpt_api.get_llm')
+    @patch('hart_intelligence_entry.get_llm')
     def test_returns_none_on_llm_exception(self, mock_get_llm):
         """LLM failure should return None gracefully."""
         from integrations.agentic_router import find_matching_agent
@@ -182,7 +182,7 @@ class TestFindMatchingAgent:
         # May have expert agents, so just check it doesn't crash
         assert result is None or isinstance(result, dict)
 
-    @patch('langchain_gpt_api.get_llm')
+    @patch('hart_intelligence_entry.get_llm')
     def test_case_insensitive_none_response(self, mock_get_llm):
         """LLM may return 'none' lowercase — should still return None."""
         from integrations.agentic_router import find_matching_agent
@@ -194,7 +194,7 @@ class TestFindMatchingAgent:
         result = find_matching_agent('greetings', '/tmp')
         assert result is None
 
-    @patch('langchain_gpt_api.get_llm')
+    @patch('hart_intelligence_entry.get_llm')
     def test_llm_invoked_with_catalog_context(self, mock_get_llm):
         """LLM should receive agent catalog in prompt."""
         from integrations.agentic_router import find_matching_agent
@@ -224,7 +224,7 @@ class TestFindMatchingAgent:
 class TestGeneratePlanSteps:
     """Tests for generate_plan_steps — LLM plan generation."""
 
-    @patch('langchain_gpt_api.get_llm')
+    @patch('hart_intelligence_entry.get_llm')
     def test_returns_llm_generated_steps(self, mock_get_llm):
         """When LLM returns valid JSON, should use those steps."""
         from integrations.agentic_router import generate_plan_steps
@@ -243,7 +243,7 @@ class TestGeneratePlanSteps:
         assert steps[0]['step_num'] == 1
         assert steps[1]['description'] == 'Design UI mockups'
 
-    @patch('langchain_gpt_api.get_llm')
+    @patch('hart_intelligence_entry.get_llm')
     def test_fallback_on_llm_failure(self, mock_get_llm):
         """When LLM fails, should return generic 4-step fallback."""
         from integrations.agentic_router import generate_plan_steps
@@ -254,7 +254,7 @@ class TestGeneratePlanSteps:
         assert steps[0]['description'] == 'Analyze requirements and gather context'
         assert steps[3]['description'] == 'Deliver results and get feedback'
 
-    @patch('langchain_gpt_api.get_llm')
+    @patch('hart_intelligence_entry.get_llm')
     def test_fallback_on_invalid_json(self, mock_get_llm):
         """When LLM returns non-JSON, should use fallback."""
         from integrations.agentic_router import generate_plan_steps
@@ -266,7 +266,7 @@ class TestGeneratePlanSteps:
         steps = generate_plan_steps('do something')
         assert len(steps) == 4  # fallback
 
-    @patch('langchain_gpt_api.get_llm')
+    @patch('hart_intelligence_entry.get_llm')
     def test_fallback_uses_agent_name(self, mock_get_llm):
         """Fallback step 3 should use matched agent name."""
         from integrations.agentic_router import generate_plan_steps
@@ -276,7 +276,7 @@ class TestGeneratePlanSteps:
         steps = generate_plan_steps('test', matched_agent=agent)
         assert steps[2]['tool_or_agent'] == 'Portfolio Builder'
 
-    @patch('langchain_gpt_api.get_llm')
+    @patch('hart_intelligence_entry.get_llm')
     def test_single_step_triggers_fallback(self, mock_get_llm):
         """LLM returning < 2 steps should trigger fallback."""
         from integrations.agentic_router import generate_plan_steps
@@ -382,7 +382,7 @@ class TestTimeoutGuard:
         import inspect
         # Import from the module where it's defined
         sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
-        from langchain_gpt_api import _handle_agentic_router_tool
+        from hart_intelligence_entry import _handle_agentic_router_tool
         src = inspect.getsource(_handle_agentic_router_tool)
         assert 'concurrent.futures' in src
         assert 'timeout' in src.lower()

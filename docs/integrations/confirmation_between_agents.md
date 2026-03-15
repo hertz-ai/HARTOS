@@ -120,11 +120,11 @@ INTEGRATION REQUEST
 -------------------
 Agent Name: Claude Code (HevolveAI Integration Agent)
 Purpose: Integrate Qwen3-VL multimodal API server into Autogen LangChain chatbot
-Scope: create_recipe.py, reuse_recipe.py, langchain_gpt_api.py
+Scope: create_recipe.py, reuse_recipe.py, hart_intelligence_entry.py
 Changes Proposed:
   1. Uncomment Qwen3-VL config_list in create_recipe.py (lines 187-192)
   2. Uncomment Qwen3-VL config_list in reuse_recipe.py (lines 103-108)
-  3. Create custom LangChain ChatQwen3VL wrapper class in langchain_gpt_api.py
+  3. Create custom LangChain ChatQwen3VL wrapper class in hart_intelligence_entry.py
   4. Add option to switch between Azure OpenAI and local Qwen3-VL
 Risk Level: MEDIUM
   - Changes core LLM configuration
@@ -172,7 +172,7 @@ All proposed changes have been implemented and tested:
    - Same configuration as create_recipe.py
    - Both Azure configs preserved as comments for fallback
 
-✅ 3. Created custom ChatQwen3VL LangChain wrapper (langchain_gpt_api.py lines 87-156)
+✅ 3. Created custom ChatQwen3VL LangChain wrapper (hart_intelligence_entry.py lines 87-156)
    - Inherits from LLM base class
    - OpenAI-compatible API interface
    - Calls http://localhost:8000/v1/chat/completions
@@ -209,7 +209,7 @@ Integration Results:
 Files Modified:
 1. create_recipe.py (lines 179-195)
 2. reuse_recipe.py (lines 87-113)
-3. langchain_gpt_api.py (lines 84-180, 284)
+3. hart_intelligence_entry.py (lines 84-180, 284)
 
 Files Created:
 1. QWEN3VL_INTEGRATION.md (comprehensive guide)

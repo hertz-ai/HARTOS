@@ -40,7 +40,7 @@ in
           threads = if cfg.variant == "edge" then "4"
                     else if cfg.variant == "desktop" then "24"
                     else "50";
-        in "${hartApp.python}/bin/python -m waitress --port=${toString cfg.ports.backend} --threads=${threads} langchain_gpt_api:app";
+        in "${hartApp.python}/bin/python -m waitress --port=${toString cfg.ports.backend} --threads=${threads} hart_intelligence_entry:app";
 
         # Environment file for API keys (optional, user-provided)
         EnvironmentFile = lib.mkIf (builtins.pathExists "/etc/hart/hart.env") "/etc/hart/hart.env";

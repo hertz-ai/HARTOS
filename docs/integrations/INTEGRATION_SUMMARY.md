@@ -201,7 +201,7 @@ integrations/
 
 ### Import Updates
 All main files updated to use new import paths:
-- `langchain_gpt_api.py`: Uses `from integrations.google_a2a import ...`
+- `hart_intelligence_entry.py`: Uses `from integrations.google_a2a import ...`
 - `create_recipe.py`: Uses `from integrations.mcp import ...` and `from integrations.internal_comm import ...`
 - `reuse_recipe.py`: Uses `from integrations.mcp import ...` and `from integrations.internal_comm import ...`
 
@@ -246,7 +246,7 @@ All main files updated to use new import paths:
 - SDK Installed: `a2a-sdk==0.3.10`
 - Created: `integrations/google_a2a/google_a2a_integration.py`
 - Created: `integrations/google_a2a/a2a_agent_registry.py`
-- Modified: `langchain_gpt_api.py` (Google A2A initialization and agent registration)
+- Modified: `hart_intelligence_entry.py` (Google A2A initialization and agent registration)
 - All agents registered with A2A protocol endpoints
 
 ---

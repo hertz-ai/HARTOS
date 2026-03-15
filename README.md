@@ -44,7 +44,7 @@ pip install -r requirements.txt
 echo "OPENAI_API_KEY=your-key" > .env
 
 # 3. Start the backend
-python langchain_gpt_api.py
+python hart_intelligence_entry.py
 ```
 
 Now talk to it:
@@ -303,7 +303,7 @@ pip install -r requirements.txt
 cp .env.example .env              # Add your API keys
 
 # Run
-python langchain_gpt_api.py       # Starts on port 6777
+python hart_intelligence_entry.py       # Starts on port 6777
 ```
 
 ### API

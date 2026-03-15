@@ -1,0 +1,165 @@
+name: Docker Build & Deploy — Cloud HARTOS
+
+# Triggers on push to develop, merge to main, or manual dispatch
+on:
+  push:
+    branches: [develop, main]
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+      - 'tests/**'
+      - '.github/workflows/nix-*'
+  pull_request:
+    branches: [main]
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      deploy_target:
+        description: 'Deploy target (staging/production)'
+        required: true
+        default: 'staging'
+        type: choice
+        options: [staging, production]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/hartos
+  DOCKER_BUILDKIT: 1
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # ── 1. Quick lint + import check ──────────────────────────────
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Syntax check critical modules
+        run: |
+          python -c "
+          import ast, sys
+          files = [
+              'hart_intelligence_entry.py', 'helper.py', 'agent_identity.py',
+              'cultural_wisdom.py', 'hart_onboarding.py', 'create_recipe.py',
+              'reuse_recipe.py', 'lifecycle_hooks.py',
+          ]
+          failed = []
+          for f in files:
+              try:
+                  ast.parse(open(f).read())
+              except Exception as e:
+                  failed.append(f'{f}: {e}')
+          if failed:
+              print('SYNTAX ERRORS:')
+              for f in failed: print(f'  {f}')
+              sys.exit(1)
+          print(f'All {len(files)} files OK')
+          "
+
+  # ── 2. Build Docker image ─────────────────────────────────────
+  build:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
+
+      - name: Verify image
+        run: |
+          docker pull ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          docker run --rm ${{ fromJSON(steps.meta.outputs.json).tags[0] }} python -c "
+          from hart_intelligence_entry import app
+          from agent_identity import build_identity_prompt
+          from integrations.social import init_social
+          print('All critical imports OK')
+          "
+
+  # ── 3. Deploy to cloud server ─────────────────────────────────
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.merged)
+    timeout-minutes: 10
+    environment:
+      name: ${{ github.ref == 'refs/heads/main' && 'production' || 'staging' }}
+    steps:
+      - name: Deploy to cloud server
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            cd /opt/hartos
+
+            # Pull latest image
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+
+            # Stop old container gracefully
+            docker stop hartos-langchain 2>/dev/null || true
+            docker rm hartos-langchain 2>/dev/null || true
+
+            # Start new container
+            docker run -d \
+              --name hartos-langchain \
+              --restart unless-stopped \
+              -p 6777:6777 \
+              -v /opt/hartos/data:/app/data \
+              -v /opt/hartos/prompts:/app/prompts \
+              -v /opt/hartos/logs:/app/logs \
+              -e HEVOLVE_DB_URL="${HEVOLVE_DB_URL}" \
+              -e OPENAI_API_KEY="${OPENAI_API_KEY}" \
+              -e HEVOLVE_MASTER_KEY="${HEVOLVE_MASTER_KEY}" \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+
+            # Wait for health check
+            for i in $(seq 1 30); do
+              if curl -s http://localhost:6777/api/social/feed?limit=1 | grep -q 'data'; then
+                echo "HARTOS healthy on :6777"
+                exit 0
+              fi
+              sleep 2
+            done
+            echo "WARNING: Health check timed out"

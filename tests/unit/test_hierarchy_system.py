@@ -1717,7 +1717,7 @@ class TestHartChallengeEndpoint:
         """Create a Flask test client from the main app."""
         # Import app with minimal side effects
         try:
-            from langchain_gpt_api import app
+            from hart_intelligence_entry import app
             app.config['TESTING'] = True
             with app.test_client() as client:
                 yield client

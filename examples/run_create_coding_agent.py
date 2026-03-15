@@ -101,7 +101,7 @@ try:
 
 except requests.exceptions.ConnectionError:
     print("\nERROR: Cannot connect to Flask server at " + BASE_URL)
-    print("Make sure the server is running: python langchain_gpt_api.py")
+    print("Make sure the server is running: python hart_intelligence.py")
 except requests.exceptions.Timeout:
     print("\nERROR: Request timed out after 5 minutes")
     print("The agent creation may still be processing in the background.")

@@ -1146,7 +1146,7 @@ class TestVLMVisualAgentPayload:
 
     def test_visual_agent_requires_fields(self):
         """Verify /visual_agent rejects missing fields."""
-        from langchain_gpt_api import app
+        from hart_intelligence_entry import app
         with patch.dict(os.environ, {'HEVOLVE_API_KEY': self._API_KEY}):
             with app.test_client() as client:
                 resp = client.post('/visual_agent', json={},
@@ -1157,10 +1157,10 @@ class TestVLMVisualAgentPayload:
 
     def test_visual_agent_accepts_valid_payload(self):
         """Verify /visual_agent accepts all required fields."""
-        from langchain_gpt_api import app
+        from hart_intelligence_entry import app
         with patch.dict(os.environ, {'HEVOLVE_API_KEY': self._API_KEY}):
             with app.test_client() as client:
-                with patch('langchain_gpt_api.visual_based_execution',
+                with patch('hart_intelligence_entry.visual_based_execution',
                            return_value='Action completed') as mock_exec:
                     resp = client.post('/visual_agent', json={
                         'task_description': 'Click the submit button',

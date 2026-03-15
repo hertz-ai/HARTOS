@@ -46,7 +46,7 @@ from langchain.output_parsers.json import parse_json_markdown
 from langchain.schema import AgentAction, AgentFinish, OutputParserException
 from langchain.tools.requests.tool import RequestsGetTool, TextRequestsWrapper
 from pydantic import BaseModel, Field, root_validator
-from langchain_gpt_api import CustomConvoOutputParser, CustomChain
+from hart_intelligence_entry import CustomConvoOutputParser, CustomChain
 
 with open("config.json", 'r') as f:
     config = json.load(f)

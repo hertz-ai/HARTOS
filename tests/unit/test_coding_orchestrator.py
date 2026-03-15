@@ -92,11 +92,11 @@ class TestAntipatterns:
     """Verify the orchestrator is a LEAF tool — no /chat re-entry."""
 
     def test_execute_does_not_import_chat(self):
-        """Ensure orchestrator.execute() never imports langchain_gpt_api or dispatch_to_chat."""
+        """Ensure orchestrator.execute() never imports hart_intelligence_entry or dispatch_to_chat."""
         import integrations.coding_agent.orchestrator as orch_module
         source = open(orch_module.__file__, 'r').read()
         assert 'dispatch_to_chat' not in source
-        assert 'langchain_gpt_api' not in source
+        assert 'hart_intelligence_entry' not in source
         assert "'/chat'" not in source
 
     def test_tool_backends_no_chat_dispatch(self):

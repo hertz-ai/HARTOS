@@ -14,7 +14,7 @@ HART OS (Hevolve Hive Agentic Runtime) is crowdsourced compute infrastructure fo
                                         ▼
                             ┌─────────────────────────┐
                             │   Flask Server (:6777)   │
-                            │   langchain_gpt_api.py   │
+                            │   hart_intelligence_entry.py   │
                             │                         │
                             │  /chat  /status  /a2a   │
                             │  /api/settings/compute  │

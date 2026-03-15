@@ -6,7 +6,7 @@ source =
     integrations/channels
     integrations/service_tools
     security
-    langchain_gpt_api
+    hart_intelligence_entry
     threadlocal
     helper
     helper_func

@@ -301,7 +301,7 @@ python -m vllm.entrypoints.openai.api_server \
 
 **Step 2: Start Flask App**
 ```bash
-python langchain_gpt_api.py
+python hart_intelligence_entry.py
 ```
 
 **Step 3: Run Tests**
@@ -475,7 +475,7 @@ Project Root/
 
 2. **Run Autonomous Tests** ⭐ RECOMMENDED
    ```bash
-   python langchain_gpt_api.py &  # Start Flask app
+   python hart_intelligence_entry.py &  # Start Flask app
    python test_autonomous_agent_suite.py
    ```
 
@@ -589,7 +589,7 @@ curl http://localhost:6777/status
 
 **Solution:**
 ```bash
-python langchain_gpt_api.py
+python hart_intelligence_entry.py
 # Check logs: tail -f langchain.log
 ```
 

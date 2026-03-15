@@ -31,7 +31,7 @@ Create `config.json` with API keys for: OPENAI, GROQ, GOOGLE_CSE_ID, GOOGLE_API_
 ### Running
 
 ```bash
-python langchain_gpt_api.py    # Flask server on port 6777
+python hart_intelligence_entry.py    # Flask server on port 6777
 ```
 
 ## Code Style

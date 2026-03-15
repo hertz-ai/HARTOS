@@ -28,7 +28,7 @@ graph TB
 
     subgraph AppLayer["Application Layer — Flask (port 6777)"]
         direction TB
-        API["langchain_gpt_api.py<br/>/chat, /time_agent,<br/>/visual_agent, /status"]
+        API["hart_intelligence_entry.py<br/>/chat, /time_agent,<br/>/visual_agent, /status"]
         CR["create_recipe.py<br/>Task Decomposition,<br/>Action Execution,<br/>Recipe Generation"]
         RR["reuse_recipe.py<br/>Recipe Playback,<br/>90% Faster Execution"]
         LH["lifecycle_hooks.py<br/>ActionState Machine<br/>11 States"]
@@ -247,7 +247,7 @@ graph LR
 ```mermaid
 sequenceDiagram
     actor User
-    participant Flask as langchain_gpt_api.py
+    participant Flask as hart_intelligence_entry.py
     participant Sec as security/middleware
     participant PG as prompt_guard
     participant CR as create_recipe.py
@@ -327,7 +327,7 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     actor User
-    participant Flask as langchain_gpt_api.py
+    participant Flask as hart_intelligence_entry.py
     participant Sec as security/middleware
     participant RR as reuse_recipe.py
     participant LH as lifecycle_hooks.py
@@ -562,7 +562,7 @@ graph TB
 | | rate_limiter_redis.py | 1 | Redis sliding window |
 | | tls_config.py | 1 | HTTPS enforcement |
 | | audit_log.py | 1 | Log redaction |
-| **Core** | langchain_gpt_api.py | 1 | Flask server, API endpoints |
+| **Core** | hart_intelligence_entry.py | 1 | Flask server, API endpoints |
 | | create_recipe.py | 1 | CREATE mode, task decomposition |
 | | reuse_recipe.py | 1 | REUSE mode, 90% faster |
 | | lifecycle_hooks.py | 1 | ActionState (11 states) |

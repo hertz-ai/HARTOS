@@ -69,7 +69,7 @@ COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 # Copy application code
-COPY langchain_gpt_api.py .
+COPY hart_intelligence_entry.py .
 # config.json deliberately excluded — use env vars or Docker secrets for API keys
 # COPY config.json .  # SECURITY: never bake credentials into image layers
 COPY helper.py .
@@ -159,4 +159,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
 # Run with gunicorn
-CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:8000 --workers ${WORKERS} --threads ${THREADS} --timeout ${TIMEOUT} --worker-class gevent --access-logfile - --error-logfile - --capture-output langchain_gpt_api:app"]
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:8000 --workers ${WORKERS} --threads ${THREADS} --timeout ${TIMEOUT} --worker-class gevent --access-logfile - --error-logfile - --capture-output hart_intelligence_entry:app"]

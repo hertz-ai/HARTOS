@@ -156,7 +156,7 @@ pytest tests/runtime_tests/test_e2e_agent_creation.py -v -s
 | LLM Model | Qwen3-VL-2B-Instruct | System config |
 | LLM Port | 8000 | localhost |
 | LLM Base URL | http://localhost:8000/v1 | `docker-compose.test.yml` |
-| App Port | 6777 | `langchain_gpt_api.py` |
+| App Port | 6777 | `hart_intelligence_entry.py` |
 | Redis Port | 6379 | `docker-compose.test.yml` |
 | Mock API Port | 9890 | `docker-compose.test.yml` |
 | Crossbar Port | 8088 | `docker-compose.test.yml` |

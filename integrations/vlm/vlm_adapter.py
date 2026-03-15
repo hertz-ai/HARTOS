@@ -19,7 +19,7 @@ import threading
 logger = logging.getLogger('hevolve.vlm_adapter')
 
 # ---------------------------------------------------------------------------
-# Reuse existing bundled-mode flag (same as hart_intelligence (langchain_gpt_api.py):329)
+# Reuse existing bundled-mode flag (same as hart_intelligence:329)
 # ---------------------------------------------------------------------------
 _BUNDLED_MODE = bool(os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False))
 

@@ -420,9 +420,9 @@ if current_size > last_log_size:
 **From most recent test execution:**
 
 ```
-2025-10-23 11:04:02 - langchain_gpt_api- [RequestID: complex_test_1761204241] - INFO - casual_conv type True
-2025-10-23 11:04:02 - langchain_gpt_api- [RequestID: complex_test_1761204241] - INFO - GATHER JSON doesnot EXISTS
-2025-10-23 11:04:02 - langchain_gpt_api- [RequestID: complex_test_1761204241] - INFO - Loaded config for prompt 8888
+2025-10-23 11:04:02 - hart_intelligence_entry- [RequestID: complex_test_1761204241] - INFO - casual_conv type True
+2025-10-23 11:04:02 - hart_intelligence_entry- [RequestID: complex_test_1761204241] - INFO - GATHER JSON doesnot EXISTS
+2025-10-23 11:04:02 - hart_intelligence_entry- [RequestID: complex_test_1761204241] - INFO - Loaded config for prompt 8888
 ```
 
 This shows:

@@ -51,7 +51,7 @@ config_list = [{
 
 **Same pattern as create_recipe.py** - now using local Qwen3-VL server instead of Azure.
 
-### 3. `langchain_gpt_api.py` (lines 84-180, 284)
+### 3. `hart_intelligence_entry.py` (lines 84-180, 284)
 
 **Changes:**
 1. Added custom `ChatQwen3VL` class (lines 87-156)
@@ -110,7 +110,7 @@ llm_math = LLMMathChain(llm=get_llm(model_name="gpt-3.5-turbo"))
 
 #### Option 1: Use Qwen3-VL (Default)
 
-In `langchain_gpt_api.py`:
+In `hart_intelligence_entry.py`:
 ```python
 USE_QWEN3VL = True  # Line 160
 ```
@@ -128,7 +128,7 @@ config_list = [{
 
 #### Option 2: Fallback to Azure OpenAI
 
-In `langchain_gpt_api.py`:
+In `hart_intelligence_entry.py`:
 ```python
 USE_QWEN3VL = False  # Line 160
 ```
@@ -251,7 +251,7 @@ Both `create_recipe.py` and `reuse_recipe.py`:
 ### Test LangChain Integration
 
 ```python
-from langchain_gpt_api import get_llm
+from hart_intelligence_entry import get_llm
 
 # Get LLM instance
 llm = get_llm()
@@ -308,7 +308,7 @@ Check server logs in `C:\Users\sathi\PycharmProjects\hevolveai\logs\`
 
 ### Fallback to Azure OpenAI
 
-If Qwen3-VL is unavailable, set `USE_QWEN3VL = False` in `langchain_gpt_api.py`
+If Qwen3-VL is unavailable, set `USE_QWEN3VL = False` in `hart_intelligence_entry.py`
 
 ---
 
@@ -330,7 +330,7 @@ If Qwen3-VL is unavailable, set `USE_QWEN3VL = False` in `langchain_gpt_api.py`
                   ▼
 ┌─────────────────────────────────────────────────────┐
 │   LangChain Integration Layer                       │
-│   (langchain_gpt_api.py)                            │
+│   (hart_intelligence_entry.py)                            │
 │                                                      │
 │   ┌───────────────────────────────────────┐         │
 │   │  ChatQwen3VL(LLM)                     │         │

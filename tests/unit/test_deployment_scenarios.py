@@ -475,13 +475,13 @@ class TestStartupValidation:
     """Test _validate_startup() config checks."""
 
     def test_validate_startup_returns_list(self):
-        from langchain_gpt_api import _validate_startup
+        from hart_intelligence_entry import _validate_startup
         result = _validate_startup()
         assert isinstance(result, list)
 
     def test_validate_startup_warns_on_missing_env(self):
         """Missing .env should produce a warning."""
-        from langchain_gpt_api import _validate_startup
+        from hart_intelligence_entry import _validate_startup
         with patch('os.path.exists') as mock_exists:
             # config.json doesn't exist, .env doesn't exist
             mock_exists.side_effect = lambda p: False
@@ -492,7 +492,7 @@ class TestStartupValidation:
 
     def test_validate_startup_warns_on_missing_config(self):
         """Missing config.json should produce a warning."""
-        from langchain_gpt_api import _validate_startup
+        from hart_intelligence_entry import _validate_startup
         with patch('os.path.exists') as mock_exists:
             mock_exists.side_effect = lambda p: False
             result = _validate_startup()
@@ -501,7 +501,7 @@ class TestStartupValidation:
 
     def test_validate_startup_no_crash(self):
         """Startup validation should never crash regardless of environment."""
-        from langchain_gpt_api import _validate_startup
+        from hart_intelligence_entry import _validate_startup
         # Should always return without raising
         result = _validate_startup()
         assert result is not None

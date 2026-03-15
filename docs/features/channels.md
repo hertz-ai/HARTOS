@@ -35,4 +35,4 @@ Administrators can enable, disable, and configure channels through the admin API
 ## Source Files
 
 - `integrations/channels/` (adapter implementations)
-- `langchain_gpt_api.py` (admin routes)
+- `hart_intelligence_entry.py` (admin routes)

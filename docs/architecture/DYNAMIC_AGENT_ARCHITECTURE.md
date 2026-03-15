@@ -178,7 +178,7 @@ Each agent automatically gets A2A-compatible skills:
 
 ## Integration Points
 
-### 1. Flask App (`langchain_gpt_api.py`)
+### 1. Flask App (`hart_intelligence_entry.py`)
 
 **Old (Hardcoded):**
 ```python

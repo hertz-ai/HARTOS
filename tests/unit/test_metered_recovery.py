@@ -610,7 +610,7 @@ class TestDeduplicationGuard(unittest.TestCase):
 
 
 # Flask-dependent endpoint tests are in tests/unit/test_settings_api.py
-# (isolated to avoid tempfile corruption from langchain_gpt_api import)
+# (isolated to avoid tempfile corruption from hart_intelligence_entry import)
 
 
 if __name__ == '__main__':

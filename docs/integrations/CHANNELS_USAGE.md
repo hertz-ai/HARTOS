@@ -1651,7 +1651,7 @@ ENV PYTHONUNBUFFERED=1
 
 EXPOSE 6777
 
-CMD ["python", "langchain_gpt_api.py"]
+CMD ["python", "hart_intelligence_entry.py"]
 ```
 
 ---

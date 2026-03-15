@@ -15,7 +15,7 @@ REUSE Mode:  User Input --> Load Recipe --> Execute Steps --> Output (90% faster
 
 | File | Purpose |
 |------|---------|
-| `langchain_gpt_api.py` | Flask application, all HTTP routes, Waitress server on port 6777 |
+| `hart_intelligence_entry.py` | Flask application, all HTTP routes, Waitress server on port 6777 |
 
 ### Recipe Pipeline
 

@@ -2,7 +2,7 @@
 Cached configuration loader.
 
 Replaces repeated `open("config.json")` calls across helper.py, create_recipe.py,
-reuse_recipe.py, and hart_intelligence (langchain_gpt_api.py) with a single cached load.
+reuse_recipe.py, and hart_intelligence with a single cached load.
 
 Before: config.json read 3+ times at module import (once per file).
 After:  config.json read exactly once, cached in memory.

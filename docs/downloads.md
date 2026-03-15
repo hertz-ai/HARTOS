@@ -36,7 +36,7 @@ Your phone becomes a remote to your private AI mesh.
 
 ```bash
 pip install -r requirements.txt
-python langchain_gpt_api.py
+python hart_intelligence_entry.py
 ```
 
 ## Docker

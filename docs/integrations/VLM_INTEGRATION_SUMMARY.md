@@ -256,7 +256,7 @@ python omniparser_server.py  # OmniParser (port 8080)
 
 # In another terminal
 cd C:\Users\sathi\PycharmProjects\HARTOS
-venv310/Scripts/python.exe langchain_gpt_api.py  # Main agent server
+venv310/Scripts/python.exe hart_intelligence_entry.py  # Main agent server
 ```
 
 ### 2. Test Complex Task via API

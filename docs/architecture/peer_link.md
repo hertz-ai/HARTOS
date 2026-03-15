@@ -275,7 +275,7 @@ def _exchange_with_peer(self, peer_url):
 ### MessageBus Migration (from publish_async)
 
 ```python
-# BEFORE (langchain_gpt_api.py)
+# BEFORE (hart_intelligence_entry.py)
 publish_async(f'com.hertzai.hevolve.chat.{user_id}', json.dumps(msg))
 
 # AFTER

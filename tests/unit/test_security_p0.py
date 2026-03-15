@@ -216,7 +216,7 @@ class TestShellInjectionProtection:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 4. Rate Limiter — langchain_gpt_api.py MAX_CONTENT_LENGTH
+# 4. Rate Limiter — hart_intelligence_entry.py MAX_CONTENT_LENGTH
 # ═══════════════════════════════════════════════════════════════════════
 
 class TestRateLimiter:
@@ -233,7 +233,7 @@ class TestRateLimiter:
             'GROQ_API_KEY': 'test-key',
         }):
             try:
-                from langchain_gpt_api import app
+                from hart_intelligence_entry import app
                 max_len = app.config.get('MAX_CONTENT_LENGTH')
                 assert max_len is not None, \
                     "MAX_CONTENT_LENGTH must be set on the Flask app"
@@ -245,17 +245,17 @@ class TestRateLimiter:
                 assert max_len <= 50 * 1024 * 1024, \
                     f"MAX_CONTENT_LENGTH too large: {max_len}"
             except ImportError as e:
-                pytest.skip(f"Cannot import langchain_gpt_api: {e}")
+                pytest.skip(f"Cannot import hart_intelligence_entry: {e}")
             except Exception as e:
                 # If the module fails to load for env reasons, check the source directly
                 source_path = os.path.join(
                     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-                    'langchain_gpt_api.py'
+                    'hart_intelligence_entry.py'
                 )
                 with open(source_path, 'r') as f:
                     source = f.read()
                 assert "MAX_CONTENT_LENGTH" in source, \
-                    "langchain_gpt_api.py must set app.config['MAX_CONTENT_LENGTH']"
+                    "hart_intelligence_entry.py must set app.config['MAX_CONTENT_LENGTH']"
 
 
 if __name__ == '__main__':

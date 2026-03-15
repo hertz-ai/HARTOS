@@ -73,7 +73,7 @@ class AIKeyVault:
 
     @classmethod
     def get_instance(cls) -> 'AIKeyVault':
-        """Thread-safe singleton (matches hart_intelligence (langchain_gpt_api.py):1796 call)."""
+        """Thread-safe singleton (matches hart_intelligence:1796 call)."""
         if cls._instance is None:
             with cls._cls_lock:
                 if cls._instance is None:

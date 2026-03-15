@@ -373,7 +373,7 @@ class TestVLMAgentIntegration:
         import pickle
 
         with patch('helper.redis_client') as mock_redis, \
-             patch('langchain_gpt_api.get_vision_service', return_value=None):
+             patch('hart_intelligence_entry.get_vision_service', return_value=None):
             # Mock serialized frame
             fake_frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
             serialized = pickle.dumps(fake_frame)
@@ -386,7 +386,7 @@ class TestVLMAgentIntegration:
     def test_vlm_frame_retrieval_no_frame(self, test_user_id, mock_flask_app):
         """Test frame retrieval when no frame is available"""
         with patch('helper.redis_client') as mock_redis, \
-             patch('langchain_gpt_api.get_vision_service', return_value=None):
+             patch('hart_intelligence_entry.get_vision_service', return_value=None):
             mock_redis.get.return_value = None
 
             frame = get_frame(str(test_user_id))

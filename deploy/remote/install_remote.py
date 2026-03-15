@@ -580,7 +580,7 @@ class WindowsInstaller:
             '@echo off\n'
             'call C:\\hart\\hart_env.bat\n'
             'cd /d C:\\hart\\app\n'
-            'C:\\hart\\venv\\Scripts\\python langchain_gpt_api.py\n'
+            'C:\\hart\\venv\\Scripts\\python hart_intelligence.py\n'
         )
         startup_path = os.path.join(tempfile.gettempdir(), 'hart_start.bat')
         with open(startup_path, 'w') as f:
@@ -709,7 +709,7 @@ class WindowsInstaller:
         cmds = [
             'nssm install HartOS C:\\hart\\venv\\Scripts\\python.exe',
             'nssm set HartOS AppDirectory C:\\hart\\app',
-            'nssm set HartOS AppParameters langchain_gpt_api.py',
+            'nssm set HartOS AppParameters hart_intelligence.py',
             'nssm set HartOS AppEnvironmentExtra HEVOLVE_DISTRIBUTED_MODE=true HEVOLVE_AGENT_ENGINE_ENABLED=true HEVOLVE_DB_PATH=C:\\hart\\data\\hart.db PYTHONDONTWRITEBYTECODE=1',
             'nssm set HartOS Start SERVICE_AUTO_START',
             'nssm set HartOS AppStdout C:\\hart\\logs\\hart_stdout.log',

@@ -22,7 +22,7 @@ Seven pinned packages have known CVEs:
 ## HIGH — Should Fix Soon
 
 ### 3. God Files (6300 + 2500 lines)
-- `langchain_gpt_api.py` — 6303 lines, 153 functions, 60 routes in one file
+- `hart_intelligence_entry.py` — 6303 lines, 153 functions, 60 routes in one file
 - `helper.py` — 2499 lines, 69 functions
 - `create_recipe.py` / `reuse_recipe.py` — 33 duplicated functions remain
 - **Impact**: Hard to navigate, review, and test. Circular imports between the three.
@@ -34,7 +34,7 @@ Seven pinned packages have known CVEs:
 - **Mitigation**: Critical paths already use `db_session()`. Low traffic = no issue.
 
 ### 5. Thread-Unsafe Global State
-- `langchain_gpt_api.py` has unguarded mutable dicts (`_memory_graphs`, `config`, `_active_watchers`)
+- `hart_intelligence_entry.py` has unguarded mutable dicts (`_memory_graphs`, `config`, `_active_watchers`)
 - Under concurrent `/chat` requests, these could corrupt
 - **Mitigation**: Waitress WSGI server serializes requests per worker. Low concurrency = safe.
 

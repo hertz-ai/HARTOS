@@ -61,7 +61,7 @@ curl http://localhost:8000/v1/models
 The main Flask application must be running on `localhost:6777`:
 
 ```bash
-python langchain_gpt_api.py
+python hart_intelligence_entry.py
 ```
 
 **Verify it's running:**
@@ -335,7 +335,7 @@ curl http://localhost:8000/v1/models
 **Solution:**
 ```bash
 # Start Flask app
-python langchain_gpt_api.py
+python hart_intelligence_entry.py
 
 # Verify
 curl http://localhost:6777/status
@@ -453,7 +453,7 @@ jobs:
       - name: Start Flask App
         run: |
           pip install -r requirements.txt
-          python langchain_gpt_api.py &
+          python hart_intelligence_entry.py &
           sleep 10
 
       - name: Run Tests

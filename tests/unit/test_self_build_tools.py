@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 # Prevent heavy imports
-sys.modules.setdefault('langchain_gpt_api', MagicMock())
+sys.modules.setdefault('hart_intelligence_entry', MagicMock())
 
 from integrations.agent_engine.self_build_tools import (
     _PKG_RE,

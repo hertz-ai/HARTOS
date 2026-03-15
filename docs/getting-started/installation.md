@@ -22,7 +22,7 @@ cp .env.example .env
 # Edit .env — set OPENAI_API_KEY or GROQ_API_KEY
 
 # 4. Start
-python langchain_gpt_api.py
+python hart_intelligence_entry.py
 
 # 5. Verify
 curl http://localhost:6777/status
@@ -412,7 +412,7 @@ cat > config.json << 'EOF'
 EOF
 
 # 6. Start
-python langchain_gpt_api.py
+python hart_intelligence_entry.py
 
 # 7. Verify
 curl http://localhost:6777/status
@@ -616,7 +616,7 @@ docker-compose restart
 docker-compose down && docker-compose up -d
 
 # Emergency: start backend only (minimal services)
-python langchain_gpt_api.py
+python hart_intelligence_entry.py
 ```
 
 ---
@@ -739,7 +739,7 @@ sudo bash deploy/linux/install.sh --join-peer http://central:6777
 # Or via environment
 export HART_JOIN_PEER=http://central:6777
 export HEVOLVE_NODE_TIER=regional
-python langchain_gpt_api.py
+python hart_intelligence_entry.py
 ```
 
 ### Gossip Discovery
@@ -884,7 +884,7 @@ docker-compose logs -f backend
 
 # Manual
 # Logs print to stdout — redirect as needed
-python langchain_gpt_api.py 2>&1 | tee hart.log
+python hart_intelligence_entry.py 2>&1 | tee hart.log
 ```
 
 ---

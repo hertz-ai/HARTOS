@@ -166,7 +166,7 @@ def check_global_availability(
 # ─── LLM-Powered Generation ───
 
 def _load_api_key():
-    """Load OpenAI API key from config.json (same source as langchain_gpt_api.py)."""
+    """Load OpenAI API key from config.json (same source as hart_intelligence)."""
     config_path = os.path.join(
         os.path.dirname(__file__), '..', '..', 'config.json')
     try:

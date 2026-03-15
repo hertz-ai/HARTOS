@@ -82,7 +82,7 @@ Each OS capability maps to: NixOS module (Layer 1) + Python API (Layer 2) + Liqu
 
 | Mode | Command | What You Get |
 |------|---------|-------------|
-| **Standalone** | `python langchain_gpt_api.py` | Flask on port 6777, agents, tools, social, federation |
+| **Standalone** | `python hart_intelligence_entry.py` | Flask on port 6777, agents, tools, social, federation |
 | **Bundled (pip)** | `pip install hart-backend` | Same as standalone, importable as library |
 | **Docker** | `docker compose up` | Containerized with Redis, Crossbar, workers |
 | **OS (NixOS)** | `nixos-rebuild switch` | Full OS: GNOME + LiquidUI + PipeWire + agents + everything |
@@ -103,7 +103,7 @@ All tiers participate fully in hive — budget limits connections, NOT capabilit
 
 | Entry Point | File | Port | Purpose |
 |-------------|------|------|---------|
-| Backend API | `langchain_gpt_api.py` | 6777 (app) / 677 (OS) | Flask + Waitress, 430+ REST endpoints |
+| Backend API | `hart_intelligence_entry.py` | 6777 (app) / 677 (OS) | Flask + Waitress, 430+ REST endpoints |
 | LiquidUI Shell | `integrations/agent_engine/liquid_ui_service.py` | 6778 | Desktop shell, WebKit renderer, 63 endpoints |
 | CLI | `hart_cli.py` | N/A | 21 Click subcommands |
 | Agent Daemon | `integrations/agent_engine/agent_daemon.py` | N/A | Tick-based autonomous goal processor |
@@ -1654,7 +1654,7 @@ Exception collection, recipe experience recording, notifications — never block
 
 ## 38. API Endpoints (430+)
 
-### Main Application (`langchain_gpt_api.py`) — 47 endpoints
+### Main Application (`hart_intelligence_entry.py`) — 47 endpoints
 
 **Core**: POST `/chat`, POST `/time_agent`, POST `/visual_agent`, POST `/add_history`, GET `/status`, GET `/health`, GET `/ready`, POST `/zeroshot/`
 
@@ -1746,7 +1746,7 @@ All imports use `from langchain.X` (NOT langchain_classic, langchain_community).
 
 ```
 HARTOS/
-├── langchain_gpt_api.py        # Flask entry point (port 6777), 430+ endpoints
+├── hart_intelligence_entry.py        # Flask entry point (port 6777), 430+ endpoints
 ├── create_recipe.py             # CREATE mode pipeline
 ├── reuse_recipe.py              # REUSE mode pipeline
 ├── helper.py                    # Action class, JSON utils

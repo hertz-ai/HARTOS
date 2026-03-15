@@ -17,7 +17,7 @@ with db_session() as db:
 
 ## @_json_endpoint Decorator
 
-All API endpoints in `langchain_gpt_api.py` that handle errors uniformly use this decorator:
+All API endpoints in `hart_intelligence_entry.py` that handle errors uniformly use this decorator:
 
 ```python
 def _json_endpoint(f):

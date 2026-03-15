@@ -173,7 +173,7 @@ all = [
 
 [project.scripts]
 hart = "hart_cli:hart"
-hart-server = "langchain_gpt_api:main"
+hart-server = "hart_intelligence_entry:main"
 hart-crossbar = "crossbar_server:main"
 
 [project.urls]
@@ -186,7 +186,7 @@ Issues = "https://github.com/hertz-ai/HARTOS/issues"
 py-modules = [
     "hart_version",
     "hart_intelligence",
-    "langchain_gpt_api",
+    "hart_intelligence_entry",
     "helper",
     "helper_ledger",
     "threadlocal",

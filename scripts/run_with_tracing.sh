@@ -107,7 +107,7 @@ echo "Starting server with tracing..."
 echo "Press Ctrl+C to stop."
 echo ""
 
-$PYTHON_EXE langchain_gpt_api.py
+$PYTHON_EXE hart_intelligence_entry.py
 
 if [ $? -ne 0 ]; then
     echo ""

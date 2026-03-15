@@ -133,7 +133,7 @@ class AutonomousAgentTester:
         except requests.exceptions.RequestException as e:
             self.print_error(f"Flask app not reachable: {e}")
             self.print_info(f"Start Flask app with:")
-            self.print_info(f"  python langchain_gpt_api.py")
+            self.print_info(f"  python hart_intelligence_entry.py")
             return False
 
     def test_llm_direct(self) -> bool:

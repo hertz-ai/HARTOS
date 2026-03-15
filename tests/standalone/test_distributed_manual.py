@@ -7,7 +7,7 @@ Run this after starting the backend with HEVOLVE_DISTRIBUTED_MODE=true.
 
 Usage:
     # Start backend with distributed mode + Redis:
-    HEVOLVE_DISTRIBUTED_MODE=true HEVOLVE_AGENT_ENGINE_ENABLED=true python langchain_gpt_api.py
+    HEVOLVE_DISTRIBUTED_MODE=true HEVOLVE_AGENT_ENGINE_ENABLED=true python hart_intelligence_entry.py
 
     # In another terminal:
     python scripts/test_distributed_manual.py [--base-url http://localhost:6777]
@@ -57,7 +57,7 @@ def main():
     except requests.RequestException as e:
         check('Backend reachable', False, str(e))
         print('\nBackend not running. Start with:')
-        print('  HEVOLVE_DISTRIBUTED_MODE=true python langchain_gpt_api.py')
+        print('  HEVOLVE_DISTRIBUTED_MODE=true python hart_intelligence_entry.py')
         sys.exit(1)
     print()
 
