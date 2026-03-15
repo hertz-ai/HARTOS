@@ -96,3 +96,8 @@ framework/
 media/
 pycharm-plugin/
 hevolvebot-admin-dashboard/
+secrets_to_scrub.txt
+coauthor_scrub.txt
+plan.md
+*_reddit_*.txt
+*_reddit_*.md
