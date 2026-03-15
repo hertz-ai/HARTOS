@@ -2,6 +2,9 @@
 
 Get HART OS running in 5 minutes.
 
+!!! tip "Try without installing"
+    Don't want to set up locally? Use the hosted version at [hevolve.ai](https://hevolve.ai) — same API, zero setup.
+
 ---
 
 ## Prerequisites

@@ -3,6 +3,9 @@
 Add the Hevolve AI chat agent to any website. Three integration levels:
 drop-in widget, iframe embed, or OpenAI-compatible API.
 
+!!! tip "Cloud or Local?"
+    Replace `localhost:6777` with `hevolve.ai` in all examples below if using the hosted cloud API.
+
 ---
 
 ## Option 1: Chat Widget (Recommended)
