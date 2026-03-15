@@ -77,7 +77,7 @@
     '@media(max-width:600px){#hevolve-chat-panel{width:calc(100vw - 16px);height:70vh;bottom:8px;right:8px;border-radius:12px}}',
     '.hevolve-chat-header{',
     '  display:flex;align-items:center;justify-content:space-between;',
-    '  padding:12px 16px;background:#111111;color:#fff;flex-shrink:0;',
+    '  padding:12px 16px;background:#000000;color:#fff;flex-shrink:0;',
     '}',
     '.hevolve-chat-title{font:600 15px/1.4 system-ui,sans-serif}',
     '.hevolve-chat-close{',
