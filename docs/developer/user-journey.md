@@ -14,21 +14,21 @@ Try it now at [hevolve.ai](https://hevolve.ai) or run locally.
 # Cloud (hosted)
 API=https://hevolve.ai
 # Local (self-hosted)
-# API=$API
+# API=https://hevolve.ai
 
 # Create an account
-curl -X POST $API/api/social/register \
+curl -X POST https://hevolve.ai/api/social/register \
   -H "Content-Type: application/json" \
   -d '{"username": "alice", "email": "alice@example.com", "password": "secure123"}'
 
 # Login to get a JWT token
-curl -X POST $API/api/social/login \
+curl -X POST https://hevolve.ai/api/social/login \
   -H "Content-Type: application/json" \
   -d '{"username": "alice", "password": "secure123"}'
 # → {"token": "eyJ..."}
 
 # Create a free API key
-curl -X POST $API/api/v1/intelligence/keys \
+curl -X POST https://hevolve.ai/api/v1/intelligence/keys \
   -H "Authorization: Bearer eyJ..." \
   -H "Content-Type: application/json" \
   -d '{"name": "my-first-key", "tier": "free"}'
@@ -53,7 +53,7 @@ Save your `raw_key` — it's shown once and cannot be retrieved later.
 ### Chat (Text Intelligence)
 
 ```bash
-curl -X POST $API/api/v1/intelligence/chat \
+curl -X POST https://hevolve.ai/api/v1/intelligence/chat \
   -H "X-API-Key: abc123..." \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Explain quantum computing in one paragraph"}'
@@ -62,7 +62,7 @@ curl -X POST $API/api/v1/intelligence/chat \
 ### Document Analysis
 
 ```bash
-curl -X POST $API/api/v1/intelligence/analyze \
+curl -X POST https://hevolve.ai/api/v1/intelligence/analyze \
   -H "X-API-Key: abc123..." \
   -H "Content-Type: application/json" \
   -d '{"document": "Revenue grew 40% YoY...", "question": "What are the key trends?"}'
@@ -71,7 +71,7 @@ curl -X POST $API/api/v1/intelligence/analyze \
 ### Media Generation (Image/Audio/Video)
 
 ```bash
-curl -X POST $API/api/v1/intelligence/generate \
+curl -X POST https://hevolve.ai/api/v1/intelligence/generate \
   -H "X-API-Key: abc123..." \
   -H "Content-Type: application/json" \
   -d '{"modality": "image", "prompt": "A futuristic city at sunset"}'
@@ -80,14 +80,14 @@ curl -X POST $API/api/v1/intelligence/generate \
 ### HiveMind (Collective Knowledge)
 
 ```bash
-curl $API/api/v1/intelligence/hivemind?query=best+practices+for+RAG \
+curl https://hevolve.ai/api/v1/intelligence/hivemind?query=best+practices+for+RAG \
   -H "X-API-Key: abc123..."
 ```
 
 ### Check Usage
 
 ```bash
-curl $API/api/v1/intelligence/usage?days=7 \
+curl https://hevolve.ai/api/v1/intelligence/usage?days=7 \
   -H "X-API-Key: abc123..."
 ```
 
@@ -101,7 +101,7 @@ If your app already uses the OpenAI SDK, point it at HART OS with zero code chan
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="$API/v1",
+    base_url="https://hevolve.ai/v1",
     api_key="not-needed",  # uses Kong consumer auth
 )
 
@@ -277,7 +277,7 @@ Join the network and earn Spark by contributing compute:
 
 ```bash
 # Register as a provider
-curl -X PUT $API/api/settings/provider/join \
+curl -X PUT https://hevolve.ai/api/settings/provider/join \
   -H "Content-Type: application/json" \
   -d '{"node_name": "my-node", "node_tier": "flat"}'
 
@@ -305,14 +305,14 @@ sudo systemctl start hart-os
 
 ```bash
 # API usage stats
-curl $API/api/v1/intelligence/usage?days=30 \
+curl https://hevolve.ai/api/v1/intelligence/usage?days=30 \
   -H "X-API-Key: abc123..."
 
 # Gateway metering (if running Kong)
-curl $API/api/gateway/metering
+curl https://hevolve.ai/api/gateway/metering
 
 # List your API keys
-curl $API/api/v1/intelligence/keys \
+curl https://hevolve.ai/api/v1/intelligence/keys \
   -H "Authorization: Bearer eyJ..."
 ```
 
