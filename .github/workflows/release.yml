@@ -320,3 +320,12 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
+      - name: Restore custom domain
+        run: |
+          gh api repos/${{ github.repository }}/pages \
+            --method PUT \
+            --field cname="docs.hevolve.ai" \
+            --field https_enforced=true || true
+        env:
+          GH_TOKEN: ${{ github.token }}
