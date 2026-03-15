@@ -262,13 +262,53 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install mkdocs
-        run: pip install mkdocs-material
+      - name: Install dependencies
+        run: |
+          pip install mkdocs-material
+          pip install -r requirements.txt
+          pip install pytest pytest-cov
 
       - name: Build docs
         run: |
           mkdocs build --strict --site-dir _site
           echo "docs.hevolve.ai" > _site/CNAME
+
+      - name: Run tests + generate reports
+        continue-on-error: true
+        env:
+          HEVOLVE_DB_PATH: ':memory:'
+        run: |
+          mkdir -p _site/test-reports/junit _site/test-reports/coverage
+          python -m pytest \
+            tests/unit/ tests/functional/ \
+            --noconftest -v --tb=short \
+            --junitxml=_site/test-reports/junit/results.xml \
+            --cov=integrations --cov=security --cov=core \
+            --cov-report=html:_site/test-reports/coverage \
+            --cov-report=term-missing || true
+
+      - name: Generate test reports index
+        run: |
+          cat > _site/test-reports/index.html << 'INDEXEOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head><meta charset="utf-8"><title>HART OS Test Reports</title>
+          <style>
+            body{font-family:system-ui,sans-serif;max-width:800px;margin:60px auto;padding:0 20px;color:#333}
+            h1{color:#512da8;border-bottom:2px solid #512da8;padding-bottom:10px}
+            a{color:#512da8;text-decoration:none}a:hover{text-decoration:underline}
+            .card{border:1px solid #ddd;border-radius:8px;padding:20px;margin:16px 0}
+            .card:hover{box-shadow:0 2px 8px rgba(0,0,0,.1)}.card h2{margin-top:0}
+          </style></head>
+          <body>
+            <a href="../">Back to Docs</a>
+            <h1>HART OS Test Reports</h1>
+            <div class="card"><h2><a href="coverage/index.html">Code Coverage Report</a></h2>
+            <p>Interactive line-by-line coverage browser.</p></div>
+            <div class="card"><h2><a href="junit/results.xml">JUnit XML Results</a></h2>
+            <p>Machine-readable test results.</p></div>
+          </body></html>
+          INDEXEOF
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
