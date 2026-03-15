@@ -11,12 +11,12 @@ theme:
       primary: black
       toggle:
         icon: material/brightness-7
-        name: Dark mode
+        name: Light mode
     - scheme: default
       primary: black
       toggle:
         icon: material/brightness-4
-        name: Light mode
+        name: Dark mode
   features:
     - navigation.tabs
     - navigation.sections
