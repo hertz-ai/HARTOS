@@ -2,26 +2,38 @@
 
 End-to-end guide: from zero to shipping an AI-native app on HART OS.
 
+!!! tip "Cloud or Local?"
+    Use `https://hevolve.ai` for the hosted cloud API (no setup needed).
+    Use `$API` if you're running HART OS locally.
+    All examples below show both — replace the base URL to match your setup.
+
 ---
 
 ## 1. Get a Free API Key
 
 HART OS provides a **free multimodal API** — no credit card, no gatekeeping.
 
+Try it now at [hevolve.ai](https://hevolve.ai) or run locally.
+
 ```bash
-# Create an account on the social platform
-curl -X POST http://localhost:6777/api/social/register \
+# Cloud (hosted)
+API=https://hevolve.ai
+# Local (self-hosted)
+# API=$API
+
+# Create an account
+curl -X POST $API/api/social/register \
   -H "Content-Type: application/json" \
   -d '{"username": "alice", "email": "alice@example.com", "password": "secure123"}'
 
 # Login to get a JWT token
-curl -X POST http://localhost:6777/api/social/login \
+curl -X POST $API/api/social/login \
   -H "Content-Type: application/json" \
   -d '{"username": "alice", "password": "secure123"}'
 # → {"token": "eyJ..."}
 
 # Create a free API key
-curl -X POST http://localhost:6777/api/v1/intelligence/keys \
+curl -X POST $API/api/v1/intelligence/keys \
   -H "Authorization: Bearer eyJ..." \
   -H "Content-Type: application/json" \
   -d '{"name": "my-first-key", "tier": "free"}'
@@ -46,7 +58,7 @@ Save your `raw_key` — it's shown once and cannot be retrieved later.
 ### Chat (Text Intelligence)
 
 ```bash
-curl -X POST http://localhost:6777/api/v1/intelligence/chat \
+curl -X POST $API/api/v1/intelligence/chat \
   -H "X-API-Key: abc123..." \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Explain quantum computing in one paragraph"}'
@@ -55,7 +67,7 @@ curl -X POST http://localhost:6777/api/v1/intelligence/chat \
 ### Document Analysis
 
 ```bash
-curl -X POST http://localhost:6777/api/v1/intelligence/analyze \
+curl -X POST $API/api/v1/intelligence/analyze \
   -H "X-API-Key: abc123..." \
   -H "Content-Type: application/json" \
   -d '{"document": "Revenue grew 40% YoY...", "question": "What are the key trends?"}'
@@ -64,7 +76,7 @@ curl -X POST http://localhost:6777/api/v1/intelligence/analyze \
 ### Media Generation (Image/Audio/Video)
 
 ```bash
-curl -X POST http://localhost:6777/api/v1/intelligence/generate \
+curl -X POST $API/api/v1/intelligence/generate \
   -H "X-API-Key: abc123..." \
   -H "Content-Type: application/json" \
   -d '{"modality": "image", "prompt": "A futuristic city at sunset"}'
@@ -73,14 +85,14 @@ curl -X POST http://localhost:6777/api/v1/intelligence/generate \
 ### HiveMind (Collective Knowledge)
 
 ```bash
-curl http://localhost:6777/api/v1/intelligence/hivemind?query=best+practices+for+RAG \
+curl $API/api/v1/intelligence/hivemind?query=best+practices+for+RAG \
   -H "X-API-Key: abc123..."
 ```
 
 ### Check Usage
 
 ```bash
-curl http://localhost:6777/api/v1/intelligence/usage?days=7 \
+curl $API/api/v1/intelligence/usage?days=7 \
   -H "X-API-Key: abc123..."
 ```
 
@@ -94,7 +106,7 @@ If your app already uses the OpenAI SDK, point it at HART OS with zero code chan
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://localhost:6777/v1",
+    base_url="$API/v1",
     api_key="not-needed",  # uses Kong consumer auth
 )
 
@@ -270,7 +282,7 @@ Join the network and earn Spark by contributing compute:
 
 ```bash
 # Register as a provider
-curl -X PUT http://localhost:6777/api/settings/provider/join \
+curl -X PUT $API/api/settings/provider/join \
   -H "Content-Type: application/json" \
   -d '{"node_name": "my-node", "node_tier": "flat"}'
 
@@ -298,14 +310,14 @@ sudo systemctl start hart-os
 
 ```bash
 # API usage stats
-curl http://localhost:6777/api/v1/intelligence/usage?days=30 \
+curl $API/api/v1/intelligence/usage?days=30 \
   -H "X-API-Key: abc123..."
 
 # Gateway metering (if running Kong)
-curl http://localhost:6777/api/gateway/metering
+curl $API/api/gateway/metering
 
 # List your API keys
-curl http://localhost:6777/api/v1/intelligence/keys \
+curl $API/api/v1/intelligence/keys \
   -H "Authorization: Bearer eyJ..."
 ```
 
