@@ -7,13 +7,13 @@ repo_name: hertz-ai/HARTOS
 theme:
   name: material
   palette:
-    - scheme: default
-      primary: deep purple
+    - scheme: slate
+      primary: black
       toggle:
         icon: material/brightness-7
         name: Dark mode
-    - scheme: slate
-      primary: deep purple
+    - scheme: default
+      primary: black
       toggle:
         icon: material/brightness-4
         name: Light mode
