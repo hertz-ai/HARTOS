@@ -301,7 +301,7 @@
       };
       "org/gnome/shell/extensions/dash-to-dock" = {
         dock-position = "BOTTOM";
-        dash-max-icon-size = 48;
+        dash-max-icon-size = lib.gvariant.mkInt32 48;
         extend-height = false;
         transparency-mode = "DYNAMIC";
         running-indicator-style = "DOTS";

@@ -98,6 +98,9 @@ in
 
     # ── Allow unfree packages (NVIDIA drivers, CUDA) ──
     nixpkgs.config.allowUnfree = true;
+    nixpkgs.config.permittedInsecurePackages = [
+      "electron-33.4.11"
+    ];
 
     # ── Branding ──
     environment.etc = {

@@ -1,4 +1,4 @@
-{ config, lib, pkgs, ... }:
+{ config, lib, pkgs, hartSrc ? /etc/hart, ... }:
 
 # HART OS Onboarding Module — "Light Your HART"
 #
@@ -32,7 +32,7 @@ let
   onboardingBin = pkgs.writeShellScript "hart-onboarding" ''
     # Exit silently if already onboarded
     if ${pythonForOnboarding}/bin/python3 \
-        ${cfg.installDir}/integrations/agent_engine/native_onboarding.py \
+        ${hartSrc}/integrations/agent_engine/native_onboarding.py \
         --user-id "$(id -u)" --check 2>/dev/null; then
       exit 0
     fi
@@ -42,12 +42,12 @@ let
     export ADW_DISABLE_PORTAL=1
 
     # Ensure HART Python path
-    export PYTHONPATH="${cfg.installDir}:''${PYTHONPATH:-}"
-    export HART_INSTALL_DIR="${cfg.installDir}"
+    export PYTHONPATH="${hartSrc}:''${PYTHONPATH:-}"
+    export HART_INSTALL_DIR="${hartSrc}"
 
     # Launch the ceremony
     exec ${pythonForOnboarding}/bin/python3 \
-      ${cfg.installDir}/integrations/agent_engine/native_onboarding.py \
+      ${hartSrc}/integrations/agent_engine/native_onboarding.py \
       --user-id "$(id -u)"
   '';
 

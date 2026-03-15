@@ -9,11 +9,7 @@ let
   conkyCfg = config.hart.conky;
 
   # Conky with Lua + Cairo support for styled dashboard
-  conkyPkg = pkgs.conky.override {
-    lua5_4 = pkgs.lua5_4;
-    luaSupport = true;
-    curlSupport = true;
-  };
+  conkyPkg = pkgs.conky;
 
   # Deploy our custom Conky config, Lua helper, and theme presets
   conkyConfigDir = pkgs.runCommand "hart-conky-config" {} ''

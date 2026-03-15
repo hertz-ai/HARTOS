@@ -325,8 +325,7 @@ in
         # Bottles: GUI for managing Wine prefixes (like virtual Windows installs)
         bottles
 
-        # .NET runtime for Windows .NET apps
-        wine-mono
+        # .NET runtime for Windows .NET apps (bundled in Wine staging)
       ]
       ++ lib.optionals sub.windows.gaming [
         # ── Gaming stack ──

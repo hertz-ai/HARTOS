@@ -114,7 +114,7 @@ in
 
         # Memory: optimize for multi-runtime memory pressure
         "vm.overcommit_memory" = lib.mkForce 1;
-        "vm.max_map_count" = lib.mkForce 1048576;
+        "vm.max_map_count" = lib.mkForce 2097152;  # Wine/Android need >= 1M
         "vm.vfs_cache_pressure" = lib.mkForce 50;
 
         # Network: agent-to-agent + P2P gossip
@@ -214,10 +214,7 @@ in
         "exfat"          # exFAT for large files
       ];
 
-      # Higher vm.max_map_count for Wine (Windows apps use many memory mappings)
-      boot.kernel.sysctl = {
-        "vm.max_map_count" = lib.mkForce 2097152;    # Wine recommends >= 1M, we set 2M
-      };
+      # vm.max_map_count for Wine set in main sysctl block above (2097152)
     })
 
     # ─────────────────────────────────────────────────────────
