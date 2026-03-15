@@ -1476,7 +1476,7 @@ def get_frame(user_id, frame_store=None):
 
     # Primary: FrameStore via VisionService (in-process, zero latency)
     try:
-        from langchain_gpt_api import get_vision_service
+        from hart_intelligence import get_vision_service
         svc = get_vision_service()
         if svc:
             frame_bytes = svc.store.get_frame(str(user_id))

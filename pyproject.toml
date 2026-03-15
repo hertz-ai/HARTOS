@@ -185,6 +185,7 @@ Issues = "https://github.com/hertz-ai/HARTOS/issues"
 [tool.setuptools]
 py-modules = [
     "hart_version",
+    "hart_intelligence",
     "langchain_gpt_api",
     "helper",
     "helper_ledger",

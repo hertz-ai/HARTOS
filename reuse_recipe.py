@@ -142,8 +142,8 @@ def parse_date(date_str):
 
 
 def publish_async(topic, message, timeout=2.0):
-    """Delegate to the canonical publish_async in langchain_gpt_api."""
-    from langchain_gpt_api import publish_async as _publish
+    """Delegate to the canonical publish_async in hart_intelligence."""
+    from hart_intelligence import publish_async as _publish
     _publish(topic, message, timeout)
 
 scheduler = BackgroundScheduler()

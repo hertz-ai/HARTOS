@@ -8,7 +8,7 @@ the tool output, so the LangChain/autogen agent sees intermediate progress
 Falls back to requests+BeautifulSoup if crawl4ai not installed.
 
 Consumers:
-- LangChain Data_Extraction_From_URL tool (langchain_gpt_api.py)
+- LangChain Data_Extraction_From_URL tool (hart_intelligence (langchain_gpt_api.py))
 - Google search enrichment top5_results (helper.py)
 - autogen service tools (reuse_recipe.py)
 """

@@ -33,8 +33,8 @@ from autogen.agentchat.contrib.capabilities import transform_messages, transform
 from autogen.cache.in_memory_cache import InMemoryCache
 from json_repair import repair_json
 def publish_async(topic, message, timeout=2.0):
-    """Delegate to the canonical publish_async in langchain_gpt_api."""
-    from langchain_gpt_api import publish_async as _publish
+    """Delegate to the canonical publish_async in hart_intelligence."""
+    from hart_intelligence import publish_async as _publish
     _publish(topic, message, timeout)
 
 # Add Smart Ledger for persistent task tracking - using agent_ledger package (from gpt4.1)

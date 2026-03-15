@@ -300,7 +300,7 @@ class SpeculativeDispatcher:
         """Dual-channel async delivery: Crossbar + Rasa HTTP."""
         # Publish via canonical publish_async (MessageBus → Crossbar)
         try:
-            from langchain_gpt_api import publish_async
+            from hart_intelligence import publish_async
             topic = f'com.hertzai.hevolve.chat.{user_id}'
             publish_async(topic, response)
         except Exception:

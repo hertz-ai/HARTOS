@@ -1,7 +1,7 @@
 """
 Platform Bootstrap — One-time initialization that wires all platform services.
 
-Called once at server start (from langchain_gpt_api.py or tests).
+Called once at server start (from hart_intelligence (langchain_gpt_api.py) or tests).
 Registers core services, migrates existing shell_manifest.py panels,
 detects native apps, loads extensions, and starts lifecycle services.
 

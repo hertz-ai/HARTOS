@@ -1,7 +1,7 @@
 """
 Platform Boot Service — Independent platform substrate initialization.
 
-Runs independently of both LiquidUI (desktop) and langchain_gpt_api (agent
+Runs independently of both LiquidUI (desktop) and hart_intelligence (agent
 backend). Both servers call `ensure_platform()` at startup; the first call
 bootstraps, subsequent calls are no-ops.
 
@@ -32,7 +32,7 @@ _booted = False
 def ensure_platform(extensions_dir=None):
     """Ensure the platform substrate is bootstrapped. Idempotent.
 
-    Called by both LiquidUI and langchain_gpt_api at startup.
+    Called by both LiquidUI and hart_intelligence at startup.
     First call bootstraps; subsequent calls return immediately.
 
     Returns:

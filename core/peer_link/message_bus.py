@@ -88,7 +88,7 @@ def resolve_legacy_topic(legacy_topic: str):
     """Map a legacy Crossbar topic to a MessageBus topic + extract suffix.
 
     This is the SINGLE source of truth for legacy→bus topic resolution.
-    Consumers: langchain_gpt_api.publish_async(), receive_from_crossbar().
+    Consumers: hart_intelligence.publish_async(), receive_from_crossbar().
 
     Returns:
         (bus_topic, suffix) where suffix is typically user_id.
@@ -147,8 +147,8 @@ class MessageBus:
     def set_http_transport(self, transport_fn: Callable) -> None:
         """Inject HTTP Crossbar transport (avoids layering violation).
 
-        Called by langchain_gpt_api at startup to provide the HTTP publish
-        fallback without MessageBus importing from langchain_gpt_api.
+        Called by hart_intelligence at startup to provide the HTTP publish
+        fallback without MessageBus importing from hart_intelligence.
 
         Args:
             transport_fn: callable(topic: str, payload: str) -> None
@@ -356,7 +356,7 @@ class MessageBus:
         except (ImportError, RuntimeError):
             pass
 
-        # HTTP bridge fallback (injected by langchain_gpt_api at startup)
+        # HTTP bridge fallback (injected by hart_intelligence at startup)
         if self._http_transport:
             try:
                 self._http_transport(legacy_topic, payload)

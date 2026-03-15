@@ -31,7 +31,7 @@ def find_matching_agent(prompt: str, prompts_dir: str = None) -> Optional[Dict]:
         return None
 
     try:
-        from langchain_gpt_api import get_llm
+        from hart_intelligence import get_llm
         llm = get_llm(temperature=0.1, max_tokens=300)
 
         catalog_text = "\n".join(
@@ -109,7 +109,7 @@ def _build_agent_catalog(prompts_dir: str = None) -> List[Dict]:
 def generate_plan_steps(prompt: str, matched_agent: Optional[Dict] = None) -> List[Dict]:
     """Generate plan steps using the LLM. Falls back to generic steps on failure."""
     try:
-        from langchain_gpt_api import get_llm
+        from hart_intelligence import get_llm
         llm = get_llm(temperature=0.3, max_tokens=800)
 
         agent_context = ""

@@ -421,7 +421,7 @@ def _publish_chunk_result(publish_id: str, chunk_data: dict):
     if not publish_id:
         return
     try:
-        from langchain_gpt_api import publish_async
+        from hart_intelligence import publish_async
         topic = f'com.hertzai.pupit.{publish_id}'
         publish_async(topic, json.dumps(chunk_data))
     except Exception as e:

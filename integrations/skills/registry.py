@@ -181,7 +181,7 @@ class SkillRegistry:
     Mirrors ServiceToolRegistry pattern:
     - register_skill / unregister_skill
     - discover_local / discover_github
-    - get_langchain_tools → plugs into langchain_gpt_api get_tools()
+    - get_langchain_tools → plugs into hart_intelligence get_tools()
     - Global singleton: skill_registry
     """
 
@@ -349,7 +349,7 @@ class SkillRegistry:
         """
         Get all skills as LangChain Tool objects.
 
-        Plugs into langchain_gpt_api.py get_tools() alongside service_tool_registry.
+        Plugs into hart_intelligence get_tools() alongside service_tool_registry.
         Each skill becomes a tool that returns the skill's instructions with the
         user's query injected, letting the LLM execute the skill as a thought experiment.
         """

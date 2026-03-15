@@ -117,7 +117,7 @@ class FlaskChannelIntegration:
 
                 # Notify user's desktop UI about the channel interaction (Gap 6)
                 try:
-                    from langchain_gpt_api import publish_async
+                    from hart_intelligence import publish_async
                     notification = {
                         "text": [f"[{message.channel}] {message.sender_name}: {message.content[:100]}"],
                         "priority": 48,

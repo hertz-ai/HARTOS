@@ -228,7 +228,7 @@ class ServiceToolRegistry:
         """
         Get healthy tools as LangChain Tool() objects for get_tools().
 
-        Plugs into langchain_gpt_api.py get_tools() (line 652).
+        Plugs into hart_intelligence get_tools().
         LangChain Tool func receives a single string — we route it to
         the first parameter defined in the endpoint's params_schema.
         """

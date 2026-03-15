@@ -257,7 +257,7 @@ class WorldModelBridge:
         """Try to connect to in-process learning pipeline (zero HTTP overhead).
 
         When HevolveAI is pip-installed and _init_learning_pipeline() has run
-        in langchain_gpt_api.py, we get direct references to the provider
+        in hart_intelligence (langchain_gpt_api.py), we get direct references to the provider
         and hivemind instances. All subsequent calls bypass HTTP entirely.
 
         SECURITY: Integrity verification required before enabling in-process.
@@ -282,7 +282,7 @@ class WorldModelBridge:
             logger.debug(f"[WorldModelBridge] Integrity check skipped: {e}")
 
         try:
-            from langchain_gpt_api import get_learning_provider, get_hive_mind
+            from hart_intelligence import get_learning_provider, get_hive_mind
             provider = get_learning_provider()
             hive = get_hive_mind()
             if provider is not None:

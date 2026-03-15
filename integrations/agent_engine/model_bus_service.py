@@ -47,7 +47,7 @@ def _publish_routing_status(user_id: str, message: str, request_id: str = ''):
     try:
         import json as _json
         # Lazy import — only needed when actually publishing
-        from langchain_gpt_api import publish_async
+        from hart_intelligence import publish_async
         payload = _json.dumps({
             'text': [message],
             'priority': 49,

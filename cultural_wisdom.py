@@ -9,7 +9,7 @@ This module is imported by:
   - gather_agentdetails.py  (agent creation - autogen)
   - reuse_recipe.py         (agent execution - autogen)
   - create_recipe.py        (recipe authoring - autogen)
-  - langchain_gpt_api.py    (LangChain fallback)
+  - hart_intelligence (formerly langchain_gpt_api)  (LangChain fallback)
   - hive_guardrails.py      (immutable value layer)
 
 Architecture note:

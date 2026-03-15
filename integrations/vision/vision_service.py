@@ -748,7 +748,7 @@ class VisionService:
     def _save_to_memory_graph(self, user_id: str, description: str, channel: str):
         """Auto-save visual description to MemoryGraph for long-term recall."""
         try:
-            from langchain_gpt_api import _get_or_create_graph
+            from hart_intelligence import _get_or_create_graph
             graph = _get_or_create_graph(user_id)
             if graph:
                 graph.add(

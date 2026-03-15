@@ -814,7 +814,7 @@ Example format: ["kaze", "hikari", "sora", "ren", "tsuki"]"""
     candidates = []
 
     try:
-        from langchain_gpt_api import get_llm
+        from hart_intelligence import get_llm
         llm = get_llm(temperature=0.9, max_tokens=200)
         result = llm.invoke(generation_prompt)
         text = result.content if hasattr(result, 'content') else str(result)
@@ -885,7 +885,7 @@ def _validate_names_cross_language(candidates: List[str], user_language: str) ->
         return candidates
 
     try:
-        from langchain_gpt_api import get_llm
+        from hart_intelligence import get_llm
         llm = get_llm(temperature=0.0, max_tokens=300)
 
         names_str = ', '.join(candidates)
