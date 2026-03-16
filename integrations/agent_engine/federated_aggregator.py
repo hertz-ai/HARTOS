@@ -30,11 +30,20 @@ DELTA_MAX_AGE_SECONDS = 3600  # 1 hour freshness window
 
 
 def _sign_delta(delta_dict):
-    """Sign a federation delta with node key (HMAC-SHA256)."""
+    """Sign a federation delta with node key (HMAC-SHA256).
+
+    Fallback: if HART_NODE_KEY is not set, derives an HMAC key from the
+    node's Ed25519 public key so deltas are NEVER unsigned.
+    """
     node_key = os.environ.get('HART_NODE_KEY')
     if not node_key:
-        logger.warning('HART_NODE_KEY not set — delta will be unsigned')
-        return delta_dict
+        # Derive HMAC key from node's Ed25519 public key — never send unsigned
+        try:
+            from security.node_integrity import get_public_key_hex
+            node_key = get_public_key_hex()
+        except ImportError:
+            logger.error('HART_NODE_KEY not set and Ed25519 key unavailable — delta UNSIGNED')
+            return delta_dict
     # Work on a copy without any existing hmac_signature
     to_sign = {k: v for k, v in delta_dict.items() if k != 'hmac_signature'}
     payload = json.dumps(to_sign, sort_keys=True).encode()
@@ -44,18 +53,32 @@ def _sign_delta(delta_dict):
 
 
 def _verify_delta_signature(delta_dict):
-    """Verify a received federation delta's HMAC-SHA256 signature."""
+    """Verify a received federation delta's HMAC-SHA256 signature.
+
+    The sender may have used HART_NODE_KEY or fallen back to their Ed25519
+    public key as the HMAC key. We try both.
+    """
     sig = delta_dict.get('hmac_signature', '')
     if not sig:
         return False
     to_verify = {k: v for k, v in delta_dict.items() if k != 'hmac_signature'}
-    node_key = os.environ.get('HART_NODE_KEY')
-    if not node_key:
-        logger.warning('HART_NODE_KEY not set — cannot verify delta signature')
-        return False
     payload = json.dumps(to_verify, sort_keys=True).encode()
-    expected = hmac.new(node_key.encode(), payload, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(sig, expected)
+
+    # Try HART_NODE_KEY first (shared secret between peers)
+    node_key = os.environ.get('HART_NODE_KEY')
+    if node_key:
+        expected = hmac.new(node_key.encode(), payload, hashlib.sha256).hexdigest()
+        if hmac.compare_digest(sig, expected):
+            return True
+
+    # Fallback: sender used their Ed25519 public key as HMAC key
+    sender_pubkey = delta_dict.get('public_key', '')
+    if sender_pubkey:
+        expected = hmac.new(sender_pubkey.encode(), payload, hashlib.sha256).hexdigest()
+        if hmac.compare_digest(sig, expected):
+            return True
+
+    return False
 
 
 class FederatedAggregator:
@@ -341,7 +364,9 @@ class FederatedAggregator:
         except ImportError:
             pass
 
-        # Ed25519 signature verification
+        # Ed25519 signature verification — required in hard mode
+        from security.master_key import get_enforcement_mode
+        _enforcement = get_enforcement_mode()
         sig = delta.get('signature', '')
         if sig:
             try:
@@ -350,16 +375,22 @@ class FederatedAggregator:
                                              delta, sig):
                     return False, 'invalid signature'
             except ImportError:
-                logger.warning('Ed25519 verification module unavailable — skipping signature check')
+                logger.warning('Ed25519 verification module unavailable')
+                if _enforcement == 'hard':
+                    return False, 'Ed25519 module unavailable — cannot verify'
             except Exception as e:
                 logger.warning(f'Ed25519 signature verification error: {e}')
-                if os.environ.get('HEVOLVE_ENFORCEMENT_MODE') == 'hard':
+                if _enforcement == 'hard':
                     return False, f'signature verification failed: {e}'
+        elif _enforcement == 'hard':
+            return False, 'missing Ed25519 signature (hard enforcement)'
 
-        # HMAC-SHA256 delta signing verification
+        # HMAC-SHA256 delta signing verification — required in hard mode
         if delta.get('hmac_signature'):
             if not _verify_delta_signature(delta):
                 return False, 'invalid HMAC signature'
+        elif _enforcement == 'hard':
+            return False, 'missing HMAC signature (hard enforcement)'
 
         # Origin attestation — reject forks and rebranded builds
         peer_attestation = delta.get('origin_attestation')

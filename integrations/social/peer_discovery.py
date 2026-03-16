@@ -129,12 +129,24 @@ class GossipProtocol:
         self.central_url = os.environ.get('HEVOLVE_CENTRAL_URL', '').rstrip('/')
         self.regional_url = os.environ.get('HEVOLVE_REGIONAL_URL', '').rstrip('/')
 
-        # Parse seed peers
+        # Parse seed peers — env override + hardcoded genesis peers.
+        # Genesis peers prevent bootstrap poisoning: even if env var is
+        # compromised, the node always knows at least the real network.
+        _GENESIS_PEERS = [
+            'https://central.hevolve.ai',
+        ]
         seed_str = os.environ.get('HEVOLVE_SEED_PEERS', '')
-        self.seed_peers = [
+        env_peers = [
             u.strip().rstrip('/') for u in seed_str.split(',')
             if u.strip()
         ]
+        # Merge: env peers first (user-specified), then genesis (always present)
+        seen = set()
+        self.seed_peers = []
+        for url in env_peers + _GENESIS_PEERS:
+            if url not in seen:
+                seen.add(url)
+                self.seed_peers.append(url)
 
         # HART node identity (loaded on start)
         self._hart_tag = ''

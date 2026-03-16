@@ -526,10 +526,48 @@ def onboard_kong(
 
 # ─── Entry point ───
 
+def start_sse_server(host: str = '127.0.0.1', port: int = None):
+    """Start MCP server with SSE transport for HTTP clients (Nunba, external).
+
+    This runs the FastMCP server on a dedicated port using Server-Sent Events.
+    Clients connect via standard MCP SSE protocol.
+    """
+    if port is None:
+        port = get_port('mcp')
+    logger.info(f"Starting MCP SSE server on {host}:{port}")
+    mcp.run(transport="sse", host=host, port=port)
+
+
+def start_sse_server_background(host: str = '127.0.0.1', port: int = None):
+    """Start MCP SSE server in a background thread."""
+    import threading
+    t = threading.Thread(
+        target=start_sse_server,
+        args=(host, port),
+        daemon=True,
+        name='mcp-sse-server',
+    )
+    t.start()
+    logger.info("MCP SSE server started in background thread")
+    return t
+
+
 if __name__ == "__main__":
     # Ensure HARTOS root is on sys.path
     hartos_root = str(Path(__file__).resolve().parent.parent.parent)
     if hartos_root not in sys.path:
         sys.path.insert(0, hartos_root)
 
-    mcp.run(transport="stdio")
+    # Support --sse flag for HTTP mode, default to stdio for Claude Code
+    transport = "stdio"
+    if "--sse" in sys.argv:
+        transport = "sse"
+    elif "--http" in sys.argv:
+        transport = "streamable-http"
+
+    if transport == "stdio":
+        mcp.run(transport="stdio")
+    else:
+        port = get_port('mcp')
+        logger.info(f"Starting MCP server with {transport} transport on port {port}")
+        mcp.run(transport=transport, host="127.0.0.1", port=port)

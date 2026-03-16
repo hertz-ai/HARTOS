@@ -20,6 +20,10 @@ import pytest
 # Ensure project root is on sys.path for --noconftest compatibility
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+# Tests use unsigned deltas to exercise logic — set warn mode so hard
+# enforcement doesn't reject them. Production defaults to hard.
+os.environ.setdefault('HEVOLVE_ENFORCEMENT_MODE', 'warn')
+
 from integrations.agent_engine.federated_aggregator import (
     DELTA_MAX_AGE_SECONDS,
     DELTA_VERSION,
@@ -309,18 +313,19 @@ class TestHmacRoundTrip:
             else:
                 os.environ.pop('HART_NODE_KEY', None)
 
-    def test_hmac_no_key_returns_unsigned(self):
+    def test_hmac_fallback_to_ed25519_key(self):
+        """When HART_NODE_KEY is not set, _sign_delta falls back to Ed25519 pubkey."""
         old_key = os.environ.get('HART_NODE_KEY', '')
         try:
             os.environ.pop('HART_NODE_KEY', None)
 
-            delta = _make_delta('unsigned_node')
+            delta = _make_delta('fallback_node')
             delta.pop('hmac_signature', None)
 
             _sign_delta(delta)
-            # Without HART_NODE_KEY, delta should not have hmac_signature
-            assert 'hmac_signature' not in delta, \
-                "Without HART_NODE_KEY, delta should remain unsigned"
+            # Should now be signed via Ed25519 pubkey fallback (never unsigned)
+            assert 'hmac_signature' in delta, \
+                "Without HART_NODE_KEY, delta should fall back to Ed25519 pubkey HMAC"
 
         finally:
             if old_key:

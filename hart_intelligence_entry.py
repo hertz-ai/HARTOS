@@ -583,6 +583,17 @@ except ImportError:
 except Exception as e:
     app.logger.warning(f"Consent service init skipped: {e}")
 
+# MCP HTTP Bridge — exposes local MCP tools via REST for Nunba/external clients
+try:
+    from integrations.mcp.mcp_http_bridge import mcp_local_bp, auto_register_local_mcp
+    app.register_blueprint(mcp_local_bp)
+    auto_register_local_mcp()
+    app.logger.info("MCP HTTP bridge registered at /api/mcp/local")
+except ImportError:
+    app.logger.info("MCP HTTP bridge not available, skipping")
+except Exception as e:
+    app.logger.warning(f"MCP HTTP bridge init skipped: {e}")
+
 # Instruction Queue API — never miss a user instruction
 try:
     from integrations.agent_engine.instruction_queue import (

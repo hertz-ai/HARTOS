@@ -147,11 +147,16 @@ def is_dev_mode() -> bool:
 
 
 def get_enforcement_mode() -> str:
-    """Return enforcement mode: off | warn | soft | hard. Default: warn."""
-    mode = os.environ.get('HEVOLVE_ENFORCEMENT_MODE', 'warn').lower()
+    """Return enforcement mode: off | warn | soft | hard. Default: hard.
+
+    Hard mode rejects unsigned handshakes, unsigned deltas, and
+    unverified origin attestations. This is the correct default for
+    Sybil resistance — soft/warn modes should only be used for local dev.
+    """
+    mode = os.environ.get('HEVOLVE_ENFORCEMENT_MODE', 'hard').lower()
     if mode in ('off', 'warn', 'soft', 'hard'):
         return mode
-    return 'warn'
+    return 'hard'
 
 
 def get_master_private_key() -> Ed25519PrivateKey:

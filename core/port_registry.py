@@ -39,6 +39,7 @@ APP_PORTS = {
     'mesh_wg':      6795,
     'mesh_relay':   6796,
     'model_bus':    6790,
+    'mcp':          6791,
 }
 
 # OS mode: privileged ports (HART OS is the operating system)
@@ -53,6 +54,7 @@ OS_PORTS = {
     'mesh_wg':      679,
     'mesh_relay':   680,
     'model_bus':    681,
+    'mcp':          682,
 }
 
 # Environment variable overrides (takes precedence over both modes)
@@ -67,6 +69,7 @@ ENV_OVERRIDES = {
     'mesh_wg':      'HART_MESH_WG_PORT',
     'mesh_relay':   'HART_MESH_RELAY_PORT',
     'model_bus':    'HART_MODEL_BUS_PORT',
+    'mcp':          'HART_MCP_PORT',
 }
 
 

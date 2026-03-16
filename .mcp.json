@@ -3,7 +3,17 @@
     "hartos": {
       "command": "python",
       "args": ["-m", "integrations.mcp.mcp_server"],
-      "type": "stdio"
+      "env": {
+        "PYTHONPATH": "."
+      }
+    },
+    "trueflow": {
+      "command": "python",
+      "args": [".pycharm_plugin/runtime_injector/trueflow_mcp_server.py"],
+      "env": {
+        "TRUEFLOW_PROJECT_DIR": ".",
+        "TRUEFLOW_TRACE_PORT": "5678"
+      }
     }
   }
 }

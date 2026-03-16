@@ -99,6 +99,17 @@ jobs:
           pip install build setuptools-scm
           python -m build
 
+      - name: Strip HevolveAI source from wheel
+        run: |
+          # Install HevolveAI (transitive dep) so compile script can find it
+          pip install -e . --no-deps 2>/dev/null || true
+          # Compile HevolveAI .py → .pyc and strip source
+          python scripts/compile_hevolveai.py --strip-source \
+            --output-dir /tmp/hevolveai_compiled \
+            --manifest-out dist/hevolveai_manifest.json || echo "HevolveAI not installed — skipping"
+          # Repack the wheel with compiled-only HevolveAI stubs
+          python scripts/build_compiled_wheel.py || echo "Compiled wheel build skipped"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
