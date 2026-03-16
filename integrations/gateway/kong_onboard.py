@@ -227,6 +227,136 @@ def enable_plugins(
     return results
 
 
+# ---------------------------------------------------------------------------
+# Guest widget service — rate-limited, CORS-locked, no key-auth
+# ---------------------------------------------------------------------------
+
+GUEST_SERVICE_NAME = "hevolve-guest-widget"
+GUEST_ROUTE_NAME = "guest-register-route"
+
+GUEST_ROUTE_PATHS = [
+    "/api/social/auth/guest-register",
+]
+
+GUEST_PLUGINS: list[Dict[str, Any]] = [
+    {
+        "name": "rate-limiting",
+        "config": {
+            "minute": 5,        # 5 guest tokens per minute per IP
+            "hour": 30,         # 30 per hour — enough for real users, stops farming
+            "policy": "local",  # No Redis dependency for this
+            "fault_tolerant": False,  # Fail closed — deny if counter broken
+            "hide_client_headers": False,
+        },
+    },
+    {
+        "name": "cors",
+        "config": {
+            "origins": [
+                "https://docs.hevolve.ai",
+                "https://hevolve.ai",
+                "http://localhost:8000",  # local dev
+            ],
+            "methods": ["POST", "OPTIONS"],
+            "headers": ["Content-Type"],
+            "credentials": False,
+            "max_age": 3600,
+        },
+    },
+    {
+        "name": "request-size-limiting",
+        "config": {
+            "allowed_payload_size": 1,  # 1 MB — guest register is tiny
+        },
+    },
+    {
+        "name": "ip-restriction",
+        "config": {
+            "deny": [],   # Populated by abuse detection
+            "allow": [],  # Empty = allow all (deny-list mode)
+        },
+    },
+]
+
+
+def onboard_guest_widget(
+    session: requests.Session,
+    kong_url: str,
+    upstream_url: str,
+) -> bool:
+    """Register the guest-register endpoint in Kong with tight rate limits.
+
+    No key-auth — the widget is public. Protection is via rate limiting,
+    CORS origin lock, and short-lived tokens (server-side).
+    """
+    _log("")
+    _log("=== Guest Widget Service ===")
+
+    # Service
+    _log("Step 1/3 — Guest service")
+    svc_payload = {
+        "name": GUEST_SERVICE_NAME,
+        "url": upstream_url,
+        "retries": 1,
+        "connect_timeout": 5000,
+        "write_timeout": 10000,
+        "read_timeout": 10000,
+    }
+    _put_or_post(
+        session,
+        f"{kong_url}/services/{GUEST_SERVICE_NAME}",
+        svc_payload,
+        f"service '{GUEST_SERVICE_NAME}'",
+    )
+
+    # Route
+    _log("Step 2/3 — Guest route")
+    route_payload = {
+        "name": GUEST_ROUTE_NAME,
+        "paths": GUEST_ROUTE_PATHS,
+        "methods": ["POST", "OPTIONS"],
+        "protocols": ["https", "http"],
+        "strip_path": False,
+    }
+    _put_or_post(
+        session,
+        f"{kong_url}/services/{GUEST_SERVICE_NAME}/routes/{GUEST_ROUTE_NAME}",
+        route_payload,
+        f"route '{GUEST_ROUTE_NAME}'",
+    )
+
+    # Plugins
+    _log("Step 3/3 — Guest plugins")
+    for plugin_cfg in GUEST_PLUGINS:
+        enable_plugin(session, kong_url, plugin_cfg)
+        # Re-scope to guest service
+        plugin_name = plugin_cfg["name"]
+        payload = {
+            "name": plugin_name,
+            "config": plugin_cfg["config"],
+            "enabled": True,
+        }
+        # Apply to guest service specifically
+        guest_url = f"{kong_url}/services/{GUEST_SERVICE_NAME}/plugins"
+        try:
+            existing = session.get(guest_url)
+            if existing.status_code == 200:
+                data = existing.json().get("data", [])
+                for p in data:
+                    if p.get("name") == plugin_name:
+                        session.patch(f"{kong_url}/plugins/{p['id']}", json=payload)
+                        break
+                else:
+                    session.post(guest_url, json=payload)
+            else:
+                session.post(guest_url, json=payload)
+        except Exception:
+            session.post(guest_url, json=payload)
+
+    _log("Guest widget onboarding complete.")
+    return True
+
+
 def verify(session: requests.Session, kong_url: str) -> bool:
     """Quick verification: fetch the service back from Kong."""
     _log("Step 4/4 — Verify")
@@ -288,6 +418,7 @@ def onboard(
         create_service(session, kong_url, upstream_url)
         create_route(session, kong_url)
         enable_plugins(session, kong_url)
+        onboard_guest_widget(session, kong_url, upstream_url)
         ok = verify(session, kong_url)
     except requests.ConnectionError:
         _log("ERROR: Cannot reach Kong Admin API — is Kong running?")

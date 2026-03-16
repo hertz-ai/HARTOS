@@ -175,7 +175,7 @@ def _apply_api_auth(app: Flask):
     """
 
     PROTECTED_PATHS = ('/chat', '/time_agent', '/visual_agent', '/add_history', '/prompts', '/zeroshot', '/response_ack')
-    EXEMPT_PREFIXES = ('/status', '/a2a/', '/api/social/', '/.well-known/')
+    EXEMPT_PREFIXES = ('/status', '/a2a/', '/api/social/', '/.well-known/', '/prompts/public')
 
     @app.before_request
     def check_api_auth():

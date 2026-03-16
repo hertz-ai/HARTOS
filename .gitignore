@@ -86,6 +86,7 @@ venv310/
 *.db-journal
 .trueflow/
 .agent_ledger/
+deploy/kong/*.json
 .pytest_cache/
 .secrets.baseline
 .cache/
