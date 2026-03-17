@@ -118,7 +118,8 @@ class CodingAgentDaemon:
                 prompt = GoalManager.build_prompt(goal.to_dict())
                 if prompt is None:
                     continue
-                dispatch_to_chat(prompt, str(agent['user_id']), goal.id)
+                dispatch_to_chat(prompt, str(agent['user_id']), goal.id,
+                                 goal_type=goal.goal_type or 'coding')
                 agent_idx += 1
                 dispatched += 1
                 self._wd_heartbeat()

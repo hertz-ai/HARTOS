@@ -3025,8 +3025,21 @@ def get_action_user_details(user_id):
     if response.status_code == 200:
         user_data = response.json()
 
+        # Privacy-first: use .get() with graceful defaults for local/guest users
+        # who have no cloud profile. Missing fields are noted so the agent can
+        # ask the user naturally and store in local DB when volunteered.
+        _uname = user_data.get("name") or user_data.get("display_name") or user_data.get("username") or "User"
+        _gender = user_data.get("gender", "not specified")
+        _lang = user_data.get("preferred_language", "not specified")
+        _dob = user_data.get("dob", "not specified")
+        _eng = user_data.get("english_proficiency", "not specified")
+        _created = user_data.get("created_date", "unknown")
+        _standard = user_data.get("standard", "not specified")
+        _pays = user_data.get("who_pays_for_course", "not specified")
+
         user_details = f'''Below are the information about the user.
-        user_name: {user_data["name"]} (Call the user by this name only when required and not always),gender: {user_data["gender"]}, who_pays_for_course: {user_data["who_pays_for_course"]}(Entity Responsible for Paying the Course Fees), preferred_language: {user_data["preferred_language"]}(User's Preferred Language), date_of_birth: {user_data["dob"]}, english_proficiency: {user_data["english_proficiency"]}(User's English Proficiency Level), created_date: {user_data["created_date"]}(user creation date), standard: {user_data["standard"]}(User's Standard in which user studying)
+        user_name: {_uname} (Call the user by this name only when required and not always), gender: {_gender}, who_pays_for_course: {_pays}(Entity Responsible for Paying the Course Fees), preferred_language: {_lang}(User's Preferred Language), date_of_birth: {_dob}, english_proficiency: {_eng}(User's English Proficiency Level), created_date: {_created}(user creation date), standard: {_standard}(User's Standard in which user studying)
+        If any of the above fields show "not specified", do not ask the user for this information proactively. Only note it when naturally relevant. The user's privacy is paramount — store preferences locally when volunteered, never push for personal data.
         '''
     else:
         post_dict = {'user_id': user_id, 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.GET_ACTION_USER_DETAILS.value, 'uid': thread_local_data.get_request_id(
