@@ -562,12 +562,12 @@ class TestGetRewardSummary(unittest.TestCase):
 class TestTaskSourcePropagation(unittest.TestCase):
     """Test task_source is correctly passed through dispatch paths."""
 
-    def test_task_distributor_sends_idle_source(self):
-        """task_distributor.dispatch_to_chat() sends task_source='idle'."""
+    def test_task_distributor_delegates_to_dispatch_goal(self):
+        """task_distributor.dispatch_to_chat() delegates to dispatch.dispatch_goal."""
         import integrations.coding_agent.task_distributor as td
         import inspect
         source = inspect.getsource(td.dispatch_to_chat)
-        self.assertIn("'task_source': 'idle'", source)
+        self.assertIn("dispatch_goal", source)
 
     def test_dispatch_sends_hive_source(self):
         """dispatch.dispatch_goal_distributed() sends task_source='hive'."""

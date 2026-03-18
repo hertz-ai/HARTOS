@@ -281,35 +281,27 @@ class TestGoalManager:
 # =====================================================================
 
 class TestDispatch:
+    """dispatch_to_chat delegates to dispatch.dispatch_goal (3-tier routing)."""
 
-    @patch('integrations.coding_agent.task_distributor.requests.post')
-    def test_dispatch_success(self, mock_post):
+    @patch('integrations.agent_engine.dispatch.dispatch_goal',
+           return_value='Code generated')
+    def test_dispatch_success(self, mock_dispatch):
         from integrations.coding_agent.task_distributor import dispatch_to_chat
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {'response': 'Code generated'}
-        mock_post.return_value = mock_resp
-
         result = dispatch_to_chat('Fix bugs', 'user1', 'goal123456')
         assert result == 'Code generated'
-        mock_post.assert_called_once()
-        call_json = mock_post.call_args[1]['json']
-        assert call_json['create_agent'] is True
-        assert call_json['prompt'] == 'Fix bugs'
-        assert call_json['prompt_id'] == 'coding_goal1234'
+        mock_dispatch.assert_called_once_with(
+            'Fix bugs', 'user1', 'goal123456', goal_type='coding')
 
-    @patch('integrations.coding_agent.task_distributor.requests.post',
-           side_effect=req_module.RequestException('fail'))
-    def test_dispatch_failure(self, mock_post):
+    @patch('integrations.agent_engine.dispatch.dispatch_goal',
+           return_value=None)
+    def test_dispatch_failure(self, mock_dispatch):
         from integrations.coding_agent.task_distributor import dispatch_to_chat
         assert dispatch_to_chat('x', 'u', 'g1234567') is None
 
-    @patch('integrations.coding_agent.task_distributor.requests.post')
-    def test_dispatch_non_200(self, mock_post):
+    @patch('integrations.agent_engine.dispatch.dispatch_goal',
+           return_value=None)
+    def test_dispatch_non_200(self, mock_dispatch):
         from integrations.coding_agent.task_distributor import dispatch_to_chat
-        mock_resp = MagicMock()
-        mock_resp.status_code = 500
-        mock_post.return_value = mock_resp
         assert dispatch_to_chat('x', 'u', 'g1234567') is None
 
 

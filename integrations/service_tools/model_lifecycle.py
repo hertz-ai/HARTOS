@@ -194,7 +194,11 @@ class ModelLifecycleManager:
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
-        self._interval = int(os.environ.get('HEVOLVE_LIFECYCLE_INTERVAL', '15'))
+        # Flat/bundled mode: models load once at startup, no dynamic swapping.
+        # Poll every 120s (just health check), not 15s (active management).
+        _bundled = os.environ.get('NUNBA_BUNDLED') == '1'
+        _default_interval = '120' if _bundled else '15'
+        self._interval = int(os.environ.get('HEVOLVE_LIFECYCLE_INTERVAL', _default_interval))
         self._tick_count = 0
 
         # Pressure thresholds (configurable via env)

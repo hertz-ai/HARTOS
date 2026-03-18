@@ -12,6 +12,7 @@ import os
 import time
 import logging
 import threading
+from datetime import datetime
 
 logger = logging.getLogger('hevolve_social')
 
@@ -103,9 +104,18 @@ class CodingAgentDaemon:
             agent_idx = 0
             used_agents = set()
             max_concurrent = int(os.environ.get('HEVOLVE_CODING_MAX_CONCURRENT', '10'))
+            now = datetime.utcnow()
+
             for goal in goals:
                 if dispatched >= max_concurrent:
                     break
+
+                # Skip recently dispatched goals (30s cooldown)
+                if goal.last_dispatched_at:
+                    age = (now - goal.last_dispatched_at).total_seconds()
+                    if age < self._interval:
+                        continue
+
                 # Find next available agent
                 while agent_idx < len(idle_agents):
                     if idle_agents[agent_idx]['user_id'] not in used_agents:
@@ -118,8 +128,28 @@ class CodingAgentDaemon:
                 prompt = GoalManager.build_prompt(goal.to_dict())
                 if prompt is None:
                     continue
-                dispatch_to_chat(prompt, str(agent['user_id']), goal.id,
-                                 goal_type=goal.goal_type or 'coding')
+
+                goal.last_dispatched_at = now
+                result = dispatch_to_chat(prompt, str(agent['user_id']), goal.id,
+                                          goal_type=goal.goal_type or 'coding')
+
+                if result is None:
+                    # Dispatch failed — track for backoff
+                    fails = (goal.config_json or {}).get('_dispatch_failures', 0) + 1
+                    cfg = goal.config_json or {}
+                    cfg['_dispatch_failures'] = fails
+                    goal.config_json = cfg
+                    if fails >= 5:
+                        goal.status = 'paused'
+                        cfg['pause_reason'] = f'Auto-paused: {fails} consecutive dispatch failures'
+                        goal.config_json = cfg
+                        logger.warning(f"Coding goal {goal.id} AUTO-PAUSED after {fails} failures")
+                else:
+                    # Success — clear failure count
+                    cfg = goal.config_json or {}
+                    cfg.pop('_dispatch_failures', None)
+                    goal.config_json = cfg
+
                 agent_idx += 1
                 dispatched += 1
                 self._wd_heartbeat()

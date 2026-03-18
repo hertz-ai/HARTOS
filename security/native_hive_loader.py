@@ -1,19 +1,28 @@
 """
-Native Hive AI Loader — Loads closed-source HevolveAI binaries at runtime.
+Native Hive AI Loader — Loads closed-source HevolveAI at runtime.
 
 Architecture:
   HART OS (open source, BSL-1.1)
        │
        ├─ Reads source code freely — it's open source
        │
-       └─ Loads HevolveAI native binary (closed source, packed)
+       └─ Loads HevolveAI (closed source, compiled)
            │
-           ├─ .so (Linux)  / .dll (Windows) / .dylib (macOS)
-           ├─ Compiled from Rust/C++ — no readable source
-           ├─ Signed by master key — tampered binaries rejected
+           ├─ PRIMARY: Cython-compiled Python wheel
+           │   ├─ .so (Linux) / .pyd (Windows) — standard Python C extensions
+           │   ├─ Compiled from Python via Cython — not readable source
+           │   ├─ Installed: pip install hevolveai-0.1.0-cp311-cp311-linux_x86_64.whl
+           │   └─ Imported via: import hevolveai (standard Python import)
+           │
+           ├─ FALLBACK: Native binary via ctypes (Rust hevolveai_topo)
+           │   ├─ .so (Linux) / .dll (Windows) / .dylib (macOS)
+           │   ├─ Signed by master key — tampered binaries rejected
+           │   └─ Exposed via C ABI + Python ctypes wrapper
+           │
            ├─ Provides: Hebbian learning, Bayesian inference,
-           │   RALT distribution, world model, biometric ML
-           └─ Exposed via C ABI + Python ctypes/cffi wrapper
+           │   RALT distribution, world model, embodied AI
+           │
+           └─ STUB: Pure-Python stubs if neither path available
 
 Who can run HevolveAI:
   Anyone on a legitimate deployment — Nunba, HARTOS standalone, Docker,
@@ -21,20 +30,20 @@ Who can run HevolveAI:
   Users never need the master key. They download already-signed binaries.
 
 Protection (against forks weaponizing, NOT against users running):
-  1. Binary is compiled (Rust/C++) — not readable Python
-  2. Binary is release-signed by master key — proves authenticity (not tampered)
-  3. Binary checks origin attestation — refuses to load on unauthorized forks
-  4. Forks cannot sign modified binaries — no master key = can't distribute
-     weaponized versions that pass verification
+  1. Cython-compiled .so/.pyd — not readable Python, not trivially decompilable
+  2. Release-signed by master key — proves authenticity (not tampered)
+  3. Origin attestation check — refuses to load on unauthorized forks
+  4. Forks cannot sign modified packages — no master key = can't distribute
   5. Forks cannot join federation — origin attestation fails
   6. License prohibits decompilation / reverse engineering
 
-Search order for native binary:
-  1. HEVOLVE_NATIVE_LIB env var (explicit path)
-  2. /usr/lib/hevolve/libhevolve_ai.so (system install)
-  3. ~/.hevolve/lib/libhevolve_ai.so (user install)
-  4. {HART_ROOT}/lib/libhevolve_ai.so (in-tree)
-  5. Falls back to pure-Python stubs (reduced functionality)
+Load order:
+  1. import hevolveai (Cython-compiled wheel, pip-installed)
+  2. HEVOLVE_NATIVE_LIB env var (ctypes binary, explicit path)
+  3. /usr/lib/hevolve/libhevolve_ai.so (system install)
+  4. ~/.hevolve/lib/libhevolve_ai.so (user install)
+  5. {HART_ROOT}/lib/libhevolve_ai.so (in-tree)
+  6. Falls back to pure-Python stubs (reduced functionality)
 """
 
 import ctypes
@@ -82,8 +91,10 @@ _KNOWN_SIGNATURES: Dict[str, str] = {}
 
 # Module-level singleton
 _native_lib: Optional[ctypes.CDLL] = None
+_cython_module = None  # The Cython-compiled hevolveai package (if imported)
 _native_available = False
 _stub_mode = False
+_load_method: Optional[str] = None  # 'cython' | 'ctypes' | None
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -290,37 +301,84 @@ def _decrypt_binary_to_tmpfs(enc_path: str) -> Optional[str]:
         return None
 
 
+def _try_load_cython_package() -> Tuple[bool, str]:
+    """Try to import the Cython-compiled hevolveai wheel.
+
+    This is the PRIMARY load path. The wheel is installed via pip and
+    contains .so/.pyd Cython extensions — standard Python imports, no ctypes.
+
+    Returns (success, message).
+    """
+    global _cython_module, _native_available, _stub_mode, _load_method
+
+    try:
+        import hevolveai
+        # Verify it's actually compiled (not someone's source checkout)
+        mod_file = getattr(hevolveai, '__file__', '') or ''
+        # Compiled packages have __init__.cpython-*.so or __init__.pyd
+        # OR a minimal stub __init__.py that imports from compiled submodules
+        # Check for at least one compiled submodule
+        pkg_dir = os.path.dirname(mod_file)
+        if pkg_dir:
+            has_compiled = any(
+                f.endswith('.so') or f.endswith('.pyd')
+                for d, _, files in os.walk(pkg_dir)
+                for f in files
+                if '.cpython-' in f or f.endswith('.pyd')
+            )
+            if not has_compiled:
+                # This is a source checkout, not the compiled wheel
+                return False, 'hevolveai found but not Cython-compiled (source install)'
+
+        _cython_module = hevolveai
+        _native_available = True
+        _stub_mode = False
+        _load_method = 'cython'
+        version = getattr(hevolveai, '__version__', 'unknown')
+        logger.info(f"Loaded HevolveAI Cython package v{version} from {mod_file}")
+        return True, f'Cython wheel loaded: {mod_file}'
+
+    except ImportError:
+        return False, 'hevolveai package not installed'
+    except Exception as e:
+        return False, f'hevolveai import error: {e}'
+
+
 def load_native_lib(force_reload: bool = False) -> Tuple[bool, str]:
-    """Load the HevolveAI native binary.
+    """Load HevolveAI — tries Cython wheel first, then ctypes binary.
 
     Returns (success, message).
 
-    The binary provides:
-      - hevolve_init() → Initialize the AI engine
-      - hevolve_infer(prompt, model) → Run inference
-      - hevolve_hebbian_update(signals) → Hebbian learning step
-      - hevolve_bayesian_update(prior, evidence) → Bayesian update
-      - hevolve_world_model_step(state) → World model evolution
-      - hevolve_verify_origin(fingerprint) → Origin attestation
-      - hevolve_version() → Version string
-      - hevolve_shutdown() → Clean shutdown
+    Load order:
+      1. Cython-compiled wheel (pip install hevolveai-*.whl)
+      2. ctypes native binary (.so/.dll)
+      3. Stub mode (reduced functionality)
     """
-    global _native_lib, _native_available, _stub_mode
+    global _native_lib, _native_available, _stub_mode, _load_method
 
-    if _native_lib and not force_reload:
-        return True, 'Already loaded'
+    if (_native_available or _cython_module) and not force_reload:
+        return True, f'Already loaded ({_load_method})'
 
+    # ── Path 1: Cython-compiled Python wheel (primary) ────────
+    ok, msg = _try_load_cython_package()
+    if ok:
+        return True, msg
+    logger.debug(f"Cython path: {msg}")
+
+    # ── Path 2: ctypes native binary (fallback) ──────────────
     path = _find_native_binary()
     if not path:
         _stub_mode = True
         _native_available = False
+        _load_method = None
         logger.info(
-            "HevolveAI native binary not found — running in stub mode. "
+            "HevolveAI not available — running in stub mode. "
             "AI features (Hebbian learning, Bayesian inference, RALT, "
             "world model) will use pure-Python fallbacks with reduced "
-            "performance. Install the binary for full capability."
+            "performance. Install the compiled wheel for full capability: "
+            "pip install hevolveai-*.whl"
         )
-        return False, 'Native binary not found — stub mode active'
+        return False, 'HevolveAI not found — stub mode active'
 
     # Verify binary signature
     sig_ok, sig_msg = _verify_binary_signature(path)
@@ -329,6 +387,7 @@ def load_native_lib(force_reload: bool = False) -> Tuple[bool, str]:
         if enforcement == 'hard':
             _stub_mode = True
             _native_available = False
+            _load_method = None
             logger.critical(f"Refusing to load unsigned binary: {sig_msg}")
             return False, f'Binary signature verification failed: {sig_msg}'
         else:
@@ -341,6 +400,7 @@ def load_native_lib(force_reload: bool = False) -> Tuple[bool, str]:
     except OSError as e:
         _stub_mode = True
         _native_available = False
+        _load_method = None
         logger.error(f"Failed to load native binary: {e}")
         return False, f'Load failed: {e}'
 
@@ -352,6 +412,7 @@ def load_native_lib(force_reload: bool = False) -> Tuple[bool, str]:
             _native_lib = None
             _stub_mode = True
             _native_available = False
+            _load_method = None
             return False, f'Binary origin check failed: {origin_msg}'
 
     # Initialize
@@ -366,7 +427,8 @@ def load_native_lib(force_reload: bool = False) -> Tuple[bool, str]:
 
     _native_available = True
     _stub_mode = False
-    return True, f'Loaded from {path}'
+    _load_method = 'ctypes'
+    return True, f'Loaded ctypes binary from {path}'
 
 
 def is_native_available() -> bool:
@@ -388,9 +450,33 @@ def get_native_lib() -> Optional[ctypes.CDLL]:
 # Python-side function wrappers (safe to call even in stub mode)
 # ═══════════════════════════════════════════════════════════════════════
 
+def get_hevolveai():
+    """Get the loaded hevolveai Cython package, or None.
+
+    HARTOS code that needs HevolveAI should use this:
+        hevolveai = get_hevolveai()
+        if hevolveai:
+            from hevolveai.embodied_ai.learning.hive_mind import HiveMind
+            ...
+    """
+    return _cython_module
+
+
 def native_infer(prompt: str, model: str = 'default',
                  options: Optional[Dict] = None) -> Optional[str]:
-    """Call native inference if available, else return None for Python fallback."""
+    """Call inference if available, else return None for Python fallback."""
+    # Cython path — call the Python API directly
+    if _cython_module:
+        try:
+            from hevolveai.embodied_ai.inference.qwen_inference_only import infer
+            return infer(prompt, model=model, **(options or {}))
+        except (ImportError, AttributeError):
+            pass
+        except Exception as e:
+            logger.debug(f"Cython inference error: {e}")
+            return None
+
+    # ctypes path
     if not _native_available or not _native_lib:
         return None
     try:
@@ -405,7 +491,20 @@ def native_infer(prompt: str, model: str = 'default',
 
 
 def native_hebbian_update(signals: Dict[str, float]) -> Optional[Dict]:
-    """Run Hebbian learning step via native binary."""
+    """Run Hebbian learning step."""
+    # Cython path
+    if _cython_module:
+        try:
+            from hevolveai.embodied_ai.learning.hebbian_differentiator import HebbianDifferentiator
+            heb = HebbianDifferentiator()
+            return heb.update(signals)
+        except (ImportError, AttributeError):
+            pass
+        except Exception as e:
+            logger.debug(f"Cython Hebbian error: {e}")
+            return None
+
+    # ctypes path
     if not _native_available or not _native_lib:
         return None
     try:
@@ -421,7 +520,9 @@ def native_hebbian_update(signals: Dict[str, float]) -> Optional[Dict]:
 
 
 def native_version() -> Optional[str]:
-    """Get native binary version string."""
+    """Get HevolveAI version string."""
+    if _cython_module:
+        return getattr(_cython_module, '__version__', '0.1.0')
     if not _native_available or not _native_lib:
         return None
     try:
@@ -434,8 +535,8 @@ def native_version() -> Optional[str]:
 
 
 def shutdown_native():
-    """Clean shutdown of native binary."""
-    global _native_lib, _native_available
+    """Clean shutdown of HevolveAI."""
+    global _native_lib, _native_available, _cython_module, _load_method
     if _native_lib:
         try:
             func = _native_lib.hevolve_shutdown
@@ -444,7 +545,9 @@ def shutdown_native():
         except AttributeError:
             pass
         _native_lib = None
-        _native_available = False
+    _cython_module = None
+    _native_available = False
+    _load_method = None
 
 
 def get_status() -> Dict:
@@ -452,7 +555,9 @@ def get_status() -> Dict:
     return {
         'native_available': _native_available,
         'stub_mode': _stub_mode,
+        'load_method': _load_method,
         'binary_path': _find_native_binary(),
+        'cython_package': bool(_cython_module),
         'version': native_version(),
         'platform_lib': _LIB_NAME,
         'search_paths': [p for p in _SEARCH_PATHS if p],

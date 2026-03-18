@@ -299,6 +299,7 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
         result = hevolve_chat(
             text=prompt, user_id=user_id,
             agent_id=prompt_id, create_agent=True, casual_conv=False,
+            autonomous=True,
         )
         response = result.get('text') or result.get('response', '')
         if response:

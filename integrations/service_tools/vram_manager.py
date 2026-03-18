@@ -9,6 +9,7 @@ Pattern from: integrations/vision/minicpm_installer.py (detect_gpu)
 """
 
 import logging
+import os
 import subprocess
 import sys
 from typing import Dict, Optional, Tuple
@@ -42,7 +43,10 @@ class VRAMManager:
         self._allocations: Dict[str, float] = {}  # tool → GB reserved
         self._gpu_info: Optional[Dict] = None
         self._gpu_info_ts: float = 0.0  # timestamp of last nvidia-smi call
-        self._refresh_ttl: float = 30.0  # seconds between nvidia-smi calls
+        # Bundled mode: GPU state is stable (one model loaded at startup).
+        # Poll every 120s not 30s to reduce subprocess overhead.
+        _bundled = os.environ.get('NUNBA_BUNDLED') == '1'
+        self._refresh_ttl: float = 120.0 if _bundled else 30.0
 
     # ── GPU Detection ────────────────────────────────────────────
 

@@ -926,17 +926,9 @@ class WorldModelBridge:
         except ImportError:
             pass
 
-        # In-process: direct call to HevolveAI action stream
-        if self._in_process and self._provider:
-            try:
-                from hevolveai.embodied_ai.action_stream import send_action
-                send_action(action)
-                with self._lock:
-                    self._stats['total_actions_sent'] = self._stats.get(
-                        'total_actions_sent', 0) + 1
-                return True
-            except (ImportError, Exception) as e:
-                logger.debug(f"In-process action send error: {e}")
+        # In-process: actions route through submit_correction() for error
+        # propagation when outcomes differ from predictions.  No separate
+        # action_stream module — the correction path handles backprop.
 
         # HTTP fallback
         if self._http_disabled or self._cb_is_open():
@@ -976,17 +968,9 @@ class WorldModelBridge:
         if not readings:
             return 0
 
-        # In-process: direct call
-        if self._in_process and self._provider:
-            try:
-                from hevolveai.embodied_ai.sensor_ingest import record_sensor_batch
-                count = record_sensor_batch(readings)
-                with self._lock:
-                    self._stats['total_sensor_readings'] = self._stats.get(
-                        'total_sensor_readings', 0) + len(readings)
-                return count if isinstance(count, int) else len(readings)
-            except (ImportError, Exception) as e:
-                logger.debug(f"In-process sensor ingest error: {e}")
+        # In-process: sensor data routes through submit_sensor_frame() →
+        # embodied.step(sensor, train=True).  SensorInput dataclass already
+        # carries type/modality metadata.  No separate sensor_ingest module.
 
         # HTTP fallback
         if self._http_disabled or self._cb_is_open():
@@ -1020,12 +1004,14 @@ class WorldModelBridge:
         Returns:
             Feedback dict from HevolveAI, or None if unavailable.
         """
-        # In-process
-        if self._in_process:
+        # In-process: feedback is returned inline by step() as InferenceStats
+        # (attention weights, epistemic uncertainty, kernel corrections).
+        # The provider exposes this via get_stats(). No separate module.
+        if self._in_process and self._provider:
             try:
-                from hevolveai.embodied_ai.learning_feedback import get_latest
-                return get_latest()
-            except (ImportError, Exception):
+                stats = self._provider.get_stats()
+                return stats.get('last_feedback') or stats
+            except Exception:
                 pass
 
         # HTTP fallback
@@ -1082,14 +1068,9 @@ class WorldModelBridge:
             'params': {'velocity': 0, 'force': 0},
         }
 
-        if self._in_process and self._provider:
-            try:
-                from hevolveai.embodied_ai.action_stream import emergency_stop
-                emergency_stop()
-                return True
-            except (ImportError, Exception):
-                pass
-
+        # In-process: send zero-velocity via the same HTTP estop endpoint.
+        # Emergency stop must be reliable — no in-process shortcut that
+        # could silently fail on ImportError.
         try:
             resp = pooled_post(
                 f'{self._api_url}/v1/actions/estop',
