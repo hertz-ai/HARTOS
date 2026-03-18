@@ -1,0 +1,29 @@
+[package]
+name = "hevolvearmor"
+version = "0.1.0"
+edition = "2021"
+description = "Encrypted Python module loader for HART OS — AES-256-GCM + Ed25519 key derivation"
+license = "Proprietary"
+
+[lib]
+name = "hevolvearmor"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"] }
+aes-gcm = "0.10"
+sha2 = "0.10"
+hkdf = "0.12"
+ed25519-dalek = { version = "2", features = ["std"] }
+rand = "0.8"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zeroize = { version = "1", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"

@@ -102,3 +102,7 @@ coauthor_scrub.txt
 plan.md
 *_reddit_*.txt
 *_reddit_*.md
+# HevolveArmor build artifacts
+hevolvearmor/target/
+vendor/hevolveai_armored/modules/
+vendor/hevolveai_armored/_key.bin
