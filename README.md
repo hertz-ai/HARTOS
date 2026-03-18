@@ -257,6 +257,14 @@ HART Platform
 │   ├── Gossip Protocol    - Tier-aware with certificate verification
 │   └── Integrity Service  - Challenges, witnesses, fraud scoring
 │
+├── HevolveArmor (Rust-native source protection)
+│   ├── AES-256-GCM encryption of Python modules at rest
+│   ├── Ed25519 key derivation (node identity → HKDF → AES key)
+│   ├── Anti-debug, anti-tamper, license management
+│   ├── BCC mode (Cython compile-to-C, irreversible)
+│   ├── RFT mode (AST symbol renaming)
+│   └── 54 tests (unit/integration/stress/e2e/pen)
+│
 └── Integrations
     ├── 96 Expert Agents   - Bootstrapped specialized agent network
     ├── Agent Protocol 2   - E-commerce, payments
