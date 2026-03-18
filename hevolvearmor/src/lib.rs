@@ -590,6 +590,392 @@ fn armor_is_debugger_present() -> bool {
     is_debugger_present()
 }
 
+// ─── License Management ──────────────────────────────────────────────────────
+
+/// License file format (JSON, Ed25519-signed):
+/// {
+///   "licensee": "Company Name",
+///   "license_id": "uuid",
+///   "expires_at": 1735689600,        // Unix timestamp (0 = never)
+///   "grace_days": 30,                 // days after expiry still accepted
+///   "bind_mac": ["AA:BB:CC:DD:EE:FF"],  // empty = any machine
+///   "bind_hostname": [],              // empty = any hostname
+///   "bind_machine_id": "",            // platform machine-id (empty = any)
+///   "features": ["hevolveai", "embodied_ai"],  // package names allowed
+///   "max_nodes": 0,                   // 0 = unlimited
+///   "signature": "hex-ed25519-sig"    // signs all fields above
+/// }
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+struct License {
+    licensee: String,
+    license_id: String,
+    #[serde(default)]
+    expires_at: u64,  // 0 = never expires
+    #[serde(default = "default_grace_days")]
+    grace_days: u32,
+    #[serde(default)]
+    bind_mac: Vec<String>,
+    #[serde(default)]
+    bind_hostname: Vec<String>,
+    #[serde(default)]
+    bind_machine_id: String,
+    #[serde(default)]
+    features: Vec<String>,
+    #[serde(default)]
+    max_nodes: u32,
+    signature: String,
+}
+
+fn default_grace_days() -> u32 { 30 }
+
+#[derive(Debug)]
+struct LicenseCheckResult {
+    valid: bool,
+    expired: bool,
+    in_grace: bool,
+    machine_bound: bool,
+    message: String,
+}
+
+impl License {
+    /// Serialize all fields except signature for verification.
+    fn signable_bytes(&self) -> Vec<u8> {
+        let mut copy = self.clone();
+        copy.signature = String::new();
+        serde_json::to_vec(&copy).unwrap_or_default()
+    }
+
+    /// Verify the Ed25519 signature against a public key.
+    fn verify_signature(&self, public_key_hex: &str) -> Result<bool, String> {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+        let pk_bytes = hex::decode(public_key_hex)
+            .map_err(|e| format!("Bad public key hex: {e}"))?;
+        if pk_bytes.len() != 32 {
+            return Err(format!("Public key must be 32 bytes, got {}", pk_bytes.len()));
+        }
+        let vk = VerifyingKey::from_bytes(pk_bytes.as_slice().try_into().unwrap())
+            .map_err(|e| format!("Invalid public key: {e}"))?;
+
+        let sig_bytes = hex::decode(&self.signature)
+            .map_err(|e| format!("Bad signature hex: {e}"))?;
+        if sig_bytes.len() != 64 {
+            return Err(format!("Signature must be 64 bytes, got {}", sig_bytes.len()));
+        }
+        let sig = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
+
+        let payload = self.signable_bytes();
+        Ok(vk.verify(&payload, &sig).is_ok())
+    }
+
+    /// Check expiry.
+    fn check_expiry(&self) -> (bool, bool) {
+        if self.expires_at == 0 {
+            return (false, false); // never expires
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        if now <= self.expires_at {
+            (false, false) // not expired
+        } else {
+            let grace_end = self.expires_at + (self.grace_days as u64) * 86400;
+            if now <= grace_end {
+                (true, true)  // expired but in grace
+            } else {
+                (true, false) // expired, past grace
+            }
+        }
+    }
+
+    /// Check machine binding.
+    fn check_machine_binding(&self) -> bool {
+        // MAC address check
+        if !self.bind_mac.is_empty() {
+            let current_mac = get_mac_address_string();
+            if !current_mac.is_empty() {
+                let mac_upper: Vec<String> = self.bind_mac.iter()
+                    .map(|m| m.to_uppercase()).collect();
+                if !mac_upper.contains(&current_mac.to_uppercase()) {
+                    return false;
+                }
+            }
+        }
+
+        // Hostname check
+        if !self.bind_hostname.is_empty() {
+            let current_host = get_hostname_string();
+            if !current_host.is_empty() {
+                let hosts_lower: Vec<String> = self.bind_hostname.iter()
+                    .map(|h| h.to_lowercase()).collect();
+                if !hosts_lower.contains(&current_host.to_lowercase()) {
+                    return false;
+                }
+            }
+        }
+
+        // Machine ID check
+        if !self.bind_machine_id.is_empty() {
+            let current_id = get_machine_id();
+            if !current_id.is_empty() && current_id != self.bind_machine_id {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Full validation.
+    fn validate(&self, public_key_hex: &str) -> LicenseCheckResult {
+        // 1. Signature
+        match self.verify_signature(public_key_hex) {
+            Ok(true) => {}
+            Ok(false) => {
+                return LicenseCheckResult {
+                    valid: false, expired: false, in_grace: false,
+                    machine_bound: false,
+                    message: "License signature invalid".into(),
+                };
+            }
+            Err(e) => {
+                return LicenseCheckResult {
+                    valid: false, expired: false, in_grace: false,
+                    machine_bound: false,
+                    message: format!("Signature verification error: {e}"),
+                };
+            }
+        }
+
+        // 2. Expiry
+        let (expired, in_grace) = self.check_expiry();
+        if expired && !in_grace {
+            return LicenseCheckResult {
+                valid: false, expired: true, in_grace: false,
+                machine_bound: true,
+                message: format!("License expired (grace period of {} days has passed)", self.grace_days),
+            };
+        }
+
+        // 3. Machine binding
+        let machine_ok = self.check_machine_binding();
+        if !machine_ok {
+            return LicenseCheckResult {
+                valid: false, expired, in_grace,
+                machine_bound: false,
+                message: "License not bound to this machine".into(),
+            };
+        }
+
+        let msg = if in_grace {
+            format!("License expired but within {}-day grace period", self.grace_days)
+        } else if self.expires_at == 0 {
+            "License valid (no expiry)".into()
+        } else {
+            "License valid".into()
+        };
+
+        LicenseCheckResult {
+            valid: true, expired, in_grace,
+            machine_bound: true,
+            message: msg,
+        }
+    }
+}
+
+/// Load license from file.
+fn load_license(path: &str) -> Result<License, String> {
+    let data = fs::read_to_string(path)
+        .map_err(|e| format!("Cannot read license file {path}: {e}"))?;
+    serde_json::from_str(&data)
+        .map_err(|e| format!("Invalid license format: {e}"))
+}
+
+/// Get MAC address as string.
+fn get_mac_address_string() -> String {
+    mac_address::get_mac_address()
+        .ok()
+        .flatten()
+        .map(|m| m.to_string())
+        .unwrap_or_default()
+}
+
+/// Get hostname.
+fn get_hostname_string() -> String {
+    hostname::get()
+        .ok()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+/// Get platform machine ID.
+fn get_machine_id() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        fs::read_to_string("/etc/machine-id")
+            .or_else(|_| fs::read_to_string("/var/lib/dbus/machine-id"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid
+        let output = std::process::Command::new("reg")
+            .args(["query", r"HKLM\SOFTWARE\Microsoft\Cryptography", "/v", "MachineGuid"])
+            .output();
+        if let Ok(out) = output {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines() {
+                if line.contains("MachineGuid") {
+                    if let Some(guid) = line.split_whitespace().last() {
+                        return guid.to_string();
+                    }
+                }
+            }
+        }
+        String::new()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("ioreg")
+            .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+            .output();
+        if let Ok(out) = output {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines() {
+                if line.contains("IOPlatformUUID") {
+                    let parts: Vec<&str> = line.split('"').collect();
+                    if parts.len() >= 4 {
+                        return parts[3].to_string();
+                    }
+                }
+            }
+        }
+        String::new()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    {
+        String::new()
+    }
+}
+
+// ─── License Python API ──────────────────────────────────────────────────────
+
+/// Generate a new license file signed with an Ed25519 private key.
+#[pyfunction]
+#[pyo3(signature = (
+    licensee,
+    private_key_hex,
+    output_path,
+    expires_at=0,
+    grace_days=30,
+    bind_mac=None,
+    bind_hostname=None,
+    bind_machine_id=None,
+    features=None,
+    max_nodes=0
+))]
+fn armor_generate_license(
+    licensee: &str,
+    private_key_hex: &str,
+    output_path: &str,
+    expires_at: u64,
+    grace_days: u32,
+    bind_mac: Option<Vec<String>>,
+    bind_hostname: Option<Vec<String>>,
+    bind_machine_id: Option<String>,
+    features: Option<Vec<String>>,
+    max_nodes: u32,
+) -> PyResult<String> {
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand::Rng;
+
+    let pk_bytes = hex::decode(private_key_hex)
+        .map_err(|e| PyValueError::new_err(format!("Bad private key hex: {e}")))?;
+    if pk_bytes.len() != 32 {
+        return Err(PyValueError::new_err("Private key must be 32 bytes"));
+    }
+    let signing_key = SigningKey::from_bytes(pk_bytes.as_slice().try_into().unwrap());
+
+    // Generate license ID
+    let mut rng = rand::thread_rng();
+    let license_id = format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        rng.gen::<u32>(), rng.gen::<u16>(), rng.gen::<u16>(),
+        rng.gen::<u16>(), rng.gen::<u64>() & 0xFFFFFFFFFFFF
+    );
+
+    let mut license = License {
+        licensee: licensee.to_string(),
+        license_id: license_id.clone(),
+        expires_at,
+        grace_days,
+        bind_mac: bind_mac.unwrap_or_default(),
+        bind_hostname: bind_hostname.unwrap_or_default(),
+        bind_machine_id: bind_machine_id.unwrap_or_default(),
+        features: features.unwrap_or_default(),
+        max_nodes,
+        signature: String::new(),
+    };
+
+    // Sign
+    let payload = license.signable_bytes();
+    let sig = signing_key.sign(&payload);
+    license.signature = hex::encode(sig.to_bytes());
+
+    // Write
+    let json = serde_json::to_string_pretty(&license)
+        .map_err(|e| PyRuntimeError::new_err(format!("Serialize: {e}")))?;
+    fs::write(output_path, &json)
+        .map_err(|e| PyRuntimeError::new_err(format!("Write license: {e}")))?;
+
+    Ok(license_id)
+}
+
+/// Validate a license file.  Returns dict with validation result.
+#[pyfunction]
+#[pyo3(signature = (license_path, public_key_hex=None))]
+fn armor_validate_license(
+    py: Python<'_>,
+    license_path: &str,
+    public_key_hex: Option<&str>,
+) -> PyResult<PyObject> {
+    let license = load_license(license_path)
+        .map_err(|e| PyValueError::new_err(e))?;
+
+    let pk = public_key_hex
+        .map(String::from)
+        .or_else(|| std::env::var("HEVOLVEARMOR_MASTER_PK").ok())
+        .unwrap_or_else(|| {
+            "4662e30d86c2f58416c5ac3f806c2a6af8186e1d96fdbbcad3189847cf888a01".to_string()
+        });
+
+    let result = license.validate(&pk);
+
+    let dict = PyDict::new(py);
+    dict.set_item("valid", result.valid)?;
+    dict.set_item("expired", result.expired)?;
+    dict.set_item("in_grace", result.in_grace)?;
+    dict.set_item("machine_bound", result.machine_bound)?;
+    dict.set_item("message", result.message)?;
+    dict.set_item("licensee", &license.licensee)?;
+    dict.set_item("license_id", &license.license_id)?;
+    dict.set_item("expires_at", license.expires_at)?;
+    dict.set_item("features", &license.features)?;
+    Ok(dict.into())
+}
+
+/// Get current machine info (for license binding).
+#[pyfunction]
+fn armor_machine_info(py: Python<'_>) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("mac_address", get_mac_address_string())?;
+    dict.set_item("hostname", get_hostname_string())?;
+    dict.set_item("machine_id", get_machine_id())?;
+    Ok(dict.into())
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Public Python API
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -604,7 +990,7 @@ fn armor_is_debugger_present() -> bool {
 ///     expected_hash: optional SHA-256 hash of this .pyd/.so for anti-tamper
 ///     package_names: optional list of top-level packages to intercept
 #[pyfunction]
-#[pyo3(signature = (modules_dir, passphrase=None, node_key_path=None, expected_hash=None, package_names=None))]
+#[pyo3(signature = (modules_dir, passphrase=None, node_key_path=None, expected_hash=None, package_names=None, license_file=None, license_public_key=None))]
 fn install(
     py: Python<'_>,
     modules_dir: &str,
@@ -612,12 +998,59 @@ fn install(
     node_key_path: Option<&str>,
     expected_hash: Option<&str>,
     package_names: Option<Vec<String>>,
+    license_file: Option<&str>,
+    license_public_key: Option<&str>,
 ) -> PyResult<()> {
     let dir = Path::new(modules_dir);
     if !dir.is_dir() {
         return Err(PyValueError::new_err(format!(
             "modules_dir not found: {modules_dir}"
         )));
+    }
+
+    // ── License validation (if license file provided or auto-detected) ──
+    let license_path = license_file
+        .map(String::from)
+        .or_else(|| {
+            // Auto-detect: look for .license file next to modules_dir
+            let parent = Path::new(modules_dir).parent()?;
+            let auto = parent.join("hevolvearmor.license");
+            if auto.exists() { Some(auto.to_string_lossy().to_string()) } else { None }
+        })
+        .or_else(|| std::env::var("HEVOLVEARMOR_LICENSE_FILE").ok());
+
+    if let Some(ref lpath) = license_path {
+        let pk = license_public_key
+            .map(String::from)
+            .or_else(|| std::env::var("HEVOLVEARMOR_LICENSE_PK").ok())
+            .or_else(|| std::env::var("HEVOLVEARMOR_MASTER_PK").ok())
+            .unwrap_or_else(|| {
+                "4662e30d86c2f58416c5ac3f806c2a6af8186e1d96fdbbcad3189847cf888a01".to_string()
+            });
+
+        match load_license(lpath) {
+            Ok(license) => {
+                let result = license.validate(&pk);
+                if !result.valid {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "HevolveArmor license invalid: {}", result.message
+                    )));
+                }
+                if result.in_grace {
+                    // Warn but don't block
+                    let _ = py.import("warnings").and_then(|w| {
+                        w.call_method1("warn", (format!(
+                            "HevolveArmor: {}", result.message
+                        ),))
+                    });
+                }
+            }
+            Err(e) => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "HevolveArmor license error: {e}"
+                )));
+            }
+        }
     }
 
     // Derive key
@@ -861,6 +1294,9 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(armor_self_hash, m)?)?;
     m.add_function(wrap_pyfunction!(armor_load_module, m)?)?;
     m.add_function(wrap_pyfunction!(armor_is_debugger_present, m)?)?;
+    m.add_function(wrap_pyfunction!(armor_generate_license, m)?)?;
+    m.add_function(wrap_pyfunction!(armor_validate_license, m)?)?;
+    m.add_function(wrap_pyfunction!(armor_machine_info, m)?)?;
 
     // Classes
     m.add_class::<PyArmoredFinder>()?;
