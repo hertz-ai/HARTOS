@@ -120,6 +120,11 @@ fn derive_runtime_key_internal(
     let app_name = std::env::var("HEVOLVEARMOR_APP_NAME")
         .unwrap_or_else(|_| "Nunba".to_string());
 
+    // 0. Explicit passphrase takes highest priority (user intentionally provided it)
+    if let Some(pp) = passphrase {
+        return Ok(derive_key_from_passphrase(pp));
+    }
+
     // 1. Ed25519 node private key file
     let key_candidates = [
         node_key_path.map(|s| s.to_string()),
@@ -160,12 +165,7 @@ fn derive_runtime_key_internal(
         return Ok(derive_aes_key(&tier_seed));
     }
 
-    // 4. Passphrase
-    if let Some(pp) = passphrase {
-        return Ok(derive_key_from_passphrase(pp));
-    }
-
-    // 5. Last resort: tier-based with defaults
+    // 4. Last resort: tier-based with defaults
     Ok(derive_aes_key(&tier_seed))
 }
 
