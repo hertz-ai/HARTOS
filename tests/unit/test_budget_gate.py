@@ -12,6 +12,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 # ── WS1: estimate_llm_cost_spark ─────────────────────────────────────
 
 class TestEstimateLLMCostSpark:
+    """Tests run with HEVOLVE_LOCAL_LLM_URL cleared so costs are non-zero."""
+
+    @pytest.fixture(autouse=True)
+    def _force_cloud_model(self, monkeypatch):
+        monkeypatch.delenv('HEVOLVE_LOCAL_LLM_URL', raising=False)
+        monkeypatch.delenv('HEVOLVE_LOCAL_LLM_MODEL', raising=False)
+        # Force _is_local_model to return False (cloud model = costs money)
+        monkeypatch.setattr(
+            'integrations.agent_engine.budget_gate._is_local_model',
+            lambda: False)
 
     def test_estimate_returns_positive_int(self):
         from integrations.agent_engine.budget_gate import estimate_llm_cost_spark
