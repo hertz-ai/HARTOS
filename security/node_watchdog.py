@@ -11,6 +11,7 @@ is considered frozen and gets auto-restarted.
 After 5 consecutive restart failures, the thread is marked 'dead'.
 """
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -24,6 +25,10 @@ MAX_CONSECUTIVE_FAILURES = 5
 # Prevents false FROZEN alerts during startup when daemons are still
 # initialising and haven't entered their heartbeat loop yet.
 STARTUP_GRACE_SECONDS = 60
+# LLM calls can take 30-120s on local models. When a thread is marked
+# in_llm_call, the frozen threshold is multiplied by this factor instead
+# of the normal frozen_multiplier. Prevents restart cascade.
+LLM_CALL_TIMEOUT_SECONDS = int(os.environ.get('HEVOLVE_LLM_CALL_TIMEOUT', '300'))
 
 
 @dataclass
@@ -34,12 +39,17 @@ class ThreadInfo:
     restart_fn: Callable
     stop_fn: Optional[Callable] = None
     last_heartbeat: float = field(default_factory=time.time)
-    status: str = 'healthy'  # healthy | frozen | restarting | dead
+    status: str = 'healthy'  # healthy | frozen | restarting | dead | in_llm_call
     restart_count: int = 0
     last_restart_at: Optional[float] = None
     consecutive_failures: int = 0
     # Track recent restart times to detect rapid-restart loops
     recent_restart_times: list = field(default_factory=list)
+    # LLM call awareness: when True, the thread is blocked on a legitimate
+    # LLM inference call. Watchdog extends the threshold by LLM_CALL_MULTIPLIER
+    # instead of restarting.
+    in_llm_call: bool = False
+    llm_call_started_at: Optional[float] = None
 
 
 class NodeWatchdog:
@@ -98,6 +108,33 @@ class NodeWatchdog:
             info = self._threads.get(name)
             if info:
                 info.last_heartbeat = time.time()
+
+    def is_registered(self, name: str) -> bool:
+        """Check if a thread name is registered."""
+        with self._lock:
+            return name in self._threads
+
+    def mark_in_llm_call(self, name: str) -> None:
+        """Mark a thread as blocked on a legitimate LLM inference call.
+
+        The watchdog will use LLM_CALL_TIMEOUT_SECONDS instead of the
+        normal frozen threshold, preventing false restarts during long
+        inference calls.
+        """
+        with self._lock:
+            info = self._threads.get(name)
+            if info:
+                info.in_llm_call = True
+                info.llm_call_started_at = time.time()
+                info.last_heartbeat = time.time()  # refresh heartbeat
+
+    def clear_llm_call(self, name: str) -> None:
+        """Clear the LLM call marker after inference completes."""
+        with self._lock:
+            info = self._threads.get(name)
+            if info:
+                info.in_llm_call = False
+                info.llm_call_started_at = None
 
     def start(self) -> None:
         """Start the watchdog background thread. Call LAST after all daemons."""
@@ -166,8 +203,12 @@ class NodeWatchdog:
                 # Negative age means we're still in the grace period
                 if age < 0:
                     continue
-                threshold = info.expected_interval * self._frozen_multiplier
-                if age > threshold and info.status in ('healthy', 'frozen'):
+                # Use extended timeout when thread is in a legitimate LLM call
+                if info.in_llm_call:
+                    threshold = LLM_CALL_TIMEOUT_SECONDS
+                else:
+                    threshold = info.expected_interval * self._frozen_multiplier
+                if age > threshold and info.status in ('healthy', 'frozen', 'in_llm_call'):
                     # Detect rapid-restart loop: 3+ restarts in last 5 minutes
                     # means the thread keeps dying — stop restarting it
                     recent = [t for t in info.recent_restart_times

@@ -97,7 +97,8 @@ class AgentDaemon:
             if self._running:
                 return
             self._running = True
-        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread = threading.Thread(target=self._loop, daemon=True,
+                                        name='agent_daemon')
         self._thread.start()
         logger.info(f"Agent daemon started (interval={self._interval}s)")
 

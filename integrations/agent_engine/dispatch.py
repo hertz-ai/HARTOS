@@ -18,6 +18,7 @@ Falls back to local /chat when Redis is unavailable.
 """
 import os
 import logging
+import threading
 import requests
 from typing import Dict, List, Optional
 
@@ -25,6 +26,48 @@ from core.http_pool import pooled_post
 from core.port_registry import get_port
 
 logger = logging.getLogger('hevolve_social')
+
+# ── LLM concurrency control ──────────────────────────────────────────────
+# Local llama-server degrades exponentially with concurrent requests
+# (KV cache thrashing). Allow only N concurrent local LLM calls.
+# This prevents the watchdog-restart cascade where restarted daemons
+# pile up concurrent requests that each take longer, triggering more
+# restarts.
+_LOCAL_LLM_MAX_CONCURRENT = int(os.environ.get('HEVOLVE_LOCAL_LLM_MAX_CONCURRENT', '2'))
+_local_llm_semaphore = threading.Semaphore(_LOCAL_LLM_MAX_CONCURRENT)
+
+
+def _notify_watchdog_llm_start():
+    """Tell the watchdog the current thread is blocked on a legitimate LLM call.
+
+    The watchdog will extend the heartbeat threshold for threads marked
+    'in_llm_call' instead of restarting them.
+    """
+    try:
+        from security.node_watchdog import get_watchdog
+        wd = get_watchdog()
+        if wd:
+            name = threading.current_thread().name
+            # Find which daemon this thread belongs to
+            for daemon_name in ('coding_daemon', 'agent_daemon'):
+                if daemon_name in name or wd.is_registered(daemon_name):
+                    wd.mark_in_llm_call(daemon_name)
+                    break
+    except Exception:
+        pass
+
+
+def _notify_watchdog_llm_end():
+    """Clear the LLM call marker and send a heartbeat."""
+    try:
+        from security.node_watchdog import get_watchdog
+        wd = get_watchdog()
+        if wd:
+            for daemon_name in ('coding_daemon', 'agent_daemon'):
+                wd.clear_llm_call(daemon_name)
+                wd.heartbeat(daemon_name)
+    except Exception:
+        pass
 
 
 def _get_distributed_coordinator():
@@ -291,16 +334,32 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     resp = None
 
     # Tier 1: Direct in-process import of hart_intelligence
+    # Guarded by semaphore to prevent concurrent request pile-up on
+    # local llama-server (causes exponential slowdown + watchdog restarts).
     try:
         try:
             from routes.hartos_backend_adapter import chat as hevolve_chat
         except ImportError:
             from hartos_backend_adapter import chat as hevolve_chat
-        result = hevolve_chat(
-            text=prompt, user_id=user_id,
-            agent_id=prompt_id, create_agent=True, casual_conv=False,
-            autonomous=True,
-        )
+
+        # Try to acquire semaphore (non-blocking check first)
+        if not _local_llm_semaphore.acquire(timeout=5):
+            logger.info(f"LLM busy ({_LOCAL_LLM_MAX_CONCURRENT} in flight), "
+                        f"skipping dispatch for goal {goal_id}")
+            return None
+
+        # Signal to watchdog that this thread is in a legitimate LLM call
+        _notify_watchdog_llm_start()
+        try:
+            result = hevolve_chat(
+                text=prompt, user_id=user_id,
+                agent_id=prompt_id, create_agent=True, casual_conv=False,
+                autonomous=True,
+            )
+        finally:
+            _local_llm_semaphore.release()
+            _notify_watchdog_llm_end()
+
         response = result.get('text') or result.get('response', '')
         if response:
             return response

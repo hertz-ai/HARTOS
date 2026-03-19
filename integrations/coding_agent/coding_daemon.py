@@ -32,7 +32,8 @@ class CodingAgentDaemon:
             if self._running:
                 return
             self._running = True
-        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread = threading.Thread(target=self._loop, daemon=True,
+                                        name='coding_daemon')
         self._thread.start()
         logger.info(f"Coding daemon started (interval={self._interval}s)")
 
