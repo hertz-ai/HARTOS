@@ -689,7 +689,7 @@ class TestVLMAgentContextSingleton:
 class TestVLMAgentContextAvailability:
     """Availability checks for VLM and OmniParser servers."""
 
-    @patch('integrations.vlm.vlm_agent_integration.requests.get')
+    @patch('integrations.vlm.vlm_agent_integration.pooled_get')
     def test_is_vlm_available_true(self, mock_get):
         """is_vlm_available() returns True when health endpoint is 200."""
         mock_get.return_value = _make_health_ok()
@@ -699,7 +699,7 @@ class TestVLMAgentContextAvailability:
         assert ctx.is_vlm_available() is True
         mock_get.assert_called_once_with("http://localhost:5001/health", timeout=2)
 
-    @patch('integrations.vlm.vlm_agent_integration.requests.get')
+    @patch('integrations.vlm.vlm_agent_integration.pooled_get')
     def test_is_vlm_available_false_on_error(self, mock_get):
         """is_vlm_available() returns False on connection error."""
         mock_get.side_effect = ConnectionError("Connection refused")
@@ -708,7 +708,7 @@ class TestVLMAgentContextAvailability:
         ctx = VLMAgentContext()
         assert ctx.is_vlm_available() is False
 
-    @patch('integrations.vlm.vlm_agent_integration.requests.get')
+    @patch('integrations.vlm.vlm_agent_integration.pooled_get')
     def test_is_omniparser_available_true(self, mock_get):
         """is_omniparser_available() returns True when probe is 200."""
         mock_get.return_value = _make_health_ok()
@@ -718,7 +718,7 @@ class TestVLMAgentContextAvailability:
         assert ctx.is_omniparser_available() is True
         mock_get.assert_called_once_with("http://localhost:8080/probe", timeout=2)
 
-    @patch('integrations.vlm.vlm_agent_integration.requests.get')
+    @patch('integrations.vlm.vlm_agent_integration.pooled_get')
     def test_is_omniparser_available_false(self, mock_get):
         """is_omniparser_available() returns False on timeout."""
         mock_get.side_effect = TimeoutError("Timed out")
@@ -731,8 +731,8 @@ class TestVLMAgentContextAvailability:
 class TestVLMAgentContextScreenContext:
     """get_screen_context() — OmniParser screen parsing."""
 
-    @patch('integrations.vlm.vlm_agent_integration.requests.post')
-    @patch('integrations.vlm.vlm_agent_integration.requests.get')
+    @patch('integrations.vlm.vlm_agent_integration.pooled_post')
+    @patch('integrations.vlm.vlm_agent_integration.pooled_get')
     def test_get_screen_context(self, mock_get, mock_post, mock_omniparser_response):
         """get_screen_context() returns parsed OmniParser response."""
         # Mock probe check
@@ -753,7 +753,7 @@ class TestVLMAgentContextScreenContext:
         assert len(result['parsed_content_list']) == 2
         assert result['width'] == 1920
 
-    @patch('integrations.vlm.vlm_agent_integration.requests.get')
+    @patch('integrations.vlm.vlm_agent_integration.pooled_get')
     def test_get_screen_context_unavailable(self, mock_get):
         """get_screen_context() returns None when OmniParser is unavailable."""
         mock_get.side_effect = ConnectionError("Not reachable")
@@ -767,8 +767,8 @@ class TestVLMAgentContextScreenContext:
 class TestVLMAgentContextActions:
     """Context injection and action execution."""
 
-    @patch('integrations.vlm.vlm_agent_integration.requests.post')
-    @patch('integrations.vlm.vlm_agent_integration.requests.get')
+    @patch('integrations.vlm.vlm_agent_integration.pooled_post')
+    @patch('integrations.vlm.vlm_agent_integration.pooled_get')
     def test_inject_visual_context(self, mock_get, mock_post, mock_omniparser_response):
         """inject_visual_context_into_ledger_task() adds visual_context key."""
         mock_get.return_value = _make_health_ok()
@@ -789,7 +789,7 @@ class TestVLMAgentContextActions:
         assert enhanced["visual_context"]["visible_elements"] == 2
         assert enhanced["visual_context"]["screen_dimensions"]["width"] == 1920
 
-    @patch('integrations.vlm.vlm_agent_integration.requests.get')
+    @patch('integrations.vlm.vlm_agent_integration.pooled_get')
     def test_inject_visual_context_unavailable(self, mock_get):
         """When VLM is unavailable, context has has_screen_info=False."""
         mock_get.side_effect = ConnectionError("Not available")
@@ -802,8 +802,8 @@ class TestVLMAgentContextActions:
         assert enhanced["visual_context"]["has_screen_info"] is False
         assert "not available" in enhanced["visual_context"]["note"].lower()
 
-    @patch('integrations.vlm.vlm_agent_integration.requests.post')
-    @patch('integrations.vlm.vlm_agent_integration.requests.get')
+    @patch('integrations.vlm.vlm_agent_integration.pooled_post')
+    @patch('integrations.vlm.vlm_agent_integration.pooled_get')
     def test_execute_vlm_action(self, mock_get, mock_post):
         """execute_vlm_action() sends action to VLM server and tracks history."""
         mock_get.return_value = _make_health_ok()
@@ -827,7 +827,7 @@ class TestVLMAgentContextActions:
         assert len(ctx.action_history) == 1
         assert ctx.action_history[0]['action'] == 'left_click'
 
-    @patch('integrations.vlm.vlm_agent_integration.requests.get')
+    @patch('integrations.vlm.vlm_agent_integration.pooled_get')
     def test_execute_vlm_action_unavailable(self, mock_get):
         """execute_vlm_action() returns error when VLM server is down."""
         mock_get.side_effect = ConnectionError("Not available")
@@ -843,8 +843,8 @@ class TestVLMAgentContextActions:
 class TestVLMAgentContextWindowsCommand:
     """execute_windows_command() — multi-step Win+R flow."""
 
-    @patch('integrations.vlm.vlm_agent_integration.requests.post')
-    @patch('integrations.vlm.vlm_agent_integration.requests.get')
+    @patch('integrations.vlm.vlm_agent_integration.pooled_post')
+    @patch('integrations.vlm.vlm_agent_integration.pooled_get')
     def test_execute_windows_command(self, mock_get, mock_post):
         """Windows command executes 4 steps: Win+R, wait, type, Return."""
         mock_get.return_value = _make_health_ok()
@@ -866,8 +866,8 @@ class TestVLMAgentContextWindowsCommand:
         # 4 actions tracked in history
         assert len(ctx.action_history) == 4
 
-    @patch('integrations.vlm.vlm_agent_integration.requests.post')
-    @patch('integrations.vlm.vlm_agent_integration.requests.get')
+    @patch('integrations.vlm.vlm_agent_integration.pooled_post')
+    @patch('integrations.vlm.vlm_agent_integration.pooled_get')
     def test_execute_windows_command_step_failure(self, mock_get, mock_post):
         """If any step fails, command returns error with partial results."""
         mock_get.return_value = _make_health_ok()
@@ -915,8 +915,8 @@ class TestVLMAgentContextHistory:
         assert ctx.action_history[0]['action'] == 'action_5'
         assert ctx.action_history[-1]['action'] == 'action_54'
 
-    @patch('integrations.vlm.vlm_agent_integration.requests.post')
-    @patch('integrations.vlm.vlm_agent_integration.requests.get')
+    @patch('integrations.vlm.vlm_agent_integration.pooled_post')
+    @patch('integrations.vlm.vlm_agent_integration.pooled_get')
     def test_screen_history_limit(self, mock_get, mock_post, mock_omniparser_response):
         """Screen history is capped at 10 entries."""
         mock_get.return_value = _make_health_ok()
@@ -939,8 +939,8 @@ class TestVLMAgentContextHistory:
 class TestVLMAgentContextFeedbackAndTools:
     """get_visual_feedback_for_task() and create_vlm_enabled_tool()."""
 
-    @patch('integrations.vlm.vlm_agent_integration.requests.post')
-    @patch('integrations.vlm.vlm_agent_integration.requests.get')
+    @patch('integrations.vlm.vlm_agent_integration.pooled_post')
+    @patch('integrations.vlm.vlm_agent_integration.pooled_get')
     def test_get_visual_feedback(self, mock_get, mock_post, mock_omniparser_response):
         """Visual feedback generates descriptive text."""
         mock_get.return_value = _make_health_ok()
@@ -968,7 +968,7 @@ class TestVLMAgentContextFeedbackAndTools:
         assert "1920x1080" in feedback
         assert "left_click" in feedback
 
-    @patch('integrations.vlm.vlm_agent_integration.requests.get')
+    @patch('integrations.vlm.vlm_agent_integration.pooled_get')
     def test_get_visual_feedback_unavailable(self, mock_get):
         """Feedback returns unavailable message when VLM is down."""
         mock_get.side_effect = ConnectionError("down")
@@ -998,7 +998,7 @@ class TestVLMAgentContextFeedbackAndTools:
         assert 'hotkey' in action_enum
         assert 'scroll_up' in action_enum
 
-    @patch('integrations.vlm.vlm_agent_integration.requests.get')
+    @patch('integrations.vlm.vlm_agent_integration.pooled_get')
     def test_status_summary(self, mock_get):
         """get_status_summary() includes all expected keys."""
         mock_get.return_value = _make_health_ok()

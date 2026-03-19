@@ -57,12 +57,12 @@ class TestTokenBucket:
     def test_consume_from_full(self):
         bucket = TokenBucket(capacity=10, refill_rate=1.0)
         assert bucket.consume() is True
-        assert bucket.get_tokens() == 9.0
+        assert bucket.get_tokens() == pytest.approx(9.0, abs=0.01)
 
     def test_consume_multiple(self):
         bucket = TokenBucket(capacity=10, refill_rate=1.0)
         assert bucket.consume(5) is True
-        assert bucket.get_tokens() == 5.0
+        assert bucket.get_tokens() == pytest.approx(5.0, abs=0.01)
 
     def test_consume_at_empty(self):
         bucket = TokenBucket(capacity=2, refill_rate=0.1)

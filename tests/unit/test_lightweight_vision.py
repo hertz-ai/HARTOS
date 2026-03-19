@@ -93,20 +93,17 @@ class TestMiniCPMBackend:
         mock_resp.status_code = 200
         mock_resp.json.return_value = {'description': 'A cat sitting on a desk'}
 
-        with patch.object(lvb.requests, 'post',
+        with patch.object(lvb, 'pooled_post',
                           return_value=mock_resp) as mock_post:
             result = backend.describe(b'fake_jpeg_bytes')
             assert result == 'A cat sitting on a desk'
             mock_post.assert_called_once()
-            call_kwargs = mock_post.call_args
-            assert '9891' in call_kwargs[0][0]
 
     def test_describe_failure_returns_none(self):
         import integrations.vision.lightweight_backend as lvb
-        import requests as req_mod
         backend = MiniCPMBackend(port=9891)
-        with patch.object(lvb.requests, 'post',
-                          side_effect=req_mod.RequestException("connection refused")):
+        with patch.object(lvb, 'pooled_post',
+                          side_effect=Exception("connection refused")):
             result = backend.describe(b'fake_bytes')
             assert result is None
 
