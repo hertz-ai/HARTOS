@@ -96,11 +96,11 @@ class TestHARTTag(unittest.TestCase):
 
     def test_build_tag(self):
         tag = build_hart_tag('neon', 'owl', 'lumira')
-        self.assertEqual(tag, '@neon.owl.lumira')
+        self.assertEqual(tag, '@owl.lumira.neon')
 
     def test_build_tag_all_lower(self):
         tag = build_hart_tag('iron', 'wolf', 'synthar')
-        self.assertEqual(tag, '@iron.wolf.synthar')
+        self.assertEqual(tag, '@wolf.synthar.iron')
 
     def test_tag_format_consistent(self):
         tag = build_hart_tag('ember', 'dolphin', 'auren')
