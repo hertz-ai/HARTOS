@@ -614,7 +614,7 @@ class AgentDaemon:
                     for k in stale_backoff:
                         del _dispatch_backoff[k]
                     stale_budget = _budget_blocked_goals - active_goal_ids
-                    _budget_blocked_goals -= stale_budget
+                    _budget_blocked_goals.difference_update(stale_budget)
                     # _hitl_notified: keep entries to avoid re-notifying on restart,
                     # but cap size to prevent unbounded growth
                     if len(_hitl_notified) > 10000:
