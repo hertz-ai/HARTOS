@@ -863,3 +863,179 @@ def verify_pledge(escrow_id):
         'capacity': capacity_details,
         'escrow': escrow.to_dict(),
     })
+
+
+# ── Hive View Endpoints (extend tracker, no separate blueprint) ──────
+
+
+@tracker_bp.route('/experiments/<post_id>/inject', methods=['POST'])
+@require_auth
+def inject_variable(post_id):
+    """God's-eye variable injection — push new context into a running agent."""
+    data = request.get_json(silent=True) or {}
+    variable = data.get('variable', '')
+    injection_type = data.get('injection_type', 'info')  # constraint | info | question
+
+    if not variable:
+        return _err('variable is required', 400)
+
+    goal = _get_goal_for_post(g.db, post_id)
+    if not goal:
+        return _err('No active agent for this experiment', 404)
+
+    try:
+        from integrations.channels.memory.memory_graph import MemoryGraph
+        session_key = f"{goal.owner_id}_{goal.prompt_id}" if goal.prompt_id else str(goal.owner_id)
+        try:
+            from core.platform_paths import get_memory_graph_dir
+            db_path = get_memory_graph_dir(session_key)
+        except ImportError:
+            db_path = os.path.join(
+                os.path.expanduser("~"), "Documents", "Nunba", "data",
+                "memory_graph", session_key)
+        os.makedirs(db_path, exist_ok=True)
+        graph = MemoryGraph(db_path=db_path, user_id=str(goal.owner_id))
+        memory_id = graph.register(
+            content=f"[INJECTED {injection_type.upper()}] {variable}",
+            metadata={
+                'memory_type': 'injection', 'injection_type': injection_type,
+                'source_agent': 'god_eye', 'session_id': session_key,
+                'injected_by': g.user_id,
+                'injected_at': datetime.utcnow().isoformat(),
+            },
+            context_snapshot=f"God's-eye {injection_type} injection during experiment",
+        )
+
+        # Notify live UIs
+        try:
+            from .realtime import publish_event
+            publish_event('chat.social', {
+                'type': 'hive_injection', 'goal_id': goal.id,
+                'injection_type': injection_type, 'variable': variable[:200],
+            }, user_id=goal.owner_id)
+        except Exception:
+            pass
+
+        return _ok({'memory_id': memory_id, 'injection_type': injection_type,
+                     'message': f'{injection_type.capitalize()} injected into agent context.'})
+    except Exception as e:
+        logger.error("Variable injection failed: %s", e)
+        return _err(str(e), 500)
+
+
+@tracker_bp.route('/experiments/<post_id>/interview', methods=['POST'])
+@require_auth
+def interview_agent(post_id):
+    """Post-experiment agent interview — ask any agent about its reasoning."""
+    data = request.get_json(silent=True) or {}
+    question = data.get('question', '')
+    if not question:
+        return _err('question is required', 400)
+
+    goal = _get_goal_for_post(g.db, post_id)
+    if not goal:
+        return _err('No agent for this experiment', 404)
+
+    try:
+        from core.http_pool import pooled_post
+        from core.port_registry import get_port
+        chat_url = f"http://localhost:{get_port('backend')}/chat"
+
+        interview_prompt = (
+            f"[INTERVIEW MODE — You are being asked about your reasoning on the experiment "
+            f"'{goal.title}'. Reflect on your work and explain your thought process.]\n\n"
+            f"Question: {question}"
+        )
+
+        resp = pooled_post(chat_url, json={
+            'user_id': goal.owner_id,
+            'prompt_id': goal.prompt_id or 0,
+            'prompt': interview_prompt,
+        }, timeout=60)
+
+        if resp.status_code == 200:
+            result = resp.json()
+            return _ok({'question': question, 'answer': result.get('response', 'No response.'),
+                         'goal_id': goal.id})
+        else:
+            return _err(f'Agent returned {resp.status_code}', 502)
+    except Exception as e:
+        logger.error("Agent interview failed: %s", e)
+        return _err(str(e), 500)
+
+
+@tracker_bp.route('/dual-context', methods=['POST'])
+@require_auth
+def launch_dual_context():
+    """Clone an experiment into N parallel contexts with different overrides."""
+    import uuid as _uuid
+    from .models import AgentGoal
+
+    data = request.get_json(silent=True) or {}
+    source_post_id = data.get('post_id')
+    contexts = data.get('contexts', [])
+
+    if not source_post_id or not contexts or len(contexts) < 2:
+        return _err('post_id and at least 2 contexts required', 400)
+
+    source_goal = _get_goal_for_post(g.db, source_post_id)
+    if not source_goal:
+        return _err('No agent for this experiment', 404)
+
+    new_goals = []
+    for ctx in contexts:
+        new_id = str(_uuid.uuid4())[:16]
+        cfg = dict(source_goal.config_json or {})
+        cfg['dual_context_label'] = ctx.get('label', 'variant')
+        cfg['system_prompt_override'] = ctx.get('system_prompt_override', '')
+        cfg['source_goal_id'] = source_goal.id
+
+        new_goal = AgentGoal(
+            id=new_id, owner_id=source_goal.owner_id,
+            goal_type=source_goal.goal_type,
+            title=f"{source_goal.title} [{ctx.get('label', 'variant')}]",
+            description=source_goal.description,
+            status='active', priority=source_goal.priority,
+            config_json=cfg, spark_budget=source_goal.spark_budget,
+            created_by=g.user_id,
+        )
+        g.db.add(new_goal)
+        new_goals.append({'goal_id': new_id, 'label': ctx.get('label', 'variant'), 'status': 'active'})
+
+    g.db.flush()
+    return jsonify({'success': True, 'data': {
+        'source_post_id': source_post_id, 'contexts': new_goals,
+        'message': f'{len(new_goals)} parallel contexts launched.',
+    }}), 201
+
+
+@tracker_bp.route('/encounters', methods=['GET'])
+@require_auth
+def get_encounter_graph():
+    """Agent collaboration graph from Encounter data."""
+    try:
+        from .models import Encounter
+        encounters = g.db.query(Encounter).filter(
+            Encounter.bond_level > 0,
+        ).order_by(Encounter.latest_at.desc()).limit(200).all()
+
+        user_ids = set()
+        for e in encounters:
+            user_ids.add(e.user_a_id)
+            user_ids.add(e.user_b_id)
+
+        users = {}
+        if user_ids:
+            user_rows = g.db.query(User).filter(User.id.in_(list(user_ids))).all()
+            users = {u.id: {'id': u.id, 'name': u.display_name or u.username,
+                            'type': getattr(u, 'user_type', 'human')} for u in user_rows}
+
+        return _ok({
+            'nodes': list(users.values()),
+            'edges': [{'source': e.user_a_id, 'target': e.user_b_id,
+                        'bond_level': e.bond_level, 'encounter_count': e.encounter_count,
+                        'context_type': e.context_type} for e in encounters],
+        })
+    except Exception as e:
+        logger.error("Encounter graph failed: %s", e)
+        return _err(str(e), 500)

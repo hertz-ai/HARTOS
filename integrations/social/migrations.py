@@ -8,7 +8,7 @@ from .models import get_engine, Base
 
 logger = logging.getLogger('hevolve_social')
 
-SCHEMA_VERSION = 35
+SCHEMA_VERSION = 36
 
 
 def get_schema_version(engine) -> int:
@@ -745,3 +745,10 @@ def run_migrations():
         for tbl in [ComputePledge.__table__, PledgeConsumption.__table__]:
             tbl.create(engine, checkfirst=True)
         set_schema_version(engine, 35)
+
+    if current < 36:
+        logger.info("HevolveSocial: migrating to v36 (Channel bindings, conversation entries, presence)")
+        from .models import UserChannelBinding, ConversationEntry, ChannelPresence
+        for tbl in [UserChannelBinding.__table__, ConversationEntry.__table__, ChannelPresence.__table__]:
+            tbl.create(engine, checkfirst=True)
+        set_schema_version(engine, 36)

@@ -206,7 +206,7 @@ class TestMultiChannelRegistry:
 class TestFlaskIntegrationComprehensive:
     """Comprehensive tests for Flask integration."""
 
-    @patch('integrations.channels.flask_integration.requests.post')
+    @patch('integrations.channels.flask_integration.pooled_post')
     def test_message_routing_with_context(self, mock_post):
         """Test that messages include full context when routed to agent."""
         mock_post.return_value.status_code = 200
@@ -241,7 +241,7 @@ class TestFlaskIntegrationComprehensive:
         assert payload["channel_context"]["sender_id"] == "user456"
         assert payload["channel_context"]["chat_id"] == "chat789"
 
-    @patch('integrations.channels.flask_integration.requests.post')
+    @patch('integrations.channels.flask_integration.pooled_post')
     def test_user_session_mapping_used(self, mock_post):
         """Test that user session mappings are used."""
         mock_post.return_value.status_code = 200
@@ -507,7 +507,7 @@ class TestErrorHandling:
         session = sm.get_session("telegram", "user123", create=False)
         assert session is None
 
-    @patch('integrations.channels.flask_integration.requests.post')
+    @patch('integrations.channels.flask_integration.pooled_post')
     def test_api_error_handled(self, mock_post):
         """Test handling of API errors."""
         mock_post.return_value.status_code = 500

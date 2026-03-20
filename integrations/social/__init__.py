@@ -112,6 +112,14 @@ def init_social(app):
     except Exception as e:
         logger.debug(f"HevolveSocial admin blueprint skipped: {e}")
 
+    # Register user-facing channel bindings API (catalog, bindings, pairing, presence)
+    try:
+        from .api_channels import channel_user_bp
+        app.register_blueprint(channel_user_bp)
+        logger.info("HevolveSocial channel user API registered at /api/social/channels/")
+    except Exception as e:
+        logger.debug(f"HevolveSocial channel user blueprint skipped: {e}")
+
     # Register agent dashboard blueprint (truth-grounded unified agent view)
     try:
         from .api_dashboard import dashboard_bp

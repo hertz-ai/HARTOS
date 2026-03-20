@@ -962,6 +962,246 @@ def build_core_tool_closures(ctx):
         device_control,
     ))
 
+    # ------------------------------------------------------------------
+    # data_extraction_from_url — Parity with LangChain Data_Extraction_From_URL
+    # ------------------------------------------------------------------
+    @log_tool_execution
+    def data_extraction_from_url(
+        url: Annotated[str, "The URL to extract content from"],
+        url_type: Annotated[str, "Type of URL: 'pdf' or 'website'"] = "website",
+    ) -> str:
+        """Extract content from a URL (PDF or website). Uses Crawl4AI or direct parsing."""
+        try:
+            from threadlocal import thread_local_data as _tld
+            _uid = _tld.get_user_id() if hasattr(_tld, 'get_user_id') else user_id
+            _rid = _tld.get_request_id() if hasattr(_tld, 'get_request_id') else None
+
+            # Try Crawl4AI service first
+            try:
+                from integrations.service_tools import service_tool_registry
+                crawl_tool = service_tool_registry.get_tool('Crawl4AI')
+                if crawl_tool:
+                    result = crawl_tool.execute(url)
+                    if result:
+                        return f"Extracted from {url}:\n{str(result)[:5000]}"
+            except Exception:
+                pass
+
+            # Fallback: direct requests
+            import requests as _req
+            resp = _req.get(url, timeout=30, headers={'User-Agent': 'Mozilla/5.0'})
+            if url_type == 'pdf':
+                return f"PDF downloaded ({len(resp.content)} bytes). Use a PDF parser for full extraction."
+            text = resp.text[:5000]
+            # Strip HTML tags naively
+            import re
+            text = re.sub(r'<[^>]+>', ' ', text)
+            text = re.sub(r'\s+', ' ', text).strip()
+            return f"Extracted from {url}:\n{text[:4000]}"
+        except Exception as e:
+            return f"URL extraction failed: {e}"
+
+    tools.append((
+        "data_extraction_from_url",
+        "Extract content from a URL (PDF or website). Input: URL and type ('pdf' or 'website'). "
+        "Uses Crawl4AI for rich extraction with fallback to direct HTTP fetch.",
+        data_extraction_from_url,
+    ))
+
+    # ------------------------------------------------------------------
+    # get_user_details — Parity with LangChain User_details_tool
+    # ------------------------------------------------------------------
+    @log_tool_execution
+    def get_user_details() -> str:
+        """Get current user's profile details."""
+        try:
+            uid = user_id
+            # Try local DB first
+            try:
+                from integrations.social.models import get_db, User
+                db = get_db()
+                try:
+                    user = db.query(User).filter_by(id=str(uid)).first()
+                    if user:
+                        return json.dumps(user.to_dict(), default=str)
+                finally:
+                    db.close()
+            except Exception:
+                pass
+
+            # Fallback: cloud API
+            import requests as _req
+            resp = _req.post(
+                'https://azurekong.hertzai.com:8443/db/getstudent_by_user_id',
+                json={'user_id': uid}, timeout=10,
+            )
+            return f"User details: {resp.text}"
+        except Exception as e:
+            return f"Could not fetch user details: {e}"
+
+    tools.append((
+        "get_user_details",
+        "Get the current user's profile information (name, email, preferences, etc.). "
+        "Use when the user asks about their profile or when you need user context.",
+        get_user_details,
+    ))
+
+    # ------------------------------------------------------------------
+    # request_resource — Parity with LangChain Request_Resource
+    # ------------------------------------------------------------------
+    @log_tool_execution
+    def request_resource(
+        resource_description: Annotated[str, "JSON or plain text describing the needed resource. JSON format: {\"resource_type\": \"api_key\", \"key_name\": \"GOOGLE_API_KEY\", \"label\": \"Google API Key\", \"used_by\": \"search tool\", \"description\": \"needed for web search\"}"],
+    ) -> str:
+        """Request an API key, credential, token, or config value that is not currently available."""
+        try:
+            try:
+                req = json.loads(resource_description)
+            except (ValueError, TypeError):
+                req = {
+                    'resource_type': 'api_key',
+                    'key_name': 'UNKNOWN',
+                    'label': resource_description[:100],
+                    'description': resource_description,
+                    'used_by': 'Agent tool',
+                }
+
+            key_name = req.get('key_name', 'UNKNOWN')
+            resource_type = req.get('resource_type', 'api_key')
+
+            # Check env vars first
+            env_val = os.environ.get(key_name)
+            if env_val:
+                return f"Resource '{key_name}' is already configured and available."
+
+            # Check vault
+            try:
+                from desktop.ai_key_vault import AIKeyVault
+                vault = AIKeyVault.get_instance()
+                val = vault.get_tool_key(key_name) if resource_type != 'channel_secret' else vault.get_channel_secret(req.get('channel_type', ''), key_name)
+                if val:
+                    os.environ[key_name] = val
+                    return f"Resource '{key_name}' loaded from vault and is now available."
+            except Exception:
+                pass
+
+            # Track as pending and request from user
+            try:
+                from desktop.ai_key_vault import AIKeyVault
+                AIKeyVault.get_instance().add_pending_request(
+                    key_name=key_name, resource_type=resource_type,
+                    channel_type=req.get('channel_type', ''),
+                    label=req.get('label', key_name),
+                    description=req.get('description', ''),
+                    used_by=req.get('used_by', 'Agent tool'),
+                )
+            except Exception:
+                pass
+
+            secret_request = json.dumps({
+                '__SECRET_REQUEST__': True, 'type': resource_type,
+                'key_name': key_name, 'label': req.get('label', key_name),
+                'description': req.get('description', f'{key_name} is required.'),
+                'used_by': req.get('used_by', 'Agent tool'),
+                'channel_type': req.get('channel_type', ''),
+            })
+            return (
+                f"I need the user to provide '{req.get('label', key_name)}'. "
+                f"Required for {req.get('used_by', 'a tool')}. "
+                f"{req.get('description', '')} "
+                f"RESOURCE_REQUEST:{secret_request}"
+            )
+        except Exception as e:
+            return f"Resource request failed: {e}"
+
+    tools.append((
+        "request_resource",
+        "Request an API key, credential, token, or config value. Checks vault/env first, "
+        "then prompts the user if not found. Handles: API keys (OpenAI, Google, Slack), "
+        "OAuth tokens, channel secrets, service credentials. "
+        "Input: JSON with resource_type, key_name, label, used_by, description.",
+        request_resource,
+    ))
+
+    # ------------------------------------------------------------------
+    # observe_user_experience — Parity with LangChain Observe_User_Experience
+    # ------------------------------------------------------------------
+    @log_tool_execution
+    def observe_user_experience(
+        event: Annotated[str, "What happened (e.g. 'clicked', 'scrolled', 'left page')"],
+        page: Annotated[str, "Which page or screen"] = "",
+        outcome: Annotated[str, "What was the result or user reaction"] = "",
+        duration_ms: Annotated[int, "How long the interaction lasted in ms"] = 0,
+    ) -> str:
+        """Record a user experience observation for self-improvement."""
+        observation = f"User {event} on {page} ({duration_ms}ms): {outcome}"
+        try:
+            if memory_graph:
+                session_id = f"{user_id}_{prompt_id}" if prompt_id else str(user_id)
+                mid = memory_graph.register(
+                    content=observation,
+                    metadata={'memory_type': 'observation', 'source_agent': 'agent',
+                              'session_id': session_id, 'page': page, 'event': event},
+                    context_snapshot=f"UX observation during session {session_id}",
+                )
+                return f"Observation recorded (id: {mid}): {observation}"
+        except Exception:
+            pass
+        return f"Observation noted: {observation}"
+
+    tools.append((
+        "observe_user_experience",
+        "Record a user experience observation. Use to track behavior patterns "
+        "for self-improvement. Input: event, page, outcome, duration_ms.",
+        observe_user_experience,
+    ))
+
+    # ------------------------------------------------------------------
+    # self_critique_and_enhance — Parity with LangChain Self_Critique_And_Enhance
+    # ------------------------------------------------------------------
+    @log_tool_execution
+    def self_critique_and_enhance(
+        topic: Annotated[str, "Topic or area to critique (e.g. 'my recommendations', 'search quality')"] = "",
+    ) -> str:
+        """Review past agent suggestions and user observations to improve future behavior."""
+        try:
+            if not memory_graph:
+                return "Self-critique unavailable: no memory graph for this session."
+
+            suggestions = memory_graph.recall(topic or 'suggestions made outcomes', mode='semantic', top_k=10)
+            observations = memory_graph.recall('user experience observation', mode='semantic', top_k=10)
+
+            if not suggestions and not observations:
+                return "No past interactions to critique yet. Will observe and learn."
+
+            critique = "Self-critique findings:\n"
+            if suggestions:
+                critique += f"Past suggestions ({len(suggestions)}):\n"
+                for s in suggestions[:5]:
+                    critique += f"  - {s.content[:100]}\n"
+            if observations:
+                critique += f"User observations ({len(observations)}):\n"
+                for o in observations[:5]:
+                    critique += f"  - {o.content[:100]}\n"
+
+            session_id = f"{user_id}_{prompt_id}" if prompt_id else str(user_id)
+            memory_graph.register(
+                content=f"Self-critique on: {topic}",
+                metadata={'memory_type': 'insight', 'source_agent': 'agent',
+                          'session_id': session_id, 'type': 'self_critique'},
+                context_snapshot=f"Self-critique during session {session_id}",
+            )
+            return critique
+        except Exception as e:
+            return f"Self-critique unavailable: {e}"
+
+    tools.append((
+        "self_critique_and_enhance",
+        "Review past agent suggestions and user behavior observations to improve "
+        "future recommendations. Input: topic or area to critique.",
+        self_critique_and_enhance,
+    ))
+
     return tools
 
 

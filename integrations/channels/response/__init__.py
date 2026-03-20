@@ -42,6 +42,11 @@ from .streaming import (
     create_streaming_response,
 )
 
+from .router import (
+    ChannelResponseRouter,
+    get_response_router,
+)
+
 __all__ = [
     # Typing
     "TypingManager",
@@ -69,4 +74,7 @@ __all__ = [
     "ProgressIndicator",
     "PLATFORM_CAPABILITIES",
     "create_streaming_response",
+    # Router
+    "ChannelResponseRouter",
+    "get_response_router",
 ]

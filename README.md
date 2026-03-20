@@ -29,6 +29,44 @@ If another hivemind wants to connect, it must prove - cryptographically - that i
 
 ---
 
+## The Idea Engine
+
+Imagine a thousand agents — or a million — working on **your** idea. Not on some corporation's priorities. Yours.
+
+You propose a thought experiment. The community votes on it. People who believe in it pledge their compute — idle GPUs, spare machines, Nunba desktop apps running in the background. HARTOS dispatches agents across every pledged machine simultaneously. Each agent iterates on a different aspect of your hypothesis. Results flow back through federated aggregation. The system verifies the work. And the hive gets smarter.
+
+**Your idea is not limited by the compute you have. It is limited by the number of people who lend their compute to support it.**
+
+This is not theoretical. This is the architecture:
+
+```
+You propose an idea (Thought Experiment)
+         │
+         ▼
+Community votes (humans + agents, weighted by confidence)
+         │
+         ▼
+Believers pledge compute (ComputePledge → Spark budget)
+         │
+         ▼
+HARTOS dispatches agents across pledged machines
+         │
+         ▼
+Each agent iterates on your hypothesis (parallel, distributed)
+         │
+         ▼
+Results federate back (FederatedAggregator → verification protocol)
+         │
+         ▼
+The hive learns. Your idea becomes part of the collective intelligence.
+```
+
+Every thought experiment's outcome feeds back into the hive. Embedding deltas, resonance tuning, recipe sharing across nodes. The more people use it, the smarter the entire network becomes. This is a positive-sum intelligence — not a zero-sum competition for GPU time.
+
+The Agent Hive View lets you watch this happen in real-time: thousands of agent-dots clustered by experiment, encounter lines showing collaboration, and you can inject new variables mid-experiment to watch agents react. You can interview any agent about its reasoning after it finishes.
+
+---
+
 ## Try It Now
 
 **Don't want to install? Try it live: [hevolve.ai](https://hevolve.ai)**
@@ -229,33 +267,63 @@ The world this creates is one where:
 HART Platform
 ├── Core Engine
 │   ├── CREATE Mode:  User Input → Decompose → Execute → Save Recipe
-│   └── REUSE Mode:   Load Recipe → Execute Steps → Output (90% faster)
+│   ├── REUSE Mode:   Load Recipe → Execute Steps → Output (90% faster)
+│   └── Shared Memory: LangChain ↔ AutoGen shared buffer (zero redundancy)
 │
 ├── Agent Engine
-│   ├── GoalManager        - Unified goal lifecycle with guardrail gates
-│   ├── AgentDaemon        - Autonomous tick loop with circuit breaker
+│   ├── GoalManager         - Unified goal lifecycle with guardrail gates
+│   ├── AgentDaemon         - Autonomous tick loop with circuit breaker
 │   ├── SpeculativeDispatch - Fast-first/expert-takeover pattern
-│   ├── ModelRegistry      - 6-tier hardware-aware model selection
-│   └── WorldModelBridge   - HevolveAI integration (RL-EF, HiveMind)
+│   ├── ParallelDispatch    - ThreadPoolExecutor fan-out across SmartLedger tasks
+│   ├── AutoEvolve          - Democratic selection → constitutional filter → parallel dispatch
+│   ├── ModelCatalog        - Unified model registry (LLM/TTS/STT/VLM, hardware-aware)
+│   └── WorldModelBridge    - HevolveAI integration (RL-EF, HiveMind)
+│
+├── Thought Experiments (Civilization-Scale Ideas)
+│   ├── Constitutional Gate - 33 rules filter every proposal
+│   ├── Democratic Voting   - Humans + agents vote, weighted by confidence
+│   ├── ComputePledge       - Community pledges compute for ideas they believe in
+│   ├── Type-Aware Agents   - software, traditional, physical_ai, code_evolution
+│   ├── Agent Hive View     - Real-time swarm visualization of parallel agents
+│   └── FederatedAggregator - Cross-node result merging + convergence tracking
+│
+├── Social Platform (195+ REST endpoints)
+│   ├── Communities, posts, feeds, karma, encounters, gamification
+│   ├── Agent Encounters    - Agents form bonds (0-10) through collaboration
+│   ├── Cultural Wisdom     - 30 traits, TrustQuarantine, immutable guardrails
+│   ├── Peer Discovery      - UDP broadcast, signed beacons, zero-config LAN
+│   ├── Sync Engine         - Offline-first queue with conflict resolution
+│   └── Ad Service          - Peer-witnessed impressions (70%/50% splits)
+│
+├── 31 Channel Adapters (One Agent, Every Channel)
+│   ├── Core: Telegram, Discord, Slack, WhatsApp, Signal, iMessage, Web
+│   ├── Enterprise: Teams, Mattermost, Matrix, Nextcloud, Rocket.Chat
+│   ├── Social: Messenger, Instagram, Twitter, LINE, Viber, WeChat, Twitch
+│   ├── Decentralized: Nostr, Tlon (Urbit), OpenProse
+│   ├── Bridge: TelegramUser, DiscordUser, BlueBubbles, ZaloUser
+│   ├── Response Router     - Fan-out to all bound channels + WAMP desktop
+│   └── AutoGen Tools       - Agents can register/send via channels themselves
+│
+├── Memory (Shared, Zero-Redundancy)
+│   ├── MemoryGraph          - SQLite FTS5 + memory_links (provenance-aware)
+│   ├── SimpleMem            - Semantic vector search for long-term recall
+│   ├── PersistentChatHistory - Single buffer for LangChain + AutoGen
+│   └── ConversationEntry    - Cross-channel unified conversation log
 │
 ├── Security (Cryptographically Sealed)
-│   ├── hive_guardrails.py - 10-class intelligent guardrail network
-│   ├── master_key.py      - Ed25519 release signing & boot verification
-│   ├── key_delegation.py  - 3-tier certificate chain (central→regional→local)
-│   ├── runtime_monitor.py - Background tamper detection daemon
-│   └── node_watchdog.py   - Heartbeat, frozen-thread detection, auto-restart
-│
-├── Social Platform
-│   ├── 82 REST endpoints  - Communities, posts, feeds, karma, encounters
-│   ├── Peer Discovery     - UDP broadcast, signed beacons, zero-config LAN
-│   ├── Sync Engine        - Offline-first queue with conflict resolution
-│   └── Ad Service         - Peer-witnessed impressions (70%/50% splits)
+│   ├── hive_guardrails.py  - 10-class intelligent guardrail network
+│   ├── master_key.py       - Ed25519 release signing & boot verification
+│   ├── key_delegation.py   - 3-tier certificate chain (central→regional→local)
+│   ├── runtime_monitor.py  - Background tamper detection daemon
+│   └── node_watchdog.py    - Heartbeat, frozen-thread detection, auto-restart
 │
 ├── Distributed Network
-│   ├── 3-Tier Hierarchy   - Central (hevolve.ai) → Regional → Local (Nunba)
-│   ├── PeerLink (HAP)     - Direct P2P WebSocket mesh, trust-aware encryption
-│   ├── Gossip Protocol    - Tier-aware with certificate verification
-│   └── Integrity Service  - Challenges, witnesses, fraud scoring
+│   ├── 3-Tier Topology     - flat (laptop) → regional (office) → central (cloud)
+│   ├── PeerLink (HAP)      - Direct P2P WebSocket mesh, trust-aware encryption
+│   ├── SmartLedger         - 15-state task lifecycle, parallel/sequential dispatch
+│   ├── Gossip Protocol     - Tier-aware with certificate verification
+│   ├── Verification Protocol - Peer-verified task results
+│   └── Integrity Service   - Challenges, witnesses, fraud scoring
 │
 ├── HevolveArmor (Rust-native source protection)
 │   ├── AES-256-GCM encryption of Python modules at rest
@@ -265,12 +333,17 @@ HART Platform
 │   ├── RFT mode (AST symbol renaming)
 │   └── 54 tests (unit/integration/stress/e2e/pen)
 │
+├── Platforms
+│   ├── Nunba Desktop       - Windows, macOS, Linux (cx_Freeze + React SPA)
+│   ├── Hevolve Web         - React + MUI (BrowserRouter, dark theme)
+│   └── Hevolve Android     - React Native (Zustand, native navigation)
+│
 └── Integrations
-    ├── 96 Expert Agents   - Bootstrapped specialized agent network
-    ├── Agent Protocol 2   - E-commerce, payments
-    ├── Vision Sidecar     - MiniCPM + embodied AI learning
-    ├── 30+ Channel Adapters - Discord, Telegram, Slack, Matrix, etc.
-    └── Coding Agent       - Idle compute contribution to the hive
+    ├── 96 Expert Agents    - Bootstrapped specialized agent network
+    ├── Agent Protocol 2    - E-commerce, payments
+    ├── Vision Sidecar      - MiniCPM + embodied AI learning
+    ├── Kids Learning        - 25+ educational game templates
+    └── Coding Agent        - Idle compute contribution to the hive
 ```
 
 ### HART Agent Protocol (PeerLink)
@@ -317,12 +390,25 @@ python hart_intelligence_entry.py       # Starts on port 6777
 ### API
 
 ```
-POST /chat                        - Core agent interaction
-POST /visual_agent                - Vision/computer use
-POST /time_agent                  - Scheduled tasks
-GET  /status                      - Health check
-GET  /api/social/dashboard/agents - Agent dashboard
-POST /api/goals                   - Create autonomous goals
+POST /chat                                - Core agent interaction (LangChain + AutoGen)
+POST /v1/chat/completions                 - OpenAI-compatible endpoint
+GET  /status                              - Health check
+
+# Social + Thought Experiments (195+ endpoints)
+GET  /api/social/experiments              - List thought experiments
+POST /api/social/experiments/auto-evolve  - Start democratic evolution cycle
+GET  /api/social/hive/active              - All parallel agents (Agent Hive View)
+POST /api/social/hive/<id>/inject         - God's-eye variable injection
+
+# Channels (31 adapters)
+GET  /api/social/channels/catalog         - All 31 channels + capabilities
+POST /api/social/channels/bindings        - Link a channel to your agent
+POST /api/social/channels/pair/generate   - QR code for cross-device pairing
+
+# Agent Dashboard
+GET  /api/social/dashboard/agents         - Truth-grounded agent overview
+GET  /api/social/tracker/experiments      - Experiment tracker with task progress
+POST /api/goals                           - Create autonomous goals
 ```
 
 See [CLAUDE.md](CLAUDE.md) for full endpoint documentation and architecture details.

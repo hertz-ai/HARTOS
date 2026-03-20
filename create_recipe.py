@@ -899,6 +899,13 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     register_core_tools(core_tools, helper, assistant)
     register_memory_graph_tools(memory_graph, helper, assistant, user_id, user_prompt)
 
+    # Channel tools: send to channels, register channels, list status, get context
+    try:
+        from integrations.channels.agent_tools import register_channel_tools
+        register_channel_tools(helper, assistant, _tool_ctx)
+    except Exception as e:
+        tool_logger.debug(f"Channel tools registration skipped: {e}")
+
 
     # Unified media generation tools (already DRY)
     try:
@@ -2134,9 +2141,16 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     )
 
     # Try to use select_speaker_transform_messages if supported (added in AutoGen 0.2.36+)
+    # Seed autogen with recent messages from shared LangChain/autogen buffer
+    try:
+        from integrations.channels.memory.shared_history import seed_autogen_from_shared_history
+        _seed_msgs = seed_autogen_from_shared_history(user_id, max_messages=8)
+    except Exception:
+        _seed_msgs = []
+
     group_chat_kwargs = {
         'agents': all_agents,
-        'messages': [],
+        'messages': _seed_msgs,
         'max_round': 30,
         'select_speaker_prompt_template': f"Read the above conversation, select the next person from [Assistant, Helper, Executor, ChatInstructor, StatusVerifier & User] & only return the role as agent. Return User only if the previous message demands it",
         'speaker_selection_method': state_transition,  # using an LLM to decide
@@ -2163,24 +2177,45 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         llm_config={"config_list": config_list,"cache_seed": None,"max_tokens": 1500}
     )
 
-    # Auto-ingest group_chat messages into SimpleMem
-    if simplemem_store is not None:
-        _original_append = group_chat.messages.append
-        def _simplemem_ingest_hook(msg):
-            _original_append(msg)
+    # Auto-ingest group_chat messages into SimpleMem + shared LangChain buffer
+    _original_append = group_chat.messages.append
+    def _unified_ingest_hook(msg):
+        _original_append(msg)
+        if isinstance(msg, dict) and msg.get('_from_shared'):
+            return  # seeded message, already in buffer
+        content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+        if not content or len(content.strip()) <= 5 or content == 'TERMINATE':
+            return
+        speaker = msg.get("name", "Agent") if isinstance(msg, dict) else "Agent"
+        # SimpleMem ingest
+        if simplemem_store is not None:
             try:
-                content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
-                speaker = msg.get("name", "Agent") if isinstance(msg, dict) else "Agent"
-                if content and len(content.strip()) > 5:
-                    loop = get_or_create_event_loop()
-                    loop.run_until_complete(simplemem_store.add(content, {
-                        "sender_name": speaker,
-                        "user_id": user_id,
-                        "prompt_id": prompt_id,
-                    }))
+                loop = get_or_create_event_loop()
+                loop.run_until_complete(simplemem_store.add(content, {
+                    "sender_name": speaker,
+                    "user_id": user_id,
+                    "prompt_id": prompt_id,
+                }))
             except Exception:
-                pass  # Non-blocking
-        group_chat.messages.append = _simplemem_ingest_hook
+                pass
+        # Shared PersistentChatHistory write-back (dedup-aware)
+        try:
+            from integrations.channels.memory.shared_history import _get_persistent_history
+            hist = _get_persistent_history(user_id)
+            if hist:
+                from langchain_core.messages import HumanMessage, AIMessage
+                role = msg.get("role", "assistant") if isinstance(msg, dict) else "assistant"
+                lc_msg = HumanMessage(content=content) if role == "user" else AIMessage(content=content)
+                last_msgs = hist.messages[-3:] if hist.messages else []
+                if not any(m.content == content for m in last_msgs):
+                    from datetime import datetime
+                    hist.add_message(lc_msg, metadata={
+                        'timestamp': datetime.now().isoformat(),
+                        'source': 'autogen',
+                    })
+        except Exception:
+            pass
+    group_chat.messages.append = _unified_ingest_hook
 
     # Auto-ingest group_chat messages into MemoryGraph (provenance tracking)
     if memory_graph is not None:
@@ -2637,6 +2672,12 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     core_tools_time = build_core_tool_closures(_tool_ctx_time)
     register_core_tools(core_tools_time, helper1, time_agent)
 
+    # Channel tools for time_agent too
+    try:
+        from integrations.channels.agent_tools import register_channel_tools
+        register_channel_tools(helper1, time_agent, _tool_ctx_time)
+    except Exception:
+        pass
 
     context_handling = transform_messages.TransformMessages(
         transforms=[
@@ -2744,7 +2785,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     )
     time_group_chat = autogen.GroupChat(
         agents=[time_agent, helper1, time_user,multi_role_agent1,executor1,chat_instructor1,verify1],
-        messages=[],
+        messages=_seed_msgs,  # shared history seed (same as main group_chat)
         max_round=10,
         select_speaker_transform_messages=select_speaker_transforms,
         speaker_selection_method=state_transition1,  # using an LLM to decide

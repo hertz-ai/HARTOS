@@ -56,6 +56,10 @@ class FlaskChannelIntegration:
         from .session_manager import get_session_manager
         self._session_manager = get_session_manager()
 
+        # Response router for fan-out, conversation logging, WAMP
+        from .response.router import get_response_router
+        self._response_router = get_response_router(registry=self.registry)
+
     def _handle_message(self, message: Message) -> str:
         """
         Handle incoming message from any channel.
@@ -115,25 +119,19 @@ class FlaskChannelIntegration:
                 if session:
                     session.add_message('assistant', agent_reply)
 
-                # Notify user's desktop UI about the channel interaction (Gap 6)
-                try:
-                    from hart_intelligence import publish_async
-                    notification = {
-                        "text": [f"[{message.channel}] {message.sender_name}: {message.content[:100]}"],
-                        "priority": 48,
-                        "action": "ChannelMessage",
-                        "channel": message.channel,
-                        "sender": message.sender_name,
-                        "response": agent_reply[:200],
-                        "historical_request_id": [],
-                        "options": [], "newoptions": [],
-                    }
-                    publish_async(
-                        f'com.hertzai.hevolve.chat.{user_id}',
-                        json.dumps(notification)
-                    )
-                except Exception:
-                    pass  # Non-blocking — notification is supplementary
+                # Auto-upsert channel binding + log user message
+                self._response_router.upsert_binding(
+                    user_id, message.channel, message.sender_id, message.chat_id)
+                self._response_router.log_user_message(
+                    user_id, message.channel, message.content)
+
+                # Route response: WAMP desktop + fan-out to bound channels + log
+                self._response_router.route_response(
+                    user_id=user_id,
+                    response_text=agent_reply,
+                    channel_context=payload.get('channel_context'),
+                    fan_out=True,
+                )
 
                 return agent_reply
             else:

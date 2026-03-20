@@ -898,6 +898,13 @@ def create_agents_for_role(user_id: str, prompt_id):
                 return None
             return "auto"
 
+        # Seed autogen with recent messages from shared LangChain/autogen buffer
+        try:
+            from integrations.channels.memory.shared_history import seed_autogen_from_shared_history
+            _seed_msgs = seed_autogen_from_shared_history(user_id, max_messages=8)
+        except Exception:
+            _seed_msgs = []
+
         select_speaker_transforms = transform_messages.TransformMessages(
             transforms=[
                 transforms.MessageHistoryLimiter(max_messages=5),
@@ -906,7 +913,7 @@ def create_agents_for_role(user_id: str, prompt_id):
         )
         group_chat = autogen.GroupChat(
             agents=[assistant, helper, user_proxy],
-            messages=[],
+            messages=_seed_msgs,
             max_round=3,
             select_speaker_prompt_template=f"Read the above conversation, select the next person from [Assistant, Helper, & User] & only return the role as agent. Return User only if the previous message demands it",
             select_speaker_transform_messages=select_speaker_transforms,
@@ -2296,6 +2303,13 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     core_tools = build_core_tool_closures(_tool_ctx)
     register_core_tools(core_tools, helper1, time_agent)
 
+    # Channel tools: send to channels, register channels, list status, get context
+    try:
+        from integrations.channels.agent_tools import register_channel_tools
+        register_channel_tools(helper1, time_agent, _tool_ctx)
+    except Exception as e:
+        tool_logger.debug(f"Channel tools registration skipped: {e}")
+
     def connect_time_main(message: Annotated[str, "The message time agent want to send to main agent"]) -> str:
         message = f"Role: Time Agent\n Message: {message}"
         print(f'user_id {user_id}')
@@ -2331,6 +2345,13 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
     # --- Core tools for visual_agent (reuse same tool closures) ---
     register_core_tools(core_tools, helper2, visual_agent)
+
+    # Channel tools for visual_agent too
+    try:
+        from integrations.channels.agent_tools import register_channel_tools
+        register_channel_tools(helper2, visual_agent, _tool_ctx)
+    except Exception:
+        pass
 
     # MCP Integration: Load and register user-provided MCP server tools
     try:
@@ -2904,27 +2925,62 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     visual_agent_group['group_chat_2'] = group_chat_2
     visual_agent_group['manager_2'] = manager_2
 
-    # Auto-ingest group_chat messages into SimpleMem
-    if simplemem_store is not None:
-        for gc in [group_chat, group_chat_1, group_chat_2]:
-            _original_append = gc.messages.append
-            def _make_hook(orig_append, store=simplemem_store):
-                def _simplemem_ingest_hook(msg):
-                    orig_append(msg)
+    # Auto-ingest group_chat messages into SimpleMem + shared LangChain buffer
+    # This ensures autogen writes go to the SAME PersistentChatHistory that LangChain reads,
+    # eliminating redundant conversation storage and keeping both frameworks in sync.
+    _shared_hook_factory = None
+    try:
+        from integrations.channels.memory.shared_history import create_autogen_history_hook
+        _shared_hook_factory = create_autogen_history_hook(user_id, simplemem_store)
+    except Exception:
+        pass
+
+    for gc in [group_chat, group_chat_1, group_chat_2]:
+        _original_append = gc.messages.append
+
+        def _make_hook(orig_append, store=simplemem_store, shared_factory=_shared_hook_factory):
+            def _unified_ingest_hook(msg):
+                orig_append(msg)
+                # Skip seeded messages (already in buffer)
+                if isinstance(msg, dict) and msg.get('_from_shared'):
+                    return
+                content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+                if not content or len(content.strip()) <= 5 or content == 'TERMINATE':
+                    return
+                speaker = msg.get("name", "Agent") if isinstance(msg, dict) else "Agent"
+                # SimpleMem ingest
+                if store is not None:
                     try:
-                        content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
-                        speaker = msg.get("name", "Agent") if isinstance(msg, dict) else "Agent"
-                        if content and len(content.strip()) > 5:
-                            loop = get_or_create_event_loop()
-                            loop.run_until_complete(store.add(content, {
-                                "sender_name": speaker,
-                                "user_id": user_id,
-                                "prompt_id": prompt_id,
-                            }))
+                        loop = get_or_create_event_loop()
+                        loop.run_until_complete(store.add(content, {
+                            "sender_name": speaker,
+                            "user_id": user_id,
+                            "prompt_id": prompt_id,
+                        }))
                     except Exception:
-                        pass  # Non-blocking
-                return _simplemem_ingest_hook
-            gc.messages.append = _make_hook(_original_append)
+                        pass
+                # Shared PersistentChatHistory write-back (dedup-aware)
+                if shared_factory is not None:
+                    try:
+                        from langchain_core.messages import HumanMessage, AIMessage
+                        from integrations.channels.memory.shared_history import _get_persistent_history
+                        hist = _get_persistent_history(user_id)
+                        if hist:
+                            role = msg.get("role", "assistant") if isinstance(msg, dict) else "assistant"
+                            lc_msg = HumanMessage(content=content) if role == "user" else AIMessage(content=content)
+                            # Dedup: skip if last buffer message has same content
+                            last_msgs = hist.messages[-3:] if hist.messages else []
+                            if not any(m.content == content for m in last_msgs):
+                                from datetime import datetime
+                                hist.add_message(lc_msg, metadata={
+                                    'timestamp': datetime.now().isoformat(),
+                                    'source': 'autogen',
+                                })
+                    except Exception:
+                        pass
+            return _unified_ingest_hook
+
+        gc.messages.append = _make_hook(_original_append)
 
     # Auto-ingest group_chat messages into MemoryGraph (provenance tracking)
     if memory_graph is not None:

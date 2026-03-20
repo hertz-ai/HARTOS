@@ -242,6 +242,7 @@ try:
         NodeComputeConfig, AuditLogEntry, GameSession, GameParticipant,
         ShareableLink, ShareEvent, UserConsent, MarketplaceListing,
         ListingReview, MCPServer, MCPTool, ComputePledge, PledgeConsumption,
+        UserChannelBinding, ConversationEntry, ChannelPresence,
     )
 except ImportError:
     # Standalone/Docker mode: sql package not installed, use local definitions
@@ -265,4 +266,5 @@ except ImportError:
         NodeComputeConfig, AuditLogEntry, GameSession, GameParticipant,
         ShareableLink, ShareEvent, UserConsent, MarketplaceListing,
         ListingReview, MCPServer, MCPTool, ComputePledge, PledgeConsumption,
+        UserChannelBinding, ConversationEntry, ChannelPresence,
     )

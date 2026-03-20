@@ -3286,3 +3286,93 @@ class PledgeConsumption(Base):
             'agent_goal_id': self.agent_goal_id,
             'consumed_at': self.consumed_at.isoformat() if self.consumed_at else None,
         }
+
+
+class UserChannelBinding(Base):
+    """Persists user-to-channel links across restarts."""
+    __tablename__ = 'user_channel_bindings'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String(64), ForeignKey('users.id'), nullable=False, index=True)
+    channel_type = Column(String(32), nullable=False, index=True)
+    channel_sender_id = Column(String(256), nullable=True)
+    channel_chat_id = Column(String(256), nullable=True)
+    auth_method = Column(String(32), nullable=True)
+    is_preferred = Column(Boolean, default=False)
+    is_active = Column(Boolean, default=True)
+    last_message_at = Column(DateTime, nullable=True)
+    metadata_json = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('user_id', 'channel_type', 'channel_sender_id',
+                         name='uq_user_channel_sender'),
+    )
+
+    user = relationship('User', backref='channel_bindings')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'channel_type': self.channel_type,
+            'channel_sender_id': self.channel_sender_id,
+            'channel_chat_id': self.channel_chat_id,
+            'auth_method': self.auth_method,
+            'is_preferred': self.is_preferred,
+            'is_active': self.is_active,
+            'last_message_at': self.last_message_at.isoformat() if self.last_message_at else None,
+            'metadata_json': self.metadata_json,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class ConversationEntry(Base):
+    """Unified conversation history across all channels."""
+    __tablename__ = 'conversation_entries'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String(64), ForeignKey('users.id'), nullable=False, index=True)
+    channel_type = Column(String(32), nullable=False, index=True)
+    role = Column(String(16), nullable=False)  # 'user' | 'assistant' | 'system'
+    content = Column(Text, nullable=False)
+    agent_id = Column(String(64), nullable=True, index=True)
+    prompt_id = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=func.now(), index=True)
+
+    user = relationship('User', backref='conversation_entries')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'channel_type': self.channel_type,
+            'role': self.role,
+            'content': self.content,
+            'agent_id': self.agent_id,
+            'prompt_id': self.prompt_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class ChannelPresence(Base):
+    """Live channel adapter status and heartbeat tracking."""
+    __tablename__ = 'channel_presences'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    channel_type = Column(String(32), nullable=False, unique=True)
+    status = Column(String(16), nullable=False, default='offline')  # 'online' | 'offline' | 'error'
+    last_heartbeat = Column(DateTime, nullable=True)
+    error_message = Column(Text, nullable=True)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    def to_dict(self):
+        return {
+            'channel_type': self.channel_type,
+            'status': self.status,
+            'last_heartbeat': self.last_heartbeat.isoformat() if self.last_heartbeat else None,
+            'error_message': self.error_message,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
