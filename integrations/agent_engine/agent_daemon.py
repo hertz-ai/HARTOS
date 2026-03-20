@@ -377,8 +377,12 @@ class AgentDaemon:
                     logger.warning("hive_guardrails not available — dispatch proceeds without guardrail pre-check")
 
                 # Store prompt_id on goal for REUSE tracking
-                prompt_id = f"{goal.goal_type}_{goal.id[:8]}"
-                if not goal.prompt_id:
+                # Must be NUMERIC — the adapter and /chat handler reject non-integer prompt_ids.
+                # Use deterministic hash of goal.id so same goal always gets same prompt_id.
+                import hashlib
+                _gh = int(hashlib.md5(str(goal.id).encode()).hexdigest()[:10], 16) % 100_000_000_000
+                prompt_id = str(max(1, _gh))
+                if not goal.prompt_id or not str(goal.prompt_id).isdigit():
                     goal.prompt_id = prompt_id
 
                 # BACKOFF: skip goals that have failed repeatedly

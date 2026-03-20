@@ -311,7 +311,13 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
             # Fall through to local dispatch if distributed fails
             logger.info(f"Distributed fallback -> local dispatch for {goal_type} goal {goal_id}")
 
-    prompt_id = f"{goal_type}_{goal_id[:8]}"
+    # Generate a NUMERIC prompt_id (same format as hart_intelligence_entry._next_prompt_id)
+    # so it passes the isdigit() check in the adapter and /chat handler.
+    # Use goal_id hash to ensure the SAME goal always gets the SAME prompt_id
+    # across dispatches — this is what enables recipe reuse on subsequent ticks.
+    import hashlib
+    _goal_hash = int(hashlib.md5(goal_id.encode()).hexdigest()[:10], 16) % 100_000_000_000
+    prompt_id = str(max(1, _goal_hash))
 
     body = {
         'user_id': user_id,

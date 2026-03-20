@@ -939,6 +939,23 @@ if config.get('CLOUD_FALLBACK_URL'):
 # in cloud/dev mode it has flat top-level keys.
 _ip = config.get('IP_ADDRESS', {})
 GPT_API = config.get('GPT_API', _ip.get('gpt3_url', ''))
+# If GPT_API is empty (no config.json in local/bundled mode), resolve from
+# the local LLM URL that Nunba/setup-wizard configured. This ensures
+# CustomGPT._call() can reach the llama-server for agent reasoning.
+if not GPT_API:
+    try:
+        from core.port_registry import get_local_llm_url
+        _resolved = get_local_llm_url()
+        if _resolved:
+            # get_local_llm_url returns base like http://127.0.0.1:8081/v1
+            # CustomGPT._call() needs the chat completions endpoint
+            GPT_API = _resolved.rstrip('/') + '/chat/completions'
+    except Exception:
+        pass
+    if not GPT_API:
+        _llm_url = os.environ.get('HEVOLVE_LOCAL_LLM_URL', '')
+        if _llm_url:
+            GPT_API = _llm_url.rstrip('/') + '/chat/completions'
 FAV_TEACHER_API = config.get('FAV_TEACHER_API', '')
 DREAMBOOTH_API = config.get('DREAMBOOTH_API', '')
 STABLE_DIFF_API = config.get('STABLE_DIFF_API', '')
@@ -4545,14 +4562,50 @@ def chat():
                 return jsonify({'response': 'Need user_id and text to create agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
             if autonomous:
                 # Autonomous dispatch (from daemon or API): LLM self-generates agent config
+                # AND immediately creates recipe — no human review step needed.
+                # Full pipeline: gather_info → save config → recipe() → completed
                 auto_response = _autonomous_gather_info(user_id, prompt, prompt_id)
+
+                # Now immediately create the recipe so next dispatch enters REUSE
+                _config_path = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
+                if os.path.exists(_config_path):
+                    try:
+                        recipe_response = recipe(user_id, prompt, prompt_id, file_id, request_id)
+                        if recipe_response == 'Agent Created Successfully':
+                            with _user_lock:
+                                review_agents[_ak] = True
+                                conversation_agent[_ak] = True
+                                _touch_agent_timestamp(_ak)
+                            try:
+                                _create_social_agent_from_prompt(user_id, prompt_id)
+                            except Exception:
+                                pass
+                            _record_lifecycle('completed', user_id, prompt_id,
+                                             f'Autonomous full pipeline: gather + recipe in one shot')
+                            _push_workflow_flowchart(user_id, prompt_id, request_id)
+                            return jsonify({'response': recipe_response, 'intent': ['FINAL_ANSWER'],
+                                            'req_token_count': 0, 'res_token_count': 0,
+                                            'history_request_id': [],
+                                            'Agent_status': 'completed',
+                                            'autonomous_creation': True, 'prompt_id': prompt_id})
+                        else:
+                            app.logger.info(f'Autonomous recipe() returned: {str(recipe_response)[:100]}')
+                    except Exception as e:
+                        app.logger.warning(f'Autonomous recipe creation failed (will retry on next dispatch): {e}')
+
+                # Fallback: config saved but recipe failed — next dispatch will retry
                 with _user_lock:
                     review_agents[_ak] = True
                     conversation_agent[_ak] = False
                     _touch_agent_timestamp(_ak)
-                _record_lifecycle('Review Mode', user_id, prompt_id, f'Autonomous creation via dispatch: {prompt[:100]}')
+                _record_lifecycle('Review Mode', user_id, prompt_id,
+                                 f'Autonomous creation via dispatch: {prompt[:100]}')
                 _push_workflow_flowchart(user_id, prompt_id, request_id)
-                return jsonify({'response': auto_response, 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': [], 'Agent_status': 'Review Mode', 'autonomous_creation': True, 'prompt_id': prompt_id})
+                return jsonify({'response': auto_response, 'intent': ['FINAL_ANSWER'],
+                                'req_token_count': 0, 'res_token_count': 0,
+                                'history_request_id': [],
+                                'Agent_status': 'Review Mode',
+                                'autonomous_creation': True, 'prompt_id': prompt_id})
             from gather_agentdetails import gather_info
 
             # --- Turn counter: force-complete after MAX_GATHER_TURNS ---

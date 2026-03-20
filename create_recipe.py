@@ -2170,6 +2170,16 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     except Exception as e:
         current_app.logger.warning(f"Could not check AutoGen version compatibility: {e}")
 
+    # Debug: log agent types before GroupChat creation
+    current_app.logger.info(f"GroupChat agents ({len(all_agents)}): {[(a.name, type(a).__name__, isinstance(a, autogen.Agent)) for a in all_agents]}")
+    current_app.logger.info(f"GroupChat kwargs keys: {list(group_chat_kwargs.keys())}")
+
+    # Guard: filter out any non-Agent items that might have crept in
+    valid_agents = [a for a in all_agents if isinstance(a, autogen.Agent)]
+    if len(valid_agents) != len(all_agents):
+        current_app.logger.warning(f"Filtered {len(all_agents) - len(valid_agents)} non-Agent items from all_agents")
+        group_chat_kwargs['agents'] = valid_agents
+
     group_chat = autogen.GroupChat(**group_chat_kwargs)
 
     manager = autogen.GroupChatManager(
