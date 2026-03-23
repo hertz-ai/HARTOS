@@ -1390,6 +1390,14 @@ class TestFullActionLoop:
 
         from integrations.vlm.local_loop import run_local_agentic_loop
 
+        # Patch time.time to simulate elapsed time advancing by 1s per call
+        call_count = {'n': 0}
+        real_time = __import__('time').time
+
+        def advancing_time():
+            call_count['n'] += 1
+            return real_time() + call_count['n']
+
         message = {
             "instruction_to_vlm_agent": "Test",
             "user_id": "u1",
@@ -1397,9 +1405,10 @@ class TestFullActionLoop:
             "max_ETA_in_seconds": 0,  # Immediate timeout
         }
 
-        result = run_local_agentic_loop(message, tier='inprocess', max_iterations=100)
+        with patch('integrations.vlm.local_loop.time.time', side_effect=advancing_time):
+            result = run_local_agentic_loop(message, tier='inprocess', max_iterations=100)
         assert result['status'] == 'success'
-        # Should have stopped quickly due to ETA
+        # Should have stopped after first iteration due to ETA timeout
         assert len(result['extracted_responses']) <= 1
 
     @patch('integrations.vlm.local_loop.time.sleep')

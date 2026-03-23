@@ -33,6 +33,10 @@ try:
                     )
             except Exception:
                 pass
+        # Log BEFORE send to diagnose connection errors
+        if b'/v1/chat/completions' in request.url.raw_path:
+            _logging.getLogger('hevolve_social').info(
+                f"[LLM-autogen] SENDING to {request.url} ({len(request.content or b'')} bytes)")
         resp = _orig_httpx_send(self, request, **kwargs)
         # Log autogen LLM input/output
         if b'/v1/chat/completions' in request.url.raw_path:

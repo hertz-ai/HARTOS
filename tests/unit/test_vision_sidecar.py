@@ -206,7 +206,7 @@ class TestFrameStoreScreenChannel:
 class TestVisionServiceScreenDescribe:
     """VisionService.describe_screen_frame integration."""
 
-    @patch('integrations.vision.vision_service.requests.post')
+    @patch('integrations.vision.vision_service.pooled_post')
     def test_describe_screen_frame_stores_and_returns(self, mock_post):
         from integrations.vision.vision_service import VisionService
         mock_post.return_value = MagicMock(
@@ -215,8 +215,12 @@ class TestVisionServiceScreenDescribe:
         )
         svc = VisionService()
         svc._running = True
+        svc._vision_backend = None  # Force MiniCPM HTTP path
+        svc._circuit_open = False
+        svc._consecutive_failures = 0
         jpeg = _make_jpeg(100)
-        desc = svc.describe_screen_frame('u1', jpeg)
+        with patch.object(svc, '_record_to_world_model'):
+            desc = svc.describe_screen_frame('u1', jpeg)
         assert desc == 'VS Code with Python file'
         assert svc.store.get_screen_description('u1') == 'VS Code with Python file'
 
@@ -235,7 +239,7 @@ class TestVisionServiceScreenDescribe:
         desc = svc.describe_screen_frame('u1', b'data')
         assert desc is None
 
-    @patch('integrations.vision.vision_service.requests.post')
+    @patch('integrations.vision.vision_service.pooled_post')
     def test_describe_screen_frame_stores_screen_frame(self, mock_post):
         from integrations.vision.vision_service import VisionService
         mock_post.return_value = MagicMock(
@@ -250,7 +254,7 @@ class TestVisionServiceScreenDescribe:
         assert svc.store.get_screen_frame('u1') == jpeg
         assert svc.store.get_frame('u1') is None  # Camera channel untouched
 
-    @patch('integrations.vision.vision_service.requests.post')
+    @patch('integrations.vision.vision_service.pooled_post')
     def test_describe_screen_posts_to_db_as_screen_context(self, mock_post):
         from integrations.vision.vision_service import VisionService
         mock_post.return_value = MagicMock(
@@ -444,7 +448,7 @@ class TestVisionService:
         svc._circuit_open = svc._consecutive_failures >= svc._max_failures
         assert svc._circuit_open is True
 
-    @patch('integrations.vision.vision_service.requests.get')
+    @patch('integrations.vision.vision_service.pooled_get')
     def test_health_check_resets_failures(self, mock_get):
         from integrations.vision.vision_service import VisionService
         mock_get.return_value = MagicMock(status_code=200)
@@ -455,7 +459,7 @@ class TestVisionService:
         assert svc._consecutive_failures == 0
         assert svc._circuit_open is False
 
-    @patch('integrations.vision.vision_service.requests.get',
+    @patch('integrations.vision.vision_service.pooled_get',
            side_effect=__import__('requests').RequestException('fail'))
     def test_health_check_increments_failures(self, mock_get):
         from integrations.vision.vision_service import VisionService
@@ -474,7 +478,7 @@ class TestVisionService:
         assert 'store' in status
         assert 'installer' in status
 
-    @patch('integrations.vision.vision_service.requests.post')
+    @patch('integrations.vision.vision_service.pooled_post')
     def test_describe_frame_success(self, mock_post):
         from integrations.vision.vision_service import VisionService
         mock_post.return_value = MagicMock(
@@ -600,7 +604,7 @@ class TestIntelligentSampling:
         assert svc._should_describe('u1', jpeg, 'camera') is True
         assert svc._should_describe('u1', jpeg, 'screen') is True
 
-    @patch('integrations.vision.vision_service.requests.post')
+    @patch('integrations.vision.vision_service.pooled_post')
     def test_skip_counter_increments(self, mock_post):
         from integrations.vision.vision_service import VisionService
         mock_post.return_value = MagicMock(

@@ -203,7 +203,8 @@ class AgentDaemon:
             try:
                 self._tick()
             except Exception as e:
-                logger.debug(f"Agent daemon tick error: {e}")
+                import traceback
+                logger.error(f"Agent daemon tick error: {e}\n{traceback.format_exc()}")
 
     def _tick(self):
         """Find active goals, find idle agents, dispatch via /chat.

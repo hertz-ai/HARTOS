@@ -62,7 +62,8 @@ class CodingAgentDaemon:
             try:
                 self._tick()
             except Exception as e:
-                logger.debug(f"Coding daemon tick error: {e}")
+                import traceback
+                logger.error(f"Coding daemon tick error: {e}\n{traceback.format_exc()}")
 
     def _tick(self):
         """Find active coding goals, find idle agents, dispatch via /chat.
