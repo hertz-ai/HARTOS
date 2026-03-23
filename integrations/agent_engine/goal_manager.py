@@ -1282,6 +1282,14 @@ def _build_autoresearch_prompt(goal_dict: Dict, product_dict: Optional[Dict] = N
     hive_parallel = config.get('hive_parallel', False)
     experiment_id = config.get('experiment_id', '')
 
+    # Guard: autoresearch needs at least repo_path + run_command to do anything.
+    # Without them, the LLM loops trying to "extract" non-existent config,
+    # wastes budget, and gets killed by the watchdog — repeat N times.
+    if not repo_path or not run_command:
+        logger.info(f"Autoresearch goal '{goal_dict.get('title', '')}': "
+                     f"skipping — repo_path or run_command not configured")
+        return None
+
     return (
         f"YOU ARE AN AUTONOMOUS RESEARCH AGENT.\n\n"
         f"Goal: {goal_dict.get('title', '')}\n"
