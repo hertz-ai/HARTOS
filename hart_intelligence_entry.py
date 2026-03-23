@@ -4550,22 +4550,6 @@ def chat():
         with _user_lock:
             _in_review = _ak in review_agents and review_agents[_ak]
             _in_convo = _ak in conversation_agent and conversation_agent[_ak]
-
-            # Persist-safe fallback: if in-memory flags are empty (process restarted,
-            # daemon re-dispatch) but {prompt_id}.json already exists on disk,
-            # gather_info already completed — skip Phase 1, go straight to recipe.
-            # Without this, every process restart re-runs gather_info from scratch,
-            # causing the "6x repeated actions" on daemon continuous goals.
-            if not _in_review and prompt_id:
-                _gather_path = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
-                if os.path.exists(_gather_path):
-                    app.logger.info(f'[PERSIST] {prompt_id}.json exists but review_agents empty — '
-                                    f'restoring in-memory flags from disk state')
-                    _in_review = True
-                    review_agents[_ak] = True
-                    conversation_agent[_ak] = False
-                    _touch_agent_timestamp(_ak)
-
         # Phase 1: Gather Requirements
         if not _in_review:
             with _user_lock:
