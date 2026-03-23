@@ -654,7 +654,7 @@ class TestCodeHashVerification:
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.json.return_value = {'code_hash': 'expected_hash'}
-        with patch('requests.get', return_value=mock_resp):
+        with patch('integrations.social.integrity_service.pooled_get', return_value=mock_resp):
             result = IntegrityService.fetch_expected_hash(
                 'http://registry.example.com', '1.0.0')
         assert result == 'expected_hash'
@@ -772,7 +772,9 @@ class TestGossipSignatureIntegration:
             'name': 'unsigned-node',
             'version': '1.0.0',
         }
-        is_new = gp._merge_peer(db, peer_data)
+        # Unsigned peers are only accepted in soft enforcement mode
+        with patch('security.master_key.get_enforcement_mode', return_value='soft'):
+            is_new = gp._merge_peer(db, peer_data)
         assert is_new is True
 
         from integrations.social.models import PeerNode

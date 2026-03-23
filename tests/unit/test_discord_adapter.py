@@ -214,8 +214,14 @@ class TestRegressionWithTelegram:
         integration.set_user_session("telegram", "user1", 100, 200)
         integration.set_user_session("discord", "user1", 300, 400)
 
-        assert integration._user_sessions[("telegram", "user1")] == (100, 200)
-        assert integration._user_sessions[("discord", "user1")] == (300, 400)
+        # Sessions are stored in _session_manager, verify via get_session
+        sm = integration._session_manager
+        tel_session = sm.get_session("telegram", "user1")
+        disc_session = sm.get_session("discord", "user1")
+        assert tel_session is not None
+        assert disc_session is not None
+        assert tel_session.user_id == 100
+        assert disc_session.user_id == 300
 
     def test_base_imports_unchanged(self):
         """Test that base channel imports still work."""

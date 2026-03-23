@@ -264,8 +264,10 @@ class TestFlaskIntegration:
         integration = FlaskChannelIntegration()
         integration.set_user_session("telegram", "123456", 999, 111)
 
-        assert ("telegram", "123456") in integration._user_sessions
-        assert integration._user_sessions[("telegram", "123456")] == (999, 111)
+        # Sessions are stored in _session_manager
+        session = integration._session_manager.get_session("telegram", "123456")
+        assert session is not None
+        assert session.user_id == 999
 
     @patch('integrations.channels.flask_integration.pooled_post')
     def test_message_handling(self, mock_post):

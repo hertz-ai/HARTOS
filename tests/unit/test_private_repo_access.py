@@ -117,7 +117,7 @@ class TestSendGitHubInvite:
         mock_run.assert_called_once()
 
     @patch('subprocess.run', side_effect=FileNotFoundError)
-    @patch('requests.put')
+    @patch('core.http_pool.pooled_put')
     def test_invite_fallback_to_http(self, mock_put, mock_run, monkeypatch):
         monkeypatch.setenv('HEVOLVE_GITHUB_TOKEN', 'fake_token')
         mock_resp = MagicMock()

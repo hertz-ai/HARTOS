@@ -419,13 +419,13 @@ class TestPackagingModules:
 class TestSQLiteConfig:
     """Verify SQLite is configured for concurrent thread safety."""
 
-    def test_busy_timeout_is_15000(self):
-        """busy_timeout must be 15000ms (15s) for 50+ concurrent threads."""
+    def test_busy_timeout_is_3000(self):
+        """busy_timeout must be 3000ms (3s) — fail fast to avoid watchdog restarts."""
         # Read the source to verify the PRAGMA value
         import inspect
         from integrations.social.models import get_engine
         source = inspect.getsource(get_engine)
-        assert 'busy_timeout=15000' in source or 'busy_timeout = 15000' in source
+        assert 'busy_timeout=3000' in source or 'busy_timeout = 3000' in source
 
     def test_wal_mode_enabled(self):
         """WAL journal mode must be set for concurrent access."""

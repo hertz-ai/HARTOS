@@ -494,7 +494,7 @@ class TestURLConfiguration:
     def test_default_url(self):
         """DEFAULT_UPDATE_URL points to GitHub releases."""
         assert 'github.com' in ota.DEFAULT_UPDATE_URL
-        assert 'hevolve-ai' in ota.DEFAULT_UPDATE_URL
+        assert 'hertz-ai' in ota.DEFAULT_UPDATE_URL
 
     def test_module_constants(self):
         """Module has expected filesystem constants."""

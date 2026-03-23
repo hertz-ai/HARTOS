@@ -211,11 +211,12 @@ def test_backends_dict_has_aider_native():
 # ── tool_router integration ──
 
 def test_heuristic_defaults_include_aider_native():
-    """HEURISTIC_DEFAULTS prefers aider_native for key task types."""
+    """HEURISTIC_DEFAULTS includes aider_native for key task types."""
     from integrations.coding_agent.tool_router import HEURISTIC_DEFAULTS
-    assert HEURISTIC_DEFAULTS.get('code_review') == 'aider_native'
-    assert HEURISTIC_DEFAULTS.get('debugging') == 'aider_native'
+    # aider_native is the default for refactor, bug_fix, multi_file_edit
     assert HEURISTIC_DEFAULTS.get('refactor') == 'aider_native'
+    assert HEURISTIC_DEFAULTS.get('bug_fix') == 'aider_native'
+    assert HEURISTIC_DEFAULTS.get('multi_file_edit') == 'aider_native'
 
 
 # ── installer integration ──

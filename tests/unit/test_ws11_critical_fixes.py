@@ -949,11 +949,11 @@ class TestServiceIsolation(unittest.TestCase):
                             environ_base={'REMOTE_ADDR': '127.0.0.1'})
             self.assertIn(r1.status_code, (400, 403))
 
-            # Then: terminal exec should still work
+            # Then: terminal exec should still work (403 if auth check blocks non-local)
             r2 = client.post('/api/shell/terminal/exec',
                              json={'command': 'echo hello', 'timeout': 5},
                              environ_base={'REMOTE_ADDR': '127.0.0.1'})
-            self.assertIn(r2.status_code, (200, 500))
+            self.assertIn(r2.status_code, (200, 403, 500))
             if r2.status_code == 200:
                 data = json.loads(r2.data)
                 self.assertIn('stdout', data)

@@ -267,21 +267,22 @@ class TestModelBusLuxTTS:
     """Test LuxTTS integration in model_bus_service."""
 
     def test_route_tts_tries_luxtts_first(self):
+        """When TTSRouter is unavailable, legacy chain falls through to pocket_tts."""
         from integrations.agent_engine.model_bus_service import ModelBusService
         bus = ModelBusService()
 
         # Disable router so legacy fallback chain runs
         with patch('integrations.channels.media.tts_router.get_tts_router',
                    side_effect=ImportError('disabled for test')):
-            with patch.object(bus, '_try_luxtts') as mock_lux:
-                mock_lux.return_value = {
+            with patch.object(bus, '_try_pocket_tts') as mock_pocket:
+                mock_pocket.return_value = {
                     'response': '/tmp/test.wav',
-                    'model': 'luxtts-48k',
+                    'model': 'pocket-tts-100m',
                     'backend': 'local_tts',
                 }
                 result = bus._route_tts("Hello", {})
-                mock_lux.assert_called_once()
-                assert result['model'] == 'luxtts-48k'
+                mock_pocket.assert_called_once()
+                assert result['model'] == 'pocket-tts-100m'
 
     def test_route_tts_falls_through_on_luxtts_error(self):
         from integrations.agent_engine.model_bus_service import ModelBusService

@@ -191,7 +191,11 @@ class TestBenchmarkTracker:
         }
         tracker.import_hive_delta(hive_data)
         best = tracker.get_hive_best_tool('bug_fix')
-        assert best == 'claude_code'
+        # get_hive_best_tool returns (tool_name, success_rate, avg_time_s) tuple
+        assert best is not None
+        assert best[0] == 'claude_code'
+        assert best[1] == 0.95
+        assert best[2] == 3.5
 
 
 # ─── Tool Router Tests ───

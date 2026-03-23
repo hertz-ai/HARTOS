@@ -87,24 +87,16 @@ class TestSendAction:
     def test_send_action_blocked_by_estop(self, bridge):
         from integrations.robotics.safety_monitor import SafetyMonitor
         monitor = SafetyMonitor()
-        monitor.trigger_estop('test', source='test')
+        monitor.trigger_estop('test block', source='test')
 
-        with patch('integrations.agent_engine.world_model_bridge.get_safety_monitor',
-                   return_value=monitor, create=True):
-            # Should be blocked (the import inside send_action catches this)
-            pass
-
-        # Direct test: trigger estop and verify action blocked
-        from integrations.robotics.safety_monitor import SafetyMonitor as SM
-        m = SM()
-        m.trigger_estop('test block', source='test')
-        # The bridge checks via import
-        result = bridge.send_action({'type': 'motor', 'target': 'wheel', 'params': {}})
-        # Since E-stop sets HEVOLVE_HALTED, and monitor.is_estopped returns True
-        # The send_action should return False
+        # Patch get_safety_monitor to return our estopped monitor
+        with patch('integrations.robotics.safety_monitor.get_safety_monitor',
+                   return_value=monitor):
+            result = bridge.send_action({'type': 'motor', 'target': 'wheel', 'params': {}})
+        # Since monitor.is_estopped is True, send_action returns False
         assert result is False
 
-    @patch('integrations.agent_engine.world_model_bridge.requests.post')
+    @patch('integrations.agent_engine.world_model_bridge.pooled_post')
     def test_send_action_http_success(self, mock_post, bridge):
         mock_post.return_value = MagicMock(status_code=200)
         os.environ.pop('HEVOLVE_HALTED', None)
@@ -120,7 +112,7 @@ class TestSendAction:
         assert result is True
         assert bridge._stats.get('total_actions_sent', 0) >= 1
 
-    @patch('integrations.agent_engine.world_model_bridge.requests.post')
+    @patch('integrations.agent_engine.world_model_bridge.pooled_post')
     def test_send_action_http_failure(self, mock_post, bridge):
         mock_post.return_value = MagicMock(status_code=500)
         mock_monitor = MagicMock()
@@ -131,8 +123,8 @@ class TestSendAction:
         assert result is False
 
     def test_send_action_circuit_breaker_open(self, bridge):
-        bridge._circuit_breaker._state = 'open'
-        bridge._circuit_breaker._open_until = time.time() + 100
+        bridge._circuit_breaker._failures = bridge._circuit_breaker.threshold
+        bridge._circuit_breaker._opened_at = time.time()
         mock_monitor = MagicMock()
         mock_monitor.is_estopped = False
         with patch('integrations.robotics.safety_monitor.get_safety_monitor',
@@ -148,7 +140,7 @@ class TestIngestSensorBatch:
         result = bridge.ingest_sensor_batch([])
         assert result == 0
 
-    @patch('integrations.agent_engine.world_model_bridge.requests.post')
+    @patch('integrations.agent_engine.world_model_bridge.pooled_post')
     def test_http_batch_success(self, mock_post, bridge):
         mock_post.return_value = MagicMock(status_code=200)
         readings = [
@@ -159,15 +151,15 @@ class TestIngestSensorBatch:
         assert result == 2
         assert bridge._stats.get('total_sensor_readings', 0) >= 2
 
-    @patch('integrations.agent_engine.world_model_bridge.requests.post')
+    @patch('integrations.agent_engine.world_model_bridge.pooled_post')
     def test_http_batch_failure(self, mock_post, bridge):
         mock_post.return_value = MagicMock(status_code=500)
         result = bridge.ingest_sensor_batch([{'sensor_id': 'x', 'data': {}}])
         assert result == 0
 
     def test_circuit_breaker_blocks_batch(self, bridge):
-        bridge._circuit_breaker._state = 'open'
-        bridge._circuit_breaker._open_until = time.time() + 100
+        bridge._circuit_breaker._failures = bridge._circuit_breaker.threshold
+        bridge._circuit_breaker._opened_at = time.time()
         result = bridge.ingest_sensor_batch([{'sensor_id': 'x', 'data': {}}])
         assert result == 0
 
@@ -175,7 +167,7 @@ class TestIngestSensorBatch:
 # ── WorldModelBridge.get_learning_feedback() Tests ───────────────
 
 class TestGetLearningFeedback:
-    @patch('integrations.agent_engine.world_model_bridge.requests.get')
+    @patch('integrations.agent_engine.world_model_bridge.pooled_get')
     def test_http_feedback_success(self, mock_get, bridge):
         mock_get.return_value = MagicMock(
             status_code=200,
@@ -185,15 +177,15 @@ class TestGetLearningFeedback:
         assert result is not None
         assert 'correction' in result
 
-    @patch('integrations.agent_engine.world_model_bridge.requests.get')
+    @patch('integrations.agent_engine.world_model_bridge.pooled_get')
     def test_http_feedback_failure(self, mock_get, bridge):
         mock_get.return_value = MagicMock(status_code=500)
         result = bridge.get_learning_feedback()
         assert result is None
 
     def test_circuit_breaker_blocks_feedback(self, bridge):
-        bridge._circuit_breaker._state = 'open'
-        bridge._circuit_breaker._open_until = time.time() + 100
+        bridge._circuit_breaker._failures = bridge._circuit_breaker.threshold
+        bridge._circuit_breaker._opened_at = time.time()
         result = bridge.get_learning_feedback()
         assert result is None
 
@@ -218,7 +210,7 @@ class TestRecordEmbodiedInteraction:
 # ── WorldModelBridge.emergency_stop() Tests ─────────────────────
 
 class TestEmergencyStop:
-    @patch('integrations.agent_engine.world_model_bridge.requests.post')
+    @patch('integrations.agent_engine.world_model_bridge.pooled_post')
     def test_http_estop(self, mock_post, bridge):
         mock_post.return_value = MagicMock(status_code=200)
         result = bridge.emergency_stop()

@@ -308,7 +308,7 @@ class TestGoalSeedingRobotLearning:
 # ── Integration: Recipe → Replay → Bridge ────────────────────────
 
 class TestRecipeBridgeIntegration:
-    @patch('integrations.agent_engine.world_model_bridge.requests.post')
+    @patch('integrations.agent_engine.world_model_bridge.pooled_post')
     def test_replay_sends_through_bridge(self, mock_post):
         """Replayed actions route through WorldModelBridge."""
         mock_post.return_value = MagicMock(status_code=200)
@@ -330,6 +330,7 @@ class TestRecipeBridgeIntegration:
         # Send through bridge
         bridge = WorldModelBridge()
         bridge._in_process = False
+        bridge._http_disabled = False
         mock_monitor = MagicMock()
         mock_monitor.is_estopped = False
         mock_monitor.check_position_safe.return_value = True

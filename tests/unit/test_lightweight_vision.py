@@ -335,7 +335,6 @@ class TestVisionServiceBackendIntegration:
 
     def test_describe_frame_minicpm_path(self):
         """When _vision_backend is None, uses MiniCPM HTTP."""
-        import integrations.vision.vision_service as vs_mod
         from integrations.vision.vision_service import VisionService
         svc = VisionService.__new__(VisionService)
         svc._circuit_open = False
@@ -346,7 +345,7 @@ class TestVisionServiceBackendIntegration:
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.json.return_value = {'result': 'User typing on keyboard'}
-        with patch.object(vs_mod.requests, 'post', return_value=mock_resp):
+        with patch('integrations.vision.vision_service.pooled_post', return_value=mock_resp):
             result = svc._describe_frame('user1', b'fake_jpeg')
             assert result == 'User typing on keyboard'
 

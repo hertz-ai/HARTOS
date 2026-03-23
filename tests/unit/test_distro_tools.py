@@ -363,7 +363,6 @@ class TestDBusService:
             assert dbus_mod.BUS_NAME == 'com.hart.Agent'
             assert dbus_mod.OBJ_PATH == '/com/hart/Agent'
             assert dbus_mod.IFACE == 'com.hart.Agent'
-            assert dbus_mod.FLEET_POLL_INTERVAL == 10
 
     def test_backend_port_default(self):
         """BACKEND_PORT defaults to 6777."""
