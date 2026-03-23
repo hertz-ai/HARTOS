@@ -381,10 +381,14 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
         # Signal to watchdog that this thread is in a legitimate LLM call
         _notify_watchdog_llm_start()
         try:
+            # Use a daemon-specific request_id so thinking traces from daemon
+            # dispatch are isolated from user chat traces. Without this, daemon
+            # traces leak into user responses via drain_thinking_traces().
+            _daemon_request_id = f'daemon_{goal_id}'
             result = hevolve_chat(
                 text=prompt, user_id=user_id,
                 agent_id=prompt_id, create_agent=True, casual_conv=False,
-                autonomous=True,
+                autonomous=True, request_id=_daemon_request_id,
             )
         finally:
             _local_llm_semaphore.release()

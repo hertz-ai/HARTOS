@@ -284,9 +284,26 @@ class AgentDaemon:
             # Reduce concurrency proportional to system pressure
             max_concurrent = max(1, int(max_concurrent * _throttle))
 
+            # Minimum interval between dispatches for continuous goals.
+            # Without this, a continuous goal (e.g. autoresearch coordinator)
+            # gets re-dispatched every 30s tick even if the previous dispatch
+            # is still running — causing repeated identical actions.
+            _CONTINUOUS_COOLDOWN_S = 300  # 5 minutes
+
             for goal in goals:
                 if dispatched >= len(idle_agents) or dispatched >= max_concurrent:
                     break
+
+                # Skip continuous goals dispatched recently — let the previous
+                # dispatch complete before re-dispatching.
+                cfg = goal.config_json or {}
+                if cfg.get('continuous', False) and goal.last_dispatched_at:
+                    elapsed = (datetime.utcnow() - goal.last_dispatched_at).total_seconds()
+                    if elapsed < _CONTINUOUS_COOLDOWN_S:
+                        logger.debug(
+                            f"Continuous goal {goal.id} dispatched {elapsed:.0f}s ago "
+                            f"(cooldown={_CONTINUOUS_COOLDOWN_S}s), skipping")
+                        continue
 
                 # ── PARALLEL DISPATCH: check for goals with parallel subtasks ──
                 parallel_dispatched = self._try_parallel_dispatch(
