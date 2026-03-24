@@ -51,8 +51,7 @@ jobs:
           python -m pytest \
             tests/unit/ \
             tests/functional/ \
-            --noconftest --rootdir=${{ github.workspace }} \
-            --import-mode=importlib \
+            -p no:capture \
             -q --tb=line
 
   # ═══════════════════════════════════════════════════════════
