@@ -356,7 +356,7 @@ class TestVisionServiceTemporalMethods:
         vs = VisionService.__new__(VisionService)
 
         mock_graph = MagicMock()
-        with patch('hart_intelligence_entry._get_or_create_graph', return_value=mock_graph):
+        with patch('hart_intelligence._get_or_create_graph', return_value=mock_graph):
             vs._save_to_memory_graph('user_1', 'person sitting at desk', 'camera')
 
         mock_graph.add.assert_called_once()
@@ -370,7 +370,7 @@ class TestVisionServiceTemporalMethods:
 
         vs = VisionService.__new__(VisionService)
 
-        with patch('hart_intelligence_entry._get_or_create_graph', side_effect=RuntimeError('db error')):
+        with patch('hart_intelligence._get_or_create_graph', side_effect=RuntimeError('db error')):
             # Should not raise
             vs._save_to_memory_graph('u1', 'test', 'camera')
 

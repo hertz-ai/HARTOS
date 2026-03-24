@@ -38,7 +38,6 @@ def bridge():
     from integrations.agent_engine.world_model_bridge import WorldModelBridge
     b = WorldModelBridge()
     b._in_process = False  # Force HTTP mode for testing
-    b._http_disabled = False  # Enable HTTP for tests (constructor disables without HEVOLVEAI_API_URL)
     return b
 
 
@@ -86,13 +85,15 @@ class TestRobotAction:
 
 class TestSendAction:
     def test_send_action_blocked_by_estop(self, bridge):
-        # Create a mock monitor with is_estopped = True
-        mock_monitor = MagicMock()
-        mock_monitor.is_estopped = True
+        from integrations.robotics.safety_monitor import SafetyMonitor
+        monitor = SafetyMonitor()
+        monitor.trigger_estop('test block', source='test')
 
+        # Patch get_safety_monitor to return our estopped monitor
         with patch('integrations.robotics.safety_monitor.get_safety_monitor',
-                   return_value=mock_monitor):
+                   return_value=monitor):
             result = bridge.send_action({'type': 'motor', 'target': 'wheel', 'params': {}})
+        # Since monitor.is_estopped is True, send_action returns False
         assert result is False
 
     @patch('integrations.agent_engine.world_model_bridge.pooled_post')

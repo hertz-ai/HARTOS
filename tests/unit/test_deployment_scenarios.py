@@ -497,10 +497,11 @@ class TestStartupValidation:
     def test_validate_startup_warns_on_missing_env(self):
         """Missing .env should produce a warning."""
         from hart_intelligence_entry import _validate_startup
-        with patch('os.path.exists') as mock_exists:
+        with patch('hart_intelligence_entry.os.path.exists') as mock_exists:
             # config.json doesn't exist, .env doesn't exist
             mock_exists.side_effect = lambda p: False
             result = _validate_startup()
+        assert isinstance(result, list)
         # Should have at least the .env warning
         env_warnings = [w for w in result if '.env' in w]
         assert len(env_warnings) >= 1
@@ -508,9 +509,10 @@ class TestStartupValidation:
     def test_validate_startup_warns_on_missing_config(self):
         """Missing config.json should produce a warning."""
         from hart_intelligence_entry import _validate_startup
-        with patch('os.path.exists') as mock_exists:
+        with patch('hart_intelligence_entry.os.path.exists') as mock_exists:
             mock_exists.side_effect = lambda p: False
             result = _validate_startup()
+        assert isinstance(result, list)
         config_warnings = [w for w in result if 'config.json' in w]
         assert len(config_warnings) >= 1
 
