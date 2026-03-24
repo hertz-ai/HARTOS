@@ -16,13 +16,14 @@ Torrents available alongside each ISO (web-seeded via GitHub CDN).
 
 ## Nunba (Companion App)
 
-Runs on your existing OS. Connects to HART OS backend.
+Runs on your existing OS. Connects to HART OS backend or runs standalone with local AI.
 
-| Platform | Download |
-|----------|----------|
-| **Windows** | [Nunba Installer](https://github.com/hertz-ai/HARTOS/releases/latest) |
-| **macOS** | [Nunba.dmg](https://github.com/hertz-ai/HARTOS/releases/latest) |
-| **Linux** | [AppImage](https://github.com/hertz-ai/HARTOS/releases/latest) |
+| Platform | Download | Notes |
+|----------|----------|-------|
+| **Windows** | [Nunba Installer](https://github.com/hertz-ai/Nunba/releases/latest/download/Nunba_Setup.exe) | Windows 10/11, x64. Azure Trusted Signing. |
+| **macOS** | [Nunba.dmg](https://github.com/hertz-ai/Nunba/releases/latest/download/Nunba_Setup.dmg) | macOS 13+ (Apple Silicon native). Notarized. |
+| **Linux** | [AppImage](https://github.com/hertz-ai/Nunba/releases/latest/download/Nunba-x86_64.AppImage) | Any distro, x86_64. `chmod +x` and run. |
+| **Linux (.deb)** | [.deb package](https://github.com/hertz-ai/Nunba/releases/latest) | Debian/Ubuntu. `sudo dpkg -i nunba_*.deb` |
 
 ## Hevolve Droid (Android)
 
@@ -30,7 +31,16 @@ Your phone becomes a remote to your private AI mesh.
 
 | Platform | Download |
 |----------|----------|
-| **Android** | [Hevolve APK](https://github.com/hertz-ai/HARTOS/releases/latest) |
+| **Android (Play Store)** | [Google Play](https://play.google.com/store/apps/details?id=com.hertzai.hevolve) |
+| **Android (APK)** | [Direct APK](https://github.com/hertz-ai/Hevolve_React_Native/releases/latest/download/Hevolve.apk) |
+
+## Hevolve Web
+
+Access from any browser — no install needed.
+
+| Platform | Link |
+|----------|------|
+| **Web App** | [hevolve.ai](https://hevolve.ai/) |
 
 ## pip install (Backend only)
 
@@ -64,4 +74,8 @@ print('VALID' if verify_release_manifest(m) else 'INVALID')
 
 ## All Releases
 
-[View all releases on GitHub](https://github.com/hertz-ai/HARTOS/releases)
+| Project | Releases |
+|---------|----------|
+| **HART OS** | [GitHub Releases](https://github.com/hertz-ai/HARTOS/releases) |
+| **Nunba** | [GitHub Releases](https://github.com/hertz-ai/Nunba/releases) |
+| **Hevolve Droid** | [GitHub Releases](https://github.com/hertz-ai/Hevolve_React_Native/releases) |
