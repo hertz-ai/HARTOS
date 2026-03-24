@@ -42,6 +42,30 @@ jobs:
           pip install grep-ast tree-sitter tree-sitter-language-pack 2>/dev/null || true
           python -c "import nltk; nltk.download('punkt', quiet=True); nltk.download('punkt_tab', quiet=True)" 2>/dev/null || true
 
+      - name: Debug core.platform import
+        run: |
+          cd ${{ github.workspace }}
+          python -c "
+          import sys; sys.path.insert(0, '.')
+          import importlib.util
+          spec = importlib.util.find_spec('core.platform.events')
+          print(f'events spec: {spec}')
+          print(f'events origin: {spec.origin if spec else None}')
+          # Try direct import
+          try:
+              from core.platform.events import EventBus
+              print(f'EventBus: {EventBus}')
+          except Exception as e:
+              print(f'EventBus import error: {e}')
+              # Check what core resolves to
+              import core
+              print(f'core.__file__: {getattr(core, \"__file__\", \"NO FILE\")}')
+              print(f'core.__path__: {getattr(core, \"__path__\", \"NO PATH\")}')
+              import core.platform
+              print(f'core.platform.__file__: {getattr(core.platform, \"__file__\", \"NO FILE\")}')
+              print(f'core.platform.__path__: {getattr(core.platform, \"__path__\", \"NO PATH\")}')
+          "
+
       - name: Run tests
         env:
           HEVOLVE_DB_PATH: ':memory:'
