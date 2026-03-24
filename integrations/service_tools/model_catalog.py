@@ -386,25 +386,50 @@ class ModelCatalog:
             except Exception as e:
                 logger.debug(f"Populator '{name}' failed: {e}")
         # Built-in entries that don't depend on application modules
+        added += self._populate_tts_models()
         added += self._populate_stt_models()
         added += self._populate_vlm_models()
+        added += self._populate_videogen_models()
         if added > 0:
             self._save()
             logger.info(f"Auto-populated {added} model entries from subsystems")
         return added
 
+    def _populate_tts_models(self) -> int:
+        """Populate TTS engine entries from tts_router.ENGINE_REGISTRY.
+
+        Lazy-imports populate_tts_catalog to avoid circular imports at
+        module load time. tts_router → model_catalog direction is only
+        present inside function bodies (never at module scope).
+        """
+        try:
+            from integrations.channels.media.tts_router import populate_tts_catalog
+            return populate_tts_catalog(self)
+        except Exception as e:
+            logger.debug(f"TTS catalog population skipped: {e}")
+            return 0
+
     def _populate_stt_models(self) -> int:
-        """Built-in STT model entries (no external deps)."""
+        """STT model entries — delegated to whisper_tool.populate_stt_catalog().
+
+        whisper_tool is the single source of truth for STT model specs
+        (engine names, VRAM thresholds, sherpa-onnx archive mappings).
+        Falls back to a minimal inline set if whisper_tool is unavailable.
+        """
+        try:
+            from integrations.service_tools.whisper_tool import populate_stt_catalog
+            return populate_stt_catalog(self)
+        except Exception as e:
+            logger.debug(f"STT catalog population via whisper_tool skipped: {e}")
+
+        # Minimal fallback (whisper_tool not yet importable at catalog init time)
         added = 0
-        stt_models = [
-            ('stt-whisper-base', 'Whisper Base (faster-whisper)', 0.2, 0.5,
-             0.75, 0.9, ['multilingual'], ['local', 'stt', 'cpu-friendly']),
-            ('stt-whisper-medium', 'Whisper Medium', 1.5, 2.0,
-             0.85, 0.7, ['multilingual'], ['local', 'stt']),
-            ('stt-whisper-large', 'Whisper Large v3 Turbo', 3.0, 4.0,
-             0.93, 0.5, ['multilingual'], ['local', 'stt']),
+        _fallback = [
+            ('stt-whisper-base',   'Whisper Base (faster-whisper)',      0.2, 0.5,  0.75, 0.9),
+            ('stt-whisper-medium', 'Whisper Medium (faster-whisper)',    1.5, 2.0,  0.85, 0.7),
+            ('stt-whisper-large',  'Whisper Large v3 (faster-whisper)', 3.0, 4.0,  0.93, 0.5),
         ]
-        for mid, name, vram, ram, quality, speed, langs, tags in stt_models:
+        for mid, name, vram, ram, quality, speed in _fallback:
             if mid in self._entries:
                 continue
             entry = ModelEntry(
@@ -414,16 +439,29 @@ class ModelCatalog:
                 backend='torch', supports_gpu=vram > 0, supports_cpu=True,
                 supports_cpu_offload=True, cpu_offload_method='torch_to_cpu',
                 idle_timeout_s=300,
-                capabilities={'realtime': True, 'diarization': False},
+                capabilities={'realtime': True, 'diarization': False,
+                              'multilingual': True},
                 quality_score=quality, speed_score=speed,
-                languages=langs, tags=tags,
+                languages=['multilingual'],
+                tags=['local', 'stt', 'cpu-friendly'],
             )
             self.register(entry, persist=False)
             added += 1
         return added
 
     def _populate_vlm_models(self) -> int:
-        """Built-in VLM model entries (no external deps)."""
+        """VLM model entries — delegated to lightweight_backend.populate_vlm_catalog().
+
+        lightweight_backend is the single source of truth for VLM backend names
+        and hardware tier thresholds. Falls back to MiniCPM only if unavailable.
+        """
+        try:
+            from integrations.vision.lightweight_backend import populate_vlm_catalog
+            return populate_vlm_catalog(self)
+        except Exception as e:
+            logger.debug(f"VLM catalog population via lightweight_backend skipped: {e}")
+
+        # Minimal fallback — MiniCPM only
         added = 0
         if 'vlm-minicpm-v2' not in self._entries:
             entry = ModelEntry(
@@ -438,6 +476,43 @@ class ModelCatalog:
                               'description_loop': True},
                 quality_score=0.8, speed_score=0.7,
                 tags=['local', 'vision'],
+            )
+            self.register(entry, persist=False)
+            added += 1
+        return added
+
+    def _populate_videogen_models(self) -> int:
+        """Video generation model entries — delegated to media_agent.populate_videogen_catalog().
+
+        media_agent is the single source of truth for video gen tool names
+        and VRAM routing thresholds. Falls back to inline entries if unavailable.
+        """
+        try:
+            from integrations.service_tools.media_agent import populate_videogen_catalog
+            return populate_videogen_catalog(self)
+        except Exception as e:
+            logger.debug(f"Video gen catalog population via media_agent skipped: {e}")
+
+        # Minimal fallback
+        added = 0
+        _fallback = [
+            ('video_gen-wan2gp', 'Wan2GP',  8.0, 12.0, 0.88, 0.65),
+            ('video_gen-ltx2',   'LTX2',    4.0,  8.0, 0.75, 0.80),
+        ]
+        for mid, name, vram, ram, quality, speed in _fallback:
+            if mid in self._entries:
+                continue
+            entry = ModelEntry(
+                id=mid, name=name, model_type=ModelType.VIDEO_GEN,
+                source='huggingface',
+                vram_gb=vram, ram_gb=ram,
+                backend='sidecar', supports_gpu=True,
+                supports_cpu=(vram < 6),
+                supports_cpu_offload=(vram < 6),
+                idle_timeout_s=600,
+                capabilities={'txt2vid': True, 'img2vid': False},
+                quality_score=quality, speed_score=speed,
+                tags=['local', 'video_gen'],
             )
             self.register(entry, persist=False)
             added += 1
@@ -495,10 +570,23 @@ class ModelCatalog:
                 'models': [e.to_dict() for e in self._entries.values()],
             }
         try:
-            tmp = self._path.with_suffix('.tmp')
-            with open(tmp, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            tmp.replace(self._path)
+            # Use unique temp file per save to prevent WinError 32 when
+            # multiple populators call _save() concurrently.
+            import tempfile
+            fd, tmp_path = tempfile.mkstemp(
+                suffix='.tmp', prefix='model_catalog_',
+                dir=str(self._path.parent))
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                Path(tmp_path).replace(self._path)
+            except Exception:
+                # Clean up temp file on failure
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
             self._dirty = False
         except Exception as e:
             logger.error(f"Failed to save catalog: {e}")

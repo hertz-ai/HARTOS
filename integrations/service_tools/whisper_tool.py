@@ -340,13 +340,122 @@ def _select_legacy_model() -> str:
 # Public API (same interface for all callers)
 # ═══════════════════════════════════════════════════════════════
 
-def select_whisper_model() -> str:
-    """Select best sherpa-onnx STT model for this hardware (fallback path).
+def populate_stt_catalog(catalog) -> int:
+    """Register all STT model variants into the ModelCatalog.
 
-    Returns a model name from _SHERPA_MODELS if sherpa-onnx is available,
-    otherwise falls back to openai-whisper model names.
-    Primary engine is faster-whisper (base, CPU int8).
+    Called by ModelCatalog._populate_stt_models() so the catalog is the
+    single source of truth for model names, VRAM requirements, and tier gates.
+    Replaces the hardcoded VRAM thresholds in select_whisper_model().
+
+    Returns number of new entries added.
     """
+    from integrations.service_tools.model_catalog import ModelEntry, ModelType
+
+    # (id, name, vram_gb, ram_gb, disk_gb, quality, speed, tags, min_tier)
+    models = [
+        # faster-whisper (primary engine, CTranslate2 INT8)
+        ('stt-faster-whisper-tiny',   'Whisper Tiny (faster-whisper)',   0.0, 0.3, 0.15,
+         0.60, 0.98, ['multilingual', 'cpu-friendly', 'faster-whisper'], 'lite'),
+        ('stt-faster-whisper-base',   'Whisper Base (faster-whisper)',   0.2, 0.5, 0.30,
+         0.72, 0.95, ['multilingual', 'cpu-friendly', 'faster-whisper'], 'lite'),
+        ('stt-faster-whisper-small',  'Whisper Small (faster-whisper)',  0.5, 1.0, 0.46,
+         0.80, 0.85, ['multilingual', 'faster-whisper'], 'lite'),
+        ('stt-faster-whisper-medium', 'Whisper Medium (faster-whisper)', 1.5, 2.0, 1.50,
+         0.87, 0.72, ['multilingual', 'faster-whisper'], 'standard'),
+        ('stt-faster-whisper-large',  'Whisper Large v3 (faster-whisper)', 3.0, 4.0, 3.10,
+         0.94, 0.55, ['multilingual', 'faster-whisper'], 'full'),
+        # sherpa-onnx (lightweight ONNX, no PyTorch)
+        ('stt-sherpa-moonshine-tiny', 'Moonshine Tiny (sherpa-onnx, EN)', 0.0, 0.2, 0.08,
+         0.62, 0.99, ['english-only', 'onnx', 'sherpa-onnx', 'cpu-friendly'], 'lite'),
+        ('stt-sherpa-moonshine-base', 'Moonshine Base (sherpa-onnx, EN)', 0.0, 0.3, 0.15,
+         0.68, 0.96, ['english-only', 'onnx', 'sherpa-onnx', 'cpu-friendly'], 'lite'),
+        ('stt-sherpa-whisper-tiny',   'Whisper Tiny (sherpa-onnx)',      0.0, 0.3, 0.15,
+         0.61, 0.97, ['multilingual', 'onnx', 'sherpa-onnx', 'cpu-friendly'], 'lite'),
+        ('stt-sherpa-whisper-base',   'Whisper Base (sherpa-onnx)',      0.0, 0.4, 0.30,
+         0.72, 0.92, ['multilingual', 'onnx', 'sherpa-onnx'], 'lite'),
+        ('stt-sherpa-whisper-small',  'Whisper Small (sherpa-onnx)',     0.0, 0.7, 0.46,
+         0.79, 0.80, ['multilingual', 'onnx', 'sherpa-onnx'], 'lite'),
+        ('stt-sherpa-whisper-medium', 'Whisper Medium (sherpa-onnx)',    0.0, 1.5, 1.50,
+         0.86, 0.65, ['multilingual', 'onnx', 'sherpa-onnx'], 'standard'),
+    ]
+
+    added = 0
+    for (mid, name, vram, ram, disk, quality, speed, tags, min_tier) in models:
+        if catalog.get(mid) is not None:
+            continue
+        entry = ModelEntry(
+            id=mid, name=name, model_type=ModelType.STT,
+            source='github' if 'sherpa' in mid else 'huggingface',
+            vram_gb=vram, ram_gb=ram, disk_gb=disk,
+            min_capability_tier=min_tier,
+            backend='onnx' if 'sherpa' in mid else 'torch',
+            supports_gpu=(vram > 0), supports_cpu=True,
+            supports_cpu_offload=False,
+            idle_timeout_s=300,
+            capabilities={
+                'realtime': True,
+                'diarization': False,
+                'multilingual': ('multilingual' in tags),
+            },
+            quality_score=quality, speed_score=speed,
+            languages=['multilingual'] if 'multilingual' in tags else ['en'],
+            tags=tags,
+        )
+        catalog.register(entry, persist=False)
+        added += 1
+    return added
+
+
+# ── Catalog-aware model name → sherpa-onnx key mapping ─────────────────────
+_CATALOG_ID_TO_SHERPA = {
+    'stt-sherpa-moonshine-tiny': 'moonshine-tiny',
+    'stt-sherpa-moonshine-base': 'moonshine-base',
+    'stt-sherpa-whisper-tiny':   'whisper-tiny',
+    'stt-sherpa-whisper-base':   'whisper-base',
+    'stt-sherpa-whisper-small':  'whisper-small',
+    'stt-sherpa-whisper-medium': 'whisper-medium',
+}
+
+_CATALOG_ID_TO_FASTER_WHISPER_SIZE = {
+    'stt-faster-whisper-tiny':   'tiny',
+    'stt-faster-whisper-base':   'base',
+    'stt-faster-whisper-small':  'small',
+    'stt-faster-whisper-medium': 'medium',
+    'stt-faster-whisper-large':  'large-v3',
+}
+
+
+def select_whisper_model() -> str:
+    """Select best STT model for this hardware.
+
+    Tries ModelCatalog first (single source of truth for VRAM thresholds).
+    Falls back to direct VRAM query if catalog is unavailable.
+
+    Returns a sherpa-onnx model key (from _SHERPA_MODELS) when sherpa-onnx
+    is available, or an openai-whisper model name as a legacy fallback.
+    """
+    # ── Primary path: ask the catalog ───────────────────────────────────────
+    try:
+        from integrations.service_tools.model_orchestrator import get_orchestrator
+        orch = get_orchestrator()
+        entry = orch.select_best('stt')
+        if entry:
+            # Map catalog entry ID back to the engine-specific key
+            sherpa_key = _CATALOG_ID_TO_SHERPA.get(entry.id)
+            if sherpa_key and sherpa_key in _SHERPA_MODELS:
+                try:
+                    import sherpa_onnx  # noqa: F401
+                    return sherpa_key
+                except ImportError:
+                    pass
+            # faster-whisper size
+            fw_size = _CATALOG_ID_TO_FASTER_WHISPER_SIZE.get(entry.id)
+            if fw_size:
+                return fw_size
+    except Exception:
+        pass
+
+    # ── Fallback: direct VRAM query (no catalog dependency) ─────────────────
     try:
         import sherpa_onnx  # noqa: F401 — check availability
     except ImportError:

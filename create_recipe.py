@@ -8,57 +8,11 @@ import os
 # Autogen's GroupChat sends system-role speaker selection prompts mid-conversation.
 # Patch the httpx transport to rewrite system→user before sending to llama-server.
 # This catches ALL LLM calls from autogen regardless of which method triggers them.
-try:
-    import httpx as _httpx
-    import json as _json
-    _orig_httpx_send = _httpx.Client.send
-
-    def _fix_system_role_send(self, request, **kwargs):
-        # Only intercept chat completions to local LLM
-        if b'/v1/chat/completions' in request.url.raw_path and request.content:
-            try:
-                body = _json.loads(request.content)
-                messages = body.get('messages', [])
-                changed = False
-                for i, msg in enumerate(messages):
-                    if i > 0 and msg.get('role') == 'system':
-                        msg['role'] = 'user'
-                        changed = True
-                if changed:
-                    request = _httpx.Request(
-                        method=request.method,
-                        url=request.url,
-                        headers=request.headers,
-                        content=_json.dumps(body).encode(),
-                    )
-            except Exception:
-                pass
-        # Log BEFORE send to diagnose connection errors
-        if b'/v1/chat/completions' in request.url.raw_path:
-            _logging.getLogger('hevolve_social').info(
-                f"[LLM-autogen] SENDING to {request.url} ({len(request.content or b'')} bytes)")
-        resp = _orig_httpx_send(self, request, **kwargs)
-        # Log autogen LLM input/output
-        if b'/v1/chat/completions' in request.url.raw_path:
-            try:
-                body = _json.loads(request.content) if request.content else {}
-                msgs = body.get('messages', [])
-                prompt_preview = msgs[-1].get('content', '')[:200] if msgs else ''
-                rj = resp.json() if resp.status_code == 200 else {}
-                content = rj.get('choices', [{}])[0].get('message', {}).get('content', '')
-                reasoning = rj.get('choices', [{}])[0].get('message', {}).get('reasoning_content', '')
-                usage = rj.get('usage', {})
-                _logging.getLogger('hevolve_social').info(
-                    f"[LLM-autogen] IN: {prompt_preview}... | "
-                    f"OUT({usage.get('completion_tokens',0)}tok): {content[:200]}... | "
-                    f"THINK: {len(reasoning or '')}chars")
-            except Exception:
-                pass
-        return resp
-
-    _httpx.Client.send = _fix_system_role_send
-except ImportError:
-    pass
+# No httpx monkey-patch needed.
+# Qwen3.5 mid-conversation system messages are handled by autogen's
+# role_for_select_speaker_messages='user' parameter (set in GroupChat kwargs).
+# The previous monkey-patch that rewrote system→user caused Connection errors
+# from double-wrapping httpx.Client.send. Removed entirely.
 from typing import Annotated, Optional, Dict, Tuple, List, Any
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -355,28 +309,8 @@ else:
         "model": os.environ.get('HEVOLVE_LOCAL_LLM_MODEL', 'local'),
         "api_key": 'dummy',
         "base_url": get_local_llm_url(),
-        "price": [0, 0]
+        "price": [0, 0],
     }]
-# Log LLM 500 errors with response body for debugging.
-# Wraps httpx.Client.send to capture error responses from llama-server.
-try:
-    import httpx as _httpx
-    _orig_httpx_send = _httpx.Client.send
-
-    def _logging_send(self, request, **kwargs):
-        response = _orig_httpx_send(self, request, **kwargs)
-        if response.status_code >= 400 and '/v1/chat/completions' in str(request.url):
-            try:
-                body = response.text[:500]
-            except Exception:
-                body = '<unreadable>'
-            logging.getLogger('create_recipe').error(
-                f"LLM HTTP {response.status_code} from {request.url}: {body}")
-        return response
-
-    _httpx.Client.send = _logging_send
-except ImportError:
-    pass
 
 # Per-request model config override (speculative execution, hive compute routing)
 # Canonical implementation lives in helper.py — thin wrapper passes local config_list.
@@ -1838,6 +1772,16 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         user_prompt = f'{user_id}_{prompt_id}'
         current_action_id = user_tasks[user_prompt].current_action
 
+        # Preempt: if user started chatting, abort this daemon recipe
+        # so the LLM is free for the user's request immediately.
+        try:
+            from integrations.agent_engine.dispatch import is_user_recently_active
+            if is_user_recently_active():
+                current_app.logger.info("[PREEMPT] User active — aborting daemon recipe to free LLM")
+                raise KeyboardInterrupt("User preemption")
+        except ImportError:
+            pass
+
         current_app.logger.info(
             f'Inside state_transition with action id {user_tasks.get(user_prompt, Action([])).current_action}')
         # Log the first message for debugging if it exists
@@ -1849,6 +1793,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                 f"STATE_TRANSITION - Last message role: {groupchat.messages[last_idx].get('role')}, name: {groupchat.messages[last_idx].get('name')}")
 
         messages = groupchat.messages
+        if not messages:
+            current_app.logger.warning("state_transition called with empty messages list")
+            return assistant
         new_role = 'user'
         if messages[-1]['name'] != 'UserProxy':
             new_role = 'AI'
@@ -2838,6 +2785,9 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     def state_transition1(last_speaker, groupchat):
         current_app.logger.info('INSIDE TIMER STATE TRANSITION')
         messages = groupchat.messages
+        if not messages:
+            current_app.logger.warning("state_transition1 called with empty messages list")
+            return time_agent
         # visual_context = helper_fun.get_visual_context(user_id)
         # if visual_context:
         #     groupchat.messages.insert(-1,{'content':visual_context,'role':'user','name':'helper'})
@@ -3421,7 +3371,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             current_app.logger.info('inside while')
             current_state = get_action_state(user_prompt, current_action_id)
 
-            if group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
+            if group_chat.messages and group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
                 current_app.logger.info(f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")
                 json_obj = retrieve_json(group_chat.messages[-2]["content"])
 
@@ -3547,7 +3497,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                 else:
                     current_app.logger.warning(f'it is not a json object the error is:')
                     current_app.logger.info('it is not a json object You should ask status verifier to give response in proper format & not move ahead to next action')
-                    if group_chat.messages[-1]['role'] == 'tool':
+                    if group_chat.messages and group_chat.messages[-1]['role'] == 'tool':
                         current_app.logger.info('GOT role is tool')
                         break
                     # FIX: Better message construction based on current state
@@ -3614,7 +3564,8 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                             current_app.logger.info(f'DELETE CURRENT AGENTS AND CREATE NEW')
                             config = get_prompt_config_json(prompt_id)
                             # recipe_for_persona[user_prompt] += 1
-                            user_tasks[user_prompt] = Action(config['flows'][get_current_flow(user_prompt)]['actions'])
+                            flow_actions = config['flows'][get_current_flow(user_prompt)]['actions']
+                            user_tasks[user_prompt] = create_action_with_ledger(flow_actions, user_id, prompt_id, user_prompt)
                             del user_agents[user_prompt]
                             x = get_response_group(user_id,text,prompt_id)
                             continue
@@ -3699,7 +3650,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
 
                 continue
 
-            elif group_chat.messages[-1]['content'].startswith('Focus on the current task at hand'):
+            elif group_chat.messages and group_chat.messages[-1]['content'].startswith('Focus on the current task at hand'):
                 result = agents_object['assistant'].initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
                 continue
             elif user_tasks[user_prompt].current_action <= len(user_tasks[user_prompt].actions):
@@ -3707,6 +3658,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
 
                 if len(group_chat.messages) == 0:
                     current_app.logger.warning("No messages in group chat after processing")
+                    break
                 last_message = group_chat.messages[-1]
 
                 if 'tool_calls' in last_message:
@@ -3759,9 +3711,10 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
 
                 if len(group_chat.messages) == 0:
                     current_app.logger.warning("No messages in group chat after processing")
+                    return "I encountered an issue processing your request. Please try again."
 
                 last_message = group_chat.messages[-1]
-                if last_message['content'] == 'TERMINATE':
+                if last_message['content'] == 'TERMINATE' and len(group_chat.messages) > 1:
                     last_message = group_chat.messages[-2]
 
                 if f'message2user'.lower() in last_message['content'].lower():
@@ -3812,9 +3765,10 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
 
         if len(group_chat.messages) == 0:
             current_app.logger.warning("No messages in group chat after processing")
+            return "I encountered an issue processing your request. Please try again."
 
         last_message = group_chat.messages[-1]
-        if last_message['content'] == 'TERMINATE':
+        if last_message['content'] == 'TERMINATE' and len(group_chat.messages) > 1:
             last_message = group_chat.messages[-2]
 
         if f'message2user'.lower() in last_message['content'].lower():
@@ -4483,9 +4437,22 @@ def initialise_current_flow_to_zero(user_prompt):
     recipe_for_persona[user_prompt] = 0
 
 
-def increment_current_flow(user_prompt):
+def increment_current_flow(user_prompt, prompt_id):
+    """Advance to next flow and create Action with ledger for the new flow's actions.
+
+    Args:
+        user_prompt: Cache key (user_id_prompt_id)
+        prompt_id: Required — used to load the prompt config JSON
+    """
     recipe_for_persona[user_prompt] += 1
-    user_tasks[user_prompt] = Action(config['flows'][get_current_flow(user_prompt)]['actions'])
+    prompt_config = get_prompt_config_json(prompt_id)
+    flow_idx = get_current_flow(user_prompt)
+    if flow_idx < len(prompt_config['flows']):
+        user_id = user_prompt.split('_')[0]
+        user_tasks[user_prompt] = create_action_with_ledger(
+            prompt_config['flows'][flow_idx]['actions'], user_id, prompt_id, user_prompt)
+    else:
+        user_tasks[user_prompt] = Action([])
     user_tasks[user_prompt].current_action = 1
 
 
@@ -4501,7 +4468,7 @@ def safe_increment_flow(user_prompt, prompt_id):
         if get_action_state(user_prompt, action_id) != ActionState.TERMINATED:
             raise StateTransitionError(f"Cannot increment flow: Action {action_id} not terminated")
 
-    increment_current_flow(user_prompt)
+    increment_current_flow(user_prompt, prompt_id)
 
     # Reset action states for new flow
     next_flow = get_current_flow(user_prompt)

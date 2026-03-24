@@ -973,3 +973,262 @@ def get_tts_router() -> TTSRouter:
     if _router_instance is None:
         _router_instance = TTSRouter()
     return _router_instance
+
+
+# ═══════════════════════════════════════════════════════════════
+# ModelCatalog integration — populate_tts_catalog()
+# ═══════════════════════════════════════════════════════════════
+
+# Human-readable display names for each engine (used in admin UI)
+_ENGINE_DISPLAY_NAMES: Dict[str, str] = {
+    'chatterbox_turbo': 'Chatterbox Turbo (GPU, English, voice-clone)',
+    'luxtts':           'LuxTTS (CPU, English, voice-clone)',
+    'cosyvoice3':       'CosyVoice 3 (GPU, multilingual, voice-clone)',
+    'f5_tts':           'F5-TTS (GPU, EN/ZH, voice-clone)',
+    'indic_parler':     'Indic Parler-TTS (GPU, 22 Indic languages)',
+    'chatterbox_ml':    'Chatterbox Multilingual (GPU, 23 languages, voice-clone)',
+    'pocket_tts':       'Pocket TTS (CPU, English, voice-clone)',
+    'espeak':           'eSpeak-NG (CPU, 100+ languages, instant fallback)',
+    'makeittalk':       'MakeItTalk (Cloud, English)',
+}
+
+# Extra capabilities per engine that don't map 1-to-1 onto TTSEngineSpec fields
+_ENGINE_EXTRA_CAPS: Dict[str, Dict[str, Any]] = {
+    'chatterbox_turbo': {
+        'streaming': False,
+        'paralinguistic': ['emotion_happy', 'emotion_sad', 'emotion_angry',
+                           'emotion_surprised', 'laughing', 'whispering'],
+        'emotion_tags': True,
+    },
+    'luxtts': {
+        'streaming': False,
+        'paralinguistic': [],
+        'emotion_tags': False,
+    },
+    'cosyvoice3': {
+        'streaming': True,
+        'paralinguistic': ['emotion_happy', 'emotion_sad', 'whispering'],
+        'emotion_tags': True,
+    },
+    'f5_tts': {
+        'streaming': False,
+        'paralinguistic': [],
+        'emotion_tags': False,
+    },
+    'indic_parler': {
+        'streaming': False,
+        'paralinguistic': [],
+        'emotion_tags': False,
+    },
+    'chatterbox_ml': {
+        'streaming': False,
+        'paralinguistic': ['emotion_happy', 'emotion_sad', 'whispering'],
+        'emotion_tags': True,
+    },
+    'pocket_tts': {
+        'streaming': False,
+        'paralinguistic': [],
+        'emotion_tags': False,
+    },
+    'espeak': {
+        'streaming': False,
+        'paralinguistic': [],
+        'emotion_tags': False,
+    },
+    'makeittalk': {
+        'streaming': False,
+        'paralinguistic': [],
+        'emotion_tags': False,
+    },
+}
+
+# Device → backend string mapping for ModelEntry.backend field
+_DEVICE_TO_BACKEND: Dict[str, str] = {
+    TTSDevice.GPU_ONLY.value:       'torch',
+    TTSDevice.GPU_PREFERRED.value:  'torch',
+    TTSDevice.CPU_ONLY.value:       'in_process',
+    TTSDevice.CLOUD.value:          'api',
+}
+
+# Device → supports_gpu / supports_cpu flags
+_DEVICE_TO_COMPUTE: Dict[str, Tuple[bool, bool]] = {
+    # (supports_gpu, supports_cpu)
+    TTSDevice.GPU_ONLY.value:       (True,  False),
+    TTSDevice.GPU_PREFERRED.value:  (True,  True),
+    TTSDevice.CPU_ONLY.value:       (False, True),
+    TTSDevice.CLOUD.value:          (False, False),
+}
+
+# Approximate VRAM usage per GPU engine (GB) — CPU/cloud engines are 0
+_ENGINE_VRAM_GB: Dict[str, float] = {
+    'chatterbox_turbo': 4.0,
+    'cosyvoice3':       6.0,
+    'f5_tts':           4.0,
+    'indic_parler':     8.0,
+    'chatterbox_ml':    6.0,
+}
+
+# Approximate disk footprint per engine (GB)
+_ENGINE_DISK_GB: Dict[str, float] = {
+    'chatterbox_turbo': 2.0,
+    'luxtts':           0.5,
+    'cosyvoice3':       3.5,
+    'f5_tts':           2.5,
+    'indic_parler':     4.0,
+    'chatterbox_ml':    3.0,
+    'pocket_tts':       0.1,
+    'espeak':           0.05,
+    'makeittalk':       0.0,
+}
+
+# Approximate RAM needed for CPU-capable engines (GB)
+_ENGINE_RAM_GB: Dict[str, float] = {
+    'chatterbox_turbo': 2.0,
+    'luxtts':           2.0,
+    'cosyvoice3':       4.0,
+    'f5_tts':           2.0,
+    'indic_parler':     4.0,
+    'chatterbox_ml':    4.0,
+    'pocket_tts':       0.5,
+    'espeak':           0.1,
+    'makeittalk':       0.1,
+}
+
+
+def populate_tts_catalog(catalog) -> int:
+    """Convert ENGINE_REGISTRY into ModelEntry objects and register them.
+
+    Called by ModelCatalog.populate_from_subsystems() via the populator
+    plugin mechanism — keeps tts_router as the single source of truth for
+    TTS engine capabilities.
+
+    Args:
+        catalog: ModelCatalog instance (accepts Any to avoid a hard import
+                 at module level — the catalog is passed in by the caller).
+
+    Returns:
+        Number of new entries added (skips already-registered IDs).
+    """
+    # Lazy import inside function body — avoids circular import at module load
+    from integrations.service_tools.model_catalog import ModelEntry, ModelType
+
+    added = 0
+    for engine_id, spec in ENGINE_REGISTRY.items():
+        # Skip if already registered (preserves user edits from admin UI)
+        if catalog.get(f'tts-{engine_id.replace("_", "-")}') is not None:
+            continue
+
+        device_value = spec.device.value
+        supports_gpu, supports_cpu = _DEVICE_TO_COMPUTE.get(
+            device_value, (False, True)
+        )
+        backend = _DEVICE_TO_BACKEND.get(device_value, 'in_process')
+
+        # Build language_priority from LANG_ENGINE_PREFERENCE:
+        # lower rank in the preference list → lower priority number → preferred
+        lang_priority: Dict[str, int] = {}
+        for lang, engine_list in LANG_ENGINE_PREFERENCE.items():
+            if engine_id in engine_list:
+                rank = engine_list.index(engine_id)   # 0 = most preferred
+                lang_priority[lang] = rank * 10       # 0, 10, 20, ...
+
+        # Pick the best latency figure for quality/speed scores
+        best_latency_ms = min(
+            (v for v in (spec.latency_gpu_ms, spec.latency_cpu_ms,
+                          spec.latency_cloud_ms) if v > 0),
+            default=5000,
+        )
+        # speed_score: 1.0 = instant (≤10 ms), 0.0 = very slow (≥5000 ms)
+        speed_score = max(0.0, 1.0 - (best_latency_ms - 10) / 4990)
+
+        # Build capabilities dict — TTS-specific fields + extras
+        extra = _ENGINE_EXTRA_CAPS.get(engine_id, {})
+        capabilities: Dict[str, Any] = {
+            'voice_clone':    spec.voice_clone,
+            'sample_rate':    spec.sample_rate,
+            'latency_gpu_ms': spec.latency_gpu_ms,
+            'latency_cpu_ms': spec.latency_cpu_ms,
+            'latency_cloud_ms': spec.latency_cloud_ms,
+            'tool_module':    spec.tool_module,
+            'tool_function':  spec.tool_function,
+            'vram_key':       spec.vram_key,
+            'streaming':      extra.get('streaming', False),
+            'paralinguistic': extra.get('paralinguistic', []),
+            'emotion_tags':   extra.get('emotion_tags', False),
+        }
+
+        # languages list — ('*',) means "all"; store as-is so select_best
+        # language matching still works (catalog treats '*' as wildcard)
+        languages = list(spec.languages)
+
+        entry = ModelEntry(
+            id=f'tts-{engine_id.replace("_", "-")}',
+            name=_ENGINE_DISPLAY_NAMES.get(engine_id, engine_id),
+            model_type=ModelType.TTS,
+            version='1.0',
+            source='cloud' if spec.device == TTSDevice.CLOUD else 'local',
+            vram_gb=_ENGINE_VRAM_GB.get(engine_id, 0.0),
+            ram_gb=_ENGINE_RAM_GB.get(engine_id, 0.5),
+            disk_gb=_ENGINE_DISK_GB.get(engine_id, 0.0),
+            min_capability_tier='lite' if supports_cpu else 'standard',
+            backend=backend,
+            supports_gpu=supports_gpu,
+            supports_cpu=supports_cpu,
+            supports_cpu_offload=False,
+            idle_timeout_s=300.0,
+            capabilities=capabilities,
+            quality_score=spec.quality,
+            speed_score=round(speed_score, 3),
+            priority=50,
+            languages=languages,
+            language_priority=lang_priority,
+            tags=['tts', 'local' if spec.device != TTSDevice.CLOUD else 'cloud'],
+            enabled=True,
+            auto_load=False,
+        )
+        catalog.register(entry, persist=False)
+        added += 1
+
+    return added
+
+
+def _catalog_entry_to_spec(entry) -> Optional[TTSEngineSpec]:
+    """Convert a ModelCatalog ModelEntry back to a TTSEngineSpec.
+
+    Used by code that needs a TTSEngineSpec but only has a catalog entry
+    (e.g. when the router consults the catalog for dynamically registered
+    engines that were not present in ENGINE_REGISTRY at startup).
+
+    Returns None if the entry is not a valid TTS engine spec.
+    """
+    caps = entry.capabilities or {}
+    tool_module = caps.get('tool_module')
+    tool_function = caps.get('tool_function')
+
+    # Determine TTSDevice from backend + supports_* flags
+    if caps.get('latency_cloud_ms', 0) > 0 and not entry.supports_gpu and not entry.supports_cpu:
+        device = TTSDevice.CLOUD
+    elif entry.supports_gpu and not entry.supports_cpu:
+        device = TTSDevice.GPU_ONLY
+    elif entry.supports_gpu and entry.supports_cpu:
+        device = TTSDevice.GPU_PREFERRED
+    else:
+        device = TTSDevice.CPU_ONLY
+
+    # Strip the 'tts-' prefix that populate_tts_catalog adds
+    raw_id = entry.id[4:] if entry.id.startswith('tts-') else entry.id
+
+    return TTSEngineSpec(
+        engine_id=raw_id,
+        device=device,
+        vram_key=caps.get('vram_key', ''),
+        languages=tuple(entry.languages) if entry.languages else ('en',),
+        quality=entry.quality_score,
+        voice_clone=caps.get('voice_clone', False),
+        latency_gpu_ms=caps.get('latency_gpu_ms', 0),
+        latency_cpu_ms=caps.get('latency_cpu_ms', 0),
+        latency_cloud_ms=caps.get('latency_cloud_ms', 0),
+        tool_module=tool_module,
+        tool_function=tool_function,
+        sample_rate=caps.get('sample_rate', 24000),
+    )

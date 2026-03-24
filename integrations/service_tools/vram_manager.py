@@ -144,6 +144,16 @@ class VRAMManager:
         if "torch" in sys.modules:
             try:
                 import torch
+                # Detect frozen build torch stub (version 0.0.0, _is_stub=True).
+                # Replace with real torch so CUDA detection works across all
+                # deployments (Nunba frozen, HART OS standalone, cloud).
+                if getattr(torch, '_is_stub', False):
+                    import importlib
+                    _stale = [k for k in sys.modules if k == 'torch' or k.startswith('torch.')]
+                    for _k in _stale:
+                        del sys.modules[_k]
+                    torch = importlib.import_module('torch')
+                    logger.info(f"Replaced torch stub with real torch {torch.__version__}")
                 if torch.cuda.is_available():
                     props = torch.cuda.get_device_properties(0)
                     total = props.total_memory / (1024 ** 3)

@@ -394,7 +394,9 @@ def get_vision_backend(name: str = '') -> VisionBackend:
 
     Priority (when name not specified):
         1. HEVOLVE_VISION_BACKEND env var
-        2. Auto-detect from hardware tier:
+        2. ModelCatalog.select_best('vlm') — catalog is single source of truth
+           for VRAM thresholds and tier gates
+        3. Fallback: direct VRAM query (catalog unavailable)
            - 4GB+ VRAM → minicpm
            - 2GB+ RAM, no GPU → mobilevlm (if ONNX Runtime available)
            - 1GB+ RAM → clip (if clip/open_clip available)
@@ -407,10 +409,33 @@ def get_vision_backend(name: str = '') -> VisionBackend:
         return cls()
 
     # Auto-detect — prefer Qwen3-VL if its server is already running
+    # (zero extra VRAM cost since it reuses the Qwen3-VL server)
     qwen3vl = Qwen3VLVisionBackend()
     if qwen3vl.is_available():
         return qwen3vl
 
+    # ── Catalog-aware selection (single source of truth for VRAM thresholds) ─
+    try:
+        from integrations.service_tools.model_orchestrator import get_orchestrator
+        entry = get_orchestrator().select_best('vlm')
+        if entry:
+            # Map catalog ID → backend name → backend class
+            _CATALOG_TO_BACKEND = {
+                'vlm-qwen3vl':    'qwen3vl',
+                'vlm-minicpm-v2': 'minicpm',
+                'vlm-mobilevlm':  'mobilevlm',
+                'vlm-clip':       'clip',
+            }
+            backend_key = _CATALOG_TO_BACKEND.get(entry.id)
+            if backend_key:
+                cls = _BACKENDS.get(backend_key, NoneBackend)
+                candidate = cls()
+                if candidate.is_available():
+                    return candidate
+    except Exception:
+        pass
+
+    # ── Fallback: direct VRAM / RAM query ────────────────────────────────────
     try:
         from security.system_requirements import get_capabilities
         caps = get_capabilities()
@@ -432,7 +457,7 @@ def get_vision_backend(name: str = '') -> VisionBackend:
     except Exception:
         pass
 
-    # Fallback: try minicpm (original behavior)
+    # Last resort: try minicpm (original behavior)
     minicpm = MiniCPMBackend()
     if minicpm.is_available():
         return minicpm
@@ -452,3 +477,76 @@ def list_available_backends():
             'ram_mb': backend.ram_mb,
         })
     return results
+
+
+def populate_vlm_catalog(catalog) -> int:
+    """Register all VLM backend variants into the ModelCatalog.
+
+    This is the single source of truth for VLM model names, VRAM thresholds,
+    and capability tier gates — replacing hardcoded values in get_vision_backend().
+
+    Called by ModelCatalog._populate_vlm_models() so the catalog stays
+    consistent with what lightweight_backend actually supports.
+
+    Returns number of new entries added.
+    """
+    from integrations.service_tools.model_catalog import ModelEntry, ModelType
+
+    vlm_models = [
+        # (id, name, vram_gb, ram_gb, disk_gb, quality, speed, min_tier, backend,
+        #  supports_gpu, supports_cpu, caps, tags)
+        (
+            'vlm-qwen3vl', 'Qwen3-VL',
+            4.0, 4.0, 8.0, 0.90, 0.70, 'full',
+            'api', True, False,
+            {'image_input': True, 'video_input': True, 'description_loop': True,
+             'computer_use': True},
+            ['local', 'vision', 'qwen3vl'],
+        ),
+        (
+            'vlm-minicpm-v2', 'MiniCPM-V-2',
+            4.0, 4.0, 4.0, 0.80, 0.70, 'full',
+            'sidecar', True, False,
+            {'image_input': True, 'video_input': False, 'description_loop': True,
+             'computer_use': False},
+            ['local', 'vision'],
+        ),
+        (
+            'vlm-mobilevlm', 'MobileVLM-1.7B (ONNX)',
+            0.0, 0.4, 0.5, 0.55, 0.92, 'lite',
+            'onnx', False, True,
+            {'image_input': True, 'video_input': False, 'description_loop': True,
+             'computer_use': False},
+            ['local', 'vision', 'cpu-friendly', 'onnx'],
+        ),
+        (
+            'vlm-clip', 'CLIP ViT-B/16 (classification)',
+            0.0, 0.5, 0.6, 0.45, 0.96, 'lite',
+            'torch', False, True,
+            {'image_input': True, 'video_input': False, 'description_loop': False,
+             'classification_only': True, 'computer_use': False},
+            ['local', 'vision', 'cpu-friendly', 'classification'],
+        ),
+    ]
+
+    added = 0
+    for (mid, name, vram, ram, disk, quality, speed, min_tier,
+         backend, sup_gpu, sup_cpu, caps, tags) in vlm_models:
+        if catalog.get(mid) is not None:
+            continue
+        entry = ModelEntry(
+            id=mid, name=name, model_type=ModelType.VLM,
+            source='huggingface',
+            vram_gb=vram, ram_gb=ram, disk_gb=disk,
+            min_capability_tier=min_tier,
+            backend=backend,
+            supports_gpu=sup_gpu, supports_cpu=sup_cpu,
+            supports_cpu_offload=False,
+            idle_timeout_s=900,
+            capabilities=caps,
+            quality_score=quality, speed_score=speed,
+            tags=tags,
+        )
+        catalog.register(entry, persist=False)
+        added += 1
+    return added

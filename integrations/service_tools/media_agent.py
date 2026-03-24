@@ -49,12 +49,86 @@ def _ensure_tool_running(tool_name: str) -> bool:
         return False
 
 
-def _select_video_tool() -> str:
-    """Select the best video tool based on available VRAM.
+def populate_videogen_catalog(catalog) -> int:
+    """Register all video generation model variants into the ModelCatalog.
 
-    VRAM >= 8 GB → wan2gp (higher quality)
-    Otherwise   → ltx2 (supports CPU offload)
+    This is the single source of truth for video gen model names, VRAM
+    thresholds, and capabilities — replacing the hardcoded free_gb >= 8.0
+    threshold in _select_video_tool().
+
+    Called by ModelCatalog._populate_videogen_models().
+    Returns number of new entries added.
     """
+    from integrations.service_tools.model_catalog import ModelEntry, ModelType
+
+    # (id, name, vram_gb, ram_gb, disk_gb, quality, speed, min_tier,
+    #  supports_cpu, supports_cpu_offload, caps)
+    videogen_models = [
+        (
+            'video_gen-wan2gp', 'Wan2GP',
+            8.0, 12.0, 15.0, 0.88, 0.65, 'full',
+            False, False,
+            {'txt2vid': True, 'img2vid': True, 'resolution': '512x320',
+             'fps': 24, 'async_task': True},
+        ),
+        (
+            'video_gen-ltx2', 'LTX-Video-2',
+            4.0, 8.0, 10.0, 0.78, 0.78, 'standard',
+            True, True,
+            {'txt2vid': True, 'img2vid': False, 'resolution': '832x480',
+             'fps': 24, 'async_task': True, 'cpu_offload': True},
+        ),
+    ]
+
+    added = 0
+    for (mid, name, vram, ram, disk, quality, speed, min_tier,
+         sup_cpu, sup_offload, caps) in videogen_models:
+        if catalog.get(mid) is not None:
+            continue
+        entry = ModelEntry(
+            id=mid, name=name, model_type=ModelType.VIDEO_GEN,
+            source='huggingface',
+            vram_gb=vram, ram_gb=ram, disk_gb=disk,
+            min_capability_tier=min_tier,
+            backend='sidecar',
+            supports_gpu=True, supports_cpu=sup_cpu,
+            supports_cpu_offload=sup_offload,
+            cpu_offload_method='restart_cpu' if sup_offload else 'none',
+            idle_timeout_s=600,
+            capabilities=caps,
+            quality_score=quality, speed_score=speed,
+            tags=['local', 'video_gen'],
+        )
+        catalog.register(entry, persist=False)
+        added += 1
+    return added
+
+
+def _select_video_tool() -> str:
+    """Select the best video generation tool for current hardware.
+
+    Consults ModelCatalog (single source of truth for VRAM thresholds).
+    Falls back to direct VRAM query if catalog is unavailable.
+
+    Returns 'wan2gp' or 'ltx2'.
+    """
+    # ── Primary path: ask the catalog/orchestrator ───────────────────────────
+    try:
+        from integrations.service_tools.model_orchestrator import get_orchestrator
+        entry = get_orchestrator().select_best('video_gen')
+        if entry:
+            # Map catalog ID → tool name used by service_tool_registry
+            _CATALOG_TO_TOOL = {
+                'video_gen-wan2gp': 'wan2gp',
+                'video_gen-ltx2':   'ltx2',
+            }
+            tool = _CATALOG_TO_TOOL.get(entry.id)
+            if tool:
+                return tool
+    except Exception:
+        pass
+
+    # ── Fallback: direct VRAM query ──────────────────────────────────────────
     try:
         from integrations.service_tools.vram_manager import vram_manager
         info = vram_manager.detect_gpu()

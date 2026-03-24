@@ -289,15 +289,38 @@ class ModelOrchestrator:
     # double-counting when both RTM and the Orchestrator register the same model.
 
     _CATALOG_TO_VRAM_KEY = {
-        'stt-whisper-base': 'whisper_base',
+        # STT — faster-whisper (primary engine)
+        'stt-faster-whisper-tiny':   'whisper_tiny',
+        'stt-faster-whisper-base':   'whisper_base',
+        'stt-faster-whisper-small':  'whisper_small',
+        'stt-faster-whisper-medium': 'whisper_medium',
+        'stt-faster-whisper-large':  'whisper_large',
+        # STT — sherpa-onnx (CPU-only ONNX, no GPU VRAM)
+        'stt-sherpa-moonshine-tiny':  'sherpa_moonshine_tiny',
+        'stt-sherpa-moonshine-base':  'sherpa_moonshine_base',
+        'stt-sherpa-whisper-tiny':    'sherpa_whisper_tiny',
+        'stt-sherpa-whisper-base':    'sherpa_whisper_base',
+        'stt-sherpa-whisper-small':   'sherpa_whisper_small',
+        'stt-sherpa-whisper-medium':  'sherpa_whisper_medium',
+        # STT — legacy fallback IDs (used by old catalog entries)
+        'stt-whisper-base':   'whisper_base',
         'stt-whisper-medium': 'whisper_medium',
-        'stt-whisper-large': 'whisper_large',
+        'stt-whisper-large':  'whisper_large',
+        # TTS
         'tts-chatterbox-turbo': 'tts_chatterbox_turbo',
-        'tts-f5-tts': 'tts_f5',
-        'tts-indic-parler': 'tts_indic_parler',
-        'tts-cosyvoice3': 'tts_cosyvoice3',
-        'tts-chatterbox-ml': 'tts_chatterbox_ml',
+        'tts-f5-tts':           'tts_f5',
+        'tts-indic-parler':     'tts_indic_parler',
+        'tts-cosyvoice3':       'tts_cosyvoice3',
+        'tts-chatterbox-ml':    'tts_chatterbox_ml',
+        # VLM
         'vlm-minicpm-v2': 'minicpm',
+        'vlm-qwen3vl':    'qwen3vl',
+        # VLM — CPU-only backends (no GPU VRAM tracking needed, included for completeness)
+        'vlm-mobilevlm': 'mobilevlm',
+        'vlm-clip':       'clip',
+        # Video gen
+        'video_gen-wan2gp': 'wan2gp',
+        'video_gen-ltx2':   'ltx2',
     }
 
     def _vram_key(self, entry: ModelEntry) -> str:
