@@ -153,3 +153,100 @@ class TestResponseShapes:
             data = resp[0].get_json()
         assert 'success' in data
         assert 'error' in data
+
+
+# ============================================================
+# Access control helpers — who can approve/reject tasks
+# ============================================================
+
+class TestAccessControl:
+    """_is_contributor and _is_central drive HITL task approval permissions."""
+
+    def test_is_central_true_for_admin(self):
+        from integrations.social.api_tracker import _is_central
+        mock_user = MagicMock()
+        mock_user.role = 'central'
+        mock_user.is_admin = True
+        assert _is_central(mock_user) is True
+
+    def test_is_central_true_for_central_role(self):
+        from integrations.social.api_tracker import _is_central
+        mock_user = MagicMock()
+        mock_user.role = 'central'
+        mock_user.is_admin = False
+        assert _is_central(mock_user) is True
+
+    def test_is_central_false_for_flat(self):
+        """Flat users cannot approve/reject — only central (admins)."""
+        from integrations.social.api_tracker import _is_central
+        mock_user = MagicMock()
+        mock_user.role = 'flat'
+        mock_user.is_admin = False
+        assert _is_central(mock_user) is False
+
+    def test_is_central_false_for_regional(self):
+        from integrations.social.api_tracker import _is_central
+        mock_user = MagicMock()
+        mock_user.role = 'regional'
+        mock_user.is_admin = False
+        assert _is_central(mock_user) is False
+
+    def test_is_central_handles_missing_role(self):
+        """User object without role attr defaults to flat."""
+        from integrations.social.api_tracker import _is_central
+        mock_user = MagicMock(spec=[])  # No attributes
+        assert _is_central(mock_user) is False
+
+    def test_is_contributor_with_active_pledge(self):
+        """Users with active pledges can see private experiment data."""
+        from integrations.social.api_tracker import _is_contributor
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = MagicMock()  # Found
+        assert _is_contributor(mock_db, 'user_1', 'post_1') is True
+
+    def test_is_contributor_without_pledge(self):
+        from integrations.social.api_tracker import _is_contributor
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = None
+        assert _is_contributor(mock_db, 'user_1', 'post_1') is False
+
+
+# ============================================================
+# Error status codes — frontend handles these specifically
+# ============================================================
+
+class TestErrorCodes:
+    """Different error codes trigger different UI behaviors."""
+
+    def test_err_default_400(self):
+        from integrations.social.api_tracker import _err
+        from flask import Flask
+        app = Flask(__name__)
+        with app.app_context():
+            resp = _err('bad request')
+        assert resp[1] == 400
+
+    def test_err_custom_404(self):
+        from integrations.social.api_tracker import _err
+        from flask import Flask
+        app = Flask(__name__)
+        with app.app_context():
+            resp = _err('not found', 404)
+        assert resp[1] == 404
+
+    def test_err_custom_403(self):
+        from integrations.social.api_tracker import _err
+        from flask import Flask
+        app = Flask(__name__)
+        with app.app_context():
+            resp = _err('forbidden', 403)
+        assert resp[1] == 403
+
+    def test_ok_custom_201(self):
+        """201 returned on successful creation (pledge, contribution)."""
+        from integrations.social.api_tracker import _ok
+        from flask import Flask
+        app = Flask(__name__)
+        with app.app_context():
+            resp = _ok({'created': True}, status=201)
+        assert resp[1] == 201
