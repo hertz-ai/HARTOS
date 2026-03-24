@@ -314,9 +314,26 @@ ALWAYS:
 # Persistence — save/load alongside recipe files
 # ═══════════════════════════════════════════════════════════════════════
 
+def _resolve_prompts_dir(base_dir: str = None) -> str:
+    """Resolve prompts directory — platform-aware, works on all OS.
+
+    Installed builds (Windows/Linux/macOS) run from read-only dirs like
+    C:\\Program Files\\. The relative './prompts' fails there. Resolve
+    to the user data directory via platform_paths.
+    """
+    if base_dir and not base_dir.startswith('.'):
+        return base_dir  # explicit absolute path — use as-is
+    try:
+        from core.platform_paths import get_prompts_dir
+        return get_prompts_dir()
+    except ImportError:
+        return os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'prompts')
+
+
 def save_personality(prompt_id: str, personality: AgentPersonality,
-                     base_dir: str = "prompts") -> None:
-    """Save personality to prompts/{prompt_id}_personality.json."""
+                     base_dir: str = None) -> None:
+    """Save personality to {prompts_dir}/{prompt_id}_personality.json."""
+    base_dir = _resolve_prompts_dir(base_dir)
     path = os.path.join(base_dir, f"{prompt_id}_personality.json")
     try:
         os.makedirs(base_dir, exist_ok=True)
@@ -327,8 +344,9 @@ def save_personality(prompt_id: str, personality: AgentPersonality,
         logger.warning(f"Failed to save personality: {e}")
 
 
-def load_personality(prompt_id: str, base_dir: str = "prompts") -> Optional[AgentPersonality]:
-    """Load personality from prompts/{prompt_id}_personality.json."""
+def load_personality(prompt_id: str, base_dir: str = None) -> Optional[AgentPersonality]:
+    """Load personality from {prompts_dir}/{prompt_id}_personality.json."""
+    base_dir = _resolve_prompts_dir(base_dir)
     path = os.path.join(base_dir, f"{prompt_id}_personality.json")
     if not os.path.exists(path):
         return None

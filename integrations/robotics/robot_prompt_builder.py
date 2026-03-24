@@ -32,6 +32,23 @@ def build_robot_prompt(goal_dict: Dict,
     """
     config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
 
+    # Guard: skip if no robot bridge is connected. Without an actual robot,
+    # the agent loops trying to call get_robot_status() which fails, wastes
+    # LLM budget, and gets killed by the watchdog.
+    try:
+        from integrations.robotics.capability_advertiser import get_capability_advertiser
+        caps = get_capability_advertiser().get_capabilities()
+        has_any = (caps.get('locomotion') or caps.get('manipulation')
+                   or any(v for v in caps.get('sensors', {}).values()))
+        if not has_any:
+            import logging
+            logging.getLogger('hevolve_social').info(
+                f"Robot goal '{goal_dict.get('title', '')}': skipping — "
+                f"no locomotion, manipulation, or sensors detected")
+            return None
+    except Exception:
+        pass  # Capability advertiser unavailable — continue with fallback prompt
+
     # Capabilities
     caps_section = _get_capabilities_section()
 
