@@ -280,8 +280,11 @@ class TestToolWrappers:
                 'cuda_available': False, 'total_gb': 0,
                 'free_gb': 0, 'name': None,
             }
-            # Hide sherpa_onnx to force legacy whisper path (returns 'base')
-            with patch.dict(sys.modules, {'sherpa_onnx': None}):
+            # Hide sherpa_onnx and orchestrator to force legacy whisper path
+            with patch.dict(sys.modules, {
+                'sherpa_onnx': None,
+                'integrations.service_tools.model_orchestrator': None,
+            }):
                 model = select_whisper_model()
             assert model == 'base'
         finally:
@@ -660,7 +663,10 @@ class TestMediaAgent:
                 'cuda_available': True, 'total_gb': 12.0,
                 'free_gb': 10.0, 'name': 'RTX 3080',
             }
-            assert _select_video_tool() == 'wan2gp'
+            # Disable orchestrator/catalog so we test the direct VRAM fallback
+            with patch.dict('sys.modules',
+                            {'integrations.service_tools.model_orchestrator': None}):
+                assert _select_video_tool() == 'wan2gp'
         finally:
             vram_manager._gpu_info = original
 

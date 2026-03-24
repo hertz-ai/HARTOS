@@ -3934,9 +3934,16 @@ else:
 # main function
 def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang):
     start_time = time.time()
-    user_details, actions = get_action_user_details(user_id=user_id)
-    app.logger.info(
-        "time taken by get_action_user_details %s seconds", time.time() - start_time)
+    # Skip action history fetch for casual conversations — they don't use it
+    # in the prompt, and the HTTP call to ACTION_API adds 5+ seconds latency.
+    if casual_conv:
+        user_details = "Casual conversation mode."
+        actions = ""
+        app.logger.info("Skipped get_action_user_details (casual_conv=True)")
+    else:
+        user_details, actions = get_action_user_details(user_id=user_id)
+        app.logger.info(
+            "time taken by get_action_user_details %s seconds", time.time() - start_time)
     app.logger.info(casual_conv)
     llm = CustomGPT(casual_conv=casual_conv)
     app.logger.info(f"query------> {query}")

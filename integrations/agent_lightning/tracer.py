@@ -301,8 +301,16 @@ class LightningTracer:
             import os
             import json
 
-            # Get traces path from config
-            traces_path = AGENT_LIGHTNING_CONFIG.get('traces_path', './agent_data/lightning_traces')
+            # Get traces path from config — resolve to user data dir (not CWD which
+            # may be read-only C:\Program Files\ in installed builds)
+            traces_path = AGENT_LIGHTNING_CONFIG.get('traces_path', '')
+            if not traces_path or traces_path.startswith('./'):
+                try:
+                    from core.platform_paths import get_agent_data_dir
+                    traces_path = os.path.join(get_agent_data_dir(), 'lightning_traces')
+                except ImportError:
+                    traces_path = os.path.join(
+                        os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'lightning_traces')
             os.makedirs(traces_path, exist_ok=True)
 
             # Save span as JSON

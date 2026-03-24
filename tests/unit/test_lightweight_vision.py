@@ -204,14 +204,22 @@ class TestGetVisionBackend:
         assert backend.name == 'none'
 
     def test_auto_select_gpu(self):
-        """With 4GB+ VRAM, auto-selects minicpm."""
+        """With 4GB+ VRAM, auto-selects minicpm via direct VRAM fallback."""
         mock_caps = MagicMock()
         mock_caps.hardware.gpu_vram_gb = 8
         mock_caps.hardware.ram_gb = 16
 
+        from integrations.vision.lightweight_backend import Qwen3VLVisionBackend
+
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop('HEVOLVE_VISION_BACKEND', None)
-            with patch('security.system_requirements.get_capabilities',
+            # Disable Qwen3VL server check and catalog so we test
+            # the direct VRAM fallback path
+            with patch.object(Qwen3VLVisionBackend, 'is_available',
+                              return_value=False), \
+                 patch.dict('sys.modules',
+                            {'integrations.service_tools.model_orchestrator': None}), \
+                 patch('security.system_requirements.get_capabilities',
                        return_value=mock_caps):
                 backend = get_vision_backend()
                 assert backend.name == 'minicpm'
@@ -232,17 +240,23 @@ class TestGetVisionBackend:
 
     def test_auto_select_fallback_to_none(self):
         """With no GPU, no ONNX, no CLIP → NoneBackend."""
+        from integrations.vision.lightweight_backend import Qwen3VLVisionBackend
+
         mock_caps = MagicMock()
         mock_caps.hardware.gpu_vram_gb = 0
         mock_caps.hardware.ram_gb = 0.5  # Below 1GB
 
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop('HEVOLVE_VISION_BACKEND', None)
-            with patch('security.system_requirements.get_capabilities',
-                       return_value=mock_caps):
-                with patch.object(MiniCPMBackend, 'is_available', return_value=False):
-                    backend = get_vision_backend()
-                    assert backend.name == 'none'
+            with patch.object(Qwen3VLVisionBackend, 'is_available',
+                              return_value=False), \
+                 patch.dict('sys.modules',
+                            {'integrations.service_tools.model_orchestrator': None}), \
+                 patch('security.system_requirements.get_capabilities',
+                       return_value=mock_caps), \
+                 patch.object(MiniCPMBackend, 'is_available', return_value=False):
+                backend = get_vision_backend()
+                assert backend.name == 'none'
 
 
 class TestBackendProperties:

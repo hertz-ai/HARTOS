@@ -28,10 +28,7 @@ STARTUP_GRACE_SECONDS = 60
 # LLM calls can take 30-120s on local models. When a thread is marked
 # in_llm_call, the frozen threshold is multiplied by this factor instead
 # of the normal frozen_multiplier. Prevents restart cascade.
-# Autonomous gather_info + recipe() on local LLM routinely takes 5-10 min.
-# 300s was too tight — caused watchdog restart loops where each restart
-# re-dispatched the same goal, producing duplicate messages.
-LLM_CALL_TIMEOUT_SECONDS = int(os.environ.get('HEVOLVE_LLM_CALL_TIMEOUT', '900'))
+LLM_CALL_TIMEOUT_SECONDS = int(os.environ.get('HEVOLVE_LLM_CALL_TIMEOUT', '300'))
 
 
 @dataclass
