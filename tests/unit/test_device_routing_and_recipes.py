@@ -198,3 +198,94 @@ class TestRecipeFork:
         with patch('integrations.social.recipe_sharing.PROMPTS_DIR', '/nonexistent'):
             result = fork_recipe('missing.json', 1, 0)
         assert result is None
+
+
+# ============================================================
+# TTS routing — route_tts picks the best device for voice output
+# ============================================================
+
+class TestRouteTTS:
+    """route_tts is called when an agent needs to speak to a user."""
+
+    def _mock_device(self, form_factor, capabilities=None, device_id='dev_1'):
+        d = MagicMock()
+        d.form_factor = form_factor
+        d.capabilities = capabilities or {'tts': True, 'speaker': True}
+        d.device_id = device_id
+        d.to_dict.return_value = {'form_factor': form_factor, 'device_id': device_id}
+        return d
+
+    def test_no_devices_returns_error(self):
+        """User with no linked devices = TTS fails gracefully."""
+        from integrations.social.device_routing_service import DeviceRoutingService
+        db = MagicMock()
+        db.query.return_value.filter_by.return_value.all.return_value = []
+        result = DeviceRoutingService.route_tts(db, 'user_1', 'Hello')
+        assert result['success'] is False
+        assert 'error' in result
+
+    def test_routes_to_phone(self):
+        """Phone with TTS capability = success via fleet_command."""
+        from integrations.social.device_routing_service import DeviceRoutingService
+        db = MagicMock()
+        phone = self._mock_device('phone', device_id='phone_1')
+        db.query.return_value.filter_by.return_value.all.return_value = [phone]
+        result = DeviceRoutingService.route_tts(db, 'user_1', 'Hello')
+        assert result['success'] is True
+        assert result['device_id'] == 'phone_1'
+        assert result['method'] == 'fleet_command'
+
+    def test_watch_gets_relay(self):
+        """Watch + phone: TTS goes to phone with relay_to pointing at watch."""
+        from integrations.social.device_routing_service import DeviceRoutingService
+        db = MagicMock()
+        phone = self._mock_device('phone', device_id='phone_1')
+        watch = self._mock_device('watch', capabilities={'tts': False}, device_id='watch_1')
+        watch.form_factor = 'watch'
+        db.query.return_value.filter_by.return_value.all.return_value = [phone, watch]
+        result = DeviceRoutingService.route_tts(db, 'user_1', 'Hello')
+        assert result['success'] is True
+        assert result['relay_to'] == 'watch_1'
+
+    def test_no_tts_device_falls_back_to_notification(self):
+        """If no device has TTS, send a notification instead."""
+        from integrations.social.device_routing_service import DeviceRoutingService
+        db = MagicMock()
+        no_tts = self._mock_device('tablet', capabilities={'tts': False})
+        db.query.return_value.filter_by.return_value.all.return_value = [no_tts]
+        with patch('integrations.social.device_routing_service.NotificationService') as mock_notif:
+            result = DeviceRoutingService.route_tts(db, 'user_1', 'Hello')
+        assert result['success'] is True
+        assert result['method'] == 'notification_fallback'
+
+
+# ============================================================
+# Recipe summary — what the recipe browser shows
+# ============================================================
+
+class TestRecipeSummaryEdgeCases:
+    """Edge cases for get_recipe_summary used by the recipe marketplace."""
+
+    def test_summary_with_steps_key(self):
+        """Some recipes use 'steps' instead of 'recipe' for the action list."""
+        from integrations.social.recipe_sharing import get_recipe_summary
+        with tempfile.TemporaryDirectory() as tmpdir:
+            recipe = {'persona': 'writer', 'action': 'draft', 'steps': [1, 2]}
+            path = os.path.join(tmpdir, 'r.json')
+            with open(path, 'w') as f:
+                json.dump(recipe, f)
+            with patch('integrations.social.recipe_sharing.PROMPTS_DIR', tmpdir):
+                result = get_recipe_summary('r.json')
+        assert result['steps'] == 2
+
+    def test_summary_has_fallback_indicator(self):
+        """has_fallback tells the UI whether a fallback strategy exists."""
+        from integrations.social.recipe_sharing import get_recipe_summary
+        with tempfile.TemporaryDirectory() as tmpdir:
+            recipe = {'persona': 'p', 'action': 'a', 'recipe': [], 'fallback_strategy': 'retry'}
+            path = os.path.join(tmpdir, 'r.json')
+            with open(path, 'w') as f:
+                json.dump(recipe, f)
+            with patch('integrations.social.recipe_sharing.PROMPTS_DIR', tmpdir):
+                result = get_recipe_summary('r.json')
+        assert result['has_fallback'] is True
