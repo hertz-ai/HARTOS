@@ -973,7 +973,6 @@ def get_tts_router() -> TTSRouter:
     if _router_instance is None:
         _router_instance = TTSRouter()
     return _router_instance
-<<<<<<< HEAD
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1233,5 +1232,3 @@ def _catalog_entry_to_spec(entry) -> Optional[TTSEngineSpec]:
         tool_function=tool_function,
         sample_rate=caps.get('sample_rate', 24000),
     )
-=======
->>>>>>> 8756e93 (test coverage improved and TTS auto spawn logic added)

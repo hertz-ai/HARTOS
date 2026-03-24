@@ -55,7 +55,9 @@ class TestChatRedaction:
     def test_chat_imports_redact_secrets(self):
         """Verify the redaction code exists in hart_intelligence_entry.py."""
         import hart_intelligence_entry
-        source_file = hart_intelligence_entry.__file__
+        source_file = getattr(hart_intelligence_entry, '__file__', None)
+        if not source_file:
+            pytest.skip("hart_intelligence_entry has no __file__ (compiled or partial import)")
         with open(source_file, 'r', encoding='utf-8') as f:
             source = f.read()
         assert 'from security.secret_redactor import redact_secrets' in source

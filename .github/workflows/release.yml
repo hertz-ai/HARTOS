@@ -37,6 +37,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install -e . --no-deps 2>/dev/null || true
           pip install pytest pytest-asyncio
           pip install grep-ast tree-sitter tree-sitter-language-pack 2>/dev/null || true
           python -c "import nltk; nltk.download('punkt', quiet=True); nltk.download('punkt_tab', quiet=True)" 2>/dev/null || true
@@ -44,11 +45,15 @@ jobs:
       - name: Run tests
         env:
           HEVOLVE_DB_PATH: ':memory:'
+          PYTHONPATH: ${{ github.workspace }}
         run: |
+          cd ${{ github.workspace }}
           python -m pytest \
             tests/unit/ \
             tests/functional/ \
-            --noconftest -q --tb=line
+            --noconftest --rootdir=${{ github.workspace }} \
+            --import-mode=importlib \
+            -q --tb=line
 
   # ═══════════════════════════════════════════════════════════
   # 2. Tag + Sign (only on manual dispatch with version)
