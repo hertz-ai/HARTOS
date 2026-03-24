@@ -18,7 +18,17 @@ import pytest
 class TestTextChunking:
     """Test sentence splitting and merging for streaming TTS."""
 
+    @staticmethod
+    def _check_nltk():
+        """Skip if NLTK punkt tokenizer not available."""
+        try:
+            import nltk
+            nltk.data.find('tokenizers/punkt')
+        except (ImportError, LookupError):
+            pytest.skip("NLTK punkt tokenizer not available")
+
     def test_single_short_sentence(self):
+        self._check_nltk()
         from integrations.agent_engine.video_orchestrator import chunk_text
         result = chunk_text('Hello world.')
         assert len(result) == 1
@@ -43,11 +53,13 @@ class TestTextChunking:
         assert len(result) == 2
 
     def test_empty_text(self):
+        self._check_nltk()
         from integrations.agent_engine.video_orchestrator import chunk_text
         result = chunk_text('')
         assert result == []
 
     def test_no_punctuation(self):
+        self._check_nltk()
         from integrations.agent_engine.video_orchestrator import chunk_text
         result = chunk_text('just a plain text without punctuation')
         assert len(result) >= 1

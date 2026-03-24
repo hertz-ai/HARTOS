@@ -194,17 +194,15 @@ class TestPressureDetection:
     def test_vram_pressure_below_threshold(self, manager):
         """No pressure when VRAM usage is below threshold."""
         manager._vram_pressure_pct = 85.0
-        mock_vm = MagicMock()
-        mock_vm.get_vram_usage_pct.return_value = 50.0
-        with patch('integrations.service_tools.vram_manager.vram_manager', mock_vm):
+        with patch('integrations.service_tools.vram_manager.VRAMManager.get_vram_usage_pct',
+                    return_value=50.0):
             assert not manager._detect_vram_pressure()
 
     def test_vram_pressure_above_threshold(self, manager):
         """Pressure detected when VRAM usage exceeds threshold."""
         manager._vram_pressure_pct = 85.0
-        mock_vm = MagicMock()
-        mock_vm.get_vram_usage_pct.return_value = 90.0
-        with patch('integrations.service_tools.vram_manager.vram_manager', mock_vm):
+        with patch('integrations.service_tools.vram_manager.VRAMManager.get_vram_usage_pct',
+                    return_value=90.0):
             assert manager._detect_vram_pressure()
 
     def test_ram_pressure_no_psutil(self, manager):
@@ -512,7 +510,7 @@ class TestThrottleFactor:
         mock_vm.get_vram_usage_pct.return_value = 30.0
         mock_usage = MagicMock(free=100 * 1024 ** 3)  # 100 GB free
         with patch.dict('sys.modules', {'psutil': mock_psutil}), \
-             patch('integrations.service_tools.vram_manager.vram_manager', mock_vm), \
+             patch('integrations.service_tools.vram_manager.VRAMManager.get_vram_usage_pct', mock_vm.get_vram_usage_pct), \
              patch('shutil.disk_usage', return_value=mock_usage):
             factor = manager._calculate_throttle_factor()
             assert factor == 1.0
@@ -526,7 +524,7 @@ class TestThrottleFactor:
         mock_vm.get_vram_usage_pct.return_value = 30.0
         mock_usage = MagicMock(free=100 * 1024 ** 3)
         with patch.dict('sys.modules', {'psutil': mock_psutil}), \
-             patch('integrations.service_tools.vram_manager.vram_manager', mock_vm), \
+             patch('integrations.service_tools.vram_manager.VRAMManager.get_vram_usage_pct', mock_vm.get_vram_usage_pct), \
              patch('shutil.disk_usage', return_value=mock_usage):
             factor = manager._calculate_throttle_factor()
             assert factor < 0.3
@@ -547,7 +545,7 @@ class TestSystemPressureAPI:
         mock_vm.get_vram_usage_pct.return_value = 40.0
         mock_usage = MagicMock(free=50 * 1024 ** 3)
         with patch.dict('sys.modules', {'psutil': mock_psutil}), \
-             patch('integrations.service_tools.vram_manager.vram_manager', mock_vm), \
+             patch('integrations.service_tools.vram_manager.VRAMManager.get_vram_usage_pct', mock_vm.get_vram_usage_pct), \
              patch('shutil.disk_usage', return_value=mock_usage):
             result = manager.get_system_pressure()
             assert 'vram_pressure' in result

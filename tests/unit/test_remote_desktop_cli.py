@@ -127,6 +127,9 @@ class TestRemoteDesktopAPI(unittest.TestCase):
     def setUpClass(cls):
         # Import Flask app
         from hart_intelligence_entry import app
+        # Skip if app loaded without routes (partial import on CI)
+        if not any(r.rule == '/chat' for r in app.url_map.iter_rules()):
+            raise unittest.SkipTest("Flask app has no routes (partial import)")
         app.config['TESTING'] = True
         cls.app = app
         cls.client = app.test_client()

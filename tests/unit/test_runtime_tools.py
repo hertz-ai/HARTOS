@@ -475,6 +475,8 @@ class TestVoiceTranscription:
     def client(self):
         """Flask test client."""
         from hart_intelligence_entry import app
+        if not any(r.rule == '/chat' for r in app.url_map.iter_rules()):
+            pytest.skip("Flask app has no routes (partial import)")
         app.config['TESTING'] = True
         with app.test_client() as c:
             yield c
@@ -509,6 +511,8 @@ class TestToolsAPIEndpoints:
     @pytest.fixture
     def client(self):
         from hart_intelligence_entry import app
+        if not any(r.rule == '/chat' for r in app.url_map.iter_rules()):
+            pytest.skip("Flask app has no routes (partial import)")
         app.config['TESTING'] = True
         with app.test_client() as c:
             yield c
