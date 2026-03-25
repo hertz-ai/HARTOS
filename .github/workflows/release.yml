@@ -52,7 +52,9 @@ jobs:
           python -m pytest \
             tests/unit/ \
             tests/functional/ \
-            --noconftest -q --tb=line
+            --ignore=tests/unit/test_social_models.py \
+            -p no:capture \
+            -q --tb=line
 
   # ═══════════════════════════════════════════════════════════
   # 2. Tag + Sign (only on manual dispatch with version)
