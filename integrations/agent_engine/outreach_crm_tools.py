@@ -61,28 +61,42 @@ def _save_prospects(data: Dict):
             json.dump(data, f, indent=2, default=str)
 
 
-def _try_crm_sync(query: str, variables: Dict = None) -> Optional[Dict]:
-    """Best-effort sync to external CRM (Erxes) if configured.
-
-    Only runs when ERXES_API_URL is explicitly set. Returns None if CRM
-    is unavailable or unconfigured. The local prospect store is always
-    the source of truth — CRM sync is opportunistic.
-    """
-    if not os.environ.get('ERXES_API_URL'):
-        return None  # Not configured — skip silently
+def _get_erxes():
+    """Get the native Erxes CRM client (singleton). Returns None if unavailable."""
     try:
-        from core.http_pool import pooled_post
-        resp = pooled_post(
-            f'{ERXES_API_URL}/graphql',
-            json={'query': query, 'variables': variables or {}},
-            headers={'Content-Type': 'application/json'},
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            return resp.json()
+        from integrations.agent_engine.erxes_client import get_erxes_client
+        return get_erxes_client()
     except Exception as e:
-        logger.debug(f"CRM sync unavailable: {e}")
-    return None
+        logger.debug(f"Erxes client unavailable: {e}")
+        return None
+
+
+def _sync_prospect_to_crm(prospect: Dict) -> Dict:
+    """Sync a prospect to Erxes CRM. Returns sync result with IDs."""
+    erxes = _get_erxes()
+    if not erxes:
+        return {'synced': False, 'reason': 'erxes_unavailable'}
+    try:
+        result = erxes.sync_prospect_to_erxes(prospect)
+        if result.get('synced'):
+            logger.info(f"CRM synced: {prospect.get('company')} "
+                        f"(customer={result.get('erxes_customer_id')}, "
+                        f"deal={result.get('erxes_deal_id')})")
+        return result
+    except Exception as e:
+        logger.debug(f"CRM sync failed: {e}")
+        return {'synced': False, 'error': str(e)}
+
+
+def _sync_stage_change(prospect: Dict, new_stage: str):
+    """Sync a stage change to Erxes deal pipeline."""
+    erxes = _get_erxes()
+    if not erxes:
+        return
+    try:
+        erxes.sync_stage_change(prospect, new_stage)
+    except Exception as e:
+        logger.debug(f"CRM stage sync failed: {e}")
 
 
 def _sanitize_html(html_body: str) -> str:
@@ -195,26 +209,15 @@ def register_outreach_tools(helper, assistant, user_id: str):
         data['prospects'][prospect_id] = prospect
         _save_prospects(data)
 
-        # Sync to Erxes if available
-        _try_crm_sync('''
-            mutation CreateCustomer($doc: CustomerInput!) {
-                customersAdd(doc: $doc) { _id firstName lastName primaryEmail }
-            }
-        ''', {
-            'doc': {
-                'firstName': contact_name.split()[0] if contact_name else '',
-                'lastName': ' '.join(contact_name.split()[1:]) if contact_name else '',
-                'primaryEmail': email,
-                'state': 'lead',
-                'customFieldsData': [
-                    {'field': 'company', 'value': company},
-                    {'field': 'vertical', 'value': vertical or ''},
-                    {'field': 'tier', 'value': str(tier)},
-                ],
-            }
-        })
+        # Sync to Erxes CRM (native client)
+        crm_result = _sync_prospect_to_crm(prospect)
+        if crm_result.get('synced'):
+            prospect['erxes_customer_id'] = crm_result.get('erxes_customer_id')
+            prospect['erxes_deal_id'] = crm_result.get('erxes_deal_id')
+            data['prospects'][prospect_id] = prospect
+            _save_prospects(data)
 
-        return json.dumps({'success': True, 'prospect': prospect})
+        return json.dumps({'success': True, 'prospect': prospect, 'crm_sync': crm_result})
 
     def send_outreach_email(
         prospect_id: Annotated[str, "Prospect ID to send email to"],
@@ -354,10 +357,17 @@ def register_outreach_tools(helper, assistant, user_id: str):
             prospect['last_reply_at'] = datetime.utcnow().isoformat()
 
         _save_prospects(data)
+
+        # Sync stage change to Erxes CRM
+        _sync_stage_change(prospect, new_stage)
+
         return json.dumps({'success': True, 'prospect': prospect, 'transition': f'{old_stage}→{new_stage}'})
 
     def get_pipeline_status() -> str:
-        """Get the full outreach pipeline status — all prospects grouped by stage."""
+        """Get the full outreach pipeline status — all prospects grouped by stage.
+
+        Merges local prospect data with Erxes CRM pipeline view.
+        """
         data = _load_prospects()
         pipeline = {}
         for pid, prospect in data.get('prospects', {}).items():
@@ -372,6 +382,7 @@ def register_outreach_tools(helper, assistant, user_id: str):
                 'emails_sent': prospect.get('emails_sent', 0),
                 'last_email': prospect.get('last_email_at'),
                 'tier': prospect.get('tier', 1),
+                'erxes_deal_id': prospect.get('erxes_deal_id'),
             })
 
         # Count active sequences
@@ -380,11 +391,21 @@ def register_outreach_tools(helper, assistant, user_id: str):
             if s.get('status') == 'active'
         )
 
+        # Include Erxes CRM status if available
+        erxes_status = None
+        erxes = _get_erxes()
+        if erxes:
+            try:
+                erxes_status = erxes.get_pipeline_status()
+            except Exception as e:
+                erxes_status = {'error': str(e)}
+
         return json.dumps({
             'success': True,
             'pipeline': pipeline,
             'total_prospects': len(data.get('prospects', {})),
             'active_sequences': active_sequences,
+            'erxes_pipeline': erxes_status,
         })
 
     def list_sent_emails(
@@ -601,6 +622,9 @@ def handle_inbound_email(sender_email: str, subject: str, body: str, message_id:
             logger.info(f"Sequence {seq_id} auto-completed: prospect {matched_prospect['company']} replied")
 
     _save_prospects(data)
+
+    # ── Sync stage change to Erxes CRM ──
+    _sync_stage_change(matched_prospect, 'replied')
 
     # ── Build context for the agent to draft a response ──
     # Gather full conversation history
