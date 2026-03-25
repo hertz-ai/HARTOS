@@ -543,6 +543,8 @@ def register_outreach_goal_type():
         tool_tags=['outreach', 'email', 'crm'],
     )
     logger.info("Registered 'outreach' goal type with prompt builder and tool tags")
+    # Wire reply detection into email channel
+    register_reply_handler()
 
 
 def check_pending_followups_daemon() -> dict:
@@ -560,3 +562,176 @@ def check_pending_followups_daemon() -> dict:
         elif action.get('action') == 'sequence_completed':
             logger.info(f"Sequence completed: {action.get('prospect')} ({action.get('reason')})")
     return {'sent': sent, 'checked_at': result.get('checked_at', '')}
+
+
+# ═══════════════════════════════════════════════════════════════
+# Inbound Reply Handler — wired into email channel adapter
+# ═══════════════════════════════════════════════════════════════
+
+def handle_inbound_email(sender_email: str, subject: str, body: str, message_id: str = '') -> Optional[Dict]:
+    """Check if an inbound email matches a prospect. If so, update CRM and trigger response flow.
+
+    Called by the email channel adapter's _process_email hook.
+    Returns match info if this is a prospect reply, None otherwise.
+    """
+    data = _load_prospects()
+
+    # Match sender to any prospect by email
+    matched_prospect = None
+    for pid, prospect in data.get('prospects', {}).items():
+        if prospect.get('email', '').lower() == sender_email.lower():
+            matched_prospect = prospect
+            break
+
+    if not matched_prospect:
+        return None  # Not a prospect — normal email flow
+
+    # ── Update prospect state ──
+    matched_prospect['stage'] = 'replied'
+    matched_prospect['last_reply_at'] = datetime.utcnow().isoformat()
+    matched_prospect['updated_at'] = datetime.utcnow().isoformat()
+    matched_prospect['notes'] = matched_prospect.get('notes', '') + (
+        f"\n[{datetime.utcnow().isoformat()}] REPLY received: {subject}"
+    )
+
+    # ── Pause all active sequences for this prospect ──
+    for seq_id, sequence in data.get('sequences', {}).items():
+        if sequence.get('prospect_id') == matched_prospect['id'] and sequence['status'] == 'active':
+            sequence['status'] = 'completed'
+            logger.info(f"Sequence {seq_id} auto-completed: prospect {matched_prospect['company']} replied")
+
+    _save_prospects(data)
+
+    # ── Build context for the agent to draft a response ──
+    # Gather full conversation history
+    sent_emails = [
+        e for e in data.get('sent_log', [])
+        if e.get('prospect_id') == matched_prospect['id']
+    ]
+    sent_emails.sort(key=lambda x: x.get('sent_at', ''))
+
+    context = {
+        'prospect': matched_prospect,
+        'their_reply': {'subject': subject, 'body': body[:2000], 'message_id': message_id},
+        'our_emails': [
+            {'subject': e.get('subject', ''), 'sent_at': e.get('sent_at', ''), 'step': e.get('sequence_step', 1)}
+            for e in sent_emails[-5:]  # Last 5 emails we sent
+        ],
+        'campaign_stage': matched_prospect.get('stage', 'replied'),
+        'total_emails_sent': matched_prospect.get('emails_sent', 0),
+    }
+
+    # ── Push notification to user ──
+    _notify_prospect_replied(matched_prospect, subject, body, context)
+
+    # ── Dispatch agent to draft response ──
+    _dispatch_response_draft(matched_prospect, context)
+
+    logger.info(
+        f"Prospect reply detected: {matched_prospect['company']} ({sender_email}) "
+        f"subject='{subject}' — stage moved to 'replied', sequences paused"
+    )
+    return context
+
+
+def _notify_prospect_replied(prospect: Dict, subject: str, body: str, context: Dict):
+    """Push notification to user that a prospect replied.
+
+    Uses EventBus → Nunba notification channel.
+    """
+    try:
+        from core.platform.events import emit_event
+        emit_event('outreach.prospect_replied', {
+            'prospect_id': prospect['id'],
+            'company': prospect['company'],
+            'contact': prospect['contact_name'],
+            'email': prospect['email'],
+            'subject': subject,
+            'body_preview': body[:200],
+            'stage': prospect['stage'],
+            'emails_sent': prospect.get('emails_sent', 0),
+        })
+    except Exception as e:
+        logger.debug(f"EventBus notification failed: {e}")
+
+    # Also try direct Nunba push via channel system
+    try:
+        from integrations.channels.agent_tools import _get_user_id_from_threadlocal
+        from integrations.channels.response.router import get_response_router
+        user_id = prospect.get('created_by') or _get_user_id_from_threadlocal()
+        router = get_response_router()
+        notification = (
+            f"📬 {prospect['company']} replied to your outreach!\n"
+            f"From: {prospect['contact_name']} ({prospect['email']})\n"
+            f"Subject: {subject}\n"
+            f"Preview: {body[:150]}..."
+        )
+        router.route_response(user_id=user_id, response_text=notification, fan_out=True)
+    except Exception as e:
+        logger.debug(f"Push notification failed: {e}")
+
+
+def _dispatch_response_draft(prospect: Dict, context: Dict):
+    """Dispatch an agent task to draft a response to the prospect's reply.
+
+    Uses the existing dispatch system — creates a goal that runs through
+    the CREATE/REUSE pipeline with full conversation context.
+    """
+    try:
+        from integrations.agent_engine.dispatch import dispatch_goal
+        user_id = prospect.get('created_by', 'system')
+
+        prompt = (
+            f"A prospect has replied to our outreach. Draft a response.\n\n"
+            f"PROSPECT: {prospect['company']} — {prospect['contact_name']} ({prospect['email']})\n"
+            f"STAGE: {prospect.get('stage', 'replied')}\n"
+            f"THEIR REPLY:\nSubject: {context['their_reply']['subject']}\n"
+            f"Body: {context['their_reply']['body']}\n\n"
+            f"OUR PREVIOUS EMAILS ({len(context['our_emails'])} total):\n"
+        )
+        for e in context['our_emails']:
+            prompt += f"  - Step {e['step']}: \"{e['subject']}\" (sent {e['sent_at']})\n"
+
+        prompt += (
+            f"\nRULES:\n"
+            f"1. Be conversational, not salesy. They replied — that's interest.\n"
+            f"2. Reference what they said specifically.\n"
+            f"3. Propose a concrete next step (call, demo, meeting link).\n"
+            f"4. Keep it short — 3-5 sentences max.\n"
+            f"5. Do NOT send the email automatically — present the draft for user approval.\n"
+        )
+
+        dispatch_goal(
+            prompt=prompt,
+            user_id=user_id,
+            goal_id=f"outreach_reply_{prospect['id']}_{int(time.time())}",
+            goal_type='outreach',
+        )
+    except Exception as e:
+        logger.error(f"Failed to dispatch response draft: {e}")
+
+
+def register_reply_handler():
+    """Register the inbound email handler with the email channel adapter.
+
+    Called during boot (from register_outreach_goal_type) to wire
+    reply detection into the channel system.
+    """
+    try:
+        from integrations.channels.registry import get_registry
+        registry = get_registry()
+        adapter = registry.get_adapter('email')
+        if adapter and hasattr(adapter, 'on_message'):
+            async def _outreach_reply_hook(message):
+                """Post-process inbound emails for prospect matching."""
+                sender = getattr(message, 'sender_id', '') or ''
+                subject = getattr(message, 'metadata', {}).get('subject', '')
+                body = getattr(message, 'text', '')
+                msg_id = getattr(message, 'message_id', '')
+                if '@' in sender:
+                    handle_inbound_email(sender, subject, body, msg_id)
+
+            adapter.on_message(_outreach_reply_hook)
+            logger.info("Outreach reply handler registered with email adapter")
+    except Exception as e:
+        logger.debug(f"Could not register reply handler: {e}")
