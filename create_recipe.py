@@ -1744,6 +1744,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             from integrations.agent_engine.self_build_tools import register_self_build_tools
             register_self_build_tools(helper, assistant, user_id)
             tool_logger.info("Self-build tools loaded (Tier 2) based on prompt content")
+        if 'outreach' in goal_tags:
+            from integrations.agent_engine.outreach_crm_tools import register_outreach_tools
+            register_outreach_tools(helper, assistant, user_id)
+            tool_logger.info("Outreach CRM tools loaded (Tier 2) based on prompt content")
     except Exception as e:
         tool_logger.debug(f"Goal-aware tool loading skipped: {e}")
 

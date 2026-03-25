@@ -913,6 +913,13 @@ register_goal_type('thought_experiment', _build_thought_experiment_prompt,
 register_goal_type('news', _build_news_prompt, tool_tags=['news', 'feed_management'])
 register_goal_type('provision', _build_provision_prompt, tool_tags=['provision'])
 
+# Outreach CRM goal type — auto follow-up sequences, deal pipeline, email outreach
+try:
+    from .outreach_crm_tools import build_outreach_prompt, register_outreach_goal_type
+    register_outreach_goal_type()
+except ImportError:
+    logger.debug("outreach_crm_tools not available — outreach goal type not registered")
+
 
 def _build_content_gen_prompt(goal_dict, product_dict=None):
     """Build prompt for content generation monitor agent."""

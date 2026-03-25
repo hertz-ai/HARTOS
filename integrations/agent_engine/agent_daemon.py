@@ -507,6 +507,18 @@ class AgentDaemon:
                 except Exception as e:
                     logger.debug(f"Content gen monitor: {e}")
 
+                # Outreach follow-up checker: send due follow-ups every 5 ticks
+                try:
+                    from .outreach_crm_tools import check_pending_followups_daemon
+                    followup_result = check_pending_followups_daemon()
+                    sent = followup_result.get('sent', 0)
+                    if sent > 0:
+                        logger.info(f"Outreach follow-ups: sent {sent} follow-up email(s)")
+                except ImportError:
+                    pass  # outreach_crm_tools not available
+                except Exception as e:
+                    logger.debug(f"Outreach follow-up check: {e}")
+
             # Periodic auto-remediation: scan loopholes every Nth tick
             if self._tick_count % self._remediate_every == 0:
                 try:
