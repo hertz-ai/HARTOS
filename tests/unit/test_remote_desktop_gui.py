@@ -47,10 +47,14 @@ class TestShellManifest(unittest.TestCase):
 class TestPanelData(unittest.TestCase):
     """Test the panel data aggregation module."""
 
-    def test_get_panel_data_structure(self):
+    @patch('integrations.remote_desktop.orchestrator.get_orchestrator',
+           side_effect=Exception('no orchestrator'))
+    def test_get_panel_data_structure(self, _mock_orch):
         from integrations.remote_desktop.gui.panel import get_panel_data
         with patch('integrations.remote_desktop.device_id.get_device_id',
                    return_value='abcdef1234567890'), \
+             patch('integrations.remote_desktop.device_id.format_device_id',
+                   return_value='abc-def-123'), \
              patch('integrations.remote_desktop.engine_selector.get_all_status',
                    return_value={'engines': {'native': {'available': True}},
                                  'install_recommendations': []}), \

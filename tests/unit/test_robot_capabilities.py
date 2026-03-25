@@ -336,7 +336,7 @@ class TestRobotPromptBuilder:
             'goal_type': 'robot',
         }
         with patch(
-            'integrations.robotics.robot_prompt_builder.get_capability_advertiser',
+            'integrations.robotics.capability_advertiser.get_capability_advertiser',
             return_value=self._mock_advertiser_with_hardware(),
         ):
             prompt = build_robot_prompt(goal)
@@ -353,7 +353,7 @@ class TestRobotPromptBuilder:
         )
         goal = {'title': 'Test', 'description': '', 'goal_type': 'robot'}
         with patch(
-            'integrations.robotics.robot_prompt_builder.get_capability_advertiser',
+            'integrations.robotics.capability_advertiser.get_capability_advertiser',
             return_value=self._mock_advertiser_with_hardware(),
         ):
             prompt = build_robot_prompt(goal)

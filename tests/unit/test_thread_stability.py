@@ -474,6 +474,15 @@ class TestLifecycleTickHeartbeats:
         m._detect_cpu_pressure = lambda: False
         m._detect_disk_pressure = lambda: False
         m._evict_idle_models = lambda: None
+        m._respond_to_vram_pressure = lambda: None
+        m._respond_to_ram_pressure = lambda: None
+        m._respond_to_cpu_pressure = lambda: None
+        m._apply_hive_hints = lambda: None
+        m._report_to_federation = lambda: None
+        m._check_process_health = lambda: None
+        m._process_restart_queue = lambda: None
+        m._process_swap_queue = lambda: None
+        m._emit_pressure_alerts = lambda: None
         m._tick_count = 0
 
         m._tick()

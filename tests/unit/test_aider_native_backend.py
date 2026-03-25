@@ -17,6 +17,7 @@ def test_aider_core_search_replace_import():
 
 def test_aider_core_repomap_import():
     """Vendored repomap module imports successfully."""
+    pytest.importorskip('grep_ast.tsl', reason='grep_ast.tsl not available')
     from integrations.coding_agent.aider_core.repomap import RepoMap
     assert RepoMap is not None
 

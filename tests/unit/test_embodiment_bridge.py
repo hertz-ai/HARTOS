@@ -38,6 +38,7 @@ def bridge():
     from integrations.agent_engine.world_model_bridge import WorldModelBridge
     b = WorldModelBridge()
     b._in_process = False  # Force HTTP mode for testing
+    b._http_disabled = False  # Allow HTTP calls in tests
     return b
 
 
