@@ -52,8 +52,7 @@ jobs:
           python -m pytest \
             tests/unit/ \
             tests/functional/ \
-            -p no:capture \
-            -q --tb=line
+            --noconftest -q --tb=line
 
   # ═══════════════════════════════════════════════════════════
   # 2. Tag + Sign (only on manual dispatch with version)
