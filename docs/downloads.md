@@ -2,6 +2,20 @@
 
 All builds are automated, signed, and verified. Pick your platform.
 
+## Quick Install (Any Platform)
+
+Download the installer for your OS — it auto-detects your platform and installs the right thing.
+
+| Platform | Download | Size |
+|----------|----------|------|
+| **Windows** | [hevolve-install.exe](https://github.com/hertz-ai/HARTOS/releases/latest/download/hevolve-install.exe) | ~5 MB |
+| **macOS** | [hevolve-install-macos](https://github.com/hertz-ai/HARTOS/releases/latest/download/hevolve-install-macos) | ~5 MB |
+| **Linux** | [hevolve-install-linux](https://github.com/hertz-ai/HARTOS/releases/latest/download/hevolve-install-linux) | ~5 MB |
+
+Double-click (Windows) or `chmod +x && ./hevolve-install-*` (macOS/Linux). Choose: Nunba app, HART OS ISO, or pip install.
+
+---
+
 ## HART OS (Full Operating System)
 
 Boot from USB/SD card or run in a VM. Includes everything.
