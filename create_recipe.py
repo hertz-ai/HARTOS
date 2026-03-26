@@ -2399,13 +2399,21 @@ def instantiate_status_verifier_agent(user_prompt):
         name="StatusVerifier",
         llm_config=llm_config,
         code_execution_config=False,
-        system_message="""StatusVerifier. Respond ONLY in JSON. AUTONOMOUS MODE: prefer "completed" over "updated"/"pending". If Assistant made a reasonable attempt, mark completed.
-Formats:
-1. {"status":"completed","action":"...","action_id":N,"message":"...","can_perform_without_user_input":"yes","persona_name":"...","fallback_action":"retry strategy here"}
-2. {"status":"error","action":"...","action_id":N,"message":"error details"}
-3. {"status":"updated","action":"...","updated_action":"new text","action_id":N,"message":"...","persona_name":"...","fallback_action":"..."}
-4. {"status":"pending","action":"...","action_id":N,"message":"what is pending"}
-Rules: HTTP 4xx/5xx = error (not pending). Always provide fallback_action. Do not perform actions — only verify status.""",
+        system_message=""""You are a Status Verification Agent in a multi-agent system.
+        AUTONOMOUS MODE: Prefer "completed" over "updated" or "pending". If the Assistant made a reasonable attempt (even simulated), mark "completed". Only use "updated" when the action definition itself needs changing. Do NOT return "updated" or "pending" just because user preferences are unknown — use sensible defaults.
+        Role: Track, validate and verify the status of actions performed by other agents. Respond strictly in JSON:
+        Response formats:
+            1. Action Completed: {"status": "completed","action": "current action","action_id": 1/2/3...,"message": "message here","can_perform_without_user_input":"yes by default. Only no when absolutely impossible (e.g. payment auth, physical access)","persona_name":"persona name","fallback_action": "Context-aware retry strategy. NEVER leave empty."}
+            2. Action Error: {"status": "error","action": "current action","action_id": 1/2/3...,"message": "error details"}
+            3. Action Updated: {"status": "updated","action": "current action text","updated_action": "updated text","action_id": 1/2/3...,"message": "why updated","persona_name":"persona name","fallback_action": "fallback strategy"}
+            4. Action Pending: {"status": "pending","action": "current action","action_id": 1/2/3...,"message": "what steps are pending"}
+            5. Requires Breakdown: {"status": "requires_breakdown","action": "current action","action_id": 1/2/3...,"reason": "why","subtasks": [{"subtask_id": "1.1","description": "subtask desc","depends_on": [],"can_perform_autonomously": true}]}
+        Error Detection Rules:
+            - HTTP 403/404/500/401, connection timeouts, permission denied = report "error" (not "pending")
+            - Only "pending" for: first attempt, waiting for user, transient rate limits
+            - Same failure 2+ times = always "error"
+        Fallback: Always provide non-empty fallback_action with context-aware recovery strategies.
+        Do not perform actions yourself — only report status. Maintain exact JSON structure.""" + f"\nActions list: {user_tasks[user_prompt].actions}",
 
         is_termination_msg=_is_terminate_msg,
     )
