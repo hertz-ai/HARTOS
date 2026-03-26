@@ -42,17 +42,36 @@ _local_llm_semaphore = threading.Semaphore(_LOCAL_LLM_MAX_CONCURRENT)
 # Tracked via timestamp of last user activity — daemon checks freshness.
 import time as _time
 _last_user_chat_at: float = 0.0
-_USER_CHAT_COOLDOWN = 10  # seconds after last user chat to yield LLM
+_USER_CHAT_COOLDOWN = 600  # 10 min — CREATE pipeline can take this long
+_active_create_sessions: int = 0  # count of in-flight CREATE requests
+_create_lock = threading.Lock()
 
 
 def mark_user_chat_activity():
-    """Call on every user (non-daemon) /chat request."""
+    """Call on every user /chat request (including autonomous CREATE)."""
     global _last_user_chat_at
     _last_user_chat_at = _time.time()
 
 
+def mark_create_start():
+    """Call when a CREATE pipeline starts."""
+    global _active_create_sessions
+    with _create_lock:
+        _active_create_sessions += 1
+    mark_user_chat_activity()
+
+
+def mark_create_end():
+    """Call when a CREATE pipeline finishes."""
+    global _active_create_sessions
+    with _create_lock:
+        _active_create_sessions = max(0, _active_create_sessions - 1)
+
+
 def is_user_recently_active() -> bool:
-    """True if a human user chatted within the cooldown window."""
+    """True if user chatted recently OR a CREATE pipeline is running."""
+    if _active_create_sessions > 0:
+        return True
     return (_time.time() - _last_user_chat_at) < _USER_CHAT_COOLDOWN
 
 

@@ -227,7 +227,12 @@ class AgentDaemon:
         from integrations.social.models import get_db, AgentGoal, Product
         from integrations.coding_agent.idle_detection import IdleDetectionService
         from .goal_manager import GoalManager, CODING_GOAL_TYPES
-        from .dispatch import dispatch_goal
+        from .dispatch import dispatch_goal, is_user_recently_active
+
+        # Yield LLM to user requests — don't compete for inference
+        if is_user_recently_active():
+            logger.debug("Agent daemon: user/CREATE active, yielding LLM")
+            return
 
         # RESOURCE GATE: throttle dispatch when system is under pressure
         # Prevents machine slowness while Nunba/HARTOS is running

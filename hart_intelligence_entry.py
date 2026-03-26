@@ -4378,12 +4378,11 @@ def chat():
         thread_local_data.channel_context = channel_context
 
     # USER PRIORITY: mark user activity so daemon dispatch yields the LLM
-    if not autonomous:
-        try:
-            from integrations.agent_engine.dispatch import mark_user_chat_activity
-            mark_user_chat_activity()
-        except ImportError:
-            pass
+    try:
+        from integrations.agent_engine.dispatch import mark_user_chat_activity
+        mark_user_chat_activity()
+    except ImportError:
+        pass
 
     app.logger.info(f"casual_conv type {casual_conv}")
 
@@ -4592,6 +4591,11 @@ def chat():
                 _config_path = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
                 if os.path.exists(_config_path):
                     try:
+                        try:
+                            from integrations.agent_engine.dispatch import mark_create_start, mark_create_end
+                            mark_create_start()
+                        except ImportError:
+                            mark_create_end = None
                         recipe_response = recipe(user_id, prompt, prompt_id, file_id, request_id)
                         if recipe_response == 'Agent Created Successfully':
                             with _user_lock:
@@ -4615,6 +4619,12 @@ def chat():
                     except Exception as e:
                         import traceback
                         app.logger.error(f'Autonomous recipe creation failed: {e}\n{traceback.format_exc()}')
+                    finally:
+                        try:
+                            from integrations.agent_engine.dispatch import mark_create_end
+                            mark_create_end()
+                        except ImportError:
+                            pass
 
                 # Fallback: config saved but recipe failed — next dispatch will retry
                 with _user_lock:
@@ -4779,7 +4789,19 @@ def chat():
             _in_review = _ak in review_agents and review_agents[_ak]
             _in_convo = _ak in conversation_agent and conversation_agent[_ak]
         if _in_review and not _in_convo:
-            response = recipe(user_id,prompt,prompt_id,file_id,request_id)
+            try:
+                from integrations.agent_engine.dispatch import mark_create_start, mark_create_end
+                mark_create_start()
+            except ImportError:
+                mark_create_end = None
+            try:
+                response = recipe(user_id,prompt,prompt_id,file_id,request_id)
+            finally:
+                try:
+                    from integrations.agent_engine.dispatch import mark_create_end as _mce
+                    _mce()
+                except ImportError:
+                    pass
             if response =='Agent Created Successfully':
                 with _user_lock:
                     conversation_agent[_ak] = True
