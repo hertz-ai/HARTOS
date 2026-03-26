@@ -1929,7 +1929,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                             safe_set_state(user_prompt, current_action_id, ActionState.ERROR, "verifier error")
                             return author
                         elif json_obj['status'].lower() == 'completed' or json_obj['status'].lower() == 'success':
-                            json_action_id = int(json_obj.get('action_id', user_tasks[user_prompt].current_action))
+                            json_action_id = int(float(json_obj.get('action_id', user_tasks[user_prompt].current_action)))
 
 
                             # Normal Set ActionState To Complete
@@ -1991,7 +1991,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                             safe_set_state(user_prompt, current_action_id, ActionState.PENDING, "requires breakdown into subtasks")
                             return assistant
                         elif json_obj['status'].lower() == 'done':
-                            json_action_id = int(json_obj.get('action_id', user_tasks[user_prompt].current_action))
+                            json_action_id = int(float(json_obj.get('action_id', user_tasks[user_prompt].current_action)))
 
                             # Normal Set ActionState To Terminate After getting Recipe json for each action
                             if 'recipe' in json_obj.keys() and json_obj['status'].lower() == 'done' and json_action_id > len(user_tasks[user_prompt].actions): # Done state when recipe is created
@@ -3479,7 +3479,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                             result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False)
                         continue
                     elif json_obj['status'].lower() == 'completed' and 'recipe' not in json_obj.keys():
-                        json_action_id = int(json_obj.get('action_id', current_action_id))
+                        json_action_id = int(float(json_obj.get('action_id', current_action_id)))
 
                         # === LLM HALLUCINATION DEFENSE ===
                         # Cross-reference LLM-claimed action_id against KNOWN state.
