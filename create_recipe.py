@@ -4126,15 +4126,10 @@ def request_recipe_for_action(current_action_id, prompt_id, role, user_prompt):
     user_tasks[user_prompt].fallback = False
     safe_set_state(user_prompt, current_action_id, ActionState.RECIPE_REQUESTED, "recipe start")
     metadata = strip_json_values(agent_data[prompt_id])
-    message = '''Focus on the current task at hand and create a detailed recipe that includes only the necessary steps for this action, along with a suitable name. Provide the output in the following JSON format:
-                        { "status": "done", "action": "Describe the action performed here","fallback_action":"", "persona":"","action_id": ''' + f'{user_tasks[user_prompt].current_action}' + ''', "recipe": [{{"steps":"steps here","tool_name":"Only include tool name here if used for this step.","generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely."}}],"can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
-                        Recipe Requirements:
-                        1. Generalized Python Functions: Give the code which was created and excuted successfully without any error handling edge cases. leave it blank when there is no code nedded to perform the action
-                        2. Avoid directly storing any specific information provided by the author in the recipe. Use placeholders for variables instead.
-                        3. Ensure that coding and non-coding steps are not combined within the same function.
-                        4. For all Python functions, include comprehensive docstrings to explain their purpose, parameters, and usage. This should especially clarify non-coding steps that require utilizing the assistant's language capabilities.
-                        5. If any internal tool is used to complete a step, provide detailed instructions on how to call or utilize that tool instead of providing the code for that step.
-                        ''' + f'6. Metadata created till this action: {metadata}\n7. The persona must be one of the following: {role}. No other personas are allowed.'
+    _aid = user_tasks[user_prompt].current_action
+    message = f'''Create a recipe for action {_aid}. Respond ONLY with this JSON:
+{{"status":"done","action":"what was done","fallback_action":"retry strategy","persona":"{role}","action_id":{_aid},"recipe":[{{"steps":"step description","tool_name":"tool if used","generalized_functions":"python code if any"}}],"can_perform_without_user_input":"yes","scheduled_tasks":[]}}
+Use placeholders, not hardcoded values. Include tool_name if a tool was used. Include generalized_functions only if Python code was created.'''
     return message
 
 def fix_cyclic_dependency(cyc, individual_recipe):
