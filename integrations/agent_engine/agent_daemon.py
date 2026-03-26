@@ -519,6 +519,18 @@ class AgentDaemon:
                 except Exception as e:
                     logger.debug(f"Outreach follow-up check: {e}")
 
+                # Journey engine tick: stage transitions, A/B analysis, channel routing
+                try:
+                    from .journey_engine import journey_daemon_tick
+                    journey_result = journey_daemon_tick()
+                    if journey_result.get('transitions', 0) > 0 or journey_result.get('actions', 0) > 0:
+                        logger.info(f"Journey engine: {journey_result.get('transitions', 0)} transitions, "
+                                    f"{journey_result.get('actions', 0)} actions")
+                except ImportError:
+                    pass  # journey_engine not available
+                except Exception as e:
+                    logger.debug(f"Journey engine tick: {e}")
+
             # Periodic auto-remediation: scan loopholes every Nth tick
             if self._tick_count % self._remediate_every == 0:
                 try:

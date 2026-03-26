@@ -920,6 +920,13 @@ try:
 except ImportError:
     logger.debug("outreach_crm_tools not available — outreach goal type not registered")
 
+# Sales/Marketing journey goal type — full flywheel with A/B testing, multi-channel, agentic actions
+try:
+    from .journey_engine import register_sales_goal_type
+    register_sales_goal_type()
+except ImportError:
+    logger.debug("journey_engine not available — sales goal type not registered")
+
 
 def _build_content_gen_prompt(goal_dict, product_dict=None):
     """Build prompt for content generation monitor agent."""

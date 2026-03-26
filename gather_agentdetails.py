@@ -1,12 +1,16 @@
-from typing import Dict, Tuple
-import autogen
+from typing import Any, Dict, Tuple
 import os
 from flask import current_app
+
+try:
+    import autogen
+except ImportError:
+    autogen = None
 
 from helper import retrieve_json, retrieve_json, _is_terminate_msg
 from cultural_wisdom import get_cultural_prompt
 # Store user-specific agents & their chat history
-user_agents: Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]] = {}
+user_agents: Dict[str, Tuple[Any, Any]] = {}
 
 AGENT_CREATOR_SYSTEM_MESSAGE = """You are a custom agent bot creator. Your task is to interact with the user to gather all the necessary details to create an agent. Once you have collected all the required information, you will generate a complete agent configuration.
         Your role is to assist in a co-creative manner. You should actively suggest actions or improvements, but always confirm with the user before implementing them. Ensure that any actions or suggestions are realistic, humanly possible & ethical. Avoid proposing anything beyond practical feasibility, such as tasks like taking the user to the moon. Your primary goal is to enhance collaboration while adhering to these boundaries.
@@ -176,6 +180,11 @@ def gather_info(user_id, user_message, prompt_id, autonomous=False):
         prompt_id: The prompt ID for this agent creation session
         autonomous: If True, LLM answers its own questions (no human input needed)
     """
+    if autogen is None:
+        raise ImportError(
+            "Agent creation requires the 'pyautogen' package. "
+            "Install it with: pip install pyautogen"
+        )
     current_app.logger.info('INSIDE GATHER INFo')
     current_app.logger.info('--'*100)
     user_prompt = f'{user_id}_{prompt_id}'

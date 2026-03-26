@@ -330,4 +330,13 @@ def detect_goal_tags(prompt: str) -> list:
     if any(kw in lower for kw in outreach_keywords):
         tags.append('outreach')
 
+    sales_keywords = [
+        'sales agent', 'marketing agent', 'flywheel', 'user journey',
+        'a/b test', 'ab test', 'prospect journey', 'sales pipeline',
+        'meeting schedule', 'deal close', 'partner onboard',
+        'channel outreach', 'multi-channel', 'nurture',
+    ]
+    if any(kw in lower for kw in sales_keywords):
+        tags.append('sales')
+
     return tags
