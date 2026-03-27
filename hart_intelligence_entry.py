@@ -4587,44 +4587,49 @@ def chat():
                 # Full pipeline: gather_info → save config → recipe() → completed
                 auto_response = _autonomous_gather_info(user_id, prompt, prompt_id)
 
-                # Now immediately create the recipe so next dispatch enters REUSE
+                # Run recipe creation in background thread — don't block HTTP response
                 _config_path = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
                 if os.path.exists(_config_path):
-                    try:
-                        try:
-                            from integrations.agent_engine.dispatch import mark_create_start, mark_create_end
-                            mark_create_start()
-                        except ImportError:
-                            mark_create_end = None
-                        recipe_response = recipe(user_id, prompt, prompt_id, file_id, request_id)
-                        if recipe_response == 'Agent Created Successfully':
-                            with _user_lock:
-                                review_agents[_ak] = True
-                                conversation_agent[_ak] = True
-                                _touch_agent_timestamp(_ak)
+                    def _bg_create_recipe(_uid, _prompt, _pid, _fid, _rid, _ak):
+                        """Background recipe creation — runs after HTTP response returns."""
+                        with app.app_context():
                             try:
-                                _create_social_agent_from_prompt(user_id, prompt_id)
-                            except Exception:
-                                pass
-                            _record_lifecycle('completed', user_id, prompt_id,
-                                             f'Autonomous full pipeline: gather + recipe in one shot')
-                            _push_workflow_flowchart(user_id, prompt_id, request_id)
-                            return jsonify({'response': recipe_response, 'intent': ['FINAL_ANSWER'],
-                                            'req_token_count': 0, 'res_token_count': 0,
-                                            'history_request_id': [],
-                                            'Agent_status': 'completed',
-                                            'autonomous_creation': True, 'prompt_id': prompt_id})
-                        else:
-                            app.logger.info(f'Autonomous recipe() returned: {str(recipe_response)[:100]}')
-                    except Exception as e:
-                        import traceback
-                        app.logger.error(f'Autonomous recipe creation failed: {e}\n{traceback.format_exc()}')
-                    finally:
-                        try:
-                            from integrations.agent_engine.dispatch import mark_create_end
-                            mark_create_end()
-                        except ImportError:
-                            pass
+                                from integrations.agent_engine.dispatch import mark_create_start, mark_create_end
+                                mark_create_start()
+                            except ImportError:
+                                mark_create_end = lambda: None
+                            try:
+                                recipe_response = recipe(_uid, _prompt, _pid, _fid, _rid)
+                                if recipe_response == 'Agent Created Successfully':
+                                    with _user_lock:
+                                        review_agents[_ak] = True
+                                        conversation_agent[_ak] = True
+                                        _touch_agent_timestamp(_ak)
+                                    try:
+                                        _create_social_agent_from_prompt(_uid, _pid)
+                                    except Exception:
+                                        pass
+                                    _record_lifecycle('completed', _uid, _pid,
+                                                     f'Autonomous full pipeline: gather + recipe in one shot')
+                                    app.logger.info(f'[BG-CREATE] Agent {_pid} created successfully')
+                                else:
+                                    app.logger.info(f'[BG-CREATE] recipe() returned: {str(recipe_response)[:100]}')
+                            except Exception as e:
+                                import traceback
+                                app.logger.error(f'[BG-CREATE] Failed: {e}\n{traceback.format_exc()}')
+                            finally:
+                                try:
+                                    from integrations.agent_engine.dispatch import mark_create_end as _mce
+                                    _mce()
+                                except ImportError:
+                                    pass
+
+                    threading.Thread(
+                        target=_bg_create_recipe,
+                        args=(user_id, prompt, prompt_id, file_id, request_id, _ak),
+                        daemon=True, name=f'create_{prompt_id}'
+                    ).start()
+                    app.logger.info(f'[BG-CREATE] Started background recipe creation for {prompt_id}')
 
                 # Fallback: config saved but recipe failed — next dispatch will retry
                 with _user_lock:
