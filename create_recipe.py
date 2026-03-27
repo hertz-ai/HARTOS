@@ -3935,16 +3935,23 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                 else:
                     continue
 
-            if while_loop_iterations > 5 and current_state in [ActionState.FALLBACK_REQUESTED,
+            # Only break on stuck state if NO progress has been made (no recipes saved, no advances)
+            if while_loop_iterations > 30 and current_state in [ActionState.FALLBACK_REQUESTED,
                                                                ActionState.RECIPE_REQUESTED]:
-                current_app.logger.warning(f"Stuck in {current_state.value} state, attempting recovery")
-                if current_state == ActionState.FALLBACK_REQUESTED:
-                    message = f"Ask @User for fallback actions if Action {current_action_id} fails"
-                else:
-                    message = f"Create recipe for Action {current_action_id}"
-                result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,
-                                                       silent=False)
-                break
+                # Check if we've made any progress at all
+                _any_recipes = any(
+                    os.path.exists(os.path.join(PROMPTS_DIR, f'{prompt_id}_{get_current_flow(user_prompt)}_{i}.json'))
+                    for i in range(1, current_action_id + 1)
+                )
+                if not _any_recipes:
+                    current_app.logger.warning(f"Stuck in {current_state.value} state with no progress, attempting recovery")
+                    if current_state == ActionState.FALLBACK_REQUESTED:
+                        message = f"Ask @User for fallback actions if Action {current_action_id} fails"
+                    else:
+                        message = f"Create recipe for Action {current_action_id}"
+                    result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,
+                                                           silent=False)
+                    break
 
         # Log loop exit
         if while_loop_iterations >= max_iterations:
