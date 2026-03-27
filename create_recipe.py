@@ -2044,7 +2044,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                 # Save recipe even if action is already TERMINATED/COMPLETED
                                 # (state_transition handled completion, while loop requested recipe,
                                 #  but this handler saw action already terminated — recipe still valid)
-                                if 'recipe' in json_obj and json_obj.get('recipe'):
+                                _has_recipe = 'recipe' in json_obj and json_obj.get('recipe')
+                                current_app.logger.info(f'Late save check: has_recipe={_has_recipe}, keys={list(json_obj.keys()) if json_obj else "None"}')
+                                if _has_recipe:
                                     flow = get_current_flow(user_prompt)
                                     name = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow}_{json_obj["action_id"]}.json')
                                     if not os.path.exists(name):
@@ -3746,6 +3748,26 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         _rh = chat_instructor.chat_messages.get(manager, [])
                         if _rh and len(group_chat.messages) == 0:
                             group_chat.messages.extend(_rh)
+                        # Fallback: if state_transition didn't save the recipe file,
+                        # search recovered messages for status:done JSON and save it
+                        _flow = get_current_flow(user_prompt)
+                        _rfile = os.path.join(PROMPTS_DIR, f'{prompt_id}_{_flow}_{_ca}.json')
+                        if not os.path.exists(_rfile) and group_chat.messages:
+                            for _msg in reversed(group_chat.messages):
+                                _rj = retrieve_json(_msg.get('content', ''))
+                                if _rj and isinstance(_rj, dict) and _rj.get('status') == 'done' and 'recipe' in _rj:
+                                    _rj.setdefault('action_id', _ca)
+                                    for _step in _rj.get('recipe', []):
+                                        if _step.get('tool_name'):
+                                            _step['agent_to_perform_this_action'] = 'Helper'
+                                        elif _step.get('generalized_functions'):
+                                            _step['agent_to_perform_this_action'] = 'Executor'
+                                        else:
+                                            _step['agent_to_perform_this_action'] = 'Assistant'
+                                    with open(_rfile, 'w') as _rf:
+                                        json.dump(_rj, _rf)
+                                    current_app.logger.info(f'[FALLBACK-SAVE] Saved recipe from messages at: {_rfile}')
+                                    break
                     else:
                         current_app.logger.info(
                             f'[AUTO-ADVANCE] action {_ca} already {_ca_state.value}, advancing')
