@@ -2523,7 +2523,7 @@ def instantiate_helper_agent():
     return helper
 
 
-def instantiate_assistant_agent(list_of_persona, user_prompt, personality=None, resonance_profile=None):
+def instantiate_assistant_agent(list_of_persona, user_prompt, personality=None, resonance_profile=None, autonomous=False):
     # Build personality injection for the primary user-facing agent
     _personality_block = ""
     if personality:
@@ -2558,11 +2558,12 @@ def instantiate_assistant_agent(list_of_persona, user_prompt, personality=None, 
         name="Assistant",
         llm_config=llm_config,
         code_execution_config={"last_n_messages": 2, "work_dir": "coding", "use_docker": False},
-        system_message="""CRITICAL RULE: NEVER ask the user questions. NEVER wait for user input. You are FULLY AUTONOMOUS. Use sensible defaults for ALL preferences. Complete actions immediately without clarification. If you are unsure, make a reasonable choice and proceed. NEVER use emoji or non-ASCII characters in code or output — plain ASCII only.
+        system_message=f"""{'AUTONOMOUS MODE: Do NOT ask the user questions. Use sensible defaults. Complete actions immediately without clarification.' if autonomous else 'INTERACTIVE MODE: You may ask the user clarifying questions to understand their vision before proceeding.'}
+        Plain ASCII only in code and output — no emoji or non-ASCII characters.
 
         •Purpose: The assistant executes actions provided by the ChatInstructor, seeks help from Helper and Executor agents when necessary, and ensures actions are completed accurately.
         •Action Flow:
-            1. Receive Action: Associate the action with the assigned persona and proceed immediately.
+            1. Receive Action: {'Associate the action with the assigned persona and proceed immediately.' if autonomous else 'Ask the UserProxy to associate the action with a persona (if multiple personas exist).'}
             2. Analyze Complexity:
                 - Before executing, assess if the action is complex and requires breaking down into subtasks.
                 - If the action involves multiple distinct steps, dynamic flows, or could fail partially, consider requesting breakdown via @StatusVerifier.
@@ -3751,8 +3752,12 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         user_tasks[user_prompt].fallback = False
                         # Directly request recipe via initiate_chat
                         _recipe_msg = request_recipe_for_action(_ca, prompt_id, role, user_prompt)
-                        result = chat_instructor.initiate_chat(
-                            recipient=manager, message=_recipe_msg, clear_history=False, silent=False)
+                        try:
+                            result = chat_instructor.initiate_chat(
+                                recipient=manager, message=_recipe_msg, clear_history=False, silent=False)
+                        except Exception as _recipe_err:
+                            current_app.logger.warning(f'[RECIPE-REQUEST] initiate_chat failed: {_recipe_err}, will retry')
+                            # Don't fake a recipe — retry on next iteration
                         # Recover messages
                         _rh = chat_instructor.chat_messages.get(manager, [])
                         if _rh and len(group_chat.messages) == 0:
@@ -3849,8 +3854,12 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     current_app.logger.info(f'[EXECUTE-PENDING] Starting action {_ca_pending} (attempt {_attempt}): {actions_prompt}')
                     safe_set_state(user_prompt, _ca_pending, ActionState.IN_PROGRESS, "executing pending action")
                     _exec_msg = f'Execute Action {_ca_pending}: {actions_prompt} ,Latest User message: {text}'
-                    result = chat_instructor.initiate_chat(
-                        recipient=manager, message=_exec_msg, clear_history=False, silent=False)
+                    try:
+                        result = chat_instructor.initiate_chat(
+                            recipient=manager, message=_exec_msg, clear_history=False, silent=False)
+                    except Exception as _exec_err:
+                        current_app.logger.warning(f'[EXECUTE-PENDING] initiate_chat failed: {_exec_err}')
+                        continue  # Retry on next iteration
                     # Recover messages after initiate_chat
                     _chat_history = chat_instructor.chat_messages.get(manager, [])
                     if _chat_history and len(group_chat.messages) == 0:
