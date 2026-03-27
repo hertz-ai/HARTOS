@@ -5092,10 +5092,13 @@ def time_agent():
     if not task_description or not user_id or not prompt_id:
         return jsonify({'error':'user_id or task_description or prompt_id is missing'}), 404
     app.logger.info(f'GOT user_id:{user_id} & prompt_id:{prompt_id} & task_description:{task_description}')
+    # Support both string and numeric IDs
+    _uid = int(user_id) if str(user_id).isdigit() else str(user_id)
+    _pid = int(prompt_id) if str(prompt_id).isdigit() else str(prompt_id)
     if request_from == 'Reuse':
-        res = time_based_execution(str(task_description),int(user_id),int(prompt_id),action_entry_point)
+        res = time_based_execution(str(task_description), _uid, _pid, action_entry_point)
     else:
-        res = time_execution(str(task_description),int(user_id),int(prompt_id),action_entry_point)
+        res = time_execution(str(task_description), _uid, _pid, action_entry_point)
     return jsonify({'response':f'{res}'}), 200
 
 
@@ -5110,10 +5113,12 @@ def visual_agent():
     if not task_description or not user_id or not prompt_id:
         return jsonify({'error':'user_id or task_description or prompt_id is missing'}), 404
     app.logger.info(f'GOT user_id:{user_id} & prompt_id:{prompt_id} & task_description:{task_description}')
+    _uid = int(user_id) if str(user_id).isdigit() else str(user_id)
+    _pid = int(prompt_id) if str(prompt_id).isdigit() else str(prompt_id)
     if request_from == 'Reuse':
-        res = visual_based_execution(str(task_description),int(user_id),int(prompt_id))
+        res = visual_based_execution(str(task_description), _uid, _pid)
     else:
-        res = visual_execution(str(task_description),int(user_id),int(prompt_id))
+        res = visual_execution(str(task_description), _uid, _pid)
     return jsonify({'response':f'{res}'}), 200
 
 @app.route('/response_ack',methods=['POST'])
