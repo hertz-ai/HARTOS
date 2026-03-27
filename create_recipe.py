@@ -2044,8 +2044,13 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                 # Save recipe even if action is already TERMINATED/COMPLETED
                                 # (state_transition handled completion, while loop requested recipe,
                                 #  but this handler saw action already terminated — recipe still valid)
-                                _has_recipe = 'recipe' in json_obj  # Save even if recipe is empty []
-                                current_app.logger.info(f'Late save check: has_recipe={_has_recipe}, recipe={json_obj.get("recipe","MISSING")}')
+                                _recipe_list = json_obj.get('recipe', None)
+                                _has_recipe = isinstance(_recipe_list, list) and len(_recipe_list) > 0
+                                if not _has_recipe:
+                                    current_app.logger.warning(f'Late save: recipe empty or missing — rejecting, will retry. Got: {_recipe_list}')
+                                    # Don't save — let the while loop retry the recipe request
+                                    return chat_instructor  # Route back to request recipe again
+                                current_app.logger.info(f'Late save: valid recipe with {len(_recipe_list)} steps')
                                 if _has_recipe:
                                     flow = get_current_flow(user_prompt)
                                     name = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow}_{json_obj["action_id"]}.json')
@@ -3755,7 +3760,8 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         if not os.path.exists(_rfile) and group_chat.messages:
                             for _msg in reversed(group_chat.messages):
                                 _rj = retrieve_json(_msg.get('content', ''))
-                                if _rj and isinstance(_rj, dict) and _rj.get('status') == 'done' and 'recipe' in _rj:
+                                if (_rj and isinstance(_rj, dict) and _rj.get('status') == 'done'
+                                        and isinstance(_rj.get('recipe'), list) and len(_rj['recipe']) > 0):
                                     _rj.setdefault('action_id', _ca)
                                     for _step in _rj.get('recipe', []):
                                         if _step.get('tool_name'):
