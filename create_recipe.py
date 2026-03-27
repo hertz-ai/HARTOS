@@ -2044,8 +2044,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                 # Save recipe even if action is already TERMINATED/COMPLETED
                                 # (state_transition handled completion, while loop requested recipe,
                                 #  but this handler saw action already terminated — recipe still valid)
-                                _has_recipe = 'recipe' in json_obj and json_obj.get('recipe')
-                                current_app.logger.info(f'Late save check: has_recipe={_has_recipe}, keys={list(json_obj.keys()) if json_obj else "None"}')
+                                _has_recipe = 'recipe' in json_obj  # Save even if recipe is empty []
+                                current_app.logger.info(f'Late save check: has_recipe={_has_recipe}, recipe={json_obj.get("recipe","MISSING")}')
                                 if _has_recipe:
                                     flow = get_current_flow(user_prompt)
                                     name = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow}_{json_obj["action_id"]}.json')
