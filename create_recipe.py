@@ -3358,7 +3358,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
         while_loop_iterations = 0
         max_iterations = 300  # Time-based: ~5s per iteration = ~25 min max
         _pipeline_start = time.time()
-        _pipeline_timeout = 600  # 10 minutes hard timeout for entire pipeline
+        _pipeline_timeout = 1800  # 30 minutes — CREATE is the learning phase, needs time
 
         while while_loop_iterations < max_iterations:
             # Hard timeout: don't let pipeline run forever
