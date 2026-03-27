@@ -3601,7 +3601,34 @@ def parse_visual_context(inp: str):
 
         prompt_text = f'Instruction: Respond in second person point of view\ninput:-{inp}'
 
-        # Tier 1: Try local MiniCPM sidecar (port 9891) — zero latency, no cloud
+        # Tier 0: Qwen+mmproj on local llama-server (already running, zero extra VRAM)
+        _llm_port = int(os.environ.get('HEVOLVE_LLM_PORT', 8080))
+        try:
+            import base64 as _b64
+            with open(image_path, 'rb') as _imgf:
+                _img_b64 = _b64.b64encode(_imgf.read()).decode('ascii')
+            _vlm_resp = requests.post(
+                f'http://127.0.0.1:{_llm_port}/v1/chat/completions',
+                json={
+                    'model': 'local',
+                    'messages': [{'role': 'user', 'content': [
+                        {'type': 'text', 'text': prompt_text},
+                        {'type': 'image_url', 'image_url': {'url': f'data:image/jpeg;base64,{_img_b64}'}}
+                    ]}],
+                    'max_tokens': 300,
+                },
+                timeout=15,
+            )
+            if _vlm_resp.status_code == 200:
+                _vlm_data = _vlm_resp.json()
+                result = _vlm_data.get('choices', [{}])[0].get('message', {}).get('content', '')
+                if result:
+                    app.logger.info(f'Visual context from Qwen+mmproj: {result[:100]}')
+                    return result
+        except Exception as e:
+            app.logger.debug(f"Qwen+mmproj VLM unavailable: {e}")
+
+        # Tier 1: Try local MiniCPM sidecar (port 9891) — dedicated VLM server
         local_minicpm_port = int(os.environ.get('HEVOLVE_MINICPM_PORT', 9891))
         try:
             with open(image_path, 'rb') as f:
@@ -3617,7 +3644,7 @@ def parse_visual_context(inp: str):
                     app.logger.info(f'Visual context from local MiniCPM: {result[:100]}')
                     return result
         except Exception as e:
-            app.logger.debug(f"Local MiniCPM sidecar unavailable, falling back to cloud: {e}")
+            app.logger.debug(f"Local MiniCPM sidecar unavailable, falling back: {e}")
 
         # Tier 2: Hive mesh peer with GPU
         try:
@@ -5121,21 +5148,21 @@ def visual_agent():
     if not task_description or not user_id or not prompt_id:
         return jsonify({'error':'user_id or task_description or prompt_id is missing'}), 404
     app.logger.info(f'GOT user_id:{user_id} & prompt_id:{prompt_id} & task_description:{task_description}')
-    # Quick VLM health check — fail fast instead of 60s timeout
+    # Quick VLM health check — try Qwen+mmproj first (already running), then MiniCPM
+    _vlm_available = False
+    _llm_port = int(os.environ.get('HEVOLVE_LLM_PORT', 8080))
     try:
         import urllib.request
-        urllib.request.urlopen('http://localhost:9001/status', timeout=2)
+        urllib.request.urlopen(f'http://127.0.0.1:{_llm_port}/health', timeout=2)
+        _vlm_available = True  # Qwen+mmproj on llama-server
     except Exception:
-        # MiniCPM not running — try lightweight VLM or return clear error
-        app.logger.warning('VLM server (MiniCPM:9001) not available')
         try:
-            from helper import get_frame
-            frame = get_frame(str(user_id))
-            if frame is None:
-                return jsonify({'response': 'Visual agent unavailable: no camera frame and VLM server not running. Start MiniCPM or enable camera.', 'vlm_status': 'offline'}), 200
+            urllib.request.urlopen('http://localhost:9001/status', timeout=2)
+            _vlm_available = True  # MiniCPM fallback
         except Exception:
             pass
-        return jsonify({'response': 'Visual agent: VLM server not running. Start with: python integrations/vision/minicpm_server.py', 'vlm_status': 'offline'}), 200
+    if not _vlm_available:
+        return jsonify({'response': 'Visual agent: no VLM server available. Start llama-server with --mmproj or MiniCPM.', 'vlm_status': 'offline'}), 200
     _uid = int(user_id) if str(user_id).isdigit() else str(user_id)
     _pid = int(prompt_id) if str(prompt_id).isdigit() else str(prompt_id)
     if request_from == 'Reuse':
