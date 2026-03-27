@@ -2302,6 +2302,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     # Auto-ingest group_chat messages into SimpleMem + shared LangChain buffer
     _original_append = group_chat.messages.append
     def _unified_ingest_hook(msg):
+        # Strip non-ASCII (emoji etc) from content — prevents cp1252 crashes on Windows
+        # and JSON parse errors in llama.cpp tool call parsing
+        if isinstance(msg, dict) and isinstance(msg.get('content'), str):
+            msg['content'] = msg['content'].encode('ascii', 'replace').decode('ascii')
         _original_append(msg)
         if isinstance(msg, dict) and msg.get('_from_shared'):
             return  # seeded message, already in buffer
