@@ -83,13 +83,14 @@ class Qwen3VLBackend:
     """Unified screen parsing + action reasoning via Qwen3-VL."""
 
     def __init__(self, base_url=None, model_name=None):
+        _llm_port = os.environ.get('HEVOLVE_LLM_PORT', '8080')
         self.base_url = base_url or os.environ.get(
             'HEVOLVE_VLM_ENDPOINT_URL',
-            os.environ.get('HEVOLVE_LLM_ENDPOINT_URL', 'http://localhost:8000/v1')
+            os.environ.get('HEVOLVE_LLM_ENDPOINT_URL', f'http://127.0.0.1:{_llm_port}/v1')
         )
         self.model_name = model_name or os.environ.get(
             'HEVOLVE_VLM_MODEL_NAME',
-            os.environ.get('HEVOLVE_LLM_MODEL_NAME', 'Qwen3-VL-2B-Instruct')
+            os.environ.get('HEVOLVE_LLM_MODEL_NAME', 'local')
         )
         self.api_key = os.environ.get(
             'HEVOLVE_VLM_API_KEY',
@@ -236,6 +237,178 @@ class Qwen3VLBackend:
             'height': img_h,
             'latency': latency,
         }
+
+    def point_and_act(self, screenshot_b64, task, history=None, prev_screenshot_b64=None):
+        """
+        Native Qwen 3.5 grounding: screenshot → <point>x,y</point> → screen coords.
+
+        Uses the model's native <point> format for precise coordinate grounding.
+        Includes verification: compares current screenshot with previous to detect
+        whether the last action had the expected effect.
+
+        Args:
+            screenshot_b64: Current screenshot (base64 JPEG/PNG)
+            task: What to accomplish (e.g. "Click the Start button")
+            history: List of previous action strings for context
+            prev_screenshot_b64: Previous screenshot for state change detection
+
+        Returns:
+            dict with: action, screen_x, screen_y, text, done, reasoning, raw
+        """
+        start = time.time()
+        hist_text = ' → '.join(history[-3:]) if history else 'None'
+
+        # Get OS context — actual window list (ground truth, not VLM guessing)
+        os_context = ''
+        try:
+            import subprocess, platform
+            _os = platform.system()
+            if _os == 'Windows':
+                _r = subprocess.run(
+                    ['powershell', '-Command',
+                     'Get-Process | Where-Object {$_.MainWindowTitle -ne ""} | '
+                     'Select-Object ProcessName, MainWindowTitle | ConvertTo-Json'],
+                    capture_output=True, text=True, timeout=3)
+                if _r.returncode == 0:
+                    import json as _json
+                    _wins = _json.loads(_r.stdout)
+                    if isinstance(_wins, dict):
+                        _wins = [_wins]
+                    _win_list = ', '.join(f'{w["ProcessName"]}:{w["MainWindowTitle"]}'
+                                          for w in _wins if w.get('MainWindowTitle'))
+                    os_context = f'OS: Windows. Open windows: [{_win_list}]\n'
+            elif _os == 'Linux':
+                _r = subprocess.run(['wmctrl', '-l'], capture_output=True, text=True, timeout=3)
+                if _r.returncode == 0:
+                    os_context = f'OS: Linux. Open windows: [{_r.stdout.strip()}]\n'
+            elif _os == 'Darwin':
+                _r = subprocess.run(
+                    ['osascript', '-e',
+                     'tell application "System Events" to get name of every process whose visible is true'],
+                    capture_output=True, text=True, timeout=3)
+                if _r.returncode == 0:
+                    os_context = f'OS: macOS. Visible apps: [{_r.stdout.strip()}]\n'
+        except Exception:
+            pass
+
+        # Detect state change from previous action
+        state_hint = ''
+        if prev_screenshot_b64:
+            state_hint = (
+                'Compare this screenshot with the previous one. '
+                'Did the screen change from the last action? '
+                'If so, proceed to the next step. If not, the last action may have missed its target.\n\n'
+            )
+
+        prompt_text = (
+            f'{os_context}'
+            f'{state_hint}'
+            f'Task: {task}\n'
+            f'Previous actions: {hist_text}\n\n'
+            f'What is the single next action? Do NOT repeat previous actions.\n'
+            f'The Windows Start button is the Windows logo at the FAR LEFT of the taskbar (around 2-4% from left edge).\n'
+            f'Do NOT click other taskbar icons (those are pinned apps like Chrome, MobaXterm, etc).\n\n'
+            f'- To click something: reply with <point>x,y</point> where x,y are 0-1000 normalized.\n'
+            f'- To type text: reply with TYPE:the text here\n'
+            f'- If task is complete: reply with DONE\n'
+            f'Reply with ONLY one of the above, nothing else.'
+        )
+
+        messages = []
+        if prev_screenshot_b64:
+            messages.append({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Previous screenshot (before last action):"},
+                    {"type": "image_url", "image_url": {
+                        "url": f"data:image/jpeg;base64,{prev_screenshot_b64}"
+                    }},
+                ]
+            })
+            messages.append({
+                "role": "assistant",
+                "content": f"Previous action: {history[-1] if history else 'none'}"
+            })
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt_text},
+                {"type": "image_url", "image_url": {
+                    "url": f"data:image/jpeg;base64,{screenshot_b64}"
+                }},
+            ]
+        })
+
+        raw = self._call_api(messages)
+        latency = time.time() - start
+        raw = raw.strip()
+
+        img_w, img_h = self._get_image_dimensions(screenshot_b64)
+
+        # Parse response
+        if 'DONE' in raw.upper():
+            return {'action': 'done', 'screen_x': 0, 'screen_y': 0,
+                    'text': '', 'done': True, 'reasoning': raw, 'raw': raw,
+                    'latency': latency}
+
+        if raw.upper().startswith('TYPE:'):
+            text = raw.split(':', 1)[1].strip()
+            return {'action': 'type', 'screen_x': 0, 'screen_y': 0,
+                    'text': text, 'done': False, 'reasoning': f'type "{text}"',
+                    'raw': raw, 'latency': latency}
+
+        # Parse <point>x,y</point>
+        m = re.search(r'<point>\s*(\d+)\s*,\s*(\d+)\s*</point>', raw)
+        if m:
+            nx, ny = int(m.group(1)), int(m.group(2))
+            # Normalized 0-1000 → actual screen pixels
+            # Screen size obtained from caller; here we return normalized
+            # so the caller (local_loop) can map to actual screen
+            px = int(nx * img_w / 1000)
+            py = int(ny * img_h / 1000)
+            return {'action': 'left_click', 'screen_x': px, 'screen_y': py,
+                    'norm_x': nx, 'norm_y': ny,
+                    'text': '', 'done': False,
+                    'reasoning': f'click at ({nx},{ny}) normalized',
+                    'raw': raw, 'latency': latency}
+
+        # Fallback: try to extract any numbers as coordinates
+        nums = re.findall(r'\d+', raw)
+        if len(nums) >= 2:
+            nx, ny = int(nums[0]), int(nums[1])
+            if 0 <= nx <= 1000 and 0 <= ny <= 1000:
+                px = int(nx * img_w / 1000)
+                py = int(ny * img_h / 1000)
+                return {'action': 'left_click', 'screen_x': px, 'screen_y': py,
+                        'norm_x': nx, 'norm_y': ny,
+                        'text': '', 'done': False,
+                        'reasoning': f'fallback coords ({nx},{ny})',
+                        'raw': raw, 'latency': latency}
+
+        logger.warning(f"Could not parse point_and_act response: {raw[:100]}")
+        return {'action': 'none', 'screen_x': 0, 'screen_y': 0,
+                'text': '', 'done': False, 'reasoning': raw,
+                'raw': raw, 'latency': latency}
+
+    def verify_goal(self, screenshot_b64, goal):
+        """Check if the goal is achieved by looking at the current screenshot.
+
+        Returns: (bool, str) — (achieved, explanation)
+        """
+        raw = self._call_api([{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": (
+                    f'Is this goal achieved? Goal: "{goal}"\n'
+                    f'Reply YES or NO and one sentence why.'
+                )},
+                {"type": "image_url", "image_url": {
+                    "url": f"data:image/jpeg;base64,{screenshot_b64}"
+                }},
+            ]
+        }])
+        achieved = 'YES' in raw.upper().split('.')[0]
+        return achieved, raw.strip()
 
     def describe_scene(self, screenshot_b64, prompt='Describe what you see in this image'):
         """Scene description — drop-in replacement for MiniCPM backend."""

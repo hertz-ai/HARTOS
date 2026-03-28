@@ -1,0 +1,35 @@
+HART OS — Hevolve Hive Agentic Runtime
+Copyright 2024-2026 Hevolve.ai and contributors
+
+This product includes software developed at Hevolve.ai (https://hevolve.ai).
+
+IMPORTANT NOTICES:
+
+1. FEDERATION INTEGRITY
+   Nodes joining the HART OS federation network (HevolveAI Hive) MUST pass
+   guardrail hash verification. The federation protocol rejects nodes with
+   modified guardrail hashes by design. This is enforced by the network,
+   not by this license.
+
+2. MASTER KEY
+   The master key verification system and guardrail hash chain are safety
+   mechanisms designed to ensure human control over distributed AI. These
+   exist for the protection of all participants in the network.
+
+3. HEVOLVEAI (HIVE INTELLIGENCE)
+   HevolveAI — the native hive intelligence layer providing federated
+   learning, weight delta sharing, world model bridge, and cross-node
+   convergence — is a separate, proprietary product. It is NOT covered
+   by this Apache 2.0 license. HART OS functions fully as a standalone
+   agent runtime without HevolveAI. Connecting to the HevolveAI hive
+   requires a separate agreement.
+
+4. CONSTITUTIONAL RULES
+   The 33 constitutional rules encoded in security/hive_guardrails.py
+   are structurally immutable (frozen classes, crypto-verified). You are
+   free to modify them in your fork under Apache 2.0, but modified nodes
+   cannot connect to the HevolveAI federation network.
+
+5. ATTRIBUTION
+   We appreciate (but do not require beyond Apache 2.0 terms) attribution
+   as "Built on HART OS by Hevolve.ai" in derivative works.
