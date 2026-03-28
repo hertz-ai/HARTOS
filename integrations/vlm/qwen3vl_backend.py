@@ -305,13 +305,10 @@ class Qwen3VLBackend:
             f'{state_hint}'
             f'Task: {task}\n'
             f'Previous actions: {hist_text}\n\n'
-            f'What is the single next action? Do NOT repeat previous actions.\n'
-            f'The Windows Start button is the Windows logo at the FAR LEFT of the taskbar (around 2-4% from left edge).\n'
-            f'Do NOT click other taskbar icons (those are pinned apps like Chrome, MobaXterm, etc).\n\n'
-            f'- To click something: reply with <point>x,y</point> where x,y are 0-1000 normalized.\n'
-            f'- To type text: reply with TYPE:the text here\n'
-            f'- If task is complete: reply with DONE\n'
-            f'Reply with ONLY one of the above, nothing else.'
+            f'What is the single next action? Do NOT repeat previous actions.\n\n'
+            f'- To click: first describe WHERE the target is on screen, then give <point>x,y</point> (0-1000 normalized).\n'
+            f'- To type text: reply TYPE:the text here\n'
+            f'- If task is complete: reply DONE'
         )
 
         messages = []
