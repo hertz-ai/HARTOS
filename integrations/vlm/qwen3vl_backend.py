@@ -83,7 +83,11 @@ class Qwen3VLBackend:
     """Unified screen parsing + action reasoning via Qwen3-VL."""
 
     def __init__(self, base_url=None, model_name=None):
-        _llm_port = os.environ.get('HEVOLVE_LLM_PORT', '8080')
+        try:
+            from core.port_registry import get_port
+            _llm_port = get_port('llm')
+        except Exception:
+            _llm_port = int(os.environ.get('HEVOLVE_LLM_PORT', 8080))
         self.base_url = base_url or os.environ.get(
             'HEVOLVE_VLM_ENDPOINT_URL',
             os.environ.get('HEVOLVE_LLM_ENDPOINT_URL', f'http://127.0.0.1:{_llm_port}/v1')
@@ -636,10 +640,10 @@ class Qwen3VLBackend:
 
     def _call_api(self, messages):
         """Call Qwen3-VL OpenAI-compatible API."""
-        import requests as _req
+        from core.http_pool import pooled_post
 
         try:
-            resp = _req.post(
+            resp = pooled_post(
                 f'{self.base_url.rstrip("/")}/chat/completions',
                 json={
                     'model': self.model_name,

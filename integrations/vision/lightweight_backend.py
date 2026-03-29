@@ -370,7 +370,8 @@ class Qwen08BBackend(VisionBackend):
     """
 
     def __init__(self, port: int = None):
-        self._port = int(os.environ.get('HEVOLVE_VLM_CAPTION_PORT', port or 8081))
+        from core.port_registry import get_port
+        self._port = port or get_port('vlm_caption')
 
     @property
     def name(self) -> str:

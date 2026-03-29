@@ -935,17 +935,141 @@ class ModelLifecycleManager:
                         }
 
     def _restart_llm(self, mode: str) -> bool:
-        """Restart llama.cpp server in specified mode."""
+        """Restart llama.cpp server in specified mode.
+
+        Primary path: Nunba's LlamaConfig (reads ~/.nunba/llama_config.json).
+        Fallback: direct subprocess launch (Docker/standalone without Nunba).
+        """
+        # Primary: Nunba manages the server
         try:
             from llama.llama_config import LlamaConfig
             config = LlamaConfig()
-            config.stop_server()  # Clean up any zombie state
+            config.stop_server()
             config.config['use_gpu'] = (mode == 'gpu')
             config._save_config()
             return config.start_server()
+        except ImportError:
+            logger.info("Nunba not available, using direct llama-server launch")
         except Exception as e:
-            logger.error(f"LLM restart failed: {e}")
+            logger.error(f"Nunba LLM restart failed: {e}")
             return False
+
+        # Fallback: direct launch (Docker/standalone)
+        return self._launch_llama_server_direct(mode)
+
+    def _launch_llama_server_direct(self, mode: str) -> bool:
+        """Launch llama-server directly without Nunba.
+
+        Uses model_catalog for model selection, port_registry for port,
+        compute_config for parallel slots, vram_manager for GPU detection.
+        """
+        import subprocess as _sp
+
+        # Find llama-server binary
+        server_bin = self._find_llama_server_binary()
+        if not server_bin:
+            logger.error("llama-server binary not found")
+            return False
+
+        # Find model + mmproj from catalog
+        model_path, mmproj_path = self._find_model_files()
+        if not model_path:
+            logger.error("No GGUF model file found")
+            return False
+
+        # Port from registry
+        try:
+            from core.port_registry import get_port
+            port = get_port('llm')
+        except Exception:
+            port = int(os.environ.get('HEVOLVE_LLM_PORT', 8080))
+
+        # Build command
+        gpu_layers = 99 if mode == 'gpu' else 0
+        ctx_size = int(os.environ.get('HEVOLVE_LLM_CTX_SIZE', 8192))
+
+        cmd = [
+            server_bin,
+            '--model', model_path,
+            '--port', str(port),
+            '--ctx-size', str(ctx_size),
+            '--n-gpu-layers', str(gpu_layers),
+            '--threads', '4',
+            '--flash-attn', 'on',
+        ]
+        if mmproj_path:
+            cmd.extend(['--mmproj', mmproj_path])
+
+        log_path = os.path.join(
+            os.environ.get('TEMP', '/tmp'), f'llama_{port}.log')
+        log_fh = None
+        try:
+            log_fh = open(log_path, 'w')
+            _popen_kwargs = dict(stdout=log_fh, stderr=_sp.STDOUT)
+            if os.name == 'nt':
+                _popen_kwargs['creationflags'] = _sp.CREATE_NO_WINDOW
+            proc = _sp.Popen(cmd, **_popen_kwargs)
+            # Store handle so it stays open for the child process
+            self._direct_log_fh = log_fh
+            log_fh = None  # Prevent close in finally
+            logger.info(f"llama-server started: PID={proc.pid} port={port} "
+                        f"gpu_layers={gpu_layers} log={log_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Direct llama-server launch failed: {e}")
+            return False
+        finally:
+            if log_fh is not None:
+                log_fh.close()
+
+    @staticmethod
+    def _find_llama_server_binary() -> Optional[str]:
+        """Find llama-server binary across known locations."""
+        home = str(Path.home())
+        for base in ['.nunba', '.trueflow']:
+            for sub in ['llama.cpp/build/bin/Release', 'llama.cpp']:
+                for ext in ['', '.exe']:
+                    p = os.path.join(home, base, sub, f'llama-server{ext}')
+                    if os.path.isfile(p):
+                        return p
+        # Check PATH
+        binary = shutil.which('llama-server')
+        if binary:
+            return binary
+        return None
+
+    @staticmethod
+    def _find_model_files() -> Tuple[Optional[str], Optional[str]]:
+        """Find GGUF model + mmproj from known locations.
+
+        Searches ~/.nunba/models/ and ~/.trueflow/models/ for the largest
+        Qwen GGUF file (prefers 4B over 0.8B for the main LLM port).
+        """
+        home = str(Path.home())
+        model_dirs = [
+            os.path.join(home, '.nunba', 'models'),
+            os.path.join(home, '.trueflow', 'models'),
+        ]
+        best_model = None
+        best_size = 0
+        mmproj = None
+
+        for d in model_dirs:
+            if not os.path.isdir(d):
+                continue
+            for f in os.listdir(d):
+                fp = os.path.join(d, f)
+                if not os.path.isfile(fp):
+                    continue
+                if f.startswith('mmproj') and f.endswith('.gguf') and not mmproj:
+                    mmproj = fp
+                elif f.endswith('.gguf') and not f.startswith('mmproj'):
+                    size = os.path.getsize(fp)
+                    if size > best_size:
+                        best_size = size
+                        best_model = fp
+
+        return best_model, mmproj
 
     def _restart_rtm_tool(self, tool_name: str, mode: str) -> bool:
         """Restart a RuntimeToolManager-managed tool."""
