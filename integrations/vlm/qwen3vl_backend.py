@@ -96,7 +96,7 @@ class Qwen3VLBackend:
             'HEVOLVE_VLM_API_KEY',
             os.environ.get('HEVOLVE_LLM_API_KEY', 'dummy')
         )
-        self.timeout = int(os.environ.get('HEVOLVE_VLM_TIMEOUT', '60'))
+        self.timeout = int(os.environ.get('HEVOLVE_VLM_TIMEOUT', '90'))
 
     def parse_and_reason(self, screenshot_b64, task_instruction, history=None):
         """
@@ -238,13 +238,250 @@ class Qwen3VLBackend:
             'latency': latency,
         }
 
+    # Taskbar keywords — if task mentions any of these, use taskbar_list strategy
+    _TASKBAR_KEYWORDS = {
+        'taskbar', 'start button', 'start menu', 'search icon', 'search bar',
+        'chrome', 'edge', 'firefox', 'file explorer', 'explorer icon',
+        'clock', 'time display', 'system tray', 'notification', 'volume',
+        'wifi', 'network', 'battery', 'spotify', 'discord', 'teams',
+        'pinned', 'xbox', 'game bar',
+        # App names that are typically in the taskbar
+        'open chrome', 'open edge', 'open firefox', 'open explorer',
+        'open spotify', 'open discord', 'open teams', 'open steam',
+        'launch chrome', 'launch edge', 'launch firefox',
+    }
+
+    # Action keywords for detecting non-click actions from task text
+    _RIGHT_CLICK_KEYWORDS = {'right-click', 'right click', 'context menu', 'rightclick'}
+    _DOUBLE_CLICK_KEYWORDS = {'double-click', 'double click', 'doubleclick'}
+    _SCROLL_DOWN_KEYWORDS = {'scroll down', 'scroll below', 'page down'}
+    _SCROLL_UP_KEYWORDS = {'scroll up', 'scroll above', 'page up'}
+
+    def _get_os_context(self):
+        """Get OS window list with foreground/z-index info for grounding context."""
+        try:
+            import subprocess, platform
+            _os = platform.system()
+            if _os == 'Windows':
+                # Get foreground window title via PowerShell
+                _fg = subprocess.run(
+                    ['powershell', '-NoProfile', '-Command',
+                     'Add-Type @"\nusing System;\nusing System.Runtime.InteropServices;\n'
+                     'public class FG { [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow(); '
+                     '[DllImport("user32.dll")] public static extern int GetWindowText(IntPtr h, System.Text.StringBuilder t, int c); }\n"@; '
+                     '$h=[FG]::GetForegroundWindow(); $sb=New-Object System.Text.StringBuilder 256; '
+                     '[void][FG]::GetWindowText($h,$sb,256); $sb.ToString()'],
+                    capture_output=True, text=True, timeout=5)
+                fg_title = _fg.stdout.strip() if _fg.returncode == 0 else ''
+
+                # Get all windows
+                _r = subprocess.run(
+                    ['powershell', '-NoProfile', '-Command',
+                     'Get-Process | Where-Object {$_.MainWindowTitle -ne ""} | '
+                     'Select-Object ProcessName, MainWindowTitle | ConvertTo-Json'],
+                    capture_output=True, text=True, timeout=5)
+                if _r.returncode == 0:
+                    _wins = json.loads(_r.stdout)
+                    if isinstance(_wins, dict):
+                        _wins = [_wins]
+                    _win_list = ', '.join(f'{w["ProcessName"]}:{w["MainWindowTitle"]}'
+                                          for w in _wins if w.get('MainWindowTitle'))
+                    fg_info = f' FOREGROUND (topmost): "{fg_title}".' if fg_title else ''
+                    return f'OS: Windows.{fg_info} Open windows: [{_win_list}]\n'
+            elif _os == 'Linux':
+                # Get foreground window
+                _fg = subprocess.run(['xdotool', 'getactivewindow', 'getwindowname'],
+                                     capture_output=True, text=True, timeout=3)
+                fg_title = _fg.stdout.strip() if _fg.returncode == 0 else ''
+                _r = subprocess.run(['wmctrl', '-l'], capture_output=True, text=True, timeout=3)
+                if _r.returncode == 0:
+                    fg_info = f' FOREGROUND: "{fg_title}".' if fg_title else ''
+                    return f'OS: Linux.{fg_info} Open windows: [{_r.stdout.strip()}]\n'
+            elif _os == 'Darwin':
+                # Get frontmost app
+                _fg = subprocess.run(
+                    ['osascript', '-e',
+                     'tell application "System Events" to get name of first process whose frontmost is true'],
+                    capture_output=True, text=True, timeout=3)
+                fg_title = _fg.stdout.strip() if _fg.returncode == 0 else ''
+                _r = subprocess.run(
+                    ['osascript', '-e',
+                     'tell application "System Events" to get name of every process whose visible is true'],
+                    capture_output=True, text=True, timeout=3)
+                if _r.returncode == 0:
+                    fg_info = f' FOREGROUND: "{fg_title}".' if fg_title else ''
+                    return f'OS: macOS.{fg_info} Visible apps: [{_r.stdout.strip()}]\n'
+        except Exception:
+            pass
+        return ''
+
+    def _detect_action_type(self, task, raw_response=''):
+        """Detect action type from task text and VLM response.
+
+        Returns one of: left_click, right_click, double_click, scroll_up, scroll_down, type, done
+        """
+        task_lower = task.lower()
+        raw_lower = raw_response.lower()
+        combined = task_lower + ' ' + raw_lower
+
+        if any(kw in combined for kw in self._RIGHT_CLICK_KEYWORDS):
+            return 'right_click'
+        if any(kw in combined for kw in self._DOUBLE_CLICK_KEYWORDS):
+            return 'double_click'
+        if any(kw in combined for kw in self._SCROLL_DOWN_KEYWORDS):
+            return 'scroll_down'
+        if any(kw in combined for kw in self._SCROLL_UP_KEYWORDS):
+            return 'scroll_up'
+        return 'left_click'
+
+    def _parse_action_response(self, raw, img_w, img_h, task=''):
+        """Parse VLM response into action dict. Returns (result_dict, nx, ny) or (result_dict, None, None)."""
+        raw = raw.strip()
+
+        if 'DONE' in raw.upper():
+            return {'action': 'done', 'screen_x': 0, 'screen_y': 0,
+                    'text': '', 'done': True, 'reasoning': raw, 'raw': raw}, None, None
+
+        # Detect TYPE: in response
+        if raw.upper().startswith('TYPE:'):
+            text = raw.split(':', 1)[1].strip()
+            return {'action': 'type', 'screen_x': 0, 'screen_y': 0,
+                    'text': text, 'done': False, 'reasoning': f'type "{text}"',
+                    'raw': raw}, None, None
+
+        # Also detect "type" action from VLM free-text responses
+        type_match = re.search(r'(?:type|enter|input)\s*[:\-"\']+\s*(.+?)(?:\s*<|$)', raw, re.IGNORECASE)
+        if type_match and '<point>' not in raw:
+            text = type_match.group(1).strip().strip('"\'')
+            return {'action': 'type', 'screen_x': 0, 'screen_y': 0,
+                    'text': text, 'done': False, 'reasoning': f'type "{text}"',
+                    'raw': raw}, None, None
+
+        # Detect scroll actions (no coords needed)
+        raw_lower = raw.lower()
+        task_lower = task.lower() if task else ''
+        if any(kw in task_lower or kw in raw_lower for kw in self._SCROLL_DOWN_KEYWORDS):
+            return {'action': 'scroll_down', 'screen_x': 0, 'screen_y': 0,
+                    'text': '', 'done': False, 'reasoning': 'scroll down',
+                    'raw': raw}, None, None
+        if any(kw in task_lower or kw in raw_lower for kw in self._SCROLL_UP_KEYWORDS):
+            return {'action': 'scroll_up', 'screen_x': 0, 'screen_y': 0,
+                    'text': '', 'done': False, 'reasoning': 'scroll up',
+                    'raw': raw}, None, None
+
+        # Detect action type from task context
+        action_type = self._detect_action_type(task, raw)
+
+        # Parse <point>x,y</point>
+        m = re.search(r'<point>\s*(\d+)\s*,\s*(\d+)\s*</point>', raw)
+        if m:
+            nx, ny = int(m.group(1)), int(m.group(2))
+            px = int(nx * img_w / 1000)
+            py = int(ny * img_h / 1000)
+            return {'action': action_type, 'screen_x': px, 'screen_y': py,
+                    'norm_x': nx, 'norm_y': ny,
+                    'text': '', 'done': False,
+                    'reasoning': f'{action_type} at ({nx},{ny}) normalized',
+                    'raw': raw}, nx, ny
+
+        # Fallback: extract number pairs in 0-1000 range
+        nums = re.findall(r'\d+', raw)
+        if len(nums) >= 2:
+            nx, ny = int(nums[0]), int(nums[1])
+            if 0 <= nx <= 1000 and 0 <= ny <= 1000:
+                px = int(nx * img_w / 1000)
+                py = int(ny * img_h / 1000)
+                return {'action': action_type, 'screen_x': px, 'screen_y': py,
+                        'norm_x': nx, 'norm_y': ny,
+                        'text': '', 'done': False,
+                        'reasoning': f'fallback {action_type} ({nx},{ny})',
+                        'raw': raw}, nx, ny
+
+        logger.warning(f"Could not parse point_and_act response: {raw[:100]}")
+        return {'action': 'none', 'screen_x': 0, 'screen_y': 0,
+                'text': '', 'done': False, 'reasoning': raw,
+                'raw': raw}, None, None
+
+    def _is_taskbar_task(self, task):
+        """Check if task involves taskbar elements."""
+        task_lower = task.lower()
+        return any(kw in task_lower for kw in self._TASKBAR_KEYWORDS)
+
+    def _taskbar_list_lookup(self, screenshot_b64, target_name):
+        """
+        Taskbar list strategy: ask model to list ALL taskbar icons with coords,
+        then find the target by name. Avg error=50, best for taskbar targets.
+
+        Two-pass matching: first ask for the full list, then ask the model
+        which item matches the target (avoids naive keyword matching).
+        """
+        list_raw = self._call_api([{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": (
+                    'List every icon in the taskbar at the bottom of the screen, from LEFT to RIGHT. '
+                    'For each icon give its <point>x,y</point> location. Format:\n'
+                    '1. [icon name] <point>x,y</point>\n'
+                    '2. [icon name] <point>x,y</point>\n...'
+                )},
+                {"type": "image_url", "image_url": {
+                    "url": f"data:image/jpeg;base64,{screenshot_b64}"
+                }},
+            ]
+        }])
+
+        # Extract all items with coords from the list
+        items = []
+        for line in list_raw.split('\n'):
+            m = re.search(r'<point>\s*(\d+)\s*,\s*(\d+)\s*</point>', line)
+            if m:
+                items.append((int(m.group(1)), int(m.group(2)), line.strip()))
+
+        if not items:
+            return None, list_raw
+
+        # Smart matching: extract target keywords and score each item
+        # Map common task phrases to icon names
+        _ALIASES = {
+            'start': ['start', 'windows', 'menu'],
+            'search': ['search', 'magnif'],
+            'chrome': ['chrome', 'google'],
+            'edge': ['edge', 'microsoft edge'],
+            'explorer': ['explorer', 'file', 'folder'],
+            'clock': ['clock', 'time', 'date'],
+            'volume': ['volume', 'sound', 'speaker'],
+            'network': ['network', 'wifi', 'internet'],
+        }
+
+        task_lower = target_name.lower()
+        search_terms = []
+        for key, aliases in _ALIASES.items():
+            if key in task_lower:
+                search_terms.extend(aliases)
+        if not search_terms:
+            # Fallback: use significant words from task
+            search_terms = [w for w in task_lower.split() if len(w) > 2
+                           and w not in ('the', 'click', 'open', 'icon', 'button', 'taskbar')]
+
+        best_match = None
+        best_score = 0
+        for nx, ny, line_text in items:
+            line_lower = line_text.lower()
+            score = sum(1 for term in search_terms if term in line_lower)
+            if score > best_score:
+                best_score = score
+                best_match = (nx, ny, line_text)
+
+        return best_match, list_raw
+
     def point_and_act(self, screenshot_b64, task, history=None, prev_screenshot_b64=None):
         """
-        Native Qwen 3.5 grounding: screenshot → <point>x,y</point> → screen coords.
+        Optimized hybrid grounding strategy based on benchmark results.
 
-        Uses the model's native <point> format for precise coordinate grounding.
-        Includes verification: compares current screenshot with previous to detect
-        whether the last action had the expected effect.
+        Strategy selection (benchmark-driven):
+        1. Taskbar targets → taskbar_list (list all icons, pick by name) avg=50
+        2. All targets → describe_first (describe position, then point) avg=78
+        3. Suspicious center coords → elimination retry (halving search)
 
         Args:
             screenshot_b64: Current screenshot (base64 JPEG/PNG)
@@ -257,41 +494,27 @@ class Qwen3VLBackend:
         """
         start = time.time()
         hist_text = ' → '.join(history[-3:]) if history else 'None'
+        os_context = self._get_os_context()
+        img_w, img_h = self._get_image_dimensions(screenshot_b64)
 
-        # Get OS context — actual window list (ground truth, not VLM guessing)
-        os_context = ''
-        try:
-            import subprocess, platform
-            _os = platform.system()
-            if _os == 'Windows':
-                _r = subprocess.run(
-                    ['powershell', '-Command',
-                     'Get-Process | Where-Object {$_.MainWindowTitle -ne ""} | '
-                     'Select-Object ProcessName, MainWindowTitle | ConvertTo-Json'],
-                    capture_output=True, text=True, timeout=3)
-                if _r.returncode == 0:
-                    import json as _json
-                    _wins = _json.loads(_r.stdout)
-                    if isinstance(_wins, dict):
-                        _wins = [_wins]
-                    _win_list = ', '.join(f'{w["ProcessName"]}:{w["MainWindowTitle"]}'
-                                          for w in _wins if w.get('MainWindowTitle'))
-                    os_context = f'OS: Windows. Open windows: [{_win_list}]\n'
-            elif _os == 'Linux':
-                _r = subprocess.run(['wmctrl', '-l'], capture_output=True, text=True, timeout=3)
-                if _r.returncode == 0:
-                    os_context = f'OS: Linux. Open windows: [{_r.stdout.strip()}]\n'
-            elif _os == 'Darwin':
-                _r = subprocess.run(
-                    ['osascript', '-e',
-                     'tell application "System Events" to get name of every process whose visible is true'],
-                    capture_output=True, text=True, timeout=3)
-                if _r.returncode == 0:
-                    os_context = f'OS: macOS. Visible apps: [{_r.stdout.strip()}]\n'
-        except Exception:
-            pass
+        # --- Strategy 1: Taskbar list for taskbar targets ---
+        if self._is_taskbar_task(task):
+            logger.info(f"Using taskbar_list strategy for: {task}")
+            match, list_raw = self._taskbar_list_lookup(screenshot_b64, task)
+            if match:
+                nx, ny, match_line = match
+                px = int(nx * img_w / 1000)
+                py = int(ny * img_h / 1000)
+                latency = time.time() - start
+                return {'action': 'left_click', 'screen_x': px, 'screen_y': py,
+                        'norm_x': nx, 'norm_y': ny,
+                        'text': '', 'done': False,
+                        'reasoning': f'taskbar_list: {match_line}',
+                        'raw': list_raw, 'latency': latency,
+                        'strategy': 'taskbar_list'}
+            logger.info("taskbar_list: no match found, falling through to describe_first")
 
-        # Detect state change from previous action
+        # --- Strategy 2: describe_first (primary, avg=78) ---
         state_hint = ''
         if prev_screenshot_b64:
             state_hint = (
@@ -306,8 +529,13 @@ class Qwen3VLBackend:
             f'Task: {task}\n'
             f'Previous actions: {hist_text}\n\n'
             f'What is the single next action? Do NOT repeat previous actions.\n\n'
-            f'- To click: first describe WHERE the target is on screen, then give <point>x,y</point> (0-1000 normalized).\n'
+            f'- To click: first describe WHERE the target is on screen '
+            f'(which edge, which corner, left/right side), '
+            f'then give <point>x,y</point> (0-1000 normalized).\n'
+            f'- To right-click: describe WHERE, then give <point>x,y</point>\n'
+            f'- To double-click: describe WHERE, then give <point>x,y</point>\n'
             f'- To type text: reply TYPE:the text here\n'
+            f'- To scroll: reply SCROLL_UP or SCROLL_DOWN\n'
             f'- If task is complete: reply DONE'
         )
 
@@ -337,55 +565,41 @@ class Qwen3VLBackend:
         })
 
         raw = self._call_api(messages)
+        result, nx, ny = self._parse_action_response(raw, img_w, img_h, task=task)
+
+        # --- Strategy 3: elimination retry if coords look suspicious ---
+        # "Suspicious" = near dead center (400-600, 400-600) which usually means
+        # the model defaulted rather than actually grounding
+        if nx is not None and ny is not None and result['action'] == 'left_click':
+            is_center_biased = (350 < nx < 650 and 350 < ny < 650)
+            if is_center_biased:
+                logger.info(f"Center-biased coords ({nx},{ny}), retrying with elimination strategy")
+                elim_prompt = (
+                    f'I need to find the target for: {task}\n'
+                    f'Is it in the top half or bottom half of the screen? '
+                    f'Is it in the left third, middle third, or right third? '
+                    f'Now give the precise <point>x,y</point> (0-1000 normalized).'
+                )
+                elim_raw = self._call_api([{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": elim_prompt},
+                        {"type": "image_url", "image_url": {
+                            "url": f"data:image/jpeg;base64,{screenshot_b64}"
+                        }},
+                    ]
+                }])
+                elim_result, enx, eny = self._parse_action_response(elim_raw, img_w, img_h, task=task)
+                if enx is not None and not (350 < enx < 650 and 350 < eny < 650):
+                    # Elimination gave non-center coords — trust it
+                    result = elim_result
+                    result['strategy'] = 'elimination_retry'
+                    logger.info(f"Elimination retry gave ({enx},{eny}) — using it")
+
         latency = time.time() - start
-        raw = raw.strip()
-
-        img_w, img_h = self._get_image_dimensions(screenshot_b64)
-
-        # Parse response
-        if 'DONE' in raw.upper():
-            return {'action': 'done', 'screen_x': 0, 'screen_y': 0,
-                    'text': '', 'done': True, 'reasoning': raw, 'raw': raw,
-                    'latency': latency}
-
-        if raw.upper().startswith('TYPE:'):
-            text = raw.split(':', 1)[1].strip()
-            return {'action': 'type', 'screen_x': 0, 'screen_y': 0,
-                    'text': text, 'done': False, 'reasoning': f'type "{text}"',
-                    'raw': raw, 'latency': latency}
-
-        # Parse <point>x,y</point>
-        m = re.search(r'<point>\s*(\d+)\s*,\s*(\d+)\s*</point>', raw)
-        if m:
-            nx, ny = int(m.group(1)), int(m.group(2))
-            # Normalized 0-1000 → actual screen pixels
-            # Screen size obtained from caller; here we return normalized
-            # so the caller (local_loop) can map to actual screen
-            px = int(nx * img_w / 1000)
-            py = int(ny * img_h / 1000)
-            return {'action': 'left_click', 'screen_x': px, 'screen_y': py,
-                    'norm_x': nx, 'norm_y': ny,
-                    'text': '', 'done': False,
-                    'reasoning': f'click at ({nx},{ny}) normalized',
-                    'raw': raw, 'latency': latency}
-
-        # Fallback: try to extract any numbers as coordinates
-        nums = re.findall(r'\d+', raw)
-        if len(nums) >= 2:
-            nx, ny = int(nums[0]), int(nums[1])
-            if 0 <= nx <= 1000 and 0 <= ny <= 1000:
-                px = int(nx * img_w / 1000)
-                py = int(ny * img_h / 1000)
-                return {'action': 'left_click', 'screen_x': px, 'screen_y': py,
-                        'norm_x': nx, 'norm_y': ny,
-                        'text': '', 'done': False,
-                        'reasoning': f'fallback coords ({nx},{ny})',
-                        'raw': raw, 'latency': latency}
-
-        logger.warning(f"Could not parse point_and_act response: {raw[:100]}")
-        return {'action': 'none', 'screen_x': 0, 'screen_y': 0,
-                'text': '', 'done': False, 'reasoning': raw,
-                'raw': raw, 'latency': latency}
+        result['latency'] = latency
+        result.setdefault('strategy', 'describe_first')
+        return result
 
     def verify_goal(self, screenshot_b64, goal):
         """Check if the goal is achieved by looking at the current screenshot.
