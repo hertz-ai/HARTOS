@@ -3543,12 +3543,17 @@ def _parse_pdf_in_process(input_url, user_id, request_id):
             pass
 
 
-redis_client = redis.StrictRedis(
-    host='azure_all_vms.hertzai.com', port=6369, db=0)
+try:
+    redis_client = redis.StrictRedis(
+        host='azure_all_vms.hertzai.com', port=6369, db=0,
+        socket_connect_timeout=2, socket_timeout=2)
+    redis_client.ping()
+except Exception:
+    redis_client = None
 
 
 def get_frame(user_id):
-    """Get latest camera frame — FrameStore first, Redis fallback."""
+    """Get latest camera frame — FrameStore first, screenshot fallback, Redis last."""
     # Primary: FrameStore (in-process, zero latency)
     svc = get_vision_service()
     if svc:
@@ -3563,7 +3568,20 @@ def get_frame(user_id):
                     f"Frame for user_id {user_id} from FrameStore")
                 return frame[:, :, ::-1]  # BGR → RGB
 
-    # Fallback: Redis (legacy path)
+    # Desktop screenshot fallback (for computer use mode)
+    try:
+        from PIL import ImageGrab
+        screenshot = ImageGrab.grab()
+        frame = np.array(screenshot)
+        app.logger.info(f"Frame for user_id {user_id} from desktop screenshot ({frame.shape})")
+        return frame  # Already RGB
+    except Exception as _ss_err:
+        app.logger.debug(f"Screenshot fallback failed: {_ss_err}")
+
+    # Last resort: Redis (legacy camera path)
+    if redis_client is None:
+        app.logger.info(f"No frame for user_id {user_id} — Redis unavailable, no camera/screenshot.")
+        return None
     serialized_frame = redis_client.get(user_id)
     try:
         if serialized_frame is not None:
@@ -4357,7 +4375,7 @@ def chat():
     # Early validation — return 400 instead of 500 on missing required fields
     if not data.get('user_id') and not request.headers.get('Authorization', '').startswith('Bearer '):
         return jsonify({'error': 'user_id is required (in body or via Bearer token)', 'response': None}), 400
-    if not data.get('prompt_id'):
+    if data.get('prompt_id') is None and 'prompt_id' not in data:
         return jsonify({'error': 'prompt_id is required', 'response': None}), 400
     if not data.get('prompt') and not data.get('input_text'):
         return jsonify({'error': 'prompt is required', 'response': None}), 400
@@ -5165,6 +5183,39 @@ def visual_agent():
         return jsonify({'response': 'Visual agent: no VLM server available. Start llama-server with --mmproj or MiniCPM.', 'vlm_status': 'offline'}), 200
     _uid = int(user_id) if str(user_id).isdigit() else str(user_id)
     _pid = int(prompt_id) if str(prompt_id).isdigit() else str(prompt_id)
+
+    # Computer use mode: use VLM point_and_act directly with screenshot
+    mode = data.get('mode', 'auto')  # 'computer_use', 'camera', 'auto'
+    if mode == 'computer_use' or (mode == 'auto' and request_from != 'Reuse'):
+        try:
+            from integrations.vlm.qwen3vl_backend import get_qwen3vl_backend
+            import base64, io
+            from PIL import ImageGrab, Image
+            backend = get_qwen3vl_backend()
+            screenshot = ImageGrab.grab()
+            img_resized = screenshot.resize((1024, 576), Image.LANCZOS)
+            buf = io.BytesIO()
+            img_resized.save(buf, 'JPEG', quality=50)
+            b64 = base64.b64encode(buf.getvalue()).decode('ascii')
+            result = backend.point_and_act(b64, str(task_description))
+            return jsonify({
+                'response': result.get('reasoning', ''),
+                'action': result.get('action', 'none'),
+                'screen_x': result.get('screen_x', 0),
+                'screen_y': result.get('screen_y', 0),
+                'norm_x': result.get('norm_x', 0),
+                'norm_y': result.get('norm_y', 0),
+                'text': result.get('text', ''),
+                'done': result.get('done', False),
+                'strategy': result.get('strategy', ''),
+                'latency': result.get('latency', 0),
+                'vlm_status': 'ok',
+            }), 200
+        except Exception as e:
+            app.logger.error(f'Computer use error: {e}')
+            return jsonify({'response': f'Computer use error: {str(e)[:200]}', 'vlm_status': 'error'}), 200
+
+    # Camera/legacy mode: use existing visual agent pipeline
     try:
         if request_from == 'Reuse':
             res = visual_based_execution(str(task_description), _uid, _pid)
