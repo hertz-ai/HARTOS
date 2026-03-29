@@ -87,7 +87,11 @@ def main():
     download(m['hf_repo'], m['mmproj_file'], m['mmproj_subdir'])
 
     if args.benchmark:
-        port = int(os.environ.get('HEVOLVE_VLM_CAPTION_PORT', 8081))
+        try:
+            from core.port_registry import get_port
+            port = get_port('vlm_caption')
+        except Exception:
+            port = int(os.environ.get('HEVOLVE_VLM_CAPTION_PORT', 8081))
         print('\n=== Benchmark ===')
         benchmark(port)
 
