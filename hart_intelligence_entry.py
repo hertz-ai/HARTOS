@@ -5166,20 +5166,10 @@ def visual_agent():
     if not task_description or not user_id or not prompt_id:
         return jsonify({'error':'user_id or task_description or prompt_id is missing'}), 404
     app.logger.info(f'GOT user_id:{user_id} & prompt_id:{prompt_id} & task_description:{task_description}')
-    # Quick VLM health check — try Qwen+mmproj first (already running), then MiniCPM
-    _vlm_available = False
-    _llm_port = int(os.environ.get('HEVOLVE_LLM_PORT', 8080))
-    try:
-        import urllib.request
-        urllib.request.urlopen(f'http://127.0.0.1:{_llm_port}/health', timeout=2)
-        _vlm_available = True  # Qwen+mmproj on llama-server
-    except Exception:
-        try:
-            urllib.request.urlopen('http://localhost:9001/status', timeout=2)
-            _vlm_available = True  # MiniCPM fallback
-        except Exception:
-            pass
-    if not _vlm_available:
+    # Quick VLM health check — delegate to lightweight_backend (single path)
+    from integrations.vision.lightweight_backend import get_vision_backend
+    _vlm_backend = get_vision_backend()
+    if not _vlm_backend.is_available():
         return jsonify({'response': 'Visual agent: no VLM server available. Start llama-server with --mmproj or MiniCPM.', 'vlm_status': 'offline'}), 200
     _uid = int(user_id) if str(user_id).isdigit() else str(user_id)
     _pid = int(prompt_id) if str(prompt_id).isdigit() else str(prompt_id)

@@ -40,6 +40,7 @@ APP_PORTS = {
     'mesh_relay':   6796,
     'model_bus':    6790,
     'mcp':          6791,
+    'vlm_caption':  8081,
 }
 
 # OS mode: privileged ports (HART OS is the operating system)
@@ -55,6 +56,7 @@ OS_PORTS = {
     'mesh_relay':   680,
     'model_bus':    681,
     'mcp':          682,
+    'vlm_caption':  808,  # Shares with llm in OS mode (single GPU)
 }
 
 # Environment variable overrides (takes precedence over both modes)
@@ -70,6 +72,7 @@ ENV_OVERRIDES = {
     'mesh_relay':   'HART_MESH_RELAY_PORT',
     'model_bus':    'HART_MODEL_BUS_PORT',
     'mcp':          'HART_MCP_PORT',
+    'vlm_caption':  'HEVOLVE_VLM_CAPTION_PORT',
 }
 
 
