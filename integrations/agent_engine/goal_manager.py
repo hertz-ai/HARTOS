@@ -1273,7 +1273,7 @@ def _build_self_build_prompt(goal_dict: Dict, product_dict: Optional[Dict] = Non
     )
 
 
-register_goal_type('self_build', _build_we self_build_prompt,
+register_goal_type('self_build', _build_self_build_prompt,
                     tool_tags=['self_build'])
 
 
