@@ -4635,6 +4635,23 @@ def chat():
             if not user_id or not prompt:
                 return jsonify({'response': 'Need user_id and text to create agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
             if autonomous:
+                # Check if an existing agent can handle this task before creating new one
+                try:
+                    from integrations.agentic_router import find_matching_agent
+                    _match = find_matching_agent(prompt, PROMPTS_DIR)
+                    if _match and _match.get('agent_id'):
+                        _mid = _match['agent_id']
+                        _mconfig = os.path.join(PROMPTS_DIR, f'{_mid}.json')
+                        if os.path.exists(_mconfig) and os.path.exists(
+                                os.path.join(PROMPTS_DIR, f'{_mid}_0_recipe.json')):
+                            app.logger.info(
+                                f'Matched existing agent {_match["name"]} ({_mid}) '
+                                f'— routing to REUSE instead of CREATE')
+                            return chat_agent(user_id, prompt, _mid, file_id, request_id)
+                except Exception as _me:
+                    app.logger.debug(f'Agent matching skipped: {_me}')
+
+                # No existing agent matches — create new one
                 # Autonomous dispatch (from daemon or API): LLM self-generates agent config
                 # AND immediately creates recipe — no human review step needed.
                 # Full pipeline: gather_info → save config → recipe() → completed

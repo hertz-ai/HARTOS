@@ -604,39 +604,305 @@ def unload_whisper():
 
 
 # ═══════════════════════════════════════════════════════════════
-# Streaming recognizer (for real-time mic input)
+# Streaming STT WebSocket Server (faster-whisper with VAD)
+#
+# Pattern: same as diarization_server.py — standalone asyncio WebSocket
+# server started as a daemon thread by DiarizationService-style manager.
+#
+# Protocol:
+#   Client → Server: binary PCM16 audio chunks (16kHz mono) OR
+#                     binary WebM/Opus blobs (auto-detected, converted via ffmpeg)
+#   Server → Client: JSON {"text": "...", "language": "en", "is_final": true/false}
+#
+# The server accumulates audio in a per-connection buffer. When VAD detects
+# a speech pause (or buffer exceeds 30s), it transcribes the buffer with
+# faster-whisper and sends back the result. Partial results are sent
+# every 2s of accumulated audio for low-latency interim display.
 # ═══════════════════════════════════════════════════════════════
 
-def create_streaming_recognizer(sample_rate: int = 16000):
-    """Create a sherpa-onnx OnlineRecognizer for real-time streaming STT.
+_stt_ws_server = None
+_stt_ws_port = None
 
-    Usage:
-        recognizer = create_streaming_recognizer()
-        stream = recognizer.create_stream()
-        # Feed audio chunks:
-        stream.accept_waveform(sample_rate, numpy_samples)
-        while recognizer.is_ready(stream):
-            recognizer.decode_stream(stream)
-        partial_text = recognizer.get_result(stream).text
+STREAM_SAMPLE_RATE = 16000
+STREAM_BYTES_PER_SAMPLE = 2
+STREAM_CHANNELS = 1
+# Transcribe every 2s of audio for interim results
+STREAM_CHUNK_SECONDS = 2
+STREAM_CHUNK_BYTES = STREAM_SAMPLE_RATE * STREAM_BYTES_PER_SAMPLE * STREAM_CHANNELS * STREAM_CHUNK_SECONDS
+# Max buffer before forced transcription (30s)
+STREAM_MAX_BUFFER_BYTES = STREAM_SAMPLE_RATE * STREAM_BYTES_PER_SAMPLE * STREAM_CHANNELS * 30
+
+
+async def _stt_stream_handler(websocket):
+    """Handle a single streaming STT WebSocket connection.
+
+    Accepts:
+      - Raw PCM16 16kHz mono binary frames
+      - WebM/Opus blobs (auto-converted to PCM via temp file + faster-whisper)
+      - JSON {"control": "reset"} to clear buffer
+      - JSON {"control": "final"} to force final transcription
+
+    Sends back:
+      - {"text": "...", "language": "en", "is_final": false} for interim
+      - {"text": "...", "language": "en", "is_final": true} for final (pause detected)
+    """
+    import io
+    import tempfile
+    import numpy as np
+
+    audio_buffer = io.BytesIO()
+    last_transcribe_size = 0
+
+    try:
+        async for message in websocket:
+            # Control messages (JSON)
+            if isinstance(message, str):
+                try:
+                    ctrl = json.loads(message)
+                    if ctrl.get('control') == 'reset':
+                        audio_buffer = io.BytesIO()
+                        last_transcribe_size = 0
+                        continue
+                    if ctrl.get('control') == 'final':
+                        # Force final transcription of remaining buffer
+                        text, lang = _transcribe_buffer(audio_buffer)
+                        if text:
+                            await websocket.send(json.dumps({
+                                'text': text, 'language': lang, 'is_final': True,
+                            }))
+                        audio_buffer = io.BytesIO()
+                        last_transcribe_size = 0
+                        continue
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                continue
+
+            # Binary audio data
+            if not isinstance(message, (bytes, bytearray)):
+                continue
+
+            # Detect format: WebM/Opus starts with 0x1A45DFA3 (EBML header)
+            # or "OggS" (Ogg container). Raw PCM has no header.
+            is_container = (
+                message[:4] == b'\x1a\x45\xdf\xa3' or  # WebM/Matroska
+                message[:4] == b'OggS' or               # Ogg/Opus
+                message[:4] == b'RIFF'                   # WAV
+            )
+
+            if is_container:
+                # Save to temp file, let faster-whisper handle decoding
+                pcm_bytes = _container_to_pcm(message)
+                if pcm_bytes:
+                    audio_buffer.write(pcm_bytes)
+            else:
+                # Raw PCM16 mono 16kHz
+                audio_buffer.write(message)
+
+            buf_size = audio_buffer.getbuffer().nbytes
+
+            # Force transcription if buffer exceeds max
+            if buf_size >= STREAM_MAX_BUFFER_BYTES:
+                text, lang = _transcribe_buffer(audio_buffer)
+                if text:
+                    await websocket.send(json.dumps({
+                        'text': text, 'language': lang, 'is_final': True,
+                    }))
+                audio_buffer = io.BytesIO()
+                last_transcribe_size = 0
+                continue
+
+            # Interim transcription every STREAM_CHUNK_BYTES
+            if buf_size - last_transcribe_size >= STREAM_CHUNK_BYTES:
+                text, lang = _transcribe_buffer(audio_buffer, keep_buffer=True)
+                last_transcribe_size = buf_size
+                if text:
+                    await websocket.send(json.dumps({
+                        'text': text, 'language': lang, 'is_final': False,
+                    }))
+
+    except Exception as e:
+        logger.debug(f"STT stream connection ended: {e}")
+
+
+def _container_to_pcm(data: bytes) -> Optional[bytes]:
+    """Convert WebM/Opus/WAV container to raw PCM16 16kHz mono via temp file.
+
+    faster-whisper can read any ffmpeg-supported format, so we save to a
+    temp file, transcribe, and extract the raw audio. But for streaming we
+    need raw PCM — use ffmpeg subprocess if available, else return raw bytes
+    and let faster-whisper handle it at transcribe time.
+    """
+    import subprocess as _sp
+    import tempfile
+
+    tmp_in = None
+    tmp_out = None
+    try:
+        tmp_in = tempfile.NamedTemporaryFile(suffix='.webm', delete=False)
+        tmp_in.write(data)
+        tmp_in.close()
+
+        tmp_out = tempfile.NamedTemporaryFile(suffix='.pcm', delete=False)
+        tmp_out.close()
+
+        _kw = dict(capture_output=True, timeout=10)
+        if hasattr(_sp, 'CREATE_NO_WINDOW'):
+            _kw['creationflags'] = _sp.CREATE_NO_WINDOW
+
+        result = _sp.run([
+            'ffmpeg', '-y', '-i', tmp_in.name,
+            '-ar', str(STREAM_SAMPLE_RATE), '-ac', '1', '-f', 's16le',
+            tmp_out.name,
+        ], **_kw)
+
+        if result.returncode == 0:
+            with open(tmp_out.name, 'rb') as f:
+                return f.read()
+    except FileNotFoundError:
+        # ffmpeg not available — save raw container bytes,
+        # _transcribe_buffer will write to temp file for faster-whisper
+        return data
+    except Exception as e:
+        logger.debug(f"PCM conversion failed: {e}")
+    finally:
+        for p in (tmp_in, tmp_out):
+            if p:
+                try:
+                    os.unlink(p.name)
+                except Exception:
+                    pass
+    return None
+
+
+def _transcribe_buffer(audio_buffer, keep_buffer: bool = False) -> tuple:
+    """Transcribe accumulated audio buffer using faster-whisper.
+
+    Returns (text, language) tuple. Reuses the module-level faster-whisper
+    model instance (same one used by whisper_transcribe).
+    """
+    import tempfile
+    import numpy as np
+
+    buf_bytes = audio_buffer.getvalue()
+    if len(buf_bytes) < STREAM_SAMPLE_RATE * 2:  # < 1s of audio, skip
+        return ('', 'unknown')
+
+    if not keep_buffer:
+        audio_buffer.seek(0)
+        audio_buffer.truncate(0)
+
+    # Try direct numpy transcription (raw PCM)
+    try:
+        model = _get_faster_whisper_model(_FASTER_WHISPER_MODEL_SIZE)
+        audio_np = (
+            np.frombuffer(buf_bytes, dtype=np.int16)
+            .astype(np.float32) / 32768.0
+        )
+        segments, info = model.transcribe(
+            audio_np, beam_size=3, vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=500),
+        )
+        text = ' '.join(seg.text for seg in segments).strip()
+        lang = info.language if info.language else 'unknown'
+        return (text, lang)
+    except Exception as e:
+        logger.debug(f"Direct PCM transcribe failed ({e}), trying temp file")
+
+    # Fallback: write to temp WAV file for faster-whisper
+    try:
+        import wave
+        tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+        with wave.open(tmp.name, 'wb') as wf:
+            wf.setnchannels(STREAM_CHANNELS)
+            wf.setsampwidth(STREAM_BYTES_PER_SAMPLE)
+            wf.setframerate(STREAM_SAMPLE_RATE)
+            wf.writeframes(buf_bytes)
+
+        result_json = _faster_whisper_transcribe(tmp.name)
+        if result_json:
+            parsed = json.loads(result_json)
+            return (parsed.get('text', ''), parsed.get('language', 'unknown'))
+    except Exception as e:
+        logger.debug(f"WAV transcribe fallback failed: {e}")
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except Exception:
+            pass
+
+    return ('', 'unknown')
+
+
+def start_stt_stream_server(port: int = 0) -> Optional[int]:
+    """Start the streaming STT WebSocket server in a daemon thread.
+
+    Same pattern as DiarizationService — asyncio event loop in a thread.
+
+    Args:
+        port: Port to bind (0 = auto-select from port registry or dynamic)
 
     Returns:
-        sherpa_onnx.OnlineRecognizer, or None if streaming not available.
+        Actual port number, or None if failed.
     """
-    try:
-        import sherpa_onnx
-    except ImportError:
-        logger.warning("sherpa-onnx not installed — streaming STT unavailable")
-        return None
+    global _stt_ws_server, _stt_ws_port
 
-    # For streaming, use zipformer or similar online model
-    # Moonshine and Whisper are offline (batch) models in sherpa-onnx
-    # Online models need separate download
-    # For now, return None — streaming to be wired when online models are added
-    logger.info(
-        "Streaming STT: use client-side Web Speech API for real-time. "
-        "Server-side streaming requires sherpa-onnx online models (zipformer)."
-    )
+    if _stt_ws_port is not None:
+        return _stt_ws_port  # already running
+
+    if port == 0:
+        try:
+            from core.port_registry import get_port
+            port = get_port('stt_stream')
+        except Exception:
+            port = 8005  # default fallback
+
+    import asyncio
+    import threading
+
+    def _run_server():
+        global _stt_ws_server, _stt_ws_port
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        try:
+            import websockets
+
+            async def _serve():
+                global _stt_ws_server, _stt_ws_port
+                server = await websockets.serve(
+                    _stt_stream_handler, '127.0.0.1', port,
+                    max_size=2 * 1024 * 1024,  # 2MB max message (30s audio ~960KB)
+                )
+                actual_port = port
+                if server.sockets:
+                    actual_port = server.sockets[0].getsockname()[1]
+                _stt_ws_server = server
+                _stt_ws_port = actual_port
+                logger.info(f"Streaming STT WebSocket server on ws://127.0.0.1:{actual_port}")
+                await asyncio.Future()  # run forever
+
+            loop.run_until_complete(_serve())
+        except Exception as e:
+            logger.error(f"STT stream server failed: {e}")
+            _stt_ws_port = None
+
+    thread = threading.Thread(target=_run_server, daemon=True, name='stt-stream-ws')
+    thread.start()
+
+    # Wait for port to be assigned
+    import time
+    for _ in range(30):
+        if _stt_ws_port is not None:
+            return _stt_ws_port
+        time.sleep(0.1)
+
+    logger.warning("STT stream server did not start within 3s")
     return None
+
+
+def get_stt_stream_port() -> Optional[int]:
+    """Get the port of the running streaming STT WebSocket server."""
+    return _stt_ws_port
 
 
 # ═══════════════════════════════════════════════════════════════

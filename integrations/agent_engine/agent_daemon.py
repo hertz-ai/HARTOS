@@ -295,6 +295,36 @@ class AgentDaemon:
             # is still running — causing repeated identical actions.
             _CONTINUOUS_COOLDOWN_S = 300  # 5 minutes
 
+            # Split goals into two queues:
+            #   - CREATE queue: goals without recipes (need LLM planning, 1 at a time)
+            #   - REUSE pool: goals with recipes (cheap replay, round-robin)
+            import hashlib as _hlib
+            _create_queue = []
+            _reuse_pool = []
+            for goal in goals:
+                _gh = int(_hlib.md5(str(goal.id).encode()).hexdigest()[:10], 16) % 100_000_000_000
+                _pid = str(max(1, _gh))
+                _recipe_path = os.path.join('prompts', f'{_pid}_0_recipe.json')
+                if os.path.exists(_recipe_path):
+                    _reuse_pool.append(goal)
+                else:
+                    _create_queue.append(goal)
+
+            # REUSE goals round-robin (cheap, can cycle through many per tick)
+            # CREATE goals sequential (1 at a time, rotated so each gets a turn)
+            if _create_queue:
+                _cr_offset = self._tick_count % len(_create_queue)
+                _create_queue = _create_queue[_cr_offset:] + _create_queue[:_cr_offset]
+            if _reuse_pool:
+                _re_offset = self._tick_count % len(_reuse_pool)
+                _reuse_pool = _reuse_pool[_re_offset:] + _reuse_pool[:_re_offset]
+
+            # Prioritize: 1 CREATE first (if any), then fill remaining slots with REUSE
+            goals = _create_queue[:1] + _reuse_pool + _create_queue[1:]
+
+            logger.debug(f"Goal split: {len(_create_queue)} need CREATE, "
+                         f"{len(_reuse_pool)} have recipes (REUSE)")
+
             for goal in goals:
                 if dispatched >= len(idle_agents) or dispatched >= max_concurrent:
                     break

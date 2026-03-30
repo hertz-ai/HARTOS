@@ -13,6 +13,11 @@ import os
 import subprocess
 import sys
 import threading
+
+# Windows: suppress console windows for all subprocess calls
+_SUBPROCESS_KW = {}
+if sys.platform == 'win32':
+    _SUBPROCESS_KW['creationflags'] = subprocess.CREATE_NO_WINDOW
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -127,7 +132,8 @@ class RegressionAdapter(BenchmarkAdapter):
                 capture_output=True, text=True, timeout=600,
                 cwd=os.environ.get('HEVOLVE_PROJECT_ROOT',
                                    os.path.dirname(os.path.dirname(
-                                       os.path.dirname(__file__))))
+                                       os.path.dirname(__file__)))),
+                **_SUBPROCESS_KW
             )
             # Parse pytest output for pass/fail counts
             output = result.stdout + result.stderr
@@ -320,13 +326,13 @@ class DynamicBenchmarkAdapter(BenchmarkAdapter):
             if not os.path.isdir(self._install_dir):
                 subprocess.run(
                     ['git', 'clone', '--depth', '1', self.repo_url, self._install_dir],
-                    check=True, timeout=120)
+                    check=True, timeout=120, **_SUBPROCESS_KW)
             # Install requirements if present
             req_file = os.path.join(self._install_dir, 'requirements.txt')
             if os.path.isfile(req_file):
                 subprocess.run(
                     [sys.executable, '-m', 'pip', 'install', '-r', req_file, '-q'],
-                    timeout=300)
+                    timeout=300, **_SUBPROCESS_KW)
             return True
         except Exception as e:
             logger.debug(f"Benchmark install failed for {self.name}: {e}")
@@ -339,7 +345,7 @@ class DynamicBenchmarkAdapter(BenchmarkAdapter):
             cmd = self._run_command or f'{sys.executable} -m pytest --benchmark-json=results.json'
             result = subprocess.run(
                 cmd, shell=True, capture_output=True, text=True,
-                timeout=600, cwd=self._install_dir)
+                timeout=600, cwd=self._install_dir, **_SUBPROCESS_KW)
             # Try to parse metrics file
             mf = os.path.join(self._install_dir, self._metrics_file or 'results.json')
             if os.path.isfile(mf):

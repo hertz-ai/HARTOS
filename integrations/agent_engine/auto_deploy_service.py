@@ -12,7 +12,13 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import time
+
+# Windows: suppress console windows for all subprocess calls
+_SUBPROCESS_KW = {}
+if sys.platform == 'win32':
+    _SUBPROCESS_KW['creationflags'] = subprocess.CREATE_NO_WINDOW
 from typing import Dict, Optional
 
 logger = logging.getLogger('hevolve_social')
@@ -42,7 +48,8 @@ class AutoDeployService:
         try:
             pull = subprocess.run(
                 ['git', 'pull', 'origin', 'main'],
-                capture_output=True, text=True, timeout=120)
+                capture_output=True, text=True, timeout=120,
+                **_SUBPROCESS_KW)
             result['steps']['git_pull'] = {
                 'success': pull.returncode == 0,
                 'output': pull.stdout[:200],
@@ -154,7 +161,8 @@ class AutoDeployService:
                 python = os.environ.get('HEVOLVE_PYTHON', 'python')
                 result = subprocess.run(
                     [python, script_path, '--version', version],
-                    capture_output=True, text=True, timeout=60)
+                    capture_output=True, text=True, timeout=60,
+                    **_SUBPROCESS_KW)
                 if result.returncode == 0:
                     manifest['signed'] = True
                     # Parse signature from output if available
@@ -273,21 +281,24 @@ class AutoDeployService:
             # Fetch first, then checkout exact commit from manifest
             fetch = subprocess.run(
                 ['git', 'fetch', 'origin', 'main'],
-                capture_output=True, text=True, timeout=120)
+                capture_output=True, text=True, timeout=120,
+                **_SUBPROCESS_KW)
             if fetch.returncode != 0:
                 result['error'] = f'Git fetch failed: {fetch.stderr[:200]}'
                 return result
             if manifest_sha:
                 checkout = subprocess.run(
                     ['git', 'checkout', manifest_sha],
-                    capture_output=True, text=True, timeout=30)
+                    capture_output=True, text=True, timeout=30,
+                    **_SUBPROCESS_KW)
                 if checkout.returncode != 0:
                     result['error'] = f'Checkout pinned SHA failed: {checkout.stderr[:200]}'
                     return result
             else:
                 pull = subprocess.run(
                     ['git', 'pull', 'origin', 'main'],
-                    capture_output=True, text=True, timeout=120)
+                    capture_output=True, text=True, timeout=120,
+                    **_SUBPROCESS_KW)
                 if pull.returncode != 0:
                     result['error'] = f'Git pull failed: {pull.stderr[:200]}'
                     return result

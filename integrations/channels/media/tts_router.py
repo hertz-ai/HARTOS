@@ -367,7 +367,11 @@ _CACHE_TTL = 60.0  # seconds
 
 
 def _is_engine_installed(engine_id: str) -> bool:
-    """Check if a TTS engine's Python package is available."""
+    """Check if a TTS engine's Python package is available.
+
+    TODO REFACTOR: move to model_catalog as ModelEntry.is_installed() —
+    a model that isn't pip-importable shouldn't be selectable by any caller.
+    """
     now = time.time()
     cached = _engine_available_cache.get(engine_id)
     if cached and (now - cached[1]) < _CACHE_TTL:
@@ -422,7 +426,7 @@ def _get_gpu_info() -> Dict[str, Any]:
         return {'cuda_available': False, 'total_gb': 0, 'free_gb': 0}
 
 
-def _can_fit_on_gpu(engine_id: str) -> bool:
+def _can_fit_on_gpu(engine_id: str) -> bool:  # TODO REFACTOR: remove — duplicates catalog.matches_compute()
     """Check if this engine's model fits in available VRAM."""
     spec = ENGINE_REGISTRY.get(engine_id)
     if not spec or not spec.vram_key:
@@ -448,6 +452,8 @@ def _get_compute_policy() -> Dict[str, Any]:
 # ═══════════════════════════════════════════════════════════════
 
 def _find_hive_peer_for_tts(language: str) -> Optional[Dict[str, Any]]:
+    # TODO REFACTOR: move to orchestrator as find_peer_for(model_type, language) —
+    # hive peer offloading applies to all model types (STT, VLM, LLM), not just TTS.
     """Find a hive peer with GPU that can serve TTS for this language.
 
     Returns peer info dict or None.
@@ -506,7 +512,9 @@ class TTSRouter:
     to select the best engine for each synthesis request.
     """
 
-    def select_engines(
+    def select_engines(  # TODO REFACTOR: remove — catalog.select_best() is the single selector.
+        # Language preferences feed into catalog via populate_tts_catalog()'s language_priority.
+        # Move _is_engine_installed() to catalog, _find_hive_peer to orchestrator.
         self,
         text: str,
         language: Optional[str] = None,

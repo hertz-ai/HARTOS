@@ -1273,11 +1273,12 @@ def _build_self_build_prompt(goal_dict: Dict, product_dict: Optional[Dict] = Non
     )
 
 
-register_goal_type('self_build', _build_self_build_prompt,
+register_goal_type('self_build', _build_we self_build_prompt,
                     tool_tags=['self_build'])
 
 
 # ─── AutoResearch — Autonomous Experiment Loop ───
+_autoresearch_warned: set = set()  # Goal IDs already warned about missing config
 
 def _build_autoresearch_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
     """Build prompt for autonomous research loop agent.
@@ -1300,9 +1301,27 @@ def _build_autoresearch_prompt(goal_dict: Dict, product_dict: Optional[Dict] = N
     # Without them, the LLM loops trying to "extract" non-existent config,
     # wastes budget, and gets killed by the watchdog — repeat N times.
     if not repo_path or not run_command:
-        logger.info(f"Autoresearch goal '{goal_dict.get('title', '')}': "
-                     f"skipping — repo_path or run_command not configured")
-        return None
+        # Auto-detect: if we're in a git repo, use it as repo_path
+        if not repo_path:
+            try:
+                import subprocess
+                _git_kw = dict(capture_output=True, text=True, timeout=3)
+                if hasattr(subprocess, 'CREATE_NO_WINDOW'):
+                    _git_kw['creationflags'] = subprocess.CREATE_NO_WINDOW
+                _git = subprocess.run(['git', 'rev-parse', '--show-toplevel'],
+                                       **_git_kw)
+                if _git.returncode == 0:
+                    repo_path = _git.stdout.strip()
+            except Exception:
+                pass
+        if not repo_path or not run_command:
+            # Still missing — log once per goal, not every tick
+            _goal_id = goal_dict.get('id', '')
+            if _goal_id not in _autoresearch_warned:
+                _autoresearch_warned.add(_goal_id)
+                logger.info(f"Autoresearch goal '{goal_dict.get('title', '')}': "
+                            f"needs repo_path + run_command in config — paused until configured")
+            return None
 
     return (
         f"YOU ARE AN AUTONOMOUS RESEARCH AGENT.\n\n"

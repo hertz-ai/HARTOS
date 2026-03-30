@@ -631,6 +631,10 @@ class VisionService:
             except Exception as e:
                 logger.debug(f"Description loop error: {e}")
 
+            # Check if vision backend should unload (no frames for IDLE_TIMEOUT_S)
+            if self._vision_backend and hasattr(self._vision_backend, 'check_idle'):
+                self._vision_backend.check_idle()
+
             # Sleep the minimum user interval (so we check the fastest user on time)
             min_interval = self._description_interval
             if self._user_intervals:

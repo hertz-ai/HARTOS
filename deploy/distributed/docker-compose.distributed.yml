@@ -39,9 +39,9 @@ services:
     restart: unless-stopped
     environment:
       MYSQL_USER: hart
-      MYSQL_PASSWORD: hart_distributed
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in .env}
       MYSQL_DATABASE: hart_distributed
-      MYSQL_ROOT_PASSWORD: hart_root_distributed
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in .env}
     volumes:
       - mysql-data:/var/lib/mysql
     ports:

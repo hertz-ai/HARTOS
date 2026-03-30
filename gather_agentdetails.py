@@ -187,6 +187,12 @@ def gather_info(user_id, user_message, prompt_id, autonomous=False):
         )
     current_app.logger.info('INSIDE GATHER INFo')
     current_app.logger.info('--'*100)
+    # Push thinking to UI
+    try:
+        from create_recipe import _push_thinking
+        _push_thinking(user_id, 'Designing agent personas and planning actions...')
+    except Exception:
+        pass
     user_prompt = f'{user_id}_{prompt_id}'
     try:
 
@@ -206,6 +212,11 @@ def gather_info(user_id, user_message, prompt_id, autonomous=False):
         # Get chat history length for debugging
         # history_length = len(user_proxy.chat_messages.get(assistant.name, []))
         current_app.logger.info('INSIDE GATHER INFo Respponse')
+        try:
+            from create_recipe import _push_thinking
+            _push_thinking(user_id, 'Agent blueprint ready. Starting execution...')
+        except Exception:
+            pass
         return response
 
     except Exception as e:

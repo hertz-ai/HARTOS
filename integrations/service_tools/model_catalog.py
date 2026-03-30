@@ -285,9 +285,14 @@ class ModelCatalog:
             if not self._tier_sufficient(current_tier, entry.min_capability_tier):
                 continue
 
-            fit = entry.matches_compute(budget_vram_gb, budget_ram_gb, gpu_available)
-            if fit == 'impossible':
-                continue
+            # Already-loaded models always fit — they're using resources we
+            # already allocated, so never skip them due to budget calculations
+            if entry.loaded:
+                fit = entry.device or 'cpu'
+            else:
+                fit = entry.matches_compute(budget_vram_gb, budget_ram_gb, gpu_available)
+                if fit == 'impossible':
+                    continue
 
             score = entry.quality_score * 100 + entry.priority
 
@@ -299,7 +304,11 @@ class ModelCatalog:
             if language and entry.languages:
                 if language in entry.languages:
                     lang_prio = entry.language_priority.get(language, 50)
-                    score += (100 - lang_prio)
+                    # Language preference is dominant — rank 0 (preferred engine
+                    # for this language) gets +300, rank 1 gets +270, default +150.
+                    # This ensures tts_router's LANG_ENGINE_PREFERENCE order wins
+                    # over small quality_score differences between engines.
+                    score += (300 - lang_prio * 3)
                 else:
                     score -= 500
 
@@ -313,6 +322,11 @@ class ModelCatalog:
 
             if entry.downloaded:
                 score += 50
+
+            # Strongly prefer already-loaded models — avoids downloading a
+            # second model when one of the same type is already running
+            if entry.loaded:
+                score += 1000
 
             scored.append((score, fit, entry))
 

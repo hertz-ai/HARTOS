@@ -325,12 +325,28 @@ class FederatedAggregator:
 
             db = get_db()
             try:
+                # Get our own backend port to detect self-connections
+                try:
+                    from core.port_registry import get_port
+                    _own_port = get_port('backend')
+                except Exception:
+                    _own_port = 6777
+                _self_urls = {
+                    f'http://localhost:{_own_port}',
+                    f'http://127.0.0.1:{_own_port}',
+                    f'http://0.0.0.0:{_own_port}',
+                }
+
                 peers = db.query(PeerNode).filter_by(status='active').all()
                 for peer in peers:
                     if not peer.url or peer.node_id == delta.get('node_id'):
                         continue
+                    _peer_url = peer.url.rstrip('/')
+                    # Skip our own node (bundled mode has no HTTP listener)
+                    if _peer_url in _self_urls:
+                        continue
                     try:
-                        url = f"{peer.url.rstrip('/')}/api/social/peers/federation-delta"
+                        url = f"{_peer_url}/api/social/peers/federation-delta"
                         pooled_post(url, json=delta, timeout=5)
                     except Exception:
                         pass

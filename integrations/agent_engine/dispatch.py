@@ -84,26 +84,42 @@ def _notify_watchdog_llm_start():
     try:
         from security.node_watchdog import get_watchdog
         wd = get_watchdog()
-        if wd:
-            name = threading.current_thread().name
-            # Find which daemon this thread belongs to
-            for daemon_name in ('coding_daemon', 'agent_daemon'):
-                if daemon_name in name or wd.is_registered(daemon_name):
-                    wd.mark_in_llm_call(daemon_name)
-                    break
+        if not wd:
+            return
+        thread_name = threading.current_thread().name
+        # Match by thread name — works for all daemon threads
+        if wd.is_registered(thread_name):
+            wd.mark_in_llm_call(thread_name)
+            return
+        # Partial match (thread name might have suffix like 'agent_daemon-1')
+        for name in wd.registered_names():
+            if name in thread_name:
+                wd.mark_in_llm_call(name)
+                return
+        # Fallback: in-process/bundled mode — dispatch runs on a
+        # different thread (e.g. Flask worker). Mark the calling daemon
+        # via threadlocal source hint if available.
+        try:
+            from threadlocal import get_task_source
+            source = get_task_source()
+            if source and wd.is_registered(source):
+                wd.mark_in_llm_call(source)
+                return
+        except Exception:
+            pass
     except Exception:
         pass
 
 
 def _notify_watchdog_llm_end():
-    """Clear the LLM call marker and send a heartbeat."""
+    """Clear the LLM call marker and send a heartbeat for all registered daemons."""
     try:
         from security.node_watchdog import get_watchdog
         wd = get_watchdog()
         if wd:
-            for daemon_name in ('coding_daemon', 'agent_daemon'):
-                wd.clear_llm_call(daemon_name)
-                wd.heartbeat(daemon_name)
+            for name in wd.registered_names():
+                wd.clear_llm_call(name)
+                wd.heartbeat(name)
     except Exception:
         pass
 

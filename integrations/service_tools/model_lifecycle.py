@@ -412,6 +412,15 @@ class ModelLifecycleManager:
                 ram_gb=ram_gb,
             )
 
+        # Notify UI: model loaded — include capabilities from catalog
+        # so UI knows what features are now available
+        self._emit_event('model.loaded', {
+            'model': tool_name,
+            'device': device_str,
+            'vram_gb': vram_gb,
+            'capabilities': self._get_model_capabilities(tool_name),
+        })
+
     def _on_tool_stopped(self, tool_name: str, **kwargs):
         """Called when RTM stops a tool."""
         with self._lock:
@@ -422,6 +431,12 @@ class ModelLifecycleManager:
                 state.vram_gb = 0.0
                 state.ram_gb = 0.0
                 state.active_inference_count = 0
+
+        # Notify UI: model unloaded — these capabilities are now unavailable
+        self._emit_event('model.unloaded', {
+            'model': tool_name,
+            'capabilities': self._get_model_capabilities(tool_name),
+        })
 
     # ── Access tracking (called by tool wrappers) ─────────────
 
@@ -1216,6 +1231,24 @@ class ModelLifecycleManager:
                 })
 
     # ── Event emission helper ────────────────────────────────────
+
+    def _get_model_capabilities(self, tool_name: str) -> dict:
+        """Read capabilities from model_catalog (single source of truth)."""
+        try:
+            from .model_catalog import get_catalog
+            catalog = get_catalog()
+            # Try direct lookup, then prefix search
+            entry = catalog.get(tool_name)
+            if not entry:
+                for eid in catalog.list_ids():
+                    if tool_name in eid:
+                        entry = catalog.get(eid)
+                        break
+            if entry:
+                return entry.capabilities
+        except Exception:
+            pass
+        return {}
 
     def _emit_event(self, event_type: str, data: dict):
         """Emit an event to the EventBus (non-blocking, safe to fail)."""

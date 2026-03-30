@@ -369,10 +369,6 @@ class Qwen08BBackend(VisionBackend):
     Download: unsloth/Qwen3.5-0.8B-GGUF (model + mmproj)
     """
 
-    def __init__(self, port: int = None):
-        from core.port_registry import get_port
-        self._port = port or get_port('vlm_caption')
-
     @property
     def name(self) -> str:
         return 'qwen08b'
@@ -393,19 +389,158 @@ class Qwen08BBackend(VisionBackend):
             return False
 
     def start(self) -> bool:
-        """Check if 0.8B server is running. Auto-start is handled by Nunba."""
+        """Check if 0.8B is available. Does NOT auto-start at boot.
+
+        The 0.8B caption server is started lazily on first describe() call
+        (when actual frames arrive), not at VisionService.start().
+        This avoids wasting GPU memory when no camera/screen stream is active.
+        """
         if self.is_available():
             logger.info(f"Qwen3.5-0.8B caption backend ready on port {self._port}")
             return True
-        logger.warning(f"Qwen3.5-0.8B not running on port {self._port}")
+        # Not running — that's OK. Will be started lazily in describe().
+        logger.info(f"Qwen3.5-0.8B not running — will start on first frame")
+        return True  # Return True so VisionService selects us as backend
+
+        # Find llama-server binary (reuse model_lifecycle's finder)
+        try:
+            from integrations.service_tools.model_lifecycle import ModelLifecycleManager
+            server = ModelLifecycleManager._find_llama_server_binary()
+        except Exception:
+            server = None
+        if not server:
+            logger.info("Qwen3.5-0.8B: llama-server binary not found — caption disabled")
+            return False
+
+        # Find 0.8B model + mmproj (fixed filenames, known locations)
+        home = os.path.expanduser('~')
+        model = mmproj = None
+        for d in [os.path.join(home, '.nunba', 'models'),
+                  os.path.join(home, '.trueflow', 'models')]:
+            p = os.path.join(d, 'Qwen3.5-0.8B-UD-Q4_K_XL.gguf')
+            if os.path.isfile(p) and not model:
+                model = p
+            p = os.path.join(d, 'qwen08b', 'mmproj-F16.gguf')
+            if os.path.isfile(p) and not mmproj:
+                mmproj = p
+
+        if not model or not mmproj:
+            logger.info("Qwen3.5-0.8B: model files not found — run 'python scripts/setup_vlm.py'")
+            return False
+
+        import subprocess, time
+        cmd = [server, '--model', model, '--mmproj', mmproj,
+               '--port', str(self._port), '--ctx-size', '512',
+               '--n-gpu-layers', '99', '--threads', '4', '--flash-attn', 'on']
+        log_path = os.path.join(os.environ.get('TEMP', '/tmp'), f'llama_{self._port}.log')
+        try:
+            _kw = dict(stdout=open(log_path, 'w'), stderr=subprocess.STDOUT)
+            if os.name == 'nt':
+                _kw['creationflags'] = subprocess.CREATE_NO_WINDOW
+            subprocess.Popen(cmd, **_kw)
+            for _ in range(30):
+                time.sleep(1)
+                if self.is_available():
+                    logger.info(f"Qwen3.5-0.8B caption server started on port {self._port}")
+                    return True
+        except Exception as e:
+            logger.error(f"Qwen3.5-0.8B start failed: {e}")
         return False
 
     # 0.8B optimal: 512x288 (11KB JPEG) — only needs scene understanding, not coords
     CAPTION_WIDTH = 512
     CAPTION_HEIGHT = 288
+    IDLE_TIMEOUT_S = 300  # Unload after 5 min with no frames
+
+    def __init__(self, port: int = None):
+        from core.port_registry import get_port
+        self._port = port or get_port('vlm_caption')
+        self._launch_attempted = False
+        self._last_describe_time = 0.0
+        self._server_proc = None  # subprocess.Popen object (not just PID)
+
+    def _ensure_running(self) -> bool:
+        """Lazy-start: launch 0.8B server on first frame, not at boot."""
+        if self.is_available():
+            return True
+        if self._launch_attempted:
+            return False  # Already tried and failed — don't retry every frame
+        self._launch_attempted = True
+
+        # Find llama-server binary (reuse model_lifecycle's finder)
+        try:
+            from integrations.service_tools.model_lifecycle import ModelLifecycleManager
+            server = ModelLifecycleManager._find_llama_server_binary()
+        except Exception:
+            server = None
+        if not server:
+            logger.info("Qwen3.5-0.8B: llama-server not found")
+            return False
+
+        home = os.path.expanduser('~')
+        model = mmproj = None
+        for d in [os.path.join(home, '.nunba', 'models'),
+                  os.path.join(home, '.trueflow', 'models')]:
+            p = os.path.join(d, 'Qwen3.5-0.8B-UD-Q4_K_XL.gguf')
+            if os.path.isfile(p) and not model:
+                model = p
+            p = os.path.join(d, 'qwen08b', 'mmproj-F16.gguf')
+            if os.path.isfile(p) and not mmproj:
+                mmproj = p
+        if not model or not mmproj:
+            logger.info("Qwen3.5-0.8B: model files not found — run 'python scripts/setup_vlm.py'")
+            return False
+
+        import subprocess, time
+        cmd = [server, '--model', model, '--mmproj', mmproj,
+               '--port', str(self._port), '--ctx-size', '512',
+               '--n-gpu-layers', '99', '--threads', '4', '--flash-attn', 'on']
+        log_path = os.path.join(os.environ.get('TEMP', '/tmp'), f'llama_{self._port}.log')
+        try:
+            _kw = dict(stdout=open(log_path, 'w'), stderr=subprocess.STDOUT)
+            if os.name == 'nt':
+                _kw['creationflags'] = subprocess.CREATE_NO_WINDOW
+            self._server_proc = subprocess.Popen(cmd, **_kw)
+            logger.info(f"Qwen3.5-0.8B launching PID={self._server_proc.pid} port={self._port} (first frame trigger)")
+            for _ in range(30):
+                time.sleep(1)
+                if self.is_available():
+                    logger.info(f"Qwen3.5-0.8B ready")
+                    return True
+        except Exception as e:
+            logger.error(f"Qwen3.5-0.8B start failed: {e}")
+        return False
+
+    def stop(self):
+        """Kill the 0.8B server process to free GPU memory."""
+        if self._server_proc:
+            try:
+                self._server_proc.terminate()
+                self._server_proc.wait(timeout=5)
+                logger.info(f"Qwen3.5-0.8B stopped (PID={self._server_proc.pid})")
+            except Exception:
+                try:
+                    self._server_proc.kill()
+                except Exception:
+                    pass
+            self._server_proc = None
+            self._launch_attempted = False  # Allow re-launch on next frame
+
+    def check_idle(self):
+        """Called by VisionService's description_loop. Unloads if no frames for IDLE_TIMEOUT_S."""
+        import time
+        if self._server_proc and self._last_describe_time > 0:
+            idle = time.time() - self._last_describe_time
+            if idle > self.IDLE_TIMEOUT_S:
+                logger.info(f"Qwen3.5-0.8B idle for {idle:.0f}s — unloading to free GPU")
+                self.stop()
 
     def describe(self, frame_bytes: bytes, prompt: str = '') -> Optional[str]:
-        import base64
+        import base64, time
+        # Lazy-start on first frame
+        if not self._ensure_running():
+            return None
+        self._last_describe_time = time.time()
         try:
             # Resize to 512x288 for fast captioning (0.8B doesn't need full res)
             from PIL import Image

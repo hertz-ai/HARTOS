@@ -48,6 +48,14 @@ def publish_async(topic, message, timeout=2.0):
     from hart_intelligence import publish_async as _publish
     _publish(topic, message, timeout)
 
+
+def _push_thinking(user_id, text):
+    """Push a thinking/progress bubble to the Nunba UI.
+
+    Reuses the same crossbar message format as publish_to_crossbar_new_action_start.
+    """
+    publish_to_crossbar_new_action_start(text, user_id)
+
 # Add Smart Ledger for persistent task tracking - using agent_ledger package (from gpt4.1)
 try:
     from agent_ledger import (
@@ -2189,6 +2197,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
     def create_individual_flow_recipe_and_terminate_flow(current_action_id, json_obj, user_prompt):
         current_app.logger.info('Recipe created successfully, Saving Pending')
+        _push_thinking(user_id, f'Recipe saved for action {user_tasks[user_prompt].current_action}. Learning complete.')
 
         safe_set_state(user_prompt, user_tasks[user_prompt].current_action, ActionState.RECIPE_RECEIVED, "Recipe Received")
 
@@ -3330,6 +3339,16 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
 
             current_action_id = user_tasks[user_prompt].current_action
 
+            # Guard: clamp action_id to valid range (prevents IndexError when
+            # config has more actions than the Action object's internal list)
+            _action_count = len(user_tasks[user_prompt].actions)
+            if current_action_id - 1 >= _action_count:
+                current_app.logger.warning(
+                    f"Action index {current_action_id - 1} >= action count {_action_count}, "
+                    f"clamping to last action")
+                current_action_id = _action_count
+                user_tasks[user_prompt].current_action = current_action_id
+
             message = user_tasks[user_prompt].get_action(current_action_id - 1)
             current_state = get_action_state(user_prompt, current_action_id)
 
@@ -3345,6 +3364,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                 pass
 
             message = f'Execute Action {user_tasks[user_prompt].current_action}: {message} '+f',Latest User message: {text}' + _action_expert_hint
+            _push_thinking(user_id, f'Executing action {user_tasks[user_prompt].current_action} of {_action_count}...')
             publish_to_crossbar_new_action_start(message, user_id)
             task_time[prompt_id] = {'timer':time.time(),'times':[]}
 
@@ -3637,6 +3657,9 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                                                                            json_obj, manager,  prompt_id, text,
                                                                            user_prompt)
                         if get_current_flow(user_prompt)  < get_total_flows(user_prompt):
+                            _next_flow = get_current_flow(user_prompt) + 1
+                            _total_flows = get_total_flows(user_prompt)
+                            _push_thinking(user_id, f'Flow {_next_flow} of {_total_flows}: Starting next persona...')
                             current_app.logger.info(f'Completed ONE FLOW NOW WE SHOULD WORK ON NEXT FLOW')
                             current_app.logger.info(f'DELETE CURRENT AGENTS AND CREATE NEW')
                             config = get_prompt_config_json(prompt_id)
@@ -3805,6 +3828,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
 
                             # All actions terminated — create flow recipe and advance
                             current_app.logger.info(f'[FLOW-COMPLETE] All actions terminated, creating flow recipe')
+                            _push_thinking(user_id, f'All actions complete. Building final recipe...')
                             # Ensure group_chat has messages for after_all_actions_terminated
                             if len(group_chat.messages) == 0:
                                 group_chat.messages.append({
@@ -4284,15 +4308,21 @@ def fix_cyclic_dependency(cyc, individual_recipe):
 
 
 def set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt):
-    for i in range(1, user_tasks[user_prompt].current_action+1):
+    # Use len(actions) not current_action — after safe_increment_action(),
+    # current_action points past the last action (e.g. 5 for 4 actions),
+    # causing FileNotFoundError on the non-existent _0_5.json.
+    action_count = len(user_tasks[user_prompt].actions)
+    for i in range(1, action_count + 1):
         _recipe_path = os.path.join(PROMPTS_DIR, f"{prompt_id}_{flow}_{i}.json")
         current_app.logger.info(f'checking for {_recipe_path}')
         try:
             with open(_recipe_path, 'r') as f:
                 config = json.load(f)
                 individual_recipe.append(config)
+        except FileNotFoundError:
+            current_app.logger.error(f'Action recipe MISSING: {_recipe_path} — flow recipe will be incomplete')
         except Exception as e:
-            current_app.logger.error(f'Got error as :{e} while checking for {_recipe_path}')
+            current_app.logger.error(f'Error loading {_recipe_path}: {e}')
 
 
 def load_persona_role(prompt_id, user_prompt):

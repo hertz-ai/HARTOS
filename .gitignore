@@ -14,6 +14,9 @@ prompt/
 prompt/*
 logs/
 log/
+# All log files — never commit logs
+*.log
+*.log.*
 langchain.log
 __pycache__/
 venv_old/*
@@ -82,7 +85,10 @@ venv310/
 *.pyc
 *.pyo
 
-# Runtime data
+# Runtime data — NEVER commit
+agent_data/
+prompts/
+simplemem_db/
 *.db-journal
 .trueflow/
 .agent_ledger/
@@ -91,7 +97,16 @@ deploy/kong/*.json
 .secrets.baseline
 .cache/
 
-# Vendored / one-off directories that should not be committed
+# Crash dumps
+*.stackdump
+
+# Claude Code local state
+.claude/
+
+# Vendored binaries (closed-source HevolveAI)
+vendor/
+
+# One-off directories
 autogen-*/
 framework/
 /media/
@@ -104,5 +119,8 @@ plan.md
 *_reddit_*.md
 # HevolveArmor build artifacts
 hevolvearmor/target/
-vendor/hevolveai_armored/modules/
-vendor/hevolveai_armored/_key.bin
+
+# Root docs not needed in repo (content lives in docs/)
+ARCHITECTURE.md
+AUDIT_FIX_PLAN.md
+HART_IDENTITY_DESIGN.md
