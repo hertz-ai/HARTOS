@@ -12,7 +12,7 @@ import logging
 import os
 import subprocess
 import sys
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -253,6 +253,58 @@ class VRAMManager:
         """Return current VRAM allocations {tool → GB}."""
         return dict(self._allocations)
 
+    def get_allocations_display(self) -> Dict[str, Any]:
+        """Return VRAM allocations with rich model details for UI display.
+
+        Each value is either a float (GB) for unknown models, or a dict with
+        name, gb, device, and extra details (quant, context, mmproj) for known models.
+        The frontend VRAMBar can render either format.
+        """
+        import re as _re
+        raw = dict(self._allocations)
+        try:
+            from integrations.service_tools.model_catalog import get_catalog
+            catalog = get_catalog()
+            enriched = {}
+            for key, gb in raw.items():
+                display_key = key
+                detail = {'gb': gb}
+                for mid, entry in catalog._models.items():
+                    if entry.loaded and (
+                        mid == key or
+                        entry.model_type == key or
+                        mid.startswith(f'{key}-')
+                    ):
+                        display_key = entry.name
+                        detail = {
+                            'gb': gb,
+                            'device': entry.device or 'gpu',
+                            'backend': entry.backend,
+                            'model_id': mid,
+                        }
+                        # Extract quant from filename (e.g. Q4_K_XL from Qwen3.5-4B-UD-Q4_K_XL.gguf)
+                        fname = entry.files.get('model', '') or entry.files.get('file_name', '')
+                        if not fname and entry.repo_id:
+                            fname = entry.repo_id.split('/')[-1] if '/' in entry.repo_id else ''
+                        quant_match = _re.search(r'(Q\d+_K(?:_[A-Z]+)?|F16|F32|INT[48]|GPTQ|AWQ)', fname, _re.I)
+                        if quant_match:
+                            detail['quant'] = quant_match.group(1)
+                        # Context length from capabilities or tags
+                        ctx = entry.capabilities.get('context_length') or entry.capabilities.get('n_ctx')
+                        if ctx:
+                            detail['context'] = ctx
+                        # mmproj for vision models
+                        if entry.capabilities.get('vision') or 'vision' in (entry.tags if hasattr(entry, 'tags') else []):
+                            detail['vision'] = True
+                        break
+                enriched[display_key] = detail
+            # NOTE: LLM quant/context/mmproj enrichment is handled by
+            # Nunba's orchestrator shim (models/orchestrator.py), not here.
+            # HARTOS must not import from Nunba (upward dependency).
+            return enriched
+        except Exception:
+            return raw
+
     # ── Offload strategy ─────────────────────────────────────────
 
     def suggest_offload_mode(self, tool_name: str) -> str:
@@ -358,7 +410,7 @@ class VRAMManager:
         drift = self.detect_allocation_drift()
         return {
             "gpu": gpu,
-            "allocations": self.get_allocations(),
+            "allocations": self.get_allocations_display(),
             "total_allocated_gb": round(sum(self._allocations.values()), 2),
             "effective_free_gb": round(self.get_free_vram(), 2),
             "drift": drift,

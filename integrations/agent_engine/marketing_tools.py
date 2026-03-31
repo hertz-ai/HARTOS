@@ -321,4 +321,22 @@ def detect_goal_tags(prompt: str) -> list:
     if any(kw in lower for kw in self_build_keywords):
         tags.append('self_build')
 
+    outreach_keywords = [
+        'outreach', 'prospect', 'cold email', 'follow up', 'follow-up',
+        'sales email', 'pipeline', 'crm', 'lead gen', 'deal stage',
+        'send email to', 'contact ', 'outbound email', 'drip', 'sequence',
+        'partnership outreach', 'b2b', 'sales funnel',
+    ]
+    if any(kw in lower for kw in outreach_keywords):
+        tags.append('outreach')
+
+    sales_keywords = [
+        'sales agent', 'marketing agent', 'flywheel', 'user journey',
+        'a/b test', 'ab test', 'prospect journey', 'sales pipeline',
+        'meeting schedule', 'deal close', 'partner onboard',
+        'channel outreach', 'multi-channel', 'nurture',
+    ]
+    if any(kw in lower for kw in sales_keywords):
+        tags.append('sales')
+
     return tags

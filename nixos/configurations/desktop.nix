@@ -23,6 +23,17 @@
 
   # ─── Disable ZFS (broken in nixpkgs 24.11 for kernel 6.15) ───
   boot.supportedFilesystems.zfs = lib.mkForce false;
+  nixpkgs.config.allowBroken = false;
+
+  # ─── Workaround: systemd-hwdb update fails on CI/WSL2 build hosts ───
+  # Replace the hwdb.bin derivation with a minimal stub.
+  # The real hwdb.bin will be regenerated on first boot by udev.
+  environment.etc."udev/hwdb.bin".source = lib.mkForce (
+    pkgs.runCommand "hwdb-stub" {} ''
+      # Create minimal valid hwdb binary (KSLP magic + empty index)
+      printf 'KSLP\x00\x00\x00\x00' > $out
+    ''
+  );
 
   # ─── HART OS Core Services ───
   hart = {
@@ -226,7 +237,7 @@
 
     # ── System Utilities ──
     htop btop                   # System monitors (CLI)
-    neofetch                    # System info
+    fastfetch                   # System info (neofetch successor)
     file unzip p7zip            # File tools
     wget curl                   # Network tools
     ripgrep fd bat              # Modern CLI tools (better grep/find/cat)

@@ -212,6 +212,144 @@ def peer_exchange():
     })
 
 
+@discovery_bp.route('/api/social/peers/best-endpoint')
+def peer_best_endpoint():
+    """Return the best endpoint for a given task, ranked local-first.
+
+    Query params:
+        task: 'chat' | 'stt' | 'tts' | 'vlm' (default: 'chat')
+
+    Ranking: self (local) > same-user LAN peers > regional > cloud
+    Factors: tier, compute capability, health, latency.
+
+    Response:
+        { url, source: 'local'|'lan'|'regional'|'cloud',
+          node_id, tier, has_gpu, vram_free_gb }
+    """
+    from .peer_discovery import gossip
+    task = request.args.get('task', 'chat')
+
+    # Self is always the best if we can handle the task locally
+    self_url = gossip.base_url
+    self_info = gossip.get_health()
+
+    # Check if local HARTOS can handle this task
+    local_capable = True
+    local_gpu = False
+    local_vram_free = 0.0
+    try:
+        from integrations.service_tools.vram_manager import vram_manager
+        gpu = vram_manager.detect_gpu()
+        local_gpu = gpu.get('cuda_available', False)
+        local_vram_free = vram_manager.get_free_vram()
+    except Exception:
+        pass
+
+    # For chat: need an LLM endpoint
+    if task == 'chat':
+        try:
+            import urllib.request as _ur
+            _ur.urlopen(f'{self_url}/backend/health', timeout=2).close()
+        except Exception:
+            local_capable = False
+
+    if local_capable:
+        return jsonify({
+            'success': True,
+            'url': self_url,
+            'source': 'local',
+            'node_id': gossip.node_id,
+            'tier': gossip.tier,
+            'has_gpu': local_gpu,
+            'vram_free_gb': round(local_vram_free, 1),
+        })
+
+    # Score peers: same user's devices on LAN > regional > cloud
+    peers = gossip.get_peer_list()
+    central_url = gossip.central_url
+    regional_url = gossip.regional_url
+
+    scored = []
+    for peer in peers:
+        if peer.get('node_id') == gossip.node_id:
+            continue  # skip self (already checked)
+
+        url = peer.get('url', '')
+        if not url:
+            continue
+
+        tier = peer.get('tier', 'flat')
+        # Determine source category
+        import ipaddress
+        try:
+            from urllib.parse import urlparse
+            host = urlparse(url).hostname
+            addr = ipaddress.ip_address(host)
+            if addr.is_loopback:
+                source = 'local'
+                score = 1000
+            elif addr.is_private:
+                source = 'lan'
+                score = 800
+            else:
+                source = 'cloud' if url.rstrip('/') == central_url else 'regional'
+                score = 200 if source == 'cloud' else 500
+        except (ValueError, TypeError):
+            # Hostname not an IP — check if it's a known cloud domain
+            if any(d in url for d in ['hertzai.com', 'hevolve.ai', 'azurekong']):
+                source = 'cloud'
+                score = 200
+            elif url.rstrip('/') == regional_url:
+                source = 'regional'
+                score = 500
+            else:
+                source = 'regional'
+                score = 400
+
+        # Bonus for compute capability
+        cap_tier = peer.get('capability_tier', '')
+        if cap_tier in ('compute_host', 'full'):
+            score += 100
+        elif cap_tier == 'standard':
+            score += 50
+
+        # Freshness bonus
+        ts = peer.get('timestamp', 0)
+        age = time.time() - ts if ts else 9999
+        if age < 60:
+            score += 50  # seen in last minute
+        elif age < 300:
+            score += 20
+
+        scored.append((score, source, url, peer))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    if scored:
+        best_score, best_source, best_url, best_peer = scored[0]
+        return jsonify({
+            'success': True,
+            'url': best_url,
+            'source': best_source,
+            'node_id': best_peer.get('node_id', ''),
+            'tier': best_peer.get('tier', 'flat'),
+            'has_gpu': best_peer.get('capability_tier', '') in ('compute_host', 'full'),
+            'vram_free_gb': 0.0,  # remote VRAM not tracked in gossip yet
+        })
+
+    # Absolute fallback: cloud
+    cloud_url = central_url or 'https://azurekong.hertzai.com'
+    return jsonify({
+        'success': True,
+        'url': cloud_url,
+        'source': 'cloud',
+        'node_id': '',
+        'tier': 'central',
+        'has_gpu': True,
+        'vram_free_gb': 0.0,
+    })
+
+
 @discovery_bp.route('/api/social/peers/health')
 def peer_health():
     """Lightweight health ping. Returns node_id and uptime."""

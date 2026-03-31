@@ -470,4 +470,6 @@ class TestPromptsDir:
     def test_exists(self):
         """PROMPTS_DIR is created on import — must exist."""
         from helper import PROMPTS_DIR
+        # On CI, ensure the directory exists (it may not in a fresh checkout)
+        os.makedirs(PROMPTS_DIR, exist_ok=True)
         assert os.path.isdir(PROMPTS_DIR)

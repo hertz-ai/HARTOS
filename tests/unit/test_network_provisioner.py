@@ -361,17 +361,29 @@ class TestProvisionAPI:
         data = resp.get_json()
         assert data['count'] == 1
 
-    def test_list_nodes_endpoint(self, client):
+    @patch('integrations.social.models.get_db')
+    def test_list_nodes_endpoint(self, mock_get_db, client):
+        mock_db = MagicMock()
+        mock_db.query.return_value.all.return_value = []
+        mock_get_db.return_value = mock_db
         resp = client.get('/api/provision/nodes')
         assert resp.status_code == 200
         data = resp.get_json()
         assert 'nodes' in data
 
-    def test_get_nonexistent_node(self, client):
+    @patch('integrations.social.models.get_db')
+    def test_get_nonexistent_node(self, mock_get_db, client):
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter_by.return_value.first.return_value = None
+        mock_get_db.return_value = mock_db
         resp = client.get('/api/provision/nodes/99999')
         assert resp.status_code == 404
 
-    def test_decommission_nonexistent_node(self, client):
+    @patch('integrations.social.models.get_db')
+    def test_decommission_nonexistent_node(self, mock_get_db, client):
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter_by.return_value.first.return_value = None
+        mock_get_db.return_value = mock_db
         resp = client.delete('/api/provision/nodes/99999')
         assert resp.status_code == 404
 

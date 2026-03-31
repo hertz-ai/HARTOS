@@ -126,10 +126,12 @@ def _espeak_synthesize(text: str, output_path: str, voice: str = "en") -> bool:
     """Fallback: use espeak-ng for basic TTS."""
     import subprocess
     try:
+        _kw = dict(capture_output=True, text=True, timeout=30)
+        if hasattr(subprocess, 'CREATE_NO_WINDOW'):
+            _kw['creationflags'] = subprocess.CREATE_NO_WINDOW
         result = subprocess.run(
             ["espeak-ng", "-v", voice, "-w", output_path, text],
-            capture_output=True, text=True, timeout=30,
-        )
+            **_kw)
         return result.returncode == 0
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
@@ -245,8 +247,10 @@ def pocket_tts_list_voices() -> str:
     except ImportError:
         try:
             import subprocess
-            r = subprocess.run(["espeak-ng", "--version"],
-                               capture_output=True, text=True, timeout=5)
+            _kw2 = dict(capture_output=True, text=True, timeout=5)
+            if hasattr(subprocess, 'CREATE_NO_WINDOW'):
+                _kw2['creationflags'] = subprocess.CREATE_NO_WINDOW
+            r = subprocess.run(["espeak-ng", "--version"], **_kw2)
             if r.returncode == 0:
                 engine = "espeak-ng"
         except (FileNotFoundError, subprocess.TimeoutExpired):

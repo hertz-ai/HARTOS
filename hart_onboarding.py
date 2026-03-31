@@ -788,61 +788,130 @@ This person:
 - Their language: {lang_name}
 {f'- They said (in their own words): "{voice_transcript}"' if voice_transcript else ''}
 
-Generate exactly 5 name candidates. The name style: take a REAL word from {lang_name} that connects to this person's personality, then style it like an anime character name — short, punchy, memorable, the kind of name you'd hear a protagonist called in a Ghibli or shonen anime.
+Generate exactly 5 name candidates. These names should make the user feel POWERFUL and PROUD — like a legendary anime protagonist. Not a common dictionary word, but a name forged from one.
 
-How anime names work (follow this pattern):
-- "Hinata" = Japanese for "sunny place" — a real word, used as-is
-- "Ichigo" = "strawberry" — a real word that sounds legendary in context
-- "Naruto" = a fish cake spiral — mundane word made iconic by a character
+The formula: take a REAL word from {lang_name} that connects to this person's soul, then FORGE it into something legendary — the kind of name that gets chanted in an arena, whispered in a prophecy, or etched into a sword.
 
-Do the SAME for {lang_name}. Pick real {lang_name} words related to this person's passions and reshape minimally (or use as-is if they already sound cool).
+How legendary anime names work:
+- "Zangetsu" = "slaying moon" (zan + getsu) — two concepts fused into one blade
+- "Hinata" = "sunny place" — a real word that became iconic
+- "Kurapika" = beautiful + red (kura + pika) — syllables that FEEL like power
+- "Todoroki" = "thundering" — a word that sounds exactly like what it means
+- "Killua" = "kill" reshaped into something elegant — danger made beautiful
 
-{lang_name} words to draw from: {word_hints}
+For {lang_name}, do this:
+1. Pick a REAL {lang_name} word tied to this person's passions
+2. FORGE it: fuse two short words, add a dramatic suffix (-ra, -zen, -ki, -va, -ro, -rin), or reshape it so it sounds like a title, not a dictionary entry
+3. The result should sound like someone you'd cosplay as, not just a word you'd look up
+
+{lang_name} root words to draw from: {word_hints}
 
 Rules:
-- ONE word, lowercase, 1-4 syllables
-- Must be a real {lang_name} word OR a minimal stylization of one (add/drop one syllable max)
-- GENDER-NEUTRAL only — use nature words, elements, concepts, celestial objects, weather, terrain. In {lang_name}, many nouns carry grammatical gender — pick words that sound neutral when used as a name (e.g., Tamil "mazhai" (rain) is neutral, "uyir" (soul) is neutral, avoid words that are culturally recognized as only male or only female names)
-- Easy to remember and say aloud — if someone hears it once, they remember it
-- NOT a common first name in any language
-- Must feel like it MEANS something (because it does)
-- The full identity will be a three-word tag like @ember.fox.hikari — so the name can be a common word since the tag provides uniqueness
+- ONE word, lowercase, 2-4 syllables
+- Must be DERIVED from a real {lang_name} word (fused, suffixed, or reshaped — NOT the raw dictionary word)
+- NEVER output a common first name in any language (no "kiran", "luna", "akira", "rowan", "selva")
+- GENDER-NEUTRAL only — draw from nature, elements, celestial, weather, terrain, abstract concepts
+- Must sound LEGENDARY when spoken aloud — like a character name people would choose as a gamertag
+- Easy to remember: if someone hears it once at a convention, they remember it forever
+- The name is their IDENTITY — it should make them feel like they just unlocked a new form
 
 Return ONLY a JSON array of exactly 5 lowercase strings. Nothing else.
-Example format: ["kaze", "hikari", "sora", "ren", "tsuki"]"""
+Example format: ["zanmizu", "hivaan", "kazeran", "uyiren", "tsukiron"]"""
 
     candidates = []
 
-    try:
-        from hart_intelligence import get_llm
-        llm = get_llm(temperature=0.9, max_tokens=200)
-        result = llm.invoke(generation_prompt)
-        text = result.content if hasattr(result, 'content') else str(result)
+    # Try direct HTTP call to llama-server first (fastest, no import chain)
+    text = _llm_generate_direct(generation_prompt)
 
+    # Fallback: LangChain get_llm (heavier import chain)
+    if not text:
+        try:
+            from hart_intelligence import get_llm
+            llm = get_llm(temperature=0.9, max_tokens=200)
+            result = llm.invoke(generation_prompt)
+            text = result.content if hasattr(result, 'content') else str(result)
+        except Exception as e:
+            logger.warning(f"LLM name generation failed: {e}")
+            text = None
+
+    if text:
         # Parse JSON array from response
         match = re.search(r'\[.*?\]', text, re.DOTALL)
         if match:
-            raw = json.loads(match.group())
-            # Clean and validate
-            for name in raw:
-                if isinstance(name, str):
-                    clean = re.sub(r'[^a-z]', '', name.lower().strip())
-                    if 2 <= len(clean) <= 12 and clean not in existing_names:
-                        candidates.append(clean)
-    except Exception as e:
-        logger.warning(f"LLM name generation failed: {e}")
+            try:
+                raw = json.loads(match.group())
+                # Clean and validate
+                for name in raw:
+                    if isinstance(name, str):
+                        clean = re.sub(r'[^a-z]', '', name.lower().strip())
+                        if 2 <= len(clean) <= 12 and clean not in existing_names:
+                            candidates.append(clean)
+            except json.JSONDecodeError:
+                pass
 
     # Validate candidates — LLM checks for negative meanings across all languages
     if candidates:
         candidates = _validate_names_cross_language(candidates, language)
 
-    # Fallback: curated poetic names if LLM fails or all filtered out
+    # Fallback: curated legendary names if LLM fails or all filtered out
     if len(candidates) < 1:
         fallbacks = _fallback_names(dimensions, existing_names)
         candidates = _validate_names_cross_language(fallbacks, language) or fallbacks[:1]
 
-    # Pick the first safe unique one
-    chosen = candidates[0] if candidates else _emergency_name()
+    # GUARANTEE uniqueness: live DB check + suffix forge if all taken
+    # Refresh existing names from DB right before final pick (race window minimized)
+    try:
+        fresh_existing = HARTNameRegistry.get_all_names()
+        existing_names = fresh_existing or existing_names or set()
+    except Exception:
+        pass
+
+    # Filter out any candidate already in local DB
+    unique_candidates = [c for c in candidates if c not in existing_names]
+
+    # Global uniqueness: check each candidate against cloud (when online)
+    # Cap at 5 cloud calls total to avoid stalling the ceremony (5s timeout each = 25s max)
+    _cloud_checks = 0
+    _MAX_CLOUD_CHECKS = 5
+    globally_unique = []
+    for c in unique_candidates:
+        if _cloud_checks < _MAX_CLOUD_CHECKS:
+            _cloud_checks += 1
+            if not HARTNameRegistry.is_available(c):
+                continue
+        globally_unique.append(c)
+        if len(globally_unique) >= 3:
+            break
+    unique_candidates = globally_unique
+
+    # If all taken, forge unique variants with legendary suffixes
+    if not unique_candidates:
+        _suffixes = ['ra', 'zen', 'ki', 'va', 'rin', 'ax', 'ix', 'on', 'ex', 'is',
+                     'ith', 'os', 'en', 'ar', 'el', 'ox', 'an', 'ur', 'eth', 'ion']
+        rng = random.Random(time.time())
+        for base in candidates:
+            rng.shuffle(_suffixes)
+            for sfx in _suffixes:
+                variant = base + sfx
+                if _cloud_checks < _MAX_CLOUD_CHECKS:
+                    _cloud_checks += 1
+                    if not HARTNameRegistry.is_available(variant):
+                        continue
+                if 3 <= len(variant) <= 14:
+                    unique_candidates.append(variant)
+                    if len(unique_candidates) >= 3:
+                        break
+            if len(unique_candidates) >= 3:
+                break
+
+    # Last resort: random hex suffix on emergency name
+    if not unique_candidates:
+        import secrets
+        base = _emergency_name()
+        unique_candidates = [base + secrets.token_hex(2)]
+
+    chosen = unique_candidates[0]
+    candidates = unique_candidates[:5]
     emoji_combo = generate_emoji_combo(locale, dimensions)
     element, spirit = assign_element_spirit(dimensions)
 
@@ -873,6 +942,33 @@ def _get_label(options: list, key: str, lang: str) -> str:
     return key
 
 
+def _llm_generate_direct(prompt: str) -> Optional[str]:
+    """Direct HTTP call to llama-server — no import chain, lightweight."""
+    import urllib.request
+    import urllib.error
+
+    for port in (8080, 8081):
+        try:
+            payload = json.dumps({
+                'model': 'default',
+                'messages': [{'role': 'user', 'content': prompt}],
+                'temperature': 0.9,
+                'max_tokens': 200,
+            }).encode()
+            req = urllib.request.Request(
+                f'http://127.0.0.1:{port}/v1/chat/completions',
+                data=payload,
+                headers={'Content-Type': 'application/json'},
+                method='POST',
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode())
+                return data['choices'][0]['message']['content']
+        except Exception:
+            continue
+    return None
+
+
 def _validate_names_cross_language(candidates: List[str], user_language: str) -> List[str]:
     """Use LLM to filter out names that have negative, offensive, embarrassing,
     or unfortunate meanings in ANY language. A name like 'sori' (itch in Tamil)
@@ -884,12 +980,8 @@ def _validate_names_cross_language(candidates: List[str], user_language: str) ->
     if not candidates:
         return candidates
 
-    try:
-        from hart_intelligence import get_llm
-        llm = get_llm(temperature=0.0, max_tokens=300)
-
-        names_str = ', '.join(candidates)
-        prompt = f"""You are a multilingual name safety validator. The user's language is {user_language}.
+    names_str = ', '.join(candidates)
+    prompt = f"""You are a multilingual name safety validator. The user's language is {user_language}.
 
 Check each of these candidate names: [{names_str}]
 
@@ -905,17 +997,29 @@ Return ONLY a JSON array of the SAFE names (ones with no negative meaning in any
 If ALL names are unsafe, return an empty array: []
 Return ONLY the JSON array, nothing else."""
 
-        result = llm.invoke(prompt)
-        text = result.content if hasattr(result, 'content') else str(result)
+    # Try direct HTTP first (no import chain)
+    text = _llm_generate_direct(prompt)
 
-        match = re.search(r'\[.*?\]', text, re.DOTALL)
-        if match:
-            safe = json.loads(match.group())
-            # Only keep names that were in the original candidates
-            validated = [n.lower().strip() for n in safe if isinstance(n, str)]
-            return [c for c in candidates if c in validated]
-    except Exception as e:
-        logger.warning(f"Cross-language name validation failed: {e}")
+    # Fallback: LangChain get_llm
+    if not text:
+        try:
+            from hart_intelligence import get_llm
+            llm = get_llm(temperature=0.0, max_tokens=300)
+            result = llm.invoke(prompt)
+            text = result.content if hasattr(result, 'content') else str(result)
+        except Exception as e:
+            logger.warning(f"Cross-language name validation failed: {e}")
+            text = None
+
+    if text:
+        try:
+            match = re.search(r'\[.*?\]', text, re.DOTALL)
+            if match:
+                safe = json.loads(match.group())
+                validated = [n.lower().strip() for n in safe if isinstance(n, str)]
+                return [c for c in candidates if c in validated]
+        except Exception:
+            pass
 
     # LLM unavailable — return all candidates (best-effort)
     return candidates
@@ -929,28 +1033,28 @@ def _fallback_names(dimensions: Dict, existing: set) -> List[str]:
     """
     pools = {
         'creative': [
-            'hikari', 'kavi', 'reve', 'uyir', 'eclat',
-            'chama', 'iskra', 'lingen', 'flamar', 'hoshi',
+            'hikazen', 'kaviren', 'revalis', 'uyiren', 'eclathos',
+            'chamaro', 'iskrani', 'flamiren', 'hoshira', 'nelvari',
         ],
         'curious': [
-            'akira', 'nouri', 'soren', 'mathi', 'veter',
-            'lingen', 'byeol', 'sahari', 'xingel', 'kiran',
+            'akiron', 'nourizen', 'mathiran', 'vetaris', 'sorennix',
+            'byeorin', 'saharix', 'xingara', 'kiranox', 'zenvari',
         ],
         'builder': [
-            'agni', 'blitz', 'forgen', 'stein', 'tessari',
-            'gromon', 'kal', 'ferros', 'praxis', 'arcan',
+            'agnizen', 'blitzara', 'forgenis', 'tessaron', 'steinrek',
+            'gromonax', 'ferrozen', 'praxion', 'arcanova', 'kalvaris',
         ],
         'social': [
-            'amara', 'solari', 'auren', 'theni', 'nouri',
-            'wardel', 'brinsa', 'kindra', 'lumis', 'dalla',
+            'solarin', 'aurenvex', 'thenira', 'nourixel', 'wardenis',
+            'brinsara', 'lumizan', 'kindravex', 'dallarix', 'amarith',
         ],
         'grounded': [
-            'shan', 'rowan', 'bracken', 'cairn', 'oakley',
-            'terryn', 'valen', 'ashven', 'selva', 'pedran',
+            'terrynox', 'cairnova', 'ashveron', 'pedranis', 'valendrix',
+            'shanrok', 'brackenix', 'oakvaris', 'roothenix', 'gaiaren',
         ],
         'introspective': [
-            'yume', 'reveri', 'solace', 'mazhai', 'haven',
-            'tuman', 'dusken', 'layli', 'stillam', 'ombre',
+            'yumezan', 'reverix', 'mazharin', 'havenyx', 'tumanari',
+            'duskenra', 'layliren', 'stillovex', 'ombrenis', 'solacera',
         ],
     }
 
@@ -976,11 +1080,11 @@ def _fallback_names(dimensions: Dict, existing: set) -> List[str]:
 
 
 def _emergency_name() -> str:
-    """Last resort: pick from pre-validated safe names."""
+    """Last resort: pick from pre-validated legendary names."""
     safe_names = [
-        'lumira', 'kavani', 'zenara', 'elvani', 'onara',
-        'mirako', 'veluna', 'aisora', 'naviri', 'kaleni',
-        'rivena', 'solani', 'makira', 'tenori', 'ulveni',
+        'lumirex', 'kavanith', 'zenarion', 'elvanox', 'onarith',
+        'mirakzen', 'velunaris', 'aisoranix', 'navireth', 'kalenova',
+        'rivenark', 'solanith', 'makiron', 'tenorex', 'ulvenari',
     ]
     rng = random.Random(time.time())
     return rng.choice(safe_names)
@@ -997,36 +1101,90 @@ class HARTNameRegistry:
     Names are lowercase, alphanumeric only, 2-12 characters.
     """
 
+    # Cloud instance for global uniqueness checks
+    _CLOUD_URL = os.environ.get(
+        'HEVOLVE_CENTRAL_URL', 'https://azurekong.hertzai.com')
+
     @staticmethod
     def is_available(name: str) -> bool:
-        """Check if a HART name is available."""
+        """Check if a HART name is available locally AND globally (cloud).
+
+        Returns False if taken anywhere. Returns True only if confirmed
+        available on both local DB and cloud (when online).
+        """
         clean = re.sub(r'[^a-z0-9]', '', name.lower())
         if not clean or len(clean) < 2 or len(clean) > 12:
             return False
 
+        # Local check
         try:
             from integrations.social.models import db_session, User
             with db_session(commit=False) as db:
                 existing = db.query(User).filter(
                     User.handle == clean
                 ).first()
-                return existing is None
+                if existing is not None:
+                    return False
         except Exception as e:
-            logger.warning(f"Name availability check failed: {e}")
-            return True  # Optimistic — seal will enforce uniqueness
+            logger.warning(f"Local name availability check failed: {e}")
+
+        # Global check — cloud API (best-effort, don't block on network failure)
+        if not HARTNameRegistry._check_cloud_available(clean):
+            return False
+
+        return True
+
+    @staticmethod
+    def _check_cloud_available(name: str) -> bool:
+        """Check name availability against the cloud instance.
+
+        Returns True if available or if cloud is unreachable (optimistic).
+        Returns False only if cloud confirms the name is taken.
+        """
+        import urllib.request
+        import urllib.error
+
+        url = f"{HARTNameRegistry._CLOUD_URL}/api/social/handles/check?handle={name}"
+        try:
+            req = urllib.request.Request(url, method='GET')
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+                # Cloud API returns {success: true, data: {available: bool}}
+                available = data.get('data', {}).get('available', True)
+                if not available:
+                    logger.info(f"HART name '{name}' taken globally (cloud)")
+                return available
+        except Exception:
+            # Cloud unreachable — optimistic (seal will be synced later)
+            return True
 
     @staticmethod
     def get_all_names() -> set:
-        """Get all sealed HART names for collision prevention."""
+        """Get all sealed HART names — local + cloud (when online)."""
+        names = set()
+
+        # Local names
         try:
             from integrations.social.models import db_session, User
             with db_session(commit=False) as db:
                 handles = db.query(User.handle).filter(
                     User.handle.isnot(None)
                 ).all()
-                return {h[0].lower() for h in handles if h[0]}
+                names.update(h[0].lower() for h in handles if h[0])
         except Exception:
-            return set()
+            pass
+
+        # Cloud names (best-effort batch — fetch recent handles)
+        try:
+            import urllib.request
+            url = f"{HARTNameRegistry._CLOUD_URL}/api/social/handles/check"
+            # We can't fetch ALL cloud names in one call, but the individual
+            # is_available check covers each candidate. The local set is still
+            # used for initial candidate filtering during generation.
+        except Exception:
+            pass
+
+        return names
 
     @staticmethod
     def seal_name(user_id: str, name: str, dimensions: dict,
@@ -1054,7 +1212,12 @@ class HARTNameRegistry:
                     logger.warning(f"User {user_id} already has HART name: {user.handle}")
                     return False
 
-                # Final uniqueness check (race-condition safe via UNIQUE constraint)
+                # Final uniqueness: check cloud before writing local DB
+                if not HARTNameRegistry._check_cloud_available(clean):
+                    logger.warning(f"HART name '{clean}' taken globally at seal time")
+                    return False
+
+                # Local uniqueness via UNIQUE constraint
                 user.handle = clean
                 user.display_name = clean
 

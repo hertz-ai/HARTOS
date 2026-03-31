@@ -439,7 +439,26 @@ class A2AContextExchange:
                 suitable_agents = suitable_agents.intersection(agents_with_skill)
 
         if not suitable_agents:
-            logger.warning(f"No agents found with all required skills: {required_skills}")
+            # Fallback: semantic match against existing recipes + expert catalog
+            try:
+                from integrations.agentic_router import find_matching_agent
+                _match = find_matching_agent(task)
+                if _match and _match.get('agent_id'):
+                    logger.info(f"Skill match failed, semantic match found: {_match['name']}")
+                    delegation_id = str(uuid.uuid4())
+                    with self.lock:
+                        self.delegations[delegation_id] = {
+                            'from_agent': from_agent,
+                            'to_agent': _match['agent_id'],
+                            'task': task,
+                            'status': 'matched_existing',
+                            'matched_via': 'semantic',
+                            'matched_name': _match['name'],
+                        }
+                    return delegation_id
+            except Exception as _e:
+                logger.debug(f"Semantic fallback failed: {_e}")
+            logger.warning(f"No agents found with required skills: {required_skills}")
             return None
 
         # Score each agent using the strategy across all required skills

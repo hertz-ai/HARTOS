@@ -117,6 +117,11 @@ class NodeWatchdog:
         with self._lock:
             return name in self._threads
 
+    def registered_names(self) -> list:
+        """Return list of all registered thread names."""
+        with self._lock:
+            return list(self._threads.keys())
+
     def mark_in_llm_call(self, name: str) -> None:
         """Mark a thread as blocked on a legitimate LLM inference call.
 

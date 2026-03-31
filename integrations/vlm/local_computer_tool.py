@@ -62,20 +62,80 @@ def take_screenshot(tier: str) -> str:
         return data.get('base64_image', data.get('image', ''))
 
 
+def get_active_window_info():
+    """Get the actual foreground window title + process name from the OS.
+    Used to prevent VLM misidentifying windows (e.g. Claude Code as MobaXterm)."""
+    try:
+        import platform, subprocess, json
+        _os = platform.system()
+        if _os == 'Windows':
+            r = subprocess.run(
+                ['powershell', '-Command',
+                 '(Get-Process | Where-Object {$_.MainWindowHandle -eq '
+                 '(Add-Type -MemberDefinition \'[DllImport("user32.dll")] '
+                 'public static extern IntPtr GetForegroundWindow();\' '
+                 '-Name W -PassThru)::GetForegroundWindow()}).ProcessName + '
+                 '": " + (Get-Process | Where-Object {$_.MainWindowHandle -eq '
+                 '(Add-Type -MemberDefinition \'[DllImport("user32.dll")] '
+                 'public static extern IntPtr GetForegroundWindow();\' '
+                 '-Name W2 -PassThru)::GetForegroundWindow()}).MainWindowTitle'],
+                capture_output=True, text=True, timeout=3)
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.strip()
+        elif _os == 'Linux':
+            r = subprocess.run(['xdotool', 'getactivewindow', 'getwindowname'],
+                             capture_output=True, text=True, timeout=3)
+            if r.returncode == 0:
+                return r.stdout.strip()
+        elif _os == 'Darwin':
+            r = subprocess.run(
+                ['osascript', '-e',
+                 'tell application "System Events" to get name of first process whose frontmost is true'],
+                capture_output=True, text=True, timeout=3)
+            if r.returncode == 0:
+                return r.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
 def execute_action(action: dict, tier: str) -> dict:
     """
     Execute a single VLM action (click, type, key, etc.).
 
+    Includes active window validation — if the VLM's reasoning mentions
+    a window name that doesn't match the actual foreground window,
+    the action is flagged (prevents clicking the wrong app's taskbar icon).
+
     Args:
-        action: dict with 'action', optionally 'coordinate', 'text', 'value', 'path'
+        action: dict with 'action', optionally 'coordinate', 'text', 'value', 'path', 'reasoning'
         tier: 'inprocess' or 'http'
     Returns:
-        dict with 'output' and optionally 'error'
+        dict with 'output' and optionally 'error', 'window_mismatch'
     """
+    # Validate: if reasoning mentions a specific app, check it matches reality
+    reasoning = action.get('Reasoning', action.get('reasoning', '')).lower()
+    _mismatch = None
+    if any(app in reasoning for app in ['minimize', 'close', 'switch to', 'click on']):
+        active = get_active_window_info()
+        if active:
+            # Check for common misidentifications
+            if 'mobaxt' in reasoning and 'mobaxt' not in active.lower():
+                _mismatch = f"VLM thinks MobaXterm but active window is: {active}"
+            elif 'notepad' in reasoning and 'notepad' not in active.lower():
+                _mismatch = f"VLM thinks Notepad but active window is: {active}"
+
     if tier == 'inprocess':
-        return _execute_inprocess(action)
+        result = _execute_inprocess(action)
     else:
-        return _execute_http(action)
+        result = _execute_http(action)
+
+    if _mismatch:
+        result['window_mismatch'] = _mismatch
+        import logging
+        logging.getLogger('hevolve.vlm').warning(f"[WINDOW-MISMATCH] {_mismatch}")
+
+    return result
 
 
 def _execute_inprocess(action: dict) -> dict:

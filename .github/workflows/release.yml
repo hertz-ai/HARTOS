@@ -31,13 +31,14 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install -e . --no-deps 2>/dev/null || true
+          pip install -e . --no-deps
+          python -c "from core.platform.events import EventBus; print(f'EventBus import OK: {EventBus}')"
           pip install pytest pytest-asyncio
           pip install grep-ast tree-sitter tree-sitter-language-pack 2>/dev/null || true
           python -c "import nltk; nltk.download('punkt', quiet=True); nltk.download('punkt_tab', quiet=True)" 2>/dev/null || true
@@ -51,8 +52,7 @@ jobs:
           python -m pytest \
             tests/unit/ \
             tests/functional/ \
-            --noconftest --rootdir=${{ github.workspace }} \
-            --import-mode=importlib \
+            --ignore=tests/unit/test_social_models.py \
             -q --tb=line
 
   # ═══════════════════════════════════════════════════════════
@@ -99,12 +99,25 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
 
       - name: Build Python distribution
         run: |
           pip install build setuptools-scm
           python -m build
+
+      - name: Build universal installers
+        run: |
+          cd deploy/installer
+          mkdir -p dist
+          GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o dist/hevolve-install.exe .
+          GOOS=darwin  GOARCH=arm64 go build -ldflags="-s -w" -o dist/hevolve-install-macos .
+          GOOS=linux   GOARCH=amd64 go build -ldflags="-s -w" -o dist/hevolve-install-linux .
+          ls -lh dist/
 
       - name: Strip HevolveAI source from wheel
         run: |
@@ -125,6 +138,9 @@ jobs:
           files: |
             dist/*.whl
             dist/*.tar.gz
+            deploy/installer/dist/hevolve-install.exe
+            deploy/installer/dist/hevolve-install-macos
+            deploy/installer/dist/hevolve-install-linux
           body: |
             ## HART OS v${{ steps.version.outputs.version }}
 

@@ -319,6 +319,9 @@ class TestSubmitCorrection(unittest.TestCase):
         self.assertFalse(result['success'])
         self.assertIn('500', result['reason'])
 
+    @unittest.skipUnless(
+        __import__('importlib').util.find_spec('hevolveai') is not None,
+        'hevolveai not installed')
     def test_confidence_clamped(self):
         """BND: Confidence is clamped to [0.0, 1.0]."""
         self.bridge._in_process = True

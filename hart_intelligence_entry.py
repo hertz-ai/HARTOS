@@ -489,9 +489,15 @@ if _is_bundled:
 else:
     _langchain_log_path = 'langchain.log'
 
-handler = RotatingFileHandler(_langchain_log_path, maxBytes=5_000_000, backupCount=2)
+handler = RotatingFileHandler(_langchain_log_path, maxBytes=5_000_000, backupCount=2, encoding='utf-8')
 handler.setLevel(logging.INFO)
 
+# Prevent UnicodeEncodeError on Windows (cp1252) when LLM output contains emoji
+# by reconfiguring stdout to replace unencodable characters
+try:
+    sys.stdout.reconfigure(errors='replace')
+except (AttributeError, OSError):
+    pass  # Python < 3.7 or redirected stdout
 stream_handler = logging.StreamHandler(sys.stdout)
 
 # Create a logging format
@@ -3537,12 +3543,17 @@ def _parse_pdf_in_process(input_url, user_id, request_id):
             pass
 
 
-redis_client = redis.StrictRedis(
-    host='azure_all_vms.hertzai.com', port=6369, db=0)
+try:
+    redis_client = redis.StrictRedis(
+        host='azure_all_vms.hertzai.com', port=6369, db=0,
+        socket_connect_timeout=2, socket_timeout=2)
+    redis_client.ping()
+except Exception:
+    redis_client = None
 
 
 def get_frame(user_id):
-    """Get latest camera frame — FrameStore first, Redis fallback."""
+    """Get latest camera frame — FrameStore first, screenshot fallback, Redis last."""
     # Primary: FrameStore (in-process, zero latency)
     svc = get_vision_service()
     if svc:
@@ -3557,7 +3568,20 @@ def get_frame(user_id):
                     f"Frame for user_id {user_id} from FrameStore")
                 return frame[:, :, ::-1]  # BGR → RGB
 
-    # Fallback: Redis (legacy path)
+    # Desktop screenshot fallback (for computer use mode)
+    try:
+        from PIL import ImageGrab
+        screenshot = ImageGrab.grab()
+        frame = np.array(screenshot)
+        app.logger.info(f"Frame for user_id {user_id} from desktop screenshot ({frame.shape})")
+        return frame  # Already RGB
+    except Exception as _ss_err:
+        app.logger.debug(f"Screenshot fallback failed: {_ss_err}")
+
+    # Last resort: Redis (legacy camera path)
+    if redis_client is None:
+        app.logger.info(f"No frame for user_id {user_id} — Redis unavailable, no camera/screenshot.")
+        return None
     serialized_frame = redis_client.get(user_id)
     try:
         if serialized_frame is not None:
@@ -3595,7 +3619,34 @@ def parse_visual_context(inp: str):
 
         prompt_text = f'Instruction: Respond in second person point of view\ninput:-{inp}'
 
-        # Tier 1: Try local MiniCPM sidecar (port 9891) — zero latency, no cloud
+        # Tier 0: Qwen+mmproj on local llama-server (already running, zero extra VRAM)
+        _llm_port = int(os.environ.get('HEVOLVE_LLM_PORT', 8080))
+        try:
+            import base64 as _b64
+            with open(image_path, 'rb') as _imgf:
+                _img_b64 = _b64.b64encode(_imgf.read()).decode('ascii')
+            _vlm_resp = requests.post(
+                f'http://127.0.0.1:{_llm_port}/v1/chat/completions',
+                json={
+                    'model': 'local',
+                    'messages': [{'role': 'user', 'content': [
+                        {'type': 'text', 'text': prompt_text},
+                        {'type': 'image_url', 'image_url': {'url': f'data:image/jpeg;base64,{_img_b64}'}}
+                    ]}],
+                    'max_tokens': 300,
+                },
+                timeout=15,
+            )
+            if _vlm_resp.status_code == 200:
+                _vlm_data = _vlm_resp.json()
+                result = _vlm_data.get('choices', [{}])[0].get('message', {}).get('content', '')
+                if result:
+                    app.logger.info(f'Visual context from Qwen+mmproj: {result[:100]}')
+                    return result
+        except Exception as e:
+            app.logger.debug(f"Qwen+mmproj VLM unavailable: {e}")
+
+        # Tier 1: Try local MiniCPM sidecar (port 9891) — dedicated VLM server
         local_minicpm_port = int(os.environ.get('HEVOLVE_MINICPM_PORT', 9891))
         try:
             with open(image_path, 'rb') as f:
@@ -3611,7 +3662,7 @@ def parse_visual_context(inp: str):
                     app.logger.info(f'Visual context from local MiniCPM: {result[:100]}')
                     return result
         except Exception as e:
-            app.logger.debug(f"Local MiniCPM sidecar unavailable, falling back to cloud: {e}")
+            app.logger.debug(f"Local MiniCPM sidecar unavailable, falling back: {e}")
 
         # Tier 2: Hive mesh peer with GPU
         try:
@@ -4319,7 +4370,15 @@ def chat():
     # Periodically evict stale agent state to prevent unbounded memory growth (M2 fix)
     _cleanup_stale_agents()
 
-    data = request.get_json()
+    data = request.get_json() or {}
+
+    # Early validation — return 400 instead of 500 on missing required fields
+    if not data.get('user_id') and not request.headers.get('Authorization', '').startswith('Bearer '):
+        return jsonify({'error': 'user_id is required (in body or via Bearer token)', 'response': None}), 400
+    if data.get('prompt_id') is None and 'prompt_id' not in data:
+        return jsonify({'error': 'prompt_id is required', 'response': None}), 400
+    if not data.get('prompt') and not data.get('input_text'):
+        return jsonify({'error': 'prompt is required', 'response': None}), 400
 
     # ── Two-layer auth: extract user_id from JWT if present ──
     # Layer 1 (LOCAL): Bearer token signed by this node's HS256 secret
@@ -4372,12 +4431,11 @@ def chat():
         thread_local_data.channel_context = channel_context
 
     # USER PRIORITY: mark user activity so daemon dispatch yields the LLM
-    if not autonomous:
-        try:
-            from integrations.agent_engine.dispatch import mark_user_chat_activity
-            mark_user_chat_activity()
-        except ImportError:
-            pass
+    try:
+        from integrations.agent_engine.dispatch import mark_user_chat_activity
+        mark_user_chat_activity()
+    except ImportError:
+        pass
 
     app.logger.info(f"casual_conv type {casual_conv}")
 
@@ -4577,6 +4635,23 @@ def chat():
             if not user_id or not prompt:
                 return jsonify({'response': 'Need user_id and text to create agent', 'intent': ['FINAL_ANSWER'], 'req_token_count': 0, 'res_token_count': 0, 'history_request_id': []})
             if autonomous:
+                # Check if an existing agent can handle this task before creating new one
+                try:
+                    from integrations.agentic_router import find_matching_agent
+                    _match = find_matching_agent(prompt, PROMPTS_DIR)
+                    if _match and _match.get('agent_id'):
+                        _mid = _match['agent_id']
+                        _mconfig = os.path.join(PROMPTS_DIR, f'{_mid}.json')
+                        if os.path.exists(_mconfig) and os.path.exists(
+                                os.path.join(PROMPTS_DIR, f'{_mid}_0_recipe.json')):
+                            app.logger.info(
+                                f'Matched existing agent {_match["name"]} ({_mid}) '
+                                f'— routing to REUSE instead of CREATE')
+                            return chat_agent(user_id, prompt, _mid, file_id, request_id)
+                except Exception as _me:
+                    app.logger.debug(f'Agent matching skipped: {_me}')
+
+                # No existing agent matches — create new one
                 # Autonomous dispatch (from daemon or API): LLM self-generates agent config
                 # AND immediately creates recipe — no human review step needed.
                 # Full pipeline: gather_info → save config → recipe() → completed
@@ -4586,6 +4661,11 @@ def chat():
                 _config_path = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
                 if os.path.exists(_config_path):
                     try:
+                        try:
+                            from integrations.agent_engine.dispatch import mark_create_start, mark_create_end
+                            mark_create_start()
+                        except ImportError:
+                            mark_create_end = None
                         recipe_response = recipe(user_id, prompt, prompt_id, file_id, request_id)
                         if recipe_response == 'Agent Created Successfully':
                             with _user_lock:
@@ -4607,7 +4687,14 @@ def chat():
                         else:
                             app.logger.info(f'Autonomous recipe() returned: {str(recipe_response)[:100]}')
                     except Exception as e:
-                        app.logger.warning(f'Autonomous recipe creation failed (will retry on next dispatch): {e}')
+                        import traceback
+                        app.logger.error(f'Autonomous recipe creation failed: {e}\n{traceback.format_exc()}')
+                    finally:
+                        try:
+                            from integrations.agent_engine.dispatch import mark_create_end
+                            mark_create_end()
+                        except ImportError:
+                            pass
 
                 # Fallback: config saved but recipe failed — next dispatch will retry
                 with _user_lock:
@@ -4772,7 +4859,19 @@ def chat():
             _in_review = _ak in review_agents and review_agents[_ak]
             _in_convo = _ak in conversation_agent and conversation_agent[_ak]
         if _in_review and not _in_convo:
-            response = recipe(user_id,prompt,prompt_id,file_id,request_id)
+            try:
+                from integrations.agent_engine.dispatch import mark_create_start, mark_create_end
+                mark_create_start()
+            except ImportError:
+                mark_create_end = None
+            try:
+                response = recipe(user_id,prompt,prompt_id,file_id,request_id)
+            finally:
+                try:
+                    from integrations.agent_engine.dispatch import mark_create_end as _mce
+                    _mce()
+                except ImportError:
+                    pass
             if response =='Agent Created Successfully':
                 with _user_lock:
                     conversation_agent[_ak] = True
@@ -5063,10 +5162,13 @@ def time_agent():
     if not task_description or not user_id or not prompt_id:
         return jsonify({'error':'user_id or task_description or prompt_id is missing'}), 404
     app.logger.info(f'GOT user_id:{user_id} & prompt_id:{prompt_id} & task_description:{task_description}')
+    # Support both string and numeric IDs
+    _uid = int(user_id) if str(user_id).isdigit() else str(user_id)
+    _pid = int(prompt_id) if str(prompt_id).isdigit() else str(prompt_id)
     if request_from == 'Reuse':
-        res = time_based_execution(str(task_description),int(user_id),int(prompt_id),action_entry_point)
+        res = time_based_execution(str(task_description), _uid, _pid, action_entry_point)
     else:
-        res = time_execution(str(task_description),int(user_id),int(prompt_id),action_entry_point)
+        res = time_execution(str(task_description), _uid, _pid, action_entry_point)
     return jsonify({'response':f'{res}'}), 200
 
 
@@ -5081,11 +5183,59 @@ def visual_agent():
     if not task_description or not user_id or not prompt_id:
         return jsonify({'error':'user_id or task_description or prompt_id is missing'}), 404
     app.logger.info(f'GOT user_id:{user_id} & prompt_id:{prompt_id} & task_description:{task_description}')
-    if request_from == 'Reuse':
-        res = visual_based_execution(str(task_description),int(user_id),int(prompt_id))
-    else:
-        res = visual_execution(str(task_description),int(user_id),int(prompt_id))
-    return jsonify({'response':f'{res}'}), 200
+    # Quick VLM health check — delegate to lightweight_backend (single path)
+    from integrations.vision.lightweight_backend import get_vision_backend
+    _vlm_backend = get_vision_backend()
+    if not _vlm_backend.is_available():
+        return jsonify({'response': 'Visual agent: no VLM server available. Start llama-server with --mmproj or MiniCPM.', 'vlm_status': 'offline'}), 200
+    _uid = int(user_id) if str(user_id).isdigit() else str(user_id)
+    _pid = int(prompt_id) if str(prompt_id).isdigit() else str(prompt_id)
+
+    # Computer use mode: use VLM point_and_act directly with screenshot
+    mode = data.get('mode', 'auto')  # 'computer_use', 'camera', 'auto'
+    if mode == 'computer_use' or (mode == 'auto' and request_from != 'Reuse'):
+        try:
+            from integrations.vlm.qwen3vl_backend import get_qwen3vl_backend
+            import base64, io
+            from PIL import ImageGrab, Image
+            backend = get_qwen3vl_backend()
+            screenshot = ImageGrab.grab()
+            img_resized = screenshot.resize((1024, 576), Image.LANCZOS)
+            buf = io.BytesIO()
+            img_resized.save(buf, 'JPEG', quality=50)
+            b64 = base64.b64encode(buf.getvalue()).decode('ascii')
+            result = backend.point_and_act(b64, str(task_description))
+            return jsonify({
+                'response': result.get('reasoning', ''),
+                'action': result.get('action', 'none'),
+                'screen_x': result.get('screen_x', 0),
+                'screen_y': result.get('screen_y', 0),
+                'norm_x': result.get('norm_x', 0),
+                'norm_y': result.get('norm_y', 0),
+                'text': result.get('text', ''),
+                'done': result.get('done', False),
+                'strategy': result.get('strategy', ''),
+                'latency': result.get('latency', 0),
+                'vlm_status': 'ok',
+            }), 200
+        except Exception as e:
+            app.logger.error(f'Computer use error: {e}')
+            return jsonify({'response': f'Computer use error: {str(e)[:200]}', 'vlm_status': 'error'}), 200
+
+    # Camera/legacy mode: use existing visual agent pipeline
+    try:
+        if request_from == 'Reuse':
+            res = visual_based_execution(str(task_description), _uid, _pid)
+        else:
+            res = visual_execution(str(task_description), _uid, _pid)
+        if res is None:
+            return jsonify({'response': 'No camera frame available. Enable camera or send a frame via channel.', 'vlm_status': 'no_frame'}), 200
+        return jsonify({'response': f'{res}'}), 200
+    except KeyError:
+        return jsonify({'response': 'No active visual agent session. Send a frame first via camera or channel.', 'vlm_status': 'no_session'}), 200
+    except Exception as e:
+        app.logger.error(f'Visual agent error: {e}')
+        return jsonify({'response': f'Visual agent error: {str(e)[:100]}', 'vlm_status': 'error'}), 200
 
 @app.route('/response_ack',methods=['POST'])
 def response_ack():

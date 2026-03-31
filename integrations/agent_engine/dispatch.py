@@ -42,17 +42,36 @@ _local_llm_semaphore = threading.Semaphore(_LOCAL_LLM_MAX_CONCURRENT)
 # Tracked via timestamp of last user activity — daemon checks freshness.
 import time as _time
 _last_user_chat_at: float = 0.0
-_USER_CHAT_COOLDOWN = 10  # seconds after last user chat to yield LLM
+_USER_CHAT_COOLDOWN = 600  # 10 min — CREATE pipeline can take this long
+_active_create_sessions: int = 0  # count of in-flight CREATE requests
+_create_lock = threading.Lock()
 
 
 def mark_user_chat_activity():
-    """Call on every user (non-daemon) /chat request."""
+    """Call on every user /chat request (including autonomous CREATE)."""
     global _last_user_chat_at
     _last_user_chat_at = _time.time()
 
 
+def mark_create_start():
+    """Call when a CREATE pipeline starts."""
+    global _active_create_sessions
+    with _create_lock:
+        _active_create_sessions += 1
+    mark_user_chat_activity()
+
+
+def mark_create_end():
+    """Call when a CREATE pipeline finishes."""
+    global _active_create_sessions
+    with _create_lock:
+        _active_create_sessions = max(0, _active_create_sessions - 1)
+
+
 def is_user_recently_active() -> bool:
-    """True if a human user chatted within the cooldown window."""
+    """True if user chatted recently OR a CREATE pipeline is running."""
+    if _active_create_sessions > 0:
+        return True
     return (_time.time() - _last_user_chat_at) < _USER_CHAT_COOLDOWN
 
 
@@ -65,26 +84,42 @@ def _notify_watchdog_llm_start():
     try:
         from security.node_watchdog import get_watchdog
         wd = get_watchdog()
-        if wd:
-            name = threading.current_thread().name
-            # Find which daemon this thread belongs to
-            for daemon_name in ('coding_daemon', 'agent_daemon'):
-                if daemon_name in name or wd.is_registered(daemon_name):
-                    wd.mark_in_llm_call(daemon_name)
-                    break
+        if not wd:
+            return
+        thread_name = threading.current_thread().name
+        # Match by thread name — works for all daemon threads
+        if wd.is_registered(thread_name):
+            wd.mark_in_llm_call(thread_name)
+            return
+        # Partial match (thread name might have suffix like 'agent_daemon-1')
+        for name in wd.registered_names():
+            if name in thread_name:
+                wd.mark_in_llm_call(name)
+                return
+        # Fallback: in-process/bundled mode — dispatch runs on a
+        # different thread (e.g. Flask worker). Mark the calling daemon
+        # via threadlocal source hint if available.
+        try:
+            from threadlocal import get_task_source
+            source = get_task_source()
+            if source and wd.is_registered(source):
+                wd.mark_in_llm_call(source)
+                return
+        except Exception:
+            pass
     except Exception:
         pass
 
 
 def _notify_watchdog_llm_end():
-    """Clear the LLM call marker and send a heartbeat."""
+    """Clear the LLM call marker and send a heartbeat for all registered daemons."""
     try:
         from security.node_watchdog import get_watchdog
         wd = get_watchdog()
         if wd:
-            for daemon_name in ('coding_daemon', 'agent_daemon'):
-                wd.clear_llm_call(daemon_name)
-                wd.heartbeat(daemon_name)
+            for name in wd.registered_names():
+                wd.clear_llm_call(name)
+                wd.heartbeat(name)
     except Exception:
         pass
 

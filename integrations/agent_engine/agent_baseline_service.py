@@ -319,9 +319,11 @@ class AgentBaselineService:
         """Compute snapshot metadata."""
         meta: Dict = {'trigger': trigger}
         try:
+            _kw = dict(capture_output=True, text=True, timeout=5)
+            if hasattr(subprocess, 'CREATE_NO_WINDOW'):
+                _kw['creationflags'] = subprocess.CREATE_NO_WINDOW
             result = subprocess.run(
-                ['git', 'rev-parse', '--short', 'HEAD'],
-                capture_output=True, text=True, timeout=5)
+                ['git', 'rev-parse', '--short', 'HEAD'], **_kw)
             if result.returncode == 0:
                 meta['git_sha'] = result.stdout.strip()
         except Exception:

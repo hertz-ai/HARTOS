@@ -1528,6 +1528,28 @@ def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual c
         image = Image.fromarray(frame)
         # Save the image
         image.save(image_path)
+        # Tier 0: Try Qwen+mmproj on local llama-server (already running)
+        _llm_port = int(os.environ.get('HEVOLVE_LLM_PORT', 8080))
+        try:
+            import base64 as _b64
+            with open(image_path, 'rb') as _imgf:
+                _img_b64 = _b64.b64encode(_imgf.read()).decode('ascii')
+            _prompt_text = f'Instruction: Respond in second person point of view\ninput:-{inp}'
+            _vlm_r = requests.post(
+                f'http://127.0.0.1:{_llm_port}/v1/chat/completions',
+                json={'model': 'local', 'messages': [{'role': 'user', 'content': [
+                    {'type': 'text', 'text': _prompt_text},
+                    {'type': 'image_url', 'image_url': {'url': f'data:image/jpeg;base64,{_img_b64}'}}
+                ]}], 'max_tokens': 300},
+                timeout=15,
+            )
+            if _vlm_r.status_code == 200:
+                _c = _vlm_r.json().get('choices', [{}])[0].get('message', {}).get('content', '')
+                if _c:
+                    return _c
+        except Exception:
+            pass  # Fall through to MiniCPM/cloud
+
         from core.config_cache import get_vision_api
         url = get_vision_api() or "http://azurekong.hertzai.com:8000/minicpm/upload"
         payload = {

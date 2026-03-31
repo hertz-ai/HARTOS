@@ -563,6 +563,9 @@ class TestIntegrityServiceMasterKey:
 class TestMigrationV12:
     """Test schema migration to v12."""
 
+    @pytest.mark.skipif(
+        tuple(int(x) for x in __import__('sqlite3').sqlite_version.split('.')) < (3, 35, 0),
+        reason='SQLite < 3.35 does not support RETURNING clause')
     def test_migration_adds_columns(self):
         """Verify that v12 migration adds master_key_verified and release_version."""
         from integrations.social.migrations import run_migrations, get_schema_version

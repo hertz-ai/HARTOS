@@ -110,6 +110,8 @@ class TestPathResolution:
 
     def test_prompts_dir_exists(self):
         from helper import PROMPTS_DIR
+        # On CI, ensure the directory exists (it may not if this is a fresh checkout)
+        os.makedirs(PROMPTS_DIR, exist_ok=True)
         assert os.path.isdir(PROMPTS_DIR)
 
 

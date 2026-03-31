@@ -314,6 +314,18 @@ class TestRobotTools:
 # ── Robot Prompt Builder Tests ───────────────────────────────────
 
 class TestRobotPromptBuilder:
+    def _mock_advertiser_with_hardware(self):
+        """Return a mock capability advertiser that reports robot hardware."""
+        mock_adv = MagicMock()
+        mock_adv.get_capabilities.return_value = {
+            'form_factor': 'rover',
+            'locomotion': {'type': 'differential'},
+            'manipulation': None,
+            'sensors': {'imu': True},
+            'native_skills': [],
+        }
+        return mock_adv
+
     def test_build_robot_prompt_basic(self):
         from integrations.robotics.robot_prompt_builder import (
             build_robot_prompt,
@@ -323,7 +335,12 @@ class TestRobotPromptBuilder:
             'description': 'Find and dock at the nearest charging station.',
             'goal_type': 'robot',
         }
-        prompt = build_robot_prompt(goal)
+        with patch(
+            'integrations.robotics.capability_advertiser.get_capability_advertiser',
+            return_value=self._mock_advertiser_with_hardware(),
+        ):
+            prompt = build_robot_prompt(goal)
+        assert prompt is not None, "build_robot_prompt returned None — hardware mock failed"
         assert 'ROBOT TASK AGENT' in prompt
         assert 'Navigate to charging station' in prompt
         assert 'navigate_to' in prompt
@@ -335,7 +352,12 @@ class TestRobotPromptBuilder:
             build_robot_prompt,
         )
         goal = {'title': 'Test', 'description': '', 'goal_type': 'robot'}
-        prompt = build_robot_prompt(goal)
+        with patch(
+            'integrations.robotics.capability_advertiser.get_capability_advertiser',
+            return_value=self._mock_advertiser_with_hardware(),
+        ):
+            prompt = build_robot_prompt(goal)
+        assert prompt is not None, "build_robot_prompt returned None — hardware mock failed"
         assert 'ALWAYS check get_robot_status()' in prompt
         assert 'Never compute trajectories' in prompt
 
@@ -413,8 +435,20 @@ class TestGoalRegistration:
             'title': 'Pick up the red cube',
             'description': 'Use gripper to grasp the red cube on the table.',
         }
-        prompt = GoalManager.build_prompt(goal_dict)
-        assert prompt is not None
+        mock_adv = MagicMock()
+        mock_adv.get_capabilities.return_value = {
+            'form_factor': 'arm',
+            'locomotion': None,
+            'manipulation': {'arms': 1, 'grippers': 1, 'dof': 6},
+            'sensors': {'camera': True},
+            'native_skills': [],
+        }
+        with patch(
+            'integrations.robotics.capability_advertiser.get_capability_advertiser',
+            return_value=mock_adv,
+        ):
+            prompt = GoalManager.build_prompt(goal_dict)
+        assert prompt is not None, "build_prompt returned None — hardware mock failed"
         assert 'ROBOT TASK AGENT' in prompt
         assert 'Pick up the red cube' in prompt
 

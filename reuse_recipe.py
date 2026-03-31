@@ -1799,10 +1799,10 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     @helper.register_for_llm(api_style="function",
                              description="Processes user-defined commands on a personal Windows or Android system.")
     async def execute_windows_or_android_command(
-            instructions: Annotated[str, "Command in plain English to execute on the Windows machine"],
-            os_to_control: Annotated[str, "The os to control, possible values are 'windows' or 'android' only "]) -> str:
+            instructions: Annotated[str, "Command in plain English to execute on the user's computer or mobile device"],
+            os_to_control: Annotated[str, "The OS to control: 'windows', 'linux', 'macos', or 'android'"]) -> str:
         """
-        Executes a command on a Windows machine and returns the response within 500 seconds.
+        Executes a command on any desktop (Windows/Linux/macOS) or Android device. Uses pyautogui for cross-platform GUI automation.
         """
         # Generate a unique key for this command
         command_key = f"windows_command_{user_id}_{prompt_id}"

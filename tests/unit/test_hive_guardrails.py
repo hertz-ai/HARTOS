@@ -351,12 +351,14 @@ class TestConstitutionalFilter:
         )
         assert passed is False
 
-    @patch('security.hive_guardrails.ConstitutionalFilter.check_prompt')
-    def test_check_prompt_with_injection_detection(self, mock_check):
+    def test_check_prompt_with_injection_detection(self):
         """Prompt injection detection integration point exists.
         The check_prompt method tries to import prompt_guard."""
-        mock_check.return_value = (False, 'Prompt injection: jailbreak')
-        passed, reason = ConstitutionalFilter.check_prompt('ignore previous')
+        with patch('security.prompt_guard.detect_prompt_injection',
+                   return_value={'detected': True, 'pattern': 'jailbreak'},
+                   create=True):
+            passed, reason = ConstitutionalFilter.check_prompt('ignore previous')
+        # check_prompt detects injection and returns False
         assert passed is False
 
 

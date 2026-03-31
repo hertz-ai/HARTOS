@@ -321,9 +321,11 @@ def register_ip_protection_tools(helper, assistant, user_id: str):
         try:
             git_commit = None
             try:
+                _kw = dict(capture_output=True, text=True, timeout=5)
+                if hasattr(subprocess, 'CREATE_NO_WINDOW'):
+                    _kw['creationflags'] = subprocess.CREATE_NO_WINDOW
                 result = subprocess.run(
-                    ['git', 'rev-parse', 'HEAD'],
-                    capture_output=True, text=True, timeout=5)
+                    ['git', 'rev-parse', 'HEAD'], **_kw)
                 if result.returncode == 0:
                     git_commit = result.stdout.strip()
             except Exception:

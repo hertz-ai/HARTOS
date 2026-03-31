@@ -514,11 +514,14 @@ class TestProductionFixes:
             _failed_attempts_lock)
 
         test_ip = '192.168.99.99'
-        # Clear any previous state
+        # Clear any previous state — use _data if available (real TTLCache),
+        # otherwise treat as plain dict (stub fallback).
         with _failed_attempts_lock:
-            if test_ip in _failed_attempts._data:
-                del _failed_attempts._data[test_ip]
-                _failed_attempts._timestamps.pop(test_ip, None)
+            _store = getattr(_failed_attempts, '_data', _failed_attempts)
+            if test_ip in _store:
+                del _store[test_ip]
+                if hasattr(_failed_attempts, '_timestamps'):
+                    _failed_attempts._timestamps.pop(test_ip, None)
 
         assert _check_brute_force(test_ip) is False
         for _ in range(10):
@@ -527,9 +530,11 @@ class TestProductionFixes:
 
         # Cleanup
         with _failed_attempts_lock:
-            if test_ip in _failed_attempts._data:
-                del _failed_attempts._data[test_ip]
-                _failed_attempts._timestamps.pop(test_ip, None)
+            _store = getattr(_failed_attempts, '_data', _failed_attempts)
+            if test_ip in _store:
+                del _store[test_ip]
+                if hasattr(_failed_attempts, '_timestamps'):
+                    _failed_attempts._timestamps.pop(test_ip, None)
 
     def test_world_model_health_endpoint_exists(self):
         """Verify world model health endpoint function exists in api.py."""

@@ -227,7 +227,12 @@ class AgentDaemon:
         from integrations.social.models import get_db, AgentGoal, Product
         from integrations.coding_agent.idle_detection import IdleDetectionService
         from .goal_manager import GoalManager, CODING_GOAL_TYPES
-        from .dispatch import dispatch_goal
+        from .dispatch import dispatch_goal, is_user_recently_active
+
+        # Yield LLM to user requests — don't compete for inference
+        if is_user_recently_active():
+            logger.debug("Agent daemon: user/CREATE active, yielding LLM")
+            return
 
         # RESOURCE GATE: throttle dispatch when system is under pressure
         # Prevents machine slowness while Nunba/HARTOS is running
@@ -289,6 +294,36 @@ class AgentDaemon:
             # gets re-dispatched every 30s tick even if the previous dispatch
             # is still running — causing repeated identical actions.
             _CONTINUOUS_COOLDOWN_S = 300  # 5 minutes
+
+            # Split goals into two queues:
+            #   - CREATE queue: goals without recipes (need LLM planning, 1 at a time)
+            #   - REUSE pool: goals with recipes (cheap replay, round-robin)
+            import hashlib as _hlib
+            _create_queue = []
+            _reuse_pool = []
+            for goal in goals:
+                _gh = int(_hlib.md5(str(goal.id).encode()).hexdigest()[:10], 16) % 100_000_000_000
+                _pid = str(max(1, _gh))
+                _recipe_path = os.path.join('prompts', f'{_pid}_0_recipe.json')
+                if os.path.exists(_recipe_path):
+                    _reuse_pool.append(goal)
+                else:
+                    _create_queue.append(goal)
+
+            # REUSE goals round-robin (cheap, can cycle through many per tick)
+            # CREATE goals sequential (1 at a time, rotated so each gets a turn)
+            if _create_queue:
+                _cr_offset = self._tick_count % len(_create_queue)
+                _create_queue = _create_queue[_cr_offset:] + _create_queue[:_cr_offset]
+            if _reuse_pool:
+                _re_offset = self._tick_count % len(_reuse_pool)
+                _reuse_pool = _reuse_pool[_re_offset:] + _reuse_pool[:_re_offset]
+
+            # Prioritize: 1 CREATE first (if any), then fill remaining slots with REUSE
+            goals = _create_queue[:1] + _reuse_pool + _create_queue[1:]
+
+            logger.debug(f"Goal split: {len(_create_queue)} need CREATE, "
+                         f"{len(_reuse_pool)} have recipes (REUSE)")
 
             for goal in goals:
                 if dispatched >= len(idle_agents) or dispatched >= max_concurrent:
@@ -506,6 +541,30 @@ class AgentDaemon:
                         ContentGenTracker.record_progress_snapshot(db, game_id)
                 except Exception as e:
                     logger.debug(f"Content gen monitor: {e}")
+
+                # Outreach follow-up checker: send due follow-ups every 5 ticks
+                try:
+                    from .outreach_crm_tools import check_pending_followups_daemon
+                    followup_result = check_pending_followups_daemon()
+                    sent = followup_result.get('sent', 0)
+                    if sent > 0:
+                        logger.info(f"Outreach follow-ups: sent {sent} follow-up email(s)")
+                except ImportError:
+                    pass  # outreach_crm_tools not available
+                except Exception as e:
+                    logger.debug(f"Outreach follow-up check: {e}")
+
+                # Journey engine tick: stage transitions, A/B analysis, channel routing
+                try:
+                    from .journey_engine import journey_daemon_tick
+                    journey_result = journey_daemon_tick()
+                    if journey_result.get('transitions', 0) > 0 or journey_result.get('actions', 0) > 0:
+                        logger.info(f"Journey engine: {journey_result.get('transitions', 0)} transitions, "
+                                    f"{journey_result.get('actions', 0)} actions")
+                except ImportError:
+                    pass  # journey_engine not available
+                except Exception as e:
+                    logger.debug(f"Journey engine tick: {e}")
 
             # Periodic auto-remediation: scan loopholes every Nth tick
             if self._tick_count % self._remediate_every == 0:

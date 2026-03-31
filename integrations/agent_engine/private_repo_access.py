@@ -12,7 +12,13 @@ import logging
 import os
 import re
 import subprocess
+import sys
 from typing import Dict, List, Optional
+
+# Windows: suppress console windows for all subprocess calls
+_SUBPROCESS_KW = {}
+if sys.platform == 'win32':
+    _SUBPROCESS_KW['creationflags'] = subprocess.CREATE_NO_WINDOW
 
 logger = logging.getLogger('hevolve_social')
 
@@ -137,7 +143,8 @@ class PrivateRepoAccessService:
                 ['gh', 'api', '--method', 'PUT',
                  f'repos/{owner}/{repo}/collaborators/{github_username}',
                  '-f', f'permission={permission}'],
-                capture_output=True, text=True, timeout=30)
+                capture_output=True, text=True, timeout=30,
+                **_SUBPROCESS_KW)
             if result.returncode == 0:
                 logger.info(
                     f"GitHub invite sent: {github_username} → "
@@ -202,7 +209,8 @@ class PrivateRepoAccessService:
             result = subprocess.run(
                 ['gh', 'api', '--method', 'DELETE',
                  f'repos/{owner}/{repo}/collaborators/{github_username}'],
-                capture_output=True, text=True, timeout=30)
+                capture_output=True, text=True, timeout=30,
+                **_SUBPROCESS_KW)
             if result.returncode == 0:
                 logger.info(
                     f"GitHub access revoked: {github_username} from "
@@ -301,7 +309,8 @@ class PrivateRepoAccessService:
                     ['gh', 'api',
                      f'repos/{owner}/{repo}/contents/{fpath}',
                      '--jq', '.content'],
-                    capture_output=True, text=True, timeout=30)
+                    capture_output=True, text=True, timeout=30,
+                    **_SUBPROCESS_KW)
                 if result.returncode == 0 and result.stdout.strip():
                     import base64
                     content = base64.b64decode(

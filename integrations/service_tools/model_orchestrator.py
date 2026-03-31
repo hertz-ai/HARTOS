@@ -113,7 +113,7 @@ class ModelOrchestrator:
                 'metal' if gpu.get('metal_available') else 'none')
             state['vram_total_gb'] = gpu.get('total_gb', 0.0)
             state['vram_free_gb'] = vram_manager.get_free_vram()
-            state['allocations'] = vram_manager.get_allocations()
+            state['allocations'] = vram_manager.get_allocations_display()
         except ImportError:
             pass
         try:
@@ -273,9 +273,12 @@ class ModelOrchestrator:
         if not pkg:
             return False
         try:
+            _kw = dict(capture_output=True, text=True, timeout=300)
+            if sys.platform == 'win32':
+                _kw['creationflags'] = subprocess.CREATE_NO_WINDOW
             result = subprocess.run(
                 [sys.executable, '-m', 'pip', 'install', pkg, '--quiet'],
-                capture_output=True, text=True, timeout=300)
+                **_kw)
             return result.returncode == 0
         except Exception as e:
             logger.error(f"pip install failed for {pkg}: {e}")
@@ -324,18 +327,24 @@ class ModelOrchestrator:
     }
 
     def _vram_key(self, entry: ModelEntry) -> str:
-        """Get the VRAMManager allocation key for a catalog entry."""
+        """Get the VRAMManager allocation key for a catalog entry.
+
+        For LLMs, always uses 'llm' — there's only one LLM loaded at a time
+        (llama-server is single-model). This makes registration idempotent
+        regardless of whether LlamaConfig or the Orchestrator registers first.
+        """
+        if entry.model_type == 'llm':
+            return 'llm'
         return self._CATALOG_TO_VRAM_KEY.get(entry.id, entry.id)
 
     def _register_vram(self, entry: ModelEntry, run_mode: str) -> None:
-        """Register VRAM allocation with the global VRAMManager singleton."""
+        """Register VRAM allocation — idempotent (same key = overwrite, not stack)."""
         if run_mode != 'gpu' or entry.vram_gb <= 0:
             return
         try:
             from integrations.service_tools.vram_manager import vram_manager
             tool_key = self._vram_key(entry)
-            if tool_key not in vram_manager._allocations:
-                vram_manager._allocations[tool_key] = entry.vram_gb
+            vram_manager._allocations[tool_key] = entry.vram_gb
             logger.info(f"VRAM allocated: {tool_key} = {entry.vram_gb}GB")
         except ImportError:
             pass

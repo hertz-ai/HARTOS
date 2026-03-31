@@ -201,7 +201,7 @@ class TestBenchmarkTracker:
 # ─── Tool Router Tests ───
 
 class TestToolRouter:
-    @patch('integrations.coding_agent.tool_backends.get_available_backends')
+    @patch('integrations.coding_agent.tool_router.get_available_backends')
     def test_user_override(self, mock_backends):
         mock_kilo = MagicMock()
         mock_kilo.name = 'kilocode'

@@ -19,6 +19,28 @@ import pytest
 # without the real implementation (which may pull in Redis, etc.)
 _real_ttl_cache_store = {}
 
+# ---------------------------------------------------------------------------
+# Save original sys.modules entries BEFORE any stubbing.
+# After importing lifecycle_hooks, we IMMEDIATELY restore originals so that
+# other test files collected later get the real modules (not our stubs).
+# ---------------------------------------------------------------------------
+_ALL_STUB_NAMES = [
+    "core", "core.session_cache",
+    "helper",
+    "agent_ledger",
+    "agent_ledger.factory",
+    "core.platform",
+    "core.platform.events",
+    "security",
+    "security.immutable_audit_log",
+    "recipe_experience",
+    "integrations",
+    "integrations.social",
+    "integrations.social.consent_service",
+    "integrations.social.models",
+]
+_original_modules = {name: sys.modules.get(name) for name in _ALL_STUB_NAMES}
+
 
 class _StubTTLCache(dict):
     """Minimal TTLCache stand-in that behaves like a dict with .get()."""
@@ -42,7 +64,7 @@ sys.modules.setdefault("core", types.ModuleType("core"))
 sys.modules["core.session_cache"] = _session_cache_mod
 
 # Stub other imports that lifecycle_hooks touches at import time or runtime
-for mod_name in [
+for _mod_name in [
     "helper",
     "agent_ledger",
     "agent_ledger.factory",
@@ -56,8 +78,8 @@ for mod_name in [
     "integrations.social.consent_service",
     "integrations.social.models",
 ]:
-    if mod_name not in sys.modules:
-        sys.modules[mod_name] = types.ModuleType(mod_name)
+    if _mod_name not in sys.modules:
+        sys.modules[_mod_name] = types.ModuleType(_mod_name)
 
 # Provide PROMPTS_DIR so the import doesn't fail
 sys.modules["helper"].PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "_prompts_test")
@@ -82,6 +104,7 @@ class _FakeLedgerTaskStatus(_Enum):
                           _FakeLedgerTaskStatus.TERMINATED)
 
 
+_orig_agent_ledger_TaskStatus = getattr(sys.modules.get("agent_ledger"), "TaskStatus", None)
 sys.modules["agent_ledger"].TaskStatus = _FakeLedgerTaskStatus
 
 # ---------------------------------------------------------------------------
@@ -126,6 +149,37 @@ from lifecycle_hooks import (
     restore_action_states_from_ledger,
     _ledger_registry,
 )
+
+
+# ---------------------------------------------------------------------------
+# IMMEDIATELY restore sys.modules after importing lifecycle_hooks.
+# The stubs were only needed for the import above; lifecycle_hooks caches
+# its own references internally, so removing the stubs won't break it.
+# This prevents cross-file pollution when pytest collects other test files.
+# ---------------------------------------------------------------------------
+
+def _restore_modules():
+    for name, original in _original_modules.items():
+        if original is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = original
+
+_restore_modules()
+
+# Restore agent_ledger.TaskStatus to prevent cross-test pollution
+if _orig_agent_ledger_TaskStatus is not None:
+    import agent_ledger
+    agent_ledger.TaskStatus = _orig_agent_ledger_TaskStatus
+
+# After restoring modules, try to get the REAL TaskStatus so that tests
+# using _FakeLedgerTaskStatus are compatible with lifecycle_hooks'
+# lazy ``from agent_ledger import TaskStatus``.
+try:
+    from agent_ledger import TaskStatus as _LedgerTaskStatus
+except (ImportError, Exception):
+    # agent_ledger not installed — keep using the fake
+    _LedgerTaskStatus = _FakeLedgerTaskStatus
 
 
 # ---------------------------------------------------------------------------
@@ -651,7 +705,7 @@ class TestAutoSyncToLedger:
 
     def test_skip_noop_transition(self):
         """IN_PROGRESS -> IN_PROGRESS (same ledger status) should be skipped."""
-        task = self._make_task(_FakeLedgerTaskStatus.IN_PROGRESS)
+        task = self._make_task(_LedgerTaskStatus.IN_PROGRESS)
         ledger = MagicMock()
         ledger.tasks = {"action_1": task}
         _ledger_registry[UP] = ledger
@@ -660,7 +714,7 @@ class TestAutoSyncToLedger:
         ledger.update_task_status.assert_not_called()
 
     def test_paused_to_in_progress_resumes(self):
-        task = self._make_task(_FakeLedgerTaskStatus.PAUSED)
+        task = self._make_task(_LedgerTaskStatus.PAUSED)
         ledger = MagicMock()
         ledger.tasks = {"action_1": task}
         _ledger_registry[UP] = ledger
@@ -669,7 +723,7 @@ class TestAutoSyncToLedger:
         assert task.blocked_reason is None
 
     def test_blocked_to_in_progress_resumes(self):
-        task = self._make_task(_FakeLedgerTaskStatus.BLOCKED)
+        task = self._make_task(_LedgerTaskStatus.BLOCKED)
         ledger = MagicMock()
         ledger.tasks = {"action_1": task}
         _ledger_registry[UP] = ledger
@@ -677,7 +731,7 @@ class TestAutoSyncToLedger:
         task.resume.assert_called_once()
 
     def test_claims_ownership_on_in_progress(self):
-        task = self._make_task(_FakeLedgerTaskStatus.PENDING, is_owned=False)
+        task = self._make_task(_LedgerTaskStatus.PENDING, is_owned=False)
         ledger = MagicMock()
         ledger.tasks = {"action_1": task}
         _ledger_registry[UP] = ledger
@@ -685,7 +739,7 @@ class TestAutoSyncToLedger:
         task.claim.assert_called_once()
 
     def test_sets_blocked_reason_for_preview_pending(self):
-        task = self._make_task(_FakeLedgerTaskStatus.PENDING)
+        task = self._make_task(_LedgerTaskStatus.PENDING)
         ledger = MagicMock()
         ledger.tasks = {"action_1": task}
         _ledger_registry[UP] = ledger
@@ -819,7 +873,7 @@ class TestBlockResumeUserInput:
 
     def test_block_task_not_in_progress(self):
         task = MagicMock()
-        task.status = _FakeLedgerTaskStatus.PENDING
+        task.status = _LedgerTaskStatus.PENDING
         ledger = MagicMock()
         ledger.tasks = {"action_1": task}
         _ledger_registry[UP] = ledger
@@ -828,7 +882,7 @@ class TestBlockResumeUserInput:
 
     def test_resume_task_not_blocked(self):
         task = MagicMock()
-        task.status = _FakeLedgerTaskStatus.IN_PROGRESS
+        task.status = _LedgerTaskStatus.IN_PROGRESS
         ledger = MagicMock()
         ledger.tasks = {"action_1": task}
         _ledger_registry[UP] = ledger
@@ -843,9 +897,9 @@ class TestBlockResumeUserInput:
 class TestRestoreFromLedger:
     def test_restore_actions(self):
         task1 = MagicMock()
-        task1.status = _FakeLedgerTaskStatus.COMPLETED
+        task1.status = _LedgerTaskStatus.COMPLETED
         task2 = MagicMock()
-        task2.status = _FakeLedgerTaskStatus.FAILED
+        task2.status = _LedgerTaskStatus.FAILED
         ledger = MagicMock()
         ledger.tasks = {"action_1": task1, "action_2": task2, "not_action": MagicMock()}
         count = restore_action_states_from_ledger(UP, ledger)
@@ -855,7 +909,7 @@ class TestRestoreFromLedger:
 
     def test_restore_skips_bad_task_ids(self):
         task = MagicMock()
-        task.status = _FakeLedgerTaskStatus.IN_PROGRESS
+        task.status = _LedgerTaskStatus.IN_PROGRESS
         ledger = MagicMock()
         ledger.tasks = {"action_abc": task}
         count = restore_action_states_from_ledger(UP, ledger)

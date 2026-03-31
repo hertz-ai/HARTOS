@@ -103,6 +103,37 @@ def _build_agent_catalog(prompts_dir: str = None) -> List[Dict]:
         except Exception:
             pass
 
+    # Hive recipes — federated index from peer nodes
+    try:
+        from integrations.agent_engine.federated_aggregator import get_federated_aggregator
+        agg = get_federated_aggregator()
+        hive_index = agg.aggregate_recipes()
+        if hive_index and isinstance(hive_index, dict):
+            for rid, info in hive_index.items():
+                if isinstance(info, dict) and info.get('name'):
+                    catalog.append({
+                        'id': rid,
+                        'name': info['name'],
+                        'description': info.get('description', ''),
+                        'source': 'hive',
+                    })
+    except Exception:
+        pass
+
+    # Google A2A registered agents
+    try:
+        from integrations.google_a2a.dynamic_agent_registry import get_registry
+        a2a_registry = get_registry()
+        for agent in a2a_registry.list_agents():
+            catalog.append({
+                'id': agent.get('id', ''),
+                'name': agent.get('name', ''),
+                'description': agent.get('description', ''),
+                'source': 'a2a',
+            })
+    except Exception:
+        pass
+
     return catalog
 
 

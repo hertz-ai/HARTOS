@@ -194,7 +194,7 @@ class TestTTLCacheExpiration:
         c = TTLCache(ttl_seconds=0)  # instant expiry
         c['k'] = 'val'
         # Expired immediately (ttl=0, any elapsed > 0 is expired)
-        time.sleep(0.01)
+        time.sleep(0.05)
         with pytest.raises(KeyError):
             _ = c['k']
 
@@ -202,7 +202,7 @@ class TestTTLCacheExpiration:
         from core.session_cache import TTLCache
         c = TTLCache(ttl_seconds=0)
         c['k'] = 1
-        time.sleep(0.01)
+        time.sleep(0.05)
         assert 'k' not in c
 
     def test_len_excludes_expired(self):
@@ -219,7 +219,7 @@ class TestTTLCacheExpiration:
         from core.session_cache import TTLCache
         c = TTLCache(ttl_seconds=0)
         c['k'] = 'val'
-        time.sleep(0.01)
+        time.sleep(0.05)
         assert c.get('k', 'gone') == 'gone'
 
     def test_stats_shows_expired(self):
