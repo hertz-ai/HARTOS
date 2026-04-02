@@ -295,11 +295,12 @@ class TestPopulateSttCatalog:
 class TestPopulateVlmCatalog:
     """Tests for populate_vlm_catalog from integrations.vision.lightweight_backend."""
 
-    # qwen3vl, minicpm-v2, mobilevlm, clip = 4 entries
-    EXPECTED_COUNT = 4
+    # qwen3vl, qwen08b (caption), minicpm-v2, mobilevlm, clip = 5 entries
+    EXPECTED_COUNT = 5
 
     EXPECTED_IDS = {
         'vlm-qwen3vl',
+        'vlm-qwen08b',
         'vlm-minicpm-v2',
         'vlm-mobilevlm',
         'vlm-clip',
@@ -519,7 +520,7 @@ class TestPopulateFromSubsystems:
 
     EXPECTED_TTS_COUNT = 9
     EXPECTED_STT_COUNT = 11
-    EXPECTED_VLM_COUNT = 4
+    EXPECTED_VLM_COUNT = 5  # +1 for qwen08b caption model
     EXPECTED_VIDEOGEN_COUNT = 2
     EXPECTED_TOTAL = EXPECTED_TTS_COUNT + EXPECTED_STT_COUNT + EXPECTED_VLM_COUNT + EXPECTED_VIDEOGEN_COUNT
 

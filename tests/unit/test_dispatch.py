@@ -572,6 +572,7 @@ class TestNotifyWatchdog:
         """_notify_watchdog_llm_end clears markers and sends heartbeats."""
         mock_wd = MagicMock()
         mock_watchdog_mod = MagicMock()
+        mock_wd.registered_names.return_value = ['agent_daemon', 'coding_daemon']
         mock_watchdog_mod.get_watchdog.return_value = mock_wd
 
         with patch.dict('sys.modules', {
@@ -580,7 +581,7 @@ class TestNotifyWatchdog:
         }):
             dispatch_mod._notify_watchdog_llm_end()
 
-        # Called for both coding_daemon and agent_daemon
+        # Called for all registered daemons
         assert mock_wd.clear_llm_call.call_count == 2
         assert mock_wd.heartbeat.call_count == 2
 
