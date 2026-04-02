@@ -551,11 +551,12 @@ class TestNotifyWatchdog:
     def test_llm_start_marks_daemon(self):
         """_notify_watchdog_llm_start marks the daemon in watchdog."""
         mock_wd = MagicMock()
+        # is_registered returns True for exact thread name match
         mock_wd.is_registered.return_value = True
         mock_watchdog_mod = MagicMock()
         mock_watchdog_mod.get_watchdog.return_value = mock_wd
 
-        # Set thread name to include daemon name
+        # Set thread name — exact match path is used when is_registered returns True
         original_name = threading.current_thread().name
         threading.current_thread().name = 'coding_daemon_worker'
         try:
@@ -564,7 +565,9 @@ class TestNotifyWatchdog:
                 'security.node_watchdog': mock_watchdog_mod,
             }):
                 dispatch_mod._notify_watchdog_llm_start()
-            mock_wd.mark_in_llm_call.assert_called_with('coding_daemon')
+            # Exact match: is_registered('coding_daemon_worker') == True
+            # → mark_in_llm_call('coding_daemon_worker')
+            mock_wd.mark_in_llm_call.assert_called_with('coding_daemon_worker')
         finally:
             threading.current_thread().name = original_name
 
@@ -614,9 +617,10 @@ class TestNotifyWatchdog:
             dispatch_mod._notify_watchdog_llm_end()
 
     def test_llm_start_agent_daemon_thread(self):
-        """Thread named agent_daemon is correctly identified."""
+        """Thread named agent_daemon_tick matches via partial registered_names lookup."""
         mock_wd = MagicMock()
-        mock_wd.is_registered.return_value = False
+        mock_wd.is_registered.return_value = False  # Exact match fails
+        mock_wd.registered_names.return_value = ['agent_daemon', 'coding_daemon']
         mock_watchdog_mod = MagicMock()
         mock_watchdog_mod.get_watchdog.return_value = mock_wd
 
@@ -628,6 +632,7 @@ class TestNotifyWatchdog:
                 'security.node_watchdog': mock_watchdog_mod,
             }):
                 dispatch_mod._notify_watchdog_llm_start()
+            # Partial match: 'agent_daemon' in 'agent_daemon_tick'
             mock_wd.mark_in_llm_call.assert_called_with('agent_daemon')
         finally:
             threading.current_thread().name = original_name

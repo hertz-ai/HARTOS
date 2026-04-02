@@ -154,10 +154,11 @@ class TestBackendRegistry:
     """Verify backend registry."""
 
     def test_backends_registered(self):
-        assert len(_BACKENDS) == 5
+        assert len(_BACKENDS) == 6  # +1 for qwen08b caption model
 
     def test_all_names_present(self):
         assert 'qwen3vl' in _BACKENDS
+        assert 'qwen08b' in _BACKENDS
         assert 'minicpm' in _BACKENDS
         assert 'mobilevlm' in _BACKENDS
         assert 'clip' in _BACKENDS
@@ -165,7 +166,7 @@ class TestBackendRegistry:
 
     def test_list_available_backends(self):
         results = list_available_backends()
-        assert len(results) == 5
+        assert len(results) == 6
         names = [r['name'] for r in results]
         assert 'none' in names
         # NoneBackend is always available
