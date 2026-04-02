@@ -493,7 +493,7 @@ class TestQwen3VLApiCall:
         messages = [{"role": "user", "content": "test"}]
 
         # requests is imported inside _call_api, so patch at the top-level module
-        with patch('requests.post', return_value=mock_resp) as mock_post:
+        with patch('core.http_pool.pooled_post', return_value=mock_resp) as mock_post:
             backend._call_api(messages)
             _, kwargs = mock_post.call_args
             assert kwargs['timeout'] == 42
@@ -505,7 +505,7 @@ class TestQwen3VLApiCall:
         backend = Qwen3VLBackend()
         messages = [{"role": "user", "content": "test"}]
 
-        with patch('requests.post', side_effect=ConnectionError("Connection refused")):
+        with patch('core.http_pool.pooled_post', side_effect=ConnectionError("Connection refused")):
             with pytest.raises(ConnectionError):
                 backend._call_api(messages)
 
@@ -520,7 +520,7 @@ class TestQwen3VLApiCall:
         backend = Qwen3VLBackend()
         messages = [{"role": "user", "content": "test"}]
 
-        with patch('requests.post', return_value=mock_resp):
+        with patch('core.http_pool.pooled_post', return_value=mock_resp):
             with pytest.raises(Exception, match="500 Server Error"):
                 backend._call_api(messages)
 
@@ -570,7 +570,8 @@ class TestQwen3VLConfiguration:
         from integrations.vlm.qwen3vl_backend import Qwen3VLBackend
         backend = Qwen3VLBackend()
 
-        assert backend.base_url == 'http://localhost:8000/v1'
+        from core.port_registry import get_port
+        assert backend.base_url == f'http://127.0.0.1:{get_port("llm")}/v1'
         assert backend.model_name == 'Qwen3-VL-2B-Instruct'
         assert backend.api_key == 'dummy'
         assert backend.timeout == 60
@@ -1593,7 +1594,7 @@ class TestLocalOmniParser:
         import requests as real_requests
         # Use requests.ConnectionError (subclass of RequestException) so the
         # except (requests.RequestException, ValueError) clause catches it.
-        with patch('requests.post', side_effect=real_requests.ConnectionError("refused")):
+        with patch('core.http_pool.pooled_post', side_effect=real_requests.ConnectionError("refused")):
             from integrations.vlm.local_omniparser import _parse_http
             result = _parse_http("dummyb64")
 
