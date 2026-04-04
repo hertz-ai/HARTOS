@@ -1052,9 +1052,11 @@ class ResourceGovernor:
                 next_benchmark = now + _jitter(BENCHMARK_INTERVAL)
 
     def _proactive_check_signals(self) -> None:
-        """Check hive signal feed for actionable insights."""
+        """Check hive signals AND run agentic service discovery."""
         if self._mode != MODE_IDLE:
             return
+
+        # Hive signal feed
         try:
             from integrations.channels.hive_signal_bridge import get_signal_bridge
             bridge = get_signal_bridge()
@@ -1070,6 +1072,19 @@ class ResourceGovernor:
                 })
         except Exception as e:
             logger.debug("ResourceGovernor: signal check failed: %s", e)
+
+        # Agentic service discovery — autonomously find new providers/models
+        try:
+            from integrations.providers.discovery_agent import get_discovery_agent
+            discoveries = get_discovery_agent().run_discovery_cycle()
+            if discoveries:
+                with self._lock:
+                    self._stats['proactive_actions'] += 1
+                self._emit_proactive_event('service_discovery', {
+                    'discoveries': len(discoveries),
+                })
+        except Exception as e:
+            logger.debug("ResourceGovernor: discovery agent failed: %s", e)
 
     def _proactive_check_tasks(self) -> None:
         """Check if any pending hive tasks match this node's capabilities."""
