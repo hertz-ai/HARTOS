@@ -84,6 +84,357 @@ MODE_SLEEP = 'sleep'
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# ResourceEnforcer — hard OS-level process caps
+# ═══════════════════════════════════════════════════════════════════════
+
+class ResourceEnforcer:
+    """Enforce hard resource caps at the OS level.
+
+    The governor ADVISES. The enforcer CONSTRAINS.
+    Even buggy code cannot exceed the caps set here.
+
+    Platform-specific mechanisms:
+      Windows: Job Object (CPU rate limit + memory limit on process tree)
+      Linux:   cgroup v2 (cpu.max + memory.max), fallback RLIMIT_AS
+      macOS:   RLIMIT_AS (soft cap) + process priority
+
+    Process priority: BELOW_NORMAL on Windows, nice +10 on POSIX.
+    This alone prevents Nunba from competing with foreground apps.
+    """
+
+    def __init__(self):
+        self._enforced = False
+        self._job_handle = None   # Windows Job Object handle
+        self._cgroup_path = None  # Linux cgroup path
+        self._original_nice = None
+
+    def enforce(self, cpu_fraction: float = 0.75, ram_fraction: float = 0.75,
+                gpu_fraction: float = 0.75):
+        """Apply hard caps. Call once at startup.
+
+        Args:
+            cpu_fraction: Max fraction of total CPU Nunba can use (0.75 = 75%)
+            ram_fraction: Max fraction of total RAM Nunba can use
+            gpu_fraction: Max fraction of GPU Nunba can use (advisory for CUDA)
+        """
+        if self._enforced:
+            return
+
+        # Always subtract system buffer from the requested fraction
+        total_ram_gb = self._get_total_ram_gb()
+        usable_ram_gb = max(0.5, total_ram_gb * ram_fraction - SYSTEM_BUFFER_RAM_GB)
+
+        total_cores = os.cpu_count() or 4
+        usable_cores = max(1, int(total_cores * (cpu_fraction - SYSTEM_BUFFER_CPU_FRACTION)))
+
+        logger.info("ResourceEnforcer: total_ram=%.1fGB, cap=%.1fGB, "
+                     "total_cores=%d, cap_cores=%d",
+                     total_ram_gb, usable_ram_gb, total_cores, usable_cores)
+
+        self._set_process_priority()
+        self._enforce_cpu(cpu_fraction, usable_cores, total_cores)
+        self._enforce_ram(usable_ram_gb)
+        self._enforce_gpu(gpu_fraction)
+        self._enforced = True
+        logger.info("ResourceEnforcer: hard caps applied")
+
+    def update_caps(self, mode: str):
+        """Tighten or relax caps based on governor mode.
+
+        ACTIVE: tight (25% CPU, 50% RAM, no GPU)
+        IDLE:   relaxed (75% CPU, 75% RAM, GPU allowed)
+        SLEEP:  minimal (5% CPU, 25% RAM, no GPU)
+        """
+        if not self._enforced:
+            return
+
+        caps = {
+            MODE_ACTIVE: (0.25, 0.50, 0.0),
+            MODE_IDLE:   (0.75, 0.75, 0.75),
+            MODE_SLEEP:  (0.05, 0.25, 0.0),
+        }
+        cpu_frac, ram_frac, gpu_frac = caps.get(mode, (0.50, 0.50, 0.0))
+
+        total_ram_gb = self._get_total_ram_gb()
+        usable_ram_gb = max(0.5, total_ram_gb * ram_frac - SYSTEM_BUFFER_RAM_GB)
+        total_cores = os.cpu_count() or 4
+
+        self._enforce_cpu(cpu_frac, max(1, int(total_cores * cpu_frac)), total_cores)
+        self._enforce_ram(usable_ram_gb)
+        self._enforce_gpu(gpu_frac)
+
+    # ── Process priority ──────────────────────────────────────────────
+
+    def _set_process_priority(self):
+        """Set process to below-normal priority so foreground apps always win."""
+        try:
+            if sys.platform == 'win32':
+                # BELOW_NORMAL_PRIORITY_CLASS = 0x4000
+                kernel32 = ctypes.windll.kernel32
+                handle = kernel32.GetCurrentProcess()
+                kernel32.SetPriorityClass(handle, 0x4000)
+                logger.info("ResourceEnforcer: set BELOW_NORMAL priority (Windows)")
+            else:
+                self._original_nice = os.nice(0)
+                os.nice(10)  # Lower priority (higher nice = lower priority)
+                logger.info("ResourceEnforcer: set nice +10 (POSIX)")
+        except Exception as e:
+            logger.debug("ResourceEnforcer: priority set failed: %s", e)
+
+    # ── CPU enforcement ───────────────────────────────────────────────
+
+    def _enforce_cpu(self, cpu_fraction: float, usable_cores: int,
+                     total_cores: int):
+        """Enforce CPU cap via Job Object (Windows) or cgroup (Linux)."""
+        if sys.platform == 'win32':
+            self._enforce_cpu_windows(cpu_fraction)
+        elif sys.platform == 'linux':
+            self._enforce_cpu_linux(cpu_fraction, total_cores)
+        # macOS: no hard CPU cap, rely on nice priority + psutil affinity
+
+        # CPU affinity: restrict to subset of cores
+        psutil = _try_import_psutil()
+        if psutil is not None:
+            try:
+                p = psutil.Process()
+                available = list(range(total_cores))
+                # Use last N cores (leave first cores for OS/foreground)
+                target = available[-usable_cores:] if usable_cores < total_cores else available
+                p.cpu_affinity(target)
+                logger.info("ResourceEnforcer: CPU affinity set to cores %s", target)
+            except Exception as e:
+                logger.debug("ResourceEnforcer: CPU affinity failed: %s", e)
+
+    def _enforce_cpu_windows(self, cpu_fraction: float):
+        """Windows: use Job Object CPU rate limit."""
+        try:
+            kernel32 = ctypes.windll.kernel32
+
+            # CreateJobObjectW
+            job = kernel32.CreateJobObjectW(None, None)
+            if not job:
+                logger.debug("ResourceEnforcer: CreateJobObject failed")
+                return
+
+            # JOBOBJECT_CPU_RATE_CONTROL_INFORMATION
+            # Enable CPU rate control with hard cap
+            class JOBOBJECT_CPU_RATE_CONTROL_INFORMATION(ctypes.Structure):
+                _fields_ = [
+                    ('ControlFlags', ctypes.c_ulong),
+                    ('Value', ctypes.c_ulong),  # Union, using CpuRate
+                ]
+
+            # JOB_OBJECT_CPU_RATE_CONTROL_ENABLE = 0x1
+            # JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP = 0x4
+            rate_info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION()
+            rate_info.ControlFlags = 0x1 | 0x4  # Enable + Hard cap
+            # CpuRate is in units of 1/100th of a percent (100 = 1%)
+            rate_info.Value = max(100, int(cpu_fraction * 10000))
+
+            # SetInformationJobObject with JobObjectCpuRateControlInformation (15)
+            kernel32.SetInformationJobObject(
+                job, 15, ctypes.byref(rate_info), ctypes.sizeof(rate_info))
+
+            # Assign current process to the Job Object
+            kernel32.AssignProcessToJobObject(
+                job, kernel32.GetCurrentProcess())
+
+            self._job_handle = job
+            logger.info("ResourceEnforcer: Windows Job Object CPU rate = %.0f%%",
+                         cpu_fraction * 100)
+        except Exception as e:
+            logger.debug("ResourceEnforcer: Windows Job Object failed: %s", e)
+
+    def _enforce_cpu_linux(self, cpu_fraction: float, total_cores: int):
+        """Linux: use cgroup v2 cpu.max."""
+        try:
+            # Try cgroup v2
+            cg_path = f'/sys/fs/cgroup/nunba_{os.getpid()}'
+            if os.path.isdir('/sys/fs/cgroup/cgroup.controllers'):
+                os.makedirs(cg_path, exist_ok=True)
+                period = 100000  # 100ms
+                quota = int(period * cpu_fraction * total_cores)
+                with open(os.path.join(cg_path, 'cpu.max'), 'w') as f:
+                    f.write(f'{quota} {period}')
+                # Move current process into the cgroup
+                with open(os.path.join(cg_path, 'cgroup.procs'), 'w') as f:
+                    f.write(str(os.getpid()))
+                self._cgroup_path = cg_path
+                logger.info("ResourceEnforcer: cgroup v2 cpu.max = %d/%d (%.0f%%)",
+                             quota, period, cpu_fraction * 100)
+        except PermissionError:
+            logger.debug("ResourceEnforcer: cgroup v2 requires root, skipping")
+        except Exception as e:
+            logger.debug("ResourceEnforcer: cgroup cpu failed: %s", e)
+
+    # ── RAM enforcement ───────────────────────────────────────────────
+
+    def _enforce_ram(self, max_ram_gb: float):
+        """Enforce RAM cap via Job Object (Windows), cgroup (Linux), or RLIMIT."""
+        max_bytes = int(max_ram_gb * 1024 * 1024 * 1024)
+
+        if sys.platform == 'win32':
+            self._enforce_ram_windows(max_bytes)
+        elif sys.platform == 'linux':
+            self._enforce_ram_linux(max_bytes)
+        else:
+            self._enforce_ram_rlimit(max_bytes)
+
+    def _enforce_ram_windows(self, max_bytes: int):
+        """Windows: Job Object memory limit."""
+        if not self._job_handle:
+            return
+        try:
+            kernel32 = ctypes.windll.kernel32
+
+            # JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+            class IO_COUNTERS(ctypes.Structure):
+                _fields_ = [('_' + str(i), ctypes.c_ulonglong) for i in range(6)]
+
+            class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+                _fields_ = [
+                    ('PerProcessUserTimeLimit', ctypes.c_longlong),
+                    ('PerJobUserTimeLimit', ctypes.c_longlong),
+                    ('LimitFlags', ctypes.c_ulong),
+                    ('MinimumWorkingSetSize', ctypes.c_size_t),
+                    ('MaximumWorkingSetSize', ctypes.c_size_t),
+                    ('ActiveProcessLimit', ctypes.c_ulong),
+                    ('Affinity', ctypes.c_size_t),
+                    ('PriorityClass', ctypes.c_ulong),
+                    ('SchedulingClass', ctypes.c_ulong),
+                ]
+
+            class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+                _fields_ = [
+                    ('BasicLimitInformation', JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                    ('IoInfo', IO_COUNTERS),
+                    ('ProcessMemoryLimit', ctypes.c_size_t),
+                    ('JobMemoryLimit', ctypes.c_size_t),
+                    ('PeakProcessMemoryUsed', ctypes.c_size_t),
+                    ('PeakJobMemoryUsed', ctypes.c_size_t),
+                ]
+
+            info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            # JOB_OBJECT_LIMIT_JOB_MEMORY = 0x200
+            info.BasicLimitInformation.LimitFlags = 0x200
+            info.JobMemoryLimit = max_bytes
+
+            # SetInformationJobObject with JobObjectExtendedLimitInformation (9)
+            kernel32.SetInformationJobObject(
+                self._job_handle, 9, ctypes.byref(info), ctypes.sizeof(info))
+
+            logger.info("ResourceEnforcer: Windows Job memory limit = %.1f GB",
+                         max_bytes / (1024**3))
+        except Exception as e:
+            logger.debug("ResourceEnforcer: Windows memory limit failed: %s", e)
+
+    def _enforce_ram_linux(self, max_bytes: int):
+        """Linux: cgroup v2 memory.max."""
+        if self._cgroup_path:
+            try:
+                with open(os.path.join(self._cgroup_path, 'memory.max'), 'w') as f:
+                    f.write(str(max_bytes))
+                logger.info("ResourceEnforcer: cgroup memory.max = %.1f GB",
+                             max_bytes / (1024**3))
+                return
+            except Exception as e:
+                logger.debug("ResourceEnforcer: cgroup memory failed: %s", e)
+
+        self._enforce_ram_rlimit(max_bytes)
+
+    def _enforce_ram_rlimit(self, max_bytes: int):
+        """POSIX: RLIMIT_AS (soft cap — process gets MemoryError on exceed)."""
+        try:
+            import resource
+            soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+            resource.setrlimit(resource.RLIMIT_AS, (max_bytes, hard))
+            logger.info("ResourceEnforcer: RLIMIT_AS = %.1f GB",
+                         max_bytes / (1024**3))
+        except Exception as e:
+            logger.debug("ResourceEnforcer: RLIMIT_AS failed: %s", e)
+
+    # ── GPU enforcement ───────────────────────────────────────────────
+
+    def _enforce_gpu(self, gpu_fraction: float):
+        """Enforce GPU cap via CUDA environment variables.
+
+        CUDA_MPS_ACTIVE_THREAD_PERCENTAGE limits GPU SM utilization.
+        CUDA_VISIBLE_DEVICES can restrict which GPUs are used.
+        Also reserves SYSTEM_BUFFER_VRAM_GB via VRAMManager budget.
+        """
+        if gpu_fraction <= 0:
+            # No GPU allowed in this mode
+            os.environ['CUDA_VISIBLE_DEVICES'] = ''
+            return
+
+        pct = max(10, int(gpu_fraction * 100))
+        os.environ['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE'] = str(pct)
+
+        # Restore GPU visibility if previously hidden
+        if os.environ.get('CUDA_VISIBLE_DEVICES') == '':
+            os.environ.pop('CUDA_VISIBLE_DEVICES', None)
+
+        # Set VRAM budget via lifecycle (leaves buffer for other apps)
+        try:
+            from integrations.service_tools.vram_manager import vram_manager
+            info = vram_manager.detect_gpu()
+            total_vram = info.get('total_gb', 0)
+            if total_vram > 0:
+                budget = max(0.5, total_vram * gpu_fraction - SYSTEM_BUFFER_VRAM_GB)
+                os.environ['HARTOS_VRAM_BUDGET_GB'] = str(round(budget, 1))
+                logger.info("ResourceEnforcer: GPU %d%% SM, VRAM budget %.1fGB "
+                             "(total %.1fGB, buffer %.1fGB)",
+                             pct, budget, total_vram, SYSTEM_BUFFER_VRAM_GB)
+        except Exception:
+            pass
+
+    # ── Helpers ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _get_total_ram_gb() -> float:
+        psutil = _try_import_psutil()
+        if psutil:
+            try:
+                return psutil.virtual_memory().total / (1024**3)
+            except Exception:
+                pass
+        # Windows fallback
+        if sys.platform == 'win32':
+            try:
+                class MEMORYSTATUSEX(ctypes.Structure):
+                    _fields_ = [
+                        ('dwLength', ctypes.c_ulong),
+                        ('dwMemoryLoad', ctypes.c_ulong),
+                        ('ullTotalPhys', ctypes.c_ulonglong),
+                        ('ullAvailPhys', ctypes.c_ulonglong),
+                        ('ullTotalPageFile', ctypes.c_ulonglong),
+                        ('ullAvailPageFile', ctypes.c_ulonglong),
+                        ('ullTotalVirtual', ctypes.c_ulonglong),
+                        ('ullAvailVirtual', ctypes.c_ulonglong),
+                        ('ullAvailExtendedVirtual', ctypes.c_ulonglong),
+                    ]
+                ms = MEMORYSTATUSEX()
+                ms.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+                ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms))
+                return ms.ullTotalPhys / (1024**3)
+            except Exception:
+                pass
+        return 8.0  # Safe default
+
+
+# Module-level enforcer singleton
+_enforcer: Optional[ResourceEnforcer] = None
+
+
+def get_enforcer() -> ResourceEnforcer:
+    """Get or create the singleton ResourceEnforcer."""
+    global _enforcer
+    if _enforcer is None:
+        _enforcer = ResourceEnforcer()
+    return _enforcer
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Helpers — platform-agnostic resource detection (psutil optional)
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -165,6 +516,13 @@ class ResourceGovernor:
             self._running = True
             self._cancel_event.clear()
             self._stats['uptime_start'] = time.time()
+
+        # Apply hard OS-level resource caps at startup
+        try:
+            enforcer = get_enforcer()
+            enforcer.enforce(cpu_fraction=0.75, ram_fraction=0.75, gpu_fraction=0.75)
+        except Exception as e:
+            logger.warning("ResourceEnforcer failed at startup: %s", e)
 
         self._monitor_thread = threading.Thread(
             target=self._monitor_loop,
@@ -292,6 +650,12 @@ class ResourceGovernor:
 
         logger.info("ResourceGovernor: %s -> %s (cpu_limit=%.2f, gpu=%s)",
                      old_mode, new_mode, self._cpu_limit, self._gpu_allowed)
+
+        # Update hard OS-level caps to match new mode
+        try:
+            get_enforcer().update_caps(new_mode)
+        except Exception:
+            pass
 
         # Emit EventBus event (best-effort, lazy import)
         try:
