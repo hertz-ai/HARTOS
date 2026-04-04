@@ -126,6 +126,9 @@ def movie_maker(query: str) -> str:
     if not scenes:
         return "No scenes generated. Try a more specific concept."
 
+    # Track cost delta (not lifetime total)
+    _cost_before = _gateway().get_stats().get('total_cost_usd', 0)
+
     assets = {
         'title': script.get('title', 'Untitled'),
         'script': script,
@@ -202,9 +205,9 @@ def movie_maker(query: str) -> str:
         })
         offset += dur
 
-    # Cost tracking
-    stats = _gateway().get_stats()
-    assets['total_cost_usd'] = stats.get('total_cost_usd', 0)
+    # Cost tracking — delta from before this creation
+    _cost_after = _gateway().get_stats().get('total_cost_usd', 0)
+    assets['total_cost_usd'] = round(_cost_after - _cost_before, 6)
 
     return json.dumps(assets, indent=2)
 

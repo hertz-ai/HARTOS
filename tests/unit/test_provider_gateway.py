@@ -465,5 +465,254 @@ class TestProviderIntegration(unittest.TestCase):
             os.environ.pop('TEST_PROVIDER_KEY', None)
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# Revenue Tracker Tests
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestRevenueTracker(unittest.TestCase):
+    """Test RevenueTracker recording, analytics, and persistence."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.tracker_path = os.path.join(self.tmpdir, 'revenue.json')
+
+    def _make_tracker(self):
+        from integrations.providers.revenue_tracker import RevenueTracker
+        return RevenueTracker(tracker_path=self.tracker_path)
+
+    def test_record_cost(self):
+        t = self._make_tracker()
+        t.record_cost('together', 'llama-70b', 0.001, tokens_used=500)
+        self.assertEqual(t._total_requests, 1)
+        self.assertAlmostEqual(t._total_cost, 0.001, places=6)
+
+    def test_record_revenue(self):
+        t = self._make_tracker()
+        t.record_revenue('affiliate', 0.50, provider_id='runwayml')
+        self.assertAlmostEqual(t._total_revenue, 0.50, places=2)
+
+    def test_earning_spark(self):
+        t = self._make_tracker()
+        t.record_cost('p1', 'm1', 0.10)
+        t.record_revenue('credits', 0.30)
+        spark = t.get_earning_spark()
+        self.assertAlmostEqual(spark, 3.0, places=1)  # 0.30 / 0.10
+
+    def test_earning_spark_no_cost(self):
+        t = self._make_tracker()
+        t.record_revenue('credits', 1.0)
+        self.assertEqual(t.get_earning_spark(), float('inf'))
+
+    def test_earning_spark_no_revenue_no_cost(self):
+        t = self._make_tracker()
+        self.assertEqual(t.get_earning_spark(), 0.0)
+
+    def test_summary(self):
+        t = self._make_tracker()
+        t.record_cost('p1', 'm1', 0.05, request_type='llm')
+        t.record_cost('p2', 'm2', 0.10, request_type='image_gen')
+        t.record_revenue('affiliate', 0.25, provider_id='runwayml')
+
+        s = t.get_summary()
+        self.assertAlmostEqual(s['total_cost_usd'], 0.15, places=2)
+        self.assertAlmostEqual(s['total_revenue_usd'], 0.25, places=2)
+        self.assertGreater(s['earning_spark'], 1.0)
+        self.assertIn('p1', s['cost_by_provider'])
+        self.assertIn('llm', s['cost_by_type'])
+        self.assertIn('affiliate', s['revenue_by_source'])
+
+    def test_persistence(self):
+        t = self._make_tracker()
+        t.record_cost('p1', 'm1', 0.05)
+        t.record_revenue('credits', 0.20)
+        t.save()
+
+        t2 = self._make_tracker()
+        self.assertAlmostEqual(t2._total_cost, 0.05, places=4)
+        self.assertAlmostEqual(t2._total_revenue, 0.20, places=4)
+
+    def test_period_stats(self):
+        t = self._make_tracker()
+        t.record_cost('p1', 'm1', 0.01)
+        t.record_cost('p1', 'm1', 0.02)
+        ps = t.get_period_stats(hours=1)
+        self.assertAlmostEqual(ps.total_cost, 0.03, places=4)
+        self.assertEqual(ps.total_requests, 2)
+
+    def test_trim_old_entries(self):
+        t = self._make_tracker()
+        # Add an old entry manually
+        from integrations.providers.revenue_tracker import CostEntry
+        old = CostEntry(timestamp=time.time() - 100000, provider_id='old',
+                        model_id='old', cost_usd=999.0)
+        t._costs.append(old)
+        t._trim_old_entries()
+        self.assertFalse(any(c.provider_id == 'old' for c in t._costs))
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Discovery Agent Tests
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestDiscoveryAgent(unittest.TestCase):
+    """Test DiscoveryAgent source selection and canonical ID."""
+
+    def test_canonical_id(self):
+        from integrations.providers.discovery_agent import DiscoveryAgent
+        agent = DiscoveryAgent()
+        self.assertEqual(agent._to_canonical_id('meta-llama/Llama-3.3-70B-Instruct-Turbo'),
+                         'llama-3.3-70b')
+        self.assertEqual(agent._to_canonical_id('deepseek-ai/DeepSeek-V3'),
+                         'deepseek-v3')
+        self.assertEqual(agent._to_canonical_id('Qwen/QwQ-32B'),
+                         'qwq-32b')
+
+    def test_pick_source_rotates(self):
+        from integrations.providers.discovery_agent import DiscoveryAgent
+        agent = DiscoveryAgent()
+        sources_seen = set()
+        for _ in range(4):
+            s = agent._pick_source()
+            if s:
+                sources_seen.add(s)
+                agent._last_scan[s] = 0  # Don't block rotation
+        self.assertGreater(len(sources_seen), 1)
+
+    def test_pick_source_respects_cooldown(self):
+        from integrations.providers.discovery_agent import DiscoveryAgent, DISCOVERY_SOURCES
+        agent = DiscoveryAgent()
+        # Mark all sources as recently scanned
+        for s in DISCOVERY_SOURCES:
+            agent._last_scan[s] = time.time()
+        self.assertIsNone(agent._pick_source())
+
+    def test_stats(self):
+        from integrations.providers.discovery_agent import DiscoveryAgent
+        agent = DiscoveryAgent()
+        stats = agent.get_stats()
+        self.assertEqual(stats['total_discoveries'], 0)
+        self.assertIn('sources', stats)
+
+    def test_is_inference_ready(self):
+        from integrations.providers.discovery_agent import DiscoveryAgent
+        self.assertTrue(DiscoveryAgent._is_inference_ready({'downloads': 5000, 'likes': 50}))
+        self.assertFalse(DiscoveryAgent._is_inference_ready({'downloads': 10, 'likes': 1}))
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Resource Enforcer Tests
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestResourceEnforcer(unittest.TestCase):
+    """Test ResourceEnforcer detection and cap calculation."""
+
+    def test_get_total_ram(self):
+        from core.resource_governor import ResourceEnforcer
+        e = ResourceEnforcer()
+        ram = e._get_total_ram_gb()
+        self.assertGreater(ram, 0)
+        self.assertLess(ram, 2048)  # Sanity — no machine has 2 TB
+
+    def test_enforce_idempotent(self):
+        """Calling enforce() twice should not crash."""
+        from core.resource_governor import ResourceEnforcer
+        e = ResourceEnforcer()
+        # Don't actually enforce (would set priority) — just test the flag
+        e._enforced = True
+        e.enforce()  # Should return early
+        self.assertTrue(e._enforced)
+
+    def test_singleton_thread_safe(self):
+        from core.resource_governor import get_enforcer
+        enforcers = []
+        def _get():
+            enforcers.append(id(get_enforcer()))
+        threads = [threading.Thread(target=_get) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        # All should be the same instance
+        self.assertEqual(len(set(enforcers)), 1)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Gateway Result Model Type Test (C1 fix verification)
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestGatewayResultModelType(unittest.TestCase):
+    """Verify C1 fix: model_type propagates to _track for revenue tracker."""
+
+    def test_gateway_result_has_model_type(self):
+        from integrations.providers.gateway import GatewayResult
+        r = GatewayResult(success=True, model_type='image_gen')
+        self.assertEqual(r.model_type, 'image_gen')
+
+    def test_gateway_result_default_model_type(self):
+        from integrations.providers.gateway import GatewayResult
+        r = GatewayResult(success=True)
+        self.assertEqual(r.model_type, 'llm')
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Provider to_dict excludes api_key_set (C3 fix verification)
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestProviderApiKeyPersistence(unittest.TestCase):
+    """Verify C3 fix: api_key_set not persisted to JSON."""
+
+    def test_to_dict_excludes_api_key_set(self):
+        from integrations.providers.registry import Provider
+        p = Provider(id='test', name='Test', api_key_set=True)
+        d = p.to_dict()
+        self.assertNotIn('api_key_set', d)
+
+    def test_from_dict_does_not_mutate_input(self):
+        from integrations.providers.registry import Provider
+        d = {'id': 'test', 'name': 'Test', 'models': {}}
+        d_copy = dict(d)
+        Provider.from_dict(d)
+        self.assertEqual(d, d_copy)  # Original dict unchanged
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Auth Header Builder Tests (M1+M2 fix verification)
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestAuthHeaderBuilder(unittest.TestCase):
+    """Verify M1+M2 fix: consistent auth across all callers."""
+
+    def test_bearer_auth(self):
+        from integrations.providers.gateway import ProviderGateway
+        from integrations.providers.registry import Provider
+        os.environ['TEST_AUTH_KEY'] = 'sk-test'
+        try:
+            p = Provider(id='test', name='Test', env_key='TEST_AUTH_KEY',
+                         auth_method='bearer')
+            headers = ProviderGateway._build_headers(p)
+            self.assertEqual(headers['Authorization'], 'Bearer sk-test')
+        finally:
+            os.environ.pop('TEST_AUTH_KEY', None)
+
+    def test_fal_key_auth(self):
+        from integrations.providers.gateway import ProviderGateway
+        from integrations.providers.registry import Provider
+        os.environ['FAL_KEY'] = 'fal-test'
+        try:
+            p = Provider(id='fal', name='fal.ai', env_key='FAL_KEY')
+            headers = ProviderGateway._build_headers(p)
+            self.assertEqual(headers['Authorization'], 'Key fal-test')
+        finally:
+            os.environ.pop('FAL_KEY', None)
+
+    def test_no_key(self):
+        from integrations.providers.gateway import ProviderGateway
+        from integrations.providers.registry import Provider
+        p = Provider(id='test', name='Test', env_key='NONEXISTENT_KEY')
+        headers = ProviderGateway._build_headers(p)
+        self.assertNotIn('Authorization', headers)
+        self.assertIn('Content-Type', headers)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -149,9 +149,17 @@ class RevenueTracker:
             self._total_cost += cost_usd
             self._total_requests += 1
 
-        # Auto-save every 50 requests
+        # Auto-save and trim every 50 requests
         if self._total_requests % 50 == 0:
+            self._trim_old_entries()
             self.save()
+
+    def _trim_old_entries(self):
+        """Remove entries older than 24h from in-memory lists."""
+        cutoff = time.time() - 86400
+        with self._lock:
+            self._costs = [c for c in self._costs if c.timestamp > cutoff]
+            self._revenues = [r for r in self._revenues if r.timestamp > cutoff]
 
     def record_revenue(self, source: str, amount_usd: float,
                        provider_id: str = '', user_id: str = '',

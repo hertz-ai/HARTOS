@@ -217,6 +217,10 @@ class DiscoveryAgent:
         # Add to provider
         provider.models[model_id] = pm
 
+        # Persist immediately so discoveries survive restart
+        from integrations.providers.registry import get_registry
+        get_registry().save()
+
         logger.info("DiscoveryAgent: registered new model %s on %s (type=%s)",
                      model_id, provider.id, model_type)
 

@@ -44,6 +44,7 @@ class GatewayResult:
     cost_usd: float = 0.0          # Estimated cost in USD
     latency_ms: float = 0.0
     tok_per_s: float = 0.0
+    model_type: str = 'llm'        # Request type for revenue tracking
     error: str = ''
     raw_response: Any = None        # Full API response for advanced use
 
@@ -133,6 +134,7 @@ class ProviderGateway:
         # Track stats
         elapsed_ms = (time.time() - t0) * 1000
         result.latency_ms = elapsed_ms
+        result.model_type = model_type
         self._track(result)
 
         return result
@@ -227,6 +229,20 @@ class ProviderGateway:
     # Provider Callers — format-specific API calls
     # ═══════════════════════════════════════════════════════════════════
 
+    @staticmethod
+    def _build_headers(provider) -> dict:
+        """Build HTTP headers with correct auth for a provider (DRY)."""
+        headers = {'Content-Type': 'application/json'}
+        api_key = provider.get_api_key()
+        if api_key:
+            if provider.id == 'fal':
+                headers['Authorization'] = f'Key {api_key}'
+            elif provider.auth_method == 'header':
+                headers[provider.auth_header] = f'Bearer {api_key}'
+            else:  # bearer (default)
+                headers['Authorization'] = f'Bearer {api_key}'
+        return headers
+
     def _call_provider(self, provider, provider_model, prompt, model_type,
                        **kwargs) -> GatewayResult:
         """Dispatch to the correct API format handler."""
@@ -260,7 +276,6 @@ class ProviderGateway:
         import urllib.request
         import urllib.error
 
-        api_key = provider.get_api_key()
         url = f"{provider.base_url.rstrip('/')}/chat/completions"
 
         messages = []
@@ -273,17 +288,10 @@ class ProviderGateway:
             'messages': messages,
             'max_tokens': max_tokens,
             'temperature': temperature,
-            'stream': False,  # Non-streaming for now
+            'stream': False,
         }
 
-        headers = {
-            'Content-Type': 'application/json',
-        }
-        if api_key:
-            if provider.auth_method == 'bearer':
-                headers['Authorization'] = f'Bearer {api_key}'
-            elif provider.auth_method == 'header':
-                headers[provider.auth_header] = f'Bearer {api_key}'
+        headers = self._build_headers(provider)
 
         t0 = time.time()
         req = urllib.request.Request(
@@ -344,7 +352,6 @@ class ProviderGateway:
         """Stream from OpenAI-compatible API."""
         import urllib.request
 
-        api_key = provider.get_api_key()
         url = f"{provider.base_url.rstrip('/')}/chat/completions"
 
         messages = []
@@ -360,9 +367,7 @@ class ProviderGateway:
             'stream': True,
         }
 
-        headers = {'Content-Type': 'application/json'}
-        if api_key:
-            headers['Authorization'] = f'Bearer {api_key}'
+        headers = self._build_headers(provider)
 
         req = urllib.request.Request(
             url, data=json.dumps(body).encode(),
@@ -410,11 +415,8 @@ class ProviderGateway:
             'input': input_data,
         }
 
-        headers = {
-            'Content-Type': 'application/json',
-            'Authorization': f'Bearer {api_key}',
-            'Prefer': 'wait',  # Synchronous mode
-        }
+        headers = self._build_headers(provider)
+        headers['Prefer'] = 'wait'  # Synchronous mode
 
         t0 = time.time()
         req = urllib.request.Request(
@@ -457,9 +459,7 @@ class ProviderGateway:
         url = f"{provider.base_url.rstrip('/')}/{provider_model.model_id}"
         body = {'inputs': prompt}
 
-        headers = {'Content-Type': 'application/json'}
-        if api_key:
-            headers['Authorization'] = f'Bearer {api_key}'
+        headers = self._build_headers(provider)
 
         t0 = time.time()
         req = urllib.request.Request(
@@ -497,10 +497,7 @@ class ProviderGateway:
                 'num_images': kwargs.get('num_images', 1),
             })
 
-        headers = {
-            'Content-Type': 'application/json',
-            'Authorization': f'Key {api_key}',
-        }
+        headers = self._build_headers(provider)
 
         t0 = time.time()
         req = urllib.request.Request(
@@ -653,7 +650,7 @@ class ProviderGateway:
                     model_id=result.model_id,
                     cost_usd=result.cost_usd,
                     tokens_used=result.usage.get('total_tokens', 0),
-                    request_type=kwargs.get('model_type', 'llm'),
+                    request_type=result.model_type,
                 )
             except Exception:
                 pass

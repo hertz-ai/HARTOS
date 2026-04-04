@@ -126,10 +126,13 @@ class Provider:
     def to_dict(self) -> dict:
         d = asdict(self)
         d['models'] = {k: asdict(v) for k, v in self.models.items()}
+        # api_key_set is runtime-only — compute from env, never persist
+        d.pop('api_key_set', None)
         return d
 
     @classmethod
     def from_dict(cls, d: dict) -> 'Provider':
+        d = dict(d)  # Don't mutate caller's dict
         models_raw = d.pop('models', {})
         known = {f.name for f in cls.__dataclass_fields__.values()}
         filtered = {k: v for k, v in d.items() if k in known}

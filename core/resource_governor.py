@@ -426,11 +426,16 @@ class ResourceEnforcer:
 _enforcer: Optional[ResourceEnforcer] = None
 
 
+_enforcer_lock = threading.Lock()
+
+
 def get_enforcer() -> ResourceEnforcer:
     """Get or create the singleton ResourceEnforcer."""
     global _enforcer
     if _enforcer is None:
-        _enforcer = ResourceEnforcer()
+        with _enforcer_lock:
+            if _enforcer is None:
+                _enforcer = ResourceEnforcer()
     return _enforcer
 
 
