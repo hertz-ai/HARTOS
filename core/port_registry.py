@@ -58,7 +58,7 @@ OS_PORTS = {
     'mesh_relay':   680,
     'model_bus':    681,
     'mcp':          682,
-    'vlm_caption':  808,  # Shares with llm in OS mode (single GPU)
+    'vlm_caption':  809,
 }
 
 # Environment variable overrides (takes precedence over both modes)
@@ -69,6 +69,7 @@ ENV_OVERRIDES = {
     'llm':          'HART_LLM_PORT',
     'websocket':    'HART_WS_PORT',
     'diarization':  'HEVOLVE_DIARIZATION_PORT',
+    'stt_stream':   'HART_STT_STREAM_PORT',
     'dlna_stream':  'HART_DLNA_PORT',
     'mesh_wg':      'HART_MESH_WG_PORT',
     'mesh_relay':   'HART_MESH_RELAY_PORT',

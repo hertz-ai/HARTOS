@@ -156,11 +156,26 @@ class GossipProtocol:
         self._thread = None
         self._lock = threading.Lock()
 
+        # Exponential backoff for unreachable peers
+        from core.circuit_breaker import PeerBackoff
+        self._peer_backoff = PeerBackoff(initial=10, maximum=300)
+
         logger.info(
             f"Gossip bandwidth: {self.bandwidth_profile} "
             f"(gossip={self.gossip_interval}s, health={self.health_interval}s, "
             f"fanout={self.gossip_fanout}, payload={self.payload_mode})"
         )
+
+    # ─── Peer Backoff (delegates to core.circuit_breaker.PeerBackoff) ───
+
+    def _is_peer_backed_off(self, peer_url: str) -> bool:
+        return self._peer_backoff.is_backed_off(peer_url)
+
+    def _record_peer_failure(self, peer_url: str):
+        self._peer_backoff.record_failure(peer_url)
+
+    def _record_peer_success(self, peer_url: str):
+        self._peer_backoff.record_success(peer_url)
 
     # ─── Payload Serialization ───
 
@@ -329,6 +344,8 @@ class GossipProtocol:
             for url in list(self.seed_peers)[:2]:
                 if not self._running:
                     return
+                if self._is_peer_backed_off(url):
+                    continue
                 self._announce_to_peer(url)
                 self._heartbeat()
             return
@@ -337,15 +354,21 @@ class GossipProtocol:
         for peer in targets:
             if not self._running:
                 return
+            peer_url = peer['url']
+            if self._is_peer_backed_off(peer_url):
+                continue
             try:
-                their_peers = self._exchange_with_peer(peer['url'])
+                their_peers = self._exchange_with_peer(peer_url)
                 if their_peers:
                     self._merge_peer_list(their_peers)
+                # Backoff is handled inside _exchange_with_peer()
             except Exception as e:
-                logger.debug(f"Gossip exchange failed with {peer['url']}: {e}")
+                logger.debug(f"Gossip exchange failed with {peer_url}: {e}")
+                self._record_peer_failure(peer_url)
             self._heartbeat()
 
     def _health_check_round(self):
+        self._peer_backoff.prune_expired()
         from .models import get_db, PeerNode
         db = get_db()
         try:
@@ -403,8 +426,13 @@ class GossipProtocol:
                 json=self._self_info(),
                 timeout=5,
             )
-            return resp.status_code == 200
+            if resp.status_code == 200:
+                self._record_peer_success(peer_url)
+                return True
+            self._record_peer_failure(peer_url)
+            return False
         except requests.RequestException:
+            self._record_peer_failure(peer_url)
             return False
 
     # ─── Exchange ───
@@ -453,6 +481,7 @@ class GossipProtocol:
                 )
             if resp.status_code == 200:
                 data = resp.json()
+                self._record_peer_success(peer_url)
                 # Record exchange for auto-upgrade to PeerLink
                 try:
                     peer_id = self._url_to_node_id(peer_url)
@@ -462,8 +491,9 @@ class GossipProtocol:
                 except Exception:
                     pass
                 return data.get('peers', [])
+            self._record_peer_failure(peer_url)
         except requests.RequestException:
-            pass
+            self._record_peer_failure(peer_url)
         return None
 
     def _url_to_node_id(self, peer_url: str) -> str:
@@ -480,10 +510,17 @@ class GossipProtocol:
         return ''
 
     def _ping_peer(self, peer_url):
+        if self._is_peer_backed_off(peer_url):
+            return False
         try:
             resp = pooled_get(f"{peer_url}/api/social/peers/health", timeout=3)
-            return resp.status_code == 200
+            if resp.status_code == 200:
+                self._record_peer_success(peer_url)
+                return True
+            self._record_peer_failure(peer_url)
+            return False
         except requests.RequestException:
+            self._record_peer_failure(peer_url)
             return False
 
     # ─── Handlers (called by Flask endpoints) ───
@@ -524,15 +561,18 @@ class GossipProtocol:
             url = peer.get('url', '')
             if not url or peer.get('node_id') == self.node_id:
                 continue
+            if self._is_peer_backed_off(url):
+                continue
             try:
                 pooled_post(
                     f"{url}/api/social/peers/broadcast",
                     json=message,
                     timeout=5,
                 )
+                self._record_peer_success(url)
                 sent += 1
             except requests.RequestException:
-                pass
+                self._record_peer_failure(url)
         return sent
 
     def handle_exchange(self, their_peers):

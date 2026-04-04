@@ -1,6 +1,12 @@
 # HART OS - Hevolve Hive Agentic Runtime
 
-**Formerly Hevolve Hive Agents**
+**Democratic Crowdsourced Open Intelligence with Human Control**
+
+> **Democratic** — No single entity controls more than 5% influence. A Raspberry Pi has the same voice as a GPU rack.
+> **Crowdsourced** — Trained by everyone, owned by no corporation. 90% of value returns to the humans who contribute.
+> **Open** — Open source, open protocols, open federation. Like the internet is open, intelligence must be open.
+> **Intelligence** — Sum of many intelligences is greater than any single intelligence. 7 fused intelligences, every node contributes experience, every node benefits from collective knowledge. Intelligence sharing is gated by human trust, deterministically owned, and directly correlates with human wellness — because the hive and the humans it serves are the same entity.
+> **Human Control** — Master key kill switch held by human stewards. 33 constitutional rules cryptographically sealed. This is not policy, it is structure.
 
 ---
 

@@ -16,12 +16,14 @@ logger = logging.getLogger('hevolve.coding_agent')
 
 # Heuristic defaults when no benchmark data exists.
 # aider_native preferred for tasks where in-process code intelligence excels.
-# Falls through to subprocess backends if aider_native isn't available.
+# claw_native preferred for Rust-speed file ops, bash, grep/glob (no subprocess).
+# Falls through to subprocess backends if native backends aren't available.
 HEURISTIC_DEFAULTS = {
     'code_review': 'claude_code',
     'debugging': 'claude_code',
     'complex_reasoning': 'claude_code',
-    'terminal_workflows': 'claude_code',
+    'terminal_workflows': 'claw_native',      # Rust-native bash + file ops
+    'terminal_coding': 'claw_native',          # Agent loop with tools
     'app_build': 'kilocode',
     'feature': 'kilocode',
     'refactor': 'aider_native',
@@ -29,6 +31,8 @@ HEURISTIC_DEFAULTS = {
     'multi_session': 'opencode',
     'multi_file_edit': 'aider_native',
     'architecture': 'claude_code',
+    'repo_exploration': 'claw_native',         # Fast grep/glob via Rust
+    'bash_execution': 'claw_native',           # Sandboxed bash via Rust
 }
 
 

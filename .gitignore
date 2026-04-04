@@ -77,6 +77,10 @@ agent_data/distributed_tasks/
 agent_data/baselines/
 agent_data/benchmarks/
 
+# claw_native (vendored Rust tooling) — exclude build artifacts
+claw_native/rust/target/
+claw_native/.claude/
+
 # IDE / build / virtual environments
 .idea/
 .pycharm_plugin/

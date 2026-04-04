@@ -436,6 +436,7 @@ def force_state_through_valid_path(user_prompt: str, action_id: int, target_stat
         (ActionState.STATUS_VERIFICATION_REQUESTED, ActionState.ERROR): [ActionState.ERROR],
 
         # From COMPLETED
+        (ActionState.COMPLETED, ActionState.TERMINATED): [ActionState.TERMINATED],  # REUSE: skip recipe phase
         (ActionState.COMPLETED, ActionState.FALLBACK_REQUESTED): [ActionState.FALLBACK_REQUESTED],
         (ActionState.COMPLETED, ActionState.FALLBACK_RECEIVED): [ActionState.FALLBACK_REQUESTED,
                                                                  ActionState.FALLBACK_RECEIVED],

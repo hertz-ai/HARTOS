@@ -460,59 +460,91 @@ class Qwen08BBackend(VisionBackend):
         self._server_proc = None  # subprocess.Popen object (not just PID)
 
     def _ensure_running(self) -> bool:
-        """Lazy-start: launch 0.8B server on first frame, not at boot."""
+        """Lazy-start: launch 0.8B server on first frame, not at boot.
+
+        HARTOS emits 'vlm_caption.requested' event. In bundled mode, Nunba
+        subscribes to this event and calls its own start_caption_server().
+        In standalone mode, HARTOS uses model_lifecycle to launch directly.
+
+        Dependency direction: Nunba → HARTOS (never HARTOS → Nunba).
+        """
         if self.is_available():
             return True
         if self._launch_attempted:
-            return False  # Already tried and failed — don't retry every frame
+            return False
         self._launch_attempted = True
 
-        # Find llama-server binary (reuse model_lifecycle's finder)
+        # Emit event — Nunba subscribes in bundled mode and starts the server
+        try:
+            from core.platform.events import emit_event
+            emit_event('vlm_caption.requested', {'port': self._port})
+        except Exception:
+            pass
+
+        # Wait briefly — Nunba may start the server in response to the event
+        import time
+        for _ in range(5):
+            time.sleep(1)
+            if self.is_available():
+                logger.info(f"Qwen3.5-0.8B started (event-driven) on port {self._port}")
+                return True
+
+        # Nobody started it — standalone mode, use model_lifecycle
         try:
             from integrations.service_tools.model_lifecycle import ModelLifecycleManager
             server = ModelLifecycleManager._find_llama_server_binary()
-        except Exception:
-            server = None
-        if not server:
-            logger.info("Qwen3.5-0.8B: llama-server not found")
-            return False
+            if not server:
+                logger.info("Qwen3.5-0.8B: llama-server not found")
+                return False
 
-        home = os.path.expanduser('~')
-        model = mmproj = None
-        for d in [os.path.join(home, '.nunba', 'models'),
-                  os.path.join(home, '.trueflow', 'models')]:
-            p = os.path.join(d, 'Qwen3.5-0.8B-UD-Q4_K_XL.gguf')
-            if os.path.isfile(p) and not model:
-                model = p
-            p = os.path.join(d, 'qwen08b', 'mmproj-F16.gguf')
-            if os.path.isfile(p) and not mmproj:
-                mmproj = p
-        if not model or not mmproj:
-            logger.info("Qwen3.5-0.8B: model files not found — run 'python scripts/setup_vlm.py'")
-            return False
+            home = os.path.expanduser('~')
+            model = mmproj = None
+            for d in [os.path.join(home, '.nunba', 'models'),
+                      os.path.join(home, '.trueflow', 'models')]:
+                p = os.path.join(d, 'Qwen3.5-0.8B-UD-Q4_K_XL.gguf')
+                if os.path.isfile(p) and not model:
+                    model = p
+                p = os.path.join(d, 'qwen08b', 'mmproj-F16.gguf')
+                if os.path.isfile(p) and not mmproj:
+                    mmproj = p
+            if not model or not mmproj:
+                logger.info("Qwen3.5-0.8B: model files not found")
+                return False
 
-        import subprocess, time
-        cmd = [server, '--model', model, '--mmproj', mmproj,
-               '--port', str(self._port), '--ctx-size', '512',
-               '--n-gpu-layers', '99', '--threads', '4', '--flash-attn', 'on']
-        log_path = os.path.join(os.environ.get('TEMP', '/tmp'), f'llama_{self._port}.log')
-        try:
-            _kw = dict(stdout=open(log_path, 'w'), stderr=subprocess.STDOUT)
+            import subprocess
+            cmd = [server, '--model', model, '--mmproj', mmproj,
+                   '--port', str(self._port), '--ctx-size', '512',
+                   '--n-gpu-layers', '99', '--threads', '4', '--flash-attn', 'on']
+            log_path = os.path.join(os.environ.get('TEMP', '/tmp'), f'llama_{self._port}.log')
+            log_fh = open(log_path, 'w')
+            _kw = dict(stdout=log_fh, stderr=subprocess.STDOUT)
             if os.name == 'nt':
                 _kw['creationflags'] = subprocess.CREATE_NO_WINDOW
             self._server_proc = subprocess.Popen(cmd, **_kw)
-            logger.info(f"Qwen3.5-0.8B launching PID={self._server_proc.pid} port={self._port} (first frame trigger)")
+            self._log_fh = log_fh
+            logger.info(f"Qwen3.5-0.8B launching PID={self._server_proc.pid} port={self._port}")
             for _ in range(30):
                 time.sleep(1)
                 if self.is_available():
-                    logger.info(f"Qwen3.5-0.8B ready")
+                    logger.info(f"Qwen3.5-0.8B ready on port {self._port}")
                     return True
         except Exception as e:
-            logger.error(f"Qwen3.5-0.8B start failed: {e}")
+            logger.error(f"Qwen3.5-0.8B standalone start failed: {e}")
         return False
 
     def stop(self):
-        """Kill the 0.8B server process to free GPU memory."""
+        """Stop the 0.8B server to free GPU memory.
+
+        Emits 'vlm_caption.stop' — Nunba subscribes and stops in bundled mode.
+        Standalone: kills our own subprocess.
+        """
+        try:
+            from core.platform.events import emit_event
+            emit_event('vlm_caption.stop', {'port': self._port})
+        except Exception:
+            pass
+
+        # Standalone mode: we own the process
         if self._server_proc:
             try:
                 self._server_proc.terminate()
@@ -524,7 +556,13 @@ class Qwen08BBackend(VisionBackend):
                 except Exception:
                     pass
             self._server_proc = None
-            self._launch_attempted = False  # Allow re-launch on next frame
+            if hasattr(self, '_log_fh') and self._log_fh:
+                try:
+                    self._log_fh.close()
+                except Exception:
+                    pass
+                self._log_fh = None
+        self._launch_attempted = False
 
     def check_idle(self):
         """Called by VisionService's description_loop. Unloads if no frames for IDLE_TIMEOUT_S."""

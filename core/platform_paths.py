@@ -18,6 +18,7 @@ Usage:
 
 import os
 import sys
+import time
 
 _IS_WINDOWS = sys.platform == 'win32'
 _IS_MACOS = sys.platform == 'darwin'
@@ -110,11 +111,80 @@ def get_memory_graph_dir(session_key: str = '') -> str:
     return base
 
 
+def get_simplemem_dir(session_key: str = '') -> str:
+    """Return the simplemem_db/ subdirectory, optionally with session key."""
+    base = os.path.join(get_db_dir(), 'simplemem_db')
+    if session_key:
+        return os.path.join(base, session_key)
+    return base
+
+
+def cleanup_old_logs(max_age_days: int = 7, max_total_mb: int = 50):
+    """Delete log files older than max_age_days or when total exceeds max_total_mb.
+
+    Called at startup to prevent unbounded log accumulation.
+    Safe: only deletes *.log and *.log.* files in the log directory.
+    """
+    import glob as _glob
+    log_dir = get_log_dir()
+    if not os.path.isdir(log_dir):
+        return
+    now = time.time()
+    cutoff = now - (max_age_days * 86400)
+    log_patterns = [
+        os.path.join(log_dir, '*.log'),
+        os.path.join(log_dir, '*.log.*'),
+    ]
+    all_logs = []
+    for pat in log_patterns:
+        all_logs.extend(_glob.glob(pat))
+    # Sort oldest first
+    all_logs.sort(key=lambda f: os.path.getmtime(f) if os.path.exists(f) else 0)
+
+    deleted = 0
+    # Phase 1: delete files older than max_age_days
+    for f in all_logs:
+        try:
+            if os.path.getmtime(f) < cutoff:
+                os.remove(f)
+                deleted += 1
+        except OSError:
+            pass
+
+    # Phase 2: if still over budget, delete oldest until under limit
+    remaining = [f for f in all_logs if os.path.exists(f)]
+    total_bytes = sum(os.path.getsize(f) for f in remaining if os.path.exists(f))
+    max_bytes = max_total_mb * 1024 * 1024
+    for f in remaining:
+        if total_bytes <= max_bytes:
+            break
+        try:
+            sz = os.path.getsize(f)
+            os.remove(f)
+            total_bytes -= sz
+            deleted += 1
+        except OSError:
+            pass
+
+    if deleted:
+        import logging
+        logging.getLogger('hevolve.platform').info(
+            f"Log cleanup: deleted {deleted} old log files from {log_dir}")
+
+
 def ensure_data_dirs():
-    """Create all standard data directories if they don't exist."""
+    """Create all standard data directories if they don't exist.
+
+    Also runs log cleanup on startup to prevent unbounded log accumulation.
+    """
     for d in [get_db_dir(), get_agent_data_dir(), get_prompts_dir(),
-              get_log_dir(), get_memory_graph_dir()]:
+              get_log_dir(), get_memory_graph_dir(), get_simplemem_dir()]:
         os.makedirs(d, exist_ok=True)
+    # Clean old logs on every startup (safe — worst case is a no-op)
+    try:
+        cleanup_old_logs(max_age_days=7, max_total_mb=50)
+    except Exception:
+        pass
 
 
 def reset_cache():

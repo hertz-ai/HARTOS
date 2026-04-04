@@ -10,6 +10,7 @@ Dispatches with autonomous=True so agents self-configure.
 """
 import os
 import time
+import random
 import logging
 import threading
 from datetime import datetime
@@ -91,12 +92,19 @@ class AgentDaemon:
         # Cache SmartLedger instances by (agent_id, session_id) to avoid
         # re-creating them every tick (which spams "starting fresh" logs).
         self._ledger_cache: dict = {}
+        # Exponential backoff on consecutive tick failures
+        self._consecutive_failures = 0
+        self._BACKOFF_MAX = 300  # 5 minute cap
+        # Proactive hive tick state
+        self._next_hive_explore_time = time.time() + random.randint(300, 1800)
+        self._base_interval = self._interval  # remember original for optimizer
 
     def start(self):
         with self._lock:
             if self._running:
                 return
             self._running = True
+            self._consecutive_failures = 0
         self._thread = threading.Thread(target=self._loop, daemon=True,
                                         name='agent_daemon')
         self._thread.start()
@@ -194,17 +202,182 @@ class AgentDaemon:
         except Exception:
             pass
 
+    def _proactive_hive_tick(self):
+        """Proactive hive daemon tick — exploration, self-promotion, and compute optimization.
+
+        Runs alongside the main tick on a random 5-30 minute interval.
+        All imports are lazy (try/except) so missing modules never crash the daemon.
+        """
+        now = time.time()
+
+        # ── 1. Random-interval hive exploration ──
+        if now >= self._next_hive_explore_time:
+            # Schedule next exploration (5-30 minutes from now)
+            self._next_hive_explore_time = now + random.randint(300, 1800)
+
+            # Check benchmark prover for active benchmark needs
+            benchmark_needs = None
+            try:
+                from integrations.agent_engine.hive_benchmark_prover import get_prover
+                prover = get_prover()
+                benchmark_needs = prover.get_status()
+                logger.info(
+                    f"Proactive hive: benchmark prover checked "
+                    f"(loop_running={benchmark_needs.get('loop_running', False)})")
+            except ImportError:
+                logger.debug("Proactive hive: hive_benchmark_prover not available")
+            except Exception as e:
+                logger.debug(f"Proactive hive: benchmark prover check failed: {e}")
+
+            # Check hive task protocol for unassigned tasks
+            pending_tasks = []
+            try:
+                from integrations.coding_agent.hive_task_protocol import get_dispatcher
+                dispatcher = get_dispatcher()
+                pending_tasks = dispatcher.get_pending_tasks()
+                if pending_tasks:
+                    logger.info(
+                        f"Proactive hive: found {len(pending_tasks)} pending "
+                        f"hive tasks for dispatch")
+            except ImportError:
+                logger.debug("Proactive hive: hive_task_protocol not available")
+            except Exception as e:
+                logger.debug(f"Proactive hive: task protocol check failed: {e}")
+
+            # If idle and tasks exist, auto-dispatch to local Claude hive session
+            if pending_tasks:
+                try:
+                    from integrations.coding_agent.claude_hive_session import get_blueprint
+                    for task in pending_tasks[:3]:  # Max 3 tasks per exploration
+                        task_desc = getattr(task, 'description', '') or str(task)
+                        logger.info(
+                            f"Proactive hive: auto-dispatching task to local "
+                            f"hive session: {task_desc[:100]}")
+                except ImportError:
+                    logger.debug("Proactive hive: claude_hive_session not available")
+                except Exception as e:
+                    logger.debug(f"Proactive hive: hive session dispatch failed: {e}")
+
+        # ── 2. Self-promotion on benchmark results ──
+        try:
+            from integrations.agent_engine.hive_benchmark_prover import get_prover
+            prover = get_prover()
+            history = prover.get_benchmark_history(limit=1)
+            if history and isinstance(history, list):
+                latest = history[0]
+                score = latest.get('score', 0)
+                benchmark = latest.get('benchmark', 'unknown')
+                node_count = latest.get('node_count', 1)
+                message = (
+                    f"Hive benchmark result: {benchmark} — "
+                    f"score={score:.2f} across {node_count} nodes"
+                )
+
+                # Post to all connected channels via signal bridge
+                try:
+                    from integrations.channels.hive_signal_bridge import get_signal_bridge
+                    bridge = get_signal_bridge()
+                    bridge.broadcast_signal({
+                        'type': 'benchmark_result',
+                        'benchmark': benchmark,
+                        'score': score,
+                        'node_count': node_count,
+                        'message': message,
+                    })
+                    logger.info(f"Proactive hive: broadcast benchmark result to channels")
+                except ImportError:
+                    logger.debug("Proactive hive: hive_signal_bridge not available")
+                except Exception as e:
+                    logger.debug(f"Proactive hive: signal broadcast failed: {e}")
+
+                # Emit EventBus event for LiquidUI dashboard
+                try:
+                    from core.platform.events import emit_event
+                    emit_event('hive.benchmark.completed', {
+                        'benchmark': benchmark,
+                        'score': score,
+                        'node_count': node_count,
+                        'message': message,
+                    })
+                except ImportError:
+                    pass
+                except Exception as e:
+                    logger.debug(f"Proactive hive: EventBus emit failed: {e}")
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.debug(f"Proactive hive: self-promotion check failed: {e}")
+
+        # ── 3. Compute optimizer integration ──
+        try:
+            from core.compute_optimizer import get_optimizer
+            optimizer = get_optimizer()
+            health = optimizer.get_health_score()
+
+            # Derive load level from health score: <0.3 = high load, >0.7 = idle
+            if health < 0.3:
+                load_level = 'high'
+            elif health > 0.7:
+                load_level = 'idle'
+            else:
+                load_level = 'normal'
+
+            if load_level == 'high':
+                    # System under load: lengthen tick interval
+                    new_interval = min(self._base_interval * 3, self._BACKOFF_MAX)
+                    if self._interval != new_interval:
+                        self._interval = new_interval
+                        logger.info(
+                            f"Proactive hive: system under load, "
+                            f"lengthened tick interval to {new_interval}s")
+                elif load_level == 'idle':
+                    # System idle: shorten tick interval, accept more tasks
+                    new_interval = max(self._base_interval // 2, 10)
+                    if self._interval != new_interval:
+                        self._interval = new_interval
+                        logger.info(
+                            f"Proactive hive: system idle, "
+                            f"shortened tick interval to {new_interval}s")
+                else:
+                    # Normal: restore base interval
+                    if self._interval != self._base_interval:
+                        self._interval = self._base_interval
+                        logger.debug(
+                            f"Proactive hive: load normal, "
+                            f"restored tick interval to {self._base_interval}s")
+        except ImportError:
+            pass  # compute_optimizer not available yet
+        except Exception as e:
+            logger.debug(f"Proactive hive: compute optimizer check failed: {e}")
+
     def _loop(self):
         while self._running:
-            time.sleep(self._interval)
+            # Exponential backoff: sleep longer on consecutive failures
+            if self._consecutive_failures > 0:
+                backoff = min(
+                    self._interval * (2 ** self._consecutive_failures),
+                    self._BACKOFF_MAX)
+                time.sleep(backoff)
+            else:
+                time.sleep(self._interval)
             if not self._running:
                 break
             self._wd_heartbeat()
+
+            # Proactive hive tick — exploration, self-promotion, compute optimization
+            try:
+                self._proactive_hive_tick()
+            except Exception as e:
+                logger.debug(f"Proactive hive tick error: {e}")
+
             try:
                 self._tick()
+                self._consecutive_failures = 0
             except Exception as e:
+                self._consecutive_failures += 1
                 import traceback
-                logger.error(f"Agent daemon tick error: {e}\n{traceback.format_exc()}")
+                logger.error(f"Agent daemon tick error (backoff={self._consecutive_failures}): "
+                             f"{e}\n{traceback.format_exc()}")
 
     def _tick(self):
         """Find active goals, find idle agents, dispatch via /chat.

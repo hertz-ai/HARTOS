@@ -70,12 +70,15 @@ class ModelBusService:
 
     # Backend health cache — avoids wasting seconds on dead backends.
     # Key = backend name, Value = (is_alive: bool, last_checked: float)
-    # TTL: alive backends re-checked every 60s, dead every 15s (fast recovery).
+    # TTL: alive backends re-checked every 60s, dead backends use exponential
+    # backoff (15s → 30s → 60s → 120s → 300s cap) to avoid CPU-hogging retries.
     _health_cache: Dict[str, tuple] = {}
     _health_lock = threading.Lock()  # Guards _health_cache across threads
-    _ALIVE_TTL = 60.0   # Re-probe alive backends every 60s
-    _DEAD_TTL = 15.0     # Retry dead backends every 15s
-    _PROBE_TIMEOUT = 1.5  # Health probe: 1.5s max (not 10-60s)
+    _dead_backoff: Dict[str, float] = {}  # backend_name → current dead TTL
+    _ALIVE_TTL = 60.0     # Re-probe alive backends every 60s
+    _DEAD_TTL_INIT = 15.0  # First dead retry after 15s
+    _DEAD_TTL_MAX = 300.0  # Cap dead retry at 5 minutes
+    _PROBE_TIMEOUT = 1.5   # Health probe: 1.5s max (not 10-60s)
 
     def __init__(
         self,
@@ -115,15 +118,16 @@ class ModelBusService:
         """Check if backend is alive using cached health probe.
 
         Returns instantly for cached results. Only probes when cache is stale.
-        Dead backends are skipped immediately (0ms) until retry TTL expires.
-        This is what prevents 10-60 second waits on dead backends.
+        Dead backends use exponential backoff (15s → 300s cap) to avoid
+        CPU-hogging retry storms when services aren't running.
         """
         now = time.time()
         with self._health_lock:
             cached = self._health_cache.get(name)
+            dead_ttl = self._dead_backoff.get(name, self._DEAD_TTL_INIT)
         if cached:
             is_alive, last_checked = cached
-            ttl = self._ALIVE_TTL if is_alive else self._DEAD_TTL
+            ttl = self._ALIVE_TTL if is_alive else dead_ttl
             if now - last_checked < ttl:
                 return is_alive
 
@@ -137,20 +141,31 @@ class ModelBusService:
 
         with self._health_lock:
             self._health_cache[name] = (alive, now)
-        if not alive:
-            logger.debug("Backend %s at %s is DOWN (skipping for %.0fs)",
-                         name, url, self._DEAD_TTL)
+            if alive:
+                # Reset backoff on recovery
+                self._dead_backoff.pop(name, None)
+            else:
+                # Re-read current backoff inside lock (avoid stale local var race)
+                current = self._dead_backoff.get(name, self._DEAD_TTL_INIT)
+                new_ttl = min(current * 2, self._DEAD_TTL_MAX)
+                self._dead_backoff[name] = new_ttl
+                logger.debug("Backend %s at %s is DOWN (retry in %.0fs)",
+                             name, url, new_ttl)
         return alive
 
     def _mark_backend_dead(self, name: str):
         """Mark a backend as dead after a request failure (instant skip next time)."""
         with self._health_lock:
             self._health_cache[name] = (False, time.time())
+            # Escalate exponential backoff
+            current = self._dead_backoff.get(name, self._DEAD_TTL_INIT)
+            self._dead_backoff[name] = min(current * 2, self._DEAD_TTL_MAX)
 
     def _mark_backend_alive(self, name: str):
         """Mark backend alive after successful request."""
         with self._health_lock:
             self._health_cache[name] = (True, time.time())
+            self._dead_backoff.pop(name, None)
 
     # ─── Backend Discovery ───────────────────────────────────
 
@@ -400,8 +415,7 @@ class ModelBusService:
                         }
             except Exception as e:
                 self._mark_backend_dead(backend_name)
-                logger.warning(f"Backend {backend_name} failed (marked dead for "
-                               f"{self._DEAD_TTL}s): {e}")
+                logger.warning(f"Backend {backend_name} failed (marked dead): {e}")
                 continue
 
         return {'error': 'All LLM backends failed', 'response': None}

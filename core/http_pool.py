@@ -8,6 +8,10 @@ Before: Each HTTP call opens a new TCP connection + TLS handshake.
 After:  Connections are pooled and reused (10 pool connections, 20 max per host).
 
 Typical improvement: 40-60% latency reduction on repeated calls to same host.
+
+Retry policy:
+  - localhost: 0 retries (dead local services should fail instantly, not block 15s)
+  - remote:    2 retries with 0.5s backoff (network can be flaky)
 """
 
 import logging
@@ -23,7 +27,7 @@ _session = None
 _session_lock = threading.Lock()
 
 # Default timeout for all requests (connect, read) in seconds
-DEFAULT_TIMEOUT = (5, 30)
+DEFAULT_TIMEOUT = (3, 15)
 
 
 def get_http_session() -> requests.Session:
@@ -41,23 +45,32 @@ def get_http_session() -> requests.Session:
 
         session = requests.Session()
 
-        # Configure retry strategy
-        retry = Retry(
-            total=3,
-            backoff_factor=0.3,
-            status_forcelist=[500, 502, 503, 504],
-            allowed_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
-        )
-
-        # Connection pooling adapter
-        adapter = HTTPAdapter(
+        # Localhost: zero retries — dead local services should fail instantly.
+        # This prevents the retry storm (36 failed TCP connects/min) that kills
+        # the system when optional sidecars (MiniCPM:9891, etc.) aren't running.
+        local_adapter = HTTPAdapter(
             pool_connections=10,
             pool_maxsize=20,
-            max_retries=retry,
+            max_retries=Retry(total=0),
         )
 
-        session.mount('http://', adapter)
-        session.mount('https://', adapter)
+        # Remote: modest retries with backoff (network can be flaky)
+        remote_retry = Retry(
+            total=2,
+            backoff_factor=0.5,
+            status_forcelist=[502, 503, 504],
+            allowed_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+        )
+        remote_adapter = HTTPAdapter(
+            pool_connections=10,
+            pool_maxsize=20,
+            max_retries=remote_retry,
+        )
+
+        session.mount('http://localhost', local_adapter)
+        session.mount('http://127.0.0.1', local_adapter)
+        session.mount('http://', remote_adapter)
+        session.mount('https://', remote_adapter)
 
         # Default headers
         session.headers.update({
@@ -65,7 +78,7 @@ def get_http_session() -> requests.Session:
         })
 
         _session = session
-        logger.info("HTTP connection pool initialized (10 connections, 20 max per host)")
+        logger.info("HTTP pool initialized (localhost=0 retries, remote=2 retries)")
         return _session
 
 

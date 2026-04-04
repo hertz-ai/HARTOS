@@ -737,7 +737,7 @@ class TestSimpleMemIntegration:
         assert config.model == "gpt-4.1-mini"
         assert config.embedding_model == "Qwen/Qwen3-Embedding-0.6B"
         assert config.window_size == 40
-        assert config.db_path == "./simplemem_db"
+        assert config.db_path == ""  # Resolved at runtime via platform_paths
         assert config.enabled is True
 
     def test_simplemem_config_from_env(self):

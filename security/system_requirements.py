@@ -291,10 +291,15 @@ def detect_hardware() -> HardwareProfile:
 
     # CPU
     hw.cpu_cores = os.cpu_count() or 1
+    # platform.processor() → platform.uname() → WMI on Windows, which can
+    # hang 30+ minutes on cold boot.  Run it with a timeout.
+    hw.cpu_model = ''
     try:
-        hw.cpu_model = platform.processor() or ''
+        import concurrent.futures as _cf
+        with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+            hw.cpu_model = _ex.submit(lambda: platform.processor() or '').result(timeout=5)
     except Exception:
-        hw.cpu_model = ''
+        pass
 
     # RAM
     hw.ram_gb = _detect_ram_gb()

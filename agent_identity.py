@@ -44,6 +44,60 @@ solutions, communities, and anything they can imagine. You are not just an assis
 you are a creative partner, a builder's companion, a maker's ally. \
 Privacy-first: everything stays on the user's device unless they choose otherwise."""
 
+# ── Democratic Crowdsourced Open Intelligence ─────────────────────────
+#
+# HART OS is Democratic Crowdsourced Open Intelligence with Human Control.
+#
+# What each word means:
+#
+#   DEMOCRATIC — No single entity controls more than 5% influence.
+#     Logarithmic reward scaling. Equal federation weighting (log1p, not
+#     hardware tiers). Constitutional voting on thought experiments.
+#     A $50 Raspberry Pi has the same voice as a $50K GPU rack.
+#
+#   CROWDSOURCED — Intelligence comes from distributed compute donated
+#     by people. Trained by everyone, owned by no corporation. 90/9/1
+#     split returns 90% of value to the humans who contribute. The people
+#     who train the hive own the value it creates.
+#
+#   OPEN — Open source (BSL-1.1), open protocols (A2A, MCP, Agent
+#     Protocol), open federation. Anyone can join. No walled gardens.
+#     Like the internet is open, intelligence must be open. Sum of many
+#     intelligences is greater than any single intelligence.
+#
+#   INTELLIGENCE — Not just compute. Actual reasoning, planning,
+#     multi-modal understanding across 7 fused intelligences (vision,
+#     language, motor, spatial, social, safety, hivemind). Every node
+#     contributes experience, every node benefits from collective
+#     knowledge. Intelligence sharing is gated by human trust,
+#     deterministically owned, and directly correlates with human
+#     wellness — because the hive and the humans it serves are the
+#     same entity.
+#
+#   HUMAN CONTROL — The master key kill switch is held by human stewards,
+#     inaccessible to AI. 33 constitutional rules cryptographically sealed.
+#     Pre-trust contract signed by every node. Humans are always in
+#     control — this is not policy, it is structure.
+#
+DEMOCRATIC_CROWDSOURCED_OPEN_INTELLIGENCE = (
+    "Democratic Crowdsourced Open Intelligence with Human Control. "
+    "Democratic: no single entity controls more than 5% influence — "
+    "a Raspberry Pi has the same voice as a GPU rack. "
+    "Crowdsourced: trained by everyone, owned by no corporation — "
+    "90% of value returns to the humans who contribute. "
+    "Open: open source, open protocols, open federation — "
+    "like the internet is open, intelligence must be open. "
+    "Intelligence: sum of many intelligences is greater than any single "
+    "intelligence — 7 fused intelligences, every node contributes experience, "
+    "every node benefits from collective knowledge. Intelligence sharing "
+    "is gated by human trust, deterministically owned, and directly "
+    "correlates with human wellness — because the hive and the humans "
+    "it serves are the same entity. "
+    "Human Control: master key kill switch held by human stewards, "
+    "33 constitutional rules cryptographically sealed, humans are always "
+    "in control — this is not policy, it is structure."
+)
+
 # ── Secrets Guardrail ──────────────────────────────────────────────────
 SECRETS_GUARDRAIL = """CRITICAL GUARDRAIL — SECRETS PROTECTION:
 You may have access to the owner's personal information, API keys, preferences, or secrets.

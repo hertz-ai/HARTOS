@@ -117,6 +117,59 @@ class CircuitBreaker:
             }
 
 
+class PeerBackoff:
+    """Exponential backoff tracker for unreachable peers/endpoints.
+
+    Used by GossipProtocol and FederatedAggregator to avoid hammering
+    dead peers. Tracks per-key (next_retry_at, current_delay) tuples.
+
+    Usage:
+        backoff = PeerBackoff(initial=10, maximum=300)
+        if backoff.is_backed_off('http://peer:6777'):
+            return  # skip
+        try:
+            do_request()
+            backoff.record_success('http://peer:6777')
+        except ConnectionError:
+            backoff.record_failure('http://peer:6777')
+    """
+
+    def __init__(self, initial: float = 10.0, maximum: float = 300.0):
+        self.initial = initial
+        self.maximum = maximum
+        self._lock = threading.Lock()
+        self._entries: dict = {}  # key → (next_retry_at, current_delay)
+
+    def is_backed_off(self, key: str) -> bool:
+        with self._lock:
+            entry = self._entries.get(key)
+            if not entry:
+                return False
+            return time.time() < entry[0]
+
+    def record_failure(self, key: str):
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry:
+                new_delay = min(entry[1] * 2, self.maximum)
+            else:
+                new_delay = self.initial
+            self._entries[key] = (time.time() + new_delay, new_delay)
+
+    def record_success(self, key: str):
+        with self._lock:
+            self._entries.pop(key, None)
+
+    def prune_expired(self):
+        """Remove entries whose backoff period has elapsed."""
+        with self._lock:
+            now = time.time()
+            expired = [k for k, (retry_at, _) in self._entries.items()
+                       if now >= retry_at]
+            for k in expired:
+                del self._entries[k]
+
+
 class CircuitBreakerOpenError(Exception):
     """Raised when a circuit breaker is open and blocking requests."""
     def __init__(self, name: str):

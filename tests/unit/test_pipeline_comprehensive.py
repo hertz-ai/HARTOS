@@ -45,6 +45,13 @@ from datetime import datetime, timedelta
 from unittest.mock import patch, MagicMock, PropertyMock, call, ANY
 import pytest
 
+try:
+    import autogen
+except ImportError:
+    autogen = None
+
+pytestmark = pytest.mark.skipif(autogen is None, reason="autogen not installed")
+
 # ---------------------------------------------------------------------------
 # Shared fixtures and helpers
 # ---------------------------------------------------------------------------

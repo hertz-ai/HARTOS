@@ -39,7 +39,7 @@ class SimpleMemConfig:
     base_url: Optional[str] = None
     model: str = "gpt-4.1-mini"
     embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
-    db_path: str = "./simplemem_db"
+    db_path: str = ""  # Resolved at runtime via platform_paths
     window_size: int = 40
     overlap_size: int = 2
     parallel_workers: int = 8
@@ -57,7 +57,7 @@ class SimpleMemConfig:
             embedding_model=os.getenv(
                 "SIMPLEMEM_EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-0.6B"
             ),
-            db_path=os.getenv("SIMPLEMEM_DB_PATH", "./simplemem_db"),
+            db_path=os.getenv("SIMPLEMEM_DB_PATH", ""),
             window_size=int(os.getenv("SIMPLEMEM_WINDOW_SIZE", "40")),
             overlap_size=int(os.getenv("SIMPLEMEM_OVERLAP_SIZE", "2")),
             parallel_workers=int(os.getenv("SIMPLEMEM_PARALLEL_WORKERS", "8")),
@@ -86,6 +86,13 @@ class SimpleMemStore(MemorySource):
             )
 
         self._config = config or SimpleMemConfig.from_env()
+        # Resolve db_path to a writable directory (not CWD which may be read-only)
+        if not self._config.db_path:
+            try:
+                from core.platform_paths import get_simplemem_dir
+                self._config.db_path = get_simplemem_dir()
+            except ImportError:
+                self._config.db_path = os.path.join('.', 'simplemem_db')
         self._dialogue_count = 0
 
         # Build kwargs for SimpleMemSystem

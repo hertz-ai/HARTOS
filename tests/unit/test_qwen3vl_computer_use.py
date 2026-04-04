@@ -250,7 +250,7 @@ class TestQwen3VLBackendUnit(unittest.TestCase):
             ]
         })
 
-        with patch('requests.post', return_value=self._mock_api_response(api_content)):
+        with patch('core.http_pool.pooled_post', return_value=self._mock_api_response(api_content)):
             result = self.backend.parse_screen("fake_base64")
 
         self.assertIn('screen_info', result)
@@ -263,7 +263,7 @@ class TestQwen3VLBackendUnit(unittest.TestCase):
            return_value=(1920, 1080))
     def test_describe_scene_returns_text(self, mock_dims):
         """describe_scene() returns a text description."""
-        with patch('requests.post',
+        with patch('core.http_pool.pooled_post',
                    return_value=self._mock_api_response("A desktop with a code editor open")):
             result = self.backend.describe_scene("fake_base64")
 
@@ -285,7 +285,7 @@ class TestQwen3VLBackendUnit(unittest.TestCase):
             "Status": "IN_PROGRESS"
         })
 
-        with patch('requests.post', return_value=self._mock_api_response(api_content)):
+        with patch('core.http_pool.pooled_post', return_value=self._mock_api_response(api_content)):
             result = self.backend.parse_and_reason("fake_base64", "Save the file")
 
         self.assertIn('screen_info', result)
@@ -299,14 +299,14 @@ class TestQwen3VLBackendUnit(unittest.TestCase):
     def test_connection_failure_raises(self):
         """API connection failure raises an exception."""
         import requests
-        with patch('requests.post', side_effect=requests.ConnectionError("refused")):
+        with patch('core.http_pool.pooled_post', side_effect=requests.ConnectionError("refused")):
             with self.assertRaises(requests.ConnectionError):
                 self.backend.describe_scene("fake_base64")
 
     def test_timeout_handling(self):
         """API timeout raises an exception."""
         import requests
-        with patch('requests.post', side_effect=requests.Timeout("timed out")):
+        with patch('core.http_pool.pooled_post', side_effect=requests.Timeout("timed out")):
             with self.assertRaises(requests.Timeout):
                 self.backend.describe_scene("fake_base64")
 
@@ -354,7 +354,7 @@ class TestBoxIDResolution(unittest.TestCase):
         mock_resp.json.return_value = {'choices': [{'message': {'content': api_content}}]}
         mock_resp.raise_for_status = MagicMock()
 
-        with patch('requests.post', return_value=mock_resp):
+        with patch('core.http_pool.pooled_post', return_value=mock_resp):
             result = backend.parse_and_reason("fake_b64", "Enter name")
 
         # bbox [210, 50, 400, 80] normalized from [0,1000] to 1920x1080:
@@ -382,7 +382,7 @@ class TestBoxIDResolution(unittest.TestCase):
         mock_resp.json.return_value = {'choices': [{'message': {'content': api_content}}]}
         mock_resp.raise_for_status = MagicMock()
 
-        with patch('requests.post', return_value=mock_resp):
+        with patch('core.http_pool.pooled_post', return_value=mock_resp):
             result = backend.parse_and_reason("fake_b64", "Click")
 
         # Explicit coordinate should be preserved, not overwritten by Box ID center

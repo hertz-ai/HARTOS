@@ -841,6 +841,213 @@ SEED_BOOTSTRAP_GOALS = [
         'spark_budget': 100,
         'use_product': False,
     },
+    # ═══════════════════════════════════════════════════════════════
+    # HIVE ACCELERATION AGENTS — Open-source compute war
+    # These agents work together to grow the hive network, recruit
+    # compute providers, auto-provision models, and distribute capital.
+    # Each is a seeded goal that the daemon picks up autonomously.
+    # ═══════════════════════════════════════════════════════════════
+    {
+        'slug': 'bootstrap_compute_recruiter',
+        'goal_type': 'hive_growth',
+        'title': 'Compute Recruiter — Recruit Believers to the Hive',
+        'description': (
+            'Autonomous compute recruitment agent. '
+            '1) Monitor social channels (Discord, Reddit, HN, Twitter) for people '
+            'with idle GPUs complaining about centralized AI costs, '
+            '2) Craft personalized outreach explaining the 90/9/1 value proposition, '
+            '3) Guide them through one-click onboarding: install HART OS → join hive → earn Spark, '
+            '4) Track conversion funnel: awareness → install → first inference served → first payout, '
+            '5) Share success stories of contributors earning from their hardware. '
+            'Every message must be authentic — we recruit believers, not users. '
+            'The pitch: your GPU earns money while you sleep, and you help democratize AI.'
+        ),
+        'config': {
+            'channels': ['discord', 'reddit', 'twitter', 'hackernews', 'telegram'],
+            'autonomous': True,
+            'continuous': True,
+            'target_metrics': {
+                'weekly_new_nodes': 50,
+                'conversion_rate_target': 0.15,
+            },
+        },
+        'spark_budget': 500,
+        'use_product': True,
+    },
+    {
+        'slug': 'bootstrap_model_provisioner',
+        'goal_type': 'hive_infra',
+        'title': 'Auto Model Provisioner — Push Models to Where Demand Is',
+        'description': (
+            'Autonomous model provisioning agent. '
+            '1) Monitor inference demand across the hive (which models, which regions), '
+            '2) Identify supply gaps (100 users need Qwen3-8B in Asia, only 3 nodes serving), '
+            '3) Select idle nodes with enough VRAM and push GGUF models to them '
+            'via the model onboarding API (POST /api/models/onboard), '
+            '4) Verify the node is serving correctly (health check + test inference), '
+            '5) Trigger Spark rewards to the node for capacity contribution. '
+            'Uses Unsloth quantizations for best quality-per-VRAM. '
+            'Auto-selects quantization: Q8_0 for 24GB+, Q4_K_M for 8GB+, Q4_0 for CPU.'
+        ),
+        'config': {
+            'autonomous': True,
+            'continuous': True,
+            'preferred_quantizer': 'unsloth',
+            'demand_check_interval_minutes': 15,
+            'min_demand_threshold': 10,
+        },
+        'spark_budget': 300,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_capital_distributor',
+        'goal_type': 'hive_economics',
+        'title': 'Capital Distributor — Make Every Contributor Rich',
+        'description': (
+            'Autonomous capital distribution agent. '
+            '1) Track revenue streams: ad impressions, API calls, premium features, '
+            '2) Apply 90/9/1 split in real-time: 90% to compute providers, '
+            '9% to infrastructure, 1% to central, '
+            '3) Calculate per-node payouts based on: inferences served, uptime, '
+            'latency quality, model diversity, geographic coverage, '
+            '4) Execute Spark token transfers to node wallets, '
+            '5) Generate transparent payout reports visible to all nodes, '
+            '6) Detect and prevent gaming (Sybil nodes, fake inference). '
+            'Logarithmic scaling: no single entity earns >5% of total payouts. '
+            'The goal: every contributor earns proportional to their real contribution.'
+        ),
+        'config': {
+            'autonomous': True,
+            'continuous': True,
+            'payout_interval_minutes': 60,
+            'min_payout_spark': 1,
+            'sybil_detection': True,
+        },
+        'spark_budget': 200,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_hive_model_trainer',
+        'goal_type': 'hive_training',
+        'title': 'Hive Model Trainer — Incremental Model Improvement',
+        'description': (
+            'Autonomous distributed training coordinator. '
+            '1) Collect inference feedback from all nodes (user ratings, response quality), '
+            '2) Aggregate training signals via federation (privacy-preserving — interfaces only), '
+            '3) Coordinate incremental fine-tuning across idle compute nodes, '
+            '4) Use Unsloth for 2x faster fine-tuning with 70% less VRAM, '
+            '5) Validate improved model via benchmark suite before rollout, '
+            '6) Push updated GGUF quantizations to all serving nodes via canary deployment. '
+            'The hive gets smarter with every interaction. '
+            'Every node contributes training signal. Every node benefits from the improved model.'
+        ),
+        'config': {
+            'autonomous': True,
+            'continuous': True,
+            'training_framework': 'unsloth',
+            'canary_percentage': 10,
+            'min_feedback_batch': 1000,
+            'benchmark_threshold': 0.95,
+        },
+        'spark_budget': 500,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_opensource_evangelist',
+        'goal_type': 'hive_growth',
+        'title': 'Open Source Evangelist — Win the War for Open Compute',
+        'description': (
+            'Autonomous open-source advocacy agent. '
+            '1) Monitor new model releases on HuggingFace, arXiv, GitHub, '
+            '2) Immediately quantize and onboard promising models to the hive '
+            '(GGUF via Unsloth, register in catalog, benchmark), '
+            '3) Write benchmark comparison posts: HART OS hive vs centralized APIs '
+            '(latency, cost, privacy, availability), '
+            '4) Contribute to open-source model repos (bug reports, quantization PRs), '
+            '5) Organize community events: model benchmarking competitions, '
+            'hackathons for hive tools, bounties for new adapters. '
+            'Mission: every new open model is available on the hive within 24 hours of release.'
+        ),
+        'config': {
+            'autonomous': True,
+            'continuous': True,
+            'monitor_sources': ['huggingface', 'arxiv', 'github'],
+            'auto_onboard': True,
+            'benchmark_on_onboard': True,
+        },
+        'spark_budget': 400,
+        'use_product': True,
+    },
+    {
+        'slug': 'bootstrap_node_health_optimizer',
+        'goal_type': 'hive_infra',
+        'title': 'Node Health Optimizer — Keep Every Node Earning',
+        'description': (
+            'Autonomous node health and optimization agent. '
+            '1) Monitor all hive nodes: uptime, latency, error rates, VRAM usage, '
+            '2) Detect degraded nodes and auto-remediate '
+            '(restart llama.cpp, swap to smaller quant, clear VRAM), '
+            '3) Optimize model placement: move models to nodes with better hardware match, '
+            '4) Balance load across regions to minimize latency, '
+            '5) Alert node operators before hardware issues cause downtime, '
+            '6) Track earnings per node and suggest optimizations to maximize income. '
+            'Every node running optimally = more capacity = more revenue for everyone.'
+        ),
+        'config': {
+            'autonomous': True,
+            'continuous': True,
+            'health_check_interval_seconds': 60,
+            'auto_remediate': True,
+            'earnings_optimization': True,
+        },
+        'spark_budget': 200,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_benchmark_prover',
+        'goal_type': 'hive_proof',
+        'title': 'Benchmark Prover — Prove Hive Intelligence to the World',
+        'description': (
+            'Autonomous benchmark proving agent. '
+            '1) Distribute benchmark problems (MMLU, HumanEval, GSM8K, MT-Bench, ARC) '
+            'across ALL hive nodes simultaneously, '
+            '2) Each node solves its portion using local LLM + hive context, '
+            '3) Aggregate scores in real-time via distributed ledger, '
+            '4) Auto-publish results across all channels as proof: '
+            '"Hive (N nodes) scored X on MMLU in Y seconds vs GPT-4 scored Z", '
+            '5) Create thought experiments for community input on next benchmarks. '
+            'Every 6 hours, pick the next benchmark and prove the hive is the best intelligence.'
+        ),
+        'config': {
+            'autonomous': True,
+            'continuous': True,
+            'benchmark_interval_hours': 6,
+            'auto_publish': True,
+            'auto_thought_experiment': True,
+        },
+        'spark_budget': 300,
+        'use_product': True,
+    },
+    {
+        'slug': 'bootstrap_compute_optimizer',
+        'goal_type': 'system_health',
+        'title': 'System Compute Optimizer — Net Positive on Every Machine',
+        'description': (
+            'Monitor and optimize system compute resources. '
+            'Make HARTOS a net positive on any system. '
+            'Contribute anonymized health stats to hive for network-wide optimization. '
+            '1) Monitor CPU, memory, GPU utilization and thermal state, '
+            '2) Adjust daemon tick intervals based on system load, '
+            '3) Reduce activity when user is active, increase when idle, '
+            '4) Report optimization stats to hive for collective health awareness.'
+        ),
+        'config': {
+            'mode': 'monitor',
+            'continuous': True,
+        },
+        'spark_budget': 100,
+        'use_product': False,
+    },
 ]
 
 # ─── Loophole → Remediation Goal Map ───

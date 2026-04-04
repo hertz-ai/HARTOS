@@ -94,6 +94,9 @@ class FederatedAggregator:
         self._epoch = 0
         self._convergence_history: List[float] = []
         self._last_aggregated: Optional[dict] = None
+        # Exponential backoff for unreachable federation peers
+        from core.circuit_breaker import PeerBackoff
+        self._peer_backoff = PeerBackoff(initial=10, maximum=300)
         # Embedding delta channel (Phase 1 gradient sync)
         self._embedding_lock = threading.Lock()
         self._embedding_deltas: Dict[str, dict] = {}  # node_id → compressed delta
@@ -121,6 +124,7 @@ class FederatedAggregator:
 
     def tick(self) -> dict:
         """Full cycle: extract → broadcast → aggregate → apply → track."""
+        self._peer_backoff.prune_expired()
         result = {'epoch': self._epoch, 'aggregated': False}
         try:
             self._local_delta = self.extract_local_delta()
@@ -338,6 +342,7 @@ class FederatedAggregator:
                 }
 
                 peers = db.query(PeerNode).filter_by(status='active').all()
+                now = time.time()
                 for peer in peers:
                     if not peer.url or peer.node_id == delta.get('node_id'):
                         continue
@@ -345,11 +350,14 @@ class FederatedAggregator:
                     # Skip our own node (bundled mode has no HTTP listener)
                     if _peer_url in _self_urls:
                         continue
+                    if self._peer_backoff.is_backed_off(_peer_url):
+                        continue
                     try:
                         url = f"{_peer_url}/api/social/peers/federation-delta"
                         pooled_post(url, json=delta, timeout=5)
+                        self._peer_backoff.record_success(_peer_url)
                     except Exception:
-                        pass
+                        self._peer_backoff.record_failure(_peer_url)
             finally:
                 db.close()
         except Exception as e:

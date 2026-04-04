@@ -1899,6 +1899,111 @@ def mcp_servers(ctx):
 
 @hart.group()
 @click.pass_context
+def model(ctx):
+    """Model management — download, run, swap local LLMs."""
+    pass
+
+
+@model.command('onboard')
+@click.argument('model_name')
+@click.option('--quant', default='auto', help='Quantization (auto, Q4_K_M, Q8_0, etc.)')
+@click.pass_context
+def model_onboard(ctx, model_name, quant):
+    """Download a HuggingFace model and start llama.cpp inference.
+
+    Example: hart model onboard Qwen/Qwen3-8B
+    """
+    click.echo(f"Onboarding {model_name} (quant={quant})...")
+    try:
+        from integrations.service_tools.model_onboarding import onboard
+        result = onboard(model_name, quant=quant)
+        if result.get('status') == 'ready':
+            click.echo(f"Model ready at {result['endpoint']}")
+            click.echo(f"  GGUF: {result.get('gguf_path', 'unknown')}")
+            click.echo(f"  Quant: {result.get('quant', quant)}")
+        else:
+            click.echo(f"Error: {result.get('error', 'unknown')}", err=True)
+    except Exception as e:
+        click.echo(f"Failed: {e}", err=True)
+
+
+@model.command('switch')
+@click.argument('model_name')
+@click.option('--quant', default='auto')
+@click.pass_context
+def model_switch(ctx, model_name, quant):
+    """Hot-swap to a different model (downloads if needed)."""
+    click.echo(f"Switching to {model_name}...")
+    try:
+        from integrations.service_tools.model_onboarding import switch_model
+        result = switch_model(model_name, quant=quant)
+        if result.get('status') == 'ready':
+            click.echo(f"Switched to {model_name} at {result['endpoint']}")
+        else:
+            click.echo(f"Error: {result.get('error', 'unknown')}", err=True)
+    except Exception as e:
+        click.echo(f"Failed: {e}", err=True)
+
+
+@model.command('status')
+@click.pass_context
+def model_status(ctx):
+    """Show active model, server health, VRAM usage."""
+    try:
+        from integrations.service_tools.model_onboarding import status
+        s = status()
+        active = s.get('active_model')
+        if active:
+            click.echo(f"Active: {active.get('model', active.get('model_name', 'unknown'))} ({active.get('quant', '?')})")
+            click.echo(f"  Endpoint: {active.get('endpoint', '?')}")
+        else:
+            click.echo("No model running")
+        gpu = s.get('vram', s.get('gpu', {}))
+        if gpu.get('cuda_available'):
+            click.echo(f"  GPU: {gpu.get('name')} — {gpu.get('free_gb', 0):.1f}GB free / {gpu.get('total_gb', 0):.1f}GB")
+        click.echo(f"  Downloaded: {s.get('downloaded_count', 0)} models ({s.get('downloaded_size_gb', 0):.1f}GB)")
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+
+
+@model.command('list')
+@click.pass_context
+def model_list(ctx):
+    """List downloaded GGUF models."""
+    try:
+        from integrations.service_tools.model_onboarding import list_downloaded
+        models = list_downloaded()
+        if not models:
+            click.echo("No models downloaded. Run: hart model onboard <model_name>")
+            return
+        for m in models:
+            size_gb = m.get('size_bytes', 0) / (1024**3)
+            click.echo(f"  {m.get('repo', '?')}/{m.get('filename', '?')} [{m.get('quant', '?')}] {size_gb:.1f}GB")
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+
+
+@model.command('search')
+@click.argument('model_name')
+@click.pass_context
+def model_search(ctx, model_name):
+    """Search HuggingFace for available GGUF quantizations."""
+    click.echo(f"Searching for {model_name} GGUFs...")
+    try:
+        from integrations.service_tools.model_onboarding import list_available
+        items = list_available(model_name)
+        if not items:
+            click.echo("No GGUF files found")
+            return
+        for item in items[:15]:
+            size_gb = item.get('size_bytes', 0) / (1024**3)
+            click.echo(f"  {item.get('repo_id', '?')}/{item.get('filename', '?')} [{item.get('quant', '?')}] {size_gb:.1f}GB")
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+
+
+@hart.group()
+@click.pass_context
 def compute(ctx):
     """Compute policy, resource monitoring, peer network."""
     pass

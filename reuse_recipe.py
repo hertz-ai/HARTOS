@@ -1,4 +1,14 @@
 """reuse_recipe.py"""
+# Guard: cx_Freeze frozen builds close stdout/stderr. Autogen writes to them.
+import sys, os
+try:
+    if sys.stdout is None or sys.stdout.closed:
+        sys.stdout = open(os.devnull, 'w')
+    if sys.stderr is None or sys.stderr.closed:
+        sys.stderr = open(os.devnull, 'w')
+except Exception:
+    pass
+
 from enum import Enum
 import random
 try:
@@ -104,7 +114,10 @@ from helper_ledger import (
 )
 
 # Import sync function from lifecycle_hooks
-from lifecycle_hooks import sync_action_state_to_ledger
+from lifecycle_hooks import (
+    sync_action_state_to_ledger, register_ledger_for_session,
+    ActionState, safe_set_state, force_state_through_valid_path, get_action_state,
+)
 from cultural_wisdom import get_cultural_prompt
 
 
@@ -954,7 +967,11 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         try:
             sm_config = SimpleMemConfig.from_env()
             if sm_config.enabled and sm_config.api_key:
-                sm_config.db_path = f"./simplemem_db/{user_prompt}"
+                try:
+                    from core.platform_paths import get_simplemem_dir
+                    sm_config.db_path = get_simplemem_dir(str(user_prompt))
+                except ImportError:
+                    sm_config.db_path = f"./simplemem_db/{user_prompt}"
                 simplemem_store = SimpleMemStore(sm_config)
                 user_simplemem[user_prompt] = simplemem_store
                 current_app.logger.info(f"SimpleMem initialized for {user_prompt}")
@@ -1043,6 +1060,10 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         ledger = create_ledger_from_actions(user_id, prompt_id, role_actions, backend=backend)
         user_ledgers[user_prompt] = ledger
 
+        # Register for auto-sync so ActionState changes propagate to ledger
+        register_ledger_for_session(user_prompt, ledger)
+        current_app.logger.info(f"Registered ledger for auto-sync in reuse: {user_prompt}")
+
         # Create TaskDelegationBridge for this ledger
         delegation_bridge = TaskDelegationBridge(a2a_context, ledger)
         user_delegation_bridges[user_prompt] = delegation_bridge
@@ -1059,6 +1080,10 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
     # Attach ledger to Action instance
     user_tasks[user_prompt].set_ledger(ledger)
+
+    # Set first action to IN_PROGRESS so ledger tracks it
+    safe_set_state(user_prompt, 1, ActionState.ASSIGNED, "reuse: first action assigned")
+    safe_set_state(user_prompt, 1, ActionState.IN_PROGRESS, "reuse: first action starting")
 
     individual_recipe = []
     for i in range(1, (len(recipes[user_prompt]['actions']) + 1)):
@@ -2507,7 +2532,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         assistant.register_for_execution(name="delegate_to_specialist")(delegate_to_specialist)
 
         def share_context_with_agents(context_key: Annotated[str, "Context identifier"],
-                                      context_value: Annotated[Any, "Context data"]) -> str:
+                                      context_value: Annotated[str, "Context data as string"]) -> str:
             """Share context information with other agents"""
             sharing_func = create_context_sharing_function('assistant')
             result = sharing_func(context_key, context_value)
@@ -2640,17 +2665,18 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                     current_app.logger.info(f'last json as {last_json}')
 
                     if 'status' in last_json.keys() and last_json['status'].lower() == 'completed':
-                        current_app.logger.info('GOT COMPLETED FOR ACTION')
-                        try:
-                            user_tasks[user_prompt].current_action = int(last_json['action_id'])
-                        except Exception as e:
-                            current_app.logger.error(f'GOT ERROR WHILE UPDATING CURRENT ACTION:{e}')
-                            current_app.logger.error(traceback.format_exc())
+                        current_app.logger.info('GOT COMPLETED FOR ACTION in state_transition')
+                        # Don't trust LLM's action_id — use known pipeline state
+                        # The actual advancement happens in get_agent_response/chat_agent loops
                         return chat_instructor
 
-                    currentaction_id = last_json['action_id']
-                    if individual_recipe[currentaction_id - 1]['can_perform_without_user_input'] == 'yes':
-                        return assistant
+                    # Use known pipeline state, not LLM's claimed action_id
+                    _known_aid = user_tasks[user_prompt].current_action
+                    try:
+                        if individual_recipe[_known_aid - 1]['can_perform_without_user_input'] == 'yes':
+                            return assistant
+                    except (IndexError, KeyError):
+                        pass
             except Exception as e:
                 current_app.logger.error(f'Got Error while getting json for current actionid: {e}')
 
@@ -2740,17 +2766,17 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                 last_json = json_objects[-1]
                 current_app.logger.info(f'last json as {last_json}')
                 if 'status' in last_json.keys() and last_json['status'].lower() == 'completed':
-                    current_app.logger.info('GOT COMPLETED FOR ACTION')
-                    try:
-                        time_actions[user_prompt].current_action += 1
-                    except Exception:
-                        current_app.logger.error('GOT ERROR WHILE UPDATING CURRENT ACTION')
-                        time_actions[user_prompt].current_action += 1
+                    current_app.logger.info('GOT COMPLETED FOR ACTION in timer state_transition1')
+                    time_actions[user_prompt].current_action += 1
                     return chat_instructor1
 
-                currentaction_id = last_json['action_id']
-                if final_recipe[prompt_id]['actions'][currentaction_id - 1]['can_perform_without_user_input'] == 'yes':
-                    return time_agent
+                # Use known pipeline state, not LLM's claimed action_id
+                _timer_aid = time_actions[user_prompt].current_action
+                try:
+                    if final_recipe[prompt_id]['actions'][_timer_aid - 1]['can_perform_without_user_input'] == 'yes':
+                        return time_agent
+                except (IndexError, KeyError):
+                    pass
         except Exception as e:
             current_app.logger.error(f'Got Error while getting json for current actionid: {e}')
 
@@ -3075,49 +3101,38 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                         json_obj = ast.literal_eval(group_chat.messages[-2]["content"])
                     current_app.logger.info(f'got json object {json_obj}')
                     if json_obj['status'].lower() == 'completed':
-                        # === LLM CLAIM VALIDATION: cross-reference against known state ===
                         _llm_action_id = int(json_obj.get("action_id", _reuse_current_action))
                         if _llm_action_id != _reuse_current_action:
                             current_app.logger.warning(
                                 f"[HALLUCINATION?] LLM claims action_id={_llm_action_id} "
-                                f"but pipeline assigned {_reuse_current_action} — using known value")
-                        current_app.logger.info(f'UPDATING CURRENT ACTION AS :{_reuse_current_action}')
-                        user_tasks[user_prompt].current_action = _reuse_current_action
-                        action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)[
-                            'action']
-                        steps = [{x['steps']: {'tool_name': x.get('tool_name', None),
-                                               'code': x.get('generalized_functions', None)}} for x in
-                                 recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action - 1]['recipe']]
-                        user_message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action}:{action_message}\n follow these steps: {steps}"
+                                f"but pipeline assigned {_reuse_current_action}")
+                        _next, _ok = _advance_reuse_action(user_prompt, _reuse_current_action, "reuse-w1")
+                        if not _ok:
+                            return ''
+                        user_message = _build_reuse_action_message(user_prompt, _next)
                         chat_instructor.initiate_chat(recipient=manager, message=user_message, clear_history=False,
                                                       silent=False)
                         continue
-                except IndexError as e:
-                    current_app.logger.info(f"COmpleted ALL ACTIONS:")
+                except IndexError:
+                    current_app.logger.info("Completed ALL ACTIONS")
                     return ''
                 except Exception:
                     try:
                         json_match = re.search(r'{[\s\S]*}', group_chat.messages[-2]["content"])
                         if json_match:
-                            json_part = json_match.group(0)
-                            json_obj = json.loads(json_part)
+                            json_obj = json.loads(json_match.group(0))
                             current_app.logger.info(f'got json object {json_obj}')
                             if json_obj['status'].lower() == 'completed':
-                                # Use KNOWN action_id from scope, not LLM's claim
-                                _known_action = user_tasks[user_prompt].current_action
-                                _llm_claimed = int(json_obj.get("action_id", _known_action))
-                                if _llm_claimed != _known_action:
+                                _known = user_tasks[user_prompt].current_action
+                                _llm_claimed = int(json_obj.get("action_id", _known))
+                                if _llm_claimed != _known:
                                     current_app.logger.warning(
                                         f"[HALLUCINATION?] LLM claims action_id={_llm_claimed} "
-                                        f"but pipeline has {_known_action}")
-                                current_app.logger.info(f'UPDATING CURRENT ACTION AS :{_known_action}')
-                                user_tasks[user_prompt].current_action = _known_action
-                                action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)['action']
-                                steps = [{x['steps']: {'tool_name': x.get('tool_name', None),
-                                                       'code': x.get('generalized_functions', None)}} for x in
-                                         recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action - 1][
-                                             'recipe']]
-                                user_message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action}:{action_message}\n follow these steps: {steps}"
+                                        f"but pipeline has {_known}")
+                                _next2, _ok2 = _advance_reuse_action(user_prompt, _known, "reuse-w1-regex")
+                                if not _ok2:
+                                    return ''
+                                user_message = _build_reuse_action_message(user_prompt, _next2)
                                 chat_instructor.initiate_chat(recipient=manager, message=user_message,
                                                               clear_history=False, silent=False)
                                 continue
@@ -3322,6 +3337,59 @@ final_recipe = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_final_recipe
 # Signals from autogen agents that a new agent creation is needed
 # Keyed by user_prompt (f'{user_id}_{prompt_id}'), set by create_new_agent tool
 creation_signals = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_creation_signals')
+
+
+# =============================================================================
+# REUSE ACTION ADVANCEMENT HELPER
+# =============================================================================
+
+def _advance_reuse_action(user_prompt, current_action_id, reason="reuse"):
+    """
+    Mark action COMPLETED → TERMINATED, advance to next action, set ASSIGNED → IN_PROGRESS.
+    Returns (next_action_id, True) if advanced, or (None, False) if all actions done or state error.
+    """
+    # Mark current action done
+    ok1 = force_state_through_valid_path(user_prompt, current_action_id,
+                                         ActionState.COMPLETED, f"{reason}: confirmed")
+    ok2 = force_state_through_valid_path(user_prompt, current_action_id,
+                                         ActionState.TERMINATED, f"{reason}: done")
+    if not ok1 or not ok2:
+        # Check actual state — if already TERMINATED, idempotent (safe to advance).
+        # If stuck in ERROR or another state, don't advance — ledger would desync.
+        actual = get_action_state(user_prompt, current_action_id)
+        if actual != ActionState.TERMINATED:
+            current_app.logger.error(
+                f"[REUSE] Cannot advance action {current_action_id}: "
+                f"state is {actual.value}, not TERMINATED — aborting advance")
+            return None, False
+        current_app.logger.info(
+            f"[REUSE] Action {current_action_id} already TERMINATED (idempotent)")
+
+    current_app.logger.info(f'[REUSE] Action {current_action_id} TERMINATED, advancing')
+    next_id = current_action_id + 1
+    user_tasks[user_prompt].current_action = next_id
+
+    if next_id > len(user_tasks[user_prompt].actions):
+        current_app.logger.info(f'[REUSE] All {len(user_tasks[user_prompt].actions)} actions completed')
+        return None, False
+
+    safe_set_state(user_prompt, next_id, ActionState.ASSIGNED, f"{reason}: next assigned")
+    safe_set_state(user_prompt, next_id, ActionState.IN_PROGRESS, f"{reason}: starting")
+    return next_id, True
+
+
+def _build_reuse_action_message(user_prompt, action_id):
+    """Build the action execution message for REUSE mode."""
+    action_message = user_tasks[user_prompt].get_action(action_id - 1)['action']
+    recipe_actions = recipes[user_prompt].get('actions', [])
+    if action_id - 1 < len(recipe_actions):
+        steps = [{x['steps']: {'tool_name': x.get('tool_name', None),
+                               'code': x.get('generalized_functions', None)}} for x in
+                 recipe_actions[action_id - 1].get('recipe', [])]
+    else:
+        steps = []
+        current_app.logger.warning(f"[REUSE] No recipe for action {action_id} — executing without steps")
+    return f"Perform this action -> Action #{action_id}:{action_message}\n follow these steps: {steps}"
 
 
 # =============================================================================
@@ -3584,20 +3652,15 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                 json_obj = ast.literal_eval(group_chat.messages[-2]["content"])
                             current_app.logger.info(f'got json object {json_obj}')
                             if json_obj['status'].lower() == 'completed':
-                                # Use KNOWN action_id, not LLM's claim
                                 _llm_aid = int(json_obj.get("action_id", _w2_current))
                                 if _llm_aid != _w2_current:
                                     current_app.logger.warning(
                                         f"[HALLUCINATION?] LLM claims action_id={_llm_aid} "
                                         f"but pipeline has {_w2_current}")
-                                current_app.logger.info(f'UPDATING CURRENT ACTION AS :{_w2_current}')
-                                user_tasks[user_prompt].current_action = _w2_current
-                                action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)['action']
-                                steps = [{x['steps']: {'tool_name': x.get('tool_name', None),
-                                                       'code': x.get('generalized_functions', None)}} for x in
-                                         recipes[user_prompt]['actions'][user_tasks[user_prompt].current_action - 1][
-                                             'recipe']]
-                                user_message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action}:{action_message}\n follow these steps: {steps}"
+                                _w2_next, _w2_ok = _advance_reuse_action(user_prompt, _w2_current, "reuse-w2")
+                                if not _w2_ok:
+                                    return ''
+                                user_message = _build_reuse_action_message(user_prompt, _w2_next)
                                 chat_instructor.initiate_chat(recipient=manager, message=user_message,
                                                               clear_history=False, silent=False)
                                 continue
@@ -3605,34 +3668,26 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                             try:
                                 json_match = re.search(r'{[\s\S]*}', group_chat.messages[-2]["content"])
                                 if json_match:
-                                    json_part = json_match.group(0)
-                                    json_obj = json.loads(json_part)
+                                    json_obj = json.loads(json_match.group(0))
                                     current_app.logger.info(f'got json object {json_obj}')
                                     if json_obj['status'].lower() == 'completed':
-                                        # Use KNOWN action_id, not LLM's claim
                                         _llm_aid2 = int(json_obj.get("action_id", _w2_current))
                                         if _llm_aid2 != _w2_current:
                                             current_app.logger.warning(
                                                 f"[HALLUCINATION?] LLM claims action_id={_llm_aid2} "
                                                 f"but pipeline has {_w2_current}")
-                                        current_app.logger.info(
-                                            f'UPDATING CURRENT ACTION AS :{_w2_current}')
-                                        user_tasks[user_prompt].current_action = _w2_current
-                                        action_message = user_tasks[user_prompt].get_action(user_tasks[user_prompt].current_action - 1)['action']
-                                        steps = [{x['steps']: {'tool_name': x.get('tool_name', None),
-                                                               'code': x.get('generalized_functions', None)}} for x in
-                                                 recipes[user_prompt]['actions'][
-                                                     user_tasks[user_prompt].current_action - 1]['recipe']]
-                                        user_message = f"Perform this action -> Action #{user_tasks[user_prompt].current_action}:{action_message}\n follow these steps: {steps}"
+                                        _w2_next2, _w2_ok2 = _advance_reuse_action(user_prompt, _w2_current, "reuse-w2-regex")
+                                        if not _w2_ok2:
+                                            return ''
+                                        user_message = _build_reuse_action_message(user_prompt, _w2_next2)
                                         chat_instructor.initiate_chat(recipient=manager, message=user_message,
                                                                       clear_history=False, silent=False)
                                         continue
 
-
                                 else:
                                     raise ValueError('No json found')
-                            except IndexError as e:
-                                current_app.logger.info(f"COmpleted ALL ACTIONS:")
+                            except IndexError:
+                                current_app.logger.info("Completed ALL ACTIONS")
                                 return ''
                             except Exception as e:
                                 current_app.logger.warning(f'it is not a json object the error is: {e}')

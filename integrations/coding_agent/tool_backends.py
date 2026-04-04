@@ -251,12 +251,93 @@ class _LazyAiderNative:
         return False  # Never matches shutil.which checks
 
 
+# ─── Claw Native Backend (Rust via PyO3, zero subprocess overhead) ───────────
+
+class _LazyClaw:
+    """Lazy proxy for ClawNativeBackend — avoids hard dep on compiled claw_bridge."""
+
+    _cls = None
+
+    def __call__(self):
+        if self._cls is None:
+            try:
+                self._cls = _get_claw_native_class()
+            except ImportError:
+                return None
+        return self._cls()
+
+    def __eq__(self, other):
+        return False
+
+
+def _get_claw_native_class():
+    """Import claw_bridge (compiled Rust PyO3 module) and return backend class."""
+    import claw_bridge  # noqa: F401 — compiled .pyd/.so from claw_native/rust/crates/hart-bridge
+
+    class ClawNativeBackend(CodingToolBackend):
+        """In-process Rust coding agent — bash, file ops, grep, glob via claw-code.
+
+        Calls compiled Rust functions directly (no subprocess). Complements the
+        existing Aider Native backend with Rust-speed file ops and the claw agent
+        loop for terminal-native coding tasks.
+        """
+        name = 'claw_native'
+        binary = ''  # No subprocess — runs in-process via PyO3
+        strengths = [
+            'terminal_coding', 'file_editing', 'bash_execution',
+            'grep_search', 'glob_search', 'repo_exploration',
+            'lsp_integration', 'session_persistence',
+        ]
+
+        def is_installed(self) -> bool:
+            try:
+                import claw_bridge
+                return True
+            except ImportError:
+                return False
+
+        def build_command(self, task, context=None):
+            return []  # Not subprocess-based
+
+        def parse_output(self, stdout, stderr, returncode):
+            return {'success': returncode == 0, 'output': stdout, 'error': stderr}
+
+        def execute(self, task: str, context=None, timeout: int = 120) -> Dict:
+            """Execute coding task via Rust claw_bridge — zero subprocess overhead."""
+            import json as _json
+            working_dir = (context or {}).get('working_dir', os.getcwd())
+
+            try:
+                import shlex
+                cmd = f'cd {shlex.quote(working_dir)} && {task}' if working_dir else task
+                result = claw_bridge.execute_bash(cmd, timeout * 1000)
+                parsed = _json.loads(result)
+                return {
+                    'success': parsed.get('exit_code', 1) == 0,
+                    'output': parsed.get('stdout', ''),
+                    'error': parsed.get('stderr', ''),
+                    'exit_code': parsed.get('exit_code', 1),
+                    'backend': 'claw_native',
+                }
+            except Exception as e:
+                return {'success': False, 'output': '', 'error': str(e), 'backend': 'claw_native'}
+
+        def get_capabilities(self) -> Dict:
+            caps = super().get_capabilities()
+            caps['type'] = 'native_rust'
+            caps['tools'] = ['bash', 'read_file', 'write_file', 'edit_file', 'glob', 'grep']
+            return caps
+
+    return ClawNativeBackend
+
+
 # Registry of all backends
 BACKENDS = {
     'kilocode': KiloCodeBackend,
     'claude_code': ClaudeCodeBackend,
     'opencode': OpenCodeBackend,
     'aider_native': _LazyAiderNative(),
+    'claw_native': _LazyClaw(),
 }
 
 

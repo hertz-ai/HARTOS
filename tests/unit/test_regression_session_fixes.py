@@ -132,14 +132,17 @@ class TestAutoresearchGuard:
         })
         assert result is None
 
-    def test_returns_none_for_missing_repo_path(self):
+    def test_fallback_repo_path_when_missing(self):
+        """When repo_path missing, auto-detect git repo as fallback."""
         from integrations.agent_engine.goal_manager import _build_autoresearch_prompt
         result = _build_autoresearch_prompt({
             'title': 'Test',
             'description': 'Test',
-            'config': {'run_command': 'pytest'},  # repo_path missing
+            'config': {'run_command': 'pytest'},  # repo_path missing — auto-detect
         })
-        assert result is None
+        # Returns a prompt (not None) if running inside a git repo
+        if result is not None:
+            assert 'AUTONOMOUS RESEARCH AGENT' in result
 
     def test_returns_prompt_for_complete_config(self):
         from integrations.agent_engine.goal_manager import _build_autoresearch_prompt

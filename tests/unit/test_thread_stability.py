@@ -409,9 +409,9 @@ class TestPackagingModules:
         for mod_name in modules:
             try:
                 __import__(mod_name)
-            except ImportError as e:
-                # Some modules may need deps not installed in test env
-                # but they should at least exist as files
+            except (ImportError, AttributeError) as e:
+                # Some modules need autogen/other deps not installed in CI.
+                # AttributeError: autogen=None → accessing .AssistantAgent
                 import importlib.util
                 spec = importlib.util.find_spec(mod_name)
                 if spec is None:

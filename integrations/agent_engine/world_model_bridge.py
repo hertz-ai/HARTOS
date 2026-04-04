@@ -715,24 +715,30 @@ class WorldModelBridge:
                     pass
             return result
 
-        # HTTP fallback
-        if self._http_disabled:
+        # HTTP fallback — guarded by circuit breaker to avoid retry storms
+        if self._http_disabled or self._circuit_breaker.is_open():
             return result
         try:
             resp = pooled_get(
                 f'{self._api_url}/v1/stats', timeout=self._timeout_default)
             if resp.status_code == 200:
                 result['learning'] = resp.json()
+                self._circuit_breaker.record_success()
+            else:
+                self._circuit_breaker.record_failure()
         except requests.RequestException:
-            pass
+            self._circuit_breaker.record_failure()
 
         try:
             resp = pooled_get(
                 f'{self._api_url}/v1/hivemind/stats', timeout=self._timeout_default)
             if resp.status_code == 200:
                 result['hivemind'] = resp.json()
+                self._circuit_breaker.record_success()
+            else:
+                self._circuit_breaker.record_failure()
         except requests.RequestException:
-            pass
+            self._circuit_breaker.record_failure()
 
         return result
 
@@ -749,17 +755,19 @@ class WorldModelBridge:
             except Exception:
                 pass
 
-        # HTTP fallback
-        if self._http_disabled:
+        # HTTP fallback — guarded by circuit breaker
+        if self._http_disabled or self._circuit_breaker.is_open():
             return []
         try:
             resp = pooled_get(
                 f'{self._api_url}/v1/hivemind/agents', timeout=self._timeout_default)
             if resp.status_code == 200:
                 data = resp.json()
+                self._circuit_breaker.record_success()
                 return data.get('agents', data) if isinstance(data, dict) else data
+            self._circuit_breaker.record_failure()
         except requests.RequestException:
-            pass
+            self._circuit_breaker.record_failure()
         return []
 
     # ─── RALT skill distribution ─────────────────────────────────────

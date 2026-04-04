@@ -135,19 +135,37 @@ _FASTER_WHISPER_MODEL_SIZE = "base"  # CPU int8 — preserves GPU VRAM for TTS/V
 
 
 def _get_faster_whisper_model(model_size: str = "base"):
-    """Lazy-load faster-whisper model (CTranslate2, CPU int8, auto-downloads from HuggingFace)."""
+    """Lazy-load faster-whisper model (CTranslate2, auto-downloads from HuggingFace).
+
+    Device selection:
+      - NVIDIA GPU (CUDA): CTranslate2 uses its own CUDA runtime (not torch)
+      - AMD GPU: CTranslate2 doesn't support ROCm/Vulkan → CPU fallback
+      - CPU: int8 quantization for speed
+    """
     global _faster_whisper_model, _faster_whisper_model_size
     if _faster_whisper_model is not None and _faster_whisper_model_size == model_size:
         return _faster_whisper_model
 
     from faster_whisper import WhisperModel
 
-    logger.info(f"Loading faster-whisper model '{model_size}' on cpu (int8)...")
+    # Detect if CUDA is available for CTranslate2 (separate from torch CUDA)
+    device = "cpu"
+    compute_type = "int8"
+    try:
+        import ctranslate2
+        if 'cuda' in ctranslate2.get_supported_compute_types('cuda'):
+            device = "cuda"
+            compute_type = "float16"
+            logger.info(f"CTranslate2 CUDA available — loading faster-whisper on GPU")
+    except Exception:
+        pass
+
+    logger.info(f"Loading faster-whisper model '{model_size}' on {device} ({compute_type})...")
     _faster_whisper_model = WhisperModel(
-        model_size, device="cpu", compute_type="int8"
+        model_size, device=device, compute_type=compute_type
     )
     _faster_whisper_model_size = model_size
-    logger.info(f"faster-whisper model '{model_size}' loaded")
+    logger.info(f"faster-whisper model '{model_size}' loaded on {device}")
     return _faster_whisper_model
 
 

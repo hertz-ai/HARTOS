@@ -1,7 +1,17 @@
 """create_recipe.py"""
+# Guard: cx_Freeze frozen builds close stdout/stderr. Autogen writes to them.
+# Must be at module level BEFORE autogen imports.
+import sys, os
+try:
+    if sys.stdout is None or sys.stdout.closed:
+        sys.stdout = open(os.devnull, 'w')
+    if sys.stderr is None or sys.stderr.closed:
+        sys.stderr = open(os.devnull, 'w')
+except Exception:
+    pass
+
 import ast
 import autogen
-import os
 
 # Qwen3.5's Jinja chat template rejects system messages mid-conversation:
 #   "System message must be at the beginning"
@@ -169,19 +179,30 @@ except PermissionError:
         log_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'logs')
     os.makedirs(log_dir, exist_ok=True)
 
-# Create a custom logger with timestamp in filename
-timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-log_file = os.path.join(log_dir, f"agent_system_{timestamp}.log")
+# Single log file with rotation (no more timestamped files that accumulate forever)
+log_file = os.path.join(log_dir, "agent_system.log")
+
+# Clean up old timestamped log files from previous versions (keep last 5)
+try:
+    import glob as _glob
+    old_logs = sorted(_glob.glob(os.path.join(log_dir, "agent_system_*.log")))
+    for old_log in old_logs[:-5]:  # keep newest 5, delete rest
+        try:
+            os.remove(old_log)
+        except OSError:
+            pass
+except Exception:
+    pass
 
 # Configure the logger
 tool_logger = logging.getLogger("agent_logger")
 tool_logger.setLevel(logging.DEBUG)
 
-# File handler with rotation (10 MB max size, keep 10 backup files)
+# File handler with rotation (10 MB max size, keep 5 backup files)
 file_handler = logging.handlers.RotatingFileHandler(
     log_file,
     maxBytes=10*1024*1024,  # 10 MB
-    backupCount=10
+    backupCount=5
 )
 file_handler.setLevel(logging.DEBUG)
 
@@ -772,7 +793,11 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         try:
             sm_config = SimpleMemConfig.from_env()
             if sm_config.enabled and sm_config.api_key:
-                sm_config.db_path = f"./simplemem_db/{user_prompt}"
+                try:
+                    from core.platform_paths import get_simplemem_dir
+                    sm_config.db_path = get_simplemem_dir(str(user_prompt))
+                except ImportError:
+                    sm_config.db_path = f"./simplemem_db/{user_prompt}"
                 simplemem_store = SimpleMemStore(sm_config)
                 user_simplemem[user_prompt] = simplemem_store
                 tool_logger.info(f"[SIMPLEMEM] Initialized for {user_prompt}")
@@ -828,7 +853,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     except Exception as e:
         tool_logger.debug(f"Resonance profile loading skipped: {e}")
 
-    # Create assistant agent
+    # Create assistant agent (user_language resolved inside build_personality_prompt)
     assistant = instantiate_assistant_agent(list_of_persona, user_prompt, personality=_agent_personality, resonance_profile=_resonance_profile)
 
     # Wrap assistant with Agent Lightning for training and optimization
@@ -1420,7 +1445,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     async def execute_coding_task(
         task: Annotated[str, "The coding task to execute (e.g., 'review this function for bugs', 'implement a login form')"],
         task_type: Annotated[str, "Task type: code_review, feature, bug_fix, refactor, app_build, debugging, multi_session"] = "feature",
-        preferred_tool: Annotated[str, "Optional tool override: kilocode, claude_code, opencode, or aider_native (empty = auto-select best)"] = "",
+        preferred_tool: Annotated[str, "Optional tool override: kilocode, claude_code, opencode, aider_native, or claw_native (empty = auto-select best)"] = "",
         working_dir: Annotated[str, "Working directory / repo path for the coding task (empty = use HEVOLVE_CODING_WORKDIR env or cwd)"] = "",
     ) -> str:
         """Execute a coding task using the best available coding agent tool (KiloCode, Claude Code, OpenCode, or AiderNative).
@@ -1447,7 +1472,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
     helper.register_for_llm(
         name="execute_coding_task",
-        description="Execute a coding task (write, review, refactor, debug code) using the best available coding agent tool. Routes to KiloCode, Claude Code, OpenCode, or AiderNative based on benchmarks. Pass working_dir for the target repo path."
+        description="Execute a coding task (write, review, refactor, debug code) using the best available coding agent tool. Routes to KiloCode, Claude Code, OpenCode, AiderNative, or ClawNative (Rust) based on benchmarks. Pass working_dir for the target repo path."
     )(execute_coding_task)
     assistant.register_for_execution(name="execute_coding_task")(execute_coding_task)
 
@@ -2057,8 +2082,11 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                 _recipe_list = json_obj.get('recipe', None)
                                 _has_recipe = isinstance(_recipe_list, list) and len(_recipe_list) > 0
                                 if not _has_recipe:
+                                    if current_state == ActionState.TERMINATED:
+                                        # Action already TERMINATED — don't retry recipe, let while loop advance
+                                        current_app.logger.warning(f'Late save: recipe empty but action already TERMINATED — not retrying')
+                                        return None  # End conversation turn, while loop will detect and advance
                                     current_app.logger.warning(f'Late save: recipe empty or missing — rejecting, will retry. Got: {_recipe_list}')
-                                    # Don't save — let the while loop retry the recipe request
                                     return chat_instructor  # Route back to request recipe again
                                 current_app.logger.info(f'Late save: valid recipe with {len(_recipe_list)} steps')
                                 if _has_recipe:
@@ -2561,7 +2589,11 @@ def instantiate_assistant_agent(list_of_persona, user_prompt, personality=None, 
     if not _personality_block:
         try:
             from cultural_wisdom import get_cultural_prompt_compact
+            from core.agent_personality import get_regional_tone_prompt
             _personality_block = get_cultural_prompt_compact()
+            _regional = get_regional_tone_prompt()  # resolves language internally
+            if _regional:
+                _personality_block += _regional
         except Exception:
             pass
 
@@ -3401,6 +3433,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                 break
             while_loop_iterations += 1
             current_action_id = user_tasks[user_prompt].current_action
+            json_obj = None  # Reset each iteration — set by state_transition JSON parse paths
 
             current_app.logger.info(f"WHILE LOOP ITERATION #{while_loop_iterations} , Current Action Id:{current_action_id}")
 
@@ -3656,6 +3689,10 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         flow, message, text = after_all_actions_terminated(assistant_agent, chat_instructor, group_chat,
                                                                            json_obj, manager,  prompt_id, text,
                                                                            user_prompt)
+
+                        # Save the flow recipe (topologically sorted + scheduler)
+                        _save_flow_recipe(flow, prompt_id, user_prompt, user_id, group_chat)
+
                         if get_current_flow(user_prompt)  < get_total_flows(user_prompt):
                             _next_flow = get_current_flow(user_prompt) + 1
                             _total_flows = get_total_flows(user_prompt)
@@ -3663,16 +3700,17 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                             current_app.logger.info(f'Completed ONE FLOW NOW WE SHOULD WORK ON NEXT FLOW')
                             current_app.logger.info(f'DELETE CURRENT AGENTS AND CREATE NEW')
                             config = get_prompt_config_json(prompt_id)
-                            # recipe_for_persona[user_prompt] += 1
                             flow_actions = config['flows'][get_current_flow(user_prompt)]['actions']
+                            # Fresh ledger for new flow
+                            if user_prompt in user_ledgers:
+                                del user_ledgers[user_prompt]
                             user_tasks[user_prompt] = create_action_with_ledger(flow_actions, user_id, prompt_id, user_prompt)
                             del user_agents[user_prompt]
                             x = get_response_group(user_id,text,prompt_id)
                             continue
                         scheduler_check[user_prompt] = True
-                        json_response = final_recipe[prompt_id]
-
                         safe_increment_flow(user_prompt, prompt_id)
+                        current_app.logger.info(f'[ALL-FLOWS-DONE] Agent creation complete')
                         return 'Agent created successfully'
                     result = chat_instructor.initiate_chat(recipient=manager, message=message, clear_history=False,silent=False)
                 else:
@@ -3684,19 +3722,24 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     except Exception:
                         flow, json_response = after_all_actions_terminated_from_exception(assistant_agent, chat_instructor, flow,
                                                                                           group_chat, manager, prompt_id, user_prompt)
+                        # Save flow recipe (same as Path 1 and Path 2)
+                        _save_flow_recipe(flow, prompt_id, user_prompt, user_id, group_chat)
+
                         if all_flows_completed(prompt_id, get_total_flows(user_prompt), user_prompt):
-                            if json_response and 'status' in json_response.keys():
-                                merged_dict = {**final_recipe[prompt_id], **json_response}
-                                current_app.logger.info('Recipe created successfully')
-                                create_final_recipe_for_current_flow(flow,merged_dict, prompt_id)
-                                update_agent_creation_to_db(prompt_id)
-                                current_app.logger.info('Completed from here2')
-                                return 'Agent Created Successfully'
-                            return 'Agent created successfully'
+                            update_agent_creation_to_db(prompt_id)
+                            current_app.logger.info('[ALL-FLOWS-DONE] Agent creation complete (exception path)')
+                            return 'Agent Created Successfully'
                         else:
-                            user_tasks[user_prompt].recipe=False
-                            user_tasks[user_prompt].fallback=False
+                            # Advance to next flow — same cleanup as Path 1/Path 2
+                            user_tasks[user_prompt].recipe = False
+                            user_tasks[user_prompt].fallback = False
                             safe_increment_flow(user_prompt, prompt_id)
+                            config = get_prompt_config_json(prompt_id)
+                            flow_actions = config['flows'][get_current_flow(user_prompt)]['actions']
+                            if user_prompt in user_ledgers:
+                                del user_ledgers[user_prompt]
+                            user_tasks[user_prompt] = create_action_with_ledger(flow_actions, user_id, prompt_id, user_prompt)
+                            del user_agents[user_prompt]
 
                     current_app.logger.info('checking for fallback and recipe')
 
@@ -3835,17 +3878,24 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                                     'content': f'All {_ca} actions completed for this flow.',
                                     'role': 'user', 'name': 'ChatInstructor'
                                 })
-                            # Ensure json_obj is valid
+                            # json_obj is initialized to None at loop top.
+                            # If state_transition didn't set it, create a default.
                             if not json_obj or not isinstance(json_obj, dict):
                                 json_obj = {'status': 'completed', 'action_id': _ca}
                             flow, message, text = after_all_actions_terminated(
                                 assistant_agent, chat_instructor, group_chat,
                                 json_obj, manager, prompt_id, text, user_prompt)
 
+                            # Save the flow recipe (same function as first path)
+                            _save_flow_recipe(flow, prompt_id, user_prompt, user_id, group_chat)
+
                             if get_current_flow(user_prompt) < get_total_flows(user_prompt):
                                 current_app.logger.info(f'[NEXT-FLOW] Completed flow {get_current_flow(user_prompt)}, starting next')
                                 config = get_prompt_config_json(prompt_id)
                                 flow_actions = config['flows'][get_current_flow(user_prompt)]['actions']
+                                # Fresh ledger for new flow — old one tracked previous flow's actions
+                                if user_prompt in user_ledgers:
+                                    del user_ledgers[user_prompt]
                                 user_tasks[user_prompt] = create_action_with_ledger(flow_actions, user_id, prompt_id, user_prompt)
                                 del user_agents[user_prompt]
                                 x = get_response_group(user_id, text, prompt_id)
@@ -4130,7 +4180,7 @@ def after_all_actions_terminated(assistant_agent, chat_instructor, group_chat, j
     last_message = group_chat.messages[-1]
     current_app.logger.info(f'HI I AM HERE AFTER FINAL SCHEDULED JSON NOW I WILL next actions')
     current_app.logger.info(
-        f'Current Flow -> recipe_for_persona[user_prompt]:{get_current_flow(user_prompt)} total_persona_actions[user_prompt]:{get_total_flows()}')
+        f'Current Flow -> recipe_for_persona[user_prompt]:{get_current_flow(user_prompt)} total_persona_actions[user_prompt]:{get_total_flows(user_prompt)}')
     return flow, message, text
 
 
@@ -4305,6 +4355,36 @@ def fix_cyclic_dependency(cyc, individual_recipe):
             if i['action_id'] == j['action_id']:
                 j['actions_this_action_depends_on'] = i['actions_this_action_depends_on']
                 break
+
+
+def _save_flow_recipe(flow, prompt_id, user_prompt, user_id, group_chat):
+    """Save the aggregated flow recipe to disk.
+
+    Called after after_all_actions_terminated() returns. Collects individual
+    action recipes (topologically sorted with dependencies), merges scheduler
+    data from the group_chat, and writes {prompt_id}_{flow}_recipe.json.
+
+    Single function used by BOTH flow-completion code paths to prevent divergence.
+    """
+    _flow_recipe_data = final_recipe.get(prompt_id, {})
+    if not _flow_recipe_data:
+        _flow_recipes = []
+        set_individual_recipes(flow, _flow_recipes, prompt_id, user_prompt)
+        _flow_recipe_data = {'status': 'completed', 'actions': _flow_recipes}
+    # Merge scheduler response from group_chat if available
+    try:
+        if group_chat and group_chat.messages:
+            _sched_json = retrieve_json(group_chat.messages[-1]['content'])
+            if _sched_json and isinstance(_sched_json, dict):
+                if 'scheduled_tasks' in _sched_json:
+                    _flow_recipe_data['scheduled_tasks'] = _sched_json['scheduled_tasks']
+                if 'visual_scheduled_tasks' in _sched_json:
+                    _flow_recipe_data['visual_scheduled_tasks'] = _sched_json['visual_scheduled_tasks']
+    except Exception:
+        pass
+    create_final_recipe_for_current_flow(flow, _flow_recipe_data, prompt_id)
+    current_app.logger.info(f'[FLOW-RECIPE-SAVED] {prompt_id}_{flow}_recipe.json')
+    _push_thinking(user_id, f'Flow {flow} recipe saved.')
 
 
 def set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt):

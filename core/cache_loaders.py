@@ -140,7 +140,11 @@ def load_recipe(user_prompt):
 
 def load_user_simplemem(user_prompt):
     """Load SimpleMem store. Key is user_prompt (e.g. '123_456')."""
-    simplemem_dir = os.path.join('.', 'simplemem_db', str(user_prompt))
+    try:
+        from core.platform_paths import get_simplemem_dir
+        simplemem_dir = get_simplemem_dir(str(user_prompt))
+    except ImportError:
+        simplemem_dir = os.path.join('.', 'simplemem_db', str(user_prompt))
     if not os.path.exists(simplemem_dir):
         return None
 

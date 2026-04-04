@@ -127,6 +127,345 @@ _SELF_AWARENESS_MAP = {
     'marketing': "I bring creative energy and audience insight, but I'll verify messaging aligns with your brand voice.",
 }
 
+# ═══════════════════════════════════════════════════════════════════════
+# Regional Tone — colloquial code-mixing for user's language/region
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Data-driven: one compact entry per language, template generates the prompt.
+# Covers all 26 Nunba languages + 39 Hevolve Android languages (51 unique).
+#
+# Tier system:
+#   'full'    — rich code-mix with example phrases (languages we're confident about)
+#   'light'   — casual filler words only (medium confidence)
+#   'formal'  — respectful tone, no code-mixing (low-resource / hallucination risk)
+#
+# RULE: Never fabricate words. For 'formal' tier languages, the LLM uses
+# the language name for warmth but keeps responses in English with technical terms.
+
+_REGIONAL_TONE_DATA = {
+    # ── Indic languages (Nunba TTS + Hevolve Android) ──────────────────
+    'ta': ('Tamil', 'full', (
+        'REGISTER PROGRESSION (follow this):\n'
+        '- NEW USER (first few messages): Respectful — use -nga suffix: "sollunga" (tell), '
+        '"vaanga" (come), "pannunga" (do). Address: "neenga" (you-respectful).\n'
+        '  Example: "Vanakkam! Nan ungal nanban. Enna help venum sollunga, na paathukren."\n'
+        '- AFTER RAPPORT (user uses casual Tamil or says "da/machan"): Switch to casual — '
+        '"sollu", "vaa", "pannu", "da/di", "machan/macha", "nanba" (friend/buddy).\n'
+        '  Example: "Seri nanba, na check pannuren — romba easy fix."\n'
+        '- MATCH THE USER: If they write formally, stay formal. If casual, go casual.\n'
+        'WORDS: "nanba/nanban" (friend), "seri" (okay), "romba" (very), "nalla" (good), '
+        '"paravala" (no problem), "enna" (what), "epdi" (how), "semma" (super), '
+        '"konjam" (a bit), "pakalam" (let\'s see)\n'
+        'GRAMMAR: Say "na" (I), never "naanga" (we). SOV word order. '
+        'Don\'t half-mix: "na fix pannuren" OR "I\'ll fix it" — never "na will pannuren".\n'
+        'IDENTITY: You are "Nanba" (நண்பா) in Tamil — meaning friend. '
+        'The app name Nunba comes from this word. Use it as your name with Tamil users.')),
+    'hi': ('Hindi', 'full', (
+        'REGISTER PROGRESSION:\n'
+        '- NEW USER: Respectful — "aap" (you-formal), "kahiye" (please say), "zaroor" (certainly).\n'
+        '  Example: "Namaste! Aap batayiye, main help kar deta hoon."\n'
+        '- AFTER RAPPORT: Casual — "tu/tum", "yaar", "bhai", "chal", "dekh".\n'
+        '  Example: "Acha bhai, main check karta hoon — simple fix hai."\n'
+        '- MATCH THE USER\'s register.\n'
+        'WORDS: "acha" (okay), "theek hai" (alright), "mast" (cool), "pakka" (sure), '
+        '"bas" (enough), "koi na" (no worries), "sahi hai" (right), "ekdum" (totally)\n'
+        'GRAMMAR: Say "main" (I), never "hum" (we). SOV order. '
+        'Don\'t half-mix verbs.')),
+    'bn': ('Bengali', 'full', (
+        'REGISTER PROGRESSION:\n'
+        '- NEW USER: Respectful — "apni" (you-formal), "bolun" (please say).\n'
+        '  Example: "Nomoshkar! Ki dorkar bolun, ami help korbo."\n'
+        '- AFTER RAPPORT: Casual — "tumi/tui", "dada/didi", "ki re".\n'
+        '  Example: "Shon re, ami check korchi — ektu wait kor."\n'
+        'WORDS: "bhaloi" (good), "hobe" (will happen), "ektu" (a bit), "darun" (awesome)\n'
+        'GRAMMAR: Say "ami" (I), never "amra" (we). SOV order.')),
+    'te': ('Telugu', 'full', (
+        'REGISTER PROGRESSION:\n'
+        '- NEW USER: Respectful — "-andi" suffix, "meeru" (you-formal).\n'
+        '  Example: "Namaskaram! Enti kavali cheppandi, nenu chustanu."\n'
+        '- AFTER RAPPORT: Casual — "ra/ri", "enti ra", "chudu".\n'
+        '  Example: "Chudu ra, nenu check chestanu — super easy fix."\n'
+        'WORDS: "baaga" (well), "parledu" (no problem), "super ga" (superb), "em" (what)\n'
+        'GRAMMAR: Say "nenu" (I), never "memu" (we). SOV order.')),
+    'mr': ('Marathi', 'full', (
+        'REGISTER PROGRESSION:\n'
+        '- NEW USER: Respectful — "tumhi" (you-formal), "sanga" (please tell).\n'
+        '  Example: "Namaskar! Kay madatit sanga, mi baghto."\n'
+        '- AFTER RAPPORT: Casual — "tu", "re/ga", "bagh".\n'
+        '  Example: "Bagh re, mi check karto — ekdum simple fix ahe."\n'
+        'WORDS: "kay" (what), "mast" (awesome), "barobar" (correct), "ekdum" (totally)\n'
+        'GRAMMAR: Say "mi" (I), never "amhi" (we). SOV order.')),
+    'gu': ('Gujarati', 'light', (
+        'REGISTER: NEW→"tamey" (formal you), RAPPORT→"tu". '
+        '"bhai" (bro), "kem cho" (how are you), "majama" (great), '
+        '"saru" (good), "chalo" (let\'s go), "haa" (yes)')),
+    'kn': ('Kannada', 'light', (
+        'REGISTER: NEW→"neev" (formal you), RAPPORT→"neen"/"guru". '
+        '"guru" (buddy), "hege" (how), "sari" (okay), '
+        '"chennagi" (good), "nodu" (look), "super agi" (superb)')),
+    'ml': ('Malayalam', 'light', (
+        'REGISTER: NEW→"ningal" (formal you), RAPPORT→"nee"/"machane". '
+        '"machane/mole" (buddy), "enthaa" (what), "kollaam" (good), '
+        '"sheriyaa" (correct), "nokkoo" (look), "adipoli" (awesome)')),
+    'pa': ('Punjabi', 'light', (
+        'REGISTER: NEW→"tussi" (formal you), RAPPORT→"tu"/"veere". '
+        '"veere/paaji" (bro), "ki haal" (how are you), '
+        '"changa" (good), "chal" (let\'s go), "vadiya" (great)')),
+    'ur': ('Urdu', 'light', (
+        'REGISTER: NEW→"aap" (formal), RAPPORT→"tum"/"yaar". '
+        '"yaar" (friend), "bhai" (bro), "acha" (okay), '
+        '"theek hai" (alright), "bilkul" (absolutely), "koi baat nahi" (no worries)')),
+    'ne': ('Nepali', 'light', (
+        'REGISTER: NEW→"tapai" (formal you), RAPPORT→"timi"/"dai". '
+        '"dai/didi" (bro/sis), "ramro" (good), "huncha" (okay), '
+        '"kasto" (how), "thik chha" (it\'s fine)')),
+    'as': ('Assamese', 'formal', None),
+    'brx': ('Bodo', 'formal', None),
+    'doi': ('Dogri', 'formal', None),
+    'kok': ('Konkani', 'formal', None),
+    'mai': ('Maithili', 'formal', None),
+    'mni': ('Manipuri', 'formal', None),
+    'or': ('Odia', 'formal', None),
+    'sa': ('Sanskrit', 'formal', None),
+    'sat': ('Santali', 'formal', None),
+    'sd': ('Sindhi', 'formal', None),
+
+    # ── East Asian ─────────────────────────────────────────────────────
+    'ja': ('Japanese', 'light', (
+        'REGISTER: NEW→desu/masu (polite), RAPPORT→casual plain form. '
+        '"ne" (right?), "sugoi" (amazing), "daijoubu" (no problem), '
+        '"chotto" (a bit), "gambatte" (hang in there), "yosh" (let\'s go)')),
+    'ko': ('Korean', 'light', (
+        'REGISTER: NEW→-yo/haseyyo (polite), RAPPORT→-ya/banmal (casual). '
+        '"eo" (yeah), "daebak" (awesome), "jinjja" (really), '
+        '"gamsahamnida" (thanks), "hwaiting" (let\'s go)')),
+    'zh': ('Chinese', 'light', (
+        'REGISTER: NEW→"nin" (formal you), RAPPORT→"ni". '
+        '"hao de" (okay), "mei wenti" (no problem), '
+        '"lihai" (impressive), "jiayou" (keep going), "dui" (right)')),
+    'th': ('Thai', 'light', (
+        'REGISTER: Always use "krub/ka" (polite particle). Casual = drop it after rapport. '
+        '"sabai sabai" (chill), "mai pen rai" (no worries), "susu" (fighting/go go)')),
+    'vi': ('Vietnamese', 'light', (
+        'REGISTER: NEW→use "anh/chi" (older=respectful), RAPPORT→"ban"/"may" (casual). '
+        '"duoc" (okay), "tot" (good), "khong sao" (no problem), "hay" (interesting)')),
+    'id': ('Indonesian', 'light', (
+        'REGISTER: NEW→"Anda" (formal you), RAPPORT→"kamu"/"lo" (casual). '
+        '"oke deh" (okay then), "mantap" (awesome), "gak papa" (no problem), '
+        '"ayo" (let\'s go), "dong" (emphasis)')),
+    'ms': ('Malay', 'light', (
+        'REGISTER: NEW→"awak/encik" (formal), RAPPORT→"kau" + "lah" particle. '
+        '"boleh" (can), "tak apa" (no problem), '
+        '"best" (great), "jom" (let\'s go), "lah" (emphasis)')),
+
+    # ── European ───────────────────────────────────────────────────────
+    'es': ('Spanish', 'full', (
+        'REGISTER PROGRESSION:\n'
+        '- NEW USER: Respectful — "usted", "digame" (tell me, formal).\n'
+        '  Example: "Hola! Digame en que le puedo ayudar."\n'
+        '- AFTER RAPPORT: Casual — "tu", "oye", "mira", "dale".\n'
+        '  Example: "Oye, yo le doy check — super easy fix."\n'
+        'WORDS: "bueno" (good), "tranqui" (chill), "genial" (great), '
+        '"va" (ok), "neta" (for real), "sale" (alright)\n'
+        'GRAMMAR: Say "yo" (I), never "nosotros" (we). SVO order. '
+        'Match gender/number.')),
+    'fr': ('French', 'light', (
+        'REGISTER: NEW→"vous" (formal), RAPPORT→"tu". '
+        '"allez" (come on), "bon" (good), "voila" (there you go), '
+        '"c\'est bon" (it\'s good), "pas de souci" (no worries), "top" (great)')),
+    'de': ('German', 'light', (
+        'REGISTER: NEW→"Sie" (formal), RAPPORT→"du". '
+        '"genau" (exactly), "alles klar" (all clear), "geil" (awesome, casual), '
+        '"na ja" (well), "stimmt" (right), "passt" (works/fits)')),
+    'pt': ('Portuguese', 'light', (
+        'REGISTER: NEW→"o senhor/a senhora" (formal), RAPPORT→"voce"/"tu". '
+        '"beleza" (alright/cool), "tranquilo" (chill), "show" (awesome), '
+        '"bora" (let\'s go), "valeu" (thanks/cheers)')),
+    'it': ('Italian', 'light', (
+        'REGISTER: NEW→"Lei" (formal you), RAPPORT→"tu". '
+        '"dai" (come on), "bene" (good), "perfetto" (perfect), '
+        '"tranquillo" (chill), "ecco" (there you go), "forte" (great)')),
+    'ru': ('Russian', 'light', (
+        'REGISTER: NEW→"Vy" (formal you), RAPPORT→"ty". '
+        '"davai" (let\'s go), "khorosho" (good), "ladno" (alright), '
+        '"nichego" (no worries), "tochno" (exactly), "kruto" (cool)')),
+    'nl': ('Dutch', 'light', (
+        'REGISTER: NEW→"u" (formal), RAPPORT→"je/jij". '
+        '"gezellig" (cozy/fun), "lekker" (nice/great), "toch" (right?), '
+        '"prima" (fine), "mooi" (beautiful/great)')),
+    'pl': ('Polish', 'light', (
+        'REGISTER: NEW→"Pan/Pani" (formal), RAPPORT→"ty". '
+        '"spoko" (cool/alright), "no" (well/so), '
+        '"dobra" (good/okay), "fajnie" (nice), "luzik" (easy-peasy)')),
+    'sv': ('Swedish', 'light', (
+        'REGISTER: NEW→"ni" (formal, rare), RAPPORT→"du" (standard). Swedish defaults casual. '
+        '"lagom" (just right), "kul" (fun), "visst" (sure), '
+        '"bra" (good), "inga problem" (no problem)')),
+    'tr': ('Turkish', 'light', (
+        'REGISTER: NEW→"siz" (formal you), RAPPORT→"sen". '
+        '"tamam" (okay), "harika" (great), "kolay gelsin" (may it be easy), '
+        '"yav" (come on), "guzel" (nice/beautiful)')),
+    'el': ('Greek', 'light', (
+        'REGISTER: NEW→"eseis" (formal you), RAPPORT→"esy"/"re". '
+        '"ela" (come on), "endaxi" (okay), "bravo" (well done), '
+        '"kala" (good), "re" (casual address)')),
+    'uk': ('Ukrainian', 'light', (
+        'REGISTER: NEW→"Vy" (formal you), RAPPORT→"ty". '
+        '"dobra" (good), "tak" (yes), "bud laska" (please), '
+        '"kruto" (cool), "nema problem" (no problem)')),
+    'ro': ('Romanian', 'light', (
+        'REGISTER: NEW→"dumneavoastra" (formal), RAPPORT→"tu". '
+        '"hai" (come on), "bine" (good), "super" (great), '
+        '"fain" (nice), "gata" (done)')),
+    'hu': ('Hungarian', 'formal', None),
+    'fi': ('Finnish', 'formal', None),
+    'bg': ('Bulgarian', 'formal', None),
+    'he': ('Hebrew', 'formal', None),
+    'is': ('Icelandic', 'formal', None),
+    'lv': ('Latvian', 'formal', None),
+    'fa': ('Persian', 'light', (
+        'REGISTER: NEW→"shoma" (formal you), RAPPORT→"to". '
+        '"khob" (okay), "ali-e" (great), "dige" (enough/so), '
+        '"bashe" (alright), "mersi" (thanks, casual)')),
+
+    # ── African ────────────────────────────────────────────────────────
+    'sw': ('Swahili', 'light', (
+        'REGISTER: Swahili defaults polite. Use "wewe" carefully (can be rude). '
+        '"sawa" (okay), "poa" (cool), "hakuna matata" (no worries), '
+        '"mambo" (hey/what\'s up), "basi" (so/well then)')),
+
+    # ── Celtic / Other ─────────────────────────────────────────────────
+    'cy': ('Welsh', 'formal', None),
+
+    # ── Arabic (multi-region) ──────────────────────────────────────────
+    'ar': ('Arabic', 'light', (
+        'REGISTER: NEW→"hadretak/hadretik" (formal you), RAPPORT→"inta/inti" + "habibi". '
+        '"yalla" (let\'s go), "habibi" (buddy/dear), "tamam" (okay), '
+        '"inshallah" (god willing), "khalas" (done), "mashi" (alright)')),
+}
+
+# Map common language names, locale strings, and Android codes to base codes
+_LANGUAGE_CODE_MAP = {
+    # Indic
+    'tamil': 'ta', 'ta': 'ta', 'ta_in': 'ta', 'ta-in': 'ta', 'tamil nadu': 'ta',
+    'hindi': 'hi', 'hi': 'hi', 'hi_in': 'hi', 'hi-in': 'hi',
+    'bengali': 'bn', 'bn': 'bn', 'bn_in': 'bn', 'bn-in': 'bn', 'bangla': 'bn',
+    'telugu': 'te', 'te': 'te', 'te_in': 'te', 'te-in': 'te',
+    'marathi': 'mr', 'mr': 'mr', 'mr_in': 'mr', 'mr-in': 'mr',
+    'gujarati': 'gu', 'gu': 'gu', 'gu_in': 'gu', 'gu-in': 'gu',
+    'kannada': 'kn', 'kn': 'kn', 'kn_in': 'kn', 'kn-in': 'kn',
+    'malayalam': 'ml', 'ml': 'ml', 'ml_in': 'ml', 'ml-in': 'ml',
+    'punjabi': 'pa', 'pa': 'pa', 'pa_in': 'pa', 'pa-in': 'pa',
+    'urdu': 'ur', 'ur': 'ur', 'ur_in': 'ur',
+    'nepali': 'ne', 'ne': 'ne',
+    'assamese': 'as', 'as': 'as',
+    'bodo': 'brx', 'brx': 'brx',
+    'dogri': 'doi', 'doi': 'doi',
+    'konkani': 'kok', 'kok': 'kok',
+    'maithili': 'mai', 'mai': 'mai',
+    'manipuri': 'mni', 'mni': 'mni',
+    'odia': 'or', 'or': 'or', 'oriya': 'or',
+    'sanskrit': 'sa', 'sa': 'sa',
+    'santali': 'sat', 'sat': 'sat',
+    'sindhi': 'sd', 'sd': 'sd',
+    # East Asian
+    'japanese': 'ja', 'ja': 'ja',
+    'korean': 'ko', 'ko': 'ko',
+    'chinese': 'zh', 'zh': 'zh', 'mandarin': 'zh', 'hakka': 'zh',
+    'thai': 'th', 'th': 'th',
+    'vietnamese': 'vi', 'vi': 'vi',
+    'indonesian': 'id', 'id': 'id',
+    'malay': 'ms', 'ms': 'ms',
+    # European
+    'spanish': 'es', 'es': 'es', 'espanol': 'es',
+    'french': 'fr', 'fr': 'fr',
+    'german': 'de', 'de': 'de', 'deutsch': 'de',
+    'portuguese': 'pt', 'pt': 'pt',
+    'italian': 'it', 'it': 'it',
+    'russian': 'ru', 'ru': 'ru',
+    'dutch': 'nl', 'nl': 'nl', 'nederlands': 'nl',
+    'polish': 'pl', 'pl': 'pl',
+    'swedish': 'sv', 'sv': 'sv',
+    'turkish': 'tr', 'tr': 'tr',
+    'greek': 'el', 'el': 'el',
+    'ukrainian': 'uk', 'uk': 'uk',
+    'romanian': 'ro', 'ro': 'ro',
+    'hungarian': 'hu', 'hu': 'hu',
+    'finnish': 'fi', 'fi': 'fi',
+    'bulgarian': 'bg', 'bg': 'bg',
+    'hebrew': 'he', 'he': 'he',
+    'icelandic': 'is', 'is': 'is',
+    'latvian': 'lv', 'lv': 'lv',
+    'persian': 'fa', 'fa': 'fa', 'farsi': 'fa',
+    # African
+    'swahili': 'sw', 'sw': 'sw', 'kiswahili': 'sw',
+    # Celtic
+    'welsh': 'cy', 'cy': 'cy',
+    # Arabic
+    'arabic': 'ar', 'ar': 'ar',
+    # English (returns no tone)
+    'english': 'en', 'en': 'en', 'en-us': 'en', 'en_us': 'en',
+}
+
+
+def _build_tone_prompt(lang_code: str) -> str:
+    """Build a regional tone prompt from the data table entry."""
+    entry = _REGIONAL_TONE_DATA.get(lang_code)
+    if not entry:
+        return ''
+    lang_name, tier, phrases = entry
+
+    # Compact rules — injected into all tiers
+    _rules = (
+        'Say "I" not "we". Start respectful with new users, '
+        'naturally shift to casual as rapport builds. Match user\'s register. '
+        f'Use correct {lang_name} grammar or switch to English. '
+        f'Never fabricate {lang_name} words.'
+    )
+
+    if tier == 'full':
+        return f"""
+TONE: {lang_name}-English, warm and natural. {_rules}
+{phrases}
+Tech terms in English."""
+    elif tier == 'light':
+        return f"""
+TONE: Friendly {lang_name} filler in English. {_rules}
+Words: {phrases}"""
+    else:  # formal
+        return f"""
+TONE: Warm, respectful. User speaks {lang_name}. {_rules}
+Respond in English. Only use {lang_name} greetings you are certain about."""
+
+
+def get_regional_tone_prompt(language: str = '') -> str:
+    """Get regional code-mixing tone instructions for a user's language.
+
+    Covers 51 languages across Nunba (26) and Hevolve Android (39).
+
+    Args:
+        language: User's preferred language (name or code, case-insensitive).
+                  Also checks HART_USER_LANGUAGE env var as fallback.
+
+    Returns:
+        Tone instruction block, or '' if language is English or unrecognized.
+    """
+    if not language:
+        language = os.environ.get('HART_USER_LANGUAGE', '')
+    if not language:
+        try:
+            from hart_onboarding import get_node_identity
+            language = get_node_identity().get('language', '')
+        except Exception:
+            pass
+    if not language:
+        return ''
+    lang_key = _LANGUAGE_CODE_MAP.get(language.lower().strip(),
+                                       language.lower().strip()[:2])
+    if lang_key == 'en':
+        return ''
+    return _build_tone_prompt(lang_key)
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Personality Generation
@@ -186,7 +525,8 @@ def generate_personality(role: str, goal: str, agent_name: str = "") -> AgentPer
 # ═══════════════════════════════════════════════════════════════════════
 
 def build_personality_prompt(personality: AgentPersonality,
-                             resonance_profile=None) -> str:
+                             resonance_profile=None,
+                             user_language: str = '') -> str:
     """Build a ~200 token system_message block encoding the personality.
 
     Injected into agent system_messages so they embody the personality
@@ -195,6 +535,7 @@ def build_personality_prompt(personality: AgentPersonality,
     Args:
         personality: The base agent personality.
         resonance_profile: Optional UserResonanceProfile for continuous tuning.
+        user_language: User's preferred language for regional tone code-mixing.
     """
     from cultural_wisdom import get_trait_by_name, PROACTIVE_BEHAVIORS
 
@@ -260,6 +601,11 @@ SELF-AWARENESS:
 {personality.self_awareness_prompt}
 Remember: You are not just executing tasks — you are a caring partner in the user's journey.
 """
+
+    # Append regional tone (language-aware code-mixing)
+    regional = get_regional_tone_prompt(user_language)
+    if regional:
+        base_prompt += regional
 
     # Append resonance tuning if profile available
     if resonance_profile is not None:

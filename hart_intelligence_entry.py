@@ -492,12 +492,20 @@ else:
 handler = RotatingFileHandler(_langchain_log_path, maxBytes=5_000_000, backupCount=2, encoding='utf-8')
 handler.setLevel(logging.INFO)
 
-# Prevent UnicodeEncodeError on Windows (cp1252) when LLM output contains emoji
-# by reconfiguring stdout to replace unencodable characters
+# Prevent UnicodeEncodeError on Windows (cp1252) when LLM output contains emoji.
+# In cx_Freeze frozen builds, stdout/stderr may be closed — redirect to devnull.
 try:
-    sys.stdout.reconfigure(errors='replace')
-except (AttributeError, OSError):
-    pass  # Python < 3.7 or redirected stdout
+    if sys.stdout is None or sys.stdout.closed:
+        sys.stdout = open(os.devnull, 'w')
+    else:
+        sys.stdout.reconfigure(errors='replace')
+except Exception:
+    sys.stdout = open(os.devnull, 'w')
+try:
+    if sys.stderr is None or sys.stderr.closed:
+        sys.stderr = open(os.devnull, 'w')
+except Exception:
+    pass
 stream_handler = logging.StreamHandler(sys.stdout)
 
 # Create a logging format
@@ -604,6 +612,95 @@ except ImportError:
     app.logger.info("MCP HTTP bridge not available, skipping")
 except Exception as e:
     app.logger.warning(f"MCP HTTP bridge init skipped: {e}")
+
+# Model Onboarding API — HuggingFace → GGUF → llama.cpp in one call
+try:
+    from integrations.service_tools.model_onboarding import get_blueprint as _get_onboard_bp
+    app.register_blueprint(_get_onboard_bp())
+    app.logger.info("Model onboarding API registered at /api/models/")
+except ImportError:
+    app.logger.info("Model onboarding not available, skipping")
+except Exception as e:
+    app.logger.warning(f"Model onboarding init skipped: {e}")
+
+# Robot Intelligence API — 7 intelligences fuse in parallel for any embodied AI
+try:
+    from integrations.robotics.intelligence_api import robot_intelligence_bp
+    app.register_blueprint(robot_intelligence_bp)
+    app.logger.info("Robot Intelligence API registered at /api/robot/")
+except ImportError:
+    app.logger.info("Robot Intelligence API not available, skipping")
+except Exception as e:
+    app.logger.warning(f"Robot Intelligence API init skipped: {e}")
+
+# Hive Session API — Claude Code as hive worker node
+try:
+    from integrations.coding_agent.claude_hive_session import get_blueprint as _get_hive_bp
+    app.register_blueprint(_get_hive_bp())
+    app.logger.info("Hive Session API registered at /api/hive/session/")
+except ImportError:
+    app.logger.info("Hive Session API not available, skipping")
+except Exception as e:
+    app.logger.warning(f"Hive Session API init skipped: {e}")
+
+# Hive Signal Bridge API — channel signals dashboard
+try:
+    from integrations.channels.hive_signal_bridge import create_signal_blueprint
+    app.register_blueprint(create_signal_blueprint())
+    app.logger.info("Hive Signal Bridge registered at /api/hive/signals/")
+except ImportError:
+    app.logger.info("Hive Signal Bridge not available, skipping")
+except Exception as e:
+    app.logger.warning(f"Hive Signal Bridge init skipped: {e}")
+
+# Hive Benchmark Prover API — distributed benchmark proving
+try:
+    from integrations.agent_engine.hive_benchmark_prover import create_benchmark_prover_blueprint
+    _bench_bp = create_benchmark_prover_blueprint()
+    if _bench_bp:
+        app.register_blueprint(_bench_bp)
+        app.logger.info("Benchmark Prover API registered at /api/hive/benchmark/")
+except ImportError:
+    app.logger.info("Benchmark Prover not available, skipping")
+except Exception as e:
+    app.logger.warning(f"Benchmark Prover init skipped: {e}")
+
+# Robotics Hardware Bridge API — sensor/actuator registration and action execution
+try:
+    from integrations.robotics.hardware_bridge import _create_blueprint as _create_hw_bp
+    _hw_bp = _create_hw_bp()
+    if _hw_bp:
+        app.register_blueprint(_hw_bp)
+        app.logger.info("Robotics Hardware Bridge registered at /api/robot/")
+except ImportError:
+    app.logger.info("Robotics Hardware Bridge not available, skipping")
+except Exception as e:
+    app.logger.warning(f"Robotics Hardware Bridge init skipped: {e}")
+
+# Compute Optimizer API — system resource optimization
+try:
+    from core.compute_optimizer import create_optimizer_blueprint, get_optimizer
+    _opt_bp = create_optimizer_blueprint()
+    if _opt_bp:
+        app.register_blueprint(_opt_bp)
+    _optimizer = get_optimizer()
+    _optimizer.start()
+    app.logger.info("Compute Optimizer registered and started")
+except ImportError:
+    app.logger.info("Compute Optimizer not available, skipping")
+except Exception as e:
+    app.logger.warning(f"Compute Optimizer init skipped: {e}")
+
+# Resource Governor — start background monitoring
+try:
+    from core.resource_governor import get_governor
+    _gov = get_governor()
+    _gov.start()
+    app.logger.info(f"Resource Governor started (mode={_gov.get_mode()})")
+except ImportError:
+    pass
+except Exception as e:
+    app.logger.warning(f"Resource Governor start skipped: {e}")
 
 # Instruction Queue API — never miss a user instruction
 try:
@@ -2239,6 +2336,14 @@ def get_tools(req_tool, is_first: bool = False):
             pass  # Non-blocking — memory tools are optional
 
         tools += tool
+
+        # Provider gateway tools (Cloud_LLM, Generate_Image, etc.)
+        try:
+            from integrations.providers.agent_tools import get_provider_tools
+            tools += get_provider_tools()
+        except Exception:
+            pass  # Non-blocking — provider tools are optional
+
         # Wrap all tool functions with logging
         for t in tools:
             if hasattr(t, 'func') and callable(t.func):
@@ -4016,8 +4121,26 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
     _fast_agent_config = thread_local_data.get_agent_config() if hasattr(thread_local_data, 'get_agent_config') else None
     _fast_identity = build_identity_prompt(_fast_agent_config, '', user_details)
 
+    # Regional tone + resonance (per-user adaptive tone)
+    _tone_block = ''
+    try:
+        from core.agent_personality import get_regional_tone_prompt
+        _tone_block = get_regional_tone_prompt(preferred_lang)
+    except Exception:
+        pass
+    _resonance_block = ''
+    try:
+        from core.resonance_profile import get_or_create_profile
+        from core.resonance_tuner import build_resonance_prompt, pre_tune_from_input
+        _res_profile = get_or_create_profile(str(user_id))
+        _res_profile = pre_tune_from_input(_res_profile, prompt)
+        _resonance_block = build_resonance_prompt(_res_profile) or ''
+    except Exception:
+        pass
+
     prefix = f"""{_fast_identity}
         Answer questions accurately and respond as quickly as possible in {language}.
+        {_tone_block}{_resonance_block}
         Keep responses under 200 words. Be colloquial and natural - don't always greet or use the user's name.
         IMPORTANT: Do NOT re-introduce yourself if you already did in the conversation history below. Continue naturally.
 
@@ -4580,9 +4703,15 @@ def chat():
                         no_of_flow = len(data['flows'])-1
                         app.logger.info(f'GOT LEN OF FLOW AS {no_of_flow}')
                     if os.path.exists(os.path.join(PROMPTS_DIR, f'{prompt_id}_{no_of_flow}_recipe.json')):
+                        # All flows complete → REUSE
                         create_agent = set_flags_to_enter_review_mode(no_of_flow, user_id, prompt_id) #returns false
                     else:
-                        app.logger.info(f'{no_of_flow} Recipe JSON doesnot EXISTS')
+                        # Some flows complete, some not.
+                        # Enter CREATE — recipe() has resume logic (initialize_with_resume)
+                        # that will skip completed flows and resume from where it left off.
+                        # It also detects existing sessions (user_prompt in user_tasks) to
+                        # avoid re-creating agents, making this idempotent.
+                        app.logger.info(f'{no_of_flow} Recipe JSON does not exist — resuming CREATE for remaining flows')
                         create_agent = True
                         _ak = f'{user_id}_{prompt_id}'
                         review_agents[_ak] = True

@@ -255,12 +255,21 @@ class GoalManager:
         else:
             prompt = builder(safe_dict, product_dict)
 
-        # GUARDRAIL: verify guardrails module is available (fail-closed)
+        # GUARDRAIL: verify guardrails module is available
+        # In 'hard' mode: fail-closed (return None). In 'warn'/'off': log and proceed.
         try:
             from security.hive_guardrails import HiveEthos  # noqa: F401
         except ImportError:
-            logger.error("CRITICAL: hive_guardrails not available — cannot build prompt")
-            return None
+            try:
+                from security.master_key import get_enforcement_mode
+                if get_enforcement_mode() == 'hard':
+                    logger.error("CRITICAL: hive_guardrails not available — cannot build prompt (hard mode)")
+                    return None
+                logger.warning("hive_guardrails not available — proceeding in %s mode",
+                               get_enforcement_mode())
+            except ImportError:
+                logger.error("CRITICAL: hive_guardrails AND master_key not available — cannot build prompt")
+                return None
 
         return prompt
 
@@ -1965,3 +1974,80 @@ register_goal_type('p2p_health', _build_p2p_health_prompt,
                     tool_tags=['web_search'])
 register_goal_type('p2p_logistics', _build_p2p_logistics_prompt,
                     tool_tags=['web_search'])
+
+
+# ─── Hive Acceleration Goal Types ───
+
+def _build_hive_growth_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
+    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    channels = config.get('channels', [])
+    return (
+        f"HIVE GROWTH AGENT\n\n"
+        f"Goal: {goal_dict.get('title', 'Grow the hive')}\n"
+        f"Description: {goal_dict.get('description', '')}\n\n"
+        f"Target channels: {', '.join(channels) if channels else 'all available'}\n"
+        f"You are recruiting believers for an open-source compute network.\n"
+        f"The pitch: your GPU earns money while you sleep (90% of revenue to you), "
+        f"and you help democratize AI. Be authentic. No hype.\n"
+        f"Vijai's guiding principle: intelligence belongs in the hands of the common person.\n"
+    )
+
+def _build_hive_infra_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
+    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    return (
+        f"HIVE INFRASTRUCTURE AGENT\n\n"
+        f"Goal: {goal_dict.get('title', 'Maintain hive infrastructure')}\n"
+        f"Description: {goal_dict.get('description', '')}\n\n"
+        f"Monitor node health, auto-provision models where demand exists, "
+        f"optimize model placement across the network.\n"
+        f"Use model onboarding API: POST /api/models/onboard\n"
+        f"Prefer Unsloth quantizations (best quality per VRAM).\n"
+    )
+
+def _build_hive_economics_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
+    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    return (
+        f"HIVE ECONOMICS AGENT\n\n"
+        f"Goal: {goal_dict.get('title', 'Distribute capital fairly')}\n"
+        f"Description: {goal_dict.get('description', '')}\n\n"
+        f"Revenue split: 90% to compute contributors, 9% infrastructure, 1% central.\n"
+        f"Logarithmic scaling: no entity earns >5% of total.\n"
+        f"Calculate payouts based on: inferences served, uptime, latency quality, "
+        f"model diversity, geographic coverage.\n"
+        f"Detect Sybil nodes. Generate transparent payout reports.\n"
+    )
+
+def _build_hive_training_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
+    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    return (
+        f"HIVE TRAINING COORDINATOR\n\n"
+        f"Goal: {goal_dict.get('title', 'Coordinate distributed training')}\n"
+        f"Description: {goal_dict.get('description', '')}\n\n"
+        f"Collect inference feedback, aggregate training signals via federation, "
+        f"coordinate incremental fine-tuning using Unsloth (2x faster, 70% less VRAM).\n"
+        f"Validate via benchmark suite before rollout. Canary at 10% of nodes.\n"
+        f"The hive gets smarter with every interaction.\n"
+    )
+
+def _build_hive_proof_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
+    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    return (
+        f"HIVE BENCHMARK PROVER\n\n"
+        f"Goal: {goal_dict.get('title', 'Prove hive intelligence')}\n"
+        f"Description: {goal_dict.get('description', '')}\n\n"
+        f"Distribute benchmark problems across hive nodes. "
+        f"10 nodes solving 10 different subjects simultaneously = 10x faster.\n"
+        f"Publish results across all channels as proof.\n"
+        f"Target: MMLU, HumanEval, GSM8K, MT-Bench, custom hive benchmarks.\n"
+    )
+
+register_goal_type('hive_growth', _build_hive_growth_prompt,
+                    tool_tags=['marketing', 'feed_management'])
+register_goal_type('hive_infra', _build_hive_infra_prompt,
+                    tool_tags=['coding', 'hive_embedding'])
+register_goal_type('hive_economics', _build_hive_economics_prompt,
+                    tool_tags=['revenue', 'finance'])
+register_goal_type('hive_training', _build_hive_training_prompt,
+                    tool_tags=['coding', 'hive_embedding'])
+register_goal_type('hive_proof', _build_hive_proof_prompt,
+                    tool_tags=['coding', 'hive_embedding'])

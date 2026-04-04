@@ -44,8 +44,12 @@ try:
 except ImportError:
     HAS_SIMPLEMEM = False
 
-SIMPLEMEM_DB_ROOT = os.path.join(os.path.dirname(os.path.dirname(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))))), 'simplemem_db')
+try:
+    from core.platform_paths import get_simplemem_dir
+    SIMPLEMEM_DB_ROOT = get_simplemem_dir()
+except ImportError:
+    SIMPLEMEM_DB_ROOT = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))))), 'simplemem_db')
 
 # Shared background event loop for async SimpleMem calls (one per process)
 _bg_loop: Optional[asyncio.AbstractEventLoop] = None

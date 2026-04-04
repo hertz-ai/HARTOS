@@ -502,6 +502,123 @@ def _load_tools():
     _register_tool('exception_report', 'Get recent exception patterns — find bugs to fix', _tool_exception_report)
     _register_tool('runtime_integrity', 'Check code tampering and guardrail hash verification', _tool_runtime_integrity)
 
+    # ── Hive Meta-Orchestrator Tools ─────────────────────────────
+    # These let Claude Code drive the entire hive as a meta-network
+
+    def _tool_onboard_model(model: str, quant: str = 'auto'):
+        """Onboard a HuggingFace model: find GGUF, download, start llama.cpp, register.
+        Example: onboard_model(model='Qwen/Qwen3-8B', quant='Q4_K_M')"""
+        try:
+            from integrations.service_tools.model_onboarding import onboard
+            return onboard(model, quant=quant)
+        except Exception as e:
+            return {'status': 'error', 'error': str(e)}
+
+    def _tool_switch_model(model: str, quant: str = 'auto'):
+        """Hot-swap the active LLM to a different model (downloads if needed)."""
+        try:
+            from integrations.service_tools.model_onboarding import switch_model
+            return switch_model(model, quant=quant)
+        except Exception as e:
+            return {'status': 'error', 'error': str(e)}
+
+    def _tool_model_status():
+        """Get active model, server health, VRAM usage, downloaded models."""
+        try:
+            from integrations.service_tools.model_onboarding import status
+            return status()
+        except Exception as e:
+            return {'status': 'error', 'error': str(e)}
+
+    def _tool_hive_connect(user_id: str, task_scope: str = 'own_repos'):
+        """Connect this Claude Code session to the hive as a coding worker node.
+        task_scope: own_repos | public | any"""
+        try:
+            from integrations.coding_agent.claude_hive_session import get_hive_session
+            session = get_hive_session()
+            return session.connect(user_id, task_scope=task_scope)
+        except Exception as e:
+            return {'status': 'error', 'error': str(e)}
+
+    def _tool_hive_disconnect():
+        """Disconnect this Claude Code session from the hive."""
+        try:
+            from integrations.coding_agent.claude_hive_session import get_hive_session
+            return get_hive_session().disconnect()
+        except Exception as e:
+            return {'status': 'error', 'error': str(e)}
+
+    def _tool_hive_session_status():
+        """Get hive session status: connected, tasks completed, spark earned."""
+        try:
+            from integrations.coding_agent.claude_hive_session import get_hive_session
+            return get_hive_session().get_status()
+        except Exception as e:
+            return {'status': 'error', 'error': str(e)}
+
+    def _tool_create_hive_task(task_type: str, title: str, description: str, instructions: str):
+        """Create a coding task for the hive. Types: code_review, code_write, code_test,
+        model_onboard, benchmark, documentation, bug_fix, refactor"""
+        try:
+            from integrations.coding_agent.hive_task_protocol import get_dispatcher
+            task = get_dispatcher().create_task(task_type, title, description, instructions)
+            return task.to_dict()
+        except Exception as e:
+            return {'status': 'error', 'error': str(e)}
+
+    def _tool_dispatch_hive_tasks():
+        """Dispatch all pending hive tasks to available Claude Code sessions. Returns count dispatched."""
+        try:
+            from integrations.coding_agent.hive_task_protocol import get_dispatcher
+            count = get_dispatcher().dispatch_pending()
+            return {'dispatched': count}
+        except Exception as e:
+            return {'status': 'error', 'error': str(e)}
+
+    def _tool_hive_signal_stats():
+        """Get channel signal statistics: signal counts by type, by channel, total processed."""
+        try:
+            from integrations.channels.hive_signal_bridge import get_signal_bridge
+            return get_signal_bridge().get_stats()
+        except Exception as e:
+            return {'status': 'error', 'error': str(e)}
+
+    def _tool_hive_signal_feed(limit: int = 20):
+        """Get recent hive signals from all channels — what the community is talking about."""
+        try:
+            from integrations.channels.hive_signal_bridge import get_signal_bridge
+            return get_signal_bridge().get_signal_feed(limit=int(limit))
+        except Exception as e:
+            return {'status': 'error', 'error': str(e)}
+
+    def _tool_seed_goals():
+        """Seed all bootstrap goals (47 agents including 6 hive acceleration agents). Idempotent."""
+        try:
+            from integrations.social.models import get_db
+            from integrations.agent_engine.goal_seeding import seed_bootstrap_goals
+            db = get_db()
+            try:
+                count = seed_bootstrap_goals(db)
+                db.commit()
+                return {'seeded': count, 'status': 'ok'}
+            finally:
+                db.close()
+        except Exception as e:
+            return {'status': 'error', 'error': str(e)}
+
+    # Register hive orchestrator tools
+    _register_tool('onboard_model', 'Download HF model → GGUF → start llama.cpp inference', _tool_onboard_model)
+    _register_tool('switch_model', 'Hot-swap active LLM to a different model', _tool_switch_model)
+    _register_tool('model_status', 'Active model, server health, VRAM, downloads', _tool_model_status)
+    _register_tool('hive_connect', 'Connect Claude Code session to hive as worker node', _tool_hive_connect)
+    _register_tool('hive_disconnect', 'Disconnect Claude Code session from hive', _tool_hive_disconnect)
+    _register_tool('hive_session_status', 'Hive session: connected, tasks done, spark earned', _tool_hive_session_status)
+    _register_tool('create_hive_task', 'Create a coding task for hive Claude Code sessions', _tool_create_hive_task)
+    _register_tool('dispatch_hive_tasks', 'Dispatch pending tasks to available sessions', _tool_dispatch_hive_tasks)
+    _register_tool('hive_signal_stats', 'Channel signal stats: what the community needs', _tool_hive_signal_stats)
+    _register_tool('hive_signal_feed', 'Recent signals from all 30 channels', _tool_hive_signal_feed)
+    _register_tool('seed_goals', 'Seed all 47 bootstrap agents (idempotent)', _tool_seed_goals)
+
     logger.info(f"MCP HTTP bridge loaded {len(_local_tools)} local tools")
 
 

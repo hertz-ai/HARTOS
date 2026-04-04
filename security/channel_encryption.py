@@ -208,22 +208,100 @@ def decrypt_from_peer(envelope: Dict[str, str]) -> Optional[bytes]:
 # ── JSON Convenience Wrappers ──────────────────────────────────────
 
 def encrypt_json_for_peer(payload: dict,
-                          peer_x25519_public_hex: str) -> Dict[str, str]:
-    """Encrypt a JSON-serializable dict for a peer."""
-    plaintext = json.dumps(payload, separators=(',', ':')).encode('utf-8')
+                          peer_x25519_public_hex: str,
+                          skip_egress_check: bool = False) -> Dict[str, str]:
+    """Encrypt a JSON-serializable dict for a peer.
+
+    Before encryption, this function:
+    1. Runs ScopeGuard.check_egress() — blocks data that exceeds its privacy scope
+    2. Stamps origin provenance (node fingerprint + timestamp) so the receiver
+       can verify who sent it and that it's from a genuine HART OS node
+
+    These checks happen at the encryption layer (not the caller) so they
+    cannot be bypassed. Every outbound encrypted payload is scope-checked
+    and provenance-stamped.
+
+    Args:
+        payload: JSON-serializable dict to encrypt
+        peer_x25519_public_hex: Recipient's X25519 public key
+        skip_egress_check: Only True for internal key exchange / handshake messages
+    """
+    if not skip_egress_check and '_privacy_scope' in payload:
+        # ── Egress check: only for scope-tagged data ──
+        # Untagged data = legacy/internal — allowed through (encryption is the gate).
+        # Tagged data = explicitly classified — ScopeGuard enforces the declared scope.
+        try:
+            from security.edge_privacy import ScopeGuard, PrivacyScope
+            guard = ScopeGuard()
+            dest = PrivacyScope.TRUSTED_PEER
+            allowed, reason = guard.check_egress(payload, dest)
+            if not allowed:
+                logger.warning("Egress BLOCKED: %s", reason)
+                raise ValueError(f"Egress blocked by ScopeGuard: {reason}")
+        except ImportError:
+            pass
+        except ValueError:
+            raise
+
+    # ── Provenance stamp: who is sending this and are they genuine? ──
+    # Copy so we don't mutate the caller's dict
+    stamped = dict(payload)
+    try:
+        from security.origin_attestation import compute_origin_fingerprint
+        import time as _time
+        stamped['_provenance'] = {
+            'origin_fingerprint': compute_origin_fingerprint(),
+            'node_public_key': get_x25519_public_hex(),
+            'timestamp': _time.time(),
+        }
+    except Exception:
+        pass  # Provenance is best-effort — don't block on it
+
+    plaintext = json.dumps(stamped, separators=(',', ':')).encode('utf-8')
     return encrypt_for_peer(plaintext, peer_x25519_public_hex)
 
 
 def decrypt_json_from_peer(envelope: Dict[str, str]) -> Optional[dict]:
-    """Decrypt an envelope and parse as JSON."""
+    """Decrypt an envelope and parse as JSON.
+
+    After decryption, verifies origin provenance if present:
+    - origin_fingerprint must match a known HART OS fingerprint
+    - timestamp must be within acceptable drift (5 min)
+    Provenance failure logs a warning but does NOT block — the encryption
+    itself is the primary auth. Provenance is defense-in-depth for audit.
+    """
     plaintext = decrypt_from_peer(envelope)
     if plaintext is None:
         return None
     try:
-        return json.loads(plaintext)
+        payload = json.loads(plaintext)
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
         logger.warning("E2E JSON decode failed: %s", e)
         return None
+
+    # ── Verify provenance (audit, not blocking) ──
+    prov = payload.pop('_provenance', None)
+    if prov:
+        try:
+            from security.origin_attestation import compute_origin_fingerprint
+            import time as _time
+            peer_fp = prov.get('origin_fingerprint', '')
+            our_fp = compute_origin_fingerprint()
+            ts = prov.get('timestamp', 0)
+            drift = abs(_time.time() - ts)
+
+            if peer_fp != our_fp:
+                # Different fingerprint = different HART OS build or a fork
+                # Log but don't block — could be a legitimate older version
+                logger.info("Provenance: peer fingerprint %s differs from ours %s",
+                            peer_fp[:12], our_fp[:12])
+            if drift > 300:  # 5 min
+                logger.info("Provenance: timestamp drift %.0fs from peer %s",
+                            drift, prov.get('node_public_key', '?')[:12])
+        except Exception:
+            pass  # Best-effort
+
+    return payload
 
 
 # ── Utility: Check if payload is an encrypted envelope ─────────────

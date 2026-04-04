@@ -75,15 +75,62 @@ class SignalExtractor:
     """Extract interaction signals from raw text. No LLM calls -- pure heuristics."""
 
     _FORMAL_WORDS = frozenset([
+        # English
         'please', 'kindly', 'regarding', 'therefore', 'furthermore',
         'accordingly', 'shall', 'hereby', 'pursuant', 'respectfully',
-        'dear', 'sincerely', 'appreciate', 'would',
+        'dear', 'sincerely', 'appreciate',
+        # Tamil (transliterated)
+        'mariyadhai', 'mariyadai', 'mariyathai', 'mariyatai',
+        'mariathay', 'mariathaya', 'thayavuseydhu', 'thayavu',
+        'vanakkam', 'nandri', 'aiya', 'iyya', 'amma',
+        'ungalukku', 'ungal', 'thangal',
+        # Hindi (transliterated)
+        'kripaya', 'dhanyavaad', 'dhanyavad', 'shriman', 'shrimati',
+        'namaste', 'namaskar', 'aadarniya', 'ji',
+        'aap', 'aapka',
+        # Telugu (transliterated)
+        'dayachesi', 'dhanyavaadalu', 'garu', 'namaskaram',
+        # Kannada (transliterated)
+        'dayavittu', 'dhanyavadagalu', 'namaskara',
+        # Malayalam (transliterated)
+        'dayavayi', 'nanni', 'namaskaram',
     ])
 
     _CASUAL_WORDS = frozenset([
+        # English
         'hey', 'yo', 'sup', 'gonna', 'wanna', 'lol', 'haha', 'bruh',
         'cool', 'awesome', 'yeah', 'nah', 'ok', 'k', 'thx', 'ty',
         'omg', 'btw', 'imo', 'tbh', 'ngl',
+        # Tamil (transliterated)
+        'da', 'di', 'machan', 'machi', 'poda', 'podi',
+        'vaada', 'vaadi', 'sarida', 'saridaa', 'dei', 'pa',
+        # Hindi (transliterated)
+        'yaar', 'bhai', 'abe', 'oye', 'be', 'bro',
+        'arey', 'arre', 'achha',
+    ])
+
+    # Explicit tone-change instructions — user directly asking for formal/casual
+    _FORMAL_INSTRUCTIONS = frozenset([
+        'speak respectfully', 'be respectful', 'be formal', 'speak formally',
+        'use formal language', 'be polite', 'speak politely',
+        'talk respectfully', 'talk formally', 'use respectful language',
+        # Tamil
+        'mariathaya pesu', 'mariyathaiya pesu', 'mariyathaya pesu',
+        'mariyadhaiya pesu', 'mariadhaiya pesu',
+        'mariyadhaya pesu', 'mariadhaya pesu',
+        'respect ah pesu', 'respecta pesu',
+        # Hindi
+        'respect se baat karo', 'izzat se bolo',
+        'sabhyata se bolo', 'tameez se baat karo',
+    ])
+
+    _CASUAL_INSTRUCTIONS = frozenset([
+        'speak casually', 'be casual', 'talk like a friend',
+        'be informal', 'speak informally', 'chill out',
+        # Tamil
+        'normal ah pesu', 'casual ah pesu', 'friendly ah pesu',
+        # Hindi
+        'casual mein baat karo', 'normal baat karo',
     ])
 
     _TECH_WORDS = frozenset([
@@ -107,18 +154,28 @@ class SignalExtractor:
     def extract(cls, user_message: str, agent_response: str,
                 response_time_ms: float = 0.0) -> InteractionSignals:
         """Extract signals from a single exchange."""
-        words = user_message.lower().split()
+        msg_lower = user_message.lower()
+        words = msg_lower.split()
         unique_words = set(words)
         word_count = max(len(words), 1)
 
-        # Formality score
-        formal_count = sum(1 for w in words if w in cls._FORMAL_WORDS)
-        casual_count = sum(1 for w in words if w in cls._CASUAL_WORDS)
-        total_markers = formal_count + casual_count
-        if total_markers > 0:
-            formality = formal_count / total_markers
+        # Explicit tone instruction detection (highest priority)
+        explicit_formal = any(p in msg_lower for p in cls._FORMAL_INSTRUCTIONS)
+        explicit_casual = any(p in msg_lower for p in cls._CASUAL_INSTRUCTIONS)
+
+        if explicit_formal:
+            formality = 1.0  # Max formal — user explicitly asked
+        elif explicit_casual:
+            formality = 0.0  # Max casual — user explicitly asked
         else:
-            formality = min(1.0, word_count / 50.0) * 0.5 + 0.25
+            # Word-level formality markers
+            formal_count = sum(1 for w in words if w in cls._FORMAL_WORDS)
+            casual_count = sum(1 for w in words if w in cls._CASUAL_WORDS)
+            total_markers = formal_count + casual_count
+            if total_markers > 0:
+                formality = formal_count / total_markers
+            else:
+                formality = min(1.0, word_count / 50.0) * 0.5 + 0.25
 
         tech_count = sum(1 for w in words if w in cls._TECH_WORDS)
 
@@ -560,15 +617,61 @@ class ResonanceTuner:
 
 
 # =====================================================================
+# Pre-Tune — Apply current user message signals BEFORE building prompt
+# =====================================================================
+
+def pre_tune_from_input(profile: UserResonanceProfile,
+                        user_message: str) -> UserResonanceProfile:
+    """Lightweight pre-tune: extract signals from the current user message
+    and apply them to the profile BEFORE the LLM generates its response.
+
+    This fixes the one-turn-behind problem where "speak respectfully" only
+    takes effect on the NEXT response instead of the current one.
+
+    Only applies formality (explicit tone overrides). Other dimensions
+    (verbosity, warmth, etc.) still rely on full post-response tuning.
+    Does NOT save to disk or dispatch to HevolveAI.
+    """
+    signals = SignalExtractor.extract(user_message, '', 0.0)
+
+    # Only apply if there's a strong signal (explicit instruction or clear markers)
+    has_explicit = any(
+        p in user_message.lower()
+        for p in SignalExtractor._FORMAL_INSTRUCTIONS | SignalExtractor._CASUAL_INSTRUCTIONS
+    )
+
+    if has_explicit:
+        # Explicit instruction: override formality immediately (no EMA dampening)
+        profile.tuning['formality_score'] = signals.formality_markers
+    elif signals.formality_markers > 0.8 or signals.formality_markers < 0.2:
+        # Strong word-level signal: apply with heavier weight than normal EMA
+        alpha = 0.5  # Faster than default 0.15
+        current = profile.tuning.get('formality_score', 0.5)
+        profile.tuning['formality_score'] = current * (1 - alpha) + signals.formality_markers * alpha
+
+    return profile
+
+
+# =====================================================================
 # Prompt Builder
 # =====================================================================
 
 def build_resonance_prompt(profile: UserResonanceProfile) -> str:
     """Generate system_message addon reflecting current tuning state."""
+    t = profile.tuning
+
+    # If formality has been explicitly overridden (0.0 or 1.0) even before
+    # MIN_INTERACTIONS, emit at least the formality hint so the user's
+    # tone request is honored immediately.
+    formality_val = t.get('formality_score', 0.5)
+    has_explicit_override = formality_val >= 0.9 or formality_val <= 0.1
+
     if profile.total_interactions < MIN_INTERACTIONS_FOR_TUNING:
+        if has_explicit_override:
+            label = 'very formal and respectful' if formality_val >= 0.9 else 'very casual and friendly'
+            return f"\nTONE PREFERENCE: This user prefers {label} language. Adapt immediately.\n"
         return ""
 
-    t = profile.tuning
     confidence_pct = int(profile.resonance_confidence * 100)
 
     formality = _score_to_label(t.get('formality_score', 0.5),
