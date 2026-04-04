@@ -658,6 +658,9 @@ def _score_human_consent(context: dict) -> ConstitutionalSignal:
     Missing consent → low score (action should be deferred).
     Expired consent → medium-low score (re-ask, don't block).
     Fresh consent → full score (freedom to act).
+
+    Wired to ConsentService for DB lookup + EventBus to request consent
+    from the frontend (Nunba, Hevolve web, Android) when needed.
     """
     requires = context.get('requires_consent', False)
     if not requires:
@@ -666,10 +669,39 @@ def _score_human_consent(context: dict) -> ConstitutionalSignal:
             weight=1.0, reasoning='No consent required — freedom preserved',
         )
 
+    # Check ConsentService DB for existing consent
     given = context.get('consent_given', False)
     timestamp = context.get('consent_timestamp', 0)
+    user_id = context.get('user_id', '')
+    consent_type = context.get('consent_type', 'data_access')
+    agent_id = context.get('agent_id')
+
+    if not given and user_id:
+        try:
+            from integrations.social.consent_service import ConsentService
+            from integrations.social.models import db_session
+            with db_session() as db:
+                given = ConsentService.check_consent(
+                    db, user_id, consent_type, agent_id=agent_id)
+                if given:
+                    timestamp = time.time()  # Fresh from DB
+        except Exception:
+            pass  # DB not available — fall through to context-based check
 
     if not given:
+        # Emit consent.request event so frontends show a consent dialog
+        try:
+            from core.platform.events import emit_event
+            emit_event('consent.request', {
+                'user_id': user_id,
+                'consent_type': consent_type,
+                'agent_id': agent_id,
+                'scope': context.get('scope', '*'),
+                'reason': context.get('consent_reason', 'Agent needs your permission'),
+            })
+        except Exception:
+            pass
+
         return ConstitutionalSignal(
             name='consent', score=0.15, confidence=0.95,
             weight=1.5,

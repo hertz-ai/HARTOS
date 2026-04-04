@@ -10,7 +10,13 @@ from flask import Flask, jsonify, request
 
 from .models import UserConsent, db_session
 
-CONSENT_TYPES = frozenset({'data_access', 'revenue_share', 'public_exposure'})
+CONSENT_TYPES = frozenset({
+    'data_access',       # Agent needs to access user data
+    'revenue_share',     # User opts into compute-for-revenue (earnings credited)
+    'public_exposure',   # Content made public
+    'payment_setup',     # User provides UPI/payment ID for revenue payouts
+    'compute_contribute', # User allows their device to process hive tasks
+})
 
 
 def _audit(event_type: str, actor_id: str, action: str, detail: dict):
@@ -39,12 +45,27 @@ def _audit(event_type: str, actor_id: str, action: str, detail: dict):
 
 
 def _emit(topic: str, data: dict):
-    """Best-effort EventBus broadcast."""
+    """Best-effort EventBus broadcast + push to frontend via WAMP/SSE."""
     try:
         from core.platform.events import emit_event
         emit_event(topic, data)
     except Exception:
         pass
+    # Also push as a notification to the user's frontend (Nunba, Hevolve, Android)
+    # so consent dialogs can appear on any platform
+    user_id = data.get('user_id', '')
+    if user_id:
+        try:
+            from integrations.social.realtime import on_notification
+            on_notification(user_id, {
+                'type': topic,  # consent.granted, consent.revoked, consent.request
+                'consent_type': data.get('consent_type', ''),
+                'agent_id': data.get('agent_id'),
+                'scope': data.get('scope', '*'),
+                'reason': data.get('reason', ''),
+            })
+        except Exception:
+            pass
 
 
 def _validate_consent_type(consent_type: str):
