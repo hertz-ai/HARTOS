@@ -644,6 +644,20 @@ class ProviderGateway:
         except Exception:
             pass
 
+        # Feed into revenue tracker (cost side — revenue recorded by affiliate layer)
+        if result.cost_usd > 0:
+            try:
+                from integrations.providers.revenue_tracker import get_tracker
+                get_tracker().record_cost(
+                    provider_id=result.provider_id,
+                    model_id=result.model_id,
+                    cost_usd=result.cost_usd,
+                    tokens_used=result.usage.get('total_tokens', 0),
+                    request_type=kwargs.get('model_type', 'llm'),
+                )
+            except Exception:
+                pass
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Singleton
