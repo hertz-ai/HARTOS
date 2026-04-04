@@ -613,6 +613,57 @@ except ImportError:
 except Exception as e:
     app.logger.warning(f"MCP HTTP bridge init skipped: {e}")
 
+# Model Onboarding API — HuggingFace → GGUF → llama.cpp in one call
+try:
+    from integrations.service_tools.model_onboarding import get_blueprint as _get_onboard_bp
+    app.register_blueprint(_get_onboard_bp())
+    app.logger.info("Model onboarding API registered at /api/models/")
+except ImportError:
+    app.logger.info("Model onboarding not available, skipping")
+except Exception as e:
+    app.logger.warning(f"Model onboarding init skipped: {e}")
+
+# Robot Intelligence API — 7 intelligences fuse in parallel for any embodied AI
+try:
+    from integrations.robotics.intelligence_api import robot_intelligence_bp
+    app.register_blueprint(robot_intelligence_bp)
+    app.logger.info("Robot Intelligence API registered at /api/robot/")
+except ImportError:
+    app.logger.info("Robot Intelligence API not available, skipping")
+except Exception as e:
+    app.logger.warning(f"Robot Intelligence API init skipped: {e}")
+
+# Hive Session API — Claude Code as hive worker node
+try:
+    from integrations.coding_agent.claude_hive_session import get_blueprint as _get_hive_bp
+    app.register_blueprint(_get_hive_bp())
+    app.logger.info("Hive Session API registered at /api/hive/session/")
+except ImportError:
+    app.logger.info("Hive Session API not available, skipping")
+except Exception as e:
+    app.logger.warning(f"Hive Session API init skipped: {e}")
+
+# Hive Signal Bridge API — channel signals dashboard
+try:
+    from integrations.channels.hive_signal_bridge import create_signal_blueprint
+    app.register_blueprint(create_signal_blueprint())
+    app.logger.info("Hive Signal Bridge registered at /api/hive/signals/")
+except ImportError:
+    app.logger.info("Hive Signal Bridge not available, skipping")
+except Exception as e:
+    app.logger.warning(f"Hive Signal Bridge init skipped: {e}")
+
+# Resource Governor — start background monitoring
+try:
+    from core.resource_governor import get_governor
+    _gov = get_governor()
+    _gov.start()
+    app.logger.info(f"Resource Governor started (mode={_gov.get_mode()})")
+except ImportError:
+    pass
+except Exception as e:
+    app.logger.warning(f"Resource Governor start skipped: {e}")
+
 # Instruction Queue API — never miss a user instruction
 try:
     from integrations.agent_engine.instruction_queue import (
@@ -2247,6 +2298,14 @@ def get_tools(req_tool, is_first: bool = False):
             pass  # Non-blocking — memory tools are optional
 
         tools += tool
+
+        # Provider gateway tools (Cloud_LLM, Generate_Image, etc.)
+        try:
+            from integrations.providers.agent_tools import get_provider_tools
+            tools += get_provider_tools()
+        except Exception:
+            pass  # Non-blocking — provider tools are optional
+
         # Wrap all tool functions with logging
         for t in tools:
             if hasattr(t, 'func') and callable(t.func):
@@ -4024,8 +4083,26 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
     _fast_agent_config = thread_local_data.get_agent_config() if hasattr(thread_local_data, 'get_agent_config') else None
     _fast_identity = build_identity_prompt(_fast_agent_config, '', user_details)
 
+    # Regional tone + resonance (per-user adaptive tone)
+    _tone_block = ''
+    try:
+        from core.agent_personality import get_regional_tone_prompt
+        _tone_block = get_regional_tone_prompt(preferred_lang)
+    except Exception:
+        pass
+    _resonance_block = ''
+    try:
+        from core.resonance_profile import get_or_create_profile
+        from core.resonance_tuner import build_resonance_prompt, pre_tune_from_input
+        _res_profile = get_or_create_profile(str(user_id))
+        _res_profile = pre_tune_from_input(_res_profile, prompt)
+        _resonance_block = build_resonance_prompt(_res_profile) or ''
+    except Exception:
+        pass
+
     prefix = f"""{_fast_identity}
         Answer questions accurately and respond as quickly as possible in {language}.
+        {_tone_block}{_resonance_block}
         Keep responses under 200 words. Be colloquial and natural - don't always greet or use the user's name.
         IMPORTANT: Do NOT re-introduce yourself if you already did in the conversation history below. Continue naturally.
 
