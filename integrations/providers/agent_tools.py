@@ -180,4 +180,11 @@ def get_provider_tools():
         ),
     ])
 
+    # Creative content tools (Story_Director, Movie_Maker, Game_Asset_Creator)
+    try:
+        from integrations.providers.creative_tools import get_creative_tools
+        tools += get_creative_tools()
+    except Exception:
+        pass
+
     return tools
