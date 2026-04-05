@@ -460,14 +460,21 @@ class LlamaCppManager:
                 # Unknown model size, try full offload
                 params['n_gpu_layers'] = -1
 
-            # Context size: 8192 if ample VRAM, else 4096
-            # Context memory is roughly (ctx * layers * hidden_dim * 2 * dtype_bytes)
-            # Simplified heuristic: 8K context needs ~1-2 GB extra
+            # Context size: balance between LLM capability and leaving VRAM for TTS.
+            # Reserve ~3GB for TTS (Indic Parler ~1.2GB model + ~2GB inference).
+            # KV cache memory ≈ ctx * layers * hidden_dim * 2 * 2 bytes (FP16).
+            # Qwen 4B: 32 layers × 2560 dim × 2 heads × 2 bytes ≈ 0.3MB per 1K ctx.
             vram_after_model = free_vram - model_size_gb
-            if vram_after_model >= 2.0:
+            tts_reserve_gb = 3.0  # Reserve for GPU TTS (Indic Parler, F5, etc.)
+            vram_for_ctx = vram_after_model - tts_reserve_gb
+            if vram_for_ctx >= 3.0:
+                params['ctx_size'] = 10240  # 10K — good balance
+            elif vram_for_ctx >= 1.5:
                 params['ctx_size'] = 8192
-            else:
+            elif vram_for_ctx >= 0.5:
                 params['ctx_size'] = 4096
+            else:
+                params['ctx_size'] = 2048
 
             # Flash attention: available on modern NVIDIA GPUs (Ampere+)
             # Heuristic: if GPU name contains known architectures
