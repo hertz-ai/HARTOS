@@ -148,11 +148,17 @@ def _get_faster_whisper_model(model_size: str = "base"):
 
     from faster_whisper import WhisperModel
 
-    # Force CPU for STT — GPU VRAM is shared with LLM + TTS.
-    # Whisper base on CPU int8 is fast enough (~1s per 10s audio).
-    # Using GPU would steal 0.5-1GB VRAM from Indic Parler TTS.
+    # Detect if CUDA is available for CTranslate2 (separate from torch CUDA)
     device = "cpu"
     compute_type = "int8"
+    try:
+        import ctranslate2
+        if 'cuda' in ctranslate2.get_supported_compute_types('cuda'):
+            device = "cuda"
+            compute_type = "float16"
+            logger.info("CTranslate2 CUDA available — loading faster-whisper on GPU")
+    except Exception:
+        pass
 
     logger.info(f"Loading faster-whisper model '{model_size}' on {device} ({compute_type})...")
     _faster_whisper_model = WhisperModel(
