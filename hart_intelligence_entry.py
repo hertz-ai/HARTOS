@@ -1926,14 +1926,28 @@ def get_vision_service():
     """Get the active VisionService instance.
 
     Checks module-level var first, then falls back to Nunba's
-    ``__main__._vision_service`` for bundled mode.
+    ``__main__._vision_service``; if that misses (cx_Freeze on macOS
+    mounts ``main.py`` under an opaque module name so neither ``__main__``
+    nor ``main`` matches), scans the live object graph for a
+    ``VisionService`` instance.  Safe because ``_start_vision_service``
+    only ever creates one.
     """
     if _vision_service is not None:
         return _vision_service
-    # Bundled mode: Nunba stores it on __main__
     main_mod = sys.modules.get('__main__')
     if main_mod:
-        return getattr(main_mod, '_vision_service', None)
+        _svc = getattr(main_mod, '_vision_service', None)
+        if _svc is not None:
+            return _svc
+    # cx_Freeze fallback: scan the heap.
+    try:
+        import gc
+        from integrations.vision.vision_service import VisionService
+        for _obj in gc.get_objects():
+            if isinstance(_obj, VisionService):
+                return _obj
+    except Exception:
+        pass
     return None
 
 
