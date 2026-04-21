@@ -23,28 +23,48 @@ POST /api/social/experiments/<id>/resume-evolve  — Owner resume iteration
 """
 import logging
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, g, jsonify, request
+
+from .auth import require_auth, require_admin, optional_auth  # noqa: F401 — optional_auth retained for re-export compat with sibling blueprints
 
 logger = logging.getLogger('hevolve_social')
 
 thought_experiments_bp = Blueprint('thought_experiments', __name__)
 
 
+def _current_user_id() -> str:
+    """Return the authenticated user's id from Flask g, as string.
+
+    Used to override body-supplied identity fields (creator_id, voter_id,
+    user_id) so an authenticated caller cannot impersonate another user.
+    """
+    user = getattr(g, 'user', None)
+    if user is not None and getattr(user, 'id', None) is not None:
+        return str(user.id)
+    # Fallback — should not happen under @require_auth, but defensive
+    return ''
+
+
 @thought_experiments_bp.route('/api/social/experiments', methods=['POST'])
+@require_auth
 def create_experiment():
-    """Create a new thought experiment."""
+    """Create a new thought experiment (auth required).
+
+    creator_id is taken from the JWT subject — any body-supplied creator_id
+    is ignored to prevent impersonation.
+    """
     from .models import get_db
     from .thought_experiment_service import ThoughtExperimentService
 
     body = request.get_json(silent=True) or {}
-    creator_id = body.get('creator_id')
+    creator_id = _current_user_id() or body.get('creator_id')
     title = body.get('title', '')
     hypothesis = body.get('hypothesis', '')
 
     if not creator_id or not title or not hypothesis:
         return jsonify({
             'success': False,
-            'error': 'creator_id, title, and hypothesis required',
+            'error': 'title and hypothesis required',
         }), 400
 
     db = get_db()
@@ -74,8 +94,11 @@ def create_experiment():
 
 
 @thought_experiments_bp.route('/api/social/experiments', methods=['GET'])
+@require_auth
 def list_experiments():
-    """List experiments filtered by status."""
+    """List experiments filtered by status. Auth required — P0 hardening:
+    experiment hypotheses + lifecycle states are agent-internal state and
+    must not be enumerable by unauthenticated scrapers."""
     from .models import get_db
     from .thought_experiment_service import ThoughtExperimentService
 
@@ -95,8 +118,11 @@ def list_experiments():
 
 
 @thought_experiments_bp.route('/api/social/experiments/core-ip', methods=['GET'])
+@require_auth
 def core_ip_experiments():
-    """List experiments flagged as core IP."""
+    """List experiments flagged as core IP. Auth required — core-IP list
+    exposes the hive's strategic research programme; not for unauthenticated
+    scrapers."""
     from .models import get_db
     from .thought_experiment_service import ThoughtExperimentService
 
@@ -112,8 +138,11 @@ def core_ip_experiments():
 
 
 @thought_experiments_bp.route('/api/social/experiments/discover', methods=['GET'])
+@require_auth
 def discover_experiments():
-    """Interest-based experiment discovery with personalised recommendations."""
+    """Interest-based experiment discovery with personalised recommendations.
+    Auth required — the discovery result exposes agent-internal ranking
+    signals and experiment catalogue; personalisation uses the JWT subject."""
     from .models import get_db
     from .experiment_discovery_service import ExperimentDiscoveryService
 
@@ -143,8 +172,9 @@ def discover_experiments():
 
 
 @thought_experiments_bp.route('/api/social/experiments/<experiment_id>', methods=['GET'])
+@require_auth
 def get_experiment(experiment_id):
-    """Get experiment detail with votes and timeline."""
+    """Get experiment detail with votes and timeline. Auth required."""
     from .models import get_db
     from .thought_experiment_service import ThoughtExperimentService
 
@@ -164,13 +194,17 @@ def get_experiment(experiment_id):
 
 @thought_experiments_bp.route('/api/social/experiments/<experiment_id>/vote',
                                methods=['POST'])
+@require_auth
 def vote_experiment(experiment_id):
-    """Cast a vote on a thought experiment."""
+    """Cast a vote on a thought experiment (auth required).
+
+    voter_id is taken from the JWT subject — body-supplied voter_id is ignored.
+    """
     from .models import get_db
     from .thought_experiment_service import ThoughtExperimentService
 
     body = request.get_json(silent=True) or {}
-    voter_id = body.get('voter_id')
+    voter_id = _current_user_id() or body.get('voter_id')
     if not voter_id:
         return jsonify({'success': False, 'error': 'voter_id required'}), 400
 
@@ -200,8 +234,9 @@ def vote_experiment(experiment_id):
 
 @thought_experiments_bp.route('/api/social/experiments/<experiment_id>/advance',
                                methods=['POST'])
+@require_admin
 def advance_experiment(experiment_id):
-    """Advance experiment to next lifecycle phase."""
+    """Advance experiment to next lifecycle phase (admin only)."""
     from .models import get_db
     from .thought_experiment_service import ThoughtExperimentService
 
@@ -226,8 +261,9 @@ def advance_experiment(experiment_id):
 
 @thought_experiments_bp.route('/api/social/experiments/<experiment_id>/evaluate',
                                methods=['POST'])
+@require_auth
 def evaluate_experiment(experiment_id):
-    """Trigger agent evaluation for an experiment."""
+    """Trigger agent evaluation for an experiment (auth required)."""
     from .models import get_db
     from .thought_experiment_service import ThoughtExperimentService
 
@@ -248,8 +284,13 @@ def evaluate_experiment(experiment_id):
 
 @thought_experiments_bp.route('/api/social/experiments/<experiment_id>/decide',
                                methods=['POST'])
+@require_admin
 def decide_experiment(experiment_id):
-    """Record final decision for an experiment."""
+    """Record final decision for an experiment (admin only).
+
+    Decisions are a privileged lifecycle state change that closes the
+    experiment — guard against replay/impersonation by restricting to admins.
+    """
     from .models import get_db
     from .thought_experiment_service import ThoughtExperimentService
 
@@ -278,8 +319,9 @@ def decide_experiment(experiment_id):
 
 @thought_experiments_bp.route('/api/social/experiments/<experiment_id>/votes',
                                methods=['GET'])
+@require_auth
 def experiment_votes(experiment_id):
-    """Get all votes for an experiment."""
+    """Get all votes for an experiment. Auth required."""
     from .models import get_db
     from .thought_experiment_service import ThoughtExperimentService
 
@@ -297,8 +339,9 @@ def experiment_votes(experiment_id):
 
 @thought_experiments_bp.route('/api/social/experiments/<experiment_id>/timeline',
                                methods=['GET'])
+@require_auth
 def experiment_timeline(experiment_id):
-    """Get lifecycle timeline for an experiment."""
+    """Get lifecycle timeline for an experiment. Auth required."""
     from .models import get_db
     from .thought_experiment_service import ThoughtExperimentService
 
@@ -318,8 +361,10 @@ def experiment_timeline(experiment_id):
 
 @thought_experiments_bp.route('/api/social/experiments/<experiment_id>/metrics',
                                methods=['GET'])
+@require_auth
 def experiment_metrics(experiment_id):
-    """Get live metrics for an experiment (camera feed, build stats, compute)."""
+    """Get live metrics for an experiment (camera feed, build stats, compute).
+    Auth required — live camera/compute feeds are agent-internal signals."""
     from .models import get_db
     from .experiment_discovery_service import ExperimentDiscoveryService
 
@@ -339,13 +384,18 @@ def experiment_metrics(experiment_id):
 
 @thought_experiments_bp.route('/api/social/experiments/<experiment_id>/contribute',
                                methods=['POST'])
+@require_auth
 def contribute_to_experiment(experiment_id):
-    """Record a Spark contribution to an experiment."""
+    """Record a Spark contribution to an experiment (auth required).
+
+    user_id is taken from the JWT subject — body-supplied user_id is ignored
+    so a caller cannot spend another user's Spark balance.
+    """
     from .models import get_db
     from .experiment_discovery_service import ExperimentDiscoveryService
 
     body = request.get_json(silent=True) or {}
-    user_id = body.get('user_id')
+    user_id = _current_user_id() or body.get('user_id')
     spark_amount = body.get('spark_amount', 0)
 
     if not user_id:
@@ -372,14 +422,18 @@ def contribute_to_experiment(experiment_id):
 
 @thought_experiments_bp.route('/api/social/experiments/auto-evolve',
                                methods=['POST'])
+@require_admin
 def start_auto_evolve():
-    """Start a democratic auto-evolve cycle.
+    """Start a democratic auto-evolve cycle (admin only).
+
+    Burns compute cycles across all hive nodes — restrict to admins to
+    prevent abuse (a user could otherwise force-start N parallel cycles).
 
     Gathers eligible experiments → constitutional filter → vote tally →
     dispatch top-N winners to type-aware iteration loops.
     """
     body = request.get_json(silent=True) or {}
-    user_id = body.get('user_id', 'system')
+    user_id = _current_user_id() or body.get('user_id', 'system')
     max_experiments = body.get('max_experiments', 5)
     min_approval = body.get('min_approval_score', 0.3)
 
@@ -400,8 +454,11 @@ def start_auto_evolve():
 
 @thought_experiments_bp.route('/api/social/experiments/auto-evolve/status',
                                methods=['GET'])
+@require_auth
 def auto_evolve_status():
-    """Get the current auto-evolve cycle status."""
+    """Get the current auto-evolve cycle status. Auth required — the status
+    payload reveals which experiments the hive is currently iterating on,
+    which is agent-internal strategic state."""
     try:
         from integrations.agent_engine.auto_evolve import get_auto_evolve_orchestrator
         orch = get_auto_evolve_orchestrator()
@@ -412,10 +469,16 @@ def auto_evolve_status():
 
 @thought_experiments_bp.route(
     '/api/social/experiments/<experiment_id>/pause-evolve', methods=['POST'])
+@require_auth
 def pause_evolve(experiment_id):
-    """Pause a running experiment's evolution (owner only)."""
+    """Pause a running experiment's evolution (auth required, owner or admin).
+
+    user_id is taken from the JWT subject so a caller cannot pause another
+    user's experiment by forging the body. Downstream service still enforces
+    the owner check via pause_experiment_evolution(..., user_id).
+    """
     body = request.get_json(silent=True) or {}
-    user_id = body.get('user_id', '')
+    user_id = _current_user_id() or body.get('user_id', '')
 
     if not user_id:
         return jsonify({'success': False, 'error': 'user_id required'}), 400
@@ -431,10 +494,14 @@ def pause_evolve(experiment_id):
 
 @thought_experiments_bp.route(
     '/api/social/experiments/<experiment_id>/resume-evolve', methods=['POST'])
+@require_auth
 def resume_evolve(experiment_id):
-    """Resume a paused experiment's evolution (owner only)."""
+    """Resume a paused experiment's evolution (auth required, owner or admin).
+
+    user_id is taken from the JWT subject; downstream service enforces owner.
+    """
     body = request.get_json(silent=True) or {}
-    user_id = body.get('user_id', '')
+    user_id = _current_user_id() or body.get('user_id', '')
 
     if not user_id:
         return jsonify({'success': False, 'error': 'user_id required'}), 400

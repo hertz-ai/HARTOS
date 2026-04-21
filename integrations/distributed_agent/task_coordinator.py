@@ -24,8 +24,19 @@ from typing import Any, Dict, List, Optional
 from agent_ledger.core import SmartLedger, Task, TaskType, TaskStatus
 from agent_ledger.distributed import DistributedTaskLock
 from agent_ledger.verification import TaskVerification, TaskBaseline
+from core.constants import HIVE_DEPTH
 
 logger = logging.getLogger(__name__)
+
+
+class HiveDepthExceeded(ValueError):
+    """Raised when a propagation request exceeds HIVE_DEPTH hops.
+
+    The Hevolve topology is a 3-level pyramid (flat → regional → central).
+    Anything deeper is a bug (cycle) or a policy violation; the coordinator
+    surfaces this as a dedicated exception so callers can log a structured
+    audit event rather than silently eating a generic ValueError.
+    """
 
 
 class DistributedTaskCoordinator:
@@ -69,6 +80,19 @@ class DistributedTaskCoordinator:
         """
         goal_id = f"goal_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
         context = context or {}
+
+        # Enforce HIVE_DEPTH — reject propagations deeper than the
+        # published 3-level topology (flat → regional → central).  A
+        # missing/zero hop is treated as the origin submission (hop=0);
+        # any forwarder must increment before calling submit_goal again.
+        hop = int(context.get("hop", 0) or 0)
+        if hop >= HIVE_DEPTH:
+            raise HiveDepthExceeded(
+                f"submit_goal: hop={hop} >= HIVE_DEPTH={HIVE_DEPTH}; "
+                f"objective={objective!r} rejected to prevent hive propagation cycles"
+            )
+        # Stamp the hop we just accepted so children inherit it.
+        context["hop"] = hop
 
         # Create parent goal task
         parent = Task(
@@ -125,8 +149,10 @@ class DistributedTaskCoordinator:
                 if required and not any(c in capabilities for c in required):
                     continue
 
-            # Try atomic claim
-            if self._lock.try_claim_task(task_id, agent_id):
+            # Try atomic claim — with heartbeat so the lock is renewed
+            # every HEARTBEAT_INTERVAL until submit_result / release_task.
+            # Protects tasks that run longer than DEFAULT_TTL (5 min).
+            if self._lock.try_claim_task(task_id, agent_id, heartbeat=True):
                 self._ledger.update_task_status(task_id, TaskStatus.IN_PROGRESS)
                 task.context["claimed_by"] = agent_id
                 task.context["claimed_at"] = datetime.now().isoformat()
@@ -177,8 +203,8 @@ class DistributedTaskCoordinator:
                 if required and not any(c in capabilities for c in required):
                     continue
 
-            # Try atomic claim
-            if self._lock.try_claim_task(task_id, agent_id):
+            # Try atomic claim (heartbeat-protected, see claim_next_task)
+            if self._lock.try_claim_task(task_id, agent_id, heartbeat=True):
                 self._ledger.update_task_status(task_id, TaskStatus.IN_PROGRESS)
                 task.context["claimed_by"] = agent_id
                 task.context["claimed_at"] = datetime.now().isoformat()

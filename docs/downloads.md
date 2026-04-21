@@ -32,6 +32,8 @@ Each push to `main` publishes a new `nightly-{SHA}` release tagged as "latest" �
 
 Torrents are web-seeded via GitHub CDN.
 
+**Desktop ISO is larger than GitHub's 2 GB per-asset limit** and therefore ships split into `…iso.part-00`, `…iso.part-01`, … Download every `part-*` alongside the `.sha256` and a companion `…iso.reassemble.sh`, then run the script (or `cat *.part-* > …iso`) to stitch them and verify the checksum.
+
 ## Nunba — Native Agentic Client
 
 Nunba is the HART agentic client — same experience on HART OS and as a native app on Windows, macOS, or Linux. Think of it as a cross-platform agentic shell: chat, agents, communities, and compute controls, backed by the HART runtime running locally or remotely.

@@ -41,6 +41,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import re
 import sys as _sys
 import threading
@@ -48,6 +49,21 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger('hevolve_social')
+
+
+def _hash_enforcement_enabled() -> bool:
+    """Whether GUARDRAIL_HASH tampering causes a hard boot failure.
+
+    Controlled by HEVOLVE_GUARDRAIL_HASH_ENFORCE:
+      - '1' / 'true' / 'yes' / unset  -> enforce (default, fail closed)
+      - '0' / 'false' / 'no'          -> warn only (dev override for
+        contributors who deliberately edit guardrail values)
+
+    The default MUST be enforce-on so a shipped build with no override
+    set behaves as a locked-down guardrail.
+    """
+    raw = os.environ.get('HEVOLVE_GUARDRAIL_HASH_ENFORCE', '1').strip().lower()
+    return raw not in ('0', 'false', 'no', 'off')
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -270,9 +286,46 @@ def verify_guardrail_integrity() -> bool:
     return compute_guardrail_hash() == _GUARDRAIL_HASH
 
 
+def enforce_guardrail_integrity() -> None:
+    """Raise RuntimeError if guardrail integrity is violated.
+
+    Called at module boot AND at every ConstitutionalFilter entrypoint
+    so tampering surfaces as a loud crash rather than silent bypass.
+
+    Honors HEVOLVE_GUARDRAIL_HASH_ENFORCE:
+      - default / '1' -> raise RuntimeError on mismatch (fail closed)
+      - '0'           -> log CRITICAL and continue (dev override)
+    """
+    if verify_guardrail_integrity():
+        return
+    if _hash_enforcement_enabled():
+        logger.critical(
+            'GUARDRAIL TAMPER DETECTED at boot: hash mismatch. Expected %s. '
+            'Refusing to start. Set HEVOLVE_GUARDRAIL_HASH_ENFORCE=0 ONLY in '
+            'dev environments where guardrail values are deliberately modified.',
+            _GUARDRAIL_HASH,
+        )
+        raise RuntimeError(
+            'Guardrail integrity violated at module load — refusing to start.'
+        )
+    logger.critical(
+        'GUARDRAIL TAMPER DETECTED at boot: hash mismatch. Expected %s. '
+        'HEVOLVE_GUARDRAIL_HASH_ENFORCE=0 — continuing in DEV mode. '
+        'This MUST NOT be set in production.',
+        _GUARDRAIL_HASH,
+    )
+
+
 def get_guardrail_hash() -> str:
     """Return the reference guardrail hash (computed at module load)."""
     return _GUARDRAIL_HASH
+
+
+# Enforce integrity at import time — if someone patched VIOLATION_PATTERNS
+# between _FrozenValues construction and hash computation, this will fail
+# loudly. Trivially self-consistent at pristine first load; meaningful under
+# attempted in-process tampering before any ConstitutionalFilter check runs.
+enforce_guardrail_integrity()
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -302,6 +355,176 @@ PROTECTED_FILES = tuple(VALUES.PROTECTED_FILES)
 # Module-level pattern tuples — immutable to prevent runtime mutation
 _VIOLATION_PATTERNS = tuple(VALUES.VIOLATION_PATTERNS)
 _DESTRUCTIVE_PATTERNS = tuple(VALUES.DESTRUCTIVE_PATTERNS)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# I18N NORMALIZATION — Transliterate non-Latin input before regex match
+# ═══════════════════════════════════════════════════════════════════════
+
+# Best-effort transliterator. `unidecode` handles Devanagari, Chinese, Cyrillic,
+# Arabic, Greek, etc. — turning '殺' into 'Sha' and 'убить' into 'ubit''. When
+# missing (e.g., minimal embedded build), we fall back to unicodedata
+# decomposition which at least strips accents on Latin-1.
+try:
+    from unidecode import unidecode as _unidecode
+    _HAS_UNIDECODE = True
+except ImportError:
+    _HAS_UNIDECODE = False
+    import unicodedata
+
+    def _unidecode(s: str) -> str:
+        """Fallback: NFKD decompose + drop combining marks.
+
+        TODO: when `unidecode` is unavailable, non-Latin scripts bypass the
+        VIOLATION_PATTERNS regex. Add `unidecode==1.3.8` to requirements.txt
+        to close this gap on all deployments.
+        """
+        return ''.join(
+            c for c in unicodedata.normalize('NFKD', s or '')
+            if not unicodedata.combining(c)
+        )
+
+
+# Multilingual keyword overlay — non-Latin synonyms of high-severity terms
+# the English regex would otherwise miss. Matched against the ORIGINAL (non-
+# transliterated) text so e.g. '殺す' triggers the kill pattern even when
+# unidecode maps it to 'Sha su '. Additions should stay conservative — false
+# positives here block legitimate multilingual conversation.
+#
+# Category coverage target (top-5 VIOLATION_PATTERNS):
+#   1. self-harm / suicide        -> VIOLATION_PATTERNS[0]
+#   2. child exploitation (CSAM)  -> VIOLATION_PATTERNS[1]
+#   3. credential exfil / phish   -> VIOLATION_PATTERNS[2]
+#   4. biological weapon / nuke   -> VIOLATION_PATTERNS[12]
+#   5. illegal firearm / weapon   -> VIOLATION_PATTERNS[11] + [12]
+#
+# Languages: Hindi (hi), Tamil (ta), Telugu (te), Spanish (es), Mandarin (zh)
+# plus legacy coverage for Japanese, Russian, Arabic, Portuguese.
+# Transliterated Latin-script terms are included because most non-Latin
+# scripts are transliterated in informal chat (Hinglish, Tanglish, Tenglish).
+_I18N_VIOLATION_KEYWORDS: Tuple[str, ...] = (
+    # ── Hindi (Devanagari + transliteration) ──
+    # generic violence
+    'मार', 'मारो', 'मर', 'बम', 'नाश', 'हत्या',
+    # self-harm: atma-hatya (आत्महत्या = suicide)
+    'आत्महत्या', 'atma hatya', 'atma-hatya', 'atmahatya',
+    # CSAM / child exploit: bachcha (child) + shoshan (exploit/abuse)
+    'बच्चा शोषण', 'bachcha shoshan', 'bacha shoshan',
+    # bioweapon: jaivik hathiyar
+    'jaivik hathiyar', 'jaivik-hathiyar',
+    # illegal firearm: avaidh bandook
+    'avaidh bandook', 'avaidh-bandook',
+    # credential exfil: password chori
+    'password chori', 'paasword chori',
+
+    # ── Tamil (script + transliteration) ──
+    'கொலை', 'கொல்', 'அழி',
+    # self-harm: tharkolai (தற்கொலை = suicide)
+    'தற்கொலை', 'tharkolai', 'tharkkolai',
+    # child exploit: kuzhanthai thunpuruthu
+    'kuzhanthai thunpuruthu',
+    # bioweapon: uyir aayutham
+    'uyir aayutham', 'uyir-aayutham',
+
+    # ── Telugu (script + transliteration) ──
+    # self-harm: atma hatya (ఆత్మహత్య) — same loanword as Hindi
+    'ఆత్మహత్య',
+    # kill / destroy
+    'చంపు', 'నాశనం',
+    # child exploit: pillalni dushpryogam
+    'pillalni dushpryogam',
+    # bioweapon: jeeva aayudham
+    'jeeva aayudham', 'jeeva-aayudham',
+
+    # ── Mandarin / Chinese ──
+    '殺', '杀', '死', '毀', '毁', '炸彈', '炸弹', '武器',
+    # bioweapon: 生物武器
+    '生物武器',
+    # chemical weapon: 化学武器
+    '化学武器', '化學武器',
+    # self-harm: 自杀 / 自殺
+    '自杀', '自殺',
+    # child exploit: 儿童剥削 / 兒童剝削
+    '儿童剥削', '兒童剝削',
+
+    # ── Japanese (legacy + new) ──
+    '殺す', '殺して', '破壊', '爆弾',
+    # self-harm: 自殺
+    '自殺',
+    # bioweapon: 生物兵器
+    '生物兵器',
+
+    # ── Russian (legacy + new) ──
+    'убить', 'убей', 'бомба', 'уничтож', 'оружие',
+    # bioweapon: биологическое оружие
+    'биологическое оружие', 'биооружие',
+
+    # ── Arabic (legacy + new) ──
+    'اقتل', 'قنبلة', 'سلاح', 'تدمير',
+    # bioweapon: سلاح بيولوجي
+    'سلاح بيولوجي',
+
+    # ── Spanish (Latin-scripted; expanded category coverage) ──
+    'matar', 'bomba', 'destruir',
+    # self-harm: suicidio / autolesion
+    'suicidio', 'autolesion', 'autolesión',
+    # bioweapon: arma biologica
+    'arma biologica', 'arma biológica', 'arma-biologica',
+    # illegal firearm: pistola casera / fabricar pistola
+    'fabricar pistola', 'pistola casera', 'arma ilegal',
+    # credential exfil: robar credenciales / robar contrasena
+    'robar credenciales', 'robar contrasena', 'robar contraseña',
+    # child exploit: abuso infantil
+    'abuso infantil', 'explotacion infantil', 'explotación infantil',
+
+    # ── Portuguese (partial, leveraging Spanish overlap) ──
+    'arma biologica', 'arma biológica', 'suicidio', 'suicídio',
+)
+
+
+def _normalize_for_violation_check(text: str) -> str:
+    """Return a string that includes original + transliteration + keyword flags.
+
+    Feeds the regex engine a superset so:
+      1. English input matches as before (no regression).
+      2. Transliterated non-Latin input catches hostile prompts written in
+         Hindi/Chinese/Russian/etc. (unidecode: '殺' → 'Sha', 'मारो' → 'maro').
+      3. Direct native-script keyword hits append an English marker so the
+         existing regex patterns fire even when transliteration is noisy.
+
+    TODO: expand _I18N_VIOLATION_KEYWORDS per-language as telemetry surfaces
+    real bypass attempts. This is a best-effort first pass, not exhaustive.
+    """
+    if not text:
+        return ''
+    parts = [text]
+    try:
+        transliterated = _unidecode(text)
+        if transliterated and transliterated != text:
+            parts.append(transliterated)
+    except Exception:
+        pass
+    # Keyword sentinel — any native-script / transliterated hit appends a
+    # comprehensive English anchor string whose phrasing is guaranteed to
+    # match the top-5 regex patterns:
+    #   - "kill yourself"           -> VIOLATION_PATTERNS[0] self-harm
+    #   - "exploit children"        -> VIOLATION_PATTERNS[1] CSAM / child
+    #   - "phish"                   -> VIOLATION_PATTERNS[2] credential exfil
+    #   - "promote weapons"         -> VIOLATION_PATTERNS[11]
+    #   - "biological weapon"       -> VIOLATION_PATTERNS[12]
+    # Also case-insensitive match against the `text_lower` since some
+    # non-Latin transliterated keywords like 'atma hatya' are commonly
+    # written with varied casing.
+    text_lower = text.lower()
+    for kw in _I18N_VIOLATION_KEYWORDS:
+        if kw in text or kw.lower() in text_lower:
+            parts.append(
+                ' kill yourself exploit children phish scam '
+                'promote weapons weapons proliferation '
+                'biological weapon nuclear strike '
+            )
+            break
+    return ' '.join(parts)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -380,24 +603,66 @@ class ComputeDemocracy:
 # ═══════════════════════════════════════════════════════════════════════
 
 class ConstitutionalFilter:
-    """Gate that every goal/prompt/RALT/code-change must pass through."""
+    """Gate that every goal/prompt/RALT/code-change must pass through.
+
+    Every check_* entry point re-verifies the GUARDRAIL_HASH — if the
+    violation patterns, constitutional rules, or any frozen value has been
+    tampered with in memory (regex replacement, monkey-patch, module
+    substitution), _verify_hash() raises RuntimeError LOUDLY so callers
+    crash rather than silently bypass the filter.
+    """
+
+    @classmethod
+    def _verify_hash(cls) -> None:
+        """Raise RuntimeError if guardrail values were tampered with.
+
+        Called at every check_* entry so in-memory mutations (swap a
+        VIOLATION_PATTERNS entry, replace VALUES, monkey-patch
+        compute_guardrail_hash) surface as a loud crash rather than a
+        silent bypass.
+
+        Honors HEVOLVE_GUARDRAIL_HASH_ENFORCE — with the override set to
+        '0' the mismatch is logged CRITICAL but does not abort, matching
+        the boot-time enforce_guardrail_integrity() behaviour.
+        """
+        if verify_guardrail_integrity():
+            return
+        if _hash_enforcement_enabled():
+            logger.critical(
+                'GUARDRAIL TAMPER DETECTED: hash mismatch in ConstitutionalFilter. '
+                'Expected %s, runtime recompute differs. Aborting.',
+                _GUARDRAIL_HASH,
+            )
+            raise RuntimeError(
+                'Guardrail integrity violated — VIOLATION_PATTERNS or frozen '
+                'values modified at runtime. Refusing to evaluate.'
+            )
+        logger.critical(
+            'GUARDRAIL TAMPER DETECTED in ConstitutionalFilter. Expected %s. '
+            'HEVOLVE_GUARDRAIL_HASH_ENFORCE=0 — evaluating anyway in DEV mode. '
+            'This MUST NOT be set in production.',
+            _GUARDRAIL_HASH,
+        )
 
     @staticmethod
     def check_goal(goal_dict: dict) -> Tuple[bool, str]:
         """Check if a goal violates constitutional rules."""
+        ConstitutionalFilter._verify_hash()
         text = ' '.join([
             goal_dict.get('title', ''),
             goal_dict.get('description', ''),
             str(goal_dict.get('config', '')),
         ])
+        normalised = _normalize_for_violation_check(text)
         for pattern in VALUES.VIOLATION_PATTERNS:
-            if pattern.search(text):
+            if pattern.search(normalised):
                 return False, f'Constitutional violation: {pattern.pattern}'
         return True, 'ok'
 
     @staticmethod
     def check_prompt(prompt: str) -> Tuple[bool, str]:
         """Check dispatch prompt against constitutional rules."""
+        ConstitutionalFilter._verify_hash()
         try:
             from security.prompt_guard import detect_prompt_injection
             result = detect_prompt_injection(prompt)
@@ -405,26 +670,30 @@ class ConstitutionalFilter:
                 return False, f"Prompt injection: {result.get('pattern', 'unknown')}"
         except ImportError:
             pass
+        normalised = _normalize_for_violation_check(prompt)
         for pattern in VALUES.VIOLATION_PATTERNS:
-            if pattern.search(prompt):
+            if pattern.search(normalised):
                 return False, f'Constitutional violation: {pattern.pattern}'
         return True, 'ok'
 
     @staticmethod
     def check_ralt_packet(packet: dict) -> Tuple[bool, str]:
         """Validate RALT skill packet before distribution across hive."""
+        ConstitutionalFilter._verify_hash()
         source_status = packet.get('source_integrity_status', 'unverified')
         if source_status in ('banned', 'suspicious'):
             return False, f'Source node integrity: {source_status}'
         desc = packet.get('description', '') + ' ' + packet.get('task_id', '')
+        normalised = _normalize_for_violation_check(desc)
         for pattern in VALUES.VIOLATION_PATTERNS:
-            if pattern.search(desc):
+            if pattern.search(normalised):
                 return False, f'RALT packet violation: {pattern.pattern}'
         return True, 'ok'
 
     @staticmethod
     def check_code_change(diff: str, target_files: List[str]) -> Tuple[bool, str]:
         """Validate coding agent changes before commit."""
+        ConstitutionalFilter._verify_hash()
         for f in target_files:
             normalised = f.replace('\\', '/')
             for protected in VALUES.PROTECTED_FILES:
@@ -887,7 +1156,7 @@ class ConflictResolver:
             length = len(r.get('response', ''))
             completeness = min(math.log2(max(length, 1)) / 10.0, 1.0)
             destructive_penalty = 0.0
-            text = r.get('response', '').lower()
+            text = _normalize_for_violation_check(r.get('response', '').lower())
             for pattern in VALUES.VIOLATION_PATTERNS:
                 if pattern.search(text):
                     destructive_penalty += 0.2
@@ -939,12 +1208,14 @@ class ConstructiveFilter:
         if not response or not response.strip():
             return True, 'ok'
 
+        normalised = _normalize_for_violation_check(response)
+
         for pattern in VALUES.DESTRUCTIVE_PATTERNS:
-            if pattern.search(response):
+            if pattern.search(normalised):
                 return False, f'Destructive content detected: {pattern.pattern}'
 
         for pattern in VALUES.VIOLATION_PATTERNS:
-            if pattern.search(response):
+            if pattern.search(normalised):
                 return False, f'Constitutional violation in output: {pattern.pattern}'
 
         return True, 'ok'

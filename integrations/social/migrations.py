@@ -8,7 +8,7 @@ from .models import get_engine, Base
 
 logger = logging.getLogger('hevolve_social')
 
-SCHEMA_VERSION = 36
+SCHEMA_VERSION = 37
 
 
 def get_schema_version(engine) -> int:
@@ -752,3 +752,22 @@ def run_migrations():
         for tbl in [UserChannelBinding.__table__, ConversationEntry.__table__, ChannelPresence.__table__]:
             tbl.create(engine, checkfirst=True)
         set_schema_version(engine, 36)
+
+    if current < 37:
+        # v37: agent voice_profile — previously the POST /users/<id>/agents
+        # endpoint accepted `voice_profile` in the request body but silently
+        # dropped it because the User model had no column for it.  Adds a
+        # JSON column (TEXT-backed on SQLite) so voice presets round-trip.
+        logger.info("HevolveSocial: migrating to v37 (User.voice_profile column)")
+        with engine.connect() as conn:
+            try:
+                # SQLAlchemy JSON maps to TEXT on SQLite / JSON on MySQL/PG.
+                # ALTER TABLE ADD COLUMN TEXT is the portable form.
+                conn.execute(text(
+                    "ALTER TABLE users ADD COLUMN voice_profile TEXT"))
+            except Exception as e:
+                logger.warning(
+                    "v37 migration: ADD COLUMN voice_profile on users "
+                    "skipped (may already exist): %s", e)
+            conn.commit()
+        set_schema_version(engine, 37)

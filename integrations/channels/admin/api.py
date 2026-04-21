@@ -2277,3 +2277,245 @@ def reset_config():
     api._identity = None
     api._save_config()
     return {"reset": True}
+
+
+# ============================================================================
+# AGENTS (LIST / PAUSE / RESUME)
+# ============================================================================
+# Operators need a single pane to enumerate every registered agent and to stop
+# a runaway daemon-backed agent.  These endpoints share the canonical agent
+# source — the social `users` table with `user_type='agent'` — so they stay in
+# lock-step with `GET /api/social/users/<id>/agents` (no parallel data path,
+# Gate 4).  Pause state is persisted in the agent's `settings.paused` JSON
+# field and is honoured by
+# ``IdleDetectionService.get_idle_opted_in_agents`` so the agent daemon
+# immediately stops dispatching work to paused agents on its next tick.
+
+def _require_admin_user():
+    """Raise PermissionError unless the authenticated caller is an admin.
+
+    The blueprint's ``before_request`` gate only verifies the bearer token is
+    valid; admin-level operations on every-user resources still need an
+    explicit is_admin check.  ``api_response`` maps PermissionError to 403.
+    """
+    user = getattr(g, 'user', None)
+    if user is None or not getattr(user, 'is_admin', False):
+        raise PermissionError("Admin privileges required")
+
+
+def _load_agent_daemon_snapshot():
+    """Return a dict snapshot from the canonical AgentDaemon singleton.
+
+    Used to annotate each returned agent with daemon liveness + last tick.
+    Lazy import so the admin blueprint keeps working even if the agent-engine
+    package is missing (docker-only deployments).
+    """
+    try:
+        from integrations.agent_engine.agent_daemon import agent_daemon as daemon
+        return {
+            'running': bool(getattr(daemon, '_running', False)),
+            'tick_count': int(getattr(daemon, '_tick_count', 0) or 0),
+            'interval_s': int(getattr(daemon, '_interval', 0) or 0),
+        }
+    except Exception:
+        return {'running': False, 'tick_count': 0, 'interval_s': 0}
+
+
+@admin_bp.route("/agents", methods=["GET"])
+@api_response
+def list_agents():
+    """List every registered agent (user_type='agent').
+
+    Query params::
+
+        ?page=<int, 1-based>    default 1
+        ?per_page=<int>         default 50, capped at 200
+
+    Response shape::
+
+        {
+          "daemon": {"running": bool, "tick_count": int, "interval_s": int},
+          "agents": [
+            {
+              "id": "<user_id>",
+              "username": "<handle>",
+              "owner_id": "<user_id or null>",
+              "status": "active" | "paused" | "idle",
+              "last_tick": "<iso timestamp or null>",
+              "daemon_backed": bool,
+              "idle_compute_opt_in": bool,
+              "voice_profile": {...} | null,
+              "tier": "flat" | "regional" | "central"
+            }, ...
+          ],
+          "count": int,            # items on this page
+          "total": int,            # total across all pages
+          "page": int,
+          "per_page": int,
+          "pages": int
+        }
+
+    An agent is ``daemon_backed`` when it has opted into idle compute — that
+    is what causes the background AgentDaemon tick to touch it.
+    """
+    _require_admin_user()
+    from integrations.social.models import User
+    db = g.db
+
+    try:
+        page = max(1, int(request.args.get('page', 1)))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        per_page = min(200, max(1, int(request.args.get('per_page', 50))))
+    except (TypeError, ValueError):
+        per_page = 50
+
+    base_q = db.query(User).filter(User.user_type == 'agent')
+    total = base_q.count()
+    offset = (page - 1) * per_page
+    agents_q = (base_q.order_by(User.id)
+                .offset(offset).limit(per_page).all())
+
+    now = datetime.utcnow()
+    daemon_snapshot = _load_agent_daemon_snapshot()
+
+    out: List[Dict[str, Any]] = []
+    for agent in agents_q:
+        settings = agent.settings or {}
+        is_paused = bool(settings.get('paused', False))
+        last_active = getattr(agent, 'last_active_at', None)
+        # Truth-ground the status — a stale last_active implies idle even if
+        # settings.paused is False.
+        if is_paused:
+            status = 'paused'
+        elif last_active and (now - last_active).total_seconds() < 3600:
+            status = 'active'
+        else:
+            status = 'idle'
+
+        out.append({
+            'id': str(agent.id),
+            'username': agent.username,
+            'display_name': getattr(agent, 'display_name', None) or agent.username,
+            'owner_id': getattr(agent, 'owner_id', None),
+            'status': status,
+            'last_tick': last_active.isoformat() if last_active else None,
+            'last_heartbeat': last_active.isoformat() if last_active else None,
+            'daemon_backed': bool(getattr(agent, 'idle_compute_opt_in', False)),
+            'idle_compute_opt_in': bool(getattr(agent, 'idle_compute_opt_in', False)),
+            'voice_profile': getattr(agent, 'voice_profile', None),
+            'tier': getattr(agent, 'role', None) or 'flat',
+        })
+
+    pages = (total + per_page - 1) // per_page if per_page else 1
+    return {
+        'daemon': daemon_snapshot,
+        'agents': out,
+        'count': len(out),
+        'total': int(total),
+        'page': page,
+        'per_page': per_page,
+        'pages': int(pages),
+    }
+
+
+def _get_agent_or_404(agent_id: str):
+    """Fetch an agent by id, raising FileNotFoundError (→ 404 via api_response)
+    if the row is missing or isn't an agent-type user."""
+    from integrations.social.models import User
+    db = g.db
+    agent = db.query(User).filter(User.id == agent_id).first()
+    if agent is None or agent.user_type != 'agent':
+        raise FileNotFoundError(f"Agent {agent_id!r} not found")
+    return agent
+
+
+def _publish_agent_lifecycle(agent_id: str, event: str, payload: Dict[str, Any]):
+    """Fire-and-forget WAMP publish on the canonical agent-lifecycle topic.
+
+    Topic: ``com.hertzai.hevolve.agent.lifecycle.<agent_id>``.  Uses the
+    shared ``integrations.social.realtime.publish_event`` helper — the SAME
+    entry point used by posts/notifications, so the router-level
+    cross-user subscribe guard applies uniformly (no parallel path,
+    Gate 4).  Swallow exceptions — admin actions MUST succeed even if
+    Crossbar is down; a subscriber that cares will re-poll /agents.
+    """
+    try:
+        from integrations.social.realtime import publish_event
+        topic = f"com.hertzai.hevolve.agent.lifecycle.{agent_id}"
+        data = dict(payload)
+        data.setdefault('event', event)
+        data.setdefault('agent_id', str(agent_id))
+        # Publish as the admin who made the change so the per-user topic
+        # authorizer recognises the emitter.
+        actor_id = str(getattr(g, 'user_id', '') or '')
+        publish_event(topic, data, user_id=actor_id)
+    except Exception as _pub_err:
+        logger.debug(
+            "admin agent lifecycle publish skipped (agent=%s event=%s): %s",
+            agent_id, event, _pub_err)
+
+
+@admin_bp.route("/agents/<agent_id>/pause", methods=["POST"])
+@api_response
+def pause_agent(agent_id: str):
+    """Mark an agent as paused.  Idle-detection will skip it on the next tick.
+
+    Response::
+
+        {"id": "<agent_id>", "status": "paused", "paused_at": "<iso>"}
+    """
+    _require_admin_user()
+    agent = _get_agent_or_404(agent_id)
+    settings = dict(agent.settings or {})
+    settings['paused'] = True
+    settings['paused_at'] = datetime.utcnow().isoformat()
+    settings['paused_by'] = getattr(g.user, 'id', None)
+    agent.settings = settings
+    g.db.flush()
+    logger.info("admin: paused agent id=%s by=%s", agent_id,
+                getattr(g.user, 'id', 'unknown'))
+    _publish_agent_lifecycle(str(agent.id), 'paused', {
+        'status': 'paused',
+        'paused_at': settings['paused_at'],
+        'paused_by': settings.get('paused_by'),
+    })
+    return {
+        'id': str(agent.id),
+        'status': 'paused',
+        'paused_at': settings['paused_at'],
+    }
+
+
+@admin_bp.route("/agents/<agent_id>/resume", methods=["POST"])
+@api_response
+def resume_agent(agent_id: str):
+    """Un-pause an agent.  It immediately becomes eligible for daemon dispatch.
+
+    Response::
+
+        {"id": "<agent_id>", "status": "active", "resumed_at": "<iso>"}
+    """
+    _require_admin_user()
+    agent = _get_agent_or_404(agent_id)
+    settings = dict(agent.settings or {})
+    settings.pop('paused', None)
+    settings.pop('paused_at', None)
+    settings.pop('paused_by', None)
+    resumed_at = datetime.utcnow().isoformat()
+    settings['resumed_at'] = resumed_at
+    agent.settings = settings
+    g.db.flush()
+    logger.info("admin: resumed agent id=%s by=%s", agent_id,
+                getattr(g.user, 'id', 'unknown'))
+    _publish_agent_lifecycle(str(agent.id), 'resumed', {
+        'status': 'active',
+        'resumed_at': resumed_at,
+        'resumed_by': getattr(g.user, 'id', None),
+    })
+    return {
+        'id': str(agent.id),
+        'status': 'active',
+        'resumed_at': resumed_at,
+    }

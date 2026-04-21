@@ -83,7 +83,63 @@ __all__ = [
     "DiscordUserAdapter", "DiscordUserConfig", "create_discord_user_adapter",
     # Phase 8 - Zalo User
     "ZaloUserAdapter", "ZaloUserConfig", "create_zalo_user_adapter",
+    # Discovery helper
+    "get_available_adapters",
 ]
+
+
+# (channel_name, module_basename, factory_name) — single source of truth
+# for the adapter registry used by both the lazy __getattr__ and the
+# runtime discovery helper `get_available_adapters()`.
+_ADAPTER_REGISTRY = (
+    ("matrix",          "matrix_adapter",          "create_matrix_adapter"),
+    ("teams",           "teams_adapter",           "create_teams_adapter"),
+    ("line",            "line_adapter",            "create_line_adapter"),
+    ("mattermost",      "mattermost_adapter",      "create_mattermost_adapter"),
+    ("nextcloud",       "nextcloud_adapter",       "create_nextcloud_adapter"),
+    ("twitch",          "twitch_adapter",          "create_twitch_adapter"),
+    ("zalo",            "zalo_adapter",            "create_zalo_adapter"),
+    ("nostr",           "nostr_adapter",           "create_nostr_adapter"),
+    ("bluebubbles",     "bluebubbles_adapter",     "create_bluebubbles_adapter"),
+    ("voice",           "voice_adapter",           "create_voice_adapter"),
+    ("rocketchat",      "rocketchat_adapter",      "create_rocketchat_adapter"),
+    ("wechat",          "wechat_adapter",          "create_wechat_adapter"),
+    ("viber",           "viber_adapter",           "create_viber_adapter"),
+    ("messenger",       "messenger_adapter",       "create_messenger_adapter"),
+    ("instagram",       "instagram_adapter",       "create_instagram_adapter"),
+    ("twitter",         "twitter_adapter",         "create_twitter_adapter"),
+    ("email",           "email_adapter",           "create_email_adapter"),
+    ("tlon",            "tlon_adapter",            "create_tlon_adapter"),
+    ("openprose",       "openprose_adapter",       "create_openprose_adapter"),
+    ("telegram_user",   "telegram_user_adapter",   "create_telegram_user_adapter"),
+    ("discord_user",    "discord_user_adapter",    "create_discord_user_adapter"),
+    ("zalo_user",       "zalo_user_adapter",       "create_zalo_user_adapter"),
+)
+
+
+def get_available_adapters() -> dict:
+    """Return a mapping of ``{channel_name: create_adapter_factory}`` for every
+    extension adapter whose backing module imports successfully.
+
+    Adapters whose dependencies are not installed are silently skipped so that
+    callers (marketing_tools, MCP ``list_channels``, admin API) always see a
+    stable surface. Factories are the ``create_<name>_adapter`` callables
+    declared by each adapter module; callers are expected to invoke them
+    with per-channel config.
+    """
+    import importlib
+    adapters: dict = {}
+    for channel_name, module_basename, factory_name in _ADAPTER_REGISTRY:
+        try:
+            mod = importlib.import_module(f".{module_basename}", __name__)
+        except Exception:
+            # Optional-dep / platform-specific adapters can fail to import.
+            # The discovery surface must stay stable; skip silently.
+            continue
+        factory = getattr(mod, factory_name, None)
+        if callable(factory):
+            adapters[channel_name] = factory
+    return adapters
 
 
 def __getattr__(name: str):

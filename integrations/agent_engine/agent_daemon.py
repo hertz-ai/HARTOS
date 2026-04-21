@@ -938,6 +938,28 @@ class AgentDaemon:
                 except Exception:
                     pass
 
+            # Marketplace payment reconciliation: retry failed Spark transfers.
+            # Rows with status='pending' older than 15 minutes are re-attempted
+            # through the canonical ResonanceService gateway. Prior to this
+            # hook, a failed Spark transfer during install_app() was silently
+            # dropped with no retry path — creators lost revenue on
+            # transient DB errors.
+            if self._tick_count % self._remediate_every == 0:
+                try:
+                    from .app_marketplace import get_marketplace
+                    mp = get_marketplace()
+                    counters = mp.reconcile_pending_payments()
+                    if counters.get('retried', 0) > 0 or counters.get('failed', 0) > 0:
+                        logger.info(
+                            f"Marketplace reconcile: "
+                            f"retried={counters.get('retried', 0)}, "
+                            f"settled={counters.get('settled', 0)}, "
+                            f"failed={counters.get('failed', 0)}")
+                except ImportError:
+                    pass
+                except Exception as e:
+                    logger.debug(f"Marketplace reconcile failed: {e}")
+
             # CLEANUP: prune stale entries from module-level dicts every 100 ticks
             if self._tick_count % 100 == 0:
                 active_goal_ids = {str(g.id) for g in goals}

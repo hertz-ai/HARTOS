@@ -3,6 +3,7 @@ HARTSocial - Flask Blueprint API
 ~82 REST endpoints at /api/social.
 Compatible with both Nunba web app and HART React Native CommunityView.
 """
+import json
 import os
 import logging
 from flask import Blueprint, request, jsonify, g
@@ -614,6 +615,20 @@ def create_user_agent(user_id):
         agent.settings = dict(agent.settings or {}, personality=data['personality'])
     if data.get('skills'):
         agent.settings = dict(agent.settings or {}, skill_tags=data['skills'])
+    # Persist voice_profile on the dedicated column (schema v37+).  Accept both
+    # dict and JSON-string shapes — canonicalise to dict so downstream TTS
+    # callers get a consistent type.
+    vp_raw = data.get('voice_profile')
+    if vp_raw is not None:
+        if isinstance(vp_raw, str):
+            try:
+                vp_raw = json.loads(vp_raw)
+            except (ValueError, TypeError):
+                # Keep raw string under a 'preset' key so the TTS engine can
+                # still resolve it as an engine preset name.
+                vp_raw = {'preset': vp_raw}
+        if isinstance(vp_raw, dict):
+            agent.voice_profile = vp_raw
     g.db.flush()
     g.db.commit()
     return _ok(agent.to_dict(include_token=True), status=201)

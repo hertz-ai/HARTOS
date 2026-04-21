@@ -44,7 +44,13 @@ class InMemoryTaskLock:
         self._locks: Dict[str, Dict[str, Any]] = {}  # task_id → {agent_id, expires_at}
         self._mu = threading.Lock()
 
-    def try_claim_task(self, task_id: str, agent_id: str, ttl: int = None) -> bool:
+    def try_claim_task(self, task_id: str, agent_id: str, ttl: int = None,
+                       heartbeat: bool = False) -> bool:
+        # ``heartbeat`` is accepted for signature parity with
+        # DistributedTaskLock.try_claim_task — in-memory locks don't
+        # expire under Redis pressure, so there's nothing to renew, but
+        # callers (task_coordinator) pass heartbeat=True uniformly.
+        del heartbeat  # noqa: F841 — explicit-ignore for readers
         ttl = ttl if ttl is not None else self.DEFAULT_TTL
         now = time.time()
         with self._mu:
@@ -56,6 +62,31 @@ class InMemoryTaskLock:
                 'expires_at': now + ttl,
             }
             return True
+
+    def renew(self, task_id: str, agent_id: str, ttl: int = None) -> bool:
+        """Extend this lock's expiry.  Mirrors DistributedTaskLock.renew
+        so task_coordinator can treat both backends polymorphically.
+        """
+        ttl = ttl if ttl is not None else self.DEFAULT_TTL
+        with self._mu:
+            existing = self._locks.get(task_id)
+            if not existing or existing.get('agent_id') != agent_id:
+                return False
+            existing['expires_at'] = time.time() + ttl
+            return True
+
+    def start_heartbeat(self, task_id: str, agent_id: str,
+                        ttl: int = None) -> bool:
+        """No-op for in-memory backend — locks don't drop mid-flight
+        without external pressure.  Provided for API parity.
+        """
+        return False
+
+    def stop_heartbeat(self, task_id: str, agent_id: str) -> bool:
+        return False
+
+    def stop_all_heartbeats(self, timeout: float = 5.0) -> None:
+        return None
 
     def release_task(self, task_id: str, agent_id: str) -> bool:
         with self._mu:

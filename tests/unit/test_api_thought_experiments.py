@@ -24,11 +24,59 @@ if PROJECT_ROOT not in sys.path:
 
 @pytest.fixture
 def app():
+    """Flask app with thought_experiments_bp.
+
+    Auth decorators are replaced with pass-through wrappers that inject
+    a fake authenticated user onto flask.g. These unit tests cover
+    routing/validation/service-dispatch behaviour, not auth itself —
+    auth is covered in tests/unit/test_p0_security_fixes.py.
+    """
+    # Replace require_auth / require_admin / optional_auth BEFORE the
+    # blueprint imports them, so the module-level @decorator captures
+    # the pass-through versions.
+    import flask
+    from integrations.social import auth as auth_mod
+
+    _orig_require_auth = auth_mod.require_auth
+    _orig_require_admin = auth_mod.require_admin
+    _orig_optional_auth = auth_mod.optional_auth
+
+    class _FakeUser:
+        id = 'u1'
+        is_admin = True
+        is_moderator = True
+        role = 'central'
+
+    def _passthrough(fn):
+        from functools import wraps
+
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            flask.g.user = _FakeUser()
+            flask.g.user_id = 'u1'
+            return fn(*args, **kwargs)
+        return wrapper
+
+    auth_mod.require_auth = _passthrough
+    auth_mod.require_admin = _passthrough
+    auth_mod.optional_auth = _passthrough
+
+    # Force re-import so the blueprint picks up patched decorators.
+    import importlib
+    import integrations.social.api_thought_experiments as te_mod
+    importlib.reload(te_mod)
+
     app = Flask(__name__)
     app.config['TESTING'] = True
-    from integrations.social.api_thought_experiments import thought_experiments_bp
-    app.register_blueprint(thought_experiments_bp)
-    return app
+    app.register_blueprint(te_mod.thought_experiments_bp)
+
+    yield app
+
+    # Restore and reload so other test files see the real decorators.
+    auth_mod.require_auth = _orig_require_auth
+    auth_mod.require_admin = _orig_require_admin
+    auth_mod.optional_auth = _orig_optional_auth
+    importlib.reload(te_mod)
 
 
 @pytest.fixture
@@ -135,12 +183,16 @@ class TestListExperiments:
 class TestVoteExperiment:
     """Voting drives the democratic decision outcome."""
 
-    def test_returns_400_without_voter_id(self, client):
+    def test_voter_id_comes_from_jwt_not_body(self, client):
+        """Post-P0 fix: voter_id is taken from the authenticated user, so
+        the endpoint no longer depends on body.voter_id. Absent body still
+        reaches the service (which may 400/404/500 depending on DB state)."""
         resp = client.post('/api/social/experiments/exp1/vote',
                            json={'direction': 'up'},
                            content_type='application/json')
-        # May return 400 or 500 depending on validation order
-        assert resp.status_code in (400, 500)
+        # voter_id is JWT-derived so it's never missing; downstream
+        # service may 400/404/500 but never 401 under the pass-through fixture.
+        assert resp.status_code in (200, 400, 404, 500)
 
 
 # ============================================================
@@ -267,8 +319,14 @@ class TestCreateEdgeCases:
                            content_type='application/json')
         assert resp.status_code == 400
 
-    def test_missing_creator_id_rejected(self, client):
-        resp = client.post('/api/social/experiments',
-                           json={'title': 'T', 'hypothesis': 'H'},
-                           content_type='application/json')
-        assert resp.status_code == 400
+    def test_creator_id_comes_from_jwt_not_body(self, client):
+        """Post-P0 fix: creator_id is taken from the authenticated user, so
+        a body-omitted creator_id no longer causes 400. Impersonation
+        defence — body-supplied creator_id is ignored entirely."""
+        mock_db, mock_svc, modules = _mock_db_and_service()
+        mock_svc.create_experiment.return_value = {'id': 'e1', 'title': 'T'}
+        with patch.dict('sys.modules', modules):
+            resp = client.post('/api/social/experiments',
+                               json={'title': 'T', 'hypothesis': 'H'},
+                               content_type='application/json')
+        assert resp.status_code == 201

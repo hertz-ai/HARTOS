@@ -281,6 +281,15 @@ def _register_device_control_handler():
     except Exception as e:
         logger.debug(f"Device control handler registration failed: {e}")
 
+    # Register HiveMind (0x05 PRIVATE) handler so peer thought queries and
+    # agent-to-agent private deliveries don't drop on the floor.  Idempotent
+    # — safe to call again from Nunba's boot path.
+    try:
+        from core.peer_link.hivemind_handler import bootstrap_hivemind_handler
+        bootstrap_hivemind_handler()
+    except Exception as e:
+        logger.debug(f"HiveMind handler registration failed: {e}")
+
 
 def _check_halt():
     """Check if halt has been requested (by fleet command or circuit breaker)."""

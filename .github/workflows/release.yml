@@ -332,10 +332,38 @@ jobs:
           BASENAME=$(basename "$FILE")
           mkdir -p /tmp/release-artifacts
 
-          # Copy to artifacts dir
-          cp "$FILE" /tmp/release-artifacts/
+          # GitHub Release assets are capped at 2 GB per file on
+          # public repos — iso-desktop is ~2.3 GB (GNOME + wine +
+          # fonts) so direct upload returns HTTP 422 "size must be
+          # less than 2147483648". Split anything over 1.9 GB into
+          # deterministic chunks named .part-aa / .part-ab / …
+          # and emit a companion _reassemble.sh so users can
+          # `cat *.part-* > foo.iso` or run the script.
+          SIZE_BYTES=$(stat -c '%s' "$FILE")
+          SPLIT_THRESHOLD=$((1900 * 1024 * 1024))   # 1.9 GiB
+          if [[ "$SIZE_BYTES" -gt "$SPLIT_THRESHOLD" ]]; then
+            echo "File is $SIZE_BYTES bytes (> 1.9 GiB) — splitting"
+            ( cd /tmp/release-artifacts \
+              && split -b 1900M -d -a 2 "$FILE" "${BASENAME}.part-" )
+            ls -lh /tmp/release-artifacts/"${BASENAME}".part-*
+            cat > "/tmp/release-artifacts/${BASENAME}.reassemble.sh" <<REASSEMBLE
+          #!/usr/bin/env bash
+          # Reassemble ${BASENAME} from GitHub-split 1.9 GiB parts.
+          # Usage (after downloading every ${BASENAME}.part-* file):
+          #   chmod +x ${BASENAME}.reassemble.sh
+          #   ./${BASENAME}.reassemble.sh
+          set -euo pipefail
+          cat ${BASENAME}.part-* > ${BASENAME}
+          sha256sum -c ${BASENAME}.sha256
+          REASSEMBLE
+            chmod +x "/tmp/release-artifacts/${BASENAME}.reassemble.sh"
+            echo "SPLIT=1" >> /tmp/split-status
+          else
+            # Fits under 2 GB — upload directly.
+            cp "$FILE" /tmp/release-artifacts/
+          fi
 
-          # SHA-256 checksum
+          # SHA-256 checksum (always computed against the uncut ISO)
           sha256sum "$FILE" | sed "s|.*/||" > "/tmp/release-artifacts/${BASENAME}.sha256"
 
           # Create .torrent with web seed. On push-to-main we target

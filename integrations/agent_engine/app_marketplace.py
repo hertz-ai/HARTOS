@@ -681,6 +681,12 @@ class AppMarketplace:
 
         90% to creator, 9% to infrastructure, 1% to central.
         Uses ResonanceService.award_spark when available.
+
+        Failed payments are persisted to revenue.json with status='pending'
+        so the reconciliation job (see ``reconcile_pending_payments``) can
+        retry them later. Before this guard a failed ResonanceService call
+        was silently dropped and the install was aborted without leaving
+        an audit trail.
         """
         creator_share = int(amount_spark * REVENUE_SPLIT_USERS)
         infra_share = int(amount_spark * REVENUE_SPLIT_INFRA)
@@ -703,24 +709,139 @@ class AppMarketplace:
             logger.debug("ResonanceService not available, recording payment ledger only")
         except Exception as e:
             logger.warning("Payment processing failed: %s", e)
+            # Record the failed payment so reconciliation can retry it.
+            self._record_payment(
+                seller_id, buyer_id, listing_id, amount_spark,
+                creator_share, infra_share, central_share,
+                status='pending', error=str(e), retry_count=0)
             return {'error': f'Payment failed: {e}'}
 
-        # Record in revenue ledger
-        revenue = self._revenue()
-        seller_revenue = revenue.get(seller_id, [])
-        seller_revenue.append({
-            'listing_id': listing_id,
-            'buyer_id': buyer_id,
-            'total_spark': amount_spark,
-            'creator_share': creator_share,
-            'infra_share': infra_share,
-            'central_share': central_share,
-            'timestamp': datetime.utcnow().isoformat(),
-        })
-        revenue[seller_id] = seller_revenue
-        self._save_revenue(revenue)
+        # Record successful payment in revenue ledger
+        self._record_payment(
+            seller_id, buyer_id, listing_id, amount_spark,
+            creator_share, infra_share, central_share,
+            status='settled', error='', retry_count=0)
 
         return {'success': True, 'creator_share': creator_share}
+
+    def _record_payment(self, seller_id: str, buyer_id: str,
+                        listing_id: str, amount_spark: int,
+                        creator_share: int, infra_share: int,
+                        central_share: int, *, status: str = 'settled',
+                        error: str = '', retry_count: int = 0) -> None:
+        """Append a payment record to revenue.json (thread-safe).
+
+        ``status`` is 'settled' on success and 'pending' when the Spark
+        transfer failed and needs reconciliation. This is the single writer
+        for the revenue ledger — all payment state flows through here so
+        the reconciliation job can trust the schema.
+        """
+        with self._lock:
+            revenue = self._revenue()
+            seller_revenue = revenue.get(seller_id, [])
+            seller_revenue.append({
+                'listing_id': listing_id,
+                'buyer_id': buyer_id,
+                'total_spark': amount_spark,
+                'creator_share': creator_share,
+                'infra_share': infra_share,
+                'central_share': central_share,
+                'timestamp': datetime.utcnow().isoformat(),
+                'status': status,
+                'error': error,
+                'retry_count': retry_count,
+            })
+            revenue[seller_id] = seller_revenue
+            self._save_revenue(revenue)
+
+    def reconcile_pending_payments(
+        self, stale_after_minutes: int = 15,
+    ) -> Dict[str, int]:
+        """Scan revenue.json for pending payments older than the threshold
+        and retry them through the existing payment path.
+
+        Called by the agent_daemon tick on a slow cadence (every few min).
+        Respects a retry_count cap so a truly-broken payment can't loop
+        forever — after 5 retries the row is marked 'failed' for human
+        review.
+
+        Returns a dict of counters: ``scanned``, ``retried``, ``settled``,
+        ``failed``, ``skipped``.
+        """
+        from integrations.social.models import db_session
+        from integrations.social.resonance_engine import ResonanceService
+        cutoff = datetime.utcnow() - timedelta(minutes=stale_after_minutes)
+        counters = {'scanned': 0, 'retried': 0, 'settled': 0,
+                    'failed': 0, 'skipped': 0}
+        MAX_RETRIES = 5
+        with self._lock:
+            revenue = self._revenue()
+            changed = False
+            for seller_id, rows in list(revenue.items()):
+                for row in rows:
+                    counters['scanned'] += 1
+                    if row.get('status') != 'pending':
+                        continue
+                    ts_str = row.get('timestamp', '')
+                    try:
+                        ts = datetime.fromisoformat(ts_str)
+                    except (TypeError, ValueError):
+                        counters['skipped'] += 1
+                        continue
+                    if ts >= cutoff:
+                        counters['skipped'] += 1
+                        continue
+                    retry_count = int(row.get('retry_count', 0))
+                    if retry_count >= MAX_RETRIES:
+                        row['status'] = 'failed'
+                        changed = True
+                        counters['failed'] += 1
+                        logger.critical(
+                            "Marketplace reconcile: payment marked FAILED "
+                            "after %d retries — listing=%s seller=%s "
+                            "buyer=%s amount=%s last_error=%s",
+                            retry_count, row.get('listing_id'), seller_id,
+                            row.get('buyer_id'), row.get('total_spark'),
+                            row.get('error', ''))
+                        continue
+                    # Attempt the retry via the canonical gateway
+                    counters['retried'] += 1
+                    amount = int(row.get('total_spark', 0))
+                    creator_share = int(row.get('creator_share', 0))
+                    buyer_id = row.get('buyer_id', '')
+                    listing_id = row.get('listing_id', '')
+                    try:
+                        with db_session() as db:
+                            ResonanceService.award_spark(
+                                db, buyer_id, -amount,
+                                'marketplace_purchase_retry', listing_id,
+                                f'App purchase retry: {listing_id}')
+                            ResonanceService.award_spark(
+                                db, seller_id, creator_share,
+                                'marketplace_sale_retry', listing_id,
+                                f'App sale retry (90%): {listing_id}')
+                        row['status'] = 'settled'
+                        row['error'] = ''
+                        row['retry_count'] = retry_count + 1
+                        row['settled_at'] = datetime.utcnow().isoformat()
+                        counters['settled'] += 1
+                        changed = True
+                        logger.info(
+                            "Marketplace reconcile: settled pending payment "
+                            "for listing=%s seller=%s amount=%s",
+                            listing_id, seller_id, amount)
+                    except Exception as e:
+                        row['retry_count'] = retry_count + 1
+                        row['error'] = str(e)
+                        row['last_retry_at'] = datetime.utcnow().isoformat()
+                        changed = True
+                        logger.warning(
+                            "Marketplace reconcile: retry failed for "
+                            "listing=%s seller=%s (attempt %d): %s",
+                            listing_id, seller_id, retry_count + 1, e)
+            if changed:
+                self._save_revenue(revenue)
+        return counters
 
     def get_revenue_report(self, owner_id: str) -> Dict:
         """Earnings report for an app creator."""

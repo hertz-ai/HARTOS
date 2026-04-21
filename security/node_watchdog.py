@@ -32,6 +32,16 @@ STARTUP_GRACE_SECONDS = 60
 # 300s was too tight — caused watchdog restart loops where each restart
 # re-dispatched the same goal, producing duplicate messages.
 LLM_CALL_TIMEOUT_SECONDS = int(os.environ.get('HEVOLVE_LLM_CALL_TIMEOUT', '900'))
+# Fleet-wide restart budget: hard ceiling on cross-thread restart storms.
+# The per-thread budget (3 restarts / 5min → mark dead) still applies first;
+# this is a second-line escalation when many different threads are flapping
+# in parallel (e.g. cascade failure from a shared resource exhaustion).
+# When the ceiling is breached the whole watchdog halts further restarts
+# until manual intervention. Prior to this guard an infinite restart loop
+# was possible when N threads rotated through fresh per-thread budgets.
+FLEET_RESTART_WINDOW_SECONDS = int(
+    os.environ.get('HEVOLVE_WATCHDOG_FLEET_WINDOW_S', '60'))
+FLEET_RESTART_MAX = int(os.environ.get('HEVOLVE_WATCHDOG_FLEET_MAX', '10'))
 
 
 @dataclass
@@ -79,6 +89,11 @@ class NodeWatchdog:
         self._thread: Optional[threading.Thread] = None
         self._restart_log: List[Dict] = []
         self._started_at: Optional[float] = None
+        # Fleet-wide restart budget — timestamps (monotonic seconds) of every
+        # restart across every thread. Rolling window pruned in _restart_thread.
+        # Breach → self._fleet_halted = True; no further restarts until cleared.
+        self._fleet_restart_times: List[float] = []
+        self._fleet_halted: bool = False
 
     def register(self, name: str, expected_interval: float,
                  restart_fn: Callable, stop_fn: Callable = None) -> None:
@@ -245,12 +260,31 @@ class NodeWatchdog:
                         info.last_restart_at, tz=timezone.utc).isoformat()
 
         uptime = round(now - self._started_at, 1) if self._started_at else 0
+        with self._lock:
+            fleet_recent = len(self._fleet_restart_times)
+            fleet_halted = self._fleet_halted
         return {
             'watchdog': 'healthy' if self._running else 'stopped',
             'uptime_seconds': uptime,
             'threads': threads,
             'restart_log': list(self._restart_log[-20:]),  # last 20 events
+            'fleet_restarts_in_window': fleet_recent,
+            'fleet_restart_window_s': FLEET_RESTART_WINDOW_SECONDS,
+            'fleet_restart_ceiling': FLEET_RESTART_MAX,
+            'fleet_halted': fleet_halted,
         }
+
+    def clear_fleet_halt(self) -> None:
+        """Clear the fleet-wide restart halt flag (manual recovery).
+
+        Call after diagnosing + fixing the cascade failure that triggered
+        the halt. Does NOT revive threads marked 'dead' — those still
+        require a process restart.
+        """
+        with self._lock:
+            self._fleet_halted = False
+            self._fleet_restart_times.clear()
+        logger.critical("Watchdog: fleet halt cleared — restarts re-enabled")
 
     def _check_loop(self) -> None:
         """Background loop: check heartbeats, restart frozen threads."""
@@ -354,12 +388,34 @@ class NodeWatchdog:
             info = self._threads.get(name)
             if not info:
                 return False
+            # Fleet-wide restart budget: hard ceiling across all threads.
+            # Prune outside the window, then check against the ceiling.
+            now_mono = time.monotonic()
+            cutoff = now_mono - FLEET_RESTART_WINDOW_SECONDS
+            self._fleet_restart_times = [
+                t for t in self._fleet_restart_times if t > cutoff]
+            if self._fleet_halted:
+                # Already escalated — don't restart anything until manual clear
+                return False
+            if len(self._fleet_restart_times) >= FLEET_RESTART_MAX:
+                self._fleet_halted = True
+                info.status = 'dead'
+                logger.critical(
+                    f"Watchdog: FLEET RESTART BUDGET EXCEEDED — "
+                    f"{len(self._fleet_restart_times)} restarts in "
+                    f"{FLEET_RESTART_WINDOW_SECONDS}s (ceiling="
+                    f"{FLEET_RESTART_MAX}). Halting all further restarts; "
+                    f"thread '{name}' marked DEAD. Investigate cascade "
+                    f"failure before restarting the process.")
+                return False
             if info.consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                 info.status = 'dead'
                 logger.critical(
                     f"Watchdog: thread '{name}' marked DEAD after "
                     f"{MAX_CONSECUTIVE_FAILURES} consecutive restart failures")
                 return False
+            # Record the restart attempt in the fleet window before dispatch
+            self._fleet_restart_times.append(now_mono)
             info.status = 'restarting'
             stop_fn = info.stop_fn
             restart_fn = info.restart_fn

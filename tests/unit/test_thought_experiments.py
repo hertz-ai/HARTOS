@@ -476,17 +476,51 @@ class TestThoughtExperimentAPI:
     """Test API blueprint endpoints with Flask test client."""
 
     @pytest.fixture
-    def client(self, db):
+    def client(self, db, user):
+        """Test client with auth decorators replaced by pass-throughs.
+
+        Real auth is covered in tests/unit/test_p0_security_fixes.py;
+        these tests focus on API contract + DB integration.
+        """
+        from functools import wraps
+        import importlib
+        import flask
         from flask import Flask
+        from integrations.social import auth as auth_mod
+
+        _orig_require_auth = auth_mod.require_auth
+        _orig_require_admin = auth_mod.require_admin
+        _orig_optional_auth = auth_mod.optional_auth
+
+        _user = user  # capture from fixture for the closure
+
+        def _passthrough(fn):
+            @wraps(fn)
+            def wrapper(*args, **kwargs):
+                flask.g.user = _user
+                flask.g.user_id = str(_user.id)
+                return fn(*args, **kwargs)
+            return wrapper
+
+        auth_mod.require_auth = _passthrough
+        auth_mod.require_admin = _passthrough
+        auth_mod.optional_auth = _passthrough
+
+        import integrations.social.api_thought_experiments as te_mod
+        importlib.reload(te_mod)
+
         app = Flask(__name__)
         app.config['TESTING'] = True
-
-        from integrations.social.api_thought_experiments import thought_experiments_bp
-        app.register_blueprint(thought_experiments_bp)
+        app.register_blueprint(te_mod.thought_experiments_bp)
 
         with app.test_client() as client:
             with app.app_context():
                 yield client
+
+        auth_mod.require_auth = _orig_require_auth
+        auth_mod.require_admin = _orig_require_admin
+        auth_mod.optional_auth = _orig_optional_auth
+        importlib.reload(te_mod)
 
     @patch('integrations.social.models.get_db')
     def test_create_experiment_endpoint(self, mock_get_db, client, db, user):
@@ -502,8 +536,11 @@ class TestThoughtExperimentAPI:
 
     @patch('integrations.social.models.get_db')
     def test_create_missing_fields(self, mock_get_db, client, db):
+        """Post-P0 fix: creator_id is JWT-derived so a body-empty POST still
+        has a creator. Title and hypothesis remain required."""
         mock_get_db.return_value = db
         resp = client.post('/api/social/experiments', json={})
+        # title + hypothesis still missing → 400
         assert resp.status_code == 400
 
     @patch('integrations.social.models.get_db')

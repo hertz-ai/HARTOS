@@ -251,6 +251,9 @@ class TestVoteRanking(unittest.TestCase):
     """Test vote tally ranking."""
 
     def test_ranking_by_score(self):
+        """Per PRODUCT_MAP §10 the ranking applies BOTH min_score AND a 2/3
+        super-majority gate.  Candidates that pass both are ranked by score.
+        """
         from integrations.agent_engine.auto_evolve import AutoEvolveOrchestrator, EvolveSession
         orch = AutoEvolveOrchestrator()
         session = EvolveSession()
@@ -260,8 +263,14 @@ class TestVoteRanking(unittest.TestCase):
         ]
 
         def mock_tally(db, exp_id):
+            # All three have super-majority (8 for / 2 against = 80%) so
+            # only the absolute-score floor of 0.3 differentiates them.
             scores = {'1': 0.8, '2': 0.2, '3': 1.5}
-            return {'weighted_score': scores.get(exp_id, 0)}
+            return {
+                'weighted_score': scores.get(exp_id, 0),
+                'total_for': 8.0,
+                'total_against': 2.0,
+            }
 
         with patch('integrations.social.models.get_db') as mock_db:
             db = MagicMock()

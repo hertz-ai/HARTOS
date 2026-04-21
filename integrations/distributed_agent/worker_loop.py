@@ -9,6 +9,7 @@ Polls the shared DistributedTaskCoordinator for unclaimed tasks,
 executes them via the local /chat endpoint, and submits results back.
 """
 import os
+import random
 import time
 import logging
 import threading
@@ -16,6 +17,7 @@ import requests
 from typing import Optional
 from core.http_pool import pooled_post
 
+from core.constants import HIVE_DEPTH
 from core.port_registry import get_port
 
 logger = logging.getLogger('hevolve_social')
@@ -24,6 +26,19 @@ logger = logging.getLogger('hevolve_social')
 class DistributedWorkerLoop:
     """Background loop: claim tasks from shared Redis, execute via local /chat, submit results."""
 
+    # Exponential backoff bounds for Redis outages.  Without this the
+    # tick loop used to spin at self._interval (15s) while every Redis
+    # call raised ConnectionError — not quite 100% CPU, but tens of
+    # thousands of failed connect attempts per hour during a prolonged
+    # outage.  With backoff we start at 1s (much quicker than 15s
+    # recovery) and cap at 60s (well below the poll interval during
+    # healthy operation).
+    _BACKOFF_MIN: float = 1.0
+    _BACKOFF_MAX: float = 60.0
+    # Jitter factor so N workers don't all reconnect in the same second
+    # when Redis comes back.  ±25% of the current backoff window.
+    _BACKOFF_JITTER: float = 0.25
+
     def __init__(self):
         self._interval = int(os.environ.get('HEVOLVE_WORKER_POLL_INTERVAL', '15'))
         self._running = False
@@ -31,6 +46,8 @@ class DistributedWorkerLoop:
         self._lock = threading.Lock()
         self._node_id = os.environ.get('HEVOLVE_NODE_ID', 'unknown')
         self._capabilities = self._detect_capabilities()
+        # Current Redis backoff state — reset to 0 when a tick succeeds.
+        self._redis_backoff: float = 0.0
 
     def _detect_capabilities(self):
         """Detect this node's capabilities from system_requirements."""
@@ -100,8 +117,26 @@ class DistributedWorkerLoop:
             pass
 
     def _loop(self):
+        # Lazy-import redis so tests that never touch Redis don't need
+        # the dependency installed.  ``RedisConnectionError`` resolves to
+        # ``Exception`` when redis isn't available, which is still
+        # correct (the backoff branch also traps generic connect errors).
+        try:
+            from redis.exceptions import ConnectionError as RedisConnectionError
+        except Exception:  # pragma: no cover — redis always installed in prod
+            RedisConnectionError = ConnectionError  # type: ignore[misc, assignment]
+
         while self._running:
-            time.sleep(self._interval)
+            # Sleep for poll interval + current backoff.  Backoff is 0
+            # during healthy operation so this collapses back to the
+            # pre-fix behaviour once Redis recovers.
+            sleep_for = self._interval + self._redis_backoff
+            if self._redis_backoff > 0:
+                # ±25% jitter prevents thundering-herd when many workers
+                # simultaneously discover Redis has come back.
+                jitter = self._redis_backoff * self._BACKOFF_JITTER
+                sleep_for += random.uniform(-jitter, jitter)
+            time.sleep(max(1.0, sleep_for))
             if not self._running:
                 break
             self._wd_heartbeat()
@@ -114,9 +149,34 @@ class DistributedWorkerLoop:
                 pass
             try:
                 self._tick()
+                # Tick succeeded → reset backoff so the next cycle runs
+                # at the normal poll cadence.
+                if self._redis_backoff > 0:
+                    logger.info(
+                        f"Worker Redis recovered after "
+                        f"{self._redis_backoff:.1f}s backoff")
+                    self._redis_backoff = 0.0
+            except RedisConnectionError as e:
+                self._bump_redis_backoff()
+                logger.warning(
+                    f"Worker Redis ConnectionError: {e}; "
+                    f"backoff={self._redis_backoff:.1f}s")
             except Exception as e:
+                # Unknown errors: treat as transient but still back off so
+                # a persistent bug doesn't spin.
+                msg = str(e).lower()
+                if 'connection' in msg or 'timeout' in msg or 'redis' in msg:
+                    self._bump_redis_backoff()
                 logger.debug(f"Distributed worker tick error: {e}")
             self._wd_heartbeat()
+
+    def _bump_redis_backoff(self) -> None:
+        """Double the backoff window, clamped to [MIN, MAX]."""
+        if self._redis_backoff <= 0:
+            self._redis_backoff = self._BACKOFF_MIN
+        else:
+            self._redis_backoff = min(self._redis_backoff * 2,
+                                      self._BACKOFF_MAX)
 
     def _tick(self):
         """Try to claim and execute one task per tick."""
@@ -133,6 +193,20 @@ class DistributedWorkerLoop:
             return
 
         logger.info(f"Worker claimed task {task.task_id}: {task.description[:80]}")
+
+        # HIVE_DEPTH enforcement — defense in depth.  Coordinators stamp
+        # hop at submit_goal, but a rogue peer could have forwarded a
+        # task with an inflated hop; drop anything past the published
+        # 3-level topology instead of executing it and re-propagating.
+        try:
+            task_hop = int(task.context.get('hop', 0) or 0)
+        except (TypeError, ValueError):
+            task_hop = 0
+        if task_hop >= HIVE_DEPTH:
+            logger.warning(
+                f"Worker dropping task {task.task_id}: hop={task_hop} "
+                f">= HIVE_DEPTH={HIVE_DEPTH}")
+            return
 
         # Execute via local /chat
         result = self._execute_task(task)

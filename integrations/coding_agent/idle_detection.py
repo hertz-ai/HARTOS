@@ -54,7 +54,12 @@ class IdleDetectionService:
 
     @staticmethod
     def get_idle_opted_in_agents(db: Session) -> List[Dict]:
-        """Get all idle agents that have opted in to distributed coding."""
+        """Get all idle agents that have opted in to distributed coding.
+
+        Agents with ``settings.paused == True`` (set via /api/admin/agents/<id>/pause)
+        are excluded so an admin-paused agent truly stops receiving work.  This is
+        the single enforcement point — no parallel path (Gate 4 / CLAUDE.md).
+        """
         from integrations.social.models import User
 
         opted_in = db.query(User).filter(
@@ -63,6 +68,12 @@ class IdleDetectionService:
 
         idle_agents = []
         for user in opted_in:
+            # Skip admin-paused agents entirely.  The `settings` JSON column is
+            # the single source of truth; /api/admin/agents/<id>/pause writes it,
+            # /resume clears it.
+            user_settings = user.settings or {}
+            if user_settings.get('paused') is True:
+                continue
             # Check if any session for this user is idle
             try:
                 from create_recipe import user_tasks

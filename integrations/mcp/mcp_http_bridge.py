@@ -309,6 +309,133 @@ def _register_tool(name: str, description: str, fn: Callable):
     })
 
 
+def _register_tool_module(module_tools: List[Dict[str, Any]],
+                           prefix: str = '') -> int:
+    """Register every tool declared in a module-level list like
+    THOUGHT_EXPERIMENT_TOOLS / AUTO_EVOLVE_TOOLS / AUTOEVOLVE_CODE_TOOLS.
+
+    Each entry is expected to follow the HARTOS ServiceToolRegistry schema:
+        {'name': str, 'func': callable, 'description': str, 'tags': [...]}
+
+    Skips entries whose name already exists in `_local_tools` (dedup — a
+    tool may legitimately appear in more than one module list during a
+    module-reorg migration; we prefer the first registration to keep the
+    schema stable across the session).
+
+    Returns the number of tools actually added so callers can log + assert.
+    """
+    added = 0
+    existing_names = {t['name'] for t in _local_tools}
+    for entry in module_tools:
+        try:
+            name = entry['name']
+            fn = entry['func']
+            desc = entry.get('description', '') or name
+        except (KeyError, TypeError) as e:
+            logger.warning(
+                f"_register_tool_module: malformed entry {entry!r} "
+                f"skipped ({type(e).__name__}: {e})"
+            )
+            continue
+        qualified_name = f'{prefix}{name}' if prefix else name
+        if qualified_name in existing_names:
+            logger.debug(
+                f"_register_tool_module: skipping duplicate {qualified_name!r}"
+            )
+            continue
+        _register_tool(qualified_name, desc, fn)
+        existing_names.add(qualified_name)
+        added += 1
+    return added
+
+
+# ── MCP tool arg aliases ────────────────────────────────────────
+# MCP clients (Claude Code, Cursor, other) historically called our
+# tools with slightly different kwarg names than the ones our Python
+# signatures declare — `search=` vs `query=`, `model_id=` vs `model=`,
+# `agent=` vs `agent_id=`, `user=` vs `user_id=`, etc.  Before this
+# canonicalization layer those calls returned `TypeError: unexpected
+# keyword argument 'search'` (HTTP 400), breaking every integration
+# that built against a different naming convention.
+#
+# Keep the lookup here (single source of truth) — do NOT copy the alias
+# dict into the tool bodies.  The mapping is ALIAS → CANONICAL, applied
+# only if the canonical key is not already present (so explicit clients
+# always win).
+#
+# New tools SHOULD declare kwargs that match their natural domain name;
+# this dict is a compatibility shim for external callers, not a licence
+# to invent parallel names internally.
+_TOOL_ARG_ALIASES: dict = {
+    # list_agents / search_agents
+    'list_agents': {'search': 'query', 'q': 'query', 'term': 'query',
+                    'categ': 'category', 'type': 'category'},
+    # list_goals / goal_manager
+    'list_goals': {'goal': 'goal_type', 'type': 'goal_type',
+                   'state': 'status'},
+    # onboard_model / switch_model / model_status
+    'onboard_model': {'model_id': 'model', 'name': 'model',
+                      'repo': 'model', 'quantization': 'quant',
+                      'quant_type': 'quant'},
+    'switch_model': {'model_id': 'model', 'name': 'model',
+                     'repo': 'model', 'quantization': 'quant',
+                     'quant_type': 'quant'},
+    # hive_connect / hive_disconnect / hive_session_status
+    'hive_connect': {'user': 'user_id', 'uid': 'user_id',
+                     'scope': 'task_scope', 'tasks': 'task_scope',
+                     'budget_spark': 'task_scope'},  # pass-through; func
+                                                     # accepts extra via **kw
+    # create_hive_task
+    'create_hive_task': {'type': 'task_type', 'name': 'title',
+                         'desc': 'description', 'body': 'description',
+                         'instruction': 'instructions',
+                         'steps': 'instructions'},
+    # hive_signal_feed
+    'hive_signal_feed': {'count': 'limit', 'top': 'limit', 'n': 'limit'},
+    # remember / recall (memory graph)
+    'remember': {'text': 'content', 'body': 'content',
+                 'tag': 'tags', 'label': 'tags'},
+    'recall': {'q': 'query', 'search': 'query', 'term': 'query',
+               'top': 'limit', 'count': 'limit', 'n': 'limit'},
+    # social_query
+    'social_query': {'sql': 'query', 'q': 'query'},
+    # call_endpoint
+    'call_endpoint': {'endpoint': 'path', 'url': 'path',
+                      'verb': 'method', 'body': 'data'},
+}
+
+
+def _canonicalize_args(tool_name: str, arguments: dict) -> dict:
+    """Apply per-tool alias map so MCP clients that use slightly
+    different kwarg names still hit the right Python parameter.
+
+    Only rewrites a key when the canonical target is NOT already in
+    `arguments` — explicit keys from the caller always win.  Returns a
+    NEW dict; `arguments` is not mutated.  Safe on unknown tool names
+    (pass-through).  Silent on conflicts — if both the alias and the
+    canonical are set, the canonical is preserved (logged at debug
+    level for observability).
+    """
+    aliases = _TOOL_ARG_ALIASES.get(tool_name)
+    if not aliases or not isinstance(arguments, dict):
+        return arguments if isinstance(arguments, dict) else {}
+    out = dict(arguments)  # shallow copy — args are JSON-serialisable
+    for alias, canonical in aliases.items():
+        if alias in out:
+            if canonical in out:
+                try:
+                    logger.debug(
+                        f"MCP {tool_name}: alias '{alias}' + canonical "
+                        f"'{canonical}' both present — keeping canonical"
+                    )
+                except Exception:
+                    pass
+                out.pop(alias, None)
+            else:
+                out[canonical] = out.pop(alias)
+    return out
+
+
 # ── Lazy helpers (same as mcp_server.py, avoid import-time side effects) ──
 
 _registry = None
@@ -860,6 +987,40 @@ def _load_tools():
     _register_tool('hive_signal_feed', 'Recent signals from all 30 channels', _tool_hive_signal_feed)
     _register_tool('seed_goals', 'Seed all 47 bootstrap agents (idempotent)', _tool_seed_goals)
 
+    # ── Module-level tool arrays (auto-evolve + thought experiments + ──
+    # autoresearch code tools).  These are maintained alongside the
+    # ServiceToolRegistry — importing the module-level list is the
+    # canonical way to consume them and keeps the MCP manifest in sync
+    # with the agent-side registry (single source of truth per Gate 4).
+    for mod_path, symbol, label in (
+        ('integrations.agent_engine.thought_experiment_tools',
+         'THOUGHT_EXPERIMENT_TOOLS', 'thought_experiment'),
+        ('integrations.agent_engine.auto_evolve',
+         'AUTO_EVOLVE_TOOLS', 'auto_evolve'),
+        ('integrations.coding_agent.autoevolve_code_tools',
+         'AUTOEVOLVE_CODE_TOOLS', 'autoevolve_code'),
+    ):
+        try:
+            import importlib
+            mod = importlib.import_module(mod_path)
+            tools_list = getattr(mod, symbol, None)
+            if not isinstance(tools_list, list):
+                logger.warning(
+                    f"MCP bridge: {mod_path}.{symbol} is not a list "
+                    f"(got {type(tools_list).__name__}) — skipping"
+                )
+                continue
+            added = _register_tool_module(tools_list)
+            logger.info(
+                f"MCP bridge: registered {added} {label} tools "
+                f"from {mod_path}.{symbol}"
+            )
+        except ImportError as e:
+            logger.warning(
+                f"MCP bridge: {mod_path} unavailable ({e}) — "
+                f"{label} tools NOT exposed via MCP"
+            )
+
     logger.info(f"MCP HTTP bridge loaded {len(_local_tools)} local tools")
 
 
@@ -921,6 +1082,11 @@ def mcp_execute_tool():
     fn = tool_entry["fn"]
     if fn is None:
         return jsonify({"success": False, "error": f"Tool {tool_name} has no callable"}), 500
+
+    # Apply per-tool alias canonicalization so MCP clients that call
+    # with `search=` / `model_id=` / `user=` land on the correct Python
+    # kwarg.  See `_TOOL_ARG_ALIASES` above for the full mapping.
+    arguments = _canonicalize_args(tool_name, arguments)
 
     try:
         result = fn(**arguments)

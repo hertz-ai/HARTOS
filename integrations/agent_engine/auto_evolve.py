@@ -23,10 +23,24 @@ import logging
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 logger = logging.getLogger('hevolve.auto_evolve')
+
+# PRODUCT_MAP §10: DISPATCH uses parallel_dispatch, bounded by this constant.
+# Keep conservative — each dispatched experiment spawns an agent goal which may
+# fan out further downstream.  4 keeps the blast radius small on flat-tier
+# desktops while still honouring the "parallel" contract from the spec.
+AUTO_EVOLVE_MAX_PARALLEL_DISPATCH = 4
+
+# PRODUCT_MAP §10: super-majority threshold for VOTE stage — candidates must
+# clear 2/3 of the weighted tally, not a simple majority.  Expressed as a
+# fraction of the maximum possible score so callers can still tune per-session
+# via min_approval_score (which is applied as an absolute-score floor in
+# addition to this ratio).
+AUTO_EVOLVE_SUPERMAJORITY_RATIO = 2.0 / 3.0
 
 
 @dataclass
@@ -166,30 +180,14 @@ class AutoEvolveOrchestrator:
         # Phase 4: SELECT top-N
         winners = ranked[:max_experiments]
 
-        # Phase 5: DISPATCH to type-aware iteration
+        # Phase 5: DISPATCH to type-aware iteration (parallel per PRODUCT_MAP §10)
         session.status = 'dispatching'
         self._emit_event('auto_evolve.dispatching', {
             'count': len(winners),
             'experiments': [w['id'] for w in winners],
         })
 
-        for exp in winners:
-            try:
-                goal_result = self._dispatch_experiment(session, exp, user_id)
-                session.dispatched += 1
-                session.experiments.append({
-                    'id': exp['id'],
-                    'title': exp['title'],
-                    'type': exp.get('experiment_type', 'traditional'),
-                    'approval_score': exp.get('_approval_score', 0),
-                    'goal_id': goal_result.get('goal_id'),
-                    'status': 'dispatched',
-                })
-            except Exception as e:
-                session.failed += 1
-                session.errors.append(f"Dispatch {exp['id']}: {e}")
-                logger.warning(f"[{session.session_id}] Failed to dispatch "
-                               f"{exp['id']}: {e}")
+        self._dispatch_winners_parallel(session, winners, user_id)
 
         session.status = 'running' if session.dispatched > 0 else 'failed'
         self._emit_event('auto_evolve.started', session.to_dict())
@@ -238,7 +236,16 @@ class AutoEvolveOrchestrator:
     def _rank_by_votes(self, session: EvolveSession,
                        candidates: List[Dict],
                        min_score: float) -> List[Dict]:
-        """Tally votes and rank by approval score."""
+        """Tally votes and rank by approval score.
+
+        Two gates apply per PRODUCT_MAP §10:
+          1. weighted_score >= min_score (caller-provided absolute floor)
+          2. total_for / (total_for + total_against) >= 2/3 super-majority
+
+        Both must hold for an experiment to qualify for dispatch.  The
+        super-majority gate protects against a small but highly-weighted
+        vocal minority flipping a low-participation tally into approval.
+        """
         scored = []
         try:
             from integrations.social.models import db_session
@@ -250,10 +257,25 @@ class AutoEvolveOrchestrator:
                     tally = ThoughtExperimentService.tally_votes(
                         db, exp['id'])
                     score = tally.get('weighted_score', 0)
+                    total_for = tally.get('total_for', 0) or 0
+                    total_against = tally.get('total_against', 0) or 0
+                    decisive = total_for + total_against
+                    # Super-majority: ≥ 2/3 of DECISIVE (non-abstain) weight
+                    # must be FOR.  Abstains are excluded from denominator.
+                    super_ratio = (total_for / decisive) if decisive > 0 else 0.0
                     exp['_approval_score'] = score
+                    exp['_super_majority'] = round(super_ratio, 4)
                     exp['_tally'] = tally
-                    if score >= min_score:
+                    if (score >= min_score
+                            and super_ratio >= AUTO_EVOLVE_SUPERMAJORITY_RATIO):
                         scored.append(exp)
+                    else:
+                        logger.debug(
+                            f"[{session.session_id}] Rejected {exp.get('id')}: "
+                            f"score={score} super_ratio={super_ratio:.3f} "
+                            f"(need score>={min_score} and "
+                            f"ratio>={AUTO_EVOLVE_SUPERMAJORITY_RATIO:.3f})"
+                        )
         except Exception as e:
             logger.warning(f"[{session.session_id}] Vote tally failed: {e}")
             return candidates  # Fall through unranked
@@ -261,6 +283,54 @@ class AutoEvolveOrchestrator:
         # Sort by approval score descending
         scored.sort(key=lambda e: e.get('_approval_score', 0), reverse=True)
         return scored
+
+    def _dispatch_winners_parallel(self, session: EvolveSession,
+                                    winners: List[Dict], user_id: str) -> None:
+        """Fan-out winning experiments to type-aware iteration in parallel.
+
+        PRODUCT_MAP §10 DISPATCH stage.  Uses a bounded ThreadPoolExecutor
+        (cap = AUTO_EVOLVE_MAX_PARALLEL_DISPATCH) so a large approved set
+        can't stampede the agent goal system.  Each experiment still goes
+        through _dispatch_experiment (unchanged contract) — this method
+        only adds the concurrency primitive.
+
+        Mutations on `session` (dispatched/failed/experiments/errors) are
+        serialized by acquiring self._lock around each bookkeeping update.
+        """
+        if not winners:
+            return
+
+        max_workers = min(len(winners), AUTO_EVOLVE_MAX_PARALLEL_DISPATCH)
+        with ThreadPoolExecutor(
+                max_workers=max_workers,
+                thread_name_prefix=f'auto-evolve-{session.session_id}') as pool:
+            futures = {
+                pool.submit(self._dispatch_experiment, session, exp, user_id): exp
+                for exp in winners
+            }
+            for future in as_completed(futures):
+                exp = futures[future]
+                try:
+                    goal_result = future.result()
+                    with self._lock:
+                        session.dispatched += 1
+                        session.experiments.append({
+                            'id': exp['id'],
+                            'title': exp.get('title', ''),
+                            'type': exp.get('experiment_type', 'traditional'),
+                            'approval_score': exp.get('_approval_score', 0),
+                            'super_majority': exp.get('_super_majority', 0),
+                            'goal_id': goal_result.get('goal_id')
+                            if isinstance(goal_result, dict) else None,
+                            'status': 'dispatched',
+                        })
+                except Exception as e:
+                    with self._lock:
+                        session.failed += 1
+                        session.errors.append(f"Dispatch {exp['id']}: {e}")
+                    logger.warning(
+                        f"[{session.session_id}] Failed to dispatch "
+                        f"{exp['id']}: {e}")
 
     def _dispatch_experiment(self, session: EvolveSession,
                              exp: Dict, user_id: str) -> Dict:

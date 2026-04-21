@@ -111,7 +111,13 @@ class CommercialAPIService:
     def log_usage(db: Session, api_key_id: str, endpoint: str,
                   tokens_in: int = 0, tokens_out: int = 0,
                   compute_ms: int = 0, status_code: int = 200) -> Dict:
-        """Log a single API call for billing."""
+        """Log a single API call for billing.
+
+        NOTE: does NOT increment `usage_this_month` — that is reserved
+        pre-execution by `reserve_quota()` so over-quota callers are
+        rejected before they burn GPU. This function writes the
+        APIUsageLog row (with token counts + cost) after execution.
+        """
         from integrations.social.models import APIUsageLog, CommercialAPIKey
 
         api_key = db.query(CommercialAPIKey).filter_by(id=api_key_id).first()
@@ -130,9 +136,6 @@ class CommercialAPIService:
             status_code=status_code,
         )
         db.add(log)
-
-        if api_key:
-            api_key.usage_this_month = (api_key.usage_this_month or 0) + 1
         db.flush()
         return log.to_dict()
 
@@ -152,6 +155,52 @@ class CommercialAPIService:
         ).count()
 
         return today_count < api_key.rate_limit_per_day
+
+    @staticmethod
+    def reserve_quota(db: Session, api_key_id: str) -> bool:
+        """Atomically reserve one quota unit BEFORE executing an inference call.
+
+        Prevents the race where a burst of concurrent requests all pass the
+        stale `validate_api_key` quota read, then all burn GPU time before
+        any of them get metered. Increments `usage_this_month` up front; the
+        downstream `log_usage` no longer re-increments (it still writes the
+        APIUsageLog row for billing accuracy).
+
+        Returns True if the reservation succeeded (request may proceed).
+        Returns False if the key is now over quota — caller MUST return 429
+        before touching the backend.
+        """
+        from integrations.social.models import CommercialAPIKey
+
+        api_key = db.query(CommercialAPIKey).filter_by(id=api_key_id).first()
+        if not api_key:
+            return False
+
+        current = api_key.usage_this_month or 0
+        if current >= api_key.monthly_quota:
+            return False
+
+        # Increment BEFORE the inference fires. Flushed immediately so a
+        # concurrent request in another worker reads the incremented value.
+        api_key.usage_this_month = current + 1
+        db.flush()
+        return True
+
+    @staticmethod
+    def release_quota(db: Session, api_key_id: str) -> None:
+        """Refund a reservation when the caller decides not to execute.
+
+        Used on pre-execution validation failures AFTER reserve_quota
+        succeeded (e.g., a handler rejects the request shape for 400). Not
+        called on backend failures — those still count against quota since
+        GPU time was burned.
+        """
+        from integrations.social.models import CommercialAPIKey
+
+        api_key = db.query(CommercialAPIKey).filter_by(id=api_key_id).first()
+        if api_key and (api_key.usage_this_month or 0) > 0:
+            api_key.usage_this_month = api_key.usage_this_month - 1
+            db.flush()
 
     @staticmethod
     def get_usage_stats(db: Session, api_key_id: str, days: int = 30) -> Dict:
@@ -252,14 +301,68 @@ def _record_failed_attempt(ip: str):
 # Auth decorator for API key endpoints
 # ═══════════════════════════════════════════════════════════════
 
+def _seconds_until_daily_reset() -> int:
+    """Return seconds until the next UTC midnight — when the daily rate
+    limit window rolls over. Used for the Retry-After header on 429s."""
+    now = datetime.utcnow()
+    tomorrow = (now + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    return max(1, int((tomorrow - now).total_seconds()))
+
+
+def _seconds_until_monthly_reset(api_key: Optional[dict]) -> int:
+    """Return seconds until `usage_reset_at` — when monthly quota rolls
+    over. Falls back to 24h if the key does not carry a reset timestamp."""
+    reset_raw = (api_key or {}).get('usage_reset_at') if api_key else None
+    if not reset_raw:
+        return 86400
+    try:
+        # SQLAlchemy normally returns a datetime; to_dict may serialize it
+        if isinstance(reset_raw, datetime):
+            reset_dt = reset_raw
+        else:
+            reset_dt = datetime.fromisoformat(str(reset_raw).replace('Z', ''))
+        delta = reset_dt - datetime.utcnow()
+        return max(1, int(delta.total_seconds()))
+    except (ValueError, TypeError):
+        return 86400
+
+
+def _rate_limit_response(error: str, retry_after: int,
+                         usage_meta: Optional[dict] = None):
+    """Build a 429 response with the canonical Retry-After header and
+    usage metadata. Centralised so every rate-limit / quota path emits a
+    uniform shape (single writer — Gate 4 Parallel Path)."""
+    payload = {'success': False, 'error': error, 'retry_after': retry_after}
+    if usage_meta:
+        payload['usage'] = usage_meta
+    response = jsonify(payload)
+    response.status_code = 429
+    response.headers['Retry-After'] = str(retry_after)
+    return response
+
+
 def require_api_key(f):
-    """Decorator: requires valid X-API-Key header. Sets g.api_key."""
+    """Decorator: requires valid X-API-Key header. Sets g.api_key.
+
+    Enforces quota PRE-EXECUTION via reserve_quota() — an over-quota key
+    returns 429 BEFORE the inference call reaches llama-server/media-agent,
+    so a malicious or runaway client cannot burn GPU time on requests that
+    will be billed as zero. No log_usage() is called on the 429 path — the
+    backend was never invoked, so no inference tokens are recorded.
+
+    The 429 response carries a `Retry-After` header (seconds) so clients
+    can back off correctly. All 4 tiers (free/starter/pro/enterprise) flow
+    through this single gate — the decorator is the one writer that
+    enforces quota uniformly.
+    """
     @wraps(f)
     def decorated(*args, **kwargs):
         from integrations.social.models import get_db
 
         if _check_brute_force(request.remote_addr):
-            return jsonify({'success': False, 'error': 'Too many failed attempts'}), 429
+            # Brute-force window = 15 min; surface that as Retry-After.
+            return _rate_limit_response('Too many failed attempts', 900)
 
         raw_key = request.headers.get('X-API-Key', '')
         if not raw_key:
@@ -273,7 +376,32 @@ def require_api_key(f):
                 return jsonify({'success': False, 'error': 'Invalid, expired, or quota-exceeded API key'}), 401
 
             if not CommercialAPIService.check_rate_limit(db, key_data['id']):
-                return jsonify({'success': False, 'error': 'Daily rate limit exceeded'}), 429
+                return _rate_limit_response(
+                    'Daily rate limit exceeded',
+                    _seconds_until_daily_reset(),
+                    usage_meta={
+                        'tier': key_data.get('tier', 'free'),
+                        'rate_limit_per_day': key_data.get(
+                            'rate_limit_per_day'),
+                    },
+                )
+
+            # Atomic pre-execution quota reservation. Closes the race where
+            # concurrent requests all pass the stale validate_api_key read
+            # and burn GPU before any of them update usage_this_month.
+            # No log_usage() is called on the 429 path — backend was never
+            # invoked, so no inference_used metric is written.
+            if not CommercialAPIService.reserve_quota(db, key_data['id']):
+                db.commit()  # persist any state from validate/rate checks
+                return _rate_limit_response(
+                    'Monthly quota exceeded',
+                    _seconds_until_monthly_reset(key_data),
+                    usage_meta={
+                        'tier': key_data.get('tier', 'free'),
+                        'monthly_quota': key_data.get('monthly_quota'),
+                        'usage_this_month': key_data.get('usage_this_month'),
+                    },
+                )
 
             g.api_key = key_data
             g.api_db = db

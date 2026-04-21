@@ -227,11 +227,24 @@ class TestCommercialAPIService:
         assert CommercialAPIService.validate_api_key(db, 'bogus-key-123') is None
 
     def test_log_usage(self, db, test_user):
-        """Log usage creates record and increments monthly count."""
+        """Log usage writes the APIUsageLog row.
+
+        Note: as of commit 1033327 `log_usage` no longer increments
+        `usage_this_month` — that counter is now reserved PRE-execution
+        by `reserve_quota()` to close a concurrency race. This test
+        follows the production flow (reserve → execute → log) and
+        asserts both sides: the log row contains the token/cost data,
+        and the monthly counter reflects the reservation.
+        """
         from integrations.agent_engine.commercial_api import CommercialAPIService
 
         created = CommercialAPIService.create_api_key(
             db, str(test_user.id), tier='starter')
+
+        # Production path: reserve_quota runs first (inside the decorator)
+        # so the meter increments before the handler can burn GPU.
+        assert CommercialAPIService.reserve_quota(db, created['id']) is True
+
         log = CommercialAPIService.log_usage(
             db, created['id'], '/v1/intelligence/chat',
             tokens_in=100, tokens_out=200, compute_ms=500)
@@ -241,9 +254,34 @@ class TestCommercialAPIService:
         assert log['tokens_out'] == 200
         assert log['cost_credits'] > 0  # starter tier has cost
 
-        # Monthly usage incremented
+        # Monthly usage incremented by reserve_quota (not by log_usage).
         key = db.query(CommercialAPIKey).filter_by(id=created['id']).first()
         assert key.usage_this_month >= 1
+
+    def test_log_usage_does_not_double_increment(self, db, test_user):
+        """Regression guard: log_usage must NOT increment usage_this_month.
+
+        Before commit 1033327 log_usage silently incremented the monthly
+        counter — meaning each request would be metered twice once the
+        decorator's reserve_quota() landed. This guard fails loudly if
+        the increment is re-introduced into log_usage.
+        """
+        from integrations.agent_engine.commercial_api import CommercialAPIService
+
+        created = CommercialAPIService.create_api_key(
+            db, str(test_user.id), tier='starter')
+        key_id = created['id']
+        key = db.query(CommercialAPIKey).filter_by(id=key_id).first()
+        baseline = key.usage_this_month or 0
+
+        CommercialAPIService.log_usage(
+            db, key_id, '/v1/intelligence/chat',
+            tokens_in=10, tokens_out=20, compute_ms=50)
+
+        db.refresh(key)
+        assert key.usage_this_month == baseline, (
+            "log_usage must NOT increment usage_this_month — that is "
+            "reserve_quota's job. Double-increment regressed.")
 
     def test_check_rate_limit_under(self, db, test_user):
         """Under rate limit → allowed."""

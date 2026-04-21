@@ -84,6 +84,15 @@ class AutoResearchSession:
     results: List[Dict] = field(default_factory=list)
     start_time: float = 0.0
     total_improvements: int = 0
+
+    # Regression-escape-hatch flags — set LOUDLY when an enforcement layer
+    # is unavailable, so downstream consumers (dashboards, tests, audits)
+    # can surface "this session didn't enforce baseline / benchmark gain".
+    # These are cleared (False) when the dependency is present and working.
+    baseline_enforced: bool = True      # AgentBaselineService captured snapshot
+    benchmark_gain_enforced: bool = True  # BenchmarkTracker recorded iteration
+    federation_export_enforced: bool = True  # Learning delta exported
+
     # Last edit state (for decide step)
     _pending_edits: List[Dict] = field(default_factory=list)
     _pending_files: List[str] = field(default_factory=list)
@@ -112,6 +121,11 @@ class AutoResearchSession:
             'spark_consumed': self.spark_consumed,
             'spark_budget': self.spark_budget,
             'elapsed_s': time.time() - self.start_time if self.start_time else 0,
+            # Enforcement flags — if False, dependency was missing/failed and
+            # the session ran without that regression-safety layer.
+            'baseline_enforced': self.baseline_enforced,
+            'benchmark_gain_enforced': self.benchmark_gain_enforced,
+            'federation_export_enforced': self.federation_export_enforced,
         }
 
 
@@ -272,7 +286,15 @@ class AutoResearchEngine:
 
     def record_benchmark(self, session: AutoResearchSession,
                          result: ExperimentResult):
-        """Record experiment result in BenchmarkTracker for evolution tracking."""
+        """Record experiment result in BenchmarkTracker for evolution tracking.
+
+        BenchmarkTracker is how we prove that iter N actually beat iter N-1 on
+        the hive-shared leaderboard.  If it's unavailable or raises, the
+        session's `benchmark_gain_enforced` flag is flipped to False and a
+        WARNING is emitted — callers (dashboards, tests) can then surface
+        "this session ran WITHOUT benchmark gain enforcement" rather than
+        silently treating 0 gain as a valid result.
+        """
         try:
             from integrations.coding_agent.benchmark_tracker import get_benchmark_tracker
             tracker = get_benchmark_tracker()
@@ -284,8 +306,21 @@ class AutoResearchEngine:
                 model_name=session.metric_name,
                 user_id=session.goal_id or session.session_id,
             )
-        except Exception:
-            pass
+        except ImportError as e:
+            session.benchmark_gain_enforced = False
+            logger.warning(
+                "[%s] BenchmarkTracker unavailable (ImportError: %s) — "
+                "iter %d ran WITHOUT benchmark-gain enforcement. "
+                "Set session.benchmark_gain_enforced=False.",
+                session.session_id, e, result.iteration,
+            )
+        except Exception as e:
+            session.benchmark_gain_enforced = False
+            logger.warning(
+                "[%s] BenchmarkTracker record failed (%s: %s) — "
+                "iter %d ran WITHOUT benchmark-gain enforcement.",
+                session.session_id, type(e).__name__, e, result.iteration,
+            )
 
     def extract_metric(self, output: str, session: AutoResearchSession
                        ) -> Optional[float]:
@@ -356,9 +391,23 @@ class AutoResearchEngine:
                 file_edits=result.edits,
                 working_dir=session.repo_path,
             )
-        except Exception:
-            pass
+        except ImportError as e:
+            logger.warning(
+                "[%s] CodingRecipeBridge unavailable (ImportError: %s) — "
+                "iter %d improvement NOT captured as recipe step.",
+                session.session_id, e, result.iteration,
+            )
+        except Exception as e:
+            logger.warning(
+                "[%s] CodingRecipeBridge.capture failed (%s: %s) — "
+                "iter %d improvement NOT captured as recipe step.",
+                session.session_id, type(e).__name__, e, result.iteration,
+            )
 
+        # AgentBaselineService snapshot is the regression escape-hatch the
+        # audit flagged: if we silently skip it, a later benchmark-based
+        # rollback has no anchor to roll back TO.  Make the absence LOUD
+        # and set the session flag so dashboards/tests can read it.
         try:
             from integrations.agent_engine.agent_baseline_service import AgentBaselineService
             AgentBaselineService.capture_snapshot(
@@ -367,8 +416,22 @@ class AutoResearchEngine:
                 trigger='autoresearch_improvement',
                 user_id=session.goal_id or 'system',
             )
-        except Exception:
-            pass
+        except ImportError as e:
+            session.baseline_enforced = False
+            logger.warning(
+                "[%s] AgentBaselineService unavailable (ImportError: %s) — "
+                "iter %d kept WITHOUT baseline snapshot. "
+                "Set session.baseline_enforced=False — regression rollback "
+                "will have no anchor for this iteration.",
+                session.session_id, e, result.iteration,
+            )
+        except Exception as e:
+            session.baseline_enforced = False
+            logger.warning(
+                "[%s] AgentBaselineService.capture_snapshot failed "
+                "(%s: %s) — iter %d kept WITHOUT baseline snapshot.",
+                session.session_id, type(e).__name__, e, result.iteration,
+            )
 
     # ── History & Reporting ──────────────────────────────────
 
@@ -420,7 +483,12 @@ class AutoResearchEngine:
         self.export_learning_delta(session)
 
     def export_learning_delta(self, session: AutoResearchSession):
-        """Export session results as a federated learning delta."""
+        """Export session results as a federated learning delta.
+
+        If BenchmarkTracker is unavailable the delta is NOT exported — the
+        hive won't learn from this session.  Mark the session flag + warn
+        so upstream (finalize report, dashboards) can surface the gap.
+        """
         try:
             from integrations.coding_agent.benchmark_tracker import get_benchmark_tracker
             tracker = get_benchmark_tracker()
@@ -435,8 +503,21 @@ class AutoResearchEngine:
                 'iterations': session.current_iteration,
             }
             logger.info(f"[{session.session_id}] Learning delta prepared for federation")
-        except Exception:
-            pass
+        except ImportError as e:
+            session.federation_export_enforced = False
+            logger.warning(
+                "[%s] BenchmarkTracker unavailable (ImportError: %s) — "
+                "learning delta NOT exported; hive will not learn from "
+                "this session.  Set session.federation_export_enforced=False.",
+                session.session_id, e,
+            )
+        except Exception as e:
+            session.federation_export_enforced = False
+            logger.warning(
+                "[%s] Learning delta export failed (%s: %s) — "
+                "hive will not learn from this session.",
+                session.session_id, type(e).__name__, e,
+            )
 
     def emit_progress(self, session: AutoResearchSession,
                       event_topic: str, data: Dict = None):

@@ -26,6 +26,30 @@ Why these specific values:
 DEFAULT_USER_ID: int = 10077
 DEFAULT_PROMPT_ID: int = 8888
 
+
+# ──────────────────────────────────────────────────────────────────────
+# HIVE_DEPTH — maximum hop count for any cross-host task / hivemind /
+# federation propagation.
+#
+# The Hevolve topology is a strict 3-level pyramid:
+#     flat (desktop)  →  regional (edge)  →  central (cloud)
+# A task submitted on a flat node may hop up to regional and up to
+# central (2 hops = 3 levels).  Any propagation deeper is either a bug
+# (cycle) or an attempt to fan out beyond the published topology, and
+# the coordinator must reject it.
+#
+# Single source of truth — consumed by:
+#   - integrations.distributed_agent.task_coordinator.submit_goal
+#     (stamps initial hop=0, rejects context['hop'] > HIVE_DEPTH)
+#   - integrations.distributed_agent.worker_loop (before re-dispatching
+#     a claimed task to a deeper hive layer)
+#
+# Keep in sync with security.key_delegation.get_node_tier() which also
+# enumerates the same three tiers.
+# ──────────────────────────────────────────────────────────────────────
+HIVE_DEPTH: int = 3
+
+
 # ISO 639-1 → language name mapping.
 # Used by hart_intelligence_entry (system prompt), speculative_dispatcher
 # (draft language prompt), and _persist_language (validation).
@@ -170,3 +194,66 @@ assert set(GREETINGS) <= set(SUPPORTED_LANG_DICT), (
 assert GREETING_FALLBACK_LANG in GREETINGS, (
     f"GREETING_FALLBACK_LANG={GREETING_FALLBACK_LANG!r} is not in GREETINGS"
 )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# VISION INTENT — keywords that indicate the user is asking Nunba to
+# use the camera / describe the scene / see them / read a screen.
+# When the draft 0.8B classifier flags a turn as `is_casual=True`, the
+# dispatcher short-circuits to the draft reply without loading the
+# LangChain tool registry — which means the `Visual_Context_Camera`
+# tool never runs even though the user clearly needs vision.
+#
+# This set is consulted in hart_intelligence_entry.dispatch path as a
+# safety net: if the message matches any pattern, we force the full
+# LangChain path so `parse_visual_context` is reachable.
+#
+# Single source of truth — do NOT inline a parallel regex anywhere.
+# Keep lower-cased; callers must lowercase the prompt before matching.
+# ──────────────────────────────────────────────────────────────────────
+import re as _vis_re
+
+VISION_INTENT_KEYWORDS: tuple = (
+    # direct camera / vision verbs
+    "see me", "see my", "see what", "look at me", "look at my",
+    "looking at me", "watch me", "watch my",
+    # describe-scene phrases
+    "what do you see", "what can you see", "what am i doing",
+    "what am i wearing", "what am i holding", "what's in front of",
+    "what is in front of", "what is on my", "what's on my",
+    "describe me", "describe what", "describe the scene",
+    "describe my", "describe this",
+    # camera-specific
+    "through my camera", "on my camera", "on the camera",
+    "via camera", "using camera", "use the camera", "use my camera",
+    "turn on camera", "turn on the camera", "start camera",
+    # visual modality
+    "can you see", "do you see", "are you seeing",
+    "visual context", "visual question", "video call",
+    # screen / ocr / read-what-is-shown
+    "read the screen", "read my screen", "what's on screen",
+    "what is on screen", "what does the screen show",
+)
+
+# Word-boundary regex compiled once.  Matching uses `search` so partial
+# phrasings ("can you see what i'm wearing") hit.
+_VISION_PATTERN_SRC: str = r"\b(?:" + "|".join(
+    _vis_re.escape(kw) for kw in VISION_INTENT_KEYWORDS
+) + r")\b"
+VISION_INTENT_PATTERN = _vis_re.compile(_VISION_PATTERN_SRC, _vis_re.IGNORECASE)
+
+
+def prompt_needs_vision(prompt: str) -> bool:
+    """Return True if the prompt clearly requests a vision / camera
+    capability (i.e. should route through the LangChain tool path so
+    Visual_Context_Camera can fire) even if the draft classifier
+    flagged the turn casual.
+
+    Cheap regex match — safe to call on every draft fall-through path.
+    """
+    if not prompt:
+        return False
+    try:
+        return bool(VISION_INTENT_PATTERN.search(prompt))
+    except Exception:
+        return False

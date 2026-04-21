@@ -92,6 +92,16 @@ class ExceptionCollector:
                     cls._instance = cls()
         return cls._instance
 
+    # Backwards-compatible alias — some call sites (mcp_http_bridge,
+    # older integrations) use `ExceptionCollector.instance()` without
+    # the `get_` prefix.  Route both through the same singleton getter
+    # so the spellings never diverge and we don't silently create two
+    # collectors.  Keep ONE source of truth; do not copy the lock /
+    # double-check pattern above into a sibling method.
+    @classmethod
+    def instance(cls) -> 'ExceptionCollector':
+        return cls.get_instance()
+
     @classmethod
     def reset_instance(cls):
         """Reset singleton (for testing only)."""

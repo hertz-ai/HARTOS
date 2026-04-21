@@ -5238,7 +5238,13 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
     # G10: Feed every intra-agent tool step into WorldModelBridge so the
     # inner reasoning loop (not just the final answer) becomes training data.
     _ingestor_callbacks = None
-    if AgentInteractionIngestor is not None:
+    # Global suppression flag: once we've proven that the running langchain_classic
+    # does NOT accept `callbacks=` on `.run()`, keep going but skip attempting it
+    # again.  Without this we'd hit the TypeError on every chat turn and still
+    # record/log the silent-drop metric every time.  The metric counter captures
+    # the fallback events so a /metrics endpoint can expose G10 ingestion health.
+    if AgentInteractionIngestor is not None and not getattr(
+            get_ans, '_g10_callbacks_unsupported', False):
         try:
             _ingestor_callbacks = [AgentInteractionIngestor(
                 user_id=user_id,
@@ -5253,8 +5259,44 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
                     {'input': query}, callbacks=_ingestor_callbacks)
             else:
                 ans = agent_chain.run({'input': query})
-        except TypeError:
-            # Older langchain_classic may not accept callbacks on .run(); fall back.
+        except TypeError as _cb_te:
+            # Older langchain_classic does not accept callbacks on .run().
+            # Silently swallowing this caused G10 ingestion to disable globally
+            # with zero alarm (see /api/admin/metrics — g10_silent_drops).
+            # Log once, flip the suppression flag, bump the counter, and fall
+            # back so the agent call still succeeds.  Also emit to the
+            # centralized exception_collector so SelfHealingDispatcher /
+            # ExceptionWatcher pick up the pattern and can surface it in the
+            # operator /health feed — a future schema drift must not silently
+            # degrade G10 ingestion a second time.  Intentionally NOT
+            # broadened to bare Exception: the goal is graceful-degrade on a
+            # known langchain-version mismatch, not hide every failure.
+            get_ans._g10_callbacks_unsupported = True
+            get_ans._g10_silent_drops = (
+                getattr(get_ans, '_g10_silent_drops', 0) + 1)
+            _payload_preview = (str(query or ''))[:100]
+            app.logger.warning(
+                "[G10] agent_chain.run(callbacks=) raised TypeError; "
+                "G10 training ingestion disabled for this process. "
+                "exc=%r payload=%r count=%d",
+                _cb_te, _payload_preview, get_ans._g10_silent_drops,
+                extra={
+                    'component': 'AgentInteractionIngestor',
+                    'action': 'record_interaction_failed',
+                    'silent_drops': get_ans._g10_silent_drops,
+                })
+            try:
+                from exception_collector import record_exception
+                record_exception(
+                    _cb_te, module=__name__, function='get_ans',
+                    component='AgentInteractionIngestor',
+                    action='record_interaction_failed',
+                    silent_drops=get_ans._g10_silent_drops,
+                    payload_preview=_payload_preview,
+                )
+            except Exception:
+                # Fire-and-forget — never let telemetry break the agent.
+                pass
             ans = agent_chain.run({'input': query})
     except Exception as _agent_err:
         # G13: Report text-modality generation failures to the learner so
@@ -5534,6 +5576,25 @@ def _persist_language(lang: str) -> bool:
     directly."""
     from core.user_lang import set_preferred_lang
     return set_preferred_lang(lang)
+
+
+def _vision_keyword_override(prompt: str) -> bool:
+    """Safety net that overrides the draft classifier's `is_casual`
+    verdict when the user's prompt clearly needs vision.
+
+    Thin wrapper — the canonical keyword set + compiled regex live
+    in core.constants.VISION_INTENT_PATTERN so the single source of
+    truth is a constant file that multiple callers can import.
+
+    Returns True → caller should fall through to the full LangChain
+    tool path (Visual_Context_Camera / parse_visual_context becomes
+    reachable).  Returns False → keep the draft's standby reply.
+    """
+    try:
+        from core.constants import prompt_needs_vision
+        return prompt_needs_vision(prompt or '')
+    except Exception:
+        return False
 
 
 def _chat_reply(user_id, request_id, response_text: str, **payload):
@@ -6212,6 +6273,23 @@ def chat():
                     _is_agentic_orchestration = True
                     # Fall through — do NOT return the draft reply; the
                     # create_agent branch below runs in this same request.
+                elif _vision_keyword_override(prompt):
+                    # Vision safety-net: the 0.8B draft has no sight,
+                    # so a `is_casual=True` draft reply to "can you see
+                    # me?" would be a confabulation.  When the prompt
+                    # clearly asks for camera/scene/screen access, force
+                    # the full LangChain tool path so
+                    # `Visual_Context_Camera` (parse_visual_context)
+                    # can run.  Single-source regex lives in
+                    # core.constants.VISION_INTENT_PATTERN.
+                    app.logger.info(
+                        'draft classifier returned casual but prompt '
+                        'matches VISION_INTENT_PATTERN — falling through '
+                        'to LangChain tool path for Visual_Context_Camera'
+                    )
+                    # Fall through — do NOT return the draft standby
+                    # reply; the tool-based path below will run and the
+                    # VLM tool will produce a grounded answer.
                 else:
                     return _chat_reply(
                         user_id, request_id, result['response'],
@@ -8800,6 +8878,29 @@ def main():
     """
     # Boot integrity verification (deferred from import time)
     hevolve_verify_boot()
+
+    # Guardrail hash verification — refuse to boot with tampered
+    # hive_guardrails values unless HEVOLVE_GUARDRAIL_HASH_ENFORCE=0
+    # (dev override). The module-level call inside hive_guardrails is
+    # self-consistent at pristine import; this explicit boot re-check
+    # surfaces any post-import monkey-patch or dynamic module substitution
+    # before any ConstitutionalFilter entry point has a chance to run.
+    try:
+        from security.hive_guardrails import (
+            enforce_guardrail_integrity,
+            get_guardrail_hash,
+        )
+        enforce_guardrail_integrity()
+        logging.getLogger('hevolve_social').info(
+            "[Guardrail] hash verified: %s", get_guardrail_hash()[:16] + '...')
+    except RuntimeError:
+        # enforce_guardrail_integrity already logged CRITICAL and we want
+        # the hard abort to propagate — this is a guardian-angel integrity
+        # check and we refuse to boot.
+        raise
+    except Exception as e:
+        logging.getLogger('hevolve_social').warning(
+            f"[Guardrail] hash verification skipped (import error): {e}")
 
     _validate_startup()
 

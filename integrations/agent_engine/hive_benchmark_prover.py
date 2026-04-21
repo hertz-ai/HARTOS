@@ -32,6 +32,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -551,6 +552,12 @@ class HiveBenchmarkProver:
     Singleton via ``get_benchmark_prover()``.
     """
 
+    # Upper bound on the idempotency cache.  10 000 is enough for all
+    # shards of every run in a rolling 24h window at current throughput;
+    # bounded size prevents the cache from growing without limit when
+    # callers never hit a duplicate.
+    _IDEMPOTENCY_CACHE_MAX = 10_000
+
     def __init__(self):
         self._lock = threading.Lock()
         self._ledger = _BenchmarkLedger()
@@ -562,6 +569,14 @@ class HiveBenchmarkProver:
         #   start_time, config, status}
         self._active_runs: Dict[str, dict] = {}
         self._connected_nodes: List[dict] = []
+        # Idempotency LRU: idempotency_key -> response dict.  Used by
+        # ``on_shard_result`` to deduplicate network retries so a shard
+        # that replies twice doesn't get counted twice in the leaderboard.
+        # Keys are supplied by the caller (recommended: hash of run_id +
+        # task_id + node_id + result-payload); duplicates are returned
+        # with a flag so the caller can distinguish "recorded" from
+        # "already-recorded".
+        self._idempotency_cache: OrderedDict[str, dict] = OrderedDict()
 
     # ── Async API ────────────────────────────────────────────────────
 
@@ -687,7 +702,8 @@ class HiveBenchmarkProver:
         return run_id
 
     def on_shard_result(self, run_id: str, task_id: str,
-                        result: dict) -> Optional[dict]:
+                        result: dict,
+                        idempotency_key: Optional[str] = None) -> Optional[dict]:
         """Called when a node completes its shard.
 
         Records the result in the ledger, checks if all shards for the
@@ -697,10 +713,35 @@ class HiveBenchmarkProver:
             run_id: The benchmark run identifier.
             task_id: The task/shard identifier.
             result: Shard result dict with at minimum {score, problems_solved}.
+            idempotency_key: Optional caller-supplied key that
+                deduplicates retries.  If the same key was seen before,
+                the original response is returned without re-incrementing
+                the leaderboard or re-recording the ledger entry.
+                Recommended: ``f"{run_id}:{task_id}:{node_id}"`` so the
+                same shard-retry from the same node collides but a
+                different node's submission doesn't.
 
         Returns:
             Aggregated results if all shards are complete, else None.
+            When an idempotency collision is detected, the returned dict
+            carries ``{'idempotent_replay': True}`` alongside the cached
+            response so callers can distinguish fresh vs. replayed.
         """
+        # Idempotency fast path — never record twice for the same key.
+        if idempotency_key:
+            with self._lock:
+                cached = self._idempotency_cache.get(idempotency_key)
+                if cached is not None:
+                    # LRU touch — move to end so frequently-replayed
+                    # keys stick around longer.
+                    self._idempotency_cache.move_to_end(idempotency_key)
+                    replay = dict(cached)
+                    replay['idempotent_replay'] = True
+                    logger.debug(
+                        "on_shard_result: idempotent replay for key=%s run=%s task=%s",
+                        idempotency_key[:16], run_id[:8], task_id[:8])
+                    return replay
+
         # Record result in ledger
         status = 'completed' if result.get('score', 0) >= 0 else 'failed'
         self._ledger.record_result(
@@ -745,8 +786,26 @@ class HiveBenchmarkProver:
                 pass
 
         if all_done:
-            return self.aggregate_run(run_id)
-        return None
+            response = self.aggregate_run(run_id)
+        else:
+            response = None
+
+        # Idempotency write — cache the response keyed by the caller's
+        # idempotency_key so a network-retried submission gets the same
+        # answer without re-incrementing.  Bounded LRU; oldest entry is
+        # evicted once we hit _IDEMPOTENCY_CACHE_MAX.
+        if idempotency_key:
+            with self._lock:
+                cache_value = response if isinstance(response, dict) else {
+                    'recorded': True,
+                    'task_id': task_id,
+                    'run_id': run_id,
+                }
+                self._idempotency_cache[idempotency_key] = cache_value
+                while len(self._idempotency_cache) > self._IDEMPOTENCY_CACHE_MAX:
+                    self._idempotency_cache.popitem(last=False)
+
+        return response
 
     def aggregate_run(self, run_id: str) -> Dict:
         """Combine all shard results into final score.

@@ -177,6 +177,13 @@ class FederatedAggregator:
     Singleton via get_federated_aggregator(). tick() is called by AgentDaemon.
     """
 
+    # Alarm on N consecutive failing epochs.  Below this, ticks log at
+    # .exception but federation keeps trying — one bad epoch is normal
+    # (node churn, transient network, peer restart).  At/above this,
+    # log.error + consecutive_failure counter flips so a dashboard or
+    # operator sees the sustained outage.
+    _CONSECUTIVE_FAILURE_ALARM: int = 3
+
     def __init__(self):
         self._lock = threading.Lock()
         self._peer_deltas: Dict[str, dict] = {}  # node_id → latest delta
@@ -184,6 +191,14 @@ class FederatedAggregator:
         self._epoch = 0
         self._convergence_history: List[float] = []
         self._last_aggregated: Optional[dict] = None
+        # Consecutive-tick failure counter — reset on any success.  Used
+        # by the tick() silent-fail guard to distinguish transient from
+        # sustained outages.
+        self._consecutive_tick_failures: int = 0
+        # Last exception seen per channel, exposed via get_status() so
+        # dashboards can show "federation unhealthy: <reason>" instead
+        # of an opaque stall.
+        self._last_tick_error: Optional[str] = None
         # Exponential backoff for unreachable federation peers
         from core.circuit_breaker import PeerBackoff
         self._peer_backoff = PeerBackoff(initial=10, maximum=300)
@@ -213,8 +228,27 @@ class FederatedAggregator:
         self._subscribe_to_eventbus()
 
     def tick(self) -> dict:
-        """Full cycle: extract → broadcast → aggregate → apply → track."""
+        """Full cycle: extract → broadcast → aggregate → apply → track.
+
+        Failure handling:
+          * One failing epoch is logged at .exception (full traceback)
+            so operators can correlate with peer-side errors.
+          * ``_consecutive_tick_failures`` tracks the run of failures;
+            any successful outer try-body resets it.  When the count
+            hits ``_CONSECUTIVE_FAILURE_ALARM`` (3 by default) we flip
+            to log.error level and stamp ``result['alarm']`` so any
+            dashboard / metric scraper sees the sustained outage.
+          * The tick method itself always returns — callers (AgentDaemon
+            tick loop) must be able to skip one bad epoch and try again.
+        """
         self._peer_backoff.prune_expired()
+        # Determine local node tier once per tick for structured logs.
+        try:
+            from security.key_delegation import get_node_tier
+            node_tier = get_node_tier()
+        except Exception:
+            node_tier = 'unknown'
+
         result = {'epoch': self._epoch, 'aggregated': False}
         try:
             self._local_delta = self.extract_local_delta()
@@ -242,9 +276,37 @@ class FederatedAggregator:
             resonance_result = self.resonance_tick()
             if resonance_result.get('aggregated'):
                 result['resonance'] = resonance_result
+
+            # Success — reset the consecutive-failure window.
+            if self._consecutive_tick_failures:
+                logger.info(
+                    f"[FederatedAggregator] tick recovered after "
+                    f"{self._consecutive_tick_failures} consecutive failures "
+                    f"(epoch={self._epoch}, tier={node_tier})")
+            self._consecutive_tick_failures = 0
+            self._last_tick_error = None
         except Exception as e:
-            logger.debug(f"Federation tick error: {e}")
+            self._consecutive_tick_failures += 1
+            self._last_tick_error = f"{type(e).__name__}: {e}"
+            consecutive = self._consecutive_tick_failures
             result['error'] = str(e)
+            result['consecutive_failures'] = consecutive
+
+            # First N-1 failures: .exception (with traceback) at warning
+            # level; >= N: .error + alarm flag.  Either way, federation
+            # keeps trying on the next tick.
+            if consecutive >= self._CONSECUTIVE_FAILURE_ALARM:
+                result['alarm'] = True
+                logger.error(
+                    f"[FederatedAggregator] ALARM: {consecutive} consecutive "
+                    f"federation ticks failed (epoch={self._epoch}, "
+                    f"tier={node_tier}): {e}",
+                    exc_info=True)
+            else:
+                logger.exception(
+                    f"[FederatedAggregator] tick failed "
+                    f"(consecutive={consecutive}, epoch={self._epoch}, "
+                    f"tier={node_tier}): {e}")
         return result
 
     def extract_local_delta(self) -> Optional[dict]:
