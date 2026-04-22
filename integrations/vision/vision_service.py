@@ -628,17 +628,31 @@ class VisionService:
 
             try:
                 users = self.store.active_users()
+                if not users:
+                    logger.debug("Description loop: no active users")
                 for user_id in users:
                     if not self._running:
                         return
 
                     # Camera channel
                     frame_bytes = self.store.get_frame(user_id)
+                    logger.info(
+                        f"Description loop tick: user={user_id} "
+                        f"cam_frame={'yes' if frame_bytes else 'no'} "
+                        f"described={self._frames_described} "
+                        f"skipped={self._frames_skipped}"
+                    )
                     if frame_bytes:
                         # Piggyback face signature enrollment (zero extra I/O)
                         self._enroll_face_signature(user_id, frame_bytes)
                         if self._should_describe(user_id, frame_bytes, 'camera'):
+                            _t0 = time.monotonic()
                             desc = self._describe_frame(user_id, frame_bytes)
+                            _elapsed_ms = int((time.monotonic() - _t0) * 1000)
+                            logger.info(
+                                f"Camera describe: {len(frame_bytes)}B → "
+                                f"{len(desc or '')} chars in {_elapsed_ms} ms"
+                            )
                             if desc:
                                 self.store.put_description(user_id, desc)
                                 self._post_description_to_db(user_id, desc)
@@ -677,7 +691,9 @@ class VisionService:
                         else:
                             self._frames_skipped += 1
             except Exception as e:
-                logger.debug(f"Description loop error: {e}")
+                logger.warning(
+                    f"Description loop error: {e}", exc_info=True
+                )
 
             # Check if vision backend should unload (no frames for IDLE_TIMEOUT_S)
             if self._vision_backend and hasattr(self._vision_backend, 'check_idle'):
@@ -703,9 +719,9 @@ class VisionService:
         # Use lightweight backend if available
         if self._vision_backend is not None:
             try:
-                return self._vision_backend.describe(frame_bytes)
+                return self._vision_backend.describe(frame_bytes, prompt)
             except Exception as e:
-                logger.debug(f"Lightweight backend error: {e}")
+                logger.warning(f"Lightweight backend error: {e}", exc_info=True)
                 return None
 
         # MiniCPM sidecar path
