@@ -348,7 +348,7 @@ class TestDaemonTickIntegration:
     """E2E: daemon _tick() with goals + idle agents + milestone + quota reset."""
 
     @patch('integrations.agent_engine.dispatch.dispatch_goal')
-    @patch('integrations.coding_agent.idle_detection.IdleDetectionService.get_idle_opted_in_agents')
+    @patch('integrations.coding_agent.idle_detection.IdleDetectionService.get_idle_agent_personas')
     def test_tick_dispatches_to_idle_agent(self, mock_idle, mock_dispatch, db, idle_agent):
         """Active goal + idle agent → dispatch_goal called."""
         from integrations.agent_engine.agent_daemon import AgentDaemon
@@ -379,7 +379,7 @@ class TestDaemonTickIntegration:
         assert str(idle_agent.id) in str(call_args)
 
     @patch('integrations.agent_engine.dispatch.dispatch_goal')
-    @patch('integrations.coding_agent.idle_detection.IdleDetectionService.get_idle_opted_in_agents')
+    @patch('integrations.coding_agent.idle_detection.IdleDetectionService.get_idle_agent_personas')
     def test_tick_no_goals_no_dispatch(self, mock_idle, mock_dispatch, db):
         """No active goals → no dispatch."""
         from integrations.agent_engine.agent_daemon import AgentDaemon

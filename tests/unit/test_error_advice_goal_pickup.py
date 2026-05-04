@@ -158,3 +158,66 @@ def test_error_advice_emits_self_heal_with_correct_keys():
     assert 'install failed: missing transitive' in (
         config.get('error_message') or ''
     )
+
+
+def test_remediation_failure_logged_at_warning_not_debug(caplog):
+    """When _try_agent_remediation can't create the goal (db_session
+    import fails, GoalManager raises, etc.), the failure must surface
+    at WARNING level — not DEBUG.
+
+    Previously logger.debug hid this, so an open self-heal loop
+    (goals never created, agent never invoked) was invisible at
+    production log levels.  This test pins the new behavior.
+    """
+    import logging
+    from core import error_advice as ea
+
+    # Force the inner import in _try_agent_remediation to raise so we
+    # exercise the except branch.
+    fake_gm_module = MagicMock()
+
+    def _raises(*a, **kw):
+        raise RuntimeError("simulated GoalManager failure")
+
+    fake_gm_module.GoalManager.create_goal = _raises
+
+    fake_session = MagicMock()
+    fake_session.__enter__ = MagicMock(return_value=fake_session)
+    fake_session.__exit__ = MagicMock(return_value=False)
+    fake_models_module = MagicMock()
+    fake_models_module.db_session = MagicMock(return_value=fake_session)
+
+    with patch.dict(sys.modules, {
+        'integrations.agent_engine.goal_manager': fake_gm_module,
+        'integrations.social.models': fake_models_module,
+    }):
+        ea._THROTTLE.clear()
+        with caplog.at_level(logging.WARNING, logger='hevolve_error_advice'):
+            try:
+                raise RuntimeError("the original failure")
+            except RuntimeError as e:
+                ea.handle_exception(
+                    e,
+                    category='tts.install',
+                    severity='high',
+                    agent_remediation=True,
+                    context={'backend': 'chatterbox_turbo'},
+                )
+
+    # Must have one WARNING record describing the goal creation failure
+    warnings = [r for r in caplog.records
+                if r.levelname == 'WARNING'
+                and 'agent remediation goal creation failed' in r.message]
+    assert warnings, (
+        f"Expected a WARNING log line about goal creation failure. "
+        f"Got records: {[(r.levelname, r.message) for r in caplog.records]}"
+    )
+    msg = warnings[0].message
+    # Must include the category for log-grep filtering
+    assert '[error_advice/tts.install]' in msg, (
+        f"WARNING must include the [error_advice/<category>] tag: {msg!r}"
+    )
+    # Must include the exception TYPE, not just str(exc), for triage
+    assert 'RuntimeError' in msg, (
+        f"WARNING must name the inner exception type: {msg!r}"
+    )

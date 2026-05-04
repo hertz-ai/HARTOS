@@ -413,7 +413,7 @@ class TestAgentDaemon:
         assert daemon._running is True
         daemon.stop()
 
-    @patch('integrations.coding_agent.idle_detection.IdleDetectionService.get_idle_opted_in_agents')
+    @patch('integrations.coding_agent.idle_detection.IdleDetectionService.get_idle_agent_personas')
     def test_daemon_tick_dispatches(self, mock_idle, db, test_user, test_product):
         from integrations.agent_engine.agent_daemon import AgentDaemon
 

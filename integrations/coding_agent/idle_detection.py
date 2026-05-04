@@ -79,57 +79,110 @@ class IdleDetectionService:
         return True
 
     @staticmethod
-    def get_idle_opted_in_agents(db: Session) -> List[Dict]:
-        """Get all idle agents that have opted in to distributed coding.
+    def _check_user_dispatchable(user) -> bool:
+        """Shared dispatchability check: not admin-paused AND no active sessions.
 
-        Agents with ``settings.paused == True`` (set via /api/admin/agents/<id>/pause)
-        are excluded so an admin-paused agent truly stops receiving work.  This is
-        the single enforcement point — no parallel path (Gate 4 / CLAUDE.md).
+        Used by BOTH ``get_idle_opted_in_agents`` (distributed-compute
+        privacy contract) AND ``get_idle_agent_personas`` (local agent
+        goal dispatch).  Single canonical idle-check — no parallel
+        paths (Gate 4 / CLAUDE.md).
+
+        Returns True if the user is eligible to receive work right now.
+        """
+        # Skip admin-paused entirely.  The `settings` JSON column is
+        # the single source of truth; /api/admin/agents/<id>/pause
+        # writes it, /resume clears it.
+        user_settings = user.settings or {}
+        if user_settings.get('paused') is True:
+            return False
+        # Worker-thread guard (same rationale as ``is_agent_idle``):
+        # consult sys.modules instead of ``from create_recipe import …``.
+        # If create_recipe isn't loaded yet, treat sessions as idle —
+        # same fall-through the original ImportError branch used.  Main
+        # thread loads create_recipe lazily; once that finishes,
+        # subsequent ticks see a populated ``user_tasks`` and the
+        # all_idle gate runs as designed.
+        cr_mod = sys.modules.get('create_recipe')
+        user_tasks = getattr(cr_mod, 'user_tasks', None) if cr_mod else None
+        if user_tasks is None:
+            return True
+        user_sessions = [k for k in user_tasks.keys()
+                         if k.startswith(f'{user.id}_')]
+        if not user_sessions:
+            return True
+        return all(
+            IdleDetectionService.is_agent_idle(s) for s in user_sessions
+        )
+
+    @staticmethod
+    def _user_to_dict(user) -> Dict:
+        """Project a User row into the dict shape both consumers expect."""
+        return {
+            'user_id': user.id,
+            'username': user.username,
+            'user_type': user.user_type,
+        }
+
+    @staticmethod
+    def get_idle_opted_in_agents(db: Session) -> List[Dict]:
+        """Get all idle users who have OPTED IN to distributed coding.
+
+        **Intent (privacy contract):** humans who explicitly toggled
+        ``idle_compute_opt_in=True`` consent to having their idle
+        compute used by other Hive nodes.  This is the canonical
+        eligibility filter for:
+
+        - ``coding_daemon._loop`` — peer compute sharing
+        - ``peer_discovery._self_info`` — gossip advertising of
+          available idle capacity
+
+        **Do NOT use this for local agent_daemon goal dispatch** —
+        that wants ``get_idle_agent_personas`` instead, which dispatches
+        goals to ``user_type='agent'`` rows (Echo, Quest, etc.) without
+        gating on the human-consent flag they don't apply to.
         """
         from integrations.social.models import User
-
         opted_in = db.query(User).filter(
             User.idle_compute_opt_in == True,
         ).all()
+        return [
+            IdleDetectionService._user_to_dict(u)
+            for u in opted_in
+            if IdleDetectionService._check_user_dispatchable(u)
+        ]
 
-        idle_agents = []
-        for user in opted_in:
-            # Skip admin-paused agents entirely.  The `settings` JSON column is
-            # the single source of truth; /api/admin/agents/<id>/pause writes it,
-            # /resume clears it.
-            user_settings = user.settings or {}
-            if user_settings.get('paused') is True:
-                continue
-            # Worker-thread guard (same rationale as is_agent_idle above):
-            # consult sys.modules instead of `from create_recipe import …`.
-            # If create_recipe isn't loaded yet, treat the user's sessions
-            # as idle (same fall-through the original ImportError branch
-            # used).  The main-thread bootstrap loads create_recipe lazily
-            # — once that finishes, subsequent ticks see a populated
-            # user_tasks and the all_idle gate runs as designed.
-            cr_mod = sys.modules.get('create_recipe')
-            user_tasks = getattr(cr_mod, 'user_tasks', None) if cr_mod else None
-            if user_tasks is None:
-                idle_agents.append({
-                    'user_id': user.id,
-                    'username': user.username,
-                    'user_type': user.user_type,
-                })
-                continue
-            # Sessions are keyed as f'{user_id}_{prompt_id}'
-            user_sessions = [k for k in user_tasks.keys()
-                             if k.startswith(f'{user.id}_')]
-            all_idle = all(
-                IdleDetectionService.is_agent_idle(s) for s in user_sessions
-            ) if user_sessions else True
-            if all_idle:
-                idle_agents.append({
-                    'user_id': user.id,
-                    'username': user.username,
-                    'user_type': user.user_type,
-                })
+    @staticmethod
+    def get_idle_agent_personas(db: Session) -> List[Dict]:
+        """Get all idle ``user_type='agent'`` personas eligible for goal dispatch.
 
-        return idle_agents
+        **Intent:** the agent_daemon dispatches goals (Echo's marketing
+        explainer, Quest's contest recap, Contest Curator's idea
+        capture, …) to autonomous agent personas.  Those personas are
+        DB rows with ``user_type='agent'`` — they exist *to* do work.
+        There is no human to consent on their behalf, so the
+        ``idle_compute_opt_in`` flag (which gates distributed-compute
+        sharing for humans) does NOT apply.
+
+        Eligibility rules:
+          1. ``user_type == 'agent'``
+          2. NOT admin-paused (``settings.paused != True``)
+          3. No active non-terminated sessions (``is_agent_idle`` true)
+
+        Captured 2026-05-01 root-cause: previously the daemon called
+        ``get_idle_opted_in_agents``, which silently returned `[]` on
+        installs where no user had toggled the human consent flag —
+        the seeded marketing personas (Echo/Quest/Contest Curator)
+        never dispatched because they weren't gated by the right flag.
+        """
+        from integrations.social.models import User
+        agent_users = db.query(User).filter(
+            User.user_type == 'agent',
+        ).all()
+        return [
+            IdleDetectionService._user_to_dict(u)
+            for u in agent_users
+            if IdleDetectionService._check_user_dispatchable(u)
+        ]
 
     @staticmethod
     def opt_in(db: Session, user_id: str) -> Dict:

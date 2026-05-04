@@ -866,6 +866,19 @@ def _resolve_python_exe() -> str:
     return sys.executable
 
 
+def _resolve_backend_venv_python(tool_name: Optional[str]) -> Optional[str]:
+    """Return the per-backend venv's python.exe if one exists.
+
+    Thin shim over ``core.venv_paths.venv_python_if_exists`` — kept as
+    a module-local name so the spawn-site call signature is stable.
+    The single source of truth lives in ``core.venv_paths`` and is
+    shared with ``tts.backend_venv`` so install + spawn paths can
+    never drift apart.
+    """
+    from core.venv_paths import venv_python_if_exists
+    return venv_python_if_exists(tool_name)
+
+
 # ═══════════════════════════════════════════════════════════════════
 # High-level helper: one-call tool wrapper
 # ═══════════════════════════════════════════════════════════════════
@@ -1242,12 +1255,23 @@ class ToolWorker:
                 cli_args = [self.tool_module]
                 if self.variant:
                     cli_args.append(self.variant)
+                # Resolve the spawn interpreter at start time, not at
+                # ToolWorker.__init__ time: the per-backend venv is
+                # typically created lazily on first install, AFTER the
+                # ToolWorker singleton has been constructed.  Order:
+                #   1. Explicit self.python_exe (test override / caller-set)
+                #   2. Per-backend venv at <data>/venvs/<tool_name>/  ← venv-installed deps
+                #   3. GPUWorker default = _resolve_python_exe() (python-embed)
+                spawn_python = (
+                    self.python_exe
+                    or _resolve_backend_venv_python(self.tool_name)
+                )
                 self._worker = GPUWorker(
                     name=self.tool_name,
                     module=self._DISPATCHER,
                     startup_timeout=self.startup_timeout,
                     request_timeout=self.request_timeout,
-                    python_exe=self.python_exe,
+                    python_exe=spawn_python,
                     args=cli_args,
                 )
                 self._worker.start()

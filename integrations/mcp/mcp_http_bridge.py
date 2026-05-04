@@ -547,18 +547,15 @@ def _tool_create_goal(goal_type: str, title: str, description: str = '', spark_b
 
 
 def _tool_agent_status() -> str:
-    """Check agent daemon health, active dispatches, and system state."""
-    from core.port_registry import get_port
-    from core.http_pool import pooled_get
-    status = {
-        "daemon_enabled": os.environ.get('HEVOLVE_AGENT_ENGINE_ENABLED', 'false'),
-        "poll_interval": int(os.environ.get('HEVOLVE_AGENT_POLL_INTERVAL', '30')),
-    }
-    try:
-        resp = pooled_get(f'http://localhost:{get_port("llm")}/health', timeout=2)
-        status['llm_server'] = 'running' if resp.status_code == 200 else f'status {resp.status_code}'
-    except Exception:
-        status['llm_server'] = 'not reachable'
+    """Check agent daemon health, active dispatches, and system state.
+
+    Uses ``core.health_probe`` canonical probes — never reads env-var
+    snapshots or hardcoded ports.  See module docstring there for the
+    root-cause notes from the 2026-05-01 false-negative incident.
+    """
+    from core.health_probe import probe_agent_daemon, probe_llm
+    status = probe_agent_daemon()
+    status['llm_server'] = probe_llm()
     try:
         reg = _get_registry()
         status['expert_agents'] = len(reg.agents)
@@ -618,19 +615,11 @@ def _tool_list_recipes() -> str:
 
 def _tool_system_health() -> str:
     """Full system health check: Flask server, LLM, DB, memory graph."""
-    from core.port_registry import get_port
-    from core.http_pool import pooled_get
-    health = {}
-    try:
-        resp = pooled_get(f'http://localhost:{get_port("backend")}/status', timeout=2)
-        health['backend'] = {'status': 'up', 'code': resp.status_code}
-    except Exception:
-        health['backend'] = {'status': 'down'}
-    try:
-        resp = pooled_get(f'http://localhost:{get_port("llm")}/health', timeout=2)
-        health['llm'] = {'status': 'up', 'code': resp.status_code}
-    except Exception:
-        health['llm'] = {'status': 'down'}
+    from core.health_probe import probe_nunba_flask, probe_llm
+    health = {
+        'backend': probe_nunba_flask(),
+        'llm': probe_llm(),
+    }
     try:
         db = _get_db()
         try:

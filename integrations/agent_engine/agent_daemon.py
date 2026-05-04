@@ -552,7 +552,15 @@ class AgentDaemon:
             if not goals:
                 return
 
-            idle_agents = IdleDetectionService.get_idle_opted_in_agents(db)
+            # Use ``get_idle_agent_personas`` — agent-type users (Echo,
+            # Quest, Contest Curator, …) eligible for goal dispatch.
+            # Do NOT use ``get_idle_opted_in_agents`` here: that filter
+            # is the human-consent privacy gate for distributed compute
+            # sharing, not the agent-persona gate.  Mismatch silently
+            # returned [] on installs where no human had opted in →
+            # daemon stalled with seeded personas never dispatching
+            # (root-cause logged 2026-05-01).
+            idle_agents = IdleDetectionService.get_idle_agent_personas(db)
             if not idle_agents:
                 return
 

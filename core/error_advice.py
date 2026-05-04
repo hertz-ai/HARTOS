@@ -166,8 +166,17 @@ def _try_agent_remediation(
                 created_by='error_advice',
             )
     except Exception as e:
-        # Never let the remediation path crash the failure path
-        logger.debug(f"Agent remediation goal creation failed: {e}")
+        # Never let the remediation path crash the failure path —
+        # but DO surface the failure at WARNING so an open self-heal
+        # loop is visible in production logs.  Previously this was
+        # logger.debug, which hid silent breakage of the agentic
+        # remediation chain (e.g. db_session import fails in dev mode,
+        # GoalManager.create_goal raises on schema drift).  The chain
+        # being broken is exactly the operational signal we need.
+        logger.warning(
+            f"[error_advice/{category}] agent remediation goal creation "
+            f"failed: {type(e).__name__}: {e}"
+        )
 
 
 def handle_exception(
