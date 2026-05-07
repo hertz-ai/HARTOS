@@ -457,17 +457,19 @@ class SpeculativeDispatcher:
             or parsed.get('is_create_agent')
             or (parsed.get('language_change') or '').strip()
             or (parsed.get('invite_intent') or '').strip()
+            or (parsed.get('join_room_intent') or '').strip()
         ):
             logger.info(
                 "draft-first: actionable intent flag set "
                 "(channel_connect=%r, is_create_agent=%r, "
-                "language_change=%r, invite_intent=%r) — escalating "
-                "delegate=none → 'local' so the expert tool registry "
-                "handles the turn.",
+                "language_change=%r, invite_intent=%r, "
+                "join_room_intent=%r) — escalating delegate=none → "
+                "'local' so the expert tool registry handles the turn.",
                 parsed.get('channel_connect'),
                 parsed.get('is_create_agent'),
                 parsed.get('language_change'),
                 parsed.get('invite_intent'),
+                parsed.get('join_room_intent'),
             )
             draft_reply = _REFUSAL_STANDBY_REPLY
             delegate = 'local'
@@ -797,6 +799,7 @@ class SpeculativeDispatcher:
             '"channel_connect": "<channel name or empty string>", '
             '"language_change": "<ISO 639-1 code or empty string>", '
             '"invite_intent": "<short context if user wants invite link, or empty>", '
+            '"join_room_intent": "<platform + room/url if user wants agent to join, or empty>", '
             '"reason": "<why you chose this delegate value>"}\n\n'
             # ── delegate ────────────────────────────────────────────────
             "delegate: Use \"none\" for greetings, small-talk, factual "
@@ -852,7 +855,18 @@ class SpeculativeDispatcher:
             "a short freeform context here (e.g. \"work friend\" or "
             "\"family\") — empty string is fine for a generic shareable "
             "link. Otherwise use an empty string \"\". This routes the "
-            "turn to the Invite_Friend tool."
+            "turn to the Invite_Friend tool.\n\n"
+            # ── join_room_intent ────────────────────────────────────────
+            "join_room_intent: if the user is asking the AI to JOIN an "
+            "external room / channel / meeting / group as a co-pilot, "
+            "note-taker, or participant (e.g. \"join my Discord audio "
+            "room\", \"attend my Teams meet\", \"take notes in the "
+            "WhatsApp family group\", \"co-pilot my Slack channel\"), "
+            "put a short \"<platform> <room or url>\" string here "
+            "(e.g. \"discord https://discord.com/channels/123/456\"). "
+            "Otherwise use an empty string \"\". This routes the turn "
+            "to the Join_External_Room tool, which always gates on "
+            "consent and announces the agent's presence in the room."
         )
 
     def _track_call_telemetry(

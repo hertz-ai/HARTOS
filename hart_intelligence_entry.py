@@ -3007,6 +3007,195 @@ def _handle_invite_friend_tool(input_text: str) -> str:
         return f"Invite_Friend error: {str(e)[:200]}"
 
 
+def _handle_join_external_room_tool(input_text: str) -> str:
+    """Join an external room (Discord channel, Slack channel, Telegram
+    super-group, Matrix room, Teams meet, WhatsApp group, etc.) on
+    behalf of the user, with consent + announcement guardrails.
+
+    Mirrors the _handle_connect_channel_tool pattern (G2, plan
+    elegant-spinning-avalanche).  Reuses canonical primitives:
+       - room_presence_service.gate (consent check, fail-closed)
+       - room_presence_service.announce_presence (HIVE MISSION
+         announcement on join)
+       - room_presence_service.listen_for_objection (auto-leave
+         on participant 'no AI' reply)
+       - ChannelRegistry.get / RoomCapableAdapter.join_room (transport)
+
+    Input formats:
+       - "<platform> <room_id_or_url>"            (default role=co_pilot)
+       - "<platform> <room_id> <role>"
+       - JSON: {"platform":..., "room":..., "role":...}
+
+    Roles ∈ {co_pilot, participant, note_taker, silent_observer, writer}.
+
+    Returns a human-readable string the LangChain agent can summarize.
+    Best-effort: never raises out, always returns a string.
+    """
+    import json as _json
+    try:
+        uid = thread_local_data.get_user_id()
+        if not uid:
+            return "Cannot join external room — no signed-in user in this session."
+
+        platform = ''
+        room_id = ''
+        role = 'co_pilot'
+        text = (input_text or '').strip()
+        if text.startswith('{'):
+            try:
+                parsed = _json.loads(text)
+                platform = (parsed.get('platform') or parsed.get('channel') or '').lower()
+                room_id = str(parsed.get('room') or parsed.get('room_id') or '')
+                role = (parsed.get('role') or 'co_pilot').lower()
+            except _json.JSONDecodeError:
+                pass
+        if not platform or not room_id:
+            parts = text.split(None, 2)
+            if len(parts) >= 1:
+                platform = platform or parts[0].lower()
+            if len(parts) >= 2:
+                room_id = room_id or parts[1]
+            if len(parts) >= 3 and not role:
+                role = parts[2].lower()
+
+        if not platform:
+            return (
+                "Which platform should I join? Tell me the platform "
+                "(discord, slack, telegram, matrix, teams, whatsapp) "
+                "and the room id or URL."
+            )
+        if not room_id:
+            return f"Which {platform} room should I join? Send the room id or URL."
+
+        # 1. Consent gate (canonical path)
+        from integrations.social.room_presence_service import (
+            announce_presence, gate, listen_for_objection,
+        )
+        allowed, reason = gate(str(uid), platform, room_id, role)
+        if not allowed:
+            # Surface a Liquid UI consent card so the user can grant in one click.
+            try:
+                from core.platform.service_registry import ServiceRegistry
+                _lui = ServiceRegistry.get('LiquidUIService')
+                if _lui:
+                    _lui.agent_ui_update(
+                        str(uid),
+                        {
+                            'type': 'approval',
+                            'title': 'Permission needed',
+                            'message': reason,
+                            'severity': 'info',
+                            'actions': [
+                                {'label': 'Open Privacy Settings',
+                                 'action': 'navigate',
+                                 'target': '/social/settings/privacy'},
+                            ],
+                        },
+                    )
+            except Exception as e:
+                logger.debug("Join_External_Room: consent UI emit skipped: %s", e)
+            return reason
+
+        # 2. Resolve adapter + check room-capable
+        try:
+            from integrations.channels.registry import get_registry
+            from integrations.channels.room_capable import (
+                UnsupportedRoomError, is_room_capable,
+            )
+            registry = get_registry()
+            adapter = registry.get(platform)
+        except Exception as e:
+            return f"Could not look up {platform} adapter: {str(e)[:160]}"
+        if adapter is None:
+            return (
+                f"No {platform} channel is configured. Set it up first "
+                f"via Connect_Channel ('add channel {platform}') and try again."
+            )
+        if not is_room_capable(adapter):
+            return (
+                f"The {platform} adapter is configured but does not yet "
+                f"support room/channel join semantics. Platform support "
+                f"is pending — for now you can use Connect_Channel for "
+                f"1:1 messaging."
+            )
+
+        # 3. Join via the adapter (RoomCapableAdapter.join_room)
+        import asyncio
+        try:
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    fut = asyncio.run_coroutine_threadsafe(
+                        adapter.join_room(room_id, role), loop)
+                    joined = fut.result(timeout=30)
+                else:
+                    joined = loop.run_until_complete(
+                        adapter.join_room(room_id, role))
+            except RuntimeError:
+                joined = asyncio.run(adapter.join_room(room_id, role))
+        except UnsupportedRoomError as e:
+            return f"{platform} doesn't support rooms here: {e}"
+        except Exception as e:
+            return f"Failed to join {platform}/{room_id}: {str(e)[:160]}"
+
+        if not joined:
+            return (
+                f"Could not join {platform}/{room_id} — the adapter "
+                f"refused the join (rate limit, missing permission, or "
+                f"network). Try again in a moment."
+            )
+
+        # 4. Announce presence (HIVE MISSION — non-optional)
+        owner_name = None
+        try:
+            owner_name = thread_local_data.get_user_display_name() if hasattr(
+                thread_local_data, 'get_user_display_name') else None
+        except Exception:
+            owner_name = None
+        announced = announce_presence(
+            adapter, room_id, str(uid), role,
+            owner_display_name=owner_name)
+        if not announced:
+            # Required announcement failed — leave to honor the policy.
+            try:
+                if loop and loop.is_running():
+                    asyncio.run_coroutine_threadsafe(
+                        adapter.leave_room(room_id), loop).result(timeout=15)
+                else:
+                    asyncio.run(adapter.leave_room(room_id))
+            except Exception:
+                pass
+            return (
+                f"Joined {platform}/{room_id} but could not post the "
+                f"required AI-presence announcement. Left the room to "
+                f"honor the privacy policy. Please try again."
+            )
+
+        # 5. Listen for objection
+        agent_id_for_room = f"{platform}:{room_id}"
+        def _on_detach(reason: str):
+            try:
+                if loop and loop.is_running():
+                    asyncio.run_coroutine_threadsafe(
+                        adapter.leave_room(room_id), loop).result(timeout=15)
+                else:
+                    asyncio.run(adapter.leave_room(room_id))
+            except Exception as e:
+                logger.debug("Join_External_Room: leave_room failed: %s", e)
+
+        listen_for_objection(
+            adapter, room_id, str(uid), agent_id_for_room,
+            on_detach=_on_detach)
+
+        return (
+            f"Joined {platform}/{room_id} as {role}. I posted an "
+            f"AI-presence announcement and will leave automatically if "
+            f"any participant says 'no AI' or '/agent-out'."
+        )
+    except Exception as e:
+        return f"Join_External_Room error: {str(e)[:200]}"
+
+
 def _handle_agentic_router_tool(input_text):
     """Tool handler: LLM detected a multi-step agentic task.
 
@@ -3441,6 +3630,28 @@ def get_tools(req_tool, is_first: bool = False):
                     "generic shareable link. The tool returns a URL the user can "
                     "paste into any channel; a floating share-card also appears "
                     "in chat with a one-click Copy button."
+                ),
+            ),
+            Tool(
+                name="Join_External_Room",
+                func=_handle_join_external_room_tool,
+                description=(
+                    "Join an external room/channel — Discord channel, Slack "
+                    "channel, Telegram super-group, Matrix room, Teams meeting, "
+                    "WhatsApp group, etc. — on behalf of the user as an AI "
+                    "co-pilot, note-taker, participant, silent observer, or "
+                    "writer. Use whenever the user says things like 'join my "
+                    "Discord audio room', 'attend my Teams meet', 'take notes "
+                    "in the WhatsApp family group', 'co-pilot my Slack channel', "
+                    "or similar. Always asks the user for consent first via a "
+                    "Liquid UI prompt, then announces its presence in the room "
+                    "(per HIVE AI MISSION — never silent). Leaves automatically "
+                    "if any participant says 'no AI' / '/agent-out'. Input: "
+                    "either '<platform> <room_id_or_url>' or "
+                    "'<platform> <room> <role>' or a full JSON dict "
+                    "{{\"platform\":..., \"room\":..., \"role\":...}}. Roles: "
+                    "co_pilot (default), participant, note_taker, "
+                    "silent_observer, writer."
                 ),
             ),
             Tool(
@@ -6814,6 +7025,52 @@ def chat():
                     # Fall through — do NOT return the draft standby
                     # reply; the tool-based path below will run and the
                     # VLM tool will produce a grounded answer.
+                elif (result.get('delegate') in ('local', 'hive')
+                      and not result.get('is_casual')
+                      and not result.get('is_create_agent')):
+                    # Draft self-assessed: this is a non-casual TASK
+                    # that needs more capability than the 0.8B has
+                    # (delegate='local' = bigger local model + tools;
+                    # delegate='hive' = tier escalation needed).  The
+                    # user's design intent (2026-05-07): "only if local
+                    # needs help it shd go via hive" — so try LOCAL
+                    # autogen execution first; hive escalation is
+                    # downstream via dispatch.py if the local agent
+                    # can't satisfy.
+                    #
+                    # Pre-fix this fell through to the `else` standby
+                    # reply ("I'll gather that research..."), promising
+                    # work that never happened.  Witnessed 2026-05-07
+                    # 10:24:16 with "open chrome and research AI
+                    # papers" — telemetry showed delegate='hive',
+                    # is_casual=False but reply was the draft's 102-
+                    # char polite ack and no execution kicked off.
+                    #
+                    # Setting autonomous=True (same shape as #105)
+                    # routes to:
+                    #   1. find_matching_agent (catalog 1213+ agents)
+                    #   2. If matched + recipe exists → chat_agent (REUSE)
+                    #   3. If no match → _autonomous_gather_info auto-
+                    #      fills identity (or partial-salvage at
+                    #      hart_intelligence_entry.py:5817), then
+                    #   4. recipe() runs autogen tool group locally
+                    #      (visual_execution / call_visual_task / etc).
+                    #   5. Hive escalation if step 4 can't satisfy
+                    #      (downstream in dispatch.py — separate path).
+                    app.logger.info(
+                        f"draft classifier: delegate="
+                        f"{result.get('delegate')!r} "
+                        f"is_casual=False — routing to local autogen "
+                        f"CREATE+execute (hive remains downstream "
+                        f"fallback if local can't satisfy)"
+                    )
+                    create_agent = True
+                    autonomous = True
+                    _is_agentic_orchestration = True
+                    # Fall through — do NOT return draft standby; the
+                    # create_agent branch below runs in this same
+                    # request and dispatches to find_matching_agent /
+                    # _autonomous_gather_info / recipe().
                 else:
                     return _chat_reply(
                         user_id, request_id, result['response'],
